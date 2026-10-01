@@ -28,6 +28,9 @@ pub enum Op {
     Change(u64, ConfChangeV2),
     Transfer(u64, u64),
     Read(u64, Vec<u8>),
+    /// Several reads asked of one member before it is asked what there is
+    /// to do: this core sends one round for them.
+    Reads(u64, Vec<Vec<u8>>),
     Restart(u64),
     Compact(u64),
     Block(u64, u64),
@@ -57,6 +60,9 @@ pub struct Mix {
     pub compaction: bool,
     pub partitions: bool,
     pub priorities: bool,
+    /// Whether reads are asked several at a time. Where the cores are
+    /// compared they are not: `raft-rs` sends a round for each.
+    pub bursts: bool,
     /// Of a hundred proposals, how many go by the fast track.
     pub fast: u64,
     pub lose: u64,
@@ -71,6 +77,7 @@ impl Mix {
             compaction: true,
             partitions: true,
             priorities: true,
+            bursts: false,
             fast: 0,
             lose: 8,
             repeat: 5,
@@ -97,6 +104,11 @@ pub struct Cluster<R> {
     /// is not: the comparison ends there.
     pub stop_who_left: bool,
     reads: u64,
+    /// For each read that waits, the highest index any member had
+    /// committed when it was asked: what it is answered with is no less.
+    asked: BTreeMap<Vec<u8>, u64>,
+    /// How many reads were answered.
+    pub answered: u64,
     opened: u64,
 }
 
@@ -119,6 +131,8 @@ impl<R: Replica> Cluster<R> {
             deposed: 0,
             stop_who_left: false,
             reads: 0,
+            asked: BTreeMap::new(),
+            answered: 0,
             opened: 0,
         };
         for id in 1..=count {
@@ -185,6 +199,19 @@ impl<R: Replica> Cluster<R> {
                 None => {
                     self.chosen.insert(committed.0, committed.clone());
                 }
+            }
+        }
+        for (index, context) in &output.reads {
+            // A read sees what was committed before it was asked, whoever
+            // leads by the time it is answered: a leader that was deposed
+            // meanwhile answers nothing.
+            if let Some(floor) = self.asked.remove(context) {
+                assert!(
+                    *index >= floor,
+                    "seed {}: member {member} answered a read at {index}, asked when {floor} was committed",
+                    self.seed
+                );
+                self.answered += 1;
             }
         }
         if view.role == 2 {
@@ -267,8 +294,20 @@ impl<R: Replica> Cluster<R> {
                 reports.push(self.report(*id, None));
             }
             Op::Read(id, context) => {
+                let floor = self.chosen.keys().next_back().copied().unwrap_or(0);
+                self.asked.insert(context.clone(), floor);
                 if let Some(node) = self.node(*id) {
                     node.read(context.clone());
+                }
+                reports.push(self.report(*id, None));
+            }
+            Op::Reads(id, contexts) => {
+                let floor = self.chosen.keys().next_back().copied().unwrap_or(0);
+                for context in contexts {
+                    self.asked.insert(context.clone(), floor);
+                    if let Some(node) = self.node(*id) {
+                        node.read(context.clone());
+                    }
                 }
                 reports.push(self.report(*id, None));
             }
@@ -426,6 +465,15 @@ impl<R: Replica> Cluster<R> {
                     return Op::Transfer(leader(rng), rng.pick(&all).unwrap_or(1));
                 }
                 90..=91 if !up.is_empty() => {
+                    if mix.bursts && rng.chance(50) {
+                        let contexts = (0..2 + rng.below(7))
+                            .map(|_| {
+                                self.reads += 1;
+                                self.reads.to_le_bytes().to_vec()
+                            })
+                            .collect();
+                        return Op::Reads(leader(rng), contexts);
+                    }
                     self.reads += 1;
                     return Op::Read(leader(rng), self.reads.to_le_bytes().to_vec());
                 }

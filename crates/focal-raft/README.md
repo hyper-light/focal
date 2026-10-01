@@ -7,7 +7,8 @@ durable shell that drives it is `focal-consensus`.
 
 It is Raft as Ongaro's thesis states it, with pre-vote, check-quorum, election priority,
 learners, joint consensus, leader transfer, an inflight window with conflict hints,
-ReadIndex and snapshots. It keeps the log and speaks the messages of `raft-rs` 0.7
+ReadIndex and snapshots. Reads asked before the member is next asked what there is to do
+share one round of heartbeats (`ReadRounds`, 27 §10). It keeps the log and speaks the messages of `raft-rs` 0.7
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in [27 §4.5](../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md).
 

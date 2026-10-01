@@ -687,6 +687,122 @@ fn isolated_leader_cannot_complete_a_quorum_read_barrier() {
     ));
 }
 
+/// Reads asked before the leader's owner drains leave in one round: two
+/// heartbeats to two followers, whatever the number of reads, and the
+/// answer of one follower gives every barrier. A write that commits while a
+/// round is out is seen by the reads asked after it — they are asked for by
+/// the next round — and not required of those asked before.
+#[test]
+fn reads_asked_together_are_confirmed_by_one_round_of_heartbeats() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    let heartbeat = MessageType::MsgHeartbeat as i32;
+    let answer = MessageType::MsgHeartbeatResponse as i32;
+    let mut asked = 0u32;
+    for together in [1usize, 32, 128] {
+        let contexts: Vec<Vec<u8>> = (0..together)
+            .map(|_| {
+                asked += 1;
+                asked.to_be_bytes().to_vec()
+            })
+            .collect();
+        for context in &contexts {
+            cluster.nodes[0].read_index(context.clone()).unwrap();
+        }
+        assert!(cluster.nodes[0].reads_unasked());
+        let events = cluster.nodes[0].drain().unwrap();
+        assert!(events.read_states.is_empty());
+        assert!(!cluster.nodes[0].reads_unasked());
+        let round: Vec<Message> = events
+            .messages
+            .into_iter()
+            .filter(|message| message.msg_type == heartbeat)
+            .collect();
+        assert_eq!(
+            round.len(),
+            2,
+            "{together} reads left in {} heartbeats",
+            round.len()
+        );
+        // One follower answers; the other's heartbeat is lost.
+        let mut answers = Vec::new();
+        for message in round.into_iter().filter(|message| message.to == 2) {
+            cluster.nodes[1].step(message).unwrap();
+            answers.extend(cluster.nodes[1].drain().unwrap().messages);
+        }
+        for message in answers
+            .into_iter()
+            .filter(|message| message.msg_type == answer)
+        {
+            cluster.nodes[0].step(message).unwrap();
+        }
+        let barriers = cluster.nodes[0].drain().unwrap().read_states;
+        assert_eq!(
+            barriers
+                .iter()
+                .map(|barrier| barrier.context.clone())
+                .collect::<Vec<_>>(),
+            contexts
+        );
+    }
+    cluster.pump(None);
+    // A round is out for `before`; a write commits; `after` is asked.
+    let commit = cluster.nodes[0].status().committed_index;
+    cluster.nodes[0].read_index(b"before".to_vec()).unwrap();
+    let first: Vec<Message> = cluster.nodes[0].drain().unwrap().messages;
+    cluster.nodes[0].propose(b"write".to_vec()).unwrap();
+    let appends = cluster.nodes[0].drain().unwrap().messages;
+    let mut answers = Vec::new();
+    for message in appends {
+        let to = (message.to - 1) as usize;
+        cluster.nodes[to].step(message).unwrap();
+        answers.extend(cluster.nodes[to].drain().unwrap().messages);
+    }
+    let mut after_write = Vec::new();
+    for message in answers {
+        cluster.nodes[0].step(message).unwrap();
+        after_write.extend(cluster.nodes[0].drain().unwrap().messages);
+    }
+    assert_eq!(cluster.nodes[0].status().committed_index, commit + 1);
+    cluster.nodes[0].read_index(b"after".to_vec()).unwrap();
+    let second: Vec<Message> = cluster.nodes[0].drain().unwrap().messages;
+    // The answers to the first round confirm `before`, at the commit it was
+    // asked at, and not `after`.
+    let mut barriers = Vec::new();
+    for round in [first, second] {
+        let mut answers = Vec::new();
+        for message in round
+            .into_iter()
+            .filter(|message| message.msg_type == heartbeat && message.to == 2)
+        {
+            cluster.nodes[1].step(message).unwrap();
+            answers.extend(cluster.nodes[1].drain().unwrap().messages);
+        }
+        for message in answers
+            .into_iter()
+            .filter(|message| message.msg_type == answer)
+        {
+            cluster.nodes[0].step(message).unwrap();
+        }
+        barriers.push(cluster.nodes[0].drain().unwrap().read_states);
+    }
+    assert_eq!(
+        barriers
+            .iter()
+            .map(|round| round
+                .iter()
+                .map(|barrier| (barrier.context.clone(), barrier.index))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![(b"before".to_vec(), commit)],
+            vec![(b"after".to_vec(), commit + 1)]
+        ]
+    );
+    drop(after_write);
+}
+
 #[test]
 fn a_failure_of_the_core_stops_only_this_replica_until_disk_recovery() {
     for unwinds in [false, true] {

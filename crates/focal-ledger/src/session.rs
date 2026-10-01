@@ -737,6 +737,16 @@ impl Session {
     pub fn has_ready(&self) -> bool {
         self.consensus.has_ready() || self.retained.is_some()
     }
+    /// A read asked here waits for a round that leaves with the next poll
+    /// (`DurableNode::reads_unasked`): an owner takes what else is queued
+    /// for it first.
+    pub fn reads_unasked(&self) -> bool {
+        self.consensus.reads_unasked()
+    }
+    /// The reads asked here that wait for a quorum to confirm them.
+    pub fn reads_waiting(&self) -> usize {
+        self.consensus.reads_waiting()
+    }
     fn clear_pending(&mut self) {
         self.pending_rows.clear();
         self.pending.clear();

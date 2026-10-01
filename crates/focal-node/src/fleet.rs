@@ -1516,7 +1516,7 @@ impl Owner {
                 };
                 match receiver.recv_timeout(wake.saturating_duration_since(Instant::now())) {
                     Ok(work) => {
-                        if self.accept(work)? {
+                        if self.take(work, &receiver)? {
                             return Ok(());
                         }
                         self.progress_managed()?;
@@ -1532,6 +1532,27 @@ impl Owner {
             let _ = writeln!(std::io::stderr().lock(), "focal: replica stopped: {error}");
         }
         self.close();
+    }
+    /// Takes `work`, and while a read waits for its round, what is queued
+    /// behind it, before the drain that sends the round: the reads among it
+    /// share the round (27 §9). Counted by what the owner admits at once;
+    /// work that is no read drains for itself, which sends the round and
+    /// ends this. Whether the owner is to stop.
+    fn take(&mut self, work: Work, receiver: &mpsc::Receiver<Work>) -> Result<bool, LedgerError> {
+        if self.accept(work)? {
+            return Ok(true);
+        }
+        let mut taken = 1usize;
+        while self.session.reads_unasked() && taken < self.config.pending_clients {
+            let Ok(work) = receiver.try_recv() else {
+                break;
+            };
+            taken = taken.saturating_add(1);
+            if self.accept(work)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     /// A member added after the log was compacted can only be seeded by a
     /// snapshot whose configuration names it (Raft discards any other), so
@@ -1934,6 +1955,7 @@ impl Owner {
                 let _ = response.send(self.registration_facts(charge));
             }
             Work::Request(request, response, charge) => {
+                let waiting = self.session.reads_waiting();
                 self.request(
                     request.verified,
                     response,
@@ -1941,7 +1963,16 @@ impl Owner {
                     request.witness,
                     request.native,
                 );
-                self.drain()?;
+                // A request that only asked a read is not drained for here:
+                // the owner's loop takes what else is queued first, and the
+                // round that leaves with its drain carries every read asked
+                // by then (27 §9). Reads queued together are confirmed by
+                // one round of heartbeats, and one asked alone leaves with
+                // the drain that follows at once. Anything else is drained
+                // for as it was.
+                if self.session.reads_waiting() <= waiting || !self.session.reads_unasked() {
+                    self.drain()?;
+                }
             }
             Work::Probe(request, response, charge) => {
                 let result = self.probe_receipt(&request).map(|known| ReceiptProbe {

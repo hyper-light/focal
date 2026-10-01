@@ -892,6 +892,18 @@ impl DurableNode {
     pub fn election_tick(&self) -> usize {
         self.config.election_tick
     }
+    /// Whether a read asked here waits for a round of heartbeats that has
+    /// not left: it leaves with the next drain, carrying every read asked
+    /// by then (`focal_raft::Raft::ask_reads`). An owner with more work
+    /// already queued takes it first, so that reads queued together are
+    /// confirmed by one round and not by one each.
+    pub fn reads_unasked(&self) -> bool {
+        self.raw.raft.reads_unasked()
+    }
+    /// The reads asked here that wait for a quorum to confirm them.
+    pub fn reads_waiting(&self) -> usize {
+        self.raw.raft.pending_read_count()
+    }
     /// The reads this member may hold in flight: the core's own bound, which
     /// a follower's parked read barriers share (27 §5, follower reads).
     pub fn pending_reads(&self) -> usize {

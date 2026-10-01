@@ -868,6 +868,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                         Err(_) => break,
                     }
                 }
+                // The reads the members forwarded together leave in one
+                // round.
+                if self.replica.reads_unasked() {
+                    self.drain()?;
+                }
                 if Instant::now() >= next_tick {
                     self.pace
                         .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
@@ -930,6 +935,25 @@ impl<V: AuthorityVerifier> Owner<V> {
                     Ok(work) => {
                         if self.work(work)? {
                             return Ok(());
+                        }
+                        // While a read waits for its round, what is queued
+                        // behind it is taken before the drain that sends
+                        // the round: the reads among it share the round.
+                        // Counted by what the owner admits at once; work
+                        // that is no read drains for itself, which sends
+                        // the round and ends this.
+                        let mut taken = 1usize;
+                        while self.replica.reads_unasked() && taken < self.config.pending_requests {
+                            let Ok(work) = receiver.try_recv() else {
+                                break;
+                            };
+                            taken = taken.saturating_add(1);
+                            if self.work(work)? {
+                                return Ok(());
+                            }
+                        }
+                        if self.replica.reads_unasked() {
+                            self.drain()?;
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1078,8 +1102,15 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let _ = response.send(result);
             }
             Work::Request(request, response, charge) => {
+                let waiting = self.replica.reads_waiting();
                 self.request(*request, response, charge);
-                self.drain()?;
+                // A request that only asked a read is not drained for here:
+                // the owner's loop takes what else is queued first, and the
+                // round that leaves with its drain carries every read asked
+                // by then (27 §9). Anything else is drained for as it was.
+                if self.replica.reads_waiting() <= waiting || !self.replica.reads_unasked() {
+                    self.drain()?;
+                }
             }
             Work::Campaign(response) => {
                 let result = self

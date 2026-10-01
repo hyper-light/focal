@@ -206,6 +206,7 @@ included.
 | A change refused for the size of what is uncommitted leaves the leader believing one is pending | It does not |
 | Election timeouts from the thread's generator | From a seed the owner gives: a run is reproducible |
 | Queues without a bound of their own | `Limits`: messages and reads that wait, entries not yet durable, entries in one message. A member takes of a message what it may hold and answers with the last entry taken |
+| A leader sends a round of heartbeats for each read as it is asked, and again each time the read is asked again: twenty reads taken together are forty heartbeats to two members, of which the answers to the last two confirm all twenty | One round when the member is next asked what there is to do, carrying the last read asked, for every read asked since the round before (`ReadRounds::Shared`, section 10). A read asked again while it waits asks for no round of its own; a round that was lost is asked again by the leader's clock, whose heartbeat carries the last read. The rule of raft-rs is kept (`ReadRounds::Each`) to compare the cores under one rule |
 
 **What is kept although it could be otherwise.** A member that a change removes and
 adds again is known anew, and a member added by a change is first probed one entry
@@ -737,6 +738,7 @@ commit it was told of, and a leader's followers began to persist only after it h
 | A change of membership is applied only once a write has stated the commit that covers it, and that write is waited for | Whoever is told that a change committed may act on it where no log records it: stop the member it removed. A member that then restarted without the commit would count that member again and wait for it for good — two voters, one removed and stopped, leave one that cannot elect itself (`cli_network` met it: the founder removed its peer, both were stopped, and the founder did not come back). Changes are rare; the wait is one flush for each | `fenced`, `after_advance`, `commit_durable` |
 | A control group — the root, a directory partition — applies nothing, and says of nothing that it committed, before a write has stated the commit that covers it | What a control group applies its members act on when they next start, before the group has told them anything: who is enrolled and who was revoked, the fence below which a binary does not serve (24 §21), where a ledger is placed. A member that stopped within its owner's period would start again without what it had applied and act against it (`cli_upgrade` met it: a host that had honoured the fence, killed and started below it, published that it was ready before its group told it of the fence again). What a ledger applied is served only through its group — a read by a barrier, a write by a leader that committed in its term — so its members need no such rule. Under load the commit rides the group's next append, as before; a quiet group pays one flush for the commit; a control group of one voter pays nothing, its commit being in the append | `apply_on_written_commit`, `fenced`; `ControlReplica::open`, `open_on_wal` |
 | The entries a `Ready` gives to apply are applied before its write | They are committed and durable here already (`Ready::committed_entries`); a `Ready` with a snapshot gives none | `drain_progress` |
+| The owner that shares a thread among sessions is told when the log answers a write of one of them, and drains that session then | It asked the log every millisecond, which was the floor of a commit on a device that flushes faster than that. The log's writer calls what the group gave it for the write, on its own thread; the call queues a signal the owner waits on beside its input. A signal says there is something to take and nothing more: one lost, or one that finds the queue of signals full, is made good by the owner's next pass over its sessions | `DurableNode::notify_persisted`, `focal_log::Persisted`, `fleet_group::OwnerQueue` |
 
 What a member opens with follows from the first rule, and one place did not allow for it:
 a member authorized the credential it holds against the registry its own replica
@@ -765,12 +767,46 @@ What mantle's replica does that this shell does not, and why:
 | mantle | focal |
 |---|---|
 | Holds the messages and ticks that come while a `Ready` is out and takes them after (its R19: refused, none of a loaded leader's proposals committed) | The owners queue what comes behind a pending write (`fleet_group`'s scheduler, a blocking owner's channel) and always did: nothing is refused. A tick that comes meanwhile is not held: the period has passed without it and the owner's stalls are the replica's patience (section 3.1 P3) — a member that replays held ticks after a stall campaigns for a leader that was only as slow as itself |
-| Confirms reads a round at a time | Open, the audit's F43: an owner asks the core a heartbeat round for each read |
+| Confirms reads a round at a time: one round out, and a read asked meanwhile waits for the next | A round for every drain of the owner, carrying the reads asked since the last (section 10, the audit's F43). A read asked while a round is out does not wait for that round's answers before its own leaves: on a quorum a long path away, waiting costs up to a round trip more for every read that overlaps another |
 | Applies committed entries without the commit durable and repairs the log's commit from its engine at open | The same rule, without an engine: the state is the log's, replayed to the commit the log holds |
 | Marks a member whose last frame was lost and repairs it in place | A log damaged before its fence does not open; the member is replaced (24 §19). Open with the log's fence (below) |
 
 Open, and the audit's F17 still: a group commit is three device flushes here (the data,
 the fence file, the directory entry of its rename; `focal_log::install_fence`), where the
-fence could be made durable by one write in place; and the session owner that shares a
-thread among groups polls a pending write every millisecond, which is the floor of a
-commit on a device that flushes faster than that.
+fence could be made durable by one write in place.
+
+## 10. Reads that share a round (2026-10-01)
+
+The audit's F43. A linearizable read asks the leader at which index it may be served
+(`ReadIndex`, Ongaro's thesis §6.4): the leader notes its commit and asks a quorum whether
+it still leads; a round of heartbeats sent after the read was asked, and answered by a
+quorum, confirms it and every read asked before it. The core had the second half — one
+answer released every read asked before it — and not the first: it broadcast a round for
+each read as it was asked, so twenty reads taken together were forty heartbeats to two
+followers, of which the answers to the last two did all the work. And the owners drained
+after every request, so even a core that shared rounds would have been asked for one each.
+
+| Rule | Why it is safe, and what it costs | Where |
+|---|---|---|
+| A read asked is queued and nothing is sent. One round leaves when the member is next asked what there is to do, carrying the last read asked, for every read asked since the round before | The round is sent after each of those reads was asked, which is all a round must be to confirm a read. A read asked alone leaves with the `Ready` its owner takes next: nothing waits for a timer or for another read | `Raft::read_index`, `Raft::ask_reads`, `RawNode::ready`; `RawNode::has_ready` is true while a read is unasked |
+| A read asked after a round left is asked for by the next round, never confirmed by the one before | That round's heartbeats left before the read was asked and say nothing of who led when it was: a leader deposed between the two would answer the read at a commit the group had passed. `a_round_confirms_no_read_asked_after_it_left` holds a round's answers while another leader is elected and commits, asks the old leader a second read and delivers the answers: with the rule broken the read is answered at 2 when 4 was committed | `ReadOnly::asked`, `unasked`, `advance` |
+| A round that was lost is asked again by the leader's clock | The heartbeat a leader sends each beat carries the last read asked and is a round for every read that waits. A read asked again while it waits asks for no round of its own (raft-rs sent one) | `Raft::bcast_heartbeat` |
+| An owner takes what is queued behind a read before the drain that sends its round | The reads among it share the round. Counted by what the owner admits at once (`pending_clients`, `pending_requests`); a request that is no read is drained for as it was, which sends the round with it and ends the taking. An owner that shares its thread among sessions drains a session on its next pass, after the work it dispatched in this one | `Owner::take` and the `Work::Request` arm (`fleet.rs`), `ControlHost::run` and its `Work::Request` arm |
+
+A round for each drain, and not one round out at a time (what mantle's replica does): a
+read asked while a round is out would wait for that round's answers before its own left,
+up to a round trip more on every read that overlaps another — nothing on a quorum in one
+room, and half again of a read's latency on a quorum a long path away. The rounds an
+owner sends are bounded by its drains, and under load its drains carry what queued
+meanwhile, as a group commit carries what was written meanwhile.
+
+Measured by count, not by time: 1, 32 and 128 reads asked of a leader of three before it
+drains leave in two heartbeats and are all confirmed by one follower's answer
+(`reads_asked_together_are_confirmed_by_one_round_of_heartbeats`); a hundred requests
+queued for a session's owner leave in two heartbeats where a drain for each sent two
+hundred (`reads_queued_together_leave_in_one_round_and_all_are_answered`).
+
+Open: the reads a leader may hold are bounded by the window it lets a peer have in flight
+(`DurableNode::pending_reads`), a size that was right when each read was a round in
+flight. A read a follower forwards to a leader at that bound is refused there and found
+by its asker's deadline, not told to its asker at once.

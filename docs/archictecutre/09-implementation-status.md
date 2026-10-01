@@ -12550,3 +12550,21 @@ is served only through its group. A control group's commit rides its next append
 load, and a control group of one voter pays nothing. Open under F17: a group commit is
 still three device flushes. `focal-consensus`: 80 tests; the control, ledger and node
 suites pass with their restart tests unchanged.
+
+### 2026-10-01 — F43: reads that share a round
+
+A leader sent a round of heartbeats for each read as it was asked, and the owners drained
+after every request, so no two reads ever shared one: the audit's twenty reads and forty
+heartbeats. The core now queues a read and sends one round when it is next asked what
+there is to do, for every read asked since the round before; a read asked after a round
+left is asked for by the next and never confirmed by the one before; a lost round is asked
+again by the leader's beat. The session and control owners take what is queued behind a
+read before the drain that sends its round ([27](27-consensus-roadmap-and-slates-port.md)
+§10; the remediation record, F43). 128 reads asked together were 256 heartbeats and are 2;
+a read asked alone costs what it did, and no latency is claimed. Every answered read in
+every schedule of the core is now checked against what the group had committed when it
+was asked, and a directed schedule holds a round's answers across an election to show a
+deposed leader answers no read asked after its round left. Open: the reads a leader may
+hold are still bounded by its in-flight window, and a forwarded read refused at that bound
+is found by its asker's deadline. `focal-raft`: 56 unit tests, 8 group schedules, the
+comparison with raft-rs unchanged under `ReadRounds::Each`; `focal-consensus`: 81.

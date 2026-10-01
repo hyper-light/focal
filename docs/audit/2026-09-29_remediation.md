@@ -55,7 +55,7 @@ ruling before work starts).
 | F40 | P2 | open | 10 | — |
 | F41 | P2 | open | 10 | — |
 | F42 | P1 | open | 9 | — |
-| F43 | P2 | open | 10 | — |
+| F43 | P2 | in tree (the leader's read bound open) | 10 | [F43](#f43) |
 | F44 | P2 | open | 10 | — |
 | F45 | P2 | open | 10 | — |
 | F46 | P1 | in tree | 8 | [F46](#f46) |
@@ -1748,6 +1748,63 @@ it is on a disk each):
 **Residual.** A group commit is three device flushes (`focal_log::install_fence`: the
 data, the fence file, the directory entry of its rename), where the fence could be made
 durable in place; it is the next stage, with the research it needs (what tells a torn
-fence from a damaged one once it is overwritten in place). Reads are confirmed a heartbeat
-round each (the audit's F43). A replacement of a member is not held until every voter
+fence from a damaged one once it is overwritten in place). A replacement of a member is not held until every voter
 knows the configuration it made (mantle's `configuration_known`; the audit's F24/F25).
+
+## F43
+
+**Cause.** Two things, one above the other. The core confirmed every read asked before
+the one a quorum answered for, and still broadcast a round of heartbeats for each read as
+it was asked (`Raft::read_index` called `bcast_heartbeat_with` for the read's own
+context), and again each time a read was asked again: the audit's twenty reads and forty
+heartbeats. And the owners drained after every request (`Work::Request` then `drain`, in
+`fleet.rs` and `control_host.rs`), so a core that shared rounds would still have been
+asked for a round each: a read was never in the core with another that had not been sent
+for.
+
+**Fix.** 27 §10 has the rules and why each is safe. The core queues a read and sends
+nothing; one round leaves when the member is next asked what there is to do
+(`RawNode::ready` calls `Raft::ask_reads`), carrying the last read asked, for every read
+asked since the round before (`ReadOnly::asked` counts how many of those that wait a
+round sent asks for). A read asked after a round left is asked for by the next and never
+confirmed by the one before; a round that was lost is asked again by the leader's own
+beat, whose heartbeat carries the last read. The owners take what is queued behind a read
+before the drain that sends its round (`Owner::take`; the control owner's loop), counted
+by what the owner admits at once; a request that is no read is drained for as it was. The
+rule of raft-rs is kept in the core (`ReadRounds::Each`) for the comparison alone.
+
+A round for each drain was chosen over one round out at a time, which mantle's replica
+does: there a read asked while a round is out waits for that round's answers before its
+own leaves, up to a round trip more for every read that overlaps another, and on a quorum
+a long path away that is half again of a read's latency. Here nothing waits: a read asked
+alone leaves with the drain that follows it, and the rounds are bounded by the owner's
+drains, which under load carry what queued meanwhile.
+
+**Tests.** `focal-raft`: `reads_asked_together_leave_in_one_round_and_one_answer_confirms_them`
+(twenty reads, two heartbeats, one answer); `a_read_asked_after_a_round_left_is_asked_for_by_the_next`;
+`a_round_that_was_lost_is_asked_again_by_the_leaders_clock` (and a deposed leader has no
+round left to send); `tests/group.rs` `a_round_confirms_no_read_asked_after_it_left` (a
+round's answers held while another leader is elected and commits; the old leader asked a
+second read; with `ReadOnly::advance` confirming past the round, the read is answered at
+2 when 4 was committed, and the test fails). Every answered read in every schedule is
+now checked against the highest index any member had committed when it was asked
+(`Cluster::report`), and the schedules of this core and of both cores ask reads several
+at a time (`Op::Reads`); the comparison with raft-rs runs under `ReadRounds::Each` and is
+unchanged. `focal-consensus`: `reads_asked_together_are_confirmed_by_one_round_of_heartbeats`
+(1, 32 and 128 reads: two heartbeats each time, every barrier from one follower's answer;
+a write that commits while a round is out is seen by the read asked after it and not
+required of the one asked before). `focal-node`:
+`reads_queued_together_leave_in_one_round_and_all_are_answered` (a hundred requests queued
+for a session's owner leave in two heartbeats and all are answered; a write queued behind
+a read ends the taking and the read behind it stays queued; with the drain after every
+request restored it fails).
+
+**Measured.** By count: 128 reads asked together were 256 heartbeats and are 2. No
+latency or throughput is claimed: the audit measured none, and a read asked alone costs
+what it did.
+
+**Residual.** The reads a leader may hold are bounded by the window it lets a peer have
+in flight (`DurableNode::pending_reads`), sized for a round in flight for each read. A
+read a follower forwards to a leader at that bound is refused there and found by its
+asker's deadline. The directory's own barriers (`directory_bootstrap`,
+`directory_authority_host`) drain as they did: each is one read by one operation.

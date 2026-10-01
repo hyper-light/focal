@@ -268,5 +268,8 @@ mod traversal_tests;
 #[path = "fleet_monitor_owner_tests.rs"]
 mod monitor_owner_tests;
 
+#[path = "fleet_read_round_tests.rs"]
+mod read_round_tests;
+
 #[path = "fleet_selection_tests.rs"]
 mod selection_tests;

@@ -601,6 +601,16 @@ impl ControlReplica {
         self.node.step_authenticated(peer_node, encoded)?;
         Ok(())
     }
+    /// A read asked here waits for a round that leaves with the next drain
+    /// (`DurableNode::reads_unasked`): an owner takes what else is queued
+    /// for it first.
+    pub fn reads_unasked(&self) -> bool {
+        self.node.reads_unasked()
+    }
+    /// The reads asked here that wait for a quorum to confirm them.
+    pub fn reads_waiting(&self) -> usize {
+        self.node.reads_waiting()
+    }
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ControlError> {
         self.check_ready()?;
         self.node.read_index(context)?;

@@ -399,6 +399,7 @@ impl<S: Storage> RawNode<S> {
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         !raft.msgs.is_empty()
+            || raft.reads_unasked()
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
             || !raft.read_states.is_empty()
@@ -423,6 +424,10 @@ impl<S: Storage> RawNode<S> {
             .number
             .checked_add(1)
             .ok_or(Error::Capacity("readies"))?;
+        // One round for the reads asked since the last (`Raft::ask_reads`): it
+        // leaves with this `Ready`. A round refused is asked for again by
+        // the next `Ready`, and by the heartbeat the leader's clock sends.
+        self.raft.ask_reads()?;
         let mut ready = Ready {
             number,
             ..Ready::default()

@@ -324,6 +324,148 @@ fn reads_that_wait_have_a_bound() {
     node.read_index(vec![7]).unwrap();
 }
 
+/// A leader of three that committed in its term: it answers reads.
+fn reading_leader() -> RawNode<Memory> {
+    let mut node = leader();
+    let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    append.index = 1;
+    node.step(append).unwrap();
+    drain(&mut node);
+    node
+}
+fn rounds(messages: &[Message]) -> Vec<(u64, Vec<u8>)> {
+    messages
+        .iter()
+        .filter(|message| proto::message_type(message) == Some(MessageType::MsgHeartbeat))
+        .map(|message| (message.to, message.context.clone()))
+        .collect()
+}
+fn confirmed(node: &mut RawNode<Memory>) -> Vec<Vec<u8>> {
+    let mut ready = node.ready().unwrap();
+    let reads = ready
+        .take_read_states()
+        .into_iter()
+        .map(|read| read.request_ctx)
+        .collect();
+    node.advance(ready).unwrap();
+    reads
+}
+
+/// Twenty reads asked before the member is next asked what there is to do
+/// leave in one round — a heartbeat to each of the two other members, with
+/// the context of the last — and one member's answer to it confirms all
+/// twenty. A round for each was forty heartbeats, of which the answers to
+/// the last two did the same.
+#[test]
+fn reads_asked_together_leave_in_one_round_and_one_answer_confirms_them() {
+    let mut node = reading_leader();
+    for read in 0..20u8 {
+        node.read_index(vec![read]).unwrap();
+        // Nothing is sent as a read is asked.
+        assert!(node.raft.messages().is_empty());
+    }
+    assert!(node.has_ready());
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, vec![19]), (3, vec![19])]
+    );
+    // The round is out: there is nothing more to do for the reads.
+    assert!(!node.has_ready());
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = vec![19];
+    node.step(heartbeat).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 0);
+    assert_eq!(
+        confirmed(&mut node),
+        (0..20u8).map(|read| vec![read]).collect::<Vec<_>>()
+    );
+    // A read asked alone leaves with the next `Ready`, and no later.
+    node.read_index(b"alone".to_vec()).unwrap();
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, b"alone".to_vec()), (3, b"alone".to_vec())]
+    );
+}
+
+/// A read asked after a round was sent is not confirmed by that round: the
+/// heartbeats left before the read was asked, and say nothing of who led
+/// when it was. It is asked for by the next round, which leaves with the
+/// `Ready` that follows.
+#[test]
+fn a_read_asked_after_a_round_left_is_asked_for_by_the_next() {
+    let mut node = reading_leader();
+    node.read_index(b"first".to_vec()).unwrap();
+    assert_eq!(rounds(&drain(&mut node)).len(), 2);
+    node.read_index(b"second".to_vec()).unwrap();
+    node.read_index(b"third".to_vec()).unwrap();
+    // The answer to the first round arrives before the next round left.
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = b"first".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 2);
+    let mut ready = node.ready().unwrap();
+    assert_eq!(
+        ready
+            .take_read_states()
+            .into_iter()
+            .map(|read| read.request_ctx)
+            .collect::<Vec<_>>(),
+        vec![b"first".to_vec()]
+    );
+    // The same `Ready` carries one round for the two asked since.
+    assert_eq!(
+        rounds(&ready.take_messages()),
+        vec![(2, b"third".to_vec()), (3, b"third".to_vec())]
+    );
+    node.advance(ready).unwrap();
+    assert!(!node.has_ready());
+    // A late answer to the first round confirms nothing more.
+    let mut late = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    late.context = b"first".to_vec();
+    node.step(late).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 2);
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    heartbeat.context = b"third".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(
+        confirmed(&mut node),
+        vec![b"second".to_vec(), b"third".to_vec()]
+    );
+}
+
+/// A round that was lost is asked again by the leader's own clock: its
+/// heartbeat carries the last read asked, and is a round for every read
+/// that waits. A leader that is deposed lets its reads go, and has no
+/// round left to send.
+#[test]
+fn a_round_that_was_lost_is_asked_again_by_the_leaders_clock() {
+    let mut node = reading_leader();
+    node.read_index(b"lost".to_vec()).unwrap();
+    assert_eq!(rounds(&drain(&mut node)).len(), 2);
+    assert!(!node.has_ready());
+    let mut asked_again = Vec::new();
+    for _ in 0..2 {
+        node.tick().unwrap();
+        asked_again.extend(rounds(&drain(&mut node)));
+    }
+    assert_eq!(
+        asked_again,
+        vec![(2, b"lost".to_vec()), (3, b"lost".to_vec())]
+    );
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    heartbeat.context = b"lost".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(confirmed(&mut node), vec![b"lost".to_vec()]);
+    // Deposed with a read asked and its round unsent.
+    node.read_index(b"unsent".to_vec()).unwrap();
+    assert!(node.has_ready());
+    node.step(answer(MessageType::MsgHeartbeat, 2, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.pending_read_count(), 0);
+    assert!(rounds(&drain(&mut node)).is_empty());
+}
+
 #[test]
 fn what_is_not_durable_has_a_bound() {
     let mut store = Memory::with_voters(&[1, 2, 3]);

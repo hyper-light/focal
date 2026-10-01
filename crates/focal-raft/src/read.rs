@@ -47,13 +47,28 @@ impl PendingRead {
 pub struct ReadOnly {
     queue: VecDeque<PendingRead>,
     limit: usize,
+    /// How many of them, from the first, a round that was sent asks for:
+    /// its heartbeat carried the context of the last of them, and a quorum
+    /// that answers it confirms them all. Those behind were asked after it
+    /// was sent, and it proves nothing for them.
+    asked: usize,
 }
 impl ReadOnly {
     pub fn new(limit: usize) -> Self {
         Self {
             queue: VecDeque::new(),
             limit,
+            asked: 0,
         }
+    }
+    /// Whether a read waits that no round sent asks for.
+    pub fn unasked(&self) -> bool {
+        self.asked < self.queue.len()
+    }
+    /// A round was sent with the context of the last read: it asks for
+    /// every read that waits.
+    pub fn asked(&mut self) {
+        self.asked = self.queue.len();
     }
     pub fn len(&self) -> usize {
         self.queue.len()
@@ -63,6 +78,7 @@ impl ReadOnly {
     }
     pub fn clear(&mut self) {
         self.queue = VecDeque::new();
+        self.asked = 0;
     }
     fn position(&self, context: &[u8]) -> Option<usize> {
         self.queue
@@ -138,6 +154,7 @@ impl ReadOnly {
         let count = self
             .position(context)
             .map_or(0, |position| position.saturating_add(1));
+        self.asked = self.asked.saturating_sub(count);
         if count == self.queue.len() {
             // All of them: the queue is given up with them, so that a
             // member that rests holds what it held before it was asked.
@@ -191,6 +208,12 @@ mod tests {
             Err(Error::Capacity("reads that wait for their quorum"))
         );
         assert_eq!(reads.last_context(), Some(b"c".as_slice()));
+        // A round sent now asks for the three; what is asked after it is
+        // asked for by none, and a confirmation takes what it confirms
+        // from those asked for.
+        assert!(reads.unasked());
+        reads.asked();
+        assert!(!reads.unasked());
         assert_eq!(reads.ack(3, b"b").unwrap(), Some([1, 3].as_slice()));
         assert_eq!(reads.ack(2, b"b").unwrap(), Some([1, 2, 3].as_slice()));
         assert_eq!(reads.ack(2, b"b").unwrap(), Some([1, 2, 3].as_slice()));
@@ -208,6 +231,9 @@ mod tests {
         assert_eq!(confirmed[1].acks(), [1, 2, 3]);
         assert_eq!(reads.advance(b"b").count(), 0);
         assert_eq!(reads.len(), 1);
+        assert!(!reads.unasked());
+        reads.add(8, b"d".to_vec(), 0, 1).unwrap();
+        assert!(reads.unasked());
         reads.clear();
         assert!(reads.is_empty() && reads.last_context().is_none());
     }
