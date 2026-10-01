@@ -737,6 +737,20 @@ impl Session {
     pub fn has_ready(&self) -> bool {
         self.consensus.has_ready() || self.retained.is_some()
     }
+    /// The bytes of entries `peer` is sent ahead of its answers while this
+    /// replica leads (`DurableNode::set_inflight_bytes`).
+    pub fn set_inflight_bytes(&mut self, peer: u64, bytes: u64) -> Result<bool, LedgerError> {
+        Ok(self.consensus.set_inflight_bytes(peer, bytes)?)
+    }
+    /// The bytes of entries in flight to `peer` and the bound on them
+    /// (`DurableNode::inflight_bytes`).
+    pub fn inflight_bytes(&self, peer: u64) -> Option<(u64, u64)> {
+        self.consensus.inflight_bytes(peer)
+    }
+    /// The bytes of entries one message carries (`DurableNode::page_bytes`).
+    pub fn page_bytes(&self) -> u64 {
+        self.consensus.page_bytes()
+    }
     /// A read asked here waits for a round that leaves with the next poll
     /// (`DurableNode::reads_unasked`): an owner takes what else is queued
     /// for it first.

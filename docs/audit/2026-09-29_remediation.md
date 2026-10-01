@@ -53,11 +53,11 @@ ruling before work starts).
 | F38 | P2 | open | 8 | — |
 | F39 | P2 | open | 12 | — |
 | F40 | P2 | open | 10 | — |
-| F41 | P2 | open | 10 | — |
+| F41 | P2 | in tree (the heartbeat rule open, with F42) | 10 | [F41](#f41) |
 | F42 | P1 | open | 9 | — |
 | F43 | P2 | in tree (the leader's read bound open) | 10 | [F43](#f43) |
 | F44 | P2 | open | 10 | — |
-| F45 | P2 | open | 10 | — |
+| F45 | P2 | partly, with F17 (the owner is woken by the log; it still asks every millisecond besides) | 10 | [F17](#f17) |
 | F46 | P1 | in tree | 8 | [F46](#f46) |
 | F47 | P2 | open | 11 | — |
 | F48 | P1 | open | 9 | — |
@@ -1808,3 +1808,64 @@ in flight (`DurableNode::pending_reads`), sized for a round in flight for each r
 read a follower forwards to a leader at that bound is refused there and found by its
 asker's deadline. The directory's own barriers (`directory_bootstrap`,
 `directory_authority_host`) drain as they did: each is one read by one operation.
+
+## F41
+
+**Cause.** A leader's window on what it sends a member ahead of its answers counted
+messages and nothing else (`focal-raft` `Inflights`: a ring of last indexes, 128 places by
+the shell's default). A message is a page of up to an entry's bound and a kilobyte, so the
+same window stood for a few kilobytes or for half a gigabyte, on a loopback, on a
+64 kbit/s path and on a long fat one alike; and the shell priced every transition's sends
+at 128 pages for the member whose answer it might be (`memory::sends_bytes`), so what
+bounded the bytes queued for a slow member was the memory that refused them.
+
+**Fix.** 27 §11 has the rules. The window holds bytes with its messages and is full by
+either (`Inflights::{full, room, add, free_to, check}`); a page is cut to the window's
+room before any of it is copied (`Progress::page_bytes`), and holds one entry at least,
+so an entry larger than the bound is sent alone and nothing waits for good. An answer
+gives back exactly what the messages it answers took. The bound is each member's
+(`RawNode::set_inflight_bytes`), a page until its owner says what the path carries. The
+session owner says it from what the transport already measures: twice the congestion
+window of the connection to the peer (the rule a sender's buffer is sized by, Linux
+`tcp_sndbuf_expand`), and a page at least where the path carries a page within one beat
+of the leader (`fleet::inflight_bytes`, fed by the node's pacer from
+`PeerConnectionPool::window` and the path's round trip). The shell cuts it to what the
+group's budget, and every budget above it, can stage for one transition
+(`DurableNode::set_inflight_bytes`), and prices a transition's sends by each member's
+bound.
+
+**Tests.** `focal-raft`: `a_window_is_bounded_by_the_bytes_in_flight_and_gives_back_what_it_took`
+(mixed sizes, stale, repeated and skipping answers, a bound that falls and rises while
+messages are out, an entry larger than the bound, a change of state);
+`a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries` (a leader of
+three with a bound of a thousand bytes: what is out to the member that answers never
+passes the bound by more than an entry, the member that answers nothing is sent one
+message, the two that answer commit everything, an oversized entry goes alone and the
+next waits, the bound changes mid-flight); every schedule of this core and of both cores
+now runs with a bound of 256 bytes and changes members' bounds as it goes (`Op::Window`),
+with the bytes counted checked against the messages held after every step
+(`Raft::check_accounting`); with an answer made to give back half of what it took, three
+tests fail. The comparison with raft-rs runs with no byte bound, as raft-rs has none, and
+is unchanged. `focal-consensus`:
+`the_bytes_sent_ahead_of_a_members_answers_are_what_its_path_carries_and_the_budget_stages`
+(the page until it is said; never nothing; cut to what the strictest budget above the
+group stages — the test found the first version cutting by the group's own limit, which a
+parent's is below). `focal-node`: `the_bytes_sent_ahead_follow_what_the_path_carries` (a
+new path in one room, a grown one, a thin one, a long fat one, nothing measured, the
+largest of each) and `an_owner_told_of_a_thin_path_sends_its_peer_by_it`.
+
+**Measured.** By what is bounded: a member's window stood for up to 128 pages, half a
+gigabyte at the default entry bound, and stands for a page until its path is known and for
+twice the path's window after. No throughput is claimed; none was measured over a real
+path in this batch.
+
+**Residual.** An answer to a heartbeat from a member whose window is full still frees the
+window's first message and sends the next (raft-rs's rule, for messages that were lost),
+so the bytes out pass the bound by a message for every beat a member answers heartbeats
+and no append. etcd's core sends an empty append there and adds nothing; here a peer's
+frames go each on its own stream in no order (`replication::drive`), so that append would
+overtake what is still on a far path, be refused for the entry before it, and drop the
+member to probing every beat. It goes with the audit's F42: every frame's end told to its
+owner, and a peer's frames kept in order. A member that is probed is still sent its page
+again at every heartbeat it answers. Control groups keep the page.
+

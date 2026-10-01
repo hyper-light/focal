@@ -810,3 +810,34 @@ Open: the reads a leader may hold are bounded by the window it lets a peer have 
 (`DurableNode::pending_reads`), a size that was right when each read was a round in
 flight. A read a follower forwards to a leader at that bound is refused there and found
 by its asker's deadline, not told to its asker at once.
+
+## 11. What a member is sent ahead of its answers (2026-10-01)
+
+The audit's F41. A leader sends a member entries ahead of its answers, and a window
+bounds how far (Ongaro's thesis §10.2.1). The window counted messages: 128 of them,
+each a page of up to an entry's bound and a kilobyte, so a member's window stood for
+forty bytes or for half a gigabyte, and the same number served a loopback, a 64 kbit/s
+path and a long fat one. Nothing bounded the bytes queued for a slow member but the
+memory that refused them.
+
+| Rule | Why, and what it costs | Where |
+|---|---|---|
+| A window holds messages and bytes, and is full by either. A message takes one place and what its entries encode to, by the measure a page is cut by | A page is cut to what the window has room for before any of it is copied, and holds one entry at least: what is out passes the bound by one entry at most. A window that holds nothing is never full for its bytes, so an entry larger than the bound is sent, alone, and the member is not left waiting for good | `Inflights::{full, room, add}`, `Progress::page_bytes`, `Outbox::append` |
+| An answer gives back what the messages it answers took | The bytes are kept with each message's last index; an answer out of date gives back nothing, one that repeats gives back once, one that skips ahead gives back all it covers. A change of the member's state empties the window and keeps its bound. The bytes counted are checked against the messages held wherever the core's accounting is (`check_accounting`, after every step of every schedule) | `Inflights::{free_to, reset, check}` |
+| The bound is the member's, and its owner says it | It is what the path to that member carries, which the core cannot know. Until it is said a member is sent one page: the least that always makes progress. A member the configuration makes anew begins there again | `Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`, `DurableNode::set_inflight_bytes` |
+| The owner says: twice what the transport to the member holds in flight; and a page at least where the path carries a page within one beat of the leader | The transport's congestion window is the measure of what a path holds before it answers, and it is already kept for every peer (`focal_wire::congestion`). Twice it, as a sender's buffer is sized against its window (Linux `tcp_sndbuf_expand`: "Cubic needs 1.7 factor, rounded to 2 to include extra cushion (application might react slowly"): a sender held to the window itself never fills it, and a window never filled is never found too small. The page: a new connection's window says only that nothing was sent on it yet, and a path that carries a page in a beat is not kept to that; a thin path is never given a page it would take many beats to carry. A path with no round trip measured says nothing and the member keeps what it has | `fleet::inflight_bytes`, `Work::Windows`, `ReplicaHost::inflight_windows`, `PeerConnectionPool::window`; the node's pacer says it once a round |
+| Never more than the group's budget can stage | One transition stages a page for every member and the window of the one whose answer it may be. A window the budget's limit cannot hold beside those pages and what the group holds at rest would refuse every answer of the member it was made for; the bound is cut to what can be staged. The staging a transition reserves is priced by each member's bound, where it was priced by 128 pages | `DurableNode::set_inflight_bytes`, `memory::sends_bytes` |
+
+What is not changed: an answer to a heartbeat from a member whose window is full still
+frees the window's first message and sends the next (raft-rs's rule; the messages that
+filled the window may have been lost). So the bytes out to a member pass its bound by a
+message for every beat it answers heartbeats and no append. etcd's core sends an empty
+append there instead, which adds nothing. It was not taken: this node sends a peer's
+frames each on its own stream, in no order, so an empty append overtakes the appends
+still on a far path, is refused for the entry before it, and the member is dropped to
+probing every beat. The rule goes when every frame's end is told to its owner and a
+peer's frames keep their order (the audit's F42).
+
+Control groups keep the page: their entries are small and their pacer says nothing of
+windows.
+

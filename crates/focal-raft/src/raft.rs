@@ -122,6 +122,11 @@ pub struct Config {
     pub max_size_per_msg: u64,
     /// Messages sent to a member ahead of its answers.
     pub max_inflight_msgs: usize,
+    /// The bytes of entries sent to a member ahead of its answers, until
+    /// its owner says what the path to it carries
+    /// ([`crate::RawNode::set_inflight_bytes`]); `u64::MAX` for no bound of
+    /// its own. One entry larger than the bound is still sent, alone.
+    pub max_inflight_bytes: u64,
     /// The bytes of proposals a leader holds uncommitted; `u64::MAX` for no
     /// bound of its own.
     pub max_uncommitted_size: u64,
@@ -153,6 +158,7 @@ impl Config {
             applied: 0,
             max_size_per_msg: 0,
             max_inflight_msgs: 256,
+            max_inflight_bytes: u64::MAX,
             max_uncommitted_size: u64::MAX,
             max_committed_size_per_ready: u64::MAX,
             check_quorum: false,
@@ -183,7 +189,7 @@ impl Config {
                 "an election timeout beyond what is counted",
             ));
         }
-        if self.max_inflight_msgs == 0 {
+        if self.max_inflight_msgs == 0 || self.max_inflight_bytes == 0 {
             return Err(Error::Settings("a window that admits nothing"));
         }
         if self.max_uncommitted_size < self.max_size_per_msg {
@@ -519,11 +525,14 @@ impl<S: Storage> Outbox<'_, S> {
                 return Ok(false);
             }
         } else {
-            // The page is bounded by its bytes and by its entries before
-            // any of it is copied.
-            let entries = self
-                .log
-                .entries(progress.next_index, self.max_bytes, self.max_entries);
+            // The page is bounded by its bytes, by what the member's
+            // window has room for and by its entries, before any of it is
+            // copied.
+            let entries = self.log.entries(
+                progress.next_index,
+                progress.page_bytes(self.max_bytes),
+                self.max_entries,
+            );
             if !allow_empty && entries.as_ref().map_or(true, Vec::is_empty) {
                 return Ok(false);
             }
@@ -544,7 +553,11 @@ impl<S: Storage> Outbox<'_, S> {
                     message.log_term = term;
                     message.commit = self.log.committed();
                     if let Some(last) = entries.last() {
-                        progress.sent(last.index)?;
+                        // By the rule the page was cut by.
+                        let bytes = entries.iter().fold(0u64, |bytes, entry| {
+                            bytes.saturating_add(proto::encoded_bytes(entry))
+                        });
+                        progress.sent(last.index, bytes)?;
                     }
                     message.entries = entries;
                 }
@@ -594,7 +607,12 @@ impl<S: Storage> Raft<S> {
         let initial = store.initial_state()?;
         let configuration = Configuration::from_conf_state(&initial.configuration)?;
         let log = Log::new(store, config.limits.unstable_entries)?;
-        let tracker = Tracker::new(configuration, log.last_index()?, config.max_inflight_msgs)?;
+        let tracker = Tracker::new(
+            configuration,
+            log.last_index()?,
+            config.max_inflight_msgs,
+            config.max_inflight_bytes,
+        )?;
         let mut raft = Self {
             id: config.id,
             term: 0,
@@ -767,6 +785,20 @@ impl<S: Storage> Raft<S> {
         self.priority = priority;
         self.settle_priority();
     }
+    /// The path to `member` carries `bytes` before it answers: no more of
+    /// entries is sent to it ahead of its answers, but for one entry that
+    /// is larger. False for a member the configuration does not name. What
+    /// is out stays counted; a bound that rose admits more with the
+    /// member's next answer, or the leader's next append.
+    pub fn set_inflight_bytes(&mut self, member: NodeId, bytes: u64) -> bool {
+        match self.tracker.get_mut(member) {
+            Some(progress) => {
+                progress.inflights.set_byte_cap(bytes);
+                true
+            }
+            None => false,
+        }
+    }
     /// A member that has no term has no log to defend, and every candidate
     /// is current against it: its priority judges nothing. What is in
     /// force changes between operations and never within one.
@@ -835,6 +867,9 @@ impl<S: Storage> Raft<S> {
     /// and what the fast track holds. An invariant error names the first
     /// that does not.
     pub fn check_accounting(&self) -> Result<()> {
+        for (_, progress) in self.tracker.iter() {
+            progress.inflights.check()?;
+        }
         self.msgs.check()?;
         self.log.unstable().check()?;
         self.held.check()?;
@@ -2076,7 +2111,12 @@ impl<S: Storage> Raft<S> {
         self.log.restore(snapshot)?;
         let last = self.log.last_index()?;
         self.release_proposals(last)?;
-        self.tracker = Tracker::new(configuration, last, self.config.max_inflight_msgs)?;
+        self.tracker = Tracker::new(
+            configuration,
+            last,
+            self.config.max_inflight_msgs,
+            self.config.max_inflight_bytes,
+        )?;
         self.post_conf_change()?;
         if let Some(progress) = self.tracker.get_mut(self.id) {
             let held = progress.next_index.saturating_sub(1);

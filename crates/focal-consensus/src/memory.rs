@@ -44,7 +44,7 @@ pub(super) fn member_bytes(window: usize) -> Result<usize, ConsensusError> {
     const ROW: usize =
         size_of::<(u64, Progress)>() + size_of::<(u64, bool)>() + 2 * size_of::<u64>();
     add(
-        add(ROW, mul(window, size_of::<u64>())?)?,
+        add(ROW, mul(window, size_of::<(u64, u64)>())?)?,
         MEMBER_BOOKKEEPING,
     )
 }
@@ -231,7 +231,9 @@ pub(super) fn initial_bytes(config: &NodeConfig) -> Result<usize, ConsensusError
 /// one — the core's bytes and entries a message at most, and the entries'
 /// own slots — from what the member is known to hold, or the snapshot to
 /// one behind the log; and to the one member whose answer the transition
-/// may be, as many pages as its window admits.
+/// may be, as many pages as its window admits: its places, and no more
+/// pages than hold the bytes it is bounded by and one page beyond them
+/// (`Inflights::full`: what is sent passes the bound by one entry at most).
 /// Pages are read from the running totals the storage keeps beside its
 /// entries; the entries not yet durable are counted whole when a page
 /// reaches them. Nothing is walked but the members.
@@ -287,8 +289,18 @@ fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
             pages = add(pages, snapshot)?;
             continue;
         }
+        // An answer may make the member one that is sent ahead of its
+        // answers, with an empty window: priced by the bound, not by what
+        // is left of it.
+        let bounded = progress
+            .inflights
+            .byte_cap()
+            .checked_div(core.max_size_per_msg.max(1))
+            .unwrap_or(u64::MAX)
+            .saturating_add(2);
+        let admitted = window.min(usize::try_from(bounded).unwrap_or(usize::MAX));
         let one = pages_from(from, 1)?;
-        let all = pages_from(from, window)?;
+        let all = pages_from(from, admitted)?;
         pages = add(pages, one)?;
         window_more = window_more.max(all.saturating_sub(one));
     }

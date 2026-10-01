@@ -434,6 +434,18 @@ impl PeerConnectionPool {
             .contains_key(&target)
             .then(|| state.paths.get(&target).copied().unwrap_or_default())
     }
+    /// What the open connection to `target` holds in flight, in bytes: its
+    /// congestion window, the law's estimate of what the path carries
+    /// before it answers. `None` for a peer with no connection open: there
+    /// is no estimate of a path nothing was sent on.
+    pub fn window(&self, target: u64) -> Option<u64> {
+        let slot = {
+            let state = self.state.lock().ok()?;
+            state.cached.get(&target)?.slot.clone()
+        };
+        let connection = slot.connection.lock().ok()?;
+        connection.as_ref().map(|open| open.remote.window())
+    }
     /// What an exchange with `target` is expected to take, its work
     /// included: the tail of the exchanges it answered, doubled for each
     /// one given up on since. `None` while it has answered none.

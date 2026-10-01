@@ -234,6 +234,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_priority(&mut self, priority: i64) {
         self.raft.set_priority(priority);
     }
+    /// What the path to `member` carries before it answers
+    /// ([`Raft::set_inflight_bytes`]).
+    pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
+        self.raft.set_inflight_bytes(member, bytes)
+    }
     pub fn tick(&mut self) -> Result<bool> {
         self.operate(Raft::tick)
     }

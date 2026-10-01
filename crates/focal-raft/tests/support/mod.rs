@@ -401,6 +401,9 @@ pub struct Settings {
     pub heartbeat_tick: usize,
     pub max_size_per_msg: u64,
     pub max_inflight_msgs: usize,
+    /// The bytes of entries a member is sent ahead of its answers;
+    /// `raft-rs` has no such bound.
+    pub max_inflight_bytes: u64,
     pub max_uncommitted_size: u64,
     pub max_committed_size_per_ready: u64,
     pub check_quorum: bool,
@@ -421,6 +424,7 @@ impl Settings {
             heartbeat_tick: 2,
             max_size_per_msg: 4 * 1024 * 1024 + 1024,
             max_inflight_msgs: 128,
+            max_inflight_bytes: u64::MAX,
             max_uncommitted_size: 32 * 1024 * 1024,
             max_committed_size_per_ready: 16 * 1024 * 1024,
             check_quorum: true,
@@ -435,6 +439,9 @@ impl Settings {
         Self {
             by_length: false,
             round_each: false,
+            // A few of a schedule's entries: the window fills by its
+            // bytes long before it fills by its places.
+            max_inflight_bytes: 256,
             ..Self::shell()
         }
     }
@@ -466,6 +473,9 @@ pub trait Replica: Sized {
     fn unreachable(&mut self, member: u64);
     fn snapshot_status(&mut self, member: u64, arrived: bool);
     fn set_priority(&mut self, priority: i64);
+    /// What the path to `member` carries before it answers. `raft-rs` has
+    /// no such bound and does nothing.
+    fn set_window(&mut self, _member: u64, _bytes: u64) {}
     fn set_timeout(&mut self, ticks: usize);
     fn drain(&mut self) -> Output;
     fn view(&self) -> View;
@@ -835,6 +845,7 @@ impl Replica for New {
             applied,
             max_size_per_msg: settings.max_size_per_msg,
             max_inflight_msgs: settings.max_inflight_msgs,
+            max_inflight_bytes: settings.max_inflight_bytes,
             max_uncommitted_size: settings.max_uncommitted_size,
             max_committed_size_per_ready: settings.max_committed_size_per_ready,
             check_quorum: settings.check_quorum,
@@ -902,6 +913,9 @@ impl Replica for New {
     }
     fn set_priority(&mut self, priority: i64) {
         self.raw.set_priority(priority);
+    }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        self.raw.set_inflight_bytes(member, bytes);
     }
     fn set_timeout(&mut self, ticks: usize) {
         self.raw
@@ -1093,6 +1107,9 @@ impl Replica for Either {
     }
     fn set_priority(&mut self, priority: i64) {
         either!(self, node => node.set_priority(priority))
+    }
+    fn set_window(&mut self, member: u64, bytes: u64) {
+        either!(self, node => node.set_window(member, bytes))
     }
     fn set_timeout(&mut self, ticks: usize) {
         either!(self, node => node.set_timeout(ticks))

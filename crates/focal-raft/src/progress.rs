@@ -17,29 +17,62 @@ pub enum ProgressState {
     Snapshot,
 }
 
-/// The last index of each message sent and not answered, in order: a
-/// window of at most `cap`.
+/// The messages sent and not answered, in order: the last index of each
+/// and the bytes of its entries. A window of at most `cap` messages and
+/// `byte_cap` bytes: a message of four megabytes and one of forty bytes
+/// each take one place of the first, and what they hold of the second. The
+/// bytes are what the path to the member carries before it answers, which
+/// its owner learns and says (`set_byte_cap`); the places bound the ring.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inflights {
     start: usize,
     count: usize,
-    buffer: Vec<u64>,
+    buffer: Vec<(u64, u64)>,
     cap: usize,
+    /// The bytes of the messages in the window.
+    bytes: u64,
+    byte_cap: u64,
 }
 impl Inflights {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize, byte_cap: u64) -> Self {
         Self {
             start: 0,
             count: 0,
             buffer: Vec::new(),
             cap,
+            bytes: 0,
+            byte_cap: byte_cap.max(1),
         }
     }
+    /// No message more is sent: every place is taken, or the bytes in
+    /// flight have reached their bound. A window that holds nothing is
+    /// never full for its bytes, so one entry larger than the bound is
+    /// sent, alone, and the member is not left waiting for good.
     pub fn full(&self) -> bool {
-        self.count >= self.cap
+        self.count >= self.cap || self.bytes >= self.byte_cap
     }
     pub fn count(&self) -> usize {
         self.count
+    }
+    /// The bytes of the messages in the window.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub fn byte_cap(&self) -> u64 {
+        self.byte_cap
+    }
+    /// The bytes the next message may carry: what is left of the bound. A
+    /// page is cut to it before it is copied, and holds one entry at
+    /// least.
+    pub fn room(&self) -> u64 {
+        self.byte_cap.saturating_sub(self.bytes)
+    }
+    /// The path to the member carries `bytes` before it answers. Never
+    /// nothing: a bound of none would send to the member no more. What is
+    /// in flight stays counted; a bound below it admits nothing until
+    /// enough is answered.
+    pub fn set_byte_cap(&mut self, bytes: u64) {
+        self.byte_cap = bytes.max(1);
     }
     fn wrap(&self, position: usize) -> usize {
         if position >= self.cap {
@@ -48,7 +81,7 @@ impl Inflights {
             position
         }
     }
-    pub fn add(&mut self, inflight: u64) -> Result<()> {
+    pub fn add(&mut self, inflight: u64, bytes: u64) -> Result<()> {
         if self.full() {
             return Err(Error::Invariant("a message sent into a full window"));
         }
@@ -60,43 +93,68 @@ impl Inflights {
         let next = self.wrap(self.start.saturating_add(self.count));
         let length = self.buffer.len();
         match self.buffer.get_mut(next) {
-            Some(slot) => *slot = inflight,
-            None if next == length => self.buffer.push(inflight),
+            Some(slot) => *slot = (inflight, bytes),
+            None if next == length => self.buffer.push((inflight, bytes)),
             None => return Err(Error::Invariant("the window lost its place")),
         }
         self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
         Ok(())
     }
-    /// Everything at or below `to` is answered.
+    /// Everything at or below `to` is answered, and its bytes are in
+    /// flight no more.
     pub fn free_to(&mut self, to: u64) {
         let mut freed = 0usize;
+        let mut bytes = 0u64;
         let mut position = self.start;
         while freed < self.count {
-            if self.buffer.get(position).is_none_or(|held| to < *held) {
+            let Some((_, held)) = self.buffer.get(position).filter(|(last, _)| *last <= to) else {
                 break;
-            }
+            };
+            bytes = bytes.saturating_add(*held);
             position = self.wrap(position.saturating_add(1));
             freed = freed.saturating_add(1);
         }
         self.count = self.count.saturating_sub(freed);
+        self.bytes = self.bytes.saturating_sub(bytes);
         self.start = position;
     }
     pub fn free_first_one(&mut self) {
         if self.count > 0
-            && let Some(first) = self.buffer.get(self.start).copied()
+            && let Some((first, _)) = self.buffer.get(self.start).copied()
         {
             self.free_to(first);
         }
     }
+    /// Nothing is in flight. The bound stays: it is the path's, not the
+    /// window's.
     pub fn reset(&mut self) {
         self.count = 0;
         self.start = 0;
+        self.bytes = 0;
         self.buffer = Vec::new();
+    }
+    /// Whether the bytes counted are those of the messages held: what is
+    /// credited on an answer is what was charged when it was sent.
+    pub fn check(&self) -> Result<()> {
+        let mut bytes = 0u64;
+        let mut position = self.start;
+        for _ in 0..self.count {
+            let Some((_, held)) = self.buffer.get(position) else {
+                return Err(Error::Invariant("the window lost its place"));
+            };
+            bytes = bytes.saturating_add(*held);
+            position = self.wrap(position.saturating_add(1));
+        }
+        if bytes != self.bytes {
+            return Err(Error::Invariant("the bytes in flight do not add up"));
+        }
+        Ok(())
     }
     pub fn resident_bytes(&self) -> usize {
         self.buffer
             .capacity()
-            .saturating_mul(std::mem::size_of::<u64>())
+            .saturating_mul(std::mem::size_of::<(u64, u64)>())
     }
 }
 
@@ -120,7 +178,7 @@ pub struct Progress {
     pub committed_index: u64,
 }
 impl Progress {
-    pub fn new(next_index: u64, window: usize) -> Self {
+    pub fn new(next_index: u64, window: usize, window_bytes: u64) -> Self {
         Self {
             matched: 0,
             next_index,
@@ -129,7 +187,7 @@ impl Progress {
             pending_snapshot: 0,
             pending_request_snapshot: 0,
             recent_active: false,
-            inflights: Inflights::new(window),
+            inflights: Inflights::new(window, window_bytes),
             committed_index: 0,
         }
     }
@@ -228,12 +286,21 @@ impl Progress {
             ProgressState::Snapshot => true,
         }
     }
-    /// Entries through `last` were sent.
-    pub fn sent(&mut self, last: u64) -> Result<()> {
+    /// The bytes a page for the member may hold: `page`, and while entries
+    /// are sent ahead of their answers, no more than the window has room
+    /// for.
+    pub fn page_bytes(&self, page: u64) -> u64 {
+        match self.state {
+            ProgressState::Replicate => page.min(self.inflights.room()),
+            ProgressState::Probe | ProgressState::Snapshot => page,
+        }
+    }
+    /// Entries through `last` were sent, `bytes` of them.
+    pub fn sent(&mut self, last: u64, bytes: u64) -> Result<()> {
         match self.state {
             ProgressState::Replicate => {
                 self.next_index = last.saturating_add(1);
-                self.inflights.add(last)
+                self.inflights.add(last, bytes)
             }
             ProgressState::Probe => {
                 self.paused = true;
@@ -256,15 +323,24 @@ pub struct Tracker {
     /// In order of member; the first answer of each counts.
     votes: Vec<(NodeId, bool)>,
     window: usize,
+    /// The bytes a member's window admits until its owner says what the
+    /// path to it carries.
+    window_bytes: u64,
     scratch: Vec<u64>,
 }
 impl Tracker {
-    pub fn new(configuration: Configuration, next_index: u64, window: usize) -> Result<Self> {
+    pub fn new(
+        configuration: Configuration,
+        next_index: u64,
+        window: usize,
+        window_bytes: u64,
+    ) -> Result<Self> {
         let mut tracker = Self {
             progress: Vec::new(),
             configuration: Configuration::default(),
             votes: Vec::new(),
             window,
+            window_bytes,
             scratch: Vec::new(),
         };
         tracker.apply(configuration, &[], next_index)?;
@@ -437,7 +513,7 @@ impl Tracker {
             {
                 Some(held) => progress.push(held),
                 None => {
-                    let mut new = Progress::new(next_index, self.window);
+                    let mut new = Progress::new(next_index, self.window, self.window_bytes);
                     // Heard from, so that a leader that looks for its
                     // quorum before the member could answer does not step
                     // down for it.
@@ -477,20 +553,20 @@ mod tests {
 
     #[test]
     fn a_window_admits_its_bound_and_frees_in_order() {
-        let mut window = Inflights::new(4);
+        let mut window = Inflights::new(4, u64::MAX);
         for index in [10, 20, 30, 40] {
             assert!(!window.full());
-            window.add(index).unwrap();
+            window.add(index, 1).unwrap();
         }
         assert!(window.full());
-        assert!(window.add(50).is_err());
+        assert!(window.add(50, 1).is_err());
         window.free_to(5);
         assert_eq!(window.count(), 4);
         window.free_to(20);
         assert_eq!(window.count(), 2);
         // It wraps.
-        window.add(50).unwrap();
-        window.add(60).unwrap();
+        window.add(50, 1).unwrap();
+        window.add(60, 1).unwrap();
         assert!(window.full());
         window.free_first_one();
         assert_eq!(window.count(), 3);
@@ -500,18 +576,85 @@ mod tests {
         assert_eq!(window.count(), 0);
         window.free_first_one();
         for round in 0..100u64 {
-            window.add(round).unwrap();
+            window.add(round, 1).unwrap();
             window.free_to(round);
+            window.check().unwrap();
         }
         assert_eq!(window.count(), 0);
-        assert_eq!(window.resident_bytes(), 32);
+        assert_eq!(window.bytes(), 0);
+        assert_eq!(window.resident_bytes(), 64);
         window.reset();
         assert_eq!(window.resident_bytes(), 0);
-        assert!(Inflights::new(0).full());
+        assert!(Inflights::new(0, u64::MAX).full());
+    }
+    /// The window is a bound on bytes as on messages. Messages of many
+    /// sizes fill it by what they hold; an answer gives back exactly what
+    /// the messages it answers took, in whatever order answers come, twice
+    /// or late; one entry larger than the bound is sent alone and never
+    /// waited for in vain; and a bound that changes while messages are out
+    /// keeps what is out counted.
+    #[test]
+    fn a_window_is_bounded_by_the_bytes_in_flight_and_gives_back_what_it_took() {
+        let mut window = Inflights::new(128, 1_000);
+        // Small and large together: full by bytes long before by places.
+        for (index, bytes) in [(1, 10), (2, 400), (3, 589)] {
+            assert!(!window.full());
+            window.add(index, bytes).unwrap();
+        }
+        assert_eq!((window.count(), window.bytes(), window.room()), (3, 999, 1));
+        assert!(!window.full());
+        // The page that follows is cut to the room, and holds one entry
+        // at least: it may pass the bound by that entry.
+        window.add(4, 64).unwrap();
+        assert!(window.full());
+        assert_eq!(window.room(), 0);
+        assert!(window.add(5, 1).is_err());
+        window.check().unwrap();
+        // An answer out of date gives nothing back; one that repeats gives
+        // back once; one that skips ahead gives back all it covers.
+        window.free_to(0);
+        assert_eq!(window.bytes(), 1_063);
+        window.free_to(1);
+        window.free_to(1);
+        assert_eq!((window.count(), window.bytes()), (3, 1_053));
+        window.free_to(3);
+        assert_eq!((window.count(), window.bytes()), (1, 64));
+        window.free_to(2);
+        assert_eq!((window.count(), window.bytes()), (1, 64));
+        window.check().unwrap();
+        // The bound falls below what is out: nothing more is admitted
+        // until enough is answered, and what is out stays counted.
+        window.set_byte_cap(32);
+        assert!(window.full());
+        window.free_to(4);
+        assert_eq!((window.count(), window.bytes()), (0, 0));
+        assert!(!window.full());
+        // One entry larger than the bound goes, alone.
+        window.add(5, 4_000_000).unwrap();
+        assert!(window.full());
+        window.free_first_one();
+        assert!(!window.full());
+        assert_eq!(window.bytes(), 0);
+        // The bound rises: more is admitted at once.
+        window.add(6, 30).unwrap();
+        window.add(7, 30).unwrap();
+        assert!(window.full());
+        window.set_byte_cap(1 << 20);
+        assert!(!window.full());
+        assert_eq!(window.room(), (1 << 20) - 60);
+        // A change of state empties the window and keeps the bound.
+        window.reset();
+        assert_eq!((window.count(), window.bytes()), (0, 0));
+        assert_eq!(window.byte_cap(), 1 << 20);
+        window.check().unwrap();
+        // A bound of nothing would send no more: it is one byte at least.
+        window.set_byte_cap(0);
+        assert!(!window.full());
+        assert_eq!(Inflights::new(4, 0).byte_cap(), 1);
     }
     #[test]
     fn an_answer_moves_a_member_forward_and_never_back() {
-        let mut progress = Progress::new(5, 8);
+        let mut progress = Progress::new(5, 8, u64::MAX);
         assert!(progress.maybe_update(7));
         assert_eq!((progress.matched, progress.next_index), (7, 8));
         assert!(!progress.maybe_update(6));
@@ -539,7 +682,7 @@ mod tests {
             (ProgressState::Probe, 0, 10, 9, 2, true, 3),
             (ProgressState::Probe, 0, 10, 9, 0, true, 1),
         ] {
-            let mut progress = Progress::new(next, 8);
+            let mut progress = Progress::new(next, 8, u64::MAX);
             progress.state = state;
             progress.matched = matched;
             assert_eq!(progress.maybe_decrease_to(rejected, hint, 0), moved);
@@ -547,7 +690,7 @@ mod tests {
             assert_eq!(progress.matched, matched);
         }
         // A request for a snapshot is never out of date.
-        let mut progress = Progress::new(10, 8);
+        let mut progress = Progress::new(10, 8, u64::MAX);
         progress.state = ProgressState::Replicate;
         progress.matched = 5;
         assert!(progress.maybe_decrease_to(5, 5, 7));
@@ -555,7 +698,7 @@ mod tests {
             (progress.pending_request_snapshot, progress.next_index),
             (7, 10)
         );
-        let mut progress = Progress::new(10, 8);
+        let mut progress = Progress::new(10, 8, u64::MAX);
         assert!(progress.maybe_decrease_to(3, 3, 7));
         assert_eq!(progress.pending_request_snapshot, 7);
         assert!(progress.maybe_decrease_to(3, 3, 9));
@@ -563,18 +706,23 @@ mod tests {
     }
     #[test]
     fn a_member_is_paused_by_its_state() {
-        let mut progress = Progress::new(1, 2);
+        let mut progress = Progress::new(1, 2, 100);
         assert!(!progress.is_paused());
-        progress.sent(1).unwrap();
+        // Probed, a member is sent a whole page.
+        assert_eq!(progress.page_bytes(4_096), 4_096);
+        progress.sent(1, 4_096).unwrap();
         assert!(progress.is_paused() && progress.next_index == 1);
         progress.become_replicate();
         assert!(!progress.is_paused());
-        progress.sent(3).unwrap();
-        progress.sent(5).unwrap();
+        // Sent ahead of its answers, a page is cut to the window's room.
+        assert_eq!(progress.page_bytes(4_096), 100);
+        progress.sent(3, 10).unwrap();
+        assert_eq!(progress.page_bytes(4_096), 90);
+        progress.sent(5, 10).unwrap();
         assert!(progress.is_paused() && progress.next_index == 6);
         progress.matched = 5;
         progress.become_snapshot(9);
-        assert!(progress.is_paused() && progress.sent(10).is_err());
+        assert!(progress.is_paused() && progress.sent(10, 1).is_err());
         assert!(!progress.is_snapshot_caught_up());
         progress.become_probe();
         assert_eq!((progress.next_index, progress.pending_snapshot), (10, 0));
@@ -587,6 +735,7 @@ mod tests {
             Configuration::new(voters.to_vec(), learners.to_vec()).unwrap(),
             1,
             8,
+            u64::MAX,
         )
         .unwrap()
     }

@@ -334,6 +334,10 @@ enum Work {
         oneshot::Sender<Result<(), LedgerError>>,
         Allocation,
     ),
+    /// What the paths to the replica's peers hold in flight and their
+    /// round trips, by peer: `(peer, window bytes, round trip ns)`. The
+    /// bytes a leader sends each ahead of its answers follow (27 §11).
+    Windows(Vec<(u64, u64, u64)>, Allocation),
     /// Serve clients at an activated route: `(route, policy revision)`.
     Refence(
         RouteEpoch,
@@ -472,6 +476,27 @@ impl HostSender {
 enum HostQueueError {
     Full,
     Disconnected,
+}
+/// The bytes of entries a leader sends a peer ahead of its answers, from
+/// what the path to it holds in flight (its transport's congestion window)
+/// and its round trip (27 §11).
+///
+/// Twice the window: a sender held to the window itself never fills it,
+/// and a window that is never filled is never found to be too small — the
+/// rule by which a sender's buffer is sized against its congestion window
+/// (Linux `tcp_sndbuf_expand`). And a page at least where the path carries
+/// a page within one beat of the leader: a path that fast is not kept to a
+/// window that only says nothing was sent on it yet, while a thin one is
+/// never given a page it would take many beats to carry.
+fn inflight_bytes(window: u64, round_trip_ns: u64, beat: Duration, page: u64) -> u64 {
+    let twice = window.saturating_mul(2);
+    let beat_ns = u64::try_from(beat.as_nanos()).unwrap_or(u64::MAX);
+    // What the path carries in one beat: its window, once a round trip.
+    let carried = u128::from(window)
+        .saturating_mul(u128::from(beat_ns))
+        .checked_div(u128::from(round_trip_ns))
+        .map_or(0, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
+    twice.max(page.min(carried))
 }
 fn host_queue_error<T>(error: mpsc::TrySendError<T>) -> HostQueueError {
     match error {
@@ -1032,6 +1057,32 @@ impl ReplicaHost {
                 HostQueueError::Disconnected => LedgerError::Failed,
             })?;
         receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// What the paths to this replica's peers hold in flight — each peer's
+    /// transport window, in bytes — and their round trips, as the node
+    /// measures them: `(peer, window bytes, round trip ns)` (27 §11). While
+    /// the replica leads, a peer is sent no more of entries ahead of its
+    /// answers than follows from them (`inflight_bytes`). A hint,
+    /// said again every round of the node's pacer: one the owner has no
+    /// room for is dropped, and a peer never said keeps one page.
+    pub fn inflight_windows(&self, mut windows: Vec<(u64, u64, u64)>) {
+        windows.sort_unstable();
+        windows.dedup_by_key(|(peer, _, _)| *peer);
+        if windows.is_empty()
+            || windows.len() > MAX_ADMITTED
+            || windows.first().is_some_and(|(peer, _, _)| *peer == 0)
+        {
+            return;
+        }
+        let Ok(charge) =
+            self.budget
+                .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)
+        else {
+            return;
+        };
+        let _ = self
+            .sender
+            .try_send(Work::Windows(windows, charge.commit()));
     }
     /// Serve clients at the route a committed activation moved the session
     /// to ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §17):
@@ -2030,6 +2081,19 @@ impl Owner {
                 self.publish_progress(false);
                 drop(charge);
                 let _ = response.send(Ok(()));
+            }
+            Work::Windows(windows, charge) => {
+                let beat = self.beat_interval();
+                let page = self.session.page_bytes();
+                for (peer, window, round_trip_ns) in windows {
+                    // A peer the configuration does not name is told of
+                    // nothing; a replica that failed refuses, and stops.
+                    self.session.set_inflight_bytes(
+                        peer,
+                        inflight_bytes(window, round_trip_ns, beat, page),
+                    )?;
+                }
+                drop(charge);
             }
             Work::Refence(route, revision, response, charge) => {
                 let result = if route < self.config.route_epoch {

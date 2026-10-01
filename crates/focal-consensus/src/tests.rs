@@ -803,6 +803,42 @@ fn reads_asked_together_are_confirmed_by_one_round_of_heartbeats() {
     drop(after_write);
 }
 
+/// A member is sent a page ahead of its answers until its owner says what
+/// the path to it carries; what the owner says is in force at once, is
+/// never nothing, and is never more than the group's budget can stage for
+/// one transition — a window the budget could not stage would refuse every
+/// answer of the member it was made for.
+#[test]
+fn the_bytes_sent_ahead_of_a_members_answers_are_what_its_path_carries_and_the_budget_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let limit = 96 * 1024 * 1024;
+    let budget = MemoryBudget::new(limit, 16 * 1024 * 1024).unwrap();
+    let mut cfg = config(1);
+    cfg.voters = vec![1, 2, 3];
+    let mut node = DurableNode::open_in(cfg, dir.path(), &budget).unwrap();
+    let page = node.page_bytes();
+    assert_eq!(node.inflight_bytes(2), Some((0, page)));
+    assert_eq!(node.inflight_bytes(9), None);
+    assert!(node.set_inflight_bytes(2, 6_000).unwrap());
+    assert_eq!(node.inflight_bytes(2), Some((0, 6_000)));
+    assert_eq!(node.inflight_bytes(3), Some((0, page)));
+    assert!(!node.set_inflight_bytes(9, 6_000).unwrap());
+    assert!(node.set_inflight_bytes(2, 0).unwrap());
+    assert_eq!(node.inflight_bytes(2), Some((0, 1)));
+    // More than the budget holds: what it can stage beside a page for each
+    // member, and no more.
+    assert!(node.set_inflight_bytes(3, u64::MAX).unwrap());
+    let (_, bound) = node.inflight_bytes(3).unwrap();
+    assert!(bound > page && bound < limit as u64 - 4 * page, "{bound}");
+    // The staging a transition reserves prices the window by its bound:
+    // with every member at a page it reserves far less than with one
+    // member at all the budget stages.
+    let wide = node.staging_estimate().unwrap();
+    assert!(node.set_inflight_bytes(3, page).unwrap());
+    let narrow = node.staging_estimate().unwrap();
+    assert!(narrow <= wide);
+}
+
 #[test]
 fn a_failure_of_the_core_stops_only_this_replica_until_disk_recovery() {
     for unwinds in [false, true] {

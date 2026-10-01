@@ -634,6 +634,10 @@ impl DurableNode {
             applied,
             max_size_per_msg: (config.max_entry_bytes as u64).saturating_add(1024),
             max_inflight_msgs: config.max_inflight_messages,
+            // Until its owner says what the path to a member carries
+            // (`set_inflight_bytes`), a member is sent one page ahead of its
+            // answers: the least that always makes progress.
+            max_inflight_bytes: (config.max_entry_bytes as u64).saturating_add(1024),
             max_uncommitted_size: config.max_uncommitted_bytes,
             max_committed_size_per_ready: COMMITTED_PAGE_BYTES,
             check_quorum: true,
@@ -872,6 +876,51 @@ impl DurableNode {
         self.priority = priority;
         self.raw.set_priority(priority);
         Ok(())
+    }
+    /// While this member leads, `peer` is sent no more than `bytes` of
+    /// entries ahead of its answers: what its owner learned the path to it
+    /// carries ([27 §11]). One entry that is larger is still sent, alone,
+    /// and a bound of nothing is one byte. Never more than this group's
+    /// budget can stage in one transition beside a page for every member:
+    /// a window the budget cannot stage would refuse every answer of the
+    /// member it was made for. False for a peer the configuration does not
+    /// name. The bound is kept until it is said again; a member the
+    /// configuration makes anew begins at one page (`page_bytes`).
+    ///
+    /// [27 §11]: ../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
+    pub fn set_inflight_bytes(&mut self, peer: u64, bytes: u64) -> Result<bool, ConsensusError> {
+        self.check()?;
+        let page = self.page_bytes();
+        // What one transition stages for its sends: a page for every
+        // member, and the window of the one whose answer it may be
+        // (`memory::staging_bytes`). The most one reservation may be under
+        // this budget and every budget above it, less what the group holds
+        // at rest and those pages, is the most a window can be and still
+        // be staged.
+        let members = u64::try_from(self.raw.raft.tracker().len()).unwrap_or(u64::MAX);
+        let held = u64::try_from(memory::raw_bytes(&self.raw)?).unwrap_or(u64::MAX);
+        let stageable = u64::try_from(self.budget.reservation_limit(BudgetLane::Completion))
+            .unwrap_or(u64::MAX)
+            .saturating_sub(held)
+            .saturating_sub(page.saturating_mul(members.saturating_add(1)));
+        Ok(self
+            .raw
+            .set_inflight_bytes(peer, bytes.min(stageable).max(1)))
+    }
+    /// The bytes of entries one message carries at most, and one entry at
+    /// least: what a member is sent ahead of its answers until its owner
+    /// says what the path to it carries.
+    pub fn page_bytes(&self) -> u64 {
+        self.raw.raft.config().max_size_per_msg
+    }
+    /// The bytes of entries in flight to `peer` and the bound on them, as
+    /// this member leads; `None` for a peer the configuration does not name.
+    pub fn inflight_bytes(&self, peer: u64) -> Option<(u64, u64)> {
+        self.raw
+            .raft
+            .tracker()
+            .get(peer)
+            .map(|progress| (progress.inflights.bytes(), progress.inflights.byte_cap()))
     }
     /// Ticks without leader contact before this node campaigns.
     /// Ticks between a leader's heartbeats.

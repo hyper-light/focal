@@ -107,6 +107,7 @@ fn settings_that_cannot_hold_are_refused() {
         (Box::new(|config| config.heartbeat_tick = 0), "heartbeat"),
         (Box::new(|config| config.election_tick = 2), "election"),
         (Box::new(|config| config.max_inflight_msgs = 0), "window"),
+        (Box::new(|config| config.max_inflight_bytes = 0), "bytes"),
         (
             Box::new(|config| config.max_uncommitted_size = 1),
             "uncommitted",
@@ -326,7 +327,10 @@ fn reads_that_wait_have_a_bound() {
 
 /// A leader of three that committed in its term: it answers reads.
 fn reading_leader() -> RawNode<Memory> {
-    let mut node = leader();
+    committed_leader(config(1))
+}
+fn committed_leader(config: Config) -> RawNode<Memory> {
+    let mut node = leader_with(config);
     let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
     append.index = 1;
     node.step(append).unwrap();
@@ -464,6 +468,131 @@ fn a_round_that_was_lost_is_asked_again_by_the_leaders_clock() {
     assert_eq!(node.raft.state(), StateRole::Follower);
     assert_eq!(node.raft.pending_read_count(), 0);
     assert!(rounds(&drain(&mut node)).is_empty());
+}
+
+fn appends(messages: &[Message], to: u64) -> Vec<(u64, u64)> {
+    messages
+        .iter()
+        .filter(|message| {
+            message.to == to
+                && proto::message_type(message) == Some(MessageType::MsgAppend)
+                && !message.entries.is_empty()
+        })
+        .map(|message| {
+            (
+                message.entries.last().unwrap().index,
+                message.entries.iter().map(proto::encoded_bytes).sum(),
+            )
+        })
+        .collect()
+}
+fn window(node: &RawNode<Memory>, member: u64) -> (usize, u64) {
+    let progress = node.raft.tracker().get(member).unwrap();
+    (progress.inflights.count(), progress.inflights.bytes())
+}
+
+/// A member is sent no more bytes of entries ahead of its answers than the
+/// path to it carries, whatever their sizes; a member that answers nothing
+/// holds none of them back from a majority that does; an entry larger than
+/// the bound is sent, alone, and waited for without another being sent; an
+/// answer gives back what the messages it answers took, once, in whatever
+/// order answers come; and a bound that changes while messages are out is
+/// in force for the next.
+#[test]
+fn a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries() {
+    let mut node = committed_leader(Config {
+        max_inflight_bytes: 1_000,
+        ..config(1)
+    });
+    // Member 2 answered and is sent ahead of its answers; member 3 has
+    // answered nothing and is probed: one message, and no more.
+    let sizes = [300usize, 20, 700, 40, 300, 300, 5, 300];
+    let mut sent = Vec::new();
+    for (round, size) in sizes.iter().enumerate() {
+        node.propose(vec![], vec![round as u8; *size]).unwrap();
+        let messages = drain(&mut node);
+        assert!(appends(&messages, 3).is_empty());
+        sent.extend(appends(&messages, 2));
+        node.check_accounting().unwrap();
+        let (_, bytes) = window(&node, 2);
+        // What is out passes the bound by one entry at most: the page that
+        // took the last of the room.
+        assert!(bytes < 1_000 + 710, "{bytes} bytes are out");
+    }
+    // The window filled by its bytes, with places to spare, and the
+    // entries behind it wait.
+    let (count, bytes) = window(&node, 2);
+    assert_eq!(bytes, sent.iter().map(|(_, bytes)| *bytes).sum::<u64>());
+    assert!(
+        bytes >= 1_000 && count < 8,
+        "{count} messages, {bytes} bytes"
+    );
+    let last = node.raft.log().last_index().unwrap();
+    assert!(sent.last().unwrap().0 < last);
+    // An answer out of date, and the same answer twice, give back nothing
+    // that was not taken.
+    let (first, first_bytes) = sent[0];
+    let answered = |index: u64| {
+        let mut answer = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+        answer.index = index;
+        answer
+    };
+    node.step(answered(1)).unwrap();
+    assert_eq!(window(&node, 2).1, bytes);
+    node.step(answered(first)).unwrap();
+    let more = drain(&mut node);
+    node.step(answered(first)).unwrap();
+    node.check_accounting().unwrap();
+    // What it gave back was sent again, as far as the bound allows.
+    let resent: u64 = appends(&more, 2).iter().map(|(_, bytes)| *bytes).sum();
+    assert_eq!(window(&node, 2).1, bytes - first_bytes + resent);
+    assert!(drain(&mut node).is_empty());
+    // The majority of members 1 and 2 commits everything, whatever member
+    // 3 does: answers skip ahead and come out of order.
+    let mut answers = vec![last];
+    for _ in 0..64 {
+        let Some(index) = answers.pop() else { break };
+        node.step(answered(index)).unwrap();
+        for (index, _) in appends(&drain(&mut node), 2) {
+            answers.insert(0, index);
+        }
+        node.check_accounting().unwrap();
+    }
+    for (index, _) in sent.iter().rev() {
+        node.step(answered(*index)).unwrap();
+    }
+    node.step(answered(last)).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.hard_state().commit, last);
+    assert_eq!(window(&node, 2), (0, 0));
+    assert_eq!(window(&node, 3), (0, 0));
+    // An entry larger than the bound goes alone, and the next waits for
+    // its answer: nothing spins, and nothing is sent in vain.
+    node.propose(vec![], vec![9; 5_000]).unwrap();
+    let large = appends(&drain(&mut node), 2);
+    assert_eq!(large.len(), 1);
+    assert!(large[0].1 > 5_000);
+    node.propose(vec![], b"behind".to_vec()).unwrap();
+    assert!(appends(&drain(&mut node), 2).is_empty());
+    assert!(!node.has_ready());
+    // The path is found to carry more: the bound rises, and the next
+    // answer or append sends what waited.
+    assert!(node.set_inflight_bytes(2, 1 << 20));
+    assert!(!node.set_inflight_bytes(9, 1 << 20));
+    node.propose(vec![], b"more".to_vec()).unwrap();
+    let after = appends(&drain(&mut node), 2);
+    assert_eq!(
+        after.last().unwrap().0,
+        node.raft.log().last_index().unwrap()
+    );
+    // And falls below what is out: nothing more until enough is answered.
+    assert!(node.set_inflight_bytes(2, 16));
+    node.propose(vec![], b"held".to_vec()).unwrap();
+    assert!(appends(&drain(&mut node), 2).is_empty());
+    node.step(answered(node.raft.log().last_index().unwrap() - 1))
+        .unwrap();
+    assert_eq!(appends(&drain(&mut node), 2).len(), 1);
+    node.check_accounting().unwrap();
 }
 
 #[test]

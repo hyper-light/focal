@@ -129,6 +129,7 @@ fn class(work: &Work) -> WorkClass {
         | Work::CustodyPulled(..)
         | Work::Refence(..)
         | Work::Admit(..)
+        | Work::Windows(..)
         | Work::Membership(..)
         | Work::Placement(..)
         | Work::Range(..)

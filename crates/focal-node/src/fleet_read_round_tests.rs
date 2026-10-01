@@ -166,3 +166,77 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
     ));
     assert!(late_answer.try_recv().is_err());
 }
+
+/// The bytes a leader sends a peer ahead of its answers follow what the
+/// path to it holds in flight and its round trip: twice the window; a page
+/// at least where the path carries a page within a beat; never a page on a
+/// path that would take many beats to carry it.
+#[test]
+fn the_bytes_sent_ahead_follow_what_the_path_carries() {
+    let beat = Duration::from_millis(200);
+    let page = 4 * 1024 * 1024 + 1024;
+    // A path in one room, new: twelve kilobytes in flight, a round trip of
+    // a fifth of a millisecond. It carries twelve megabytes a beat: a page.
+    assert_eq!(inflight_bytes(12_000, 200_000, beat, page), page);
+    // The same path once its window has grown past half a page.
+    assert_eq!(inflight_bytes(8 << 20, 200_000, beat, page), 16 << 20);
+    // A thin path: three kilobytes in flight, a round trip of six tenths
+    // of a second. A page would take it many beats; twice its window.
+    assert_eq!(inflight_bytes(3_000, 600_000_000, beat, page), 6_000);
+    // A long fat path: its window is what it carries in a round trip.
+    assert_eq!(inflight_bytes(12 << 20, 100_000_000, beat, page), 24 << 20);
+    // Nothing measured, nothing in flight, and the largest of each: no
+    // division by nothing and no overflow.
+    assert_eq!(inflight_bytes(5_000, 0, beat, page), 10_000);
+    assert_eq!(inflight_bytes(0, 1, beat, page), 0);
+    assert_eq!(
+        inflight_bytes(u64::MAX, 1, Duration::MAX, u64::MAX),
+        u64::MAX
+    );
+}
+
+/// The owner sets what it was told of its peers' paths, and a leader then
+/// sends by it: a hundred kilobytes proposed for a peer whose path holds a
+/// few kilobytes leave a few kilobytes at a time.
+#[test]
+fn an_owner_told_of_a_thin_path_sends_its_peer_by_it() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::open(root.path());
+    for _ in 0..10 {
+        fixture.pump();
+    }
+    let page = fixture.owners[0].session.page_bytes();
+    let charge = || {
+        MemoryBudget::new(1 << 20, 1 << 16)
+            .unwrap()
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 1)
+            .unwrap()
+            .commit()
+    };
+    // Until it is told, a peer is sent a page ahead of its answers.
+    assert_eq!(fixture.owners[0].session.inflight_bytes(2), Some((0, page)));
+    assert!(
+        !fixture.owners[0]
+            .accept(Work::Windows(
+                vec![(2, 3_000, 600_000_000), (9, 3_000, 600_000_000)],
+                charge()
+            ))
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.owners[0].session.inflight_bytes(2),
+        Some((0, 6_000))
+    );
+    assert_eq!(fixture.owners[0].session.inflight_bytes(3), Some((0, page)));
+    assert_eq!(fixture.owners[0].session.inflight_bytes(9), None);
+    // A fast path is given a page at least, and twice its window beyond.
+    assert!(
+        !fixture.owners[0]
+            .accept(Work::Windows(vec![(3, 16 << 20, 200_000)], charge()))
+            .unwrap()
+    );
+    assert_eq!(
+        fixture.owners[0].session.inflight_bytes(3),
+        Some((0, 32 << 20))
+    );
+}

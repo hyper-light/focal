@@ -36,6 +36,9 @@ pub enum Op {
     Block(u64, u64),
     Heal,
     Priority(u64, i64),
+    /// The member is told what the path to another carries before it
+    /// answers.
+    Window(u64, u64, u64),
     Campaign(u64),
     Unreachable(u64, u64),
     Ping(u64),
@@ -60,6 +63,10 @@ pub struct Mix {
     pub compaction: bool,
     pub partitions: bool,
     pub priorities: bool,
+    /// Whether the bytes a member is sent ahead of its answers change
+    /// while a schedule runs. Where the cores are compared they do not:
+    /// `raft-rs` has no such bound.
+    pub windows: bool,
     /// Whether reads are asked several at a time. Where the cores are
     /// compared they are not: `raft-rs` sends a round for each.
     pub bursts: bool,
@@ -77,6 +84,7 @@ impl Mix {
             compaction: true,
             partitions: true,
             priorities: true,
+            windows: false,
             bursts: false,
             fast: 0,
             lose: 8,
@@ -334,6 +342,12 @@ impl<R: Replica> Cluster<R> {
                 }
                 reports.push(self.report(*id, None));
             }
+            Op::Window(id, member, bytes) => {
+                if let Some(node) = self.node(*id) {
+                    node.set_window(*member, *bytes);
+                }
+                reports.push(self.report(*id, None));
+            }
             Op::Campaign(id) => {
                 let accepted = self.node(*id).map(|node| node.campaign());
                 reports.push(self.report(*id, accepted));
@@ -487,6 +501,12 @@ impl<R: Replica> Cluster<R> {
                     }
                 }
                 95 if mix.partitions => return Op::Heal,
+                96 if mix.windows && !up.is_empty() && rng.chance(50) => {
+                    // From less than one entry to more than a schedule
+                    // ever has in flight.
+                    let bytes = [1, 24, 96, 512, 1 << 20][rng.below(5) as usize];
+                    return Op::Window(leader(rng), rng.pick(&all).unwrap_or(1), bytes);
+                }
                 96 if mix.priorities && !up.is_empty() => {
                     return Op::Priority(any(rng), rng.below(4) as i64);
                 }

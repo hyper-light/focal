@@ -12568,3 +12568,20 @@ deposed leader answers no read asked after its round left. Open: the reads a lea
 hold are still bounded by its in-flight window, and a forwarded read refused at that bound
 is found by its asker's deadline. `focal-raft`: 56 unit tests, 8 group schedules, the
 comparison with raft-rs unchanged under `ReadRounds::Each`; `focal-consensus`: 81.
+
+### 2026-10-01 — F41: what a member is sent ahead of its answers
+
+A leader's window on a member counted messages, 128 of them, each a page of up to four
+megabytes: a few kilobytes or half a gigabyte, the same on every path. It holds bytes
+now, and is full by either; a page is cut to its room before it is copied and an entry
+larger than the bound is sent alone. The bound is each member's: a page until its owner
+says what the path to it carries, then twice the transport's congestion window for that
+peer, and a page at least where the path carries one within a beat
+([27](27-consensus-roadmap-and-slates-port.md) §11; the remediation record, F41), never
+more than the group's budgets can stage. Every schedule of the core runs with a byte
+bound that changes as it goes, the bytes counted checked against the messages held after
+every step. Open, with the audit's F42: a member that answers heartbeats and no append is
+still sent a message more each beat. Also recorded: the owner that shares a thread among
+sessions is woken by the log since F17, and still asks every millisecond besides (the
+audit's F45, its remainder).
+

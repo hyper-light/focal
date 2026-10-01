@@ -1672,14 +1672,35 @@ impl NetworkService {
                 // beside one whose voters are far.
                 let local = self.status.node;
                 let pace_session = |host: &ReplicaHost| {
-                    let paths: Vec<focal_timing::PathRtt> = host
-                        .progress()
+                    let progress = host.progress();
+                    let paths: Vec<focal_timing::PathRtt> = progress
                         .voters
                         .iter()
                         .filter(|voter| **voter != local)
                         .filter_map(|voter| self.pool.path(*voter))
                         .collect();
                     host.pace(paths.iter());
+                    // And what each path holds in flight bounds the bytes
+                    // a leader sends its peer ahead of its answers (27 §11):
+                    // the voters, and the members the directory admitted,
+                    // which a leader catches up before they vote.
+                    let windows: Vec<(u64, u64, u64)> = progress
+                        .voters
+                        .iter()
+                        .chain(progress.admitted.iter())
+                        .filter(|peer| **peer != local)
+                        .filter_map(|peer| {
+                            Some((
+                                *peer,
+                                self.pool.window(*peer)?,
+                                self.pool.path(*peer)?.smoothed_ns(),
+                            ))
+                        })
+                        // A path nothing was measured on says nothing: the
+                        // peer keeps what it has.
+                        .filter(|(_, _, round_trip_ns)| *round_trip_ns > 0)
+                        .collect();
+                    host.inflight_windows(windows);
                 };
                 if let Some(host) = &self.handles.ledger {
                     pace_session(host);
