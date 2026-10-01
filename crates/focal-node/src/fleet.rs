@@ -209,6 +209,10 @@ pub struct ReplicaProgress {
     /// peer, coalesced and never grown.
     pub peer_reports_coalesced: u64,
     pub peer_reports_dropped: u64,
+    /// The times this replica's owner asked what the log had answered and
+    /// found its write still out. An owner the log wakes asks once as it
+    /// queues a write, and again only at its tick (27 §9).
+    pub waits_asked: u64,
     pub stopped: bool,
     /// The group's voters as this replica's committed configuration names
     /// them; the paths a pace is derived from (27 §3.1 P2).
@@ -679,6 +683,8 @@ struct Owner {
     lost_peers: Vec<u64>,
     lost_coalesced: u64,
     lost_dropped: u64,
+    /// `ReplicaProgress::waits_asked`.
+    waits_asked: u64,
     progress: watch::Sender<ProgressState>,
     /// Drawn when this owner started: with the node id it scopes every read
     /// context the owner mints, so a nonce that restarts from zero, or one
@@ -809,6 +815,7 @@ impl ReplicaHost {
                 peers_unreachable: 0,
                 peer_reports_coalesced: 0,
                 peer_reports_dropped: 0,
+                waits_asked: 0,
                 stopped: false,
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
@@ -866,6 +873,7 @@ impl ReplicaHost {
             lost_peers: Vec::new(),
             lost_coalesced: 0,
             lost_dropped: 0,
+            waits_asked: 0,
             progress,
             incarnation,
             nonce: 0,
@@ -1970,11 +1978,20 @@ impl Owner {
         Ok(false)
     }
     fn group_deadline(&self) -> Result<Instant, LedgerError> {
-        if self.session.persistence_pending() || self.stopping.is_some() || self.evidence.is_some()
-        {
+        if self.stopping.is_some() || self.evidence.is_some() {
             return Instant::now()
                 .checked_add(Duration::from_millis(1))
                 .ok_or(LedgerError::Failed);
+        }
+        if self.session.persistence_pending() {
+            // The log tells this owner when what the replica waits for is
+            // answered (`Session::wakes_owner`, 27 §9), and the owner drains
+            // the session then: nothing is asked at intervals, and the tick
+            // is the bound on a signal that was lost. A write the log had no
+            // room for tells no one: it is asked again as the log answers
+            // the owner's other sessions, which is when room is made
+            // (`GroupOwner::signalled`), and at the tick.
+            return Ok(self.next_tick);
         }
         // A delivery waiting for seed chunks its host has not pulled yet
         // makes no progress on its own; it resumes when a chunk lands.
@@ -2360,6 +2377,7 @@ impl Owner {
                 peers_unreachable: self.unreachable,
                 peer_reports_coalesced: self.lost_coalesced,
                 peer_reports_dropped: self.lost_dropped,
+                waits_asked: self.waits_asked,
                 stopped,
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),
@@ -3213,6 +3231,7 @@ impl Owner {
             match self.session.try_poll() {
                 Ok(Some(events)) => events,
                 Ok(None) => {
+                    self.waits_asked = self.waits_asked.saturating_add(1);
                     self.send_early()?;
                     self.expire_pending();
                     self.publish_progress(false);

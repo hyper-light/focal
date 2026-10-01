@@ -12581,7 +12581,16 @@ peer, and a page at least where the path carries one within a beat
 more than the group's budgets can stage. Every schedule of the core runs with a byte
 bound that changes as it goes, the bytes counted checked against the messages held after
 every step. Open, with the audit's F42: a member that answers heartbeats and no append is
-still sent a message more each beat. Also recorded: the owner that shares a thread among
-sessions is woken by the log since F17, and still asks every millisecond besides (the
-audit's F45, its remainder).
+still sent a message more each beat.
+
+### 2026-10-01 — F45: a held log is asked nothing
+
+The owner that shares a thread among sessions asked the log every millisecond for every
+session with a write out. F17 had the log tell it of a `Ready`'s write; now every write a
+group waits for tells it (a checkpoint's and a decoder floor's too), it takes its signals
+at every pass and not only when idle, and a session that persists has its tick for its
+only deadline ([27](27-consensus-roadmap-and-slates-port.md) §9; the remediation record,
+F45). With the log held and 1, 100 and 1,000 sessions each with a write out, no session is
+asked again, and all are committed 15 ms, 53 ms and 741 ms after the log answers (a debug
+build); the millisecond asked one session 166 times in a quarter of a second.
 

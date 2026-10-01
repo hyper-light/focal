@@ -1165,6 +1165,16 @@ impl WalLease {
     ) -> Result<WalAppend, LogError> {
         self.batch_async_in(records, lane, true, None)
     }
+    /// The same checkpoint, with what the writer calls once it is answered
+    /// ([`Persisted`]), as [`Self::append_async_notified`].
+    pub fn rewrite_checkpoint_async_notified(
+        &mut self,
+        records: &[Record],
+        lane: BudgetLane,
+        persisted: Option<Persisted>,
+    ) -> Result<WalAppend, LogError> {
+        self.batch_async_in(records, lane, true, persisted)
+    }
     fn batch_async_in(
         &mut self,
         records: &[Record],

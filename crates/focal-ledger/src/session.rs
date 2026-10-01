@@ -1074,6 +1074,12 @@ impl Session {
     pub fn notify_persisted(&mut self, signal: Option<focal_consensus::PersistedSignal>) {
         self.consensus.notify_persisted(signal);
     }
+    /// Whether the log tells this session's owner when what the replica
+    /// waits for is answered (`DurableNode::wakes_owner`). A delivery that
+    /// is retained waits for no write: its owner asks again.
+    pub fn wakes_owner(&self) -> bool {
+        self.retained.is_none() && self.consensus.wakes_owner()
+    }
     /// Waits for the write the replica has in flight, when it has one
     /// (`DurableNode::wait_persisted`): an owner on its own thread waits
     /// here once it has sent what `sendable` gave, and polls after.

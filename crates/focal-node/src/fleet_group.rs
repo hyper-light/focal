@@ -307,6 +307,7 @@ impl ReplicaFleet {
             deadlines,
             scheduler,
             signals,
+            unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: None,
             _wal_owners: wal_owners,
@@ -334,6 +335,11 @@ struct GroupOwner {
     scheduler: FairScheduler<Option<Routed>>,
     /// What wakes this owner when it has nothing due (`Signal`).
     signals: mpsc::Receiver<Signal>,
+    /// The sessions that wait to persist and that the log will not tell
+    /// this owner of: it had no room for their write. One is asked again
+    /// for each write of this owner's the log answers — a write answered is
+    /// its room given back — and each at its tick.
+    unwoken: std::collections::BTreeSet<LedgerId>,
     nonce: u128,
     management: Option<management::ManagementOwner>,
     // Physical writers outlive every logical-session removal. A final handle
@@ -374,6 +380,7 @@ impl GroupOwner {
     fn stop_session(&mut self, ledger: LedgerId) {
         if let Some(mut owner) = self.sessions.remove(&ledger) {
             self.deadlines.remove(&(owner.wake_at, ledger));
+            self.unwoken.remove(&ledger);
             owner.close();
         }
         if let Some(management) = &mut self.management {
@@ -386,8 +393,35 @@ impl GroupOwner {
             self.deadlines.remove(&(owner.wake_at, ledger));
             owner.wake_at = next;
             self.deadlines.insert((next, ledger), ());
+            if owner.session.persistence_pending() && !owner.session.wakes_owner() {
+                self.unwoken.insert(ledger);
+            } else {
+                self.unwoken.remove(&ledger);
+            }
         }
         Ok(())
+    }
+    /// The session is due now.
+    fn due(&mut self, ledger: LedgerId) {
+        if let Some(owner) = self.sessions.get_mut(&ledger) {
+            let now = Instant::now();
+            if owner.wake_at > now {
+                self.deadlines.remove(&(owner.wake_at, ledger));
+                owner.wake_at = now;
+                self.deadlines.insert((now, ledger), ());
+            }
+        }
+    }
+    /// Takes the signals that wait, without waiting for one: a session
+    /// whose write was answered while the owner had work is due on the
+    /// owner's next pass, not when the owner next has nothing to do.
+    fn take_signals(&mut self) {
+        for _ in 0..QUEUED {
+            match self.signals.try_recv() {
+                Ok(signal) => self.signalled(signal),
+                Err(_) => break,
+            }
+        }
     }
     fn enqueue(&mut self, routed: Routed) -> Result<(), LedgerError> {
         let Some(owner) = self.sessions.get_mut(&routed.ledger) else {
@@ -462,6 +496,7 @@ impl GroupOwner {
             {
                 return Ok(());
             }
+            self.take_signals();
             for _ in 0..SLICE {
                 let Some((&(deadline, ledger), _)) = self.deadlines.first_key_value() else {
                     break;
@@ -558,28 +593,23 @@ impl GroupOwner {
             // at the top of the round.
             if let Ok(signal) = self.signals.recv_timeout(wait) {
                 self.signalled(signal);
-                for _ in 0..QUEUED {
-                    match self.signals.try_recv() {
-                        Ok(signal) => self.signalled(signal),
-                        Err(_) => break,
-                    }
-                }
+                self.take_signals();
             }
         }
     }
     /// A session whose write the log answered is due now: its drain takes
-    /// what the write released.
+    /// what the write released. A wake is no proof of anything: the drain
+    /// reads the write's own answer, and a signal for a session that was
+    /// stopped, or replaced since, costs one look. And the room the
+    /// answered write held is given back: one session the log had no room
+    /// for is due with it.
     fn signalled(&mut self, signal: Signal) {
         let Signal::Persisted(ledger) = signal else {
             return;
         };
-        if let Some(owner) = self.sessions.get_mut(&ledger) {
-            let now = Instant::now();
-            if owner.wake_at > now {
-                self.deadlines.remove(&(owner.wake_at, ledger));
-                owner.wake_at = now;
-                self.deadlines.insert((now, ledger), ());
-            }
+        self.due(ledger);
+        if let Some(waiting) = self.unwoken.pop_first() {
+            self.due(waiting);
         }
     }
 }

@@ -985,6 +985,7 @@ impl ReplicaFleet {
             deadlines: BTreeMap::new(),
             scheduler,
             signals,
+            unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: Some(management),
             _wal_owners: writers,

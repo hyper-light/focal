@@ -57,7 +57,7 @@ ruling before work starts).
 | F42 | P1 | open | 9 | — |
 | F43 | P2 | in tree (the leader's read bound open) | 10 | [F43](#f43) |
 | F44 | P2 | open | 10 | — |
-| F45 | P2 | partly, with F17 (the owner is woken by the log; it still asks every millisecond besides) | 10 | [F17](#f17) |
+| F45 | P2 | in tree | 10 | [F45](#f45) |
 | F46 | P1 | in tree | 8 | [F46](#f46) |
 | F47 | P2 | open | 11 | — |
 | F48 | P1 | open | 9 | — |
@@ -1868,4 +1868,43 @@ overtake what is still on a far path, be refused for the entry before it, and dr
 member to probing every beat. It goes with the audit's F42: every frame's end told to its
 owner, and a peer's frames kept in order. A member that is probed is still sent its page
 again at every heartbeat it answers. Control groups keep the page.
+
+## F45
+
+**Cause.** A session with a write out gave the owner that shares a thread among sessions
+a deadline one millisecond away, every time it was asked (`Owner::group_deadline`): the
+owner asked the log for every such session a thousand times a second, each ask a receipt
+polled and a progress published, and a write answered just after an ask waited for the
+next. The log's receipt could wake its waiter all along.
+
+**Fix.** F17 gave a group's writes a call the log's writer makes when it answers them, and
+the owner a queue of signals it waits on (27 §9). That left the millisecond in place beside
+it, signalled only a `Ready`'s write and a commit's, and read the signals only when the
+owner had nothing due — under steady work a session whose write was answered was found by
+its millisecond, not by its signal. Now a checkpoint's write and a decoder floor's are
+signalled too (`rewrite_checkpoint_async_notified`); `DurableNode::wakes_owner` says
+whether everything the group waits for was taken by the log and will signal; the owner
+takes its signals at the top of every pass (`take_signals`); and a session that persists
+has its tick for its deadline and nothing sooner. A write the log had no room for signals
+no one: such sessions are kept (`GroupOwner::unwoken`), one is asked again for each write
+of the owner's that the log answers, and each at its tick. A stop under way and an
+evidence call out keep their millisecond: they wait on other things than the log.
+
+**Tests.** `a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits`: the
+log is held with 1, 100 and 1,000 sessions each with a write out, the owners' periods
+stretched to ten seconds. While it is held no session is asked again
+(`ReplicaProgress::waits_asked`, which counts the asks that found a write still out); when
+it answers, every write is committed long before a tick. With the millisecond restored one
+session is asked 166 times in a quarter of a second and the test fails; with the signal
+ignored the write is committed 9.7 seconds later, at its tick, and the test fails. The
+existing shared-owner tests (a covering flush for several groups, a stop reaching a
+retained `Ready`, the last session stopping on a stalled writer) pass unchanged.
+
+**Measured** (this host, a debug build; the time from the log's answer to the last
+commit): one session 15 ms, a hundred 53 ms, a thousand 741 ms; asks of a held log in
+250 ms: 0, where one session made 166.
+
+**Residual.** A session the log had no room for, where the room is held by writes of
+another owner, is asked again at its tick and not when that room is given back: the log
+tells an owner of its own writes only.
 

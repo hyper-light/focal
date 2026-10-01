@@ -207,6 +207,35 @@ impl DurableNode {
         self.persisted = signal;
     }
 
+    /// Whether the log will tell this group's owner when what the group
+    /// waits for is answered: a signal is set (`notify_persisted`), and
+    /// every write the group waits for — a `Ready`'s, a commit's, a
+    /// checkpoint's, a decoder floor's — was taken by the log, which calls
+    /// the signal as it answers. An owner so told need not ask at
+    /// intervals: its own period is the bound on a signal that was lost. A
+    /// write the log had no room for tells no one, and its owner asks
+    /// again.
+    pub fn wakes_owner(&self) -> bool {
+        if self.persisted.is_none() || !self.persistence_pending() {
+            return false;
+        }
+        let drain = match self.persistence.as_ref().map(|pending| &pending.phase) {
+            None => true,
+            Some(Phase::Ready(work)) => work.receipt.is_some(),
+            Some(Phase::Light(work)) => work.receipt.is_some(),
+            Some(Phase::Start) => false,
+        };
+        drain
+            && self
+                .checkpoint
+                .as_ref()
+                .is_none_or(|pending| pending.taken())
+            && self
+                .decoder_write
+                .as_ref()
+                .is_none_or(|pending| pending.taken())
+    }
+
     /// Waits for the write this group has in flight, when it has one: an
     /// owner on its own thread, with nothing else to do for the group,
     /// waits here and drains after. False when there is no write to wait
