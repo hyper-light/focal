@@ -217,18 +217,29 @@ pub fn residency(bytes: usize, rtt: std::time::Duration) -> std::time::Duration 
 /// carries a megabit in a second as over one that carries a thousand, and
 /// no buffer is held for longer than its bytes take at the least a live
 /// path delivers.
+///
+/// `round_trip` is the path's round trip as the connection measures it,
+/// asked as the payload arrives, and the residency is priced by the longest
+/// it has answered: the round trip a payload's own datagrams take. One
+/// measured before the payload began was measured on an idle path, whose
+/// handshake did not queue behind anything; a narrow path takes longer to
+/// carry two datagrams than that, so a live sender filling it was given
+/// less than the path can deliver in, and given up on.
 pub async fn read_payload_arriving<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     header: FrameHeader,
     wait: std::time::Duration,
-    residency: std::time::Duration,
+    round_trip: impl Fn() -> std::time::Duration,
 ) -> Result<T, WireError> {
     let mut bytes = payload_buffer(header.payload_bytes())?;
     let mut filled = 0_usize;
-    let spent = tokio::time::Instant::now()
-        .checked_add(residency.max(wait))
-        .ok_or(WireError::Timeout)?;
+    let began = tokio::time::Instant::now();
+    let mut longest = std::time::Duration::ZERO;
     while filled < bytes.len() {
+        longest = longest.max(round_trip());
+        let spent = began
+            .checked_add(residency(bytes.len(), longest).max(wait))
+            .ok_or(WireError::Timeout)?;
         let owed = filled.saturating_add(LEAST_PROGRESS).min(bytes.len());
         let remaining = spent.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

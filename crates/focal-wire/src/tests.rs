@@ -1786,6 +1786,80 @@ async fn narrow(
     (address, tasks)
 }
 
+/// A payload's residency is priced by the round trip the path shows while
+/// the payload arrives, not by the one it showed before: a path's idle
+/// round trip is its handshake's, and a narrow path takes longer than that
+/// to carry two datagrams, so a live sender filling it was given less than
+/// the path delivers in, and given up on (one run in a dozen of
+/// `narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given`,
+/// whose receiver measured 7.9 ms before a megabyte that took 3.1 s and
+/// 67 ms by its end). A sender slower than two datagrams a round trip of
+/// the longest the path has shown is still given up on.
+#[tokio::test(start_paused = true)]
+async fn a_payload_is_given_the_round_trip_the_path_shows_while_it_arrives() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const PAYLOAD: usize = 256 * 1024;
+    const EVERY: Duration = Duration::from_millis(5);
+    let wait = Duration::from_millis(100);
+    // A datagram every five milliseconds: the payload takes about 1.1 s.
+    let send = |mut writer: tokio::io::DuplexStream| async move {
+        use tokio::io::AsyncWriteExt;
+        let datagram = [7u8; LEAST_PROGRESS];
+        let mut left = PAYLOAD;
+        while left > 0 {
+            let take = left.min(datagram.len());
+            if writer.write_all(&datagram[..take]).await.is_err() {
+                return;
+            }
+            left -= take;
+            tokio::time::sleep(EVERY).await;
+        }
+    };
+    let read = |measured: Arc<AtomicU64>| async move {
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let sender = tokio::spawn(send(writer));
+        let frame = read_frame_header(
+            &mut &request_header(PAYLOAD as u32)[..],
+            FrameKind::Request,
+            PAYLOAD as u32,
+        )
+        .await
+        .unwrap();
+        let began = tokio::time::Instant::now();
+        let arrived: Result<Vec<u8>, WireError> =
+            read_payload_arriving(&mut reader, frame, wait, || {
+                Duration::from_micros(measured.load(Ordering::Relaxed))
+            })
+            .await;
+        sender.abort();
+        (arrived.map(|_| ()), began.elapsed())
+    };
+    // The path showed one millisecond when the payload began: 110 round
+    // trips of it are 110 ms, and the payload takes ten times that.
+    let idle = Arc::new(AtomicU64::new(1_000));
+    let (given_up, after) = read(idle.clone()).await;
+    assert!(matches!(given_up, Err(WireError::Timeout)), "{given_up:?}");
+    assert!(after <= residency(PAYLOAD, Duration::from_millis(1)).max(wait) + EVERY);
+    // The same sender, on a path whose round trip the payload's own
+    // datagrams lengthen to twenty milliseconds once they queue: the
+    // payload is given what the path takes, and arrives.
+    let loaded = Arc::new(AtomicU64::new(1_000));
+    let lengthen = loaded.clone();
+    let queueing = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lengthen.store(20_000, Ordering::Relaxed);
+    });
+    let (arrived, took) = read(loaded).await;
+    queueing.await.unwrap();
+    // The payload is not a frame's encoding: it arrived whole and was
+    // read as far as its decoding, which the path does not answer for.
+    assert!(
+        !matches!(arrived, Err(WireError::Timeout)),
+        "given up after {took:?}"
+    );
+    assert!(took >= Duration::from_secs(1), "{took:?}");
+}
+
 /// A megabyte over a path that takes longer to carry it than a request is
 /// given is carried, each way: an exchange waits as long as the path takes
 /// (`carried`, `read_payload_arriving`), and no longer for a peer that

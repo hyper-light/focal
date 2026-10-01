@@ -1093,6 +1093,30 @@ header from the same identity is refused for its share, reset, counted; the perm
 back with the stream), the admission's existing cases, and the node's listener tests.
 `residency` is exercised by every request and response read in the suites.
 
+**Residual (2026-09-30): the residency was priced by the round trip of an idle path.**
+*Cause.* `residency(bytes, rtt)` was computed once, from the connection's round trip when
+the header arrived. That round trip is the handshake's: nothing queued behind it. The law
+is two datagrams a round trip — the round trip those datagrams take — and a narrow path
+takes longer to carry two datagrams than its idle round trip, so a live sender filling
+such a path was given less than the path delivers in. The gate run of 2026-09-30 met it:
+`narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given` failed with the
+client's `early eof` (the server gave the request up and its stream ended), once in that
+run and once in twelve repeats of the wire suite; a probe of the receiver showed 7.9 ms
+when the megabyte began, 67 ms by its end, and 3.1 s for the megabyte — 437 round trips of
+7.9 ms are 3.45 s, and a first sample a millisecond shorter is a failure. *Fix.*
+`read_payload_arriving` is given the connection's round trip to ask as the payload
+arrives and prices the residency by the longest it has answered; both readers (a server
+of its request, a client of its response) pass the connection's own measure. A sender
+slower than two datagrams a round trip of the longest the path has shown is given up on
+as before, and a buffer is still held no longer than its bytes take at the least a live
+path delivers. *Tests.* `a_payload_is_given_the_round_trip_the_path_shows_while_it_arrives`
+(virtual time: a datagram every five milliseconds; on a path that shows a millisecond
+throughout the payload is given up at its residency; on one that shows twenty once the
+payload queues it arrives; with the round trip asked once the test fails, "given up after
+110ms"). *Measurement.* The wire suite thirty times over: no failure, where it failed once
+in twelve.
+
+
 ## F20
 
 **Cause.** The listener counted every connection future — handshakes, enrollment and

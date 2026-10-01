@@ -12515,3 +12515,14 @@ expired, and the controller routed to the sponsor only while that certificate wa
 The route stands while the founder's enrollment is unrevoked; `focal-node`
 `a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up`
 fails on the rule before.
+
+### 2026-09-30 — a payload's residency is priced by the round trip its own datagrams take
+
+The bound on how long an arriving payload holds its buffer (the audit's F03) was computed
+from the connection's round trip when the header arrived — an idle path's. A narrow path
+takes longer than that to carry two datagrams, so a live sender filling it could be given
+up on: the gate run met `early eof` on a megabyte over the four-megabit test path, once in
+about a dozen runs of the wire suite. The reader now asks the connection's round trip as
+the payload arrives and prices the residency by the longest it has answered
+(`focal_wire::read_payload_arriving`). `focal-wire`: 111 tests, the new one in virtual
+time and failing on the rule before; thirty runs of the suite without a failure.

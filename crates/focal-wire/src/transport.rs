@@ -555,7 +555,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                                 return Err(WireError::Access(AccessError::Capacity));
                             }
                         };
-                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout,residency(header.payload_bytes(),carrying.rtt())).await?;
+                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout,||carrying.rtt()).await?;
                         tokio::time::timeout(limits.request_timeout,require_end(&mut recv))
                             .await.map_err(|_|WireError::Timeout)??;
                         let peer=registry.authenticate(fingerprint)?;
@@ -1110,13 +1110,8 @@ impl QuicRemote {
         };
         let (mut recv, header) =
             carried(&self.connection, &self.capacity.held, bytes, period, asked).await?;
-        let response: ResponseEnvelope = read_payload_arriving(
-            &mut recv,
-            header,
-            period,
-            residency(header.payload_bytes(), self.connection.rtt()),
-        )
-        .await?;
+        let response: ResponseEnvelope =
+            read_payload_arriving(&mut recv, header, period, || self.connection.rtt()).await?;
         tokio::time::timeout(period, require_end(&mut recv))
             .await
             .map_err(|_| WireError::Timeout)??;
