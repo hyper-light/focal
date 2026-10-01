@@ -437,6 +437,12 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
     })
     .unwrap();
     drop(node.drain().unwrap());
+    // The other answers a heartbeat a beat after its probe went unanswered:
+    // the probe is sent again, and what it needs is the checkpoint.
+    for _ in 0..node.heartbeat_tick() {
+        node.tick().unwrap();
+        drop(node.drain().unwrap());
+    }
     node.step(Message {
         from: 2,
         to: 1,

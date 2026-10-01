@@ -53,8 +53,8 @@ ruling before work starts).
 | F38 | P2 | open | 8 | — |
 | F39 | P2 | open | 12 | — |
 | F40 | P2 | open | 10 | — |
-| F41 | P2 | in tree (the heartbeat rule open, with F42) | 10 | [F41](#f41) |
-| F42 | P1 | open | 9 | — |
+| F41 | P2 | in tree | 10 | [F41](#f41) |
+| F42 | P1 | in tree (a peer's frames in order open) | 9 | [F42](#f42) |
 | F43 | P2 | in tree (the leader's read bound open) | 10 | [F43](#f43) |
 | F44 | P2 | open | 10 | — |
 | F45 | P2 | in tree | 10 | [F45](#f45) |
@@ -1859,15 +1859,11 @@ gigabyte at the default entry bound, and stands for a page until its path is kno
 twice the path's window after. No throughput is claimed; none was measured over a real
 path in this batch.
 
-**Residual.** An answer to a heartbeat from a member whose window is full still frees the
-window's first message and sends the next (raft-rs's rule, for messages that were lost),
-so the bytes out pass the bound by a message for every beat a member answers heartbeats
-and no append. etcd's core sends an empty append there and adds nothing; here a peer's
-frames go each on its own stream in no order (`replication::drive`), so that append would
-overtake what is still on a far path, be refused for the entry before it, and drop the
-member to probing every beat. It goes with the audit's F42: every frame's end told to its
-owner, and a peer's frames kept in order. A member that is probed is still sent its page
-again at every heartbeat it answers. Control groups keep the page.
+**Residual, closed with F42.** An answer to a heartbeat from a member whose window was
+full freed the window's first message and sent the next (raft-rs's rule), so the bytes out
+passed the bound by a message a beat. See F42: a heartbeat's answer says how far the
+member's log goes and is taken as an append's answer, a full window waits, and every frame
+that is not delivered is told. Control groups keep the page.
 
 ## F45
 
@@ -1907,4 +1903,89 @@ commit): one session 15 ms, a hundred 53 ms, a thousand 741 ms; asks of a held l
 **Residual.** A session the log had no room for, where the room is held by writes of
 another owner, is asked again at its tick and not when that room is given back: the log
 tells an owner of its own writes only.
+
+## F42
+
+**Cause.** `replication::drive` pushed a send into its active set and only then did the
+send wait for its peer's lane (`PeerConnectionPool::exchange`: `slot.inflight.acquire()`
+under the exchange's timeout). The set held 1,024; with a peer that stopped answering,
+its lane's worth of sends hung on the peer and the rest hung on the lane, the set filled,
+and the driver stopped taking from the owners' channel — where the frames of the peers
+that answered then waited, for as long as the slow peer's timeouts ran. Beside it: only
+`PeerSendError::Lost` was told to a frame's owner. A lane that was full, a peer that
+refused for the room, a route that changed, and a frame the owner itself dropped when its
+channel or its budget had no room were counted and forgotten, and the group's core went
+on sending ahead to a member that was receiving nothing.
+
+**Fix.** 27 §12 has the rules. A send begins only when its peer's lane has a place
+(`Waiting::sending`, the pool's own width); what has none waits in that peer's queue, a
+heartbeat, a vote or an answer before entries (`ReplicationFrame::urgent`). The driver
+never stops receiving and is sized to what the pool itself admits; when it is full the
+peer with the most waiting gives up its newest frame for a peer that holds less. Every
+frame that is not accepted is told to its owner — by the driver for what was lost, refused
+or given up, by the owners for what they drop themselves — and the core probes that
+member. The pool is behind a small trait (`Carrier`) so that the driver is tested with
+paths the test holds, not sockets.
+
+With every loss told, the core no longer needs to send on a heartbeat's answer alone
+(27 §11): a member's answer says how far its log goes (`HeartbeatAnswers::Position`), a
+leader whose own term the member's last entry is of takes it as an append's answer, a full
+window otherwise waits, a member whose window is full and that has answered for none of
+it through a beat of the leader's ticks is probed with one message cut to its path, and a
+probe is sent again when it is told lost or once a beat has passed since it was sent.
+raft-rs's rule stays for the comparison (`HeartbeatAnswers::Bare`). (A first version
+counted heartbeat answers, an election timeout of them: five tests of the shell that
+rejoin a member after a partition found it waiting that long to be probed again. A beat
+of ticks is what the answers came at before, on a path that does not stretch them.)
+
+**Tests.** `focal-node` `replication::tests`:
+`a_peer_that_answers_nothing_holds_its_own_lane_and_nothing_of_anothers` (twenty frames
+for a peer that answers nothing fill a driver of eight; five for a peer that answers come
+behind them and are all carried while the first answers nothing; all twenty are told;
+every charge is given back);
+`what_a_group_cannot_do_without_goes_before_the_entries_that_wait`;
+`a_frame_its_peer_refuses_is_told_to_its_owner` (a full lane, a peer with no room, a
+route that changed); `many_groups_share_the_driver_and_a_dropped_driver_gives_everything_back`
+(twelve hundred frames for four peers, two of which answer nothing, in a driver of a
+hundred: the six hundred for the peers that answer are carried, the rest are told or
+held, and a driver dropped mid-flight gives back every charge). With what is urgent sent
+last, or only an unreachable peer told, two of them fail. `focal-raft`:
+`a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more`, and every
+schedule of the core runs under the new rule; the comparison with raft-rs runs under
+`HeartbeatAnswers::Bare` and is unchanged. Three thousand schedules of each (the groups
+of this core, of both cores, the fast groups and the comparison) pass, where an ordinary
+run has ninety-six; twenty thousand of the groups of this core pass. (Twenty thousand
+of the groups of both cores do not all settle, before this change or after it: a member
+of raft-rs of higher priority and a longer, older log refuses the other voter for
+priority, which refuses it for its log — raft-rs's own rule, 27 §4.5.) Two tests of the
+shell and one of the control owner that answer a heartbeat for a member the moment after
+its probe let a beat pass first.
+
+**Found on the way.**
+
+*A member that left vetoed the only candidate.* Three thousand schedules of the fast
+group did not all settle on the pushed tree (seed 1707; ninety-six do). A leader of higher
+priority removed itself; the voter that remained held the removal and had not heard it
+committed, so it still needed the first one's vote, and had taken a term to campaign in;
+the first, which follows and can never be elected, refused it for priority, from a term
+the candidate no longer heard. A refusal for priority is safe only because the member that
+refuses could be elected itself. `Raft::settle_priority` puts no priority in force for a
+member that may not campaign; `a_member_that_left_refuses_no_one_for_priority` builds the
+run and fails without it. The classic core had this, and so does any group whose owner
+sets priorities (27 §5).
+
+*The fast track's election is not safe.* Forty thousand schedules of the fast group
+commit two entries at one index (seed 9843 on the commit before any change of this date;
+`a_group_with_the_fast_track_is_safe_and_settles`). 27 §4.6 has the cause: a fast quorum's
+members hold the committed entry beside their logs, vote by the classic comparison of
+logs, and the leader they elect keeps its own older entry at that index. It is recorded
+there, in `fast.rs` and at `NodeConfig::fast`; it is not mended in this batch. No owner
+uses the fast track.
+
+*The settle check proposed once.* `Cluster::settles` proposed to the leader of the moment
+and waited for that index for good; a proposal taken by a leader that was then deposed is
+gone with its term. It proposes again to the leader that followed.
+
+**Residual.** A peer's frames go each on its own stream and arrive in no order (27 §12).
+The fast track's election (above).
 

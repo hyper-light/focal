@@ -44,7 +44,8 @@ pub use error::{Error, Result, StorageError};
 pub use node::{LightReady, RawNode, Ready, SnapshotStatus};
 pub use quorum::{Quorum, Tally};
 pub use raft::{
-    Config, FastStats, Limits, Outgoing, Precedence, Raft, ReadRounds, SoftState, StateRole,
+    Config, FastStats, HeartbeatAnswers, Limits, Outgoing, Precedence, Raft, ReadRounds, SoftState,
+    StateRole,
 };
 pub use read::ReadState;
 pub use storage::{InitialState, Storage};

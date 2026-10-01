@@ -150,14 +150,28 @@ pub struct ReplicationFrame {
     /// reports it to the core, which probes the member instead of
     /// streaming to it. Bounded by the members a configuration names.
     lost: Option<mpsc::SyncSender<u64>>,
+    /// What a group cannot do without — a heartbeat, a vote, an answer:
+    /// everything but entries and snapshots. The driver sends it before the
+    /// entries that wait for the same peer, and gives it up last
+    /// (`replication::drive`).
+    pub(crate) urgent: bool,
     _charge: Allocation,
+}
+/// Whether a message is what a group cannot do without: anything but
+/// entries on their way to a member and a snapshot.
+pub(crate) fn urgent(message: &focal_consensus::Message) -> bool {
+    let entries = message.msg_type == focal_consensus::MessageType::MsgAppend as i32
+        && !message.entries.is_empty();
+    let snapshot = message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32;
+    !entries && !snapshot
 }
 /// The peers an owner may have lost exchanges with between two of its
 /// periods: at most every member once (`focal_raft::MAX_MEMBERS`); a peer
 /// lost more often within a period is reported once.
 pub(crate) const LOST_PEERS: usize = 1024;
 impl ReplicationFrame {
-    /// The driver could not reach the peer at all.
+    /// The frame did not reach its peer: it could not be reached, it
+    /// refused, or the driver had no room for the frame.
     pub(crate) fn lost(&mut self) {
         if let Some(lost) = self.lost.take() {
             let _ = lost.try_send(self.target);
@@ -175,10 +189,16 @@ impl ReplicationFrame {
             request,
             snapshot: None,
             lost: Some(lost),
+            urgent: false,
             _charge: budget
                 .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
                 .commit(),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn urgent_for_test(mut self) -> Self {
+        self.urgent = true;
+        self
     }
     pub(crate) fn report_snapshot(&mut self, accepted: bool) {
         crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
@@ -3297,7 +3317,11 @@ impl Owner {
         let _charge = early.take_allocation();
         self.send(&early.messages)
     }
-    /// Hand the replica's messages to the driver that carries them.
+    /// Hand the replica's messages to the driver that carries them. A
+    /// message that is not handed over — no room for it here, or in the
+    /// driver's queue — is told to the core as one the driver gave up is
+    /// (`report_lost`): the member is probed, and nothing is taken to be on
+    /// its way that is not.
     fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
         for message in messages {
             let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
@@ -3326,6 +3350,7 @@ impl Owner {
                     self.dropped_snapshots = self.dropped_snapshots.saturating_add(1);
                 }
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             }
             let Ok(charge) = self.budget.reserve(
@@ -3336,11 +3361,13 @@ impl Owner {
                     .ok_or(LedgerError::Capacity)?,
             ) else {
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
             let Ok(message_bytes) = message.write_to_bytes() else {
                 drop(snapshot);
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
             self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
@@ -3350,6 +3377,7 @@ impl Owner {
                 target: message.to,
                 snapshot,
                 lost: Some(self.lost_sender.clone()),
+                urgent: urgent(message),
                 _charge: charge.commit(),
                 request: RequestEnvelope {
                     protocol: PROTOCOL_VERSION,
@@ -3365,6 +3393,7 @@ impl Owner {
             };
             if self.outbound.try_send(frame).is_err() {
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
             }
         }
         Ok(())

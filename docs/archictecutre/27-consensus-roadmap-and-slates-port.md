@@ -215,6 +215,19 @@ needs no exception for them.
 
 ### 4.6 The fast track as built
 
+**Not safe as built, and to be used by no group until it is (found 2026-10-01).** A
+leader elected with a log that already fills an index keeps its own uncommitted entry
+there, though a fast quorum committed another under a leader between: the voters that
+made that quorum hold the committed entry beside their logs, the classic rule by which
+they vote compares logs, and the elected leader takes again only what lies above its
+own log. Forty thousand schedules of `a_group_with_the_fast_track_is_safe_and_settles`
+meet it (seed 9843 on the commit before any change of 2026-10-01; the ninety-six of an
+ordinary run, and three thousand, do not); the model (`docs/models/FastTrack.tla`)
+passes, so the model lacks the run. What a member holds beside its log must say the
+term of the leader it last voted it to, and an election must weigh it at every index
+above the candidate's commit — or a voter must refuse a candidate whose log is older
+than its own latest fast vote. Neither is built. No owner sets `NodeConfig::fast`.
+
 `focal_raft::fast` and `track` in the core, `DurableNode::propose_fast` in the shell. A
 group has the fast track or has none from the day it is made (`NodeConfig::fast`), and
 says so in a record of its own in its log (`RecordKind::FastTrack`), which a binary
@@ -712,7 +725,7 @@ of it was changed.
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |
 | A voter that dies and returns within the hold, end to end | Done: `cluster plan` says for how many seconds a death still stands (`focal_directory::deaths_stand_for`), and a voter that returns within the hold keeps its seat on real processes while a spare waits; one that stays dead loses it to the spare without an operator (`runbook_node_loss_within_the_hold_moves_no_seat`) |
-| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision |
+| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision. And first, its election is not safe (section 4.6): two entries can be committed at one index |
 
 ## 9. What a commit waits for (2026-09-30)
 
@@ -828,16 +841,52 @@ memory that refused them.
 | The owner says: twice what the transport to the member holds in flight; and a page at least where the path carries a page within one beat of the leader | The transport's congestion window is the measure of what a path holds before it answers, and it is already kept for every peer (`focal_wire::congestion`). Twice it, as a sender's buffer is sized against its window (Linux `tcp_sndbuf_expand`: "Cubic needs 1.7 factor, rounded to 2 to include extra cushion (application might react slowly"): a sender held to the window itself never fills it, and a window never filled is never found too small. The page: a new connection's window says only that nothing was sent on it yet, and a path that carries a page in a beat is not kept to that; a thin path is never given a page it would take many beats to carry. A path with no round trip measured says nothing and the member keeps what it has | `fleet::inflight_bytes`, `Work::Windows`, `ReplicaHost::inflight_windows`, `PeerConnectionPool::window`; the node's pacer says it once a round |
 | Never more than the group's budget can stage | One transition stages a page for every member and the window of the one whose answer it may be. A window the budget's limit cannot hold beside those pages and what the group holds at rest would refuse every answer of the member it was made for; the bound is cut to what can be staged. The staging a transition reserves is priced by each member's bound, where it was priced by 128 pages | `DurableNode::set_inflight_bytes`, `memory::sends_bytes` |
 
-What is not changed: an answer to a heartbeat from a member whose window is full still
-frees the window's first message and sends the next (raft-rs's rule; the messages that
-filled the window may have been lost). So the bytes out to a member pass its bound by a
-message for every beat it answers heartbeats and no append. etcd's core sends an empty
-append there instead, which adds nothing. It was not taken: this node sends a peer's
-frames each on its own stream, in no order, so an empty append overtakes the appends
-still on a far path, is refused for the entry before it, and the member is dropped to
-probing every beat. The rule goes when every frame's end is told to its owner and a
-peer's frames keep their order (the audit's F42).
+What a heartbeat's answer does (2026-10-01, with the audit's F42): raft-rs's rule freed a
+full window's first message at every heartbeat the member answered and sent the next,
+whatever became of the first, so the bytes out passed their bound by a message a beat. A
+member now says in its answer how far its log goes — its last index and that entry's term
+(`HeartbeatAnswers::Position`). Where the term is the leader's own, the leader made that
+entry and the member took it and all before it from the leader's appends: the answer is
+an append's answer for all of it, and is taken as one (not in a fast group, whose terms
+differ by member; there it gives the window back and nothing else). Answers that were
+lost are made good exactly; a member that holds nothing new is sent nothing more; one
+whose window is full and that has answered for none of it through a beat of the leader's
+ticks is probed, with one message cut to what its path carries; and a probe is sent again
+when its owner is told it was lost (`MsgUnreachable`), or once a beat of ticks has passed
+since it was sent — not at every heartbeat's answer, which on a path slower than the
+heartbeats sent the page again and again behind itself. The beat is counted in the
+leader's ticks because its owner stretches those by the path to the group's members
+(section 3.1 P2) while the heartbeats keep their configured cadence: a beat of ticks is,
+on whatever path, time enough for what was sent to have been answered. etcd's core sends an empty append to a full window instead; it was not taken,
+because this node sends a peer's frames each on its own stream, in no order, and an
+empty append overtakes what is still on a far path and is refused for the entry before
+it. raft-rs's rule is kept (`HeartbeatAnswers::Bare`) for the comparison alone.
 
 Control groups keep the page: their entries are small and their pacer says nothing of
 windows.
+
+## 12. What carries a group's messages to its peers (2026-10-01)
+
+The audit's F42. The owners hand their messages to a driver (`replication::drive`) that
+sends each as an exchange with the peer's node, answered once the peer has persisted
+what the message caused. The driver counted an exchange as under way before it had the
+peer's lane (`PeerConnectionPool`: as many exchanges with one peer at once as the
+consensus window), and held 1,024: a peer that stopped answering filled it with
+exchanges waiting for its lane, the driver stopped taking from the owners' channel, and
+the frames of every peer that did answer waited behind them. And a frame that was not
+delivered was told to its owner only when the peer could not be reached at all: a lane
+that was full, a peer that refused, a queue with no room dropped the frame untold, and
+the group took it to be on its way.
+
+| Rule | Why | Where |
+|---|---|---|
+| An exchange is begun only when its peer's lane has a place for it | A peer that stopped answering holds its own lane and nothing of another's | `replication::drive`, `Waiting::sending` |
+| What a peer's lane has no place for waits its turn in that peer's own queue, in the order it came, what a group cannot do without before its entries | A heartbeat, a vote or an answer behind a page of entries for a slow peer is the group's election timeout; entries and snapshots are what can wait | `Waiting::{urgent, bulk, next}`, `ReplicationFrame::urgent`, `fleet::urgent` |
+| The driver never stops receiving, and holds what the pool itself admits: every connection's lane at once | A frame left in its owner's channel holds back every frame behind it, whoever they are for. Sized by the pool, a burst from many groups to one peer waits in the driver and is carried, and the driver's own bound is met only when more peers are sent to than the pool has connections for | `PeerPoolLimits::for_consensus`, `NetworkService::run` |
+| When the driver holds all it may, the peer that holds the most waiting gives up its newest frame for a frame whose peer holds less; otherwise the frame that came is given up | The room is shared by the peers that need it, and none takes another's by being slow. Nothing under way is given up | `Waiting::newest` |
+| A frame that is not accepted — lost, refused by its peer, given up for the room, or dropped by its owner before it reached the driver — is told to its owner | The core then probes the member instead of sending ahead into a lane that is full or a void. Nothing is taken to be on its way that is not, which is what lets a full window wait for answers (section 11) | `Frame::give_up`, `ReplicationFrame::lost`, `Owner::send`, `ControlHost::carry`, `Owner::report_lost` |
+
+Open: a peer's frames still go each on its own stream, and arrive in no order; an append
+that overtakes the one before it is refused and the member probed. One ordered stream a
+peer would end that, at the price of one frame's loss holding the rest.
 

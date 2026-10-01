@@ -14,7 +14,9 @@ it carries (`RawNode::set_inflight_bytes`, 27 §11). It keeps the log and speaks
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in [27 §4.5](../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md).
 
-A group may have the fast track (`Config::fast`, `fast.rs`, `track.rs`; 27 §4.6): a
+A group may have the fast track (`Config::fast`, `fast.rs`, `track.rs`; 27 §4.6) — which
+is **not safe as built** and is used by no owner: an election in a fast group can commit a
+second entry at an index that holds one (27 §4.6). As designed, a
 member that does not lead proposes to every voter at once (`RawNode::propose_fast`),
 and its entry is committed when three quarters of the voters hold it, or a majority
 holds it from the leader, whichever is first.

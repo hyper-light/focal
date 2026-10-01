@@ -3,6 +3,8 @@ use crate::control_host::{ControlReplicationFrame, DirectoryReplication};
 use crate::fleet::{FleetReplication, ReplicationFrame};
 use focal_wire::{PeerConnectionPool, PeerSendError};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc;
 
@@ -13,22 +15,52 @@ pub struct ReplicationReport {
     pub accepted: u64,
     pub lost: u64,
     pub saturated: u64,
+    /// Given up before they were sent, for the room: a frame for a peer
+    /// that held more than its share when the driver was full. Told to
+    /// their owners, as every frame that is not accepted is.
+    pub refused: u64,
     pub peak_inflight: usize,
+    /// The most frames that waited for their peers' lanes at once.
+    pub peak_waiting: usize,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ReplicationDriverError {
-    #[error("replication driver concurrency must be between one and 1024")]
+    #[error("replication driver capacity must be between one and 65536")]
     Configuration,
     #[error("replication send task failed")]
     Worker,
 }
 
-/// Drain the host's bounded channel with at most `max_inflight` send futures.
-/// Full task capacity pauses receiving, leaving the host's existing queue/drop
-/// policy in control. There is no second queue and no task spawning.
-/// Closing the receiver's sender drains accepted frames; cancelling this future
-/// drops the owned futures and releases their frame allocations immediately.
-/// The pool is borrowed; concurrent sends need no additional Arc or spawned task.
+/// Drain the host's bounded channel, holding at most `max_inflight` frames:
+/// those being sent and those that wait for their peer's lane.
+///
+/// A frame is sent only when its peer has a place for it — as many at once
+/// as the pool's lane to one peer holds — so a send under way never waits
+/// behind another to the same peer, and a peer that stopped answering holds
+/// its own lane and nothing else (the audit's F42: it held the whole
+/// driver, and the frames of healthy peers waited in the owner's channel
+/// behind it). The frames a peer's lane has no place for wait their turn in
+/// that peer's own queue, in the order they came, what a group cannot do
+/// without (`Urgent`) before its entries.
+///
+/// The driver never stops receiving: a frame it left in its owner's channel
+/// would hold back every frame behind it, whoever they are for. It holds
+/// `max_inflight` frames, sending and waiting — what the pool itself admits,
+/// every connection's lane at once (`PeerPoolLimits::for_consensus`), so
+/// that a burst from many groups to one peer waits here and is carried.
+/// When it holds all it may, the frame that came is taken if its peer holds
+/// less waiting than the peer that holds the most, whose newest waiting
+/// frame is given up for it; otherwise the frame that came is given up. So
+/// the room is shared by the peers that need it, and none can take
+/// another's by being slow.
+///
+/// A frame that is not accepted — lost, refused by the peer, or given up
+/// for the room — is told to its owner, whose core then probes the member
+/// instead of streaming to it: nothing is dropped untold.
+///
+/// Closing the receiver's sender drains accepted frames; cancelling this
+/// future drops the owned futures and frames and releases their allocations
+/// immediately. The pool is borrowed; no task is spawned.
 pub async fn drive_replication(
     receiver: mpsc::Receiver<ReplicationFrame>,
     pool: &PeerConnectionPool,
@@ -66,6 +98,30 @@ pub async fn drive_directory_replication(
     drive(Receiver::Directory(receiver), pool, max_inflight).await
 }
 
+/// What carries a frame to its peer: the node's connection pool, or what
+/// stands for it where the driver itself is tested.
+trait Carrier: Sync {
+    /// The exchanges with one peer the carrier has under way at once.
+    fn lane(&self) -> usize;
+    fn carry<'a>(
+        &'a self,
+        target: u64,
+        request: &'a focal_wire::RequestEnvelope,
+    ) -> impl Future<Output = Result<(), PeerSendError>> + Send + 'a;
+}
+impl Carrier for PeerConnectionPool {
+    fn lane(&self) -> usize {
+        self.limits().per_peer_inflight
+    }
+    fn carry<'a>(
+        &'a self,
+        target: u64,
+        request: &'a focal_wire::RequestEnvelope,
+    ) -> impl Future<Output = Result<(), PeerSendError>> + Send + 'a {
+        self.send(target, request)
+    }
+}
+
 enum Frame {
     Session(ReplicationFrame),
     Control(ControlReplicationFrame),
@@ -95,6 +151,57 @@ impl Frame {
             Self::Control(frame) => &frame.request,
         }
     }
+    fn urgent(&self) -> bool {
+        match self {
+            Self::Session(frame) => frame.urgent,
+            Self::Control(frame) => frame.urgent,
+        }
+    }
+    /// The frame did not reach its peer: what a snapshot waits on is
+    /// answered, and the owner is told.
+    fn give_up(mut self) {
+        self.complete(false);
+        self.lost();
+    }
+}
+/// The frames that wait for one peer's lane, and how many of its frames
+/// are being sent.
+#[derive(Default)]
+struct Waiting {
+    /// What a group cannot do without — heartbeats, votes, answers — in the
+    /// order it came.
+    urgent: VecDeque<Frame>,
+    /// Entries and snapshots, in the order they came.
+    bulk: VecDeque<Frame>,
+    sending: usize,
+}
+impl Waiting {
+    fn len(&self) -> usize {
+        self.urgent.len().saturating_add(self.bulk.len())
+    }
+    /// The frame waits its turn. One there is no memory to queue is given
+    /// back, to be given up.
+    fn push(&mut self, frame: Frame) -> Option<Frame> {
+        let queue = if frame.urgent() {
+            &mut self.urgent
+        } else {
+            &mut self.bulk
+        };
+        if queue.try_reserve(1).is_err() {
+            return Some(frame);
+        }
+        queue.push_back(frame);
+        None
+    }
+    /// The next to send: what is urgent first.
+    fn next(&mut self) -> Option<Frame> {
+        self.urgent.pop_front().or_else(|| self.bulk.pop_front())
+    }
+    /// The newest that waits, entries before what is urgent: what is given
+    /// up when the peer holds more than its share.
+    fn newest(&mut self) -> Option<Frame> {
+        self.bulk.pop_back().or_else(|| self.urgent.pop_back())
+    }
 }
 
 enum Receiver {
@@ -114,48 +221,127 @@ impl Receiver {
     }
 }
 
-async fn drive(
+async fn drive<C: Carrier>(
     mut receiver: Receiver,
-    pool: &PeerConnectionPool,
+    pool: &C,
     max_inflight: usize,
 ) -> Result<ReplicationReport, ReplicationDriverError> {
-    if !(1..=1024).contains(&max_inflight) {
+    if !(1..=65536).contains(&max_inflight) {
         return Err(ReplicationDriverError::Configuration);
     }
     if tokio::runtime::Handle::try_current().is_err() {
         return Err(ReplicationDriverError::Worker);
     }
+    // As many to one peer at once as the pool's lane to it holds: a send
+    // under way never waits for that lane behind another of this driver's.
+    let lane = pool.lane().clamp(1, max_inflight);
     let mut tasks = FuturesUnordered::new();
+    let mut peers: BTreeMap<u64, Waiting> = BTreeMap::new();
+    let mut waiting = 0usize;
     let mut receiving = true;
     let mut report = ReplicationReport::default();
+    let send = |mut frame: Frame| {
+        AssertUnwindSafe(async move {
+            let target = frame.target();
+            let result = pool.carry(target, frame.request()).await;
+            frame.complete(result.is_ok());
+            // Whatever kept it from the peer, the frame's owner is told,
+            // and its core probes the member instead of streaming into a
+            // void or a lane that is full (27 §3.3).
+            if result.is_err() {
+                frame.lost();
+            }
+            // Keep the whole frame, especially its Allocation, alive
+            // across connection setup, retries and response receipt.
+            drop(frame);
+            (target, result)
+        })
+        .catch_unwind()
+    };
+    // What waits is sent only as a send to its peer ends, so nothing waits
+    // once nothing is being sent.
     while receiving || !tasks.is_empty() {
         tokio::select! {
-            frame = receiver.recv(), if receiving && tasks.len() < max_inflight => {
-                if let Some(mut frame) = frame {
-                    report.attempted = report.attempted.saturating_add(1);
-                    tasks.push(AssertUnwindSafe(async move {
-                        let result = pool.send(frame.target(), frame.request()).await;
-                        frame.complete(result.is_ok());
-                        // A peer that could not be reached at all is told to
-                        // the frame's owner, whose core probes it instead of
-                        // streaming into a void (27 §3.3); a lane that was
-                        // full or a peer that refused is not that.
-                        if matches!(result, Err(PeerSendError::Lost)) {
-                            frame.lost();
+            frame = receiver.recv(), if receiving => {
+                let Some(frame) = frame else {
+                    receiving = false;
+                    continue;
+                };
+                report.attempted = report.attempted.saturating_add(1);
+                let target = frame.target();
+                let held = peers.get(&target).map_or(0, Waiting::len);
+                if tasks.len().saturating_add(waiting) >= max_inflight {
+                    // Full. The peer that holds the most waiting gives up
+                    // its newest for this frame, unless it holds no more
+                    // than this frame's own peer; then this frame is given
+                    // up. Nothing being sent is given up: where nothing
+                    // waits there is no room to make.
+                    let most = peers
+                        .iter()
+                        .map(|(peer, held)| (held.len(), *peer))
+                        .max();
+                    let made = match most {
+                        Some((length, peer)) if peer != target && length > held => peers
+                            .get_mut(&peer)
+                            .and_then(Waiting::newest),
+                        _ => None,
+                    };
+                    match made {
+                        Some(given_up) => {
+                            waiting = waiting.saturating_sub(1);
+                            report.refused = report.refused.saturating_add(1);
+                            given_up.give_up();
                         }
-                        // Keep the whole frame, especially its Allocation, alive
-                        // across connection setup, retries and response receipt.
-                        drop(frame);
-                        result
-                    }).catch_unwind());
+                        None => {
+                            report.refused = report.refused.saturating_add(1);
+                            frame.give_up();
+                            continue;
+                        }
+                    }
+                }
+                let peer = peers.entry(target).or_default();
+                if peer.sending < lane {
+                    peer.sending = peer.sending.saturating_add(1);
+                    tasks.push(send(frame));
                     report.peak_inflight = report.peak_inflight.max(tasks.len());
-                } else { receiving = false; }
+                    continue;
+                }
+                match peer.push(frame) {
+                    None => {
+                        waiting = waiting.saturating_add(1);
+                        report.peak_waiting = report.peak_waiting.max(waiting);
+                    }
+                    Some(frame) => {
+                        report.refused = report.refused.saturating_add(1);
+                        frame.give_up();
+                    }
+                }
             }
             completed = tasks.next(), if !tasks.is_empty() => {
-                match completed.ok_or(ReplicationDriverError::Worker)?.map_err(|_| ReplicationDriverError::Worker)? {
+                let (target, result) = completed
+                    .ok_or(ReplicationDriverError::Worker)?
+                    .map_err(|_| ReplicationDriverError::Worker)?;
+                match result {
                     Ok(()) => report.accepted = report.accepted.saturating_add(1),
                     Err(PeerSendError::Busy) => report.saturated = report.saturated.saturating_add(1),
                     Err(_) => report.lost = report.lost.saturating_add(1),
+                }
+                // The peer's place is free: its next frame takes it.
+                let mut idle = false;
+                if let Some(peer) = peers.get_mut(&target) {
+                    match peer.next() {
+                        Some(frame) => {
+                            waiting = waiting.saturating_sub(1);
+                            tasks.push(send(frame));
+                        }
+                        None => {
+                            peer.sending = peer.sending.saturating_sub(1);
+                            idle = peer.sending == 0;
+                        }
+                    }
+                }
+                if idle {
+                    peers.remove(&target);
                 }
             }
         }

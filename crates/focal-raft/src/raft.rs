@@ -109,6 +109,33 @@ pub enum ReadRounds {
     Each,
 }
 
+/// What a member says when it answers a heartbeat, and what its leader
+/// makes of a full window when it hears it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeartbeatAnswers {
+    /// How far the member's log goes: its last index and that entry's
+    /// term. A leader whose term the entry is of made it, and the member
+    /// took it and all before it from that leader's appends: it holds the
+    /// leader's log through that index, which is what an append's answer
+    /// says, and the leader takes it as one. Answers that were lost are
+    /// made good, exactly, by the next heartbeat's, and the window gives
+    /// back what the member holds and nothing else: a member that answers
+    /// heartbeats and holds nothing new is sent nothing more, so the bytes
+    /// out stay within their bound. One whose window is full and that has
+    /// answered for none of it through a beat of the leader's ticks is
+    /// probed; a probe is sent again when it was told lost, or once a beat
+    /// has passed since it was sent.
+    #[default]
+    Position,
+    /// Nothing of its log; and a leader that hears from a member whose
+    /// window is full frees the window's first message and sends the next,
+    /// whatever became of the first: the rule of `raft-rs`. The bytes out
+    /// then pass their bound by a message for every beat the member answers
+    /// heartbeats and no append. Kept to compare the two cores under one
+    /// rule.
+    Bare,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub id: NodeId,
@@ -140,6 +167,7 @@ pub struct Config {
     pub priority: i64,
     pub precedence: Precedence,
     pub read_rounds: ReadRounds,
+    pub heartbeat_answers: HeartbeatAnswers,
     /// Whether the group has the fast track ([`crate::fast`]). It is part
     /// of what the group is: every member is opened with the same.
     pub fast: bool,
@@ -166,6 +194,7 @@ impl Config {
             priority: 0,
             precedence: Precedence::Log,
             read_rounds: ReadRounds::Shared,
+            heartbeat_answers: HeartbeatAnswers::Position,
             fast: false,
             skip_bcast_commit: false,
             seed: id,
@@ -800,10 +829,21 @@ impl<S: Storage> Raft<S> {
         }
     }
     /// A member that has no term has no log to defend, and every candidate
-    /// is current against it: its priority judges nothing. What is in
-    /// force changes between operations and never within one.
+    /// is current against it: its priority judges nothing. Nor does that of
+    /// a member that may not campaign — one its configuration names no
+    /// voter: a refusal for priority is safe because the member that
+    /// refuses could be elected itself, and one that cannot would leave a
+    /// group that can elect without a leader. (A leader that applied its
+    /// own removal, of higher priority than the voter that remained and
+    /// had not yet heard the removal committed, refused that voter for
+    /// good.) What is in force changes between operations and never within
+    /// one.
     pub(crate) fn settle_priority(&mut self) {
-        self.priority_in_force = if self.term == 0 { 0 } else { self.priority };
+        self.priority_in_force = if self.term == 0 || !self.promotable {
+            0
+        } else {
+            self.priority
+        };
     }
     /// The ticks this member waits beyond its election timeout before it
     /// campaigns.
@@ -1228,6 +1268,12 @@ impl<S: Storage> Raft<S> {
         if self.state != StateRole::Leader {
             return Ok(ready);
         }
+        let id = self.id;
+        for (member, progress) in self.tracker.iter_mut() {
+            if member != id {
+                progress.tick();
+            }
+        }
         if self.heartbeat_elapsed >= self.config.heartbeat_tick {
             self.heartbeat_elapsed = 0;
             ready = true;
@@ -1603,11 +1649,19 @@ impl<S: Storage> Raft<S> {
                 Ok(())
             }
             MessageType::MsgUnreachable => {
-                // What was sent ahead is likely lost.
-                if let Some(progress) = self.tracker.get_mut(message.from)
-                    && progress.state == ProgressState::Replicate
-                {
-                    progress.become_probe();
+                // What was sent ahead is likely lost; a probe that was, is
+                // sent again.
+                if let Some(progress) = self.tracker.get_mut(message.from) {
+                    match progress.state {
+                        ProgressState::Replicate => progress.become_probe(),
+                        ProgressState::Probe
+                            if self.config.heartbeat_answers == HeartbeatAnswers::Position =>
+                        {
+                            progress.paused = false;
+                            progress.stalled = 0;
+                        }
+                        ProgressState::Probe | ProgressState::Snapshot => {}
+                    }
                 }
                 Ok(())
             }
@@ -1801,16 +1855,76 @@ impl<S: Storage> Raft<S> {
     }
     fn handle_heartbeat_response(&mut self, message: &Message) -> Result<()> {
         let last = self.log.last_index()?;
+        let answers = self.config.heartbeat_answers;
+        // The member says how far its log goes, and its last entry is of
+        // this leader's term: this leader made that entry, and the member
+        // took it and everything before it from this leader's appends. It
+        // holds this leader's log through that index — what an append's
+        // answer says, and it is taken as one: an answer that was lost is
+        // made good by the next heartbeat's. Not where entries go by the
+        // fast track, whose terms are not the same at every member.
+        let held = answers == HeartbeatAnswers::Position
+            && message.log_term != 0
+            && message.log_term == self.term
+            && message.index <= last;
+        let news = held
+            && !self.config.fast
+            && self
+                .tracker
+                .get(message.from)
+                .is_some_and(|progress| progress.matched < message.index);
+        if news {
+            let mut ack = proto::message(self.id, MessageType::MsgAppendResponse);
+            ack.from = message.from;
+            ack.index = message.index;
+            self.handle_append_response(&ack)?;
+        }
+        // A beat of the leader's ticks: what was sent a beat ago has had
+        // the time, on a path the ticks are stretched by, to be answered.
+        let beat = self.config.heartbeat_tick.max(1);
         let (mut outbox, tracker) = self.outbox();
         let Some(progress) = tracker.get_mut(message.from) else {
             return Ok(());
         };
         progress.update_committed(message.commit);
         progress.recent_active = true;
-        progress.paused = false;
-        // A full window would wait on answers that may be lost.
-        if progress.state == ProgressState::Replicate && progress.inflights.full() {
-            progress.inflights.free_first_one();
+        match answers {
+            HeartbeatAnswers::Bare => {
+                progress.paused = false;
+                // A full window would wait on answers that may be lost.
+                if progress.state == ProgressState::Replicate && progress.inflights.full() {
+                    progress.inflights.free_first_one();
+                }
+            }
+            HeartbeatAnswers::Position => match progress.state {
+                ProgressState::Replicate => {
+                    if held {
+                        progress.inflights.free_to(message.index);
+                    }
+                    // The window is full, and the member answers
+                    // heartbeats and nothing of what is out. Nothing more
+                    // is sent for that: what is out stays within its
+                    // bound. Once a beat has passed with no answer for any
+                    // of it, the member is not being reached by it — what
+                    // its owner was not told was lost — and it is asked
+                    // where it is.
+                    if !news && progress.inflights.full() && progress.stalled >= beat {
+                        progress.become_probe();
+                    }
+                }
+                // The one message a probe is, is sent again when it was
+                // told lost (`MsgUnreachable`), and when a beat has passed
+                // since it was sent and the member answers heartbeats and
+                // not it — not at every heartbeat's answer, which on a path
+                // slower than the heartbeats sent the page again and again
+                // behind itself.
+                ProgressState::Probe if progress.paused => {
+                    if progress.stalled >= beat {
+                        progress.paused = false;
+                    }
+                }
+                ProgressState::Probe | ProgressState::Snapshot => {}
+            },
         }
         if progress.matched < last || progress.pending_request_snapshot != 0 {
             outbox.append(message.from, progress, true)?;
@@ -2066,6 +2180,12 @@ impl<S: Storage> Raft<S> {
         let mut answer = proto::message(message.from, MessageType::MsgHeartbeatResponse);
         answer.context = std::mem::take(&mut message.context);
         answer.commit = self.log.committed();
+        if self.config.heartbeat_answers == HeartbeatAnswers::Position {
+            // How far this log goes. It is sent once what the log holds is
+            // durable, as every answer of a member that does not lead is.
+            answer.index = self.log.last_index()?;
+            answer.log_term = self.log.last_term()?;
+        }
         self.send(answer)
     }
     fn handle_snapshot(&mut self, mut message: Message) -> Result<()> {

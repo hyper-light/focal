@@ -108,13 +108,15 @@ pub struct ControlReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
     snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
-    /// Where the driver says the peer could not be reached (`ReplicationFrame::lost`).
+    /// Where the driver says the frame did not reach its peer (`ReplicationFrame::lost`).
     lost: Option<mpsc::SyncSender<u64>>,
+    /// `ReplicationFrame::urgent`.
+    pub(crate) urgent: bool,
     // Retained until transport finishes, including connection setup/retries.
     _charge: Allocation,
 }
 impl ControlReplicationFrame {
-    /// The driver could not reach the peer at all.
+    /// The frame did not reach its peer (`ReplicationFrame::lost`).
     pub(crate) fn lost(&mut self) {
         if let Some(lost) = self.lost.take() {
             let _ = lost.try_send(self.target);
@@ -1805,7 +1807,10 @@ impl<V: AuthorityVerifier> Owner<V> {
                 self.budget
                     .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)
             else {
+                // Told to the core as a frame the driver gave up is: the
+                // member is probed (`report_lost`).
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
             let encoded = message.write_to_bytes().map_err(|_| ControlError::Failed)?;
@@ -1815,9 +1820,12 @@ impl<V: AuthorityVerifier> Owner<V> {
                 .is_none_or(|n| n > self.limits.max_frame_bytes as usize)
             {
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             }
             self.nonce = self.nonce.checked_add(1).ok_or(ControlError::Capacity)?;
+            let urgent = crate::fleet::urgent(&message);
+            let target = message.to;
             let request = RequestEnvelope {
                 protocol: PROTOCOL_VERSION,
                 ledger: self.config.namespace,
@@ -1836,11 +1844,13 @@ impl<V: AuthorityVerifier> Owner<V> {
                     request,
                     snapshot,
                     lost: Some(self.lost_sender.clone()),
+                    urgent,
                     _charge: charge.commit(),
                 })
                 .is_err()
             {
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(target);
             }
         }
         Ok(())

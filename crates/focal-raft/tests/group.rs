@@ -204,6 +204,49 @@ fn a_round_confirms_no_read_asked_after_it_left() {
     assert_eq!(group.answered, 1);
 }
 
+/// A member that may not campaign refuses no one for priority. Two voters;
+/// the one of higher priority leads and removes itself. The other holds the
+/// removal and has not heard it committed, so by its configuration it still
+/// needs the first one's vote; the first, which applied the removal and
+/// follows, could never be elected itself. Its priority judges nothing: it
+/// votes, and the group goes on. (It refused, and the group had no leader
+/// for good: found by a schedule of three thousand.)
+#[test]
+fn a_member_that_left_refuses_no_one_for_priority() {
+    let mut group: Cluster<New> = Cluster::new(2, &[1, 2], Settings::focal(), 11);
+    elect(&mut group, 2);
+    group.act(&Op::Priority(2, 3));
+    group.act(&Op::Propose(2, b"before".to_vec()));
+    quiet(&mut group);
+    group.act(&Op::Change(2, change(ConfChangeType::RemoveNode, 2)));
+    // The removal reaches member 1 and its answer reaches member 2, which
+    // commits it, applies it and follows, telling member 1 to campaign.
+    // That reaches member 1, which takes a term for it; the commit, and the
+    // vote member 1 then asks for, are lost. Member 1 is left a term ahead
+    // of member 2, so that what member 2 answers from its own term member 1
+    // does not hear.
+    let append = MessageType::MsgAppend as i32;
+    let answer = MessageType::MsgAppendResponse as i32;
+    let campaign = MessageType::MsgTimeoutNow as i32;
+    let to = |kind: i32, member: u64| {
+        move |message: &Message| message.msg_type == kind && message.to == member
+    };
+    assert!(deliver(&mut group, to(append, 1)) > 0);
+    assert!(deliver(&mut group, to(answer, 2)) > 0);
+    assert_eq!(deliver(&mut group, to(campaign, 1)), 1);
+    group.net.clear();
+    assert!(group.leaders_now().is_empty());
+    let left = group.peek(2).unwrap().view();
+    let stayed = group.peek(1).unwrap().view();
+    assert!(!left.promotable && stayed.promotable);
+    assert!(left.commit > stayed.commit && left.last_index == stayed.last_index);
+    assert!(stayed.term > left.term);
+    // Member 1 is elected by member 2's vote, commits the removal and leads
+    // alone.
+    assert!(group.settles(400));
+    assert_eq!(group.leaders_now(), vec![1]);
+}
+
 fn change(kind: ConfChangeType, member: u64) -> ConfChangeV2 {
     ConfChangeV2 {
         changes: vec![ConfChangeSingle {

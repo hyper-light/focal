@@ -176,6 +176,13 @@ pub struct Progress {
     pub inflights: Inflights,
     /// The member's commit as it last said.
     pub committed_index: u64,
+    /// The leader's ticks since something sent to the member was out and
+    /// none of it was answered for: a full window, or a probe
+    /// (`HeartbeatAnswers`). A tick is the leader's own period, which its
+    /// owner stretches by the path to the group's members; so a beat of
+    /// ticks is time enough, on whatever path, for what was sent to have
+    /// been answered.
+    pub stalled: usize,
 }
 impl Progress {
     pub fn new(next_index: u64, window: usize, window_bytes: u64) -> Self {
@@ -189,10 +196,12 @@ impl Progress {
             recent_active: false,
             inflights: Inflights::new(window, window_bytes),
             committed_index: 0,
+            stalled: 0,
         }
     }
     fn reset_state(&mut self, state: ProgressState) {
         self.paused = false;
+        self.stalled = 0;
         self.pending_snapshot = 0;
         self.state = state;
         self.inflights.reset();
@@ -205,6 +214,7 @@ impl Progress {
         self.pending_snapshot = 0;
         self.pending_request_snapshot = 0;
         self.recent_active = false;
+        self.stalled = 0;
         self.inflights.reset();
     }
     pub fn become_probe(&mut self) {
@@ -238,6 +248,7 @@ impl Progress {
         if news {
             self.matched = index;
             self.paused = false;
+            self.stalled = 0;
         }
         self.next_index = self.next_index.max(index.saturating_add(1));
         news
@@ -279,6 +290,20 @@ impl Progress {
         self.paused = false;
         true
     }
+    /// A tick of the leader passed: counted for a member with a probe out
+    /// or a window that is full, and for no other.
+    pub fn tick(&mut self) {
+        let waits = match self.state {
+            ProgressState::Probe => self.paused,
+            ProgressState::Replicate => self.inflights.full(),
+            ProgressState::Snapshot => false,
+        };
+        self.stalled = if waits {
+            self.stalled.saturating_add(1)
+        } else {
+            0
+        };
+    }
     pub fn is_paused(&self) -> bool {
         match self.state {
             ProgressState::Probe => self.paused,
@@ -286,13 +311,15 @@ impl Progress {
             ProgressState::Snapshot => true,
         }
     }
-    /// The bytes a page for the member may hold: `page`, and while entries
-    /// are sent ahead of their answers, no more than the window has room
-    /// for.
+    /// The bytes a page for the member may hold: `page`, and no more than
+    /// the path to the member carries — what the window has room for while
+    /// entries are sent ahead of their answers, the window's bound for the
+    /// one message a probe is.
     pub fn page_bytes(&self, page: u64) -> u64 {
         match self.state {
             ProgressState::Replicate => page.min(self.inflights.room()),
-            ProgressState::Probe | ProgressState::Snapshot => page,
+            ProgressState::Probe => page.min(self.inflights.byte_cap()),
+            ProgressState::Snapshot => page,
         }
     }
     /// Entries through `last` were sent, `bytes` of them.
@@ -304,6 +331,7 @@ impl Progress {
             }
             ProgressState::Probe => {
                 self.paused = true;
+                self.stalled = 0;
                 Ok(())
             }
             ProgressState::Snapshot => Err(Error::Invariant(
@@ -708,8 +736,9 @@ mod tests {
     fn a_member_is_paused_by_its_state() {
         let mut progress = Progress::new(1, 2, 100);
         assert!(!progress.is_paused());
-        // Probed, a member is sent a whole page.
-        assert_eq!(progress.page_bytes(4_096), 4_096);
+        // Probed, a member is sent one message of what its path carries.
+        assert_eq!(progress.page_bytes(4_096), 100);
+        assert_eq!(progress.page_bytes(64), 64);
         progress.sent(1, 4_096).unwrap();
         assert!(progress.is_paused() && progress.next_index == 1);
         progress.become_replicate();

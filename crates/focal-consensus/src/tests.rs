@@ -167,6 +167,12 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
     let index = node.drain().unwrap().applied_index;
     node.checkpoint(index, b"snapshot-prefix".to_vec()).unwrap();
     let term = node.status().term;
+    // The learner answers a heartbeat a beat after its probe went
+    // unanswered: the probe is sent again, as the checkpoint.
+    for _ in 0..node.heartbeat_tick() {
+        node.tick().unwrap();
+        drop(node.drain().unwrap());
+    }
     node.step(Message {
         from: 2,
         to: 1,

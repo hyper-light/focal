@@ -1512,12 +1512,12 @@ impl NetworkService {
             .control_output
             .take()
             .ok_or(ServiceError::Owner("egress already consumed"))?;
-        // Concurrent sends are bounded by the pool's own admission: a peer
-        // that stopped answering holds at most `per_peer_inflight` of them
-        // for one dial and then fails fast, so the driver's cap only has to
-        // exceed what the unreachable peers of a moment can hold at once,
-        // never leaving live followers' appends queued behind dead ones.
-        let inflight = self.pool.limits().max_inflight.min(1024);
+        // The drivers hold what the pool itself admits: every connection's
+        // lane at once. A send is started only when its peer's lane has a
+        // place for it (`replication::drive`), so a peer that stopped
+        // answering holds its own lane and nothing of another's (the
+        // audit's F42).
+        let inflight = self.pool.limits().max_inflight;
         let control_driver = drive_control_replication(output, &self.pool, inflight);
         let directory_startup = self.directory_startup.take();
         let owners = self

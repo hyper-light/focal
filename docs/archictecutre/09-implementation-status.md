@@ -12594,3 +12594,19 @@ F45). With the log held and 1, 100 and 1,000 sessions each with a write out, no 
 asked again, and all are committed 15 ms, 53 ms and 741 ms after the log answers (a debug
 build); the millisecond asked one session 166 times in a quarter of a second.
 
+### 2026-10-01 — F42: a slow peer holds its own lane; and what a heartbeat's answer says
+
+The driver that carries the groups' messages began a send before it had the peer's lane,
+so a peer that stopped answering filled it and the frames of every other peer waited in
+the owners' channel behind it; and a frame that was not delivered was told to its owner
+only when the peer could not be reached at all. A send now begins only when its peer's
+lane has a place; what has none waits in that peer's own queue, what a group cannot do
+without first; the driver never stops receiving; and every frame that is not accepted is
+told, so the core probes the member ([27](27-consensus-roadmap-and-slates-port.md) §12;
+the remediation record, F42). With every loss told, a heartbeat's answer says how far the
+member's log goes and is taken as an append's answer, and a full window waits: the bytes
+out to a member stay within their bound (§11), which closes F41. Found on the way: a
+member that had left a configuration vetoed the only candidate for priority (mended); and
+the fast track's election can commit two entries at one index (forty thousand schedules;
+recorded at 27 §4.6, not mended, used by no owner).
+

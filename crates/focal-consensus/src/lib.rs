@@ -85,6 +85,10 @@ pub struct NodeConfig {
     /// is no part of the identity record, whose bytes are as they were: a
     /// group that has it says so in a record of its own, which a binary
     /// that knows no fast track refuses.
+    ///
+    /// No group that holds anything of worth may have it yet: an election
+    /// in a fast group can commit a second entry at an index that holds
+    /// one (27 §4.6, found 2026-10-01). No owner sets it.
     #[serde(skip)]
     pub fast: bool,
 }

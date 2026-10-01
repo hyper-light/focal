@@ -531,7 +531,9 @@ impl<R: Replica> Cluster<R> {
                 self.act(&Op::Restart(id));
             }
         }
-        let mut proposed = None;
+        // The index the proposal took, and the term of the leader that
+        // took it.
+        let mut proposed: Option<(u64, u64)> = None;
         for round in 0..budget {
             // A member that joined after the leader's snapshot was taken is
             // not named by it and discards it: it is seeded by a snapshot
@@ -549,7 +551,20 @@ impl<R: Replica> Cluster<R> {
                     lose: false,
                 });
             }
-            if let Some(index) = proposed {
+            // A proposal taken by a leader that was deposed before it
+            // committed may be gone with its term: it is proposed again to
+            // the leader that followed, as its client would.
+            let leads = self
+                .leaders_now()
+                .into_iter()
+                .filter_map(|id| self.peek(id).map(|node| node.view().term))
+                .max();
+            if let (Some((_, term)), Some(now)) = (proposed, leads)
+                && now > term
+            {
+                proposed = None;
+            }
+            if let Some((index, _)) = proposed {
                 let leader = self.leaders_now().into_iter().next();
                 let conf =
                     leader.map(|leader| self.stores[(leader - 1) as usize].0.borrow().conf.clone());
@@ -569,7 +584,10 @@ impl<R: Replica> Cluster<R> {
             {
                 let reports = self.act(&Op::Propose(leader, b"settled".to_vec()));
                 if reports.iter().any(|report| report.accepted == Some(true)) {
-                    proposed = self.peek(leader).map(|node| node.view().last_index);
+                    proposed = self.peek(leader).map(|node| {
+                        let view = node.view();
+                        (view.last_index, view.term)
+                    });
                 }
             }
             for id in self.ids() {

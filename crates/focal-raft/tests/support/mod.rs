@@ -413,6 +413,9 @@ pub struct Settings {
     /// Whether a leader sends a round of heartbeats for each read as it is
     /// asked, as in `raft-rs`.
     pub round_each: bool,
+    /// Whether a heartbeat's answer says nothing of the member's log and
+    /// frees a full window's first message, as in `raft-rs`.
+    pub bare_answers: bool,
     /// Whether the group has the fast track.
     pub fast: bool,
 }
@@ -431,6 +434,7 @@ impl Settings {
             pre_vote: true,
             by_length: true,
             round_each: true,
+            bare_answers: true,
             fast: false,
         }
     }
@@ -439,6 +443,7 @@ impl Settings {
         Self {
             by_length: false,
             round_each: false,
+            bare_answers: false,
             // A few of a schedule's entries: the window fills by its
             // bytes long before it fills by its places.
             max_inflight_bytes: 256,
@@ -537,7 +542,9 @@ pub struct Old {
 }
 impl Old {
     fn settle(&mut self) {
-        let effective = if self.raw.raft.term == 0 {
+        // As this core settles it: no term, or no voter, and the priority
+        // judges nothing.
+        let effective = if self.raw.raft.term == 0 || !self.raw.raft.promotable() {
             0
         } else {
             self.priority
@@ -859,6 +866,11 @@ impl Replica for New {
                 focal_raft::ReadRounds::Each
             } else {
                 focal_raft::ReadRounds::Shared
+            },
+            heartbeat_answers: if settings.bare_answers {
+                focal_raft::HeartbeatAnswers::Bare
+            } else {
+                focal_raft::HeartbeatAnswers::Position
             },
             fast: settings.fast,
             seed,

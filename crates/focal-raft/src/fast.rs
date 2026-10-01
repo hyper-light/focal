@@ -1,6 +1,13 @@
 //! The fast track (Fast Raft: Castiglia, Goldberg and Patterson, ICDCS
 //! 2020; 27 §4).
 //!
+//! **Not safe as built (27 §4.6, found 2026-10-01).** An elected leader
+//! whose log already fills an index keeps its own uncommitted entry there,
+//! though a fast quorum committed another since: the claim below that
+//! elections compare the log "as they always did" does not hold once a
+//! commit can rest on what members hold beside their logs. No group that
+//! holds anything of worth may have the fast track until that is mended.
+//!
 //! A proposer sends its entry for an index to every voter and not to the
 //! leader. A voter that holds nothing at the index holds the entry there,
 //! **approved by itself**, and once that is durable tells the leader what it

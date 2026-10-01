@@ -226,7 +226,13 @@ fn control_snapshot_local_queue_and_frame_limit_rejection_release_flow_control()
         }
         let dropped = fixture.owner.dropped;
         for _ in 0..8 {
-            // A heartbeat response makes the lagging learner recently active.
+            // A heartbeat response makes the lagging learner recently
+            // active; it comes a beat after the snapshot failed, which is
+            // when the learner is sent it again.
+            for _ in 0..fixture.owner.replica.heartbeat_tick() {
+                fixture.owner.replica.tick().unwrap();
+                fixture.owner.drain().unwrap();
+            }
             let mut heartbeat = Message {
                 from: 2,
                 to: 1,
