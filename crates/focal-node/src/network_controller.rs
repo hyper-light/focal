@@ -1566,8 +1566,17 @@ impl NetworkController {
                 .cloned()
                 .ok_or(ControllerError::Identity)?,
         };
+        // The sponsor is routed to while the founder's enrollment stands —
+        // its key enrolled and unrevoked — whether or not the certificate
+        // the observed registry names for it is still valid. A joiner's
+        // first observation is the genesis, whose founder certificate lasts
+        // one credential lifetime; the founder presents a renewal of that
+        // key, and the pool verifies what it presents under the cluster's
+        // roots and the founder's name. Tying the route to the named
+        // certificate left a host that joined a cluster older than a
+        // credential lifetime with no route to announce itself through.
         if self.state.node != self.state.genesis.founder.node
-            && grants.contains_key(&certificate_fingerprint(&founder.certificate))
+            && matches!(enrollment.invitation_revoked(founder.invitation), Ok(false))
         {
             // The sponsor's endpoint as pinned: an address, or a name the
             // pool re-resolves when it dials (24 §24); a name that did not

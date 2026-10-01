@@ -709,6 +709,18 @@ generation before any other root work (`next_root_command`); the partition
 learns the re-grant like a drain's (§19) and the node's seats stay its own.
 `cluster credentials get` and the renewal reply report `key_identity`.
 
+**A host that joins an old cluster (2026-09-30).** A joined host's first
+observation of the root is the genesis, and the genesis names the founder
+by the certificate it was founded with, which lasts one credential lifetime.
+The controller routed to its sponsor only while the certificate the observed
+registry names for the founder was granted, so a host that joined a cluster
+older than a credential lifetime had no route to announce itself through:
+it was enrolled and never admitted. The route stands while the founder's
+enrollment does — its key enrolled and unrevoked
+(`NetworkController::refresh`); the founder presents a renewal of that key,
+which the pool verifies under the cluster's roots and the founder's name,
+and the host's own listener admits as a renewal of an enrolled key.
+
 **Limits.** CA succession and issuer recovery are designed and not built
 (the remediation record, F13: a successor CA cross-signed both ways,
 committed and accepted from the pinned one; a lost `authority.bin` recovered

@@ -1474,6 +1474,21 @@ node `a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_
 through the succeeded one, a late host enrolls with the invitation's pins, and the founder
 restarts past its genesis lifetime on it and enrolls another).
 
+**Found on the way: a host that joins an old cluster was never admitted.** *Cause.*
+`NetworkController::refresh` installed the route to the sponsor only when the certificate
+the observed registry names for the founder was granted. A joiner's first observation is
+the genesis, which names the founder's genesis certificate; once that had expired (one
+credential lifetime: thirty days by default, twelve seconds in the test) the joiner had no
+route, announced its contact to no one, and stayed outside the root for good — enrolled,
+renewing while its pins lasted, never admitted. The earlier late-joiner check stopped the
+host right after its enrollment and never looked at its admission. *Fix.* The route stands
+while the founder's enrollment is unrevoked; what the founder presents is verified by the
+pool under the cluster's roots and the founder's name. *Test.* Node
+`a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up`
+(the founder's genesis certificate expires, a host joins, its contact is committed, it
+replicates the root and renews); it fails on the rule before, the host never past the
+genesis.
+
 **Residual (designed, next batch).** Stage 3 — issuer succession. Facts the design rests
 on (read 2026-09-30): the root is issued with path length zero (`pki.rs`,
 `BasicConstraints::Constrained(0)`), so it cannot sign an intermediate and a successor

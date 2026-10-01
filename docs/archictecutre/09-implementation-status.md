@@ -12507,3 +12507,11 @@ log holds up to as many dead bytes as live ones and a segment, where a rewrite l
 durability boundary (a campaign of seeds 100 to 399 replayed every group as the model held
 it); `focal-consensus` unchanged and green. The node exports the log's physical and live bytes and the cleaning counters.
 
+### 2026-09-30 — a host that joins a cluster older than a credential lifetime is admitted
+
+A host that joined a cluster older than a credential lifetime was enrolled and never
+admitted: its first observation of the root is the genesis, whose founder certificate had
+expired, and the controller routed to the sponsor only while that certificate was granted.
+The route stands while the founder's enrollment is unrevoked; `focal-node`
+`a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up`
+fails on the rule before.

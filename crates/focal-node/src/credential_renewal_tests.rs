@@ -676,3 +676,84 @@ async fn the_credential_lifetime_is_committed_at_genesis_and_a_later_change_is_r
     assert_eq!(restarted.expires_at - restarted.issued_at, 3600);
     founder.stop().await;
 }
+
+/// A host that joins a cluster older than a credential lifetime is admitted:
+/// its first observation of the root is the genesis, whose founder
+/// certificate has expired by then, and the founder is still its route —
+/// known by its enrolled key, presenting a renewal of it. The host
+/// announces itself, the root admits it, and it catches up and renews.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up()
+ {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let mut founder_settings = settings(founder_dir.path());
+    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+    let peer_settings = settings(peer_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let genesis = founder.handles.credentials.current().await.unwrap();
+    let (peer, _node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+    // The founder's genesis certificate runs out: the founder serves on its
+    // renewals.
+    until(
+        "the founder's genesis certificate expires",
+        &[&founder, &peer],
+        Duration::from_secs(4 * SHORT_LIFETIME),
+        async || {
+            let held = founder.handles.credentials.current().await.ok()?;
+            (unix_time().ok()? >= genesis.expires_at && held.expires_at > genesis.expires_at)
+                .then_some(())
+        },
+    )
+    .await;
+    let late_dir = tempfile::tempdir().unwrap();
+    let late_settings = settings(late_dir.path());
+    let (late, late_node) = join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
+    // The root admits it: its contact is committed and it replicates the
+    // root from there.
+    let admitted = try_until(
+        &[&founder, &peer, &late],
+        Duration::from_secs(40),
+        async || {
+            let observation = late.handles.control.observe_root().await.ok()?;
+            (observation.snapshot().applied_index > 0
+                && observation
+                    .contacts()
+                    .contacts
+                    .records
+                    .iter()
+                    .any(|contact| contact.node == late_node))
+            .then_some(())
+        },
+    )
+    .await;
+    if let Err(spent) = admitted {
+        let observation = founder.handles.control.observe_root().await.unwrap();
+        panic!(
+            "the late host {late_node} was never admitted ({spent}): members {:?} contacts {:?}; late {:?}",
+            observation.configuration().configuration,
+            observation
+                .contacts()
+                .contacts
+                .records
+                .iter()
+                .map(|contact| contact.node)
+                .collect::<Vec<_>>(),
+            late.outcome().await
+        );
+    }
+    // And it renews itself as the others do.
+    until(
+        "the late host renews",
+        &[&founder, &peer, &late],
+        Duration::from_secs(4 * SHORT_LIFETIME),
+        async || {
+            let held = late.handles.credentials.current().await.ok()?;
+            (held.renewals >= 1).then_some(())
+        },
+    )
+    .await;
+    late.stop().await;
+    peer.stop().await;
+    founder.stop().await;
+}
