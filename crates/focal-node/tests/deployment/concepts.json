@@ -1093,7 +1093,7 @@
           "--plan-file",
           "<founder>/node-1.plan",
           "--wait",
-          "180"
+          "300"
         ]
       },
       {

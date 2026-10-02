@@ -674,6 +674,96 @@ const CLUSTER_LEADER_TRANSFER: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_PARTITIONS_SHOW: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.show",
+    version: 1,
+    description: "Read a directory partition group's committed configuration and applied fence from the replica this node hosts (24 §13).",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions show"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["partition"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_ADD_LEARNER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.add_learner",
+    version: 1,
+    description: "Journal and commit a learner admission to a directory partition group, through the replica this node hosts when it leads the group; the root's grant seats the learner and it hosts a replica. On a lost response the exact p1: reference is asked again.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions add-learner"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_PROMOTE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.promote",
+    version: 1,
+    description: "Journal and commit a voter promotion in a directory partition group after actual catch-up, through the replica this node hosts when it leads the group.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions promote"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_REMOVE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.remove",
+    version: 1,
+    description: "Journal and commit a removal from a directory partition group, through the replica this node hosts when it leads the group; cluster.nodes.remove vacates a leaving node's seats itself.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions remove"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_TRANSFER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.transfer",
+    version: 1,
+    description: "Initiate a transfer of a directory partition group's leadership to one of its voters, from the replica this node hosts when it leads, or to this node itself through the leader. Success is initiation.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions transfer"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_REQUEST_INSPECT: OperationDescriptor = OperationDescriptor {
     name: "cluster.request.inspect",
     version: 1,
@@ -1014,7 +1104,7 @@ const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
-pub const ADMIN_TOOL_COUNT: usize = 57;
+pub const ADMIN_TOOL_COUNT: usize = 62;
 const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_NODE_IDENTITY,
     CLUSTER_NODE_HEALTH,
@@ -1054,6 +1144,11 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_MEMBERSHIP_REMOVE,
     CLUSTER_MEMBERSHIP_LEAVE_JOINT,
     CLUSTER_LEADER_TRANSFER,
+    CLUSTER_PARTITIONS_SHOW,
+    CLUSTER_PARTITIONS_ADD_LEARNER,
+    CLUSTER_PARTITIONS_PROMOTE,
+    CLUSTER_PARTITIONS_REMOVE,
+    CLUSTER_PARTITIONS_TRANSFER,
     CLUSTER_REQUEST_INSPECT,
     CLUSTER_REQUEST_RECONCILE,
     CLUSTER_REQUEST_RETRY,

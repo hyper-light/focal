@@ -467,9 +467,73 @@ carries the current state, not the genesis) — `host_seated_partition` hosts th
 partition's group only, and a split's groups stay the founder's until then. A
 partition membership change is submitted to the node the operator runs apply on,
 which must lead the group (the founder by default); a leader elsewhere refuses
-`not_leader` and the apply reports it. No hand verb drives a partition group's
-membership yet (the deployment's apply does); `cluster nodes remove` does not yet
-take a removed node out of the partition groups it votes in. The issuer's survival
+`not_leader` and the apply reports it. **Closed (batch 3, 2026-10-02):** `cluster
+partitions show|add-learner|promote|remove|transfer` drive a partition group's
+membership and leadership by hand (descriptors, MCP tools, the focal-cluster skill);
+`cluster nodes remove` vacates a leaving node's seats in every partition group before
+its root membership — the root's grant seats a host while it is a root member, so the
+groups must stop counting it before the root does — handing a group's leadership on
+first where the node leads, and reports `partitions_vacated`; a seat not vacated within
+the bound is a typed `partition_pending` (retry). Found on the way: a control replica
+refused a leadership transfer whenever it did not lead, so `nodes remove` could hand a
+leaving leader's leadership off only when run on that leader (it polled into
+`leader_leaving` elsewhere) — a voter asked to lead itself now forwards the request
+through the leader, as the consensus layer already allowed, for the root and the
+partition groups alike; and the `committed` result schema admitted only `a1:` references
+where a partition journal's are `p1:`. Guarded in `cli_nodes.rs`: the partition group is
+seated on all four hosts by hand, its leadership handed to the host that is then drained
+and removed, and the removal vacates the seat (leadership back with a voter that stays)
+before the root's membership. Writing that journey found two more: a membership
+change proposed while the one before it is committed and not yet applied by the
+leader's core was refused as a bad request (`Configuration("already in flight")` →
+`invalid_input`) — a moment, not a fault, which the apply met only by timing; it is a
+typed `MembershipPending`, answered `not_ready`, and asked again; and the
+administrator's refusals of a change that does not apply, or of a configuration read
+that is inconsistent, said only "invalid" — they name the cause now (`Inapplicable`,
+with the configuration it judged, and `Inconsistent`), which is what found the third:
+a partition change whose reply was lost (`outcome_unknown`) and was asked for again
+had its pending intent driven to its receipt — and then a second request built for the
+same change, which no longer applied (the learner the lost reply promoted was a voter);
+a repeat of the pending change is answered with that change's receipt. And a fourth,
+the gravest: a seated member's directory permit required its host eligible (batch 2,
+mirroring the founder's), so a *drained* host that led a partition group could not
+install the root's authority into it — the drain itself among it — and the group never
+recorded the drain, nothing healed, and removal refused forever (`drain_pending`, which
+now states the root's generation against the partition's and who leads it: "drained at
+generation 2, the placement observed 1, led by the drained node"). The permit admits a
+seat, and a drain does not unseat: the condition is gone; a drained leader installs the
+grant and its own agent records it. Behind it, four more, each found by the next failure
+once the one before was fixed (the hosted partition's health now shows what its
+authority refresh last installed and why it last refused, and `drain_pending` names the
+generations and the group's leader, which is how each was placed): a seated member that
+came to lead the group resubmitted the intents it had journaled as a follower — under
+its principal — through the local ingress with a peer built from its local client, and
+was refused for the mismatch every time (the local submit presents an intent as the
+client it was journaled under); the mirror image at the leader's ingress, which admitted
+a sender's local client in the decoder but not in the `Submit` and `Receipt` checks that
+follow (the founder's partition intents, journaled under its local client while it led,
+were refused through the new leader, so its own copy's progress never arrived and the
+heal stood at `Preparing`); `cluster nodes remove` read a placement with no partition
+observed yet as `unknown_node` (it waits, as for an eligible entry); and the agent wiped
+the operator's last observation whenever one pass observed nothing (a read refused, a
+replica between leaders), showing a cluster without partitions — it keeps the last
+observation and its time. **What the push's CI found (2dd3b32):** macOS — the control-plane and
+fleet journeys' applies ran out of 240 s and 180 s with the root and the partition
+group seated and the session step committed, as the CLI journey's had: the applies'
+work grew by a control group, and the allowances grow with it (360 s, 300 s); Windows —
+the unread stream's bound missed by 1.5 % (5.85 s against 5.77 s from a round trip the
+test sampled itself, 2.0 ms; residency over two megabytes moves ~2.6 s per millisecond
+of round trip): the connection now keeps the longest round trip any carriage on it was
+judged by (`QuicRemote::longest_round_trip`), and the bound is stated by it; Linux —
+the drained leader's heal, whose fix (asking the directory-named node's promise) was
+pushed as 9549f4f after that run. **CI of 9549f4f, Windows (PR run):**
+`credential_renewal::…admits_a_late_joiner` — the joined host's service refused to
+open, `Controller(Identity)`: its enrollment receipt had expired (the test commits a
+12 s lifetime so two renewals are seen within a minute; on the starved Windows debug
+runner the join-to-open took longer than that, and the controller rightly refuses a
+receipt past its expiry). The lifetime a test commits must exceed the slowest runner's
+join-to-open with the renewals still observable in the bound — sized as its own item
+(open). The issuer's survival
 is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone until
 then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands until
 both.

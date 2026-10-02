@@ -100,7 +100,13 @@ pub fn bulk_width(window: u64, most: usize) -> usize {
 }
 /// What the exchanges under way on a connection have to send, in bytes.
 #[derive(Default)]
-struct Held(std::sync::atomic::AtomicU64);
+struct Held {
+    bytes: std::sync::atomic::AtomicU64,
+    /// The longest round trip a carriage on the connection has seen while
+    /// it waited: what every carriage's residency was judged by, for a
+    /// measurer of the connection (`QuicRemote::longest_round_trip`).
+    longest: std::sync::atomic::AtomicU64,
+}
 /// One connection's delivery for its readers (`frame::Delivery`): what the
 /// connection received, and what each class declared and read.
 struct ConnectionDelivery<'a> {
@@ -137,13 +143,15 @@ impl Held {
         use std::sync::atomic::Ordering;
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         // A count that would not fit is held at what fits.
-        let mut before = self.0.load(Ordering::Acquire);
+        let mut before = self.bytes.load(Ordering::Acquire);
         loop {
             let after = before.saturating_add(bytes);
-            match self
-                .0
-                .compare_exchange_weak(before, after, Ordering::AcqRel, Ordering::Acquire)
-            {
+            match self.bytes.compare_exchange_weak(
+                before,
+                after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => {
                     let sending = Sending {
                         held: self,
@@ -155,15 +163,24 @@ impl Held {
             }
         }
     }
+    /// A carriage saw this round trip while it waited.
+    fn saw(&self, round_trip: std::time::Duration) {
+        let nanos = u64::try_from(round_trip.as_nanos()).unwrap_or(u64::MAX);
+        self.longest
+            .fetch_max(nanos, std::sync::atomic::Ordering::AcqRel);
+    }
+    fn longest(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.longest.load(std::sync::atomic::Ordering::Acquire))
+    }
     fn now(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.bytes.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 impl Drop for Sending<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        let mut before = self.held.0.load(Ordering::Acquire);
-        while let Err(found) = self.held.0.compare_exchange_weak(
+        let mut before = self.held.bytes.load(Ordering::Acquire);
+        while let Err(found) = self.held.bytes.compare_exchange_weak(
             before,
             before.saturating_sub(self.bytes),
             Ordering::AcqRel,
@@ -233,6 +250,7 @@ impl<'a> Carriage<'a> {
     /// time the path is given; `Timeout` once none is.
     fn wait(&mut self) -> Result<std::time::Duration, WireError> {
         self.longest = self.longest.max(self.connection.rtt());
+        self.held.saw(self.longest);
         // What came to the connection since is sent in turn with this.
         self.owed = self.owed.max(self.held.now());
         let given = residency(
@@ -1155,6 +1173,12 @@ impl QuicRemote {
     /// The round trip the connection measures of its path.
     pub fn round_trip(&self) -> std::time::Duration {
         self.connection.rtt()
+    }
+    /// The longest round trip any exchange carried on this connection was
+    /// judged by, and the path's now: what bounds, in the path's terms,
+    /// how long an exchange of so many bytes was given.
+    pub fn longest_round_trip(&self) -> std::time::Duration {
+        self.capacity.held.longest().max(self.connection.rtt())
     }
     pub async fn request(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, WireError> {
         self.request_within(request, self.limits.request_timeout)

@@ -762,6 +762,7 @@ impl ControlHost {
             .map_err(queue_error)?;
         receive.await.map_err(|_| ControlFailure::Unavailable)?
     }
+
     pub async fn submit(
         &self,
         peer: AuthenticatedPeer,
@@ -1364,6 +1365,29 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             let contact = matches!(request.operation, Operation::NodeContact { .. });
             let placement = matches!(request.operation, Operation::PlacementControl { .. });
+            // The clients a request may be named by: the peer's principal;
+            // over placement control, a node's root intents by the client
+            // derived from its principal (24 §16), and its partition intents
+            // by its local client — the name its own agent journals under
+            // while its replica leads the group, carried through the node
+            // that leads it once leadership moved (F24; the decoder admits
+            // the same three, and so must the receipt a retry asks for).
+            let sender = match verified.peer().role() {
+                PeerRole::Node { node_id } => Some(node_id),
+                _ => None,
+            };
+            let cluster = self.replica.identity().cluster.0;
+            let own_client = |client: [u8; 16]| {
+                client == principal.0
+                    || (placement
+                        && (client == crate::placement_control::root_intent_client(principal.0)
+                            || sender.is_some_and(|node| {
+                                client
+                                    == crate::placement_agent::PlacementAgent::local_client(
+                                        cluster, node,
+                                    )
+                            })))
+            };
             if placement {
                 // A node's own placement facts: bind the certificate-backed
                 // identity to the enrollment this owner has installed.
@@ -1505,12 +1529,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     {
                         return Err(ControlFailure::Unauthorized);
                     }
-                    // A node's root intents over placement control are named
-                    // by the client derived from its principal (24 §16).
-                    let root_intent = placement
-                        && request.id.client
-                            == crate::placement_control::root_intent_client(principal.0);
-                    if request.id.client != principal.0 && !root_intent {
+                    if !own_client(request.id.client) {
                         return Err(ControlFailure::Unauthorized);
                     }
                     if self
@@ -1539,7 +1558,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     }
                 }
                 ControlRpc::Read(query) => {
-                    if matches!(&query, ControlRead::Receipt(id) | ControlRead::AdminReceipt {id} if id.client != principal.0)
+                    if matches!(&query, ControlRead::Receipt(id) | ControlRead::AdminReceipt {id} if !own_client(id.client))
                     {
                         return Err(ControlFailure::Unauthorized);
                     }

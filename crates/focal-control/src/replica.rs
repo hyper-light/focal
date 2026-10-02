@@ -548,7 +548,16 @@ impl ControlReplica {
         self.node.membership_configuration().contains(node)
     }
     pub fn transfer(&mut self, request: &ControlTransfer) -> Result<(), ControlError> {
-        self.check_ready()?;
+        // A replica that does not lead may still ask to lead itself: the
+        // core forwards the request to the leader, which hands over as it
+        // would to any transferee (a voter's administrator reaching only
+        // that voter takes leadership away from a node that is leaving);
+        // asked for any other target it answers who leads.
+        if self.node.status().role == StateRole::Leader {
+            self.check_ready()?;
+        } else {
+            self.check()?;
+        }
         if self.pending.is_some() {
             return Err(ControlError::Busy);
         }

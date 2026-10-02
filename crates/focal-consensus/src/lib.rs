@@ -181,6 +181,8 @@ pub enum ConsensusError {
     CheckpointIndex,
     #[error("learner is not durably caught up through the commit index")]
     LearnerBehind,
+    #[error("a membership change is committed and not yet applied here; ask again once it is")]
+    MembershipPending,
     #[error("invalid peer message: {0}")]
     MalformedMessage(&'static str),
     #[error("a leader does not remove itself; transfer leadership first")]
@@ -1245,10 +1247,12 @@ impl DurableNode {
         if change.compute_size() as usize > self.config.max_entry_bytes {
             return Err(ConsensusError::Capacity);
         }
+        // A change committed and not yet applied by this member is a
+        // moment, not a fault in the request: the one that follows it is
+        // asked again once the configuration it builds on is applied (an
+        // administrator's promotion right after its admission's receipt).
         if self.raw.raft.has_pending_conf() {
-            return Err(ConsensusError::Configuration(
-                "a membership change is already in flight",
-            ));
+            return Err(ConsensusError::MembershipPending);
         }
         // One this member could not read where it is applied is not proposed.
         proto::Plan::of(&change)

@@ -21,14 +21,19 @@ The root metadata group and each installed application replica have separate con
 | `cluster nodes list` | `cluster.nodes.list` | Committed node contact announcements |
 | `cluster nodes drain --node N` | `cluster.nodes.drain` | Re-issue the node's grant ineligible at its next generation ([24 §19](archictecutre/24-placement-execution-and-fleet-control.md)); the controller heals every placement that named it and retires its copies. The founder is never drained; a node already drained commits nothing (`changed: false`) |
 | `cluster nodes undrain --node N` | `cluster.nodes.undrain` | Re-issue the node's grant eligible again |
-| `cluster nodes remove --node N` | `cluster.nodes.remove` | Remove a drained node no session names any more: its root-group membership when it has one, then the credential its invitation issued. Refused while eligible (`not_drained`) or holding copies (`node_holding`); a repeat resumes |
+| `cluster nodes remove --node N` | `cluster.nodes.remove` | Remove a drained node no session names any more: its seats in the directory's partition groups (leadership handed on first where it leads; `partitions_vacated` counts them), its root-group membership when it has one, then the credential its invitation issued. Refused while eligible (`not_drained`), holding copies (`node_holding`) or while a seat is still being vacated (`partition_pending`, retry); a repeat resumes |
 | `cluster nodes replace --node N --with M` | `cluster.nodes.replace` | Drain `N` once `M` is enrolled, alive, eligible and reporting (`node_not_ready` otherwise); the planner chooses among every eligible node |
 | `cluster membership show` | `cluster.membership.show` | Root configuration and applied prefix |
 | `cluster membership add-learner --node N` | `cluster.membership.add_learner` | Durably applied configuration receipt |
 | `cluster membership promote --node N` | `cluster.membership.promote` | Durably applied voter promotion after actual catch-up |
 | `cluster membership remove --node N` | `cluster.membership.remove` | Durably applied removal |
 | `cluster membership leave-joint` | `cluster.membership.leave_joint` | Durably applied joint-configuration exit |
-| `cluster leader transfer --node N` | `cluster.leader.transfer` | Transfer initiation; inspect the leader afterward |
+| `cluster leader transfer --node N` | `cluster.leader.transfer` | Transfer initiation; inspect the leader afterward. Asked from a voter that does not lead, for itself, the request goes through the leader |
+| `cluster partitions show --partition P` | `cluster.partitions.show` | A directory partition group's configuration and applied prefix, from the replica this node hosts ([24 §13](archictecutre/24-placement-execution-and-fleet-control.md)); `P` from `cluster placement`'s `control.partitions` |
+| `cluster partitions add-learner --partition P --node N` | `cluster.partitions.add_learner` | Durably applied learner admission to the partition's group, from the replica this node hosts when it leads it; the root's grant seats the host and it hosts a replica. References are `p1:<node>:<operation>` in the `PARTITION.admin` journal |
+| `cluster partitions promote --partition P --node N` | `cluster.partitions.promote` | Durably applied voter promotion after actual catch-up |
+| `cluster partitions remove --partition P --node N` | `cluster.partitions.remove` | Durably applied removal |
+| `cluster partitions transfer --partition P --node N` | `cluster.partitions.transfer` | Transfer initiation of the partition group's leadership; asked for this node itself from a voter that does not lead, it goes through the leader |
 | `cluster request inspect` | `cluster.request.inspect` | Latest local root admin intent or saved receipt |
 | `cluster request retry A1` | `cluster.request.retry` | Retry the identical retained intent |
 | `cluster request reconcile A1` | `cluster.request.reconcile` | Recover its receipt or evaluate its committed precondition fence |

@@ -13,6 +13,20 @@ pub enum AdminChange {
 }
 #[derive(Debug)]
 pub enum AdminAction {
+    /// A directory partition group's configuration (24 §13).
+    PartitionShow {
+        partition: [u8; 16],
+    },
+    PartitionChange {
+        partition: [u8; 16],
+        change: AdminChange,
+        expected_configuration_index: Option<u64>,
+    },
+    PartitionTransfer {
+        partition: [u8; 16],
+        node: u64,
+        expected_configuration_index: Option<u64>,
+    },
     NodeIdentity,
     NodeHealth,
     NodeConfiguration,
@@ -200,6 +214,18 @@ struct Empty {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Member {
+    node: u64,
+    expected_configuration_index: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartitionArg {
+    partition: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartitionMember {
+    partition: String,
     node: u64,
     expected_configuration_index: Option<u64>,
 }
@@ -692,6 +718,42 @@ pub(crate) fn parse(
                 expected_configuration_index: args.expected_configuration_index,
             }
         }
+        "cluster.partitions.show" => {
+            let args: PartitionArg = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("directory partition"))?;
+            AdminAction::PartitionShow {
+                partition: focal_client::input::parse_id(&args.partition)?,
+            }
+        }
+        "cluster.partitions.add_learner"
+        | "cluster.partitions.promote"
+        | "cluster.partitions.remove"
+        | "cluster.partitions.transfer" => {
+            let args: PartitionMember = serde_json::from_value(value).map_err(|_| {
+                InputError::Invalid("directory partition, cluster node and configuration fence")
+            })?;
+            if args.node == 0 {
+                return Err(InputError::Invalid("zero cluster node"));
+            }
+            let partition = focal_client::input::parse_id(&args.partition)?;
+            if name == "cluster.partitions.transfer" {
+                AdminAction::PartitionTransfer {
+                    partition,
+                    node: args.node,
+                    expected_configuration_index: args.expected_configuration_index,
+                }
+            } else {
+                AdminAction::PartitionChange {
+                    partition,
+                    change: match name {
+                        "cluster.partitions.add_learner" => AdminChange::AddLearner(args.node),
+                        "cluster.partitions.promote" => AdminChange::Promote(args.node),
+                        _ => AdminChange::Remove(args.node),
+                    },
+                    expected_configuration_index: args.expected_configuration_index,
+                }
+            }
+        }
         "cluster.request.retry" | "cluster.request.reconcile" => {
             let args: Retry = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("cluster admin operation reference"))?;
@@ -790,6 +852,15 @@ mod tests {
                 | "cluster.leader.transfer" => json!({"node":7,"expected_configuration_index":3}),
                 "cluster.request.retry" | "cluster.request.reconcile" => {
                     json!({"operation_id":"a1:0000000000000001:0000000000000002"})
+                }
+                "cluster.partitions.show" => {
+                    json!({"partition":"03030303030303030303030303030303"})
+                }
+                "cluster.partitions.add_learner"
+                | "cluster.partitions.promote"
+                | "cluster.partitions.remove"
+                | "cluster.partitions.transfer" => {
+                    json!({"partition":"03030303030303030303030303030303","node":7,"expected_configuration_index":3})
                 }
                 "cluster.invitations.get"
                 | "cluster.credentials.get"

@@ -950,9 +950,16 @@ absorbs, the upper host retires. A restart resumes from the committed facts:
 the hosted record, the seal, the root's delegations and each partition's
 epoch say exactly which step is next.
 
-**Limits.** Partition groups are hosted by the founder alone (one voter; the
-controller does not place control groups on other hosts yet, so a split
-bounds each metadata owner's state but not the founder's total); a merge
+**Limits.** The first partition's group is seated across hosts by the
+deployment's plan (§15) or by hand (`cluster partitions
+show|add-learner|promote|remove|transfer`, each one exact journaled request
+under `PARTITION.admin`, served by the replica the node hosts when it leads
+the group), and a leaving host's seat is vacated by `cluster nodes remove`
+before its root membership (handing the group's leadership on first where
+it led). The groups a split creates stay the founder's alone until a seated
+member can be founded on the sealed image — its genesis is the image's
+hash, which only the founder holds — so a split bounds each metadata
+owner's state but not yet the founder's total; a merge
 moves at most 256 sessions because the absorb command carries the sealed
 checkpoint; the founder's session is the only session a test can create,
 so the split qualification uses a threshold of one; there is no route cache
@@ -1296,7 +1303,15 @@ prepared and installed, and its signatures still count toward the
 majorities of the facts it is asked to attest (`InstalledAuthorityVerifier`,
 `prepare_membership_proof`) — until 2026-09-10 each of those refused an
 ineligible member, which would have left a drained voter's log unable to
-prove any later fact. A seat belongs to the node identity it was granted
+prove any later fact; and the permit that seats a member in a directory
+partition group (§13, `authorize_first_directory`) admits the seat whatever
+the host's eligibility — until 2026-10-02 it required the host eligible, so
+a drained host that led the group could not install the root's authority
+into it, the drain itself among it, and nothing healed. A node's partition intents
+are named by its local client while its replica leads the group and by its principal
+while it follows (§16); leadership may move between the two, so an intent is presented
+as the client it was journaled under on the local path, and the leader's ingress admits
+a sender's local client in its `Submit` and `Receipt` checks as its decoder does. A seat belongs to the node identity it was granted
 to, at the generation of that grant: the same key re-granted since (a drain
 or an undrain) still holds every seat at or below its current generation,
 so its signatures verify and its own proofs prepare; a membership epoch

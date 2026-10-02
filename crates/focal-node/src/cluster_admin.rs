@@ -67,6 +67,18 @@ pub enum ClusterAdminError {
     Expired,
     #[error("invalid admin request or inconsistent response")]
     Invalid,
+    #[error(
+        "the change does not apply to the group's configuration: {reason} (voters {voters:?}, learners {learners:?}, configuration index {configuration_index}, applied {applied_index})"
+    )]
+    Inapplicable {
+        reason: &'static str,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        configuration_index: u64,
+        applied_index: u64,
+    },
+    #[error("the group's configuration as read is inconsistent: {0}")]
+    Inconsistent(&'static str),
     #[error("invitation was not found in the committed enrollment registry")]
     NotFound,
     #[error(
@@ -75,8 +87,20 @@ pub enum ClusterAdminError {
     NodeHolding { node: u64, sessions: usize },
     #[error("node {0} is still eligible for placement; drain it first")]
     NotDrained(u64),
-    #[error("node {0} is drained, but the placement controller has not observed it yet; retry")]
-    DrainPending(u64),
+    #[error(
+        "node {node} is drained at the root's generation {grant_generation}, but the placement observed generation {observed_generation} (eligible {observed_eligible}; partition led by node {partition_leader}); retry"
+    )]
+    DrainPending {
+        node: u64,
+        grant_generation: u64,
+        observed_generation: u64,
+        observed_eligible: bool,
+        partition_leader: u64,
+    },
+    #[error(
+        "node {node} still votes in directory partition {partition}; its seat is being vacated; retry"
+    )]
+    PartitionPending { node: u64, partition: String },
     #[error("node {0} still leads the root group; its leadership is being transferred; retry")]
     LeaderLeaving(u64),
     #[error("node {0} is not enrolled in the directory")]
@@ -141,7 +165,8 @@ impl ClusterAdminError {
             },
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
-            Self::DrainPending(_) => Failure::error("drain_pending", 5),
+            Self::DrainPending { .. } => Failure::error("drain_pending", 5),
+            Self::PartitionPending { .. } => Failure::error("partition_pending", 5),
             Self::LeaderLeaving(_) => Failure::error("leader_leaving", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
             Self::MembersBehind { .. } => Failure::error("members_behind", 5),
@@ -152,7 +177,10 @@ impl ClusterAdminError {
                 code: "probe_failed",
                 exit_code: 1,
             },
-            Self::Invalid | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
+            Self::Invalid
+            | Self::Inapplicable { .. }
+            | Self::Inconsistent(_)
+            | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
                 Failure::error("invalid_input", 2)
             }
             _ => Failure::error("admin", 1),
@@ -955,7 +983,18 @@ impl ClusterAdmin {
         }
         change
             .apply_to(&current.configuration)
-            .map_err(|_| ClusterAdminError::Invalid)?;
+            .map_err(|error| match error {
+                focal_consensus::ConsensusError::Configuration(reason) => {
+                    ClusterAdminError::Inapplicable {
+                        reason,
+                        voters: current.configuration.voters.clone(),
+                        learners: current.configuration.learners.clone(),
+                        configuration_index: current.configuration_index,
+                        applied_index: current.applied_index,
+                    }
+                }
+                _ => ClusterAdminError::Invalid,
+            })?;
         let sequence = saved.next_control;
         let operation = saved.next;
         let next = operation
@@ -1098,7 +1137,9 @@ impl ClusterAdmin {
     /// Whether the committed grant for `node` is already ineligible: the
     /// eligibility prepare read yields no command when the grant already
     /// states what is asked.
-    async fn grant_ineligible(&self, node: u64) -> Result<bool> {
+    /// Whether the root's committed grant for `node` is ineligible already,
+    /// and the grant's generation.
+    async fn grant_state(&self, node: u64) -> Result<(bool, u64)> {
         let reply = self
             .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
                 node,
@@ -1109,9 +1150,10 @@ impl ClusterAdmin {
             Ok(ControlReply::Read(ControlReadResult::PreparedEligibility {
                 node: prepared,
                 eligible: false,
+                generation,
                 command,
                 ..
-            })) if prepared == node => Ok(command.is_none()),
+            })) if prepared == node => Ok((command.is_none(), generation)),
             Ok(_) => Err(ClusterAdminError::Invalid),
             Err(ClusterAdminError::Control(ControlFailure::Invalid)) => {
                 Err(ClusterAdminError::UnknownNode(node))
@@ -1293,17 +1335,41 @@ impl ClusterAdmin {
         // say so, and name the pending drain if it still has not.
         let mut placement = self.placement_view().await?;
         let mut waited = 0u32;
-        while placement
-            .partitions
-            .iter()
-            .flat_map(|partition| partition.nodes.iter())
-            .any(|entry| entry.node == node && entry.eligible)
+        let mut grant_generation = 0;
+        // Waited for, bounded: a placement not observed at all yet (the
+        // agent's last pass saw no partition), as much as one that still
+        // shows the node eligible — neither says the node is unknown.
+        while placement.partitions.is_empty()
+            || placement
+                .partitions
+                .iter()
+                .flat_map(|partition| partition.nodes.iter())
+                .any(|entry| entry.node == node && entry.eligible)
         {
-            if waited == 0 && !self.grant_ineligible(node).await? {
-                return Err(ClusterAdminError::NotDrained(node));
+            if waited == 0 {
+                let (ineligible, generation) = self.grant_state(node).await?;
+                if !ineligible {
+                    return Err(ClusterAdminError::NotDrained(node));
+                }
+                grant_generation = generation;
             }
             if waited >= REMOVE_DRAIN_POLLS {
-                return Err(ClusterAdminError::DrainPending(node));
+                let observed = placement
+                    .partitions
+                    .iter()
+                    .flat_map(|partition| partition.nodes.iter())
+                    .find(|entry| entry.node == node);
+                return Err(ClusterAdminError::DrainPending {
+                    node,
+                    grant_generation,
+                    observed_generation: observed.map_or(0, |entry| entry.generation),
+                    observed_eligible: observed.is_some_and(|entry| entry.eligible),
+                    partition_leader: placement
+                        .control
+                        .as_ref()
+                        .and_then(|control| control.partitions.first())
+                        .map_or(0, |group| group.leader),
+                });
             }
             waited = waited.saturating_add(1);
             tokio::time::sleep(REMOVE_DRAIN_POLL).await;
@@ -1344,6 +1410,15 @@ impl ClusterAdmin {
                 node,
                 sessions: holding,
             });
+        }
+        // Its seats in the directory's partition groups first (24 §13; F24):
+        // the root's grant seats a host while it is a root member, so the
+        // groups must stop counting it before the root does.
+        let mut partitions_vacated = 0u32;
+        for partition in self.partitions_seating(node).await? {
+            if self.partition_vacate(partition, node).await? {
+                partitions_vacated = partitions_vacated.saturating_add(1);
+            }
         }
         let current = self.configuration().await?;
         if current.configuration.voters.contains(&node) {
@@ -1408,6 +1483,7 @@ impl ClusterAdmin {
         Ok(AdminResult::NodeRemoved {
             node,
             membership_removed,
+            partitions_vacated,
             invitation,
             revoked,
             contact_retired,

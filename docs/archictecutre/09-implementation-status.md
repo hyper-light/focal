@@ -12783,3 +12783,25 @@ voters, the learners and the nodes the directory names for the session that the 
 does not hold yet (the placement agent admits a pending plan's voters on every hosted
 copy before the log names them), so a replacement copy is asked for its promise ahead
 of its admission, and the admission waits on nothing.
+
+Two of batch 2's open items closed the same day: `cluster partitions
+show|add-learner|promote|remove|transfer` drive a directory partition group's membership
+and leadership by hand, and `cluster nodes remove` vacates a leaving node's seats in
+every partition group before its root membership (handing a group's leadership on first
+where it leads; `partitions_vacated` reports them). Found on the way: a control replica
+refused a leadership transfer whenever it did not lead, so a removal run anywhere but on
+the leaving leader could not hand its leadership off — a voter asked to lead itself now
+forwards the request through the leader, as the consensus layer already allowed. The
+nodes journey, extended to seat the partition group on all four hosts and hand its
+leadership to the host it drains, found six more on the way, each behind the one before
+(the remediation record under F24 batch 3): a membership change refused as invalid while
+the one before it was committed and not yet applied (`MembershipPending`, `not_ready`); a
+repeated partition change whose first reply was lost answered with its receipt rather
+than a second request; a seated member's permit that required its host eligible, so a
+drained host leading a partition group could not install the very drain (the permit
+admits a seat; a drain does not unseat); a member that came to lead resubmitting the
+intents it journaled as a follower under its local client; the leader's ingress
+admitting a sender's local client in its decoder but not in its `Submit` and `Receipt`
+checks; and `nodes remove` reading a placement not yet observed as an unknown node.
+Node health now shows what a hosted partition's authority refresh last installed and
+why it last refused, and `drain_pending` names the generations and the group's leader.

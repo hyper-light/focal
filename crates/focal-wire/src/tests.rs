@@ -4057,7 +4057,6 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
         packet
     }
     let answered = Arc::new(AtomicU64::new(0));
-    let longest = Arc::new(AtomicU64::new(0));
     let others = {
         let (remote, answered) = (remote.clone(), answered.clone());
         tokio::spawn(async move {
@@ -4071,19 +4070,14 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
             }
         })
     };
-    // The round trip, asked far more often than the exchange asks it.
-    let measuring = {
-        let (remote, longest) = (remote.clone(), longest.clone());
-        tokio::spawn(async move {
-            loop {
-                longest.fetch_max(remote.round_trip().as_nanos() as u64, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-    };
     let began = std::time::Instant::now();
     let stalled = remote.request_within(&stalled, UNREAD_PERIOD).await;
     let after = began.elapsed();
+    // The round trip the exchange was judged by: the longest any carriage
+    // on the connection saw while it waited (a sampler of the test's own
+    // misses what the carriage's own waits see — a Windows runner showed
+    // 5.85 s against a bound of 5.77 s from a sampled 2.0 ms, 2026-10-02).
+    let longest = remote.longest_round_trip();
     let during = answered.load(Ordering::Relaxed);
     // The others are answered after it as before, on the same connection.
     remote
@@ -4094,8 +4088,6 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
     assert!(!others.is_finished());
     others.abort();
     assert!(others.await.unwrap_err().is_cancelled());
-    measuring.abort();
-    let _ = measuring.await;
     remote.close();
     let _ = peer.await;
     for relay in relays {
@@ -4104,7 +4096,7 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
     Unread {
         stalled,
         after,
-        longest: Duration::from_nanos(longest.load(Ordering::Relaxed)),
+        longest,
         answered: during,
     }
 }

@@ -128,7 +128,12 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
             "--plan-file",
             plan_file.to_str().unwrap(),
             "--wait",
-            "240",
+            // The apply seats the root and the partition group (three
+            // voters each, admitted, caught up and promoted) before the
+            // session; its allowance covers that whole sequence on a
+            // starved runner (macOS CI ran out of 240 s with the session
+            // step committed after both groups were seated, 2026-10-02).
+            "360",
         ],
     );
     assert_eq!(applied["result"]["outcome"], "Complete", "{applied}");

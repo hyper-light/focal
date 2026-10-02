@@ -1,9 +1,13 @@
 //! Membership of the directory's partition groups (24 §13; the audit's
 //! F24), journaled like the root's: one latest request per node, retained
 //! until its receipt is known, so a lost reply is recovered by reference and
-//! never re-issued as a fresh change.
+//! never re-issued as a fresh change; a group's leadership handed on; and a
+//! leaving node's seats vacated, which `cluster nodes remove` does before
+//! the node leaves the root (its seats' permits end with its root
+//! membership, and a group must not count a voter that is gone).
 use super::*;
 use crate::network_admin::{PartitionAdminCommand, PartitionAdminReply};
+use focal_control::ControlTransfer;
 use std::collections::BTreeMap;
 
 const DIRECTORY: &str = "PARTITION.admin";
@@ -56,21 +60,33 @@ impl ClusterAdmin {
         else {
             return Err(ClusterAdminError::Invalid);
         };
-        if actual != partition
-            || group == [0; 16]
-            || configuration.identity.cluster.0 != self.identity.cluster
+        if actual != partition || group == [0; 16] {
+            return Err(ClusterAdminError::Inconsistent(
+                "another partition or no group",
+            ));
+        }
+        if configuration.identity.cluster.0 != self.identity.cluster
             || configuration.identity.group != group
-            || configuration.configuration_index > configuration.applied_index
-            || record
-                .as_ref()
-                .is_some_and(|record| record.index != configuration.configuration_index)
         {
-            return Err(ClusterAdminError::Invalid);
+            return Err(ClusterAdminError::Inconsistent("the replica's identity"));
+        }
+        if configuration.configuration_index > configuration.applied_index {
+            return Err(ClusterAdminError::Inconsistent(
+                "configuration index ahead of the applied index",
+            ));
+        }
+        if record
+            .as_ref()
+            .is_some_and(|record| record.index != configuration.configuration_index)
+        {
+            return Err(ClusterAdminError::Inconsistent(
+                "membership record at another index than the configuration",
+            ));
         }
         configuration
             .configuration
             .validate()
-            .map_err(|_| ClusterAdminError::Invalid)?;
+            .map_err(|_| ClusterAdminError::Inconsistent("the configuration itself"))?;
         Ok(PartitionConfiguration {
             group,
             leader,
@@ -95,13 +111,23 @@ impl ClusterAdmin {
         let (mut journal, mut state) = self.partition_journal(true)?;
         // A request whose outcome is still unknown is asked again under its
         // exact identity first: the group's retry window answers what it
-        // committed, and only a request it never took is still pending.
-        if state
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
+        // committed, and only a request it never took is still pending. An
+        // operator asking for that same change again is given its receipt —
+        // a change that took is not asked for twice (the second would not
+        // apply: a learner the lost reply promoted is a voter now).
+        if let Some(latest) = state.latest.as_ref()
+            && latest.receipt.is_none()
+            && !latest.superseded
         {
-            self.partition_drive(&mut journal, &mut state).await?;
+            let same = latest.partition == partition
+                && matches!(
+                    &latest.request.command,
+                    ControlCommand::Membership(command) if command.change == change
+                );
+            let driven = self.partition_drive(&mut journal, &mut state).await?;
+            if same {
+                return Ok(driven);
+            }
         }
         let current = self.partition_configuration(partition).await?;
         if expected_index.is_some_and(|index| index != current.configuration.configuration_index) {
@@ -109,7 +135,18 @@ impl ClusterAdmin {
         }
         change
             .apply_to(&current.configuration.configuration)
-            .map_err(|_| ClusterAdminError::Invalid)?;
+            .map_err(|error| match error {
+                focal_consensus::ConsensusError::Configuration(reason) => {
+                    ClusterAdminError::Inapplicable {
+                        reason,
+                        voters: current.configuration.configuration.voters.clone(),
+                        learners: current.configuration.configuration.learners.clone(),
+                        configuration_index: current.configuration.configuration_index,
+                        applied_index: current.configuration.applied_index,
+                    }
+                }
+                _ => ClusterAdminError::Invalid,
+            })?;
         let operation = state.next;
         let next = operation
             .checked_add(1)
@@ -148,6 +185,155 @@ impl ClusterAdmin {
         });
         save_value(&mut journal, &state)?;
         self.partition_drive(&mut journal, &mut state).await
+    }
+    /// Hand the partition group's leadership to `target`, fenced on the
+    /// configuration index when given; initiation, as the root's transfer.
+    pub async fn partition_transfer(
+        &self,
+        partition: [u8; 16],
+        target: u64,
+        expected_index: Option<u64>,
+    ) -> Result<AdminResult> {
+        let current = self.partition_configuration(partition).await?;
+        if expected_index.is_some_and(|index| index != current.configuration.configuration_index) {
+            return Err(ControlFailure::CompareFailed.into());
+        }
+        if target == 0 || !current.configuration.configuration.voters.contains(&target) {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let request = ControlTransfer {
+            expected_configuration_index: current.configuration.configuration_index,
+            expected: current.configuration.configuration,
+            target,
+        };
+        match self
+            .partition_exchange(PartitionAdminCommand::Transfer {
+                partition,
+                request: Box::new(request),
+            })
+            .await?
+        {
+            PartitionAdminReply::TransferInitiated {
+                partition: actual,
+                target: initiated,
+                ..
+            } if actual == partition && initiated == target => {
+                Ok(AdminResult::TransferInitiated { target })
+            }
+            _ => Err(ClusterAdminError::Invalid),
+        }
+    }
+    /// The partition groups whose seats name `node`, by the root's grants.
+    pub async fn partitions_seating(&self, node: u64) -> Result<Vec<[u8; 16]>> {
+        let placement = self.placement_view().await?;
+        let mut seating = Vec::new();
+        for group in placement
+            .control
+            .iter()
+            .flat_map(|control| control.partitions.iter())
+        {
+            if !group.voters.contains(&node) && !group.learners.contains(&node) {
+                continue;
+            }
+            let Some(partition) = group.partition.as_deref() else {
+                continue;
+            };
+            let id =
+                focal_client::input::parse_id(partition).map_err(|_| ClusterAdminError::Invalid)?;
+            if seating.len() >= MAX_PARTITIONS {
+                return Err(ClusterAdminError::Capacity);
+            }
+            seating
+                .try_reserve_exact(1)
+                .map_err(|_| ClusterAdminError::Capacity)?;
+            seating.push(id);
+        }
+        Ok(seating)
+    }
+    /// Take `node` out of a partition group it is seated in: when it leads
+    /// the group its leadership is handed to another voter first, then its
+    /// removal is one exact journaled request, asked again — bounded, as the
+    /// root's removal is — while the group is not ready, mid-change or the
+    /// outcome unknown. Returns whether the configuration changed.
+    pub async fn partition_vacate(&self, partition: [u8; 16], node: u64) -> Result<bool> {
+        let mut changed = false;
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let current = self.partition_configuration(partition).await?;
+            let configuration = &current.configuration.configuration;
+            if !configuration.contains(node) {
+                return Ok(changed);
+            }
+            if configuration.voters_outgoing.is_empty() {
+                if current.leader == node && configuration.voters.contains(&node) {
+                    self.partition_lead_elsewhere(partition, node).await?;
+                    continue;
+                }
+                match self
+                    .partition_change(
+                        partition,
+                        MembershipChange::Remove { node },
+                        Some(current.configuration.configuration_index),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        changed = true;
+                        continue;
+                    }
+                    Err(
+                        ClusterAdminError::Pending
+                        | ClusterAdminError::Control(
+                            ControlFailure::NotReady
+                            | ControlFailure::CompareFailed
+                            | ControlFailure::Unavailable
+                            | ControlFailure::OutcomeUnknown,
+                        ),
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        Err(ClusterAdminError::PartitionPending {
+            node,
+            partition: hex(&partition),
+        })
+    }
+    /// Hand a partition group's leadership away from `leaving`: to this
+    /// node when it votes in the group (it may ask to lead itself through
+    /// the leader), else to another voter; bounded, as the root's is.
+    async fn partition_lead_elsewhere(&self, partition: [u8; 16], leaving: u64) -> Result<()> {
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let current = self.partition_configuration(partition).await?;
+            if current.leader != 0 && current.leader != leaving {
+                return Ok(());
+            }
+            let voters = &current.configuration.configuration.voters;
+            let target = if voters.contains(&self.identity.node) {
+                Some(self.identity.node)
+            } else {
+                voters.iter().copied().find(|voter| *voter != leaving)
+            };
+            if current.leader == leaving
+                && let Some(target) = target
+            {
+                // Refused while an earlier transfer or an election is in
+                // progress; the next read says where the group leads.
+                match self
+                    .partition_transfer(
+                        partition,
+                        target,
+                        Some(current.configuration.configuration_index),
+                    )
+                    .await
+                {
+                    Ok(_) | Err(ClusterAdminError::Control(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        Err(ClusterAdminError::LeaderLeaving(leaving))
     }
     pub async fn partition_retry(&self, reference: &str) -> Result<AdminResult> {
         let (mut journal, mut state) = self.partition_journal(false)?;

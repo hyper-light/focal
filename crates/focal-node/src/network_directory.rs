@@ -28,6 +28,17 @@ type HostedFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ServiceError>> + 
 pub struct HostedPartition {
     pub plan: PartitionPlan,
     pub host: ControlHost,
+    /// What the root's authority refresh last did on this replica: the
+    /// root index installed, and the refusal of the last attempt where it
+    /// did not install (none while it follows and is told so, or installs).
+    pub authority: AuthorityRefresh,
+}
+/// The state of a hosted replica's authority refresh (`refresh_authority`),
+/// shown in node health so a group whose authority is stale says why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthorityRefresh {
+    pub installed_index: u64,
+    pub refused: Option<String>,
 }
 /// What the placement agent asks of the host manager.
 pub enum HostRequest {
@@ -70,6 +81,8 @@ struct HostedRecordV1 {
 pub struct DirectoryHandle {
     plan: PartitionPlan,
     state: watch::Receiver<Option<ControlHost>>,
+    /// The first partition's authority refresh, where this node hosts it.
+    first_authority: watch::Receiver<AuthorityRefresh>,
     hosted: watch::Receiver<BTreeMap<PartitionId, HostedPartition>>,
     pending: watch::Receiver<BTreeMap<PartitionId, HostingAttempt>>,
     requests: async_mpsc::Sender<HostRequest>,
@@ -143,6 +156,7 @@ impl DirectoryHandle {
             all.push(HostedPartition {
                 plan: self.plan,
                 host,
+                authority: self.first_authority.borrow().clone(),
             });
         }
         let extra = self.hosted.borrow();
@@ -172,6 +186,7 @@ pub(super) struct DirectoryStartup {
     founder: bool,
     node: u64,
     state: watch::Sender<Option<ControlHost>>,
+    first_authority: watch::Sender<AuthorityRefresh>,
     hosted: watch::Sender<BTreeMap<PartitionId, HostedPartition>>,
     pending: watch::Sender<BTreeMap<PartitionId, HostingAttempt>>,
     requests: async_mpsc::Receiver<HostRequest>,
@@ -190,12 +205,15 @@ impl DirectoryStartup {
     ) -> Result<(DirectoryHandle, Self), DirectoryBootstrapError> {
         let plan = PartitionPlan::derive(cluster, founder)?;
         let (state, receiver) = watch::channel(None);
+        let (first_authority, first_authority_receiver) =
+            watch::channel(AuthorityRefresh::default());
         let (hosted, hosted_receiver) = watch::channel(BTreeMap::new());
         let (pending, pending_receiver) = watch::channel(BTreeMap::new());
         let (requests, request_receiver) = async_mpsc::channel(8);
         let handle = DirectoryHandle {
             plan,
             state: receiver,
+            first_authority: first_authority_receiver,
             hosted: hosted_receiver,
             pending: pending_receiver,
             requests,
@@ -205,6 +223,7 @@ impl DirectoryStartup {
             founder: node == founder,
             node,
             state,
+            first_authority,
             hosted,
             pending,
             requests: request_receiver,
@@ -238,13 +257,17 @@ impl DirectoryStartup {
             owners.register(PhysicalOwner::Control(owner))?;
             self.state.send_replace(Some(host.clone()));
             let plan = self.plan;
+            let first_authority = &self.first_authority;
             Box::pin(async move {
                 let replication = crate::replication::drive_directory_replication(
                     output,
                     pool,
                     pool.limits().max_inflight,
                 );
-                let refresh = refresh_authority(plan, root, &host, installed_index, expires_at);
+                let refresh =
+                    refresh_authority(plan, root, &host, installed_index, expires_at, |now| {
+                        first_authority.send_replace(now);
+                    });
                 tokio::pin!(replication, refresh);
                 tokio::select! {
                     result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("directory egress ended"))),
@@ -394,6 +417,10 @@ async fn drive_hosted(
             HostedPartition {
                 plan,
                 host: host.clone(),
+                authority: AuthorityRefresh {
+                    installed_index,
+                    refused: None,
+                },
             },
         );
     });
@@ -402,7 +429,13 @@ async fn drive_hosted(
     tokio::pin!(replication);
     // Whichever replica leads the group refreshes the root's authority in
     // it; one that follows is told so and waits.
-    let refresh = refresh_authority(plan, root, &host, installed_index, expires_at);
+    let refresh = refresh_authority(plan, root, &host, installed_index, expires_at, |now| {
+        hosted.send_modify(|map| {
+            if let Some(record) = map.get_mut(&plan.partition()) {
+                record.authority = now;
+            }
+        });
+    });
     tokio::pin!(refresh);
     if plan.host() != plan.founder_node() {
         // A member's replica runs while the root's grant seats this node in
@@ -577,7 +610,15 @@ async fn refresh_authority(
     directory: &ControlHost,
     mut installed_index: u64,
     mut expires_at: i64,
+    tell: impl Fn(AuthorityRefresh),
 ) -> Result<(), ServiceError> {
+    // What the last attempt did, told to node health when it changes: a
+    // replica whose group's authority is stale says why (a permit refused,
+    // the install refused, or no attempt yet).
+    let mut told = AuthorityRefresh {
+        installed_index,
+        refused: None,
+    };
     loop {
         if root.progress().stopped || directory.progress().stopped {
             return Err(ServiceError::Owner("directory authority owner ended"));
@@ -592,10 +633,11 @@ async fn refresh_authority(
                         .refresh_directory(permit)
                         .await
                         .map(|receipt| (receipt, valid_until))
+                        .map_err(|error| (error, "install"))
                 }
-                Err(error) => Err(error),
+                Err(error) => Err((error, "permit")),
             };
-            match outcome {
+            let now = match outcome {
                 Ok((receipt, valid_until)) => {
                     if receipt.root != root.progress().identity
                         || receipt.root_index < installed_index
@@ -604,14 +646,26 @@ async fn refresh_authority(
                     }
                     installed_index = receipt.root_index;
                     expires_at = valid_until;
+                    AuthorityRefresh {
+                        installed_index,
+                        refused: None,
+                    }
                 }
-                Err(
-                    DirectoryBootstrapError::Unauthorized
+                Err((
+                    error @ (DirectoryBootstrapError::Unauthorized
                     | DirectoryBootstrapError::Unavailable
                     | DirectoryBootstrapError::NotReady
-                    | DirectoryBootstrapError::Capacity,
-                ) => {}
-                Err(error) => return Err(error.into()),
+                    | DirectoryBootstrapError::Capacity),
+                    step,
+                )) => AuthorityRefresh {
+                    installed_index,
+                    refused: Some(format!("{step}: {error}")),
+                },
+                Err((error, _)) => return Err(error.into()),
+            };
+            if now != told {
+                tell(now.clone());
+                told = now;
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

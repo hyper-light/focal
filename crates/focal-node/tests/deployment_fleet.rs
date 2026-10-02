@@ -194,7 +194,11 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
             "--plan-file",
             plan_file.to_str().unwrap(),
             "--wait",
-            "180",
+            // The apply seats the root and the partition group before the
+            // session (F24); the allowance covers the whole sequence on a
+            // starved runner (macOS CI ran out of 180 s with the session
+            // step committed after both groups were seated, 2026-10-02).
+            "300",
         ],
     );
     assert_eq!(applied["result"]["outcome"], "Complete", "{applied}");

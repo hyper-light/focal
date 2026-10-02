@@ -181,6 +181,8 @@ impl LocalNetworkAdmin {
                                     term: progress.term,
                                     applied_index: progress.applied_index,
                                     stopped: progress.stopped,
+                                    authority_installed_index: hosted.authority.installed_index,
+                                    authority_refused: hosted.authority.refused.clone(),
                                 }
                             })
                             .collect()

@@ -158,9 +158,17 @@ quorum and decoder support; enrollment is not evidence of readiness.
 
 - Root group: `cluster.membership.add_learner`, `cluster.membership.promote`,
   `cluster.membership.remove`, `cluster.membership.leave_joint`.
+- Directory partition group (`partition` from `cluster.placement`'s
+  `control.partitions`): `cluster.partitions.show`,
+  `cluster.partitions.add_learner`, `cluster.partitions.promote`,
+  `cluster.partitions.remove`. A seat is admitted as a learner first; the
+  root's grant seats the host and it hosts a replica; promote once caught up.
+  The deployment's apply seats these groups by plan; `cluster.nodes.remove`
+  vacates a leaving host's seats itself.
 - Application group: `cluster.replicas.add_learner`, `cluster.replicas.promote`,
   `cluster.replicas.remove`, `cluster.replicas.leave_joint`.
-- Leadership: `cluster.leader.transfer` or `cluster.replicas.transfer`.
+- Leadership: `cluster.leader.transfer`, `cluster.partitions.transfer` or
+  `cluster.replicas.transfer`.
 
 Completion: retain the actual committed membership receipt and reread the
 selected configuration. Transfer reports initiation; observe the subsequent

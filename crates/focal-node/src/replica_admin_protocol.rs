@@ -336,6 +336,7 @@ fn failure(error: LedgerError) -> ControlFailure {
         LedgerError::MembershipConflict => ControlFailure::CompareFailed,
         LedgerError::Consensus(
             focal_consensus::ConsensusError::LearnerBehind
+            | focal_consensus::ConsensusError::MembershipPending
             | focal_consensus::ConsensusError::LeaderLeaving
             | focal_consensus::ConsensusError::PersistencePending,
         ) => ControlFailure::NotReady,

@@ -1,7 +1,9 @@
 //! Scoped OS-owner administration of the directory partition groups this
-//! node hosts (24 §13; the audit's F24): their configuration, and a
-//! membership change submitted to the one this node leads. The deployment's
-//! apply drives them, one exact request each, as it drives the root's.
+//! node hosts (24 §13; the audit's F24): their configuration, a membership
+//! change submitted to the one this node leads, and a hand-off of a group's
+//! leadership. The deployment's apply drives the seats, one exact request
+//! each, as it drives the root's; `cluster partitions` drives them by hand;
+//! `cluster nodes remove` vacates a leaving node's seats.
 use super::*;
 use focal_control::{ControlConfiguration, ControlMembershipRecord, ControlReceipt};
 use focal_directory::PartitionId;
@@ -17,6 +19,13 @@ pub enum PartitionAdminCommand {
     Change {
         partition: [u8; 16],
         request: Box<ControlRequest>,
+    },
+    /// Hand the partition group's leadership to one of its voters: from
+    /// the replica this node hosts when it leads, or — asked to lead itself
+    /// — through the leader, as the root's transfer. Success is initiation.
+    Transfer {
+        partition: [u8; 16],
+        request: Box<focal_control::ControlTransfer>,
     },
 }
 impl PartitionAdminCommand {
@@ -37,6 +46,16 @@ impl PartitionAdminCommand {
                     .map(|_| ())
                     .map_err(|_| AccessError::InvalidRequest)
             }
+            Self::Transfer { partition, request } if *partition != [0; 16] => {
+                request
+                    .expected
+                    .validate()
+                    .map_err(|_| AccessError::InvalidRequest)?;
+                if request.target == 0 || !request.expected.voters.contains(&request.target) {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
             _ => Err(AccessError::InvalidRequest),
         }
     }
@@ -54,6 +73,11 @@ pub enum PartitionAdminReply {
         partition: [u8; 16],
         group: [u8; 16],
         receipt: ControlReceipt,
+    },
+    TransferInitiated {
+        partition: [u8; 16],
+        group: [u8; 16],
+        target: u64,
     },
     Rejected(ControlFailure),
 }
@@ -114,17 +138,7 @@ impl LocalNetworkAdmin {
                     .host_of(PartitionId(partition))
                     .ok_or(ControlFailure::Unavailable)?;
                 let group = host.progress().identity.group;
-                // The partition's requests travel under the directory's own
-                // namespace; the administrator's grant covers its tenant.
-                let peer = AuthenticatedPeer::local(PeerGrant {
-                    principal,
-                    tenants: std::collections::BTreeSet::from([
-                        self.identity.ledger.tenant,
-                        directory.namespace().tenant,
-                    ]),
-                    role: PeerRole::Runtime,
-                })
-                .map_err(|_| ControlFailure::Unauthorized)?;
+                let peer = self.directory_peer(principal, directory)?;
                 let receipt = host.submit(peer, *request).await?;
                 Ok(PartitionAdminReply::Committed {
                     partition,
@@ -132,6 +146,39 @@ impl LocalNetworkAdmin {
                     receipt,
                 })
             }
+            PartitionAdminCommand::Transfer { partition, request } => {
+                let host = directory
+                    .host_of(PartitionId(partition))
+                    .ok_or(ControlFailure::Unavailable)?;
+                let group = host.progress().identity.group;
+                let peer = self.directory_peer(principal, directory)?;
+                let target = request.target;
+                // Correlation only: a transfer has no retry identity.
+                let id = RequestId::from_u128(u128::from(request.expected_configuration_index));
+                host.transfer(peer, id, *request).await?;
+                Ok(PartitionAdminReply::TransferInitiated {
+                    partition,
+                    group,
+                    target,
+                })
+            }
         }
+    }
+    /// The partition's requests travel under the directory's own namespace;
+    /// the administrator's grant covers its tenant.
+    fn directory_peer(
+        &self,
+        principal: focal_model::ParticipantId,
+        directory: &crate::network_service::DirectoryHandle,
+    ) -> Result<AuthenticatedPeer, ControlFailure> {
+        AuthenticatedPeer::local(PeerGrant {
+            principal,
+            tenants: std::collections::BTreeSet::from([
+                self.identity.ledger.tenant,
+                directory.namespace().tenant,
+            ]),
+            role: PeerRole::Runtime,
+        })
+        .map_err(|_| ControlFailure::Unauthorized)
     }
 }

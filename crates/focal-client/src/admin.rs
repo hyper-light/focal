@@ -58,6 +58,14 @@ pub struct AdminHostedPartition {
     pub term: u64,
     pub applied_index: u64,
     pub stopped: bool,
+    /// The root index whose authority this replica's refresh last
+    /// installed, and the refusal of its last attempt where it did not
+    /// (a permit the root refused, or an install the group refused; none
+    /// while it follows the group's leader, which installs).
+    #[serde(default)]
+    pub authority_installed_index: u64,
+    #[serde(default)]
+    pub authority_refused: Option<String>,
 }
 /// The node's readiness (doc 08 §9): the five probes a supervisor asks,
 /// with the facts they are derived from. `alive` holds whenever the node
@@ -799,6 +807,10 @@ pub enum AdminResult {
     NodeRemoved {
         node: u64,
         membership_removed: bool,
+        /// The directory partition groups the node was seated in and taken
+        /// out of before it left the root (24 §13).
+        #[serde(default)]
+        partitions_vacated: u32,
         invitation: Option<String>,
         revoked: bool,
         /// Its committed contact record was retired (24 §19), freeing the

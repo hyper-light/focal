@@ -549,13 +549,18 @@ pub(crate) fn authorize_first_directory(
         || group.voters.is_empty()
         || seat.is_none_or(|seat| *seat > node.enrollment.generation)
         || !group.outgoing_voters.is_empty()
-        || !node.enrollment.eligible
         // The group is authorized while its voter is: the founder's grant,
         // extended as its credential is renewed (24 §11).
         || authority.checkpoint().group_expires_at(group) <= now
     {
         return Err(DirectoryBootstrapError::Unauthorized);
     }
+    // The permit admits a seat, and a drain does not unseat: a drained host
+    // keeps its vote (the control plane loses no quorum at a drain) and,
+    // where it leads, keeps installing the root's authority — the drain
+    // among it, which its own agent then records (24 §19). Requiring the
+    // host eligible here left a drained leader unable to install the very
+    // grant that drained it, so nothing healed (2026-10-02).
     let certificate = enrollment
         .enrollments()
         .find(|receipt| {

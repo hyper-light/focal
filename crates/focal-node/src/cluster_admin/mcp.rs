@@ -233,6 +233,32 @@ impl AdminBackend for ClusterAdmin {
                     node,
                     expected_configuration_index,
                 } => self.transfer(node, expected_configuration_index).await,
+                AdminAction::PartitionShow { partition } => self.partition_show(partition).await,
+                AdminAction::PartitionChange {
+                    partition,
+                    change,
+                    expected_configuration_index,
+                } => {
+                    self.partition_change(
+                        partition,
+                        match change {
+                            AdminChange::AddLearner(node) => MembershipChange::AddLearner { node },
+                            AdminChange::Promote(node) => MembershipChange::Promote { node },
+                            AdminChange::Remove(node) => MembershipChange::Remove { node },
+                            AdminChange::LeaveJoint => MembershipChange::LeaveJoint,
+                        },
+                        expected_configuration_index,
+                    )
+                    .await
+                }
+                AdminAction::PartitionTransfer {
+                    partition,
+                    node,
+                    expected_configuration_index,
+                } => {
+                    self.partition_transfer(partition, node, expected_configuration_index)
+                        .await
+                }
                 AdminAction::NodeEligibility { node, eligible } => {
                     self.node_eligibility(node, eligible).await
                 }

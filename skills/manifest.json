@@ -616,9 +616,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 18,
+      "version": 19,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "ecb914bc9157e8ad301d82818637abdbebe55b16a398c66a28146200e9caa854",
+      "blake3": "060156c623a384fc6ca9fe579b8187edbdac3c577631fb85612b0ad025995d9f",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -737,6 +737,26 @@
         },
         {
           "name": "cluster.nodes.undrain",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.add_learner",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.promote",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.remove",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.show",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.transfer",
           "version": 1
         },
         {

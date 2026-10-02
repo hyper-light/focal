@@ -891,6 +891,12 @@ impl PlacementAgent {
                 observed.push((*delegation, access, snapshot, installed));
             }
         }
+        // A pass that observed no partition (a replica between leaders, a
+        // read refused) leaves the operator's view as it was, dated as it
+        // was: an empty view would read as a cluster without partitions.
+        if observed.is_empty() {
+            return Ok(AgentStep::Idle);
+        }
         // The last-observed snapshot only feeds the operator's on-demand
         // placement view, so rebuild it (a deep clone of every partition
         // directory) only when a partition's revision actually moved. In steady
@@ -918,9 +924,6 @@ impl PlacementAgent {
             self.last_observed = next;
         }
         self.observed_at = now;
-        if observed.is_empty() {
-            return Ok(AgentStep::Idle);
-        }
         self.report_liveness_facts(handles, &observed, unchanged);
         let root_leader = handles.control.progress().leader == node;
         for (delegation, access, snapshot, installed) in &observed {
@@ -3190,7 +3193,24 @@ async fn submit_partition(
     request: ControlRequest,
 ) -> Result<ControlReceipt, ControlFailure> {
     match access {
-        PartitionAccess::Local(host) => host.submit(peer, request).await,
+        PartitionAccess::Local(host) => {
+            // The intent is presented as the client it was journaled under:
+            // this node's principal while its replica followed the group
+            // (submitted through the leader, 24 §16), its local client while
+            // it led. Leadership may have moved between the two — a seated
+            // member that came to lead resubmits what it journaled as a
+            // follower — and the local ingress binds a request to its own
+            // client, so a peer built from the other client was refused
+            // every time (2026-10-02).
+            let own = AuthenticatedPeer::local(PeerGrant {
+                principal: ParticipantId(request.id.client),
+                tenants: BTreeSet::from([namespace.tenant]),
+                role: PeerRole::Runtime,
+            })
+            .map_err(|_| ControlFailure::Unauthorized)?;
+            drop(peer);
+            host.submit(own, request).await
+        }
         PartitionAccess::Remote { target, group } => {
             let id = RequestId::from_u128(u128::from(request.id.sequence));
             let body = ControlRpc::Submit(request)
