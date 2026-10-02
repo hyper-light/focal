@@ -11,7 +11,7 @@ use focal_model::*;
 use focal_wire::*;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     pin::Pin,
 };
@@ -293,6 +293,45 @@ struct Job {
     route: RouteEpoch,
     kind: JobKind,
     _allocation: Allocation,
+}
+/// What a participant job is: the ledger, the request exactly (a managed
+/// request by its key, as its transfer is named) and the kind of job.
+type JobIdentity = (LedgerId, [u8; 16], u8);
+impl Job {
+    /// A trusted node job has none: it runs as it comes.
+    fn identity(&self) -> Option<JobIdentity> {
+        let request = self.request.as_ref()?;
+        let kind = match self.kind {
+            JobKind::Seal(_) => 0,
+            JobKind::Attest(_) => 1,
+            JobKind::AttestNative(_) => 2,
+            JobKind::Obligation(..) => 3,
+            JobKind::Archive { .. } | JobKind::Repair { .. } => return None,
+        };
+        Some((self.ledger, custody_request_id(request).ok()?.0, kind))
+    }
+    fn refuse(self, error: AccessError) {
+        match self.kind {
+            JobKind::Seal(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Attest(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::AttestNative(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Obligation(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Archive { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Repair { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
 }
 struct PlacementRow {
     placement: EvidencePlacement,
@@ -713,7 +752,21 @@ impl EvidenceDriver {
     }
     async fn run_inner(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
         let content = self.content.clone();
+        let node = self.node;
         let mut tasks = FuturesUnordered::new();
+        // The participant jobs in flight, by what each is, and the jobs of
+        // the same identity that run after each: an exact retry that comes
+        // while its first is in flight (its client gave up the exchange
+        // before the copies took the object, as a client does across a
+        // slow path) runs once the first is done, and finds what it did —
+        // never beside it, sending every copy the same bytes again. At
+        // most as many wait behind one as run at once; the rest are
+        // refused the room.
+        let mut same: BTreeMap<JobIdentity, VecDeque<Job>> = BTreeMap::new();
+        let begin = |placement, identity, job| {
+            let content = &content;
+            async move { (identity, process(content, pool, node, placement, job).await) }
+        };
         let mut receiving = true;
         let mut updates = true;
         while receiving || updates || !tasks.is_empty() {
@@ -727,12 +780,37 @@ impl EvidenceDriver {
                 }
                 job = self.receiver.recv(), if receiving && tasks.len() < self.concurrency => {
                     if let Some(job) = job {
-                        let placement = self.snapshot(job.ledger, job.route);
-                        tasks.push(process(&content, pool, self.node, placement, job));
+                        let identity = job.identity();
+                        match identity.and_then(|identity| same.get_mut(&identity)) {
+                            Some(after) => {
+                                if after.len() < self.concurrency && after.try_reserve(1).is_ok() {
+                                    after.push_back(job);
+                                } else {
+                                    job.refuse(AccessError::Capacity);
+                                }
+                            }
+                            None => {
+                                if let Some(identity) = identity {
+                                    same.insert(identity, VecDeque::new());
+                                }
+                                let placement = self.snapshot(job.ledger, job.route);
+                                tasks.push(begin(placement, identity, job));
+                            }
+                        }
                     } else { receiving = false; }
                 }
                 done = tasks.next(), if !tasks.is_empty() => {
-                    if let Some(done) = done {done.send(&self.placements);}
+                    if let Some((identity, done)) = done {
+                        done.send(&self.placements);
+                        if let Some(identity) = identity
+                            && let Some(mut after) = same.remove(&identity)
+                            && let Some(job) = after.pop_front()
+                        {
+                            same.insert(identity, after);
+                            let placement = self.snapshot(job.ledger, job.route);
+                            tasks.push(begin(placement, Some(identity), job));
+                        }
+                    }
                 }
             }
         }
@@ -1267,19 +1345,66 @@ async fn send_chunks(
                     usize::try_from(index).map_err(|_| AccessError::Capacity)?,
                 )
                 .await?;
-            remote(
-                pool,
-                peer,
-                scope,
-                transfer,
-                CustodyRequest::Chunk {
+            let chunk = bytes.value();
+            // A chunk the path carries within an exchange's time goes
+            // whole; one it does not goes in parts, each of which renews
+            // the copy's lease on the transfer (the audit's F49), from
+            // wherever the copy says it holds the chunk to.
+            let mut offset = 0_usize;
+            while offset < chunk.len() {
+                let part = pool.part_bytes(peer, chunk.len());
+                if offset == 0 && part >= chunk.len() {
+                    remote(
+                        pool,
+                        peer,
+                        scope,
+                        transfer,
+                        CustodyRequest::Chunk {
+                            transfer,
+                            index,
+                            bytes: chunk.clone(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let end = offset.saturating_add(part).min(chunk.len());
+                let reply = remote(
+                    pool,
+                    peer,
+                    scope,
                     transfer,
-                    index,
-                    bytes: bytes.value().clone(),
-                },
-            )
-            .await
-            .map(|_| ())
+                    CustodyRequest::ChunkPart {
+                        transfer,
+                        index,
+                        offset: u32::try_from(offset).map_err(|_| AccessError::Capacity)?,
+                        bytes: chunk
+                            .get(offset..end)
+                            .ok_or(AccessError::Capacity)?
+                            .to_vec(),
+                    },
+                )
+                .await?;
+                match reply {
+                    CustodyReply::ChunkStored { index: stored } if stored == index => {
+                        return Ok(());
+                    }
+                    CustodyReply::PartStored {
+                        index: stored,
+                        staged,
+                    } if stored == index => {
+                        let staged = usize::try_from(staged).map_err(|_| AccessError::Capacity)?;
+                        // What the copy holds grows with every part, or
+                        // the copy and this sender disagree on the chunk.
+                        if staged <= offset {
+                            return Err(AccessError::InvalidRequest);
+                        }
+                        offset = staged;
+                    }
+                    _ => return Err(AccessError::InvalidRequest),
+                }
+            }
+            Ok(())
         },
     )
     .await
@@ -1903,41 +2028,106 @@ async fn pull(
         || pool.bulk_width(peer),
         next_missing..chunks,
         async |index: u32| {
-            let reply = remote(
-                pool,
-                peer,
-                scope,
-                transfer,
-                CustodyRequest::ReadChunk {
+            // A chunk the path carries within an exchange's time is asked
+            // for whole; one it does not is asked for in parts, each of
+            // which renews both leases, the peer's and this node's (the
+            // audit's F49).
+            let mut offset = 0_usize;
+            loop {
+                let part = pool.part_bytes(peer, focal_evidence::MAX_TRANSFER_CHUNK_BYTES);
+                if offset == 0 && part >= focal_evidence::MAX_TRANSFER_CHUNK_BYTES {
+                    let reply = remote(
+                        pool,
+                        peer,
+                        scope,
+                        transfer,
+                        CustodyRequest::ReadChunk {
+                            transfer,
+                            index,
+                            max_bytes,
+                        },
+                    )
+                    .await?;
+                    let CustodyReply::Chunk {
+                        index: found,
+                        bytes,
+                    } = reply
+                    else {
+                        return Err(AccessError::InvalidRequest);
+                    };
+                    if index != found {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    local(
+                        content,
+                        node,
+                        scope,
+                        transfer,
+                        CustodyRequest::Chunk {
+                            transfer,
+                            index,
+                            bytes,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let reply = remote(
+                    pool,
+                    peer,
+                    scope,
                     transfer,
-                    index,
-                    max_bytes,
-                },
-            )
-            .await?;
-            let CustodyReply::Chunk {
-                index: found,
-                bytes,
-            } = reply
-            else {
-                return Err(AccessError::InvalidRequest);
-            };
-            if index != found {
-                return Err(AccessError::InvalidRequest);
-            }
-            local(
-                content,
-                node,
-                scope,
-                transfer,
-                CustodyRequest::Chunk {
-                    transfer,
-                    index,
+                    CustodyRequest::ReadChunkPart {
+                        transfer,
+                        index,
+                        offset: u32::try_from(offset).map_err(|_| AccessError::Capacity)?,
+                        max_bytes: u32::try_from(part).map_err(|_| AccessError::Capacity)?,
+                    },
+                )
+                .await?;
+                let CustodyReply::ChunkPart {
+                    index: found,
+                    offset: at,
+                    length: _,
                     bytes,
-                },
-            )
-            .await
-            .map(|_| ())
+                } = reply
+                else {
+                    return Err(AccessError::InvalidRequest);
+                };
+                if index != found
+                    || usize::try_from(at).map_err(|_| AccessError::Capacity)? != offset
+                    || bytes.is_empty()
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let stored = local(
+                    content,
+                    node,
+                    scope,
+                    transfer,
+                    CustodyRequest::ChunkPart {
+                        transfer,
+                        index,
+                        offset: at,
+                        bytes,
+                    },
+                )
+                .await?;
+                match stored {
+                    CustodyReply::ChunkStored { index: done } if done == index => return Ok(()),
+                    CustodyReply::PartStored {
+                        index: done,
+                        staged,
+                    } if done == index => {
+                        let staged = usize::try_from(staged).map_err(|_| AccessError::Capacity)?;
+                        if staged <= offset {
+                            return Err(AccessError::InvalidRequest);
+                        }
+                        offset = staged;
+                    }
+                    _ => return Err(AccessError::InvalidRequest),
+                }
+            }
         },
     )
     .await?;

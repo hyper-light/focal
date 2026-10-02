@@ -12674,8 +12674,30 @@ bytes outstanding: a batch now releases, or charges, before it answers. Every fi
 but one was released by closing its file, which a child process a test or a node starts
 holds open for a moment: one owner type unlocks the file when it ends. And the control
 owner refused for capacity whatever came while it decided another command: it waits its
-turn now, in order. And the replication driver's own test of a dead peer beside a live
+turn now, in order, and is given its request time from its turn, not from when it came
+(the macOS run of the day after gave up the fifth of five). And the replication driver's own test of a dead peer beside a live
 one hung in two runs of sixty, and had held a macOS runner for two hours: on a tie the
 frame that came was given up; the other peer's older frame goes now. Each has a test
 that fails on the tree before. Open: a drained leader's replacement stayed `Installed`
 for 300 s on two macOS runs.
+
+### 2026-10-02 — F48 and F49: a promise across a slow path, a megabyte across a slower one
+
+Native activation and every promotion of a learner need each voter's recorded promise
+of the native decoder, and the exchange of those promises gave each of its three parts
+250 ms of the clock, so a healthy path further than that never contributed one. No part
+has a clock of its own now: the replica answers in its owner's periods, the peer in what
+its path takes, and ledgers' discoveries run at once within one lane's worth ([27](27-consensus-roadmap-and-slates-port.md)
+§7; the remediation record, F48). Three real-process fleets behind relays of 300, 600 and
+1,200 ms round trip activate, promote and serve where the 1,200 ms one never settled.
+
+A transfer's lease was renewed only when a request was executed, after its body had
+arrived, so a megabyte chunk — the unit of custody — arrived to a transfer that had
+expired on any path slower than 140 kbit/s. A chunk goes in parts now where its path
+takes longer than an exchange's time to carry it, each part renewing the lease as it is
+taken, staged in order and verified whole before it is installed under the chunk's own
+name (27 §7; the remediation record, F49). Found on the way: a client's exact retry of a
+seal, asked once its exchange gave up, ran beside the first and pushed the same transfer
+again, every byte twice; it runs after the first now. Measured over relays: at 128 kbit/s
+the copy holds the megabyte 75.9 s after the upload began on a 65 s path, 1.10 chunks
+crossing; at 64 kbit/s 152.9 s on a 131 s path.

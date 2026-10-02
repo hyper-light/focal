@@ -830,6 +830,42 @@ and the next is delivered over a new one. At 4, 8 and 16 kbit/s, sixteen and six
 kilobytes sent or asked for are answered at none, two and ten percent loss, thirty-six
 cases of which fourteen failed before the receiver's rule changed.
 
+**A chunk goes in parts where its path is slow (2026-10-02, the audit's F49).** A
+transfer's lease on a copy (`CustodyConfig::transfer_ttl`, 60 s) was renewed only when a
+request for it was executed, and a request's body is read before it is executed: a
+megabyte chunk, the unit of custody and what a manifest hashes, takes 131 s to cross
+64 kbit/s, so it arrived to a transfer that had expired. The sender sizes a part to what
+the path carries in the time the pool gives an exchange, at the rate the law holds in
+flight over the round trip (`PeerConnectionPool::part_bytes`; a datagram at least, the
+chunk at most, the whole chunk where the path is not yet measured), and sends a chunk in
+parts (`ChunkPart`; `ReadChunkPart` for a pull), each a request that crosses within an
+exchange's time and renews the lease as it is taken. The receiver stages a chunk's parts
+in order beside its objects, promised to the volume part by part, verifies the whole
+against the manifest's hash and installs it under the same name
+(`ContentStore::import_chunk_part`): a chunk made of parts is the chunk. A transfer
+that expires or is cancelled discards what it staged. The lease is thereby tied to
+admitted progress and covers twelve crossings; the sixty seconds themselves are set,
+not derived (section 8.4). A client that gives up its exchange before the copies hold
+the object asks again, exactly; the coordinator ran the exact retry's job beside the
+first, two pushes of one transfer each sending every part, and runs it after the first
+now, where it finds the copy holds the object. Measured in process over real QUIC, each
+replica behind a relay: at 128 kbit/s a megabyte and seven bytes is sealed on its copy
+75.9 s after the upload began (the path alone takes 65 s), 1,152,399 bytes crossing
+toward the copy in 87 parts; at 64 kbit/s, 152.9 s and 1,193,907 bytes (131 s); beside the first, the retry
+made it 1,970,721 bytes and 124 s.
+
+**Discovery of the native decoder's support has no clock of its own (2026-10-02, the
+audit's F48).** The exchange of durable promises that native activation and every
+promotion need gave each of its parts 250 ms — the replica's own fact, the peer's, the
+recording — so a healthy path further than that never contributed one. Each part is
+given what it takes: the replica's owner its periods, the peer its path; discoveries of
+different ledgers run at once, as many as one lane to a peer holds, bounded by their
+charges; a ledger is asked again a period of its owner after its last, and the loop
+waits for the fleet to change when none is due (`managed_support::support`). On real
+processes behind relays of 300, 600 and 1,200 ms round trip, activation, two promotions
+and a claim settle (`native_support_across_latency`); with the ceilings, the 1,200 ms
+fleet never settles.
+
 **Classes** (`focal_wire::TrafficClass`, `Operation::class`). A stream of a higher
 priority sends all it has before one of a lower sends anything. Consensus, probes and
 the fleet's control go first, then what participants ask, then content. Before, a
@@ -907,6 +943,7 @@ of it was changed.
 | The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | Done (2026-09-29): derived from the consensus window and the reference path (`WireLimits::for_consensus`, section 7), and a group's message waits its turn on its lane, bounded by its exchange's time, instead of being refused; a peer the pool could not reach at all is told to the core, which probes it |
 | The pool's five seconds, the announcement's round of five and enrollment control's of four | Set, not derived. The pool's is no longer the time of an exchange (section 7, 2026-10-01): it is what a caller waits for its lane and for its connection, and what a peer is given to answer once it has the request. A peer under load that takes longer to answer is still given up |
 | The idle timeout of a connection, ten seconds | Set, not derived. It is what a path must return a datagram in (1,920 bit/s), and a path that carries nothing for longer loses its connections and what they carried |
+| A transfer's lease, sixty seconds | Set, not derived. It is the longest a copy holds an unfinished transfer without a part taken; a part is sized to cross in a twelfth of it at the rate the path showed (section 7), so a sender that stops is dropped after it and a live one renews it many times over |
 | The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Under eight and sixteen copies of the control suite at once this is what remains (five of eight runs, none of sixteen): a leader whose term entry the stalled followers do not acknowledge in time answers `NotReady` until leadership has moved again. The request time should follow the exchange tails of the voters (`PeerConnectionPool::exchange_tail`), which a stalled follower stretches and the leader's own stall does not |
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |

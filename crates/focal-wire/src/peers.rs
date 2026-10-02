@@ -468,6 +468,47 @@ impl PeerConnectionPool {
         let connection = slot.connection.lock().ok()?;
         connection.as_ref().map(|open| open.remote.window())
     }
+    /// The round trip of the connection to `target`, as it measures it;
+    /// `None` while there is none.
+    pub fn round_trip(&self, target: u64) -> Option<Duration> {
+        let slot = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.cached.get(&target).map(|entry| entry.slot.clone()))?;
+        let cached = slot.connection.lock().ok()?;
+        cached.as_ref().map(|entry| entry.remote.round_trip())
+    }
+    /// How much of a chunk of `chunk` bytes to send `target` at once: what
+    /// the path to it carries in the time the pool gives an exchange
+    /// (`PeerPoolLimits::timeout`), at the rate its law holds in flight
+    /// over its round trip — a datagram at least, the chunk at most. A
+    /// part so sized crosses within one exchange time at the rate the path
+    /// shows, and the lease a receiver holds a transfer under, which every
+    /// part renews, outlives many of them (the audit's F49: a chunk that
+    /// takes its path longer than the lease arrived to a transfer that had
+    /// expired). Where the path is not yet measured, the chunk goes whole,
+    /// as it did.
+    pub fn part_bytes(&self, target: u64, chunk: usize) -> usize {
+        let Some(window) = self.window(target) else {
+            return chunk;
+        };
+        let Some(round_trip) = self.round_trip(target) else {
+            return chunk;
+        };
+        let round_trip = round_trip.as_nanos().max(1);
+        let carried = u128::from(window)
+            .saturating_mul(self.limits.timeout.as_nanos())
+            .checked_div(round_trip)
+            .unwrap_or(u128::MAX);
+        usize::try_from(carried)
+            .unwrap_or(usize::MAX)
+            .clamp(
+                crate::frame::LEAST_PROGRESS,
+                chunk.max(crate::frame::LEAST_PROGRESS),
+            )
+            .min(chunk)
+    }
     /// What an exchange with `target` is expected to take, its work
     /// included: the tail of the exchanges it answered, doubled for each
     /// one given up on since. `None` while it has answered none.

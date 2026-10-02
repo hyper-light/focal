@@ -60,8 +60,8 @@ ruling before work starts).
 | F45 | P2 | in tree | 10 | [F45](#f45) |
 | F46 | P1 | in tree | 8 | [F46](#f46) |
 | F47 | P2 | open | 11 | — |
-| F48 | P1 | open | 9 | — |
-| F49 | P1 | open | 9 | — |
+| F48 | P1 | in tree | 9 | [F48](#f48) |
+| F49 | P1 | in tree | 9 | [F49](#f49) |
 | F50 | P2 | open | 11 | — |
 | F51 | P2 | open | 11 | — |
 | F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
@@ -2216,6 +2216,22 @@ the capacity refusal. *Test.*
 once, each expecting the revision the one before leaves, and a transfer behind them:
 all committed, in order; without the turn, four of the five are refused).
 
+**A write that waited its turn was given one request time for all before it**
+(`focal-node`; macOS run of 4074ead, the test above: the fifth write answered
+`OutcomeUnknown`). *Cause.* A pending request's deadline was set when it was admitted,
+the request time (350 ms in the rig) and the owner's patience from then; a write that
+waited its turn behind four others kept that deadline, took its turn with most of it
+spent, and on a runner whose five commits took longer than one request time was given
+up while its own write was in flight. *Fix.* A request is given its request time from
+its turn, and one that waits its turn is given it again each time the turn passes: its
+wait is charged to the progress of what it waits on — the commands decided before it,
+at most as many as the owner admits — never to the time they took; a turn that passes
+to no one leaves every waiter's deadline where it was, so a stalled group still gives
+them up in one request time. *Test.* The same test, paced: the rig's routers hold the
+group at each applied index until the test allows the next, one commit at a time six
+of the leader's periods apart, four of which hold more than the request time of
+fourteen; every write is decided, and without the renewal the fifth is given up.
+
 **The driver's test of a dead peer beside a live one hung** (`focal-node`, found by this
 batch's own run of the suite: 2 of 60 runs of
 `a_peer_that_answers_nothing_holds_its_own_lane_and_nothing_of_anothers` under the rule
@@ -2252,4 +2268,103 @@ CI runs on the trees since F42 pass, whose rules for a member's heartbeat answer
 probes are the ones that changed between. It is not reproduced and not mended; it stands
 here until a run on a current tree shows it again or a directed schedule of the core
 reaches it.
+
+## F48
+
+**Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms
+of the clock: the replica's own fact (an ask of its owner, answered in the owner's
+periods), the exchange with each peer (an exchange of the pool, which since F36 waits
+on what the path takes), and the recording of the answer (another ask of the owner). A
+healthy path whose exchange takes longer than that never contributed a fact, and native
+activation and the promotion of a learner, which need every voter's recorded promise,
+were refused for want of one. The loop also finished every exchange of one ledger before
+it looked at the next, so one slow ledger's discovery delayed every other's, and it asked
+again every 100 ms of the clock.
+
+**Fix.** No part of a discovery has a clock of its own: the replica answers in its
+owner's periods or refuses for its queue (`Capacity`), and an exchange with a peer is
+given what its path takes. Discoveries of different ledgers run at once, as many as one
+lane to a peer holds (`per_peer_inflight`: a node's ledgers share the same few peers, and
+more would only wait on the lane), each holding its charge of the budget, whose refusal
+is the bound. A ledger is asked again one period of its owner after its last discovery
+ended (`ReplicaHost::tick_period`), and when none is due the loop waits for the fleet to
+change (`FleetManager::changes`) or for the next to be due. What the receiving owner
+accepts is unchanged: the exact current configuration index, or a prospective learner's
+bootstrap configuration, and the request's route epoch; an obsolete fact is refused as
+before.
+
+**Tests.** `native_support_across_latency` on real processes: three hosts, each behind a
+relay that delays every datagram (`tests/support/relay.rs`), a round trip of 300, 600 and
+1,200 ms with a tenth of jitter; the founder activates the native decoder, two hosts
+join, a plan promotes both to voters — each promotion needs the host's promise, exchanged
+across the relays — and the session settles and serves a claim. The three pass in 282 s
+together on this host; with the three ceilings put back, the 1,200 ms one does not settle
+(the plan's promotions wait for promises that never arrive).
+
+**Residual.** The relay delays a node's every datagram, its clients' and the admin
+socket's excepted, so the join and the plan themselves cross it; the test states no bound
+on how long they take beyond the harness's.
+
+## F49
+
+**Cause.** A transfer's lease (`CustodyConfig::transfer_ttl`, 60 s) was renewed only when
+a request for it was executed, and the body of a request is read before it is executed:
+a megabyte chunk takes 131 s to cross 64 kbit/s and 66 s to cross 128 kbit/s, so the
+chunk arrived to a transfer that had expired and was refused `Unavailable`, the push
+failed, and the copy was never made at that rate, though durable chunks resume. The
+chunk is the unit of custody — it is what the manifest hashes — and could not be made
+smaller without changing every object's identity.
+
+**Fix.** A chunk goes in parts where its path takes longer than an exchange's time to
+carry it whole (27 §7). The sender sizes a part to what the path carries in the time the
+pool gives an exchange, at the rate its law holds in flight over its round trip
+(`PeerConnectionPool::part_bytes`): a datagram at least, the chunk at most, the whole
+chunk where the path is not yet measured. Each part is a request (`ChunkPart`,
+`ReadChunkPart` for a pull), so it crosses within an exchange's time, and each part taken
+renews the transfer's lease — the lease is tied to admitted progress, and the sixty
+seconds cover twelve crossings. The receiver holds a chunk's parts in order in a staging
+file beside the objects, promised to the volume part by part (an exact retry takes
+nothing; a gap is refused; a part of a chunk held whole is answered as held), and when
+the last byte is held verifies the whole against the manifest's hash and installs it
+under the same name, so a chunk made of parts is the chunk (`ContentStore::
+import_chunk_part`); one that does not verify is discarded whole. A transfer that
+expires or is cancelled discards its staged parts (`discard_chunk_parts`): nothing
+unfinished outlives its lease. The receiver tells the sender how much of the chunk it
+holds, so a lost reply is resumed from the truth.
+
+**Tests.** `focal-evidence`: `a_chunk_imported_in_parts_is_the_chunk_once_whole`.
+`focal-node`: `custody::tests::a_chunk_in_parts_renews_the_lease_and_is_the_chunk_once_whole`
+(parts in order, a retry, a gap; the lease renewed by a part; a last part that is not the
+chunk's discarded whole; parts gone with an expired transfer, the whole chunk kept; a
+cancelled transfer's parts gone; sealed durable) and
+`a_chunk_is_read_in_parts_from_a_verified_whole`;
+`a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second` in `evidence_quic` (three
+in-process replicas over real QUIC, each reached by the others through a relay that
+carries 128 kbit/s each way: an upload of a megabyte and seven bytes, in one chunk of a
+megabyte, is sealed once its required copy on node 2 holds it; the relay counts what
+crossed toward the copy, and the test holds it under one and a half chunks). Measured
+(2026-10-02, this machine): at 128 kbit/s the seal came 75.9 s after the upload began,
+for a path that takes 65 s to carry the chunk, 1,152,399 bytes crossing toward the copy
+for a chunk of 1,048,583 in 87 parts, none lost; at 64 kbit/s the seal came 152.9 s after the upload began, 1,193,907 bytes crossing, for a path of 131 s.
+With `part_bytes` made to answer the whole chunk, the 128 kbit/s test fails: the seal never completes within four crossings (260 s), the whole chunk arriving to a lease that expired at sixty.
+
+**Found on the way: an exact retry pushed beside its first.** The client's exchange for
+the seal is given its request time (15 s in the test; a client's configured timeout in
+the product), and the copy takes longer than that across the relay, so the client asks
+the seal again, exactly — and the coordinator ran the retry's job beside the first: two
+pushes of the same transfer to the same copy, each sending every part, the receiver's
+staging taking what each brought past what it held. 1,970,721 bytes crossed for the
+megabyte, at 124 s, where one push takes 75.9 s; and before the parts, the mutation
+of the whole-chunk sender passed the test for the same reason, two senders' chunks
+arriving to a transfer each had kept alive. A participant job is named by its ledger,
+its request (a managed one by its key, as its transfer is) and its kind; a job that
+comes while one of the same identity is in flight runs after it (`EvidenceDriver::
+run_inner`, `same`), and finds what the first did — a copy that holds the object is
+asked nothing (`replicate_to`). At most as many wait behind one as run at once; the rest
+are refused the room. The relay's count in the test above is the guard: with the retry
+running beside the first it crosses 1.9 chunks.
+
+**Residual.** The pull of a part reads the whole chunk to verify it and cuts the part from
+it: a megabyte read for each part. The lease's sixty seconds are set, not derived; what is
+derived is that a part crosses in a twelfth of them at the rate the path showed.
 

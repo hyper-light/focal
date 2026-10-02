@@ -2258,7 +2258,11 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
     let received = began.elapsed();
     assert!(received >= least, "{received:?}");
     // A peer that does not answer what it was asked: the path has
-    // carried what was asked within one wait.
+    // carried what was asked within one wait. The peer is given its
+    // period and what the path takes to carry the first of an answer
+    // (`Carriage`); on a path whose round trip the megabyte stretched,
+    // that can outlast the peer's own time for its handler (one second
+    // here), and then the peer says it gave the request up.
     let began = std::time::Instant::now();
     let unanswered = remote
         .request_within(
@@ -2267,7 +2271,14 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
         )
         .await;
     assert!(
-        matches!(unanswered, Err(WireError::Timeout)),
+        matches!(
+            &unanswered,
+            Err(WireError::Timeout)
+                | Ok(ResponseEnvelope {
+                    result: Response::Error(AccessError::Unavailable),
+                    ..
+                })
+        ),
         "{unanswered:?}"
     );
     assert!(began.elapsed() >= Duration::from_millis(300));

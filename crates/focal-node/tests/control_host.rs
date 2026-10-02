@@ -142,6 +142,10 @@ struct Rig {
     owners: Vec<ControlOwner>,
     routers: Vec<tokio::task::JoinHandle<()>>,
     isolated: Arc<AtomicU64>,
+    /// The applied index at which the routers hold every frame, until a
+    /// test lets the next one through: a commit at a time, at the test's
+    /// pace. `u64::MAX` holds nothing.
+    allowed: Arc<AtomicU64>,
     bootstrap: ControlBootstrap,
     group: [u8; 16],
 }
@@ -153,6 +157,7 @@ impl Rig {
             owners: vec![],
             routers: vec![],
             isolated: Arc::new(AtomicU64::new(0)),
+            allowed: Arc::new(AtomicU64::new(u64::MAX)),
             bootstrap,
             group,
         };
@@ -185,6 +190,7 @@ impl Rig {
         for (from, mut channel) in channels {
             let hosts = self.hosts.clone();
             let isolated = self.isolated.clone();
+            let allowed = self.allowed.clone();
             self.routers.push(tokio::spawn(async move {
                 // What the machine takes to wake a task that asked for a
                 // millisecond is the path the sender's pace is derived from
@@ -204,6 +210,17 @@ impl Rig {
                     let Some(target) = hosts.get(frame.target.saturating_sub(1) as usize) else {
                         continue;
                     };
+                    // Held while the group has applied what the test
+                    // allows: nothing more commits until it allows more.
+                    while hosts
+                        .iter()
+                        .map(|host| host.progress().applied_index)
+                        .max()
+                        .unwrap_or(0)
+                        >= allowed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                     let verified = verify_request(
                         peer(PeerRole::Node { node_id: from }),
                         frame.request.clone(),
@@ -1465,11 +1482,16 @@ async fn an_owner_refused_the_room_waits_and_goes_on() {
 }
 
 /// What comes while the owner decides another command waits its turn and
-/// is decided after it, in the order it came. A replica decides one command
-/// at a time, and what came meanwhile was refused for capacity: an
-/// operator's `membership remove` that met a placement intent of the node's
-/// own was told `[capacity]` (the macOS run of 2026-10-01), as four of these
-/// five writes are without the turn, and the transfer after them.
+/// is decided after it, in the order it came, each given its request time
+/// from its turn. A replica decides one command at a time, and what came
+/// meanwhile was refused for capacity: an operator's `membership remove`
+/// that met a placement intent of the node's own was told `[capacity]` (the
+/// macOS run of 2026-10-01), as four of these five writes are without the
+/// turn, and the transfer after them. Then the fifth was given one request
+/// time for all five, from when it came, and given up on a slow disk (the
+/// macOS run of the day after): here the group commits one write at a time,
+/// six of the owner's periods apart, four of which hold more than the
+/// request time of fourteen, and every write is decided.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
     let keys = tempfile::tempdir().unwrap();
@@ -1514,8 +1536,47 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
             target,
         },
     );
-    let (first, second, third, fourth, fifth, transferred) =
-        tokio::join!(write(1), write(2), write(3), write(4), write(5), transfer);
+    // One commit at a time: the routers hold the group at each, for six
+    // of the leader's periods, before the next is let through.
+    const HOLD: u64 = 6;
+    let applied = host.progress().applied_index;
+    rig.allowed.store(applied + 1, Ordering::SeqCst);
+    let paced = async {
+        for written in 1..=5 {
+            let mut wait = rig.deadline();
+            while host.progress().applied_index < applied + written {
+                if let Err(spent) = wait.check(&rig.periods()) {
+                    panic!(
+                        "write {written} never applied: {spent}; {:?}",
+                        host.progress()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if written == 5 {
+                break;
+            }
+            let from = host.periods();
+            let mut wait = focal_timing::ProgressDeadline::begin(&[from], HOLD + 1, FROZEN);
+            while host.periods() < from + HOLD {
+                if let Err(spent) = wait.check(&[host.periods()]) {
+                    panic!("the leader's periods stopped: {spent}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            rig.allowed.store(applied + written + 1, Ordering::SeqCst);
+        }
+        rig.allowed.store(u64::MAX, Ordering::SeqCst);
+    };
+    let (first, second, third, fourth, fifth, transferred, ()) = tokio::join!(
+        write(1),
+        write(2),
+        write(3),
+        write(4),
+        write(5),
+        transfer,
+        paced
+    );
     let receipts: Vec<ControlReceipt> = [first, second, third, fourth, fifth]
         .into_iter()
         .map(|answer| answer.expect("a write that waited its turn"))

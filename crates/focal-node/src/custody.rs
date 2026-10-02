@@ -479,6 +479,7 @@ impl CustodyStore {
                     | CustodyRequest::Manifest { .. }
                     | CustodyRequest::Open { .. }
                     | CustodyRequest::ReadChunk { .. }
+                    | CustodyRequest::ReadChunkPart { .. }
                     | CustodyRequest::Verify { .. }
                     | CustodyRequest::Cancel { .. }
             )
@@ -504,6 +505,7 @@ impl CustodyStore {
         let output = match operation {
             CustodyRequest::Manifest { max_bytes, .. }
             | CustodyRequest::ReadChunk { max_bytes, .. }
+            | CustodyRequest::ReadChunkPart { max_bytes, .. }
             | CustodyRequest::SeedChunk { max_bytes, .. } => {
                 usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?
             }
@@ -622,34 +624,88 @@ impl CustodyStore {
                     .import_chunk(&retained.manifest, index_usize, bytes)
                     .map_err(content_error)?;
                 retained.expires = deadline;
-                let word = index_usize.checked_div(u64::BITS as usize).unwrap_or(0);
-                let bit = u32::try_from(index_usize.checked_rem(u64::BITS as usize).unwrap_or(0))
-                    .ok()
-                    .and_then(|bit| 1_u64.checked_shl(bit))
-                    .ok_or(AccessError::InvalidRequest)?;
-                *retained
-                    .taken
-                    .get_mut(word)
-                    .ok_or(AccessError::InvalidRequest)? |= bit;
-                // The first that is lacked is past everything taken
-                // after it without a gap.
-                while retained.next_missing < retained.manifest.chunks() {
-                    let next = retained.next_missing;
-                    let word = next.checked_div(u64::BITS as usize).unwrap_or(0);
-                    let bit = u32::try_from(next.checked_rem(u64::BITS as usize).unwrap_or(0))
-                        .ok()
-                        .and_then(|bit| 1_u64.checked_shl(bit))
-                        .ok_or(AccessError::InvalidRequest)?;
-                    if retained
-                        .taken
-                        .get(word)
-                        .is_none_or(|taken| taken & bit == 0)
-                    {
-                        break;
-                    }
-                    retained.next_missing = next.checked_add(1).ok_or(AccessError::Capacity)?;
-                }
+                taken(retained, index_usize)?;
                 CustodyReply::ChunkStored { index: *index }
+            }
+            CustodyRequest::ChunkPart {
+                transfer,
+                index,
+                offset,
+                bytes,
+            } => {
+                let deadline = self.deadline()?;
+                let retained = self
+                    .transfers
+                    .get_mut(&(scope, node_id, *transfer))
+                    .ok_or(AccessError::Unavailable)?;
+                let index_usize = usize::try_from(*index).map_err(|_| AccessError::Capacity)?;
+                let length = retained
+                    .manifest
+                    .chunk_length(index_usize)
+                    .map_err(content_error)?;
+                let staged = self
+                    .store
+                    .import_chunk_part(&retained.manifest, index_usize, u64::from(*offset), bytes)
+                    .map_err(content_error)?;
+                // A part taken is the transfer's progress: its lease is
+                // renewed by it, as by a chunk (the audit's F49).
+                retained.expires = deadline;
+                let staged = u32::try_from(staged).map_err(|_| AccessError::Capacity)?;
+                if usize::try_from(staged).map_err(|_| AccessError::Capacity)? < length {
+                    CustodyReply::PartStored {
+                        index: *index,
+                        staged,
+                    }
+                } else {
+                    taken(retained, index_usize)?;
+                    CustodyReply::ChunkStored { index: *index }
+                }
+            }
+            CustodyRequest::ReadChunkPart {
+                transfer,
+                index,
+                offset,
+                max_bytes,
+            } => {
+                let deadline = self.deadline()?;
+                // The whole chunk is read to verify it; the part is cut
+                // from what verified.
+                let _scan = self.reserve(
+                    BudgetKind::Payload,
+                    BudgetLane::Completion,
+                    self.store.max_chunk_bytes(),
+                )?;
+                let retained = self
+                    .transfers
+                    .get_mut(&(scope, node_id, *transfer))
+                    .ok_or(AccessError::Unavailable)?;
+                let index_usize = usize::try_from(*index).map_err(|_| AccessError::Capacity)?;
+                let length = retained
+                    .manifest
+                    .chunk_length(index_usize)
+                    .map_err(content_error)?;
+                let offset_usize = usize::try_from(*offset).map_err(|_| AccessError::Capacity)?;
+                if offset_usize >= length || *max_bytes == 0 {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let bytes = self
+                    .store
+                    .read_transfer_chunk(&retained.manifest, index_usize)
+                    .map_err(content_error)?;
+                let end = offset_usize
+                    .saturating_add(usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?)
+                    .min(length);
+                let part = bytes
+                    .get(offset_usize..end)
+                    .ok_or(AccessError::InvalidRequest)?
+                    .to_vec();
+                retained.expires = deadline;
+                CustodyReply::ChunkPart {
+                    index: *index,
+                    offset: *offset,
+                    length: u32::try_from(length).map_err(|_| AccessError::Capacity)?,
+                    bytes: part,
+                }
             }
             CustodyRequest::Seal { transfer } => {
                 let deadline = self.deadline()?;
@@ -755,7 +811,11 @@ impl CustodyStore {
                 }
             }
             CustodyRequest::Cancel { transfer } => {
-                self.transfers.remove(&(scope, node_id, *transfer));
+                if let Some(cancelled) = self.transfers.remove(&(scope, node_id, *transfer)) {
+                    self.store
+                        .discard_chunk_parts(&cancelled.manifest)
+                        .map_err(content_error)?;
+                }
                 self.recount()?;
                 CustodyReply::Cancelled
             }
@@ -899,7 +959,29 @@ impl CustodyStore {
         }
     }
     pub fn expire(&mut self, now: Instant) -> Result<(), AccessError> {
-        self.transfers.retain(|_, transfer| transfer.expires > now);
+        // A transfer that expired holds no more of the volume: the parts
+        // of chunks it had not completed go with it (the audit's F49).
+        let mut gone = Vec::new();
+        gone.try_reserve_exact(
+            self.transfers
+                .values()
+                .filter(|transfer| transfer.expires <= now)
+                .count(),
+        )
+        .map_err(|_| AccessError::Capacity)?;
+        gone.extend(
+            self.transfers
+                .iter()
+                .filter(|(_, transfer)| transfer.expires <= now)
+                .map(|(key, _)| *key),
+        );
+        for key in gone {
+            if let Some(expired) = self.transfers.remove(&key) {
+                self.store
+                    .discard_chunk_parts(&expired.manifest)
+                    .map_err(content_error)?;
+            }
+        }
         self.exports.retain(|_, transfer| transfer.expires > now);
         self.recount()
     }
@@ -914,6 +996,36 @@ impl CustodyStore {
             .ok_or(AccessError::Unavailable)?;
         Ok(())
     }
+}
+/// Chunk `index` is held whole: noted, and the first chunk lacked is moved
+/// past everything held after it without a gap.
+fn taken(retained: &mut Transfer, index: usize) -> Result<(), AccessError> {
+    let word = index.checked_div(u64::BITS as usize).unwrap_or(0);
+    let bit = u32::try_from(index.checked_rem(u64::BITS as usize).unwrap_or(0))
+        .ok()
+        .and_then(|bit| 1_u64.checked_shl(bit))
+        .ok_or(AccessError::InvalidRequest)?;
+    *retained
+        .taken
+        .get_mut(word)
+        .ok_or(AccessError::InvalidRequest)? |= bit;
+    while retained.next_missing < retained.manifest.chunks() {
+        let next = retained.next_missing;
+        let word = next.checked_div(u64::BITS as usize).unwrap_or(0);
+        let bit = u32::try_from(next.checked_rem(u64::BITS as usize).unwrap_or(0))
+            .ok()
+            .and_then(|bit| 1_u64.checked_shl(bit))
+            .ok_or(AccessError::InvalidRequest)?;
+        if retained
+            .taken
+            .get(word)
+            .is_none_or(|taken| taken & bit == 0)
+        {
+            break;
+        }
+        retained.next_missing = next.checked_add(1).ok_or(AccessError::Capacity)?;
+    }
+    Ok(())
 }
 fn opened(transfer: &Transfer) -> Result<CustodyReply, AccessError> {
     Ok(CustodyReply::Opened {

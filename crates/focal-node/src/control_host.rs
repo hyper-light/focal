@@ -1657,6 +1657,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             let mut read_charge = None;
             let mut written = None;
             let mut turn = None;
+            let waited_its_turn = matches!(pending.waiting, Waiting::Turn(_));
             let ready = match &mut pending.waiting {
                 // Its turn has come: nothing holds the replica's proposal.
                 Waiting::Turn(waited)
@@ -1793,8 +1794,24 @@ impl<V: AuthorityVerifier> Owner<V> {
             if let Some(id) = written {
                 pending.waiting = Waiting::Write(id);
             }
+            // A request is given its request time from its turn, and one
+            // that waits its turn is given it again each time the turn
+            // passes: its wait is charged to the progress of what it waits
+            // on, the commands decided before it (at most as many as the
+            // owner admits), never to the time they took. Before, the
+            // fifth of five writes that came together was given one
+            // request time for all five, and was given up on a slow disk
+            // (the macOS run of 2026-10-01).
             if let Some(turn) = turn {
                 pending.waiting = Waiting::Turn(Some(Box::new(turn)));
+                if let Some(deadline) = self.request_deadline() {
+                    pending.deadline = deadline;
+                }
+            } else if waited_its_turn
+                && self.took_turn
+                && let Some(deadline) = self.request_deadline()
+            {
+                pending.deadline = deadline;
             }
             if let Some(result) = ready {
                 let result = if pending.enrollment {

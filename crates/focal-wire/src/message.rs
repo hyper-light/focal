@@ -584,6 +584,26 @@ pub enum CustodyRequest {
         hash: ContentHash,
         max_bytes: u32,
     },
+    /// A part of a chunk, from `offset`: a chunk that would take its path
+    /// longer than a transfer's lease to cross goes in parts, each of which
+    /// renews the lease as it is taken (the audit's F49). Parts of one
+    /// chunk go in order; the receiver holds them until the chunk is whole
+    /// and verified, and answers with how much of the chunk it holds.
+    ChunkPart {
+        transfer: [u8; 16],
+        index: u32,
+        offset: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// A part of a chunk the asker lacks, from `offset`, `max_bytes` at
+    /// most: the pull of a chunk too large for its path in one piece.
+    ReadChunkPart {
+        transfer: [u8; 16],
+        index: u32,
+        offset: u32,
+        max_bytes: u32,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustodyReply {
@@ -611,6 +631,20 @@ pub enum CustodyReply {
     },
     SeedChunk {
         hash: ContentHash,
+        #[serde(with = "focal_memory::serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// How much of chunk `index` the receiver holds after a part: the
+    /// sender goes on from there. The last part is answered `ChunkStored`.
+    PartStored {
+        index: u32,
+        staged: u32,
+    },
+    /// A part of a chunk, from `offset`, of a chunk `length` long.
+    ChunkPart {
+        index: u32,
+        offset: u32,
+        length: u32,
         #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },

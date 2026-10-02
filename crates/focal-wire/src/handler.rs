@@ -775,6 +775,31 @@ pub fn validate_response(
                     CustodyRequest::SeedChunk { hash, max_bytes },
                     CustodyReply::SeedChunk { hash: read, bytes },
                 ) => hash == read && !bytes.is_empty() && bytes.len() <= *max_bytes as usize,
+                (
+                    CustodyRequest::ChunkPart { index, .. },
+                    CustodyReply::PartStored { index: stored, .. }
+                    | CustodyReply::ChunkStored { index: stored },
+                ) => index == stored,
+                (
+                    CustodyRequest::ReadChunkPart {
+                        index,
+                        offset,
+                        max_bytes,
+                        ..
+                    },
+                    CustodyReply::ChunkPart {
+                        index: read,
+                        offset: at,
+                        length,
+                        bytes,
+                    },
+                ) => {
+                    index == read
+                        && offset == at
+                        && !bytes.is_empty()
+                        && bytes.len() <= *max_bytes as usize
+                        && u64::from(*at).saturating_add(bytes.len() as u64) <= u64::from(*length)
+                }
                 _ => false,
             };
             if !valid {

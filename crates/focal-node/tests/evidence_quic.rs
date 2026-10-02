@@ -41,6 +41,8 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinHandle;
+#[path = "support/relay.rs"]
+mod relay;
 const ACTOR: ParticipantId = ParticipantId::from_u128(909);
 const ROOT: RootCommandId = RootCommandId::from_u128(910);
 fn ledger() -> LedgerId {
@@ -53,6 +55,25 @@ fn wire_limits() -> WireLimits {
     WireLimits {
         request_timeout: Duration::from_secs(15),
         ..ReplicaHost::wire_limits()
+    }
+}
+/// A path between the replicas slower than the loopback: every datagram
+/// between them crosses a relay that carries `bits` a second each way, and
+/// the objects are chunked `chunk_bytes` at a time.
+#[derive(Clone, Copy)]
+struct Slow {
+    bits: u64,
+    delay: Duration,
+    chunk_bytes: usize,
+}
+fn store_limits_with(chunk_bytes: usize) -> StoreLimits {
+    let limits = store_limits();
+    let chunk = u64::try_from(chunk_bytes).unwrap();
+    StoreLimits {
+        chunk_bytes,
+        max_content_bytes: limits.max_content_bytes.max(chunk * 2),
+        max_staging_bytes: limits.max_staging_bytes.max(chunk * 8),
+        ..limits
     }
 }
 fn store_limits() -> StoreLimits {
@@ -214,9 +235,15 @@ struct Fleet {
     replicas: Vec<Replica>,
     routes: BTreeMap<u64, PeerEndpoint>,
     revision: u64,
+    /// The relays the replicas reach each other through, where the path
+    /// between them is slow; one for each replica, in order.
+    relays: Vec<relay::Relay>,
 }
 impl Fleet {
     async fn open(path: &Path, managed: bool) -> Self {
+        Self::open_with(path, managed, None).await
+    }
+    async fn open_with(path: &Path, managed: bool, slow: Option<Slow>) -> Self {
         let pki = Pki::new();
         let identities: Vec<_> = (1..=3)
             .map(|id| pki.issue(format!("evidence-{id}.focal.test"), true))
@@ -260,6 +287,7 @@ impl Fleet {
             EvidencePlacement::verified(policy.scope(), &plan, &facts, &placement).unwrap();
         let mut pending = Vec::new();
         let mut routes = BTreeMap::new();
+        let mut relays = Vec::new();
         for (index, identity) in identities.iter().enumerate() {
             let id = index as u64 + 1;
             let mut config = NodeConfig::single(id, [91; 16], [92; 16]);
@@ -343,9 +371,11 @@ impl Fleet {
                 (host, owner, TestReplication::Single(channel), None)
             };
             let allowance = MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
-            let store =
-                ContentStore::open(path.join(id.to_string()).join("content"), store_limits())
-                    .unwrap();
+            let store = ContentStore::open(
+                path.join(id.to_string()).join("content"),
+                store_limits_with(slow.map_or(store_limits().chunk_bytes, |slow| slow.chunk_bytes)),
+            )
+            .unwrap();
             let (content, content_owner) = ContentHost::spawn(
                 store,
                 CustodyConfig::new(id),
@@ -441,7 +471,26 @@ impl Fleet {
                 server_name: identity.name.clone(),
                 name: None,
             };
-            routes.insert(id, endpoint.clone());
+            // The replicas reach this one through its relay, where there is
+            // one; its actors reach it directly.
+            let reached = match slow {
+                Some(slow) => {
+                    let relay = relay::Relay::shaped(
+                        endpoint.address,
+                        slow.delay,
+                        slow.delay.checked_div(10).unwrap(),
+                        Some(slow.bits),
+                    );
+                    let front = relay.front();
+                    relays.push(relay);
+                    PeerEndpoint {
+                        address: front,
+                        ..endpoint.clone()
+                    }
+                }
+                None => endpoint.clone(),
+            };
+            routes.insert(id, reached);
             pending.push((
                 host,
                 manager,
@@ -507,6 +556,7 @@ impl Fleet {
             replicas,
             routes,
             revision: 1,
+            relays,
         }
     }
     async fn leader(&self) -> usize {
@@ -1073,4 +1123,108 @@ async fn evidence_scenario(managed: bool) {
             second_bytes
         );
     }
+}
+
+/// Custody of a chunk across a path that takes longer to carry it than a
+/// transfer's lease (the audit's F49). A transfer's lease held sixty
+/// seconds from the last request its receiver executed, and a request's
+/// body is read before it is executed: a megabyte chunk crosses 128 kbit/s
+/// in 66 s, so it arrived to a transfer that had expired, the copy was
+/// refused, and the seal that waits for its required copies never came. A
+/// chunk goes in parts now, each renewing the lease as it is taken, and the
+/// copy is made in the time the path takes.
+async fn a_chunk_reaches_its_copy_across(bits: u64) {
+    const BYTES: usize = 1024 * 1024 + 7;
+    let data = tempfile::tempdir().unwrap();
+    let fleet = Fleet::open_with(
+        data.path(),
+        false,
+        Some(Slow {
+            bits,
+            delay: Duration::from_millis(10),
+            chunk_bytes: 1024 * 1024,
+        }),
+    )
+    .await;
+    let leader = fleet.leader().await;
+    assert_eq!(leader, 0);
+    let mut bytes = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    bytes.resize_with(BYTES, || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+    });
+    // The upload comes to the leader over the loopback; the seal waits for
+    // the required copy on node 2, across its relay. The seal is asked
+    // again, exactly, for as long as four crossings take at the least.
+    let began = std::time::Instant::now();
+    let seal = upload(&fleet.replicas[leader].actor, 1, &bytes).await;
+    let least = Duration::from_secs(BYTES as u64 * 8 / bits);
+    let budget = least.saturating_mul(4);
+    let sealed = loop {
+        let response = fleet.replicas[leader].actor.request(&seal).await.unwrap();
+        if !matches!(
+            response.result,
+            Response::Error(
+                AccessError::OutcomeUnknown | AccessError::Unavailable | AccessError::Capacity
+            )
+        ) {
+            break response;
+        }
+        assert!(
+            began.elapsed() < budget,
+            "the seal did not complete in {budget:?} at {bits} bit/s: {response:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let took = began.elapsed();
+    let Response::Upload(UploadReply::Sealed(reference)) = &sealed.result else {
+        panic!("placed seal failed: {sealed:?}")
+    };
+    assert!(
+        took >= least,
+        "{took:?} for a chunk the path takes {least:?} to carry"
+    );
+    // The copy took the chunk once: what crossed toward node 2 is the
+    // chunk and the exchanges around it, not the chunk again. The client
+    // gives up its exchange before the copy has the chunk and asks the
+    // seal again, exactly; the exact retry ran beside the first seal
+    // before, and the two pushed the same transfer at once, each sending
+    // every byte: 1,970,721 crossed for this chunk, at 124 s. It runs
+    // after the first now, and finds the copy holds the object.
+    let crossed = fleet.relays[1].carried_toward_back();
+    println!(
+        "{bits} bit/s: the copy holds the megabyte and the seal came {took:?} after the upload began (the path alone takes {least:?}); {crossed} bytes crossed toward the copy, {} back, dropped {:?}",
+        fleet.relays[1].carried_toward_front(),
+        fleet.relays[1].dropped()
+    );
+    assert!(
+        crossed < (BYTES as u64) * 3 / 2,
+        "{crossed} bytes crossed toward the copy for a chunk of {BYTES}"
+    );
+    for index in [0, 1] {
+        assert_bytes(
+            download(&fleet.replicas[index].actor, reference).await,
+            &bytes,
+        );
+    }
+    fleet.stop().await;
+}
+
+/// 66 s for the chunk, past the lease of 60.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second() {
+    a_chunk_reaches_its_copy_across(128_000).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn a_megabyte_chunk_reaches_its_copy_across_64_kbit_per_second() {
+    a_chunk_reaches_its_copy_across(64_000).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of a quarter of an hour; run by name"]
+async fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
+    a_chunk_reaches_its_copy_across(8_000).await;
 }

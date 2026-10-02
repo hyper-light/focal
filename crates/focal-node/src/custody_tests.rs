@@ -1019,3 +1019,272 @@ fn the_chunks_of_a_manifest_are_taken_in_any_order() {
         }
     );
 }
+
+/// A chunk goes in parts where its path takes longer than a transfer's
+/// lease to carry it whole (the audit's F49): each part taken renews the
+/// lease, parts go in order with an exact retry taking nothing and a gap
+/// refused, the last part makes the chunk — verified against the
+/// manifest's hash and installed under the same name — and a transfer that
+/// expires or is cancelled holds no part of the volume.
+#[test]
+fn a_chunk_in_parts_renews_the_lease_and_is_the_chunk_once_whole() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    // Three chunks of four bytes.
+    let bytes: Vec<u8> = (1..=12).collect();
+    let content = stored(&mut sender, 1, 1, &bytes);
+    let manifest = sender.export_manifest(&content).unwrap();
+    let mut receiver = CustodyStore::new(
+        ContentStore::open(target.path(), limits()).unwrap(),
+        CustodyConfig::new(1),
+        memory(),
+    )
+    .unwrap();
+    let ledger = ledger(1, 10);
+    receiver.install_policy(policy(ledger)).unwrap();
+    let transfer = [9; 16];
+    let open = |receiver: &mut CustodyStore| {
+        let opened = receiver
+            .request(&custody(
+                ledger,
+                1,
+                CustodyRequest::Open {
+                    transfer,
+                    policy_revision: 1,
+                    content: content.clone(),
+                    manifest: manifest.encoded().to_vec(),
+                },
+            ))
+            .unwrap();
+        let CustodyReply::Opened { next_missing, .. } = opened.value() else {
+            panic!("opened")
+        };
+        *next_missing
+    };
+    let part = |receiver: &mut CustodyStore, index: u32, offset: u32, bytes: &[u8]| {
+        receiver
+            .request(&custody(
+                ledger,
+                2,
+                CustodyRequest::ChunkPart {
+                    transfer,
+                    index,
+                    offset,
+                    bytes: bytes.to_vec(),
+                },
+            ))
+            .map(|reply| reply.value().clone())
+    };
+    let staged = |receiver: &CustodyStore, index: usize| {
+        receiver
+            .content()
+            .staged_chunk_bytes(&manifest, index)
+            .unwrap()
+    };
+    assert_eq!(open(&mut receiver), 0);
+    // Two bytes of chunk 0, then the same two again, then a gap.
+    assert_eq!(
+        part(&mut receiver, 0, 0, &bytes[0..2]),
+        Ok(CustodyReply::PartStored {
+            index: 0,
+            staged: 2
+        })
+    );
+    assert_eq!(
+        part(&mut receiver, 0, 0, &bytes[0..2]),
+        Ok(CustodyReply::PartStored {
+            index: 0,
+            staged: 2
+        })
+    );
+    assert!(matches!(
+        part(&mut receiver, 0, 3, &bytes[3..4]),
+        Err(AccessError::InvalidRequest)
+    ));
+    assert_eq!(staged(&receiver, 0), 2);
+    // The part renewed the lease: the transfer outlives the time its open
+    // alone gave it, by the part's time, and not longer.
+    let after_part = std::time::Instant::now();
+    receiver
+        .expire(after_part + Duration::from_secs(59))
+        .unwrap();
+    assert_eq!(receiver.retained().0, 1);
+    // The rest of chunk 0, in one part: whole, verified and installed.
+    assert_eq!(
+        part(&mut receiver, 0, 2, &bytes[2..4]),
+        Ok(CustodyReply::ChunkStored { index: 0 })
+    );
+    assert_eq!(staged(&receiver, 0), 0);
+    assert_eq!(open(&mut receiver), 1);
+    assert_eq!(
+        receiver
+            .content()
+            .read_transfer_chunk(&manifest, 0)
+            .unwrap(),
+        bytes[0..4].to_vec()
+    );
+    // A chunk whose last part is not the chunk's bytes is not the chunk:
+    // discarded whole, to be sent again.
+    assert_eq!(
+        part(&mut receiver, 1, 0, &bytes[4..6]),
+        Ok(CustodyReply::PartStored {
+            index: 1,
+            staged: 2
+        })
+    );
+    assert!(matches!(
+        part(&mut receiver, 1, 2, &[0, 0]),
+        Err(AccessError::InvalidRequest)
+    ));
+    assert_eq!(staged(&receiver, 1), 0);
+    assert_eq!(open(&mut receiver), 1);
+    // Part of chunk 1 again, then the transfer expires: the part is gone
+    // with it, and the chunk installed whole stays.
+    part(&mut receiver, 1, 0, &bytes[4..6]).unwrap();
+    assert_eq!(staged(&receiver, 1), 2);
+    receiver
+        .expire(std::time::Instant::now() + Duration::from_secs(61))
+        .unwrap();
+    assert_eq!(receiver.retained().0, 0);
+    assert_eq!(staged(&receiver, 1), 0);
+    receiver
+        .content()
+        .read_transfer_chunk(&manifest, 0)
+        .unwrap();
+    // Opened again, chunk 1 in parts and chunk 2 whole, sealed: durable.
+    assert_eq!(open(&mut receiver), 1);
+    part(&mut receiver, 1, 0, &bytes[4..5]).unwrap();
+    part(&mut receiver, 1, 1, &bytes[5..7]).unwrap();
+    assert_eq!(
+        part(&mut receiver, 1, 3, &bytes[7..8]),
+        Ok(CustodyReply::ChunkStored { index: 1 })
+    );
+    receiver
+        .request(&custody(
+            ledger,
+            3,
+            CustodyRequest::Chunk {
+                transfer,
+                index: 2,
+                bytes: bytes[8..12].to_vec(),
+            },
+        ))
+        .unwrap();
+    assert_eq!(open(&mut receiver), 3);
+    let sealed = receiver
+        .request(&custody(ledger, 4, CustodyRequest::Seal { transfer }))
+        .unwrap();
+    assert!(matches!(
+        sealed.value(),
+        CustodyReply::Durable { content: found, .. } if *found == content
+    ));
+    receiver
+        .request(&custody(ledger, 8, CustodyRequest::Cancel { transfer }))
+        .unwrap();
+    assert_eq!(receiver.retained().0, 0);
+    // A cancelled transfer's parts go too.
+    let other = [10; 16];
+    receiver
+        .request(&custody(
+            ledger,
+            5,
+            CustodyRequest::Open {
+                transfer: other,
+                policy_revision: 1,
+                content: content.clone(),
+                manifest: manifest.encoded().to_vec(),
+            },
+        ))
+        .unwrap();
+    // The chunks are installed already: a part of one adds nothing and
+    // answers that the chunk is held whole.
+    assert_eq!(
+        receiver
+            .request(&custody(
+                ledger,
+                6,
+                CustodyRequest::ChunkPart {
+                    transfer: other,
+                    index: 0,
+                    offset: 0,
+                    bytes: bytes[0..1].to_vec(),
+                },
+            ))
+            .map(|reply| reply.value().clone()),
+        Ok(CustodyReply::ChunkStored { index: 0 })
+    );
+    receiver
+        .request(&custody(
+            ledger,
+            7,
+            CustodyRequest::Cancel { transfer: other },
+        ))
+        .unwrap();
+    assert_eq!(receiver.retained().0, 0);
+}
+
+/// The pull of a chunk in parts: a part is cut from the verified chunk at
+/// the offset asked, no longer than asked, and says how long the chunk is.
+#[test]
+fn a_chunk_is_read_in_parts_from_a_verified_whole() {
+    let source = tempfile::tempdir().unwrap();
+    let mut store = ContentStore::open(source.path(), limits()).unwrap();
+    let bytes: Vec<u8> = (1..=8).collect();
+    let content = stored(&mut store, 1, 1, &bytes);
+    let manifest = store.export_manifest(&content).unwrap();
+    let mut sender = CustodyStore::new(store, CustodyConfig::new(1), memory()).unwrap();
+    let ledger = ledger(1, 10);
+    sender.install_policy(policy(ledger)).unwrap();
+    let transfer = [11; 16];
+    sender
+        .request(&custody(
+            ledger,
+            1,
+            CustodyRequest::Open {
+                transfer,
+                policy_revision: 1,
+                content: content.clone(),
+                manifest: manifest.encoded().to_vec(),
+            },
+        ))
+        .unwrap();
+    let read = |sender: &mut CustodyStore, index: u32, offset: u32, max_bytes: u32| {
+        sender
+            .request(&custody(
+                ledger,
+                2,
+                CustodyRequest::ReadChunkPart {
+                    transfer,
+                    index,
+                    offset,
+                    max_bytes,
+                },
+            ))
+            .map(|reply| reply.value().clone())
+    };
+    assert_eq!(
+        read(&mut sender, 1, 1, 2),
+        Ok(CustodyReply::ChunkPart {
+            index: 1,
+            offset: 1,
+            length: 4,
+            bytes: bytes[5..7].to_vec()
+        })
+    );
+    assert_eq!(
+        read(&mut sender, 1, 3, 8),
+        Ok(CustodyReply::ChunkPart {
+            index: 1,
+            offset: 3,
+            length: 4,
+            bytes: bytes[7..8].to_vec()
+        })
+    );
+    // Past the chunk's end: nothing to read there. (A request for no
+    // bytes at all is the wire's to refuse, before it reaches the owner.)
+    assert!(matches!(
+        read(&mut sender, 1, 4, 1),
+        Err(AccessError::InvalidRequest)
+    ));
+}

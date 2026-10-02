@@ -1201,6 +1201,9 @@ fn request_shape(
                 }
                 CustodyRequest::Chunk {
                     transfer, bytes, ..
+                }
+                | CustodyRequest::ChunkPart {
+                    transfer, bytes, ..
                 } => {
                     if *transfer == [0; 16] || bytes.is_empty() {
                         return Err(AccessError::InvalidRequest);
@@ -1208,7 +1211,8 @@ fn request_shape(
                 }
                 CustodyRequest::Seal { transfer }
                 | CustodyRequest::Cancel { transfer }
-                | CustodyRequest::ReadChunk { transfer, .. } => {
+                | CustodyRequest::ReadChunk { transfer, .. }
+                | CustodyRequest::ReadChunkPart { transfer, .. } => {
                     if *transfer == [0; 16] {
                         return Err(AccessError::InvalidRequest);
                     }
@@ -1221,6 +1225,7 @@ fn request_shape(
             }
             if let CustodyRequest::Manifest { max_bytes, .. }
             | CustodyRequest::ReadChunk { max_bytes, .. }
+            | CustodyRequest::ReadChunkPart { max_bytes, .. }
             | CustodyRequest::SeedChunk { max_bytes, .. } = custody
                 && (*max_bytes == 0
                     || *max_bytes > limits.max_frame_bytes.saturating_sub(256)

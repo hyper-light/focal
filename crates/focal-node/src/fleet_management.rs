@@ -154,7 +154,7 @@ pub(in crate::fleet) enum ManagementWork {
         _permit: ManagementPermit,
     },
 }
-struct ManagementState {
+pub(crate) struct ManagementState {
     status: FleetStatus,
     quiesced: bool,
     // The sole bounded installation registry doubles as the read-only routing
@@ -180,6 +180,11 @@ impl FleetManager {
     pub(crate) fn identity(&self) -> (u64, [u8; 16]) {
         let state = self.state.borrow();
         (state.node, state.cluster)
+    }
+    /// What the fleet is, as it changes: for a driver that waits on an
+    /// install or a removal instead of asking at intervals.
+    pub(crate) fn changes(&self) -> watch::Receiver<ManagementState> {
+        self.state.clone()
     }
     pub fn status(&self) -> FleetStatus {
         self.state.borrow().status
