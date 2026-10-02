@@ -34,9 +34,9 @@ ruling before work starts).
 | F19 | P2 | in tree | 6 | [F19](#f19) |
 | F20 | P1 | in tree | 3 | [F20](#f20) |
 | F21 | P1 | open | 7 | — |
-| F22 | P1 | open | 5 | — |
+| F22 | P1 | in tree | 5 | [F22](#f22) |
 | F23 | P2 | open | 6 | — |
-| F24 | P1 | in tree (root group; partition groups open) | 5 | [F24](#f24) |
+| F24 | P1 | in tree (root and partition groups; a seated member's service end under load open) | 5 | [F24](#f24) |
 | F25 | P2 | in tree | 5 | [F25](#f25) |
 | F26 | P2 | open | 7 | — |
 | F27 | P3 | closed (a6cb86e) | 1 | [F27](#f27) |
@@ -1984,6 +1984,42 @@ replicated: a verified backup of the private directory, or a re-founding with
 re-enrollment). A founder whose credential expired outright cannot sign a renewal
 request: the runbook's escalation stands. A client context adopts a successor it verified
 by endorsement only at its next enrollment or renewal (recorded for the client batch).
+
+## F22
+
+**Cause.** The enrollment registry kept every record it ever made — invitations expired
+unredeemed, consumed and long retired with their credentials, revoked — under the one
+bound (`max_invitations`, 4096 by default) that also holds its live population; only the
+certificates a renewal retired had a grace sweep. Ordinary churn (machines replaced,
+onboardings that failed, short-lived actors, revocations) spent the bound for good, and an
+administrative history became a permanent refusal to admit.
+
+**Fix.** A record is closed at the later of its invitation's expiry and its credential's:
+past it a token is expired, a certificate expired and a revocation holds by time, so
+nothing of the record can regain meaning once the committed time floor — which only rises,
+and below which no request is admitted — has passed that moment. Closed records leave the
+table with the next committed decision, in closing order, each visited once (an index by
+closing moment, derived from the records and rebuilt at restore); their certificates,
+enrolled keys and retired entries go with them, their charge is released, and the registry
+counts them (`compacted`; schema 7, a schema-6 checkpoint restores with none counted). A
+renewal or rotation moves a record's closing with the credential, so the live keep their
+records and an exact redeem retry is preserved while the credential lives; a compacted
+token or certificate is unknown, which never redeems or authorizes. The bound now holds the
+open and live population; the issuance and revocation history is the committed command
+stream until the log compacts (`cluster invitations list` is its export while a record is
+open). The audit's "partition issuance" is F21's.
+
+**Tests.** `closed_records_compact_so_onboarding_outlives_the_active_bound`: a bound of
+eight filled and refused; the expired generation compacts with the next decision and the
+bound is free; an expired token of a compacted invitation is unknown; a consumed record
+lives with its credential while a revoked one compacts at its expiry and its replay is
+unknown; a renewal moves the closing; the founder's own unrenewed record closes like any;
+restores rebuild the index and carry the count, a schema-6 checkpoint restores with none
+and compacts the same records; six generations of onboarding past the bound with the
+checkpoint never larger than a full table.
+
+**Measurements.** Fifty-seven records compacted across the test's generations under a
+bound of eight; the checkpoint after them is smaller than one full table.
 
 ## F14
 

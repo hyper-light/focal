@@ -39,7 +39,7 @@ The root metadata group and each installed application replica have separate con
 | `cluster request reconcile A1` | `cluster.request.reconcile` | Recover its receipt or evaluate its committed precondition fence |
 | `cluster invite --node NAME --output FILE` | `cluster.invite` | Private invitation for one physical node; `--output -` writes it to standard output for a pipe (a packaged founder, [24 §24](archictecutre/24-placement-execution-and-fleet-control.md)). The invitation names the founder as it advertises itself — a name when the founder was started with one — so it outlives the founder's address |
 | `cluster client invite --name NAME --output FILE` | `cluster.client.invite` | Private invitation for an Actor client |
-| `cluster invitations list` | `cluster.invitations.list` | Redacted committed invitation page |
+| `cluster invitations list` | `cluster.invitations.list` | Redacted committed invitation page: the open and live records. A record closed — its invitation expired unredeemed, its credential expired unrenewed, or revoked and both expired — has left the registry with the next committed decision ([24 §11](archictecutre/24-placement-execution-and-fleet-control.md)); the committed command stream is the history |
 | `cluster invitations get ID` | `cluster.invitations.get` | Redacted invitation status |
 | `cluster invitations revoke ID` | `cluster.invitations.revoke` | Durable revocation of the invitation and its issued credential |
 | `cluster credentials get --invitation ID` | `cluster.credentials.get` | Issued credential metadata, without private keys |

@@ -789,6 +789,34 @@ pub struct EnrollmentRegistry {
     /// The issuers credentials chain to (24 §11): the genesis issuer in a
     /// registry founded before the succession was recorded.
     issuer: IssuerSuccession,
+    /// Records compacted since genesis (the audit's F22): closed — nothing
+    /// of theirs could regain meaning — and gone from the table, counted.
+    compacted: u64,
+    /// Every record by the moment it closes: the later of its invitation's
+    /// expiry and its credential's. Rebuilt at restore, never persisted.
+    #[serde(skip)]
+    closing: std::collections::BTreeSet<(i64, InvitationId)>,
+}
+/// The registry as schema 6 wrote it, before closed records were compacted.
+#[derive(Deserialize)]
+struct RegistryV6 {
+    schema: u16,
+    cluster: ClusterId,
+    ca_certificate: Vec<u8>,
+    limits: EnrollmentLimits,
+    revision: u64,
+    applied_index: u64,
+    time_floor: i64,
+    next_node: u64,
+    charged_bytes: usize,
+    records: BTreeMap<InvitationId, InviteMetadata>,
+    certificates: BTreeMap<Fingerprint, InvitationId>,
+    enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
+    retired: BTreeMap<Fingerprint, RetiredCredential>,
+    tenants: std::collections::BTreeSet<[u8; 16]>,
+    fence: UpgradeFence,
+    bootstrap: BootstrapServer,
+    issuer: IssuerSuccession,
 }
 /// The limits as schemas 3 to 5 wrote them, before the issuer lifetime.
 #[derive(Deserialize)]
@@ -896,9 +924,9 @@ struct RegistryV3 {
 }
 /// The registry's persisted layout; schema 2 (before admitted tenants)
 /// restores with none, schema 3 without a fence, schema 4 without the
-/// bootstrap server record, schema 5 with the genesis issuer alone; any
-/// other schema is not this registry.
-const REGISTRY_SCHEMA: u16 = 6;
+/// bootstrap server record, schema 5 with the genesis issuer alone, schema
+/// 6 with no record compacted; any other schema is not this registry.
+const REGISTRY_SCHEMA: u16 = 7;
 /// The schema 2 layout, converted on restore.
 #[derive(Deserialize)]
 struct RegistryV2 {
@@ -962,6 +990,8 @@ impl EnrollmentRegistry {
             fence: UpgradeFence::default(),
             bootstrap: BootstrapServer::default(),
             issuer,
+            compacted: 0,
+            closing: std::collections::BTreeSet::new(),
         })
     }
     // Only the private new-genesis draft constructor can select the existing
@@ -1042,6 +1072,9 @@ impl EnrollmentRegistry {
         registry
             .enrolled_keys
             .insert(public_key, receipt.invitation);
+        registry
+            .closing
+            .insert((closed_at(&record), receipt.invitation));
         registry.records.insert(receipt.invitation, record);
         registry.revision = 1;
         registry.time_floor = now;
@@ -1800,6 +1833,7 @@ impl EnrollmentRegistry {
                 }
                 let charge = record_charge(record)?;
                 self.reserve(charge)?;
+                self.closing.insert((closed_at(record), record.id));
                 self.records.insert(record.id, record.clone());
                 self.charged_bytes = self
                     .charged_bytes
@@ -1862,10 +1896,13 @@ impl EnrollmentRegistry {
                     .checked_sub(record_charge(record)?)
                     .ok_or(EnrollmentError::Corrupt)?;
                 self.reserve(extra)?;
+                let closing = (closed_at(record), *invitation);
                 self.records
                     .get_mut(invitation)
                     .ok_or(EnrollmentError::Corrupt)?
                     .receipt = Some(receipt.clone());
+                self.closing.remove(&closing);
+                self.closing.insert((closed_at(&updated), *invitation));
                 self.certificates.insert(fingerprint, *invitation);
                 self.enrolled_keys.insert(public_key, *invitation);
                 self.next_node = next_node;
@@ -2068,10 +2105,13 @@ impl EnrollmentRegistry {
                     .and_then(|bytes| bytes.checked_sub(record_charge(record).ok()?))
                     .ok_or(EnrollmentError::Corrupt)?;
                 self.reserve(charge)?;
+                let closing = (closed_at(record), *invitation);
                 self.records
                     .get_mut(invitation)
                     .ok_or(EnrollmentError::Corrupt)?
                     .receipt = Some(receipt.clone());
+                self.closing.remove(&closing);
+                self.closing.insert((closed_at(&updated), *invitation));
                 self.certificates.remove(&previous);
                 self.certificates.insert(fingerprint, *invitation);
                 self.retired.insert(previous, retired);
@@ -2133,10 +2173,13 @@ impl EnrollmentRegistry {
                     .and_then(|bytes| bytes.checked_sub(record_charge(record).ok()?))
                     .ok_or(EnrollmentError::Corrupt)?;
                 self.reserve(charge)?;
+                let closing = (closed_at(record), *invitation);
                 self.records
                     .get_mut(invitation)
                     .ok_or(EnrollmentError::Corrupt)?
                     .receipt = Some(receipt.clone());
+                self.closing.remove(&closing);
+                self.closing.insert((closed_at(&updated), *invitation));
                 self.certificates.remove(&previous);
                 self.certificates.insert(fingerprint, *invitation);
                 self.enrolled_keys.remove(&previous_key);
@@ -2160,6 +2203,37 @@ impl EnrollmentRegistry {
                 true
             }
         });
+        // Closed records leave the table (the audit's F22): past the later
+        // of its invitation's expiry and its credential's, nothing of a
+        // record can regain meaning — a token is expired, a certificate
+        // expired, a revocation holds by time — so an onboarding history
+        // never exhausts the bound the live population is held to. Each
+        // record is visited once, in closing order; the retired entries of
+        // a closed record retire with it.
+        while let Some(&(closes_at, id)) = self.closing.first() {
+            if closes_at > decided_at {
+                break;
+            }
+            self.closing.pop_first();
+            let Some(record) = self.records.remove(&id) else {
+                continue;
+            };
+            if let Some(receipt) = &record.receipt {
+                self.certificates
+                    .remove(&server_fingerprint(&receipt.certificate));
+                self.enrolled_keys.remove(&receipt.public_key);
+            }
+            self.retired.retain(|_, retired| {
+                if retired.invitation == id {
+                    reclaimed = reclaimed.saturating_add(retired_charge(retired).unwrap_or(0));
+                    false
+                } else {
+                    true
+                }
+            });
+            reclaimed = reclaimed.saturating_add(record_charge(&record).unwrap_or(0));
+            self.compacted = self.compacted.saturating_add(1);
+        }
         self.charged_bytes = self.charged_bytes.saturating_sub(reclaimed);
         self.revision = next_revision;
         self.applied_index = committed_index;
@@ -2274,6 +2348,49 @@ impl EnrollmentRegistry {
             .len();
         bytes.truncate(length);
         Ok(bytes)
+    }
+    /// The schema 6 encoding of this registry, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn encode_as_schema_six_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            schema: u16,
+            cluster: ClusterId,
+            ca_certificate: &'a [u8],
+            limits: &'a EnrollmentLimits,
+            revision: u64,
+            applied_index: u64,
+            time_floor: i64,
+            next_node: u64,
+            charged_bytes: usize,
+            records: &'a BTreeMap<InvitationId, InviteMetadata>,
+            certificates: &'a BTreeMap<Fingerprint, InvitationId>,
+            enrolled_keys: &'a BTreeMap<Fingerprint, InvitationId>,
+            retired: &'a BTreeMap<Fingerprint, RetiredCredential>,
+            tenants: &'a std::collections::BTreeSet<[u8; 16]>,
+            fence: UpgradeFence,
+            bootstrap: &'a BootstrapServer,
+            issuer: &'a IssuerSuccession,
+        }
+        encode(&Legacy {
+            schema: 6,
+            cluster: self.cluster,
+            ca_certificate: &self.ca_certificate,
+            limits: &self.limits,
+            revision: self.revision,
+            applied_index: self.applied_index,
+            time_floor: self.time_floor,
+            next_node: self.next_node,
+            charged_bytes: self.charged_bytes,
+            records: &self.records,
+            certificates: &self.certificates,
+            enrolled_keys: &self.enrolled_keys,
+            retired: &self.retired,
+            tenants: &self.tenants,
+            fence: self.fence,
+            bootstrap: &self.bootstrap,
+            issuer: &self.issuer,
+        })
     }
     /// The schema 5 encoding of this registry, for the upgrade test.
     #[cfg(test)]
@@ -2499,6 +2616,8 @@ impl EnrollmentRegistry {
                     fence: UpgradeFence::default(),
                     bootstrap: BootstrapServer::default(),
                     issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
+                    compacted: 0,
+                    closing: std::collections::BTreeSet::new(),
                 },
                 rest,
             )
@@ -2528,6 +2647,8 @@ impl EnrollmentRegistry {
                     fence: UpgradeFence::default(),
                     bootstrap: BootstrapServer::default(),
                     issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
+                    compacted: 0,
+                    closing: std::collections::BTreeSet::new(),
                 },
                 rest,
             )
@@ -2558,6 +2679,8 @@ impl EnrollmentRegistry {
                     fence: legacy.fence,
                     bootstrap: BootstrapServer::default(),
                     issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
+                    compacted: 0,
+                    closing: std::collections::BTreeSet::new(),
                 },
                 rest,
             )
@@ -2587,6 +2710,39 @@ impl EnrollmentRegistry {
                     tenants: legacy.tenants,
                     fence: legacy.fence,
                     bootstrap: legacy.bootstrap,
+                    compacted: 0,
+                    closing: std::collections::BTreeSet::new(),
+                },
+                rest,
+            )
+        } else if schema == 6 {
+            // A schema-6 checkpoint compacted no record yet.
+            let (legacy, rest): (RegistryV6, &[u8]) = postcard::take_from_bytes(bytes)?;
+            if legacy.schema != 6 {
+                return Err(EnrollmentError::Corrupt);
+            }
+            (
+                Self {
+                    owner: None,
+                    schema: REGISTRY_SCHEMA,
+                    cluster: legacy.cluster,
+                    ca_certificate: legacy.ca_certificate,
+                    limits: legacy.limits,
+                    revision: legacy.revision,
+                    applied_index: legacy.applied_index,
+                    time_floor: legacy.time_floor,
+                    next_node: legacy.next_node,
+                    charged_bytes: legacy.charged_bytes,
+                    records: legacy.records,
+                    certificates: legacy.certificates,
+                    enrolled_keys: legacy.enrolled_keys,
+                    retired: legacy.retired,
+                    tenants: legacy.tenants,
+                    fence: legacy.fence,
+                    bootstrap: legacy.bootstrap,
+                    issuer: legacy.issuer,
+                    compacted: 0,
+                    closing: std::collections::BTreeSet::new(),
                 },
                 rest,
             )
@@ -2595,7 +2751,7 @@ impl EnrollmentRegistry {
         };
         // A checkpoint written before the succession was recorded charged
         // nothing for its issuer; the genesis record is charged now.
-        if schema < REGISTRY_SCHEMA {
+        if schema < 6 {
             registry.charged_bytes = registry
                 .charged_bytes
                 .checked_add(registry.issuer.charge()?)
@@ -2753,8 +2909,20 @@ impl EnrollmentRegistry {
         if charged_bytes != registry.charged_bytes || charged_bytes > limits.max_checkpoint_bytes {
             return Err(EnrollmentError::Corrupt);
         }
+        // Every record closes at a moment of its own; the index that finds
+        // the closed ones is derived from the records, so it is rebuilt.
+        registry.closing = registry
+            .records
+            .values()
+            .map(|record| (closed_at(record), record.id))
+            .collect();
         registry.owner = Some(random()?);
         Ok(registry)
+    }
+    /// Records compacted since genesis (the audit's F22): closed ones that
+    /// left the table once nothing of theirs could regain meaning.
+    pub fn compacted(&self) -> u64 {
+        self.compacted
     }
     fn reserve(&self, additional: usize) -> Result<(), EnrollmentError> {
         if self
@@ -2832,6 +3000,16 @@ impl EnrollmentRegistry {
         }
         Ok(record)
     }
+}
+/// When nothing of a record can regain meaning: the later of its
+/// invitation's expiry and its credential's (the audit's F22).
+fn closed_at(record: &InviteMetadata) -> i64 {
+    record
+        .receipt
+        .as_ref()
+        .map_or(record.expires_at, |receipt| {
+            receipt.expires_at.max(record.expires_at)
+        })
 }
 fn record_charge(record: &InviteMetadata) -> Result<usize, EnrollmentError> {
     // Canonical payload plus map keys/node overhead. The fixed 8 KiB registry

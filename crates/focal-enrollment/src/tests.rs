@@ -2412,3 +2412,185 @@ fn an_older_trust_verifies_an_endorsed_chain_and_refuses_an_unendorsed_or_forged
         std::iter::repeat_n(chain[1].clone(), 6).collect();
     assert!(pinned.verify_chain(&padded, at).is_err());
 }
+
+/// Closed records leave the registry (the audit's F22): past the later of
+/// its invitation's expiry and its credential's, nothing of a record can
+/// regain meaning — a token is expired, a certificate expired, a revocation
+/// holds by time — so a cluster's onboarding history never exhausts the
+/// bound its live population is held to. The bound holds while records are
+/// open; a renewal keeps its record; a compacted token or certificate is
+/// unknown, which never redeems or authorizes; restores rebuild the index
+/// and an older checkpoint restores with nothing compacted.
+#[test]
+fn closed_records_compact_so_onboarding_outlives_the_active_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let limits = EnrollmentLimits {
+        max_invitations: 8,
+        max_enrollments: 8,
+        credential_lifetime: 3600,
+        issuer_lifetime: EnrollmentLimits::issuer_lifetime_for(3600),
+        ..EnrollmentLimits::default()
+    };
+    let (mut registry, _founder_key, founder_receipt, _material) =
+        founder(&dir, &authority, "founder-key", limits.clone());
+    let t0 = now();
+    let invite_at = |registry: &mut EnrollmentRegistry, at: i64| {
+        let draft = registry.prepare_invitation(
+            &authority,
+            InviteOptions {
+                endpoint: "127.0.0.1:8443".into(),
+                server_name: "localhost".into(),
+                role: EnrollmentRole::Node,
+                expires_at: at + 600,
+            },
+            at,
+        )?;
+        registry
+            .apply_committed(draft.command(), registry.applied_index() + 1)
+            .unwrap();
+        Ok::<_, EnrollmentError>(draft.release(registry).unwrap())
+    };
+    // The floor moves with any committed decision.
+    let advance = |registry: &mut EnrollmentRegistry, at: i64, tenant: u8| {
+        let command = registry
+            .prepare_admit_tenant(&authority, [tenant; 16], at)
+            .unwrap();
+        registry
+            .apply_committed(&command, registry.applied_index() + 1)
+            .unwrap();
+    };
+    // The founder's record and seven invitations fill the bound; the
+    // eighth invitation is refused for capacity.
+    let first: Vec<Invitation> = (0..7)
+        .map(|_| invite_at(&mut registry, t0).unwrap())
+        .collect();
+    assert_eq!(registry.enrollments().count(), 1);
+    assert!(matches!(
+        invite_at(&mut registry, t0),
+        Err(EnrollmentError::Capacity)
+    ));
+    let full = registry.checkpoint().unwrap().len();
+    assert_eq!(registry.compacted(), 0);
+    // Once they expired, the unredeemed invitations are closed and leave
+    // the table with the next committed decision; the bound is free again.
+    let t1 = t0 + 601;
+    advance(&mut registry, t1, 9);
+    assert_eq!(registry.compacted(), 7);
+    assert!(registry.invitation_status(first[0].id()).is_none());
+    // An expired token of a compacted invitation is unknown: it never
+    // redeems.
+    let stale_key = JoinKey::open_or_create(dir.path().join("stale"), [1; 16]).unwrap();
+    let stale = first[1].request(&stale_key, t1).unwrap();
+    assert!(matches!(
+        registry.prepare_join(&authority, &stale, t1),
+        Err(EnrollmentError::Unauthorized | EnrollmentError::Expired)
+    ));
+    // A second generation: one consumed, one revoked, the rest left open.
+    let second: Vec<Invitation> = (0..7)
+        .map(|_| invite_at(&mut registry, t1).unwrap())
+        .collect();
+    let key = JoinKey::open_or_create(dir.path().join("node"), [1; 16]).unwrap();
+    let request = second[0].request(&key, t1).unwrap();
+    let prepared = registry.prepare_join(&authority, &request, t1).unwrap();
+    commit(&mut registry, prepared);
+    let receipt = registry.release(&request, t1).unwrap();
+    let material = key
+        .complete(&receipt, registry.issuers().trusted(), t1)
+        .unwrap();
+    let revoke = registry.prepare_revoke(second[1].id(), t1).unwrap();
+    registry
+        .apply_committed(&revoke, registry.applied_index() + 1)
+        .unwrap();
+    assert!(registry.invitation_revoked(second[1].id()).unwrap());
+    // Past the second generation's expiry: the open and the revoked
+    // invitations are closed and gone; the consumed one lives with its
+    // credential; a replay of the revoked token is unknown, which never
+    // redeems.
+    let t2 = t1 + 601;
+    advance(&mut registry, t2, 10);
+    assert_eq!(registry.compacted(), 13);
+    assert!(registry.invitation_status(second[1].id()).is_none());
+    assert!(registry.invitation_status(second[0].id()).is_some());
+    let revoked_key = JoinKey::open_or_create(dir.path().join("revoked"), [1; 16]).unwrap();
+    let replay = second[1].request(&revoked_key, t2).unwrap();
+    assert!(matches!(
+        registry.prepare_join(&authority, &replay, t2),
+        Err(EnrollmentError::Unauthorized | EnrollmentError::Expired | EnrollmentError::Revoked)
+    ));
+    assert_eq!(
+        registry
+            .authorize_certificate(&receipt.certificate, t2)
+            .unwrap(),
+        receipt.identity
+    );
+    // A renewal moves the record's closing with the credential: past the
+    // first credential's expiry the renewed record stays.
+    let renewal = material.renewal_request(&key, &receipt).unwrap();
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &renewal, t2, 30)
+        .unwrap()
+    else {
+        panic!("a renewal commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry.release_renewal(&renewal, t2).unwrap();
+    let t3 = t1 + 3601;
+    assert!(t3 > founder_receipt.expires_at);
+    advance(&mut registry, t3, 11);
+    // The founder's own unrenewed credential closed too: its record is
+    // gone with the first generation's; the renewed node's stays.
+    assert_eq!(registry.compacted(), 14);
+    assert_eq!(registry.enrollments().count(), 1);
+    assert_eq!(
+        registry
+            .authorize_certificate(&renewed.certificate, t3)
+            .unwrap(),
+        renewed.identity
+    );
+    // The index is derived from the records: a restore rebuilds it and
+    // carries the count; a schema-6 checkpoint restores with none counted
+    // and compacts the same records from there.
+    let restored =
+        EnrollmentRegistry::restore(&registry.checkpoint().unwrap(), [1; 16], limits.clone())
+            .unwrap();
+    assert_eq!(restored.compacted(), 14);
+    assert_eq!(restored.charged_bytes(), registry.charged_bytes());
+    let mut six = EnrollmentRegistry::restore(
+        &registry.encode_as_schema_six_for_tests().unwrap(),
+        [1; 16],
+        limits.clone(),
+    )
+    .unwrap();
+    assert_eq!(six.compacted(), 0);
+    assert_eq!(six.enrollments().count(), 1);
+    // Past the renewed credential's expiry, that record closes as well:
+    // the certificate is unknown, which never authorizes.
+    let t4 = t2 + 3601;
+    for registry in [&mut registry, &mut six] {
+        advance(registry, t4, 12);
+        assert_eq!(registry.enrollments().count(), 0);
+        assert!(
+            registry
+                .authorize_certificate(&renewed.certificate, t4)
+                .is_err()
+        );
+        assert!(registry.retired(t4).next().is_none());
+    }
+    assert_eq!(registry.compacted(), 15);
+    assert_eq!(six.compacted(), 1);
+    // A lifetime of onboarding past the bound, and the checkpoint never
+    // grows past a full table.
+    for generation in 0..6_i64 {
+        let at = t4 + 1 + generation * 700;
+        for _ in 0..7 {
+            invite_at(&mut registry, at).unwrap();
+        }
+        assert!(registry.checkpoint().unwrap().len() <= full);
+        advance(&mut registry, at + 601, 20 + generation as u8);
+    }
+    assert_eq!(registry.compacted(), 15 + 42);
+    assert!(registry.checkpoint().unwrap().len() < full);
+}

@@ -12863,3 +12863,16 @@ when the partition refused it, so the operator plans again on the next
 observation; a request whose partition has an intent pending waits for it;
 a refusal stays visible until a commit of the same kind.
 
+### 2026-10-02 — F22: closed enrollment records leave the registry
+
+The enrollment registry kept every record it ever made under the one bound
+that also holds its live population, so ordinary churn spent the bound for
+good. A record is closed at the later of its invitation's expiry and its
+credential's — past it nothing of the record can regain meaning once the
+committed time floor has passed — and closed records now leave the table
+with the next committed decision, counted, their charge released; a
+renewal keeps a record open with the credential, and a compacted token or
+certificate is unknown, which never admits ([24](24-placement-execution-and-fleet-control.md)
+§11). The bound holds the open and live population; the committed command
+stream is the history.
+

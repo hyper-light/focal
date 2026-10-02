@@ -751,6 +751,31 @@ on. An expired
 receipt in a checkpoint may have been issued under an issuer retired since;
 `restore` holds it to its shape and verifies the signature of the live ones.
 
+**Closed records (2026-10-02; the audit's F22).** The registry kept every
+record it ever made — invitations expired unredeemed, consumed and long
+retired with their credentials, revoked — under the one bound
+(`max_invitations`) that also holds its live population, so ordinary churn
+spent the bound for good. A record is *closed* at the later of its
+invitation's expiry and its credential's: past that moment a token is
+expired, a certificate expired and a revocation holds by time, so nothing
+of the record can regain meaning once the committed time floor (every
+decision's `decided_at`, which only rises and below which no request is
+admitted) has passed it. Closed records leave the table with the next
+committed decision (`apply_committed`, after the retired sweep), in
+closing order, each visited once — an index by closing moment
+(`closing`), derived from the records and rebuilt at restore; their
+certificates, enrolled keys and retired entries go with them and their
+charge is released; the registry counts them (`compacted`, schema 7; a
+schema-6 checkpoint restores with none counted). A renewal or rotation
+moves a record's closing with the credential, so the live keep their
+records and an exact redeem retry is preserved while the credential
+lives; a compacted token or certificate is unknown, which never redeems
+or authorizes — what was `Expired` or `Revoked` before is `Unauthorized`
+after, and neither admits. `max_invitations` therefore bounds the open
+and live population; the issuance and revocation history is the committed
+command stream until the log compacts, and `cluster invitations list` is
+its export while a record is open.
+
 **Rotation (2026-09-10, R9.3).** `cluster credentials rotate`
 (`AdminCommand::RotateCredential`, `cluster.credentials.rotate`) moves a
 node's credential to a fresh key under the same identity. The holder stages
