@@ -2217,9 +2217,10 @@ once, each expecting the revision the one before leaves, and a transfer behind t
 all committed, in order; without the turn, four of the five are refused).
 
 **The driver's test of a dead peer beside a live one hung** (`focal-node`, found by this
-batch's own run of the suite, not by CI: 2 of 60 runs of
+batch's own run of the suite: 2 of 60 runs of
 `a_peer_that_answers_nothing_holds_its_own_lane_and_nothing_of_anothers` under the rule
-before, each parked with nothing to wake it). *Cause.* When the driver is full and the
+before, each parked with nothing to wake it; and then found to be what the macOS run of
+7ea6f63 had been stuck on for two hours, which was cancelled for its log). *Cause.* When the driver is full and the
 frame that came finds its own peer holding as much as the peer that holds the most, the
 frame that came was given up. The live peer's five frames arrive behind the dead peer's
 twenty; whether the driver has seen any of the live peer's sends end before its fifth

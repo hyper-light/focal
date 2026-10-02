@@ -12674,5 +12674,8 @@ bytes outstanding: a batch now releases, or charges, before it answers. Every fi
 but one was released by closing its file, which a child process a test or a node starts
 holds open for a moment: one owner type unlocks the file when it ends. And the control
 owner refused for capacity whatever came while it decided another command: it waits its
-turn now, in order. Each has a test that fails on the tree before. Open: a drained
-leader's replacement stayed `Installed` for 300 s on two macOS runs.
+turn now, in order. And the replication driver's own test of a dead peer beside a live
+one hung in two runs of sixty, and had held a macOS runner for two hours: on a tie the
+frame that came was given up; the other peer's older frame goes now. Each has a test
+that fails on the tree before. Open: a drained leader's replacement stayed `Installed`
+for 300 s on two macOS runs.
