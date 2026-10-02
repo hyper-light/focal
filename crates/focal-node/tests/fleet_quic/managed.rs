@@ -58,26 +58,30 @@ async fn current_leader(fleet: &Fleet, excluding: Option<usize>) -> usize {
     .await
     .unwrap()
 }
-async fn install_support(fleet: &Fleet, leader: usize) {
+pub(super) async fn install_support(fleet: &Fleet, leader: usize) {
+    install_support_among(fleet, leader, 3).await;
+}
+/// The first `members` replicas promise the decoder to each other.
+pub(super) async fn install_support_among(fleet: &Fleet, leader: usize, members: u64) {
     // Only an actual managed demand begins this upgrade. Its authenticated
-    // current-member probes make the other voters durably promise support.
-    for target in 1..=3 {
-        if target == leader as u64 + 1 {
-            continue;
-        }
+    // current-member probes make the other voters durably promise support;
+    // the asker is probed by another member, so that every member has
+    // begun before any records a promise.
+    for target in 1..=members {
+        let asker = if target == leader as u64 + 1 {
+            (leader + 1) % usize::try_from(members).unwrap()
+        } else {
+            leader
+        };
         let request = managed_request(
             450 + u128::from(target),
             Operation::ManagedSupport { group: [8; 16] },
         );
-        fleet.replicas[leader]
-            .pool
-            .send_managed_support(target, &request)
-            .await
-            .unwrap();
+        probe(&fleet.replicas[asker], target, &request).await;
     }
 
-    for (index, replica) in fleet.replicas.iter().enumerate() {
-        for target in 1..=3 {
+    for (index, replica) in fleet.replicas.iter().enumerate().take(members as usize) {
+        for target in 1..=members {
             if target == index as u64 + 1 {
                 continue;
             }
@@ -85,11 +89,7 @@ async fn install_support(fleet: &Fleet, leader: usize) {
                 500 + u128::from(target),
                 Operation::ManagedSupport { group: [8; 16] },
             );
-            let fact = replica
-                .pool
-                .send_managed_support(target, &request)
-                .await
-                .unwrap();
+            let fact = probe(replica, target, &request).await;
             assert_eq!(fact.node, target);
             replica
                 .host
@@ -478,4 +478,47 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
         ));
     }
     reopened.stop().await;
+}
+
+/// A member admitted later promises the decoder when a current member asks
+/// it (as the service's managed-support driver asks a learner after its
+/// admission), and every earlier member records the promise.
+pub(super) async fn promise_of(fleet: &Fleet, asker: usize, member: u64) {
+    let request = managed_request(
+        600 + u128::from(member),
+        Operation::ManagedSupport { group: [8; 16] },
+    );
+    let fact = probe(&fleet.replicas[asker], member, &request).await;
+    assert_eq!(fact.node, member);
+    for (index, replica) in fleet.replicas.iter().enumerate() {
+        if index as u64 + 1 == member {
+            continue;
+        }
+        replica
+            .host
+            .record_managed_support(member, fact.clone())
+            .await
+            .unwrap();
+    }
+}
+
+/// One support probe, asked again while the member's promise write is
+/// still in flight (`OutcomeUnknown`), under a counted budget: the exact
+/// request, answered from the member's durable promise once it is.
+async fn probe(
+    replica: &Replica,
+    target: u64,
+    request: &RequestEnvelope,
+) -> focal_model::ManagedFormatSupport {
+    let mut unknown = 0;
+    loop {
+        match replica.pool.send_managed_support(target, request).await {
+            Ok(fact) => return fact,
+            Err(PeerSendError::Rejected(AccessError::OutcomeUnknown)) if unknown < 200 => {
+                unknown += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("support probe of {target}: {error:?} after {unknown} unknown"),
+        }
+    }
 }

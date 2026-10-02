@@ -17,6 +17,18 @@ struct ManagedSupportCache {
     _native_charge: Option<Allocation>,
 }
 impl Session {
+    /// The decoder promises this replica holds (24 §21; the audit's F24):
+    /// the configuration index they were recorded at, the peers that
+    /// promised the managed baseline and those that promised the native
+    /// successor. What a learner's admission and a voter's promotion wait
+    /// on, for the diagnostics that say why one is held.
+    pub fn promises(&self) -> (Option<u64>, &[u64], &[u64]) {
+        (
+            self.managed_support.configuration_index,
+            &self.managed_support.nodes,
+            &self.managed_support.native_nodes,
+        )
+    }
     /// The compiled immutable managed decoder descriptor; inspecting it never
     /// requests the irreversible durable floor or activates managed admission.
     pub fn managed_decoder_hash() -> [u8; 32] {

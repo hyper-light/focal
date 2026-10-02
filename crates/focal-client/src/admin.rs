@@ -205,6 +205,16 @@ pub struct AdminReplicaDiagnostics {
     /// Entries applied past the last snapshot: the log kept beyond the
     /// checkpoint (26 §3).
     pub log_entries_since_checkpoint: u64,
+    /// The decoder promises this replica holds and the configuration index
+    /// they were recorded at (24 §21): a learner is admitted to a native
+    /// group, and a voter promoted, only once its promise is held at the
+    /// current index — what a held admission waits on.
+    #[serde(default)]
+    pub promises_at: Option<u64>,
+    #[serde(default)]
+    pub managed_promises: Vec<u64>,
+    #[serde(default)]
+    pub native_promises: Vec<u64>,
     /// The retention floor of a native session and its inputs (26 §3):
     /// the published prefix, what registered consumers still need, what
     /// the archive reports holding, the least of them, and what holds the

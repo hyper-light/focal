@@ -253,8 +253,17 @@ impl Fleet {
             .collect()
     }
     async fn open(path: &Path, grouped: bool) -> Self {
+        Self::open_with(path, grouped, 3, false).await
+    }
+    /// Three voters, and beyond them `members - 3` fresh nodes: each with
+    /// an empty log and a session that is not yet native, admitted to
+    /// nothing until a test admits it — a replacement copy as the
+    /// placement agent opens one. With `native`, every session is opened
+    /// with native hosting (its own content store and seed store), so the
+    /// group can activate native history.
+    async fn open_with(path: &Path, grouped: bool, members: u64, native: bool) -> Self {
         let pki = Pki::new();
-        let identities: Vec<_> = (1..=3)
+        let identities: Vec<_> = (1..=members)
             .map(|node| pki.issue(format!("node-{node}.focal.test"), true))
             .collect();
         let actor_identity = pki.issue("actor.focal.test".into(), false);
@@ -263,8 +272,13 @@ impl Fleet {
         let mut routes = BTreeMap::new();
         for (index, identity) in identities.iter().enumerate() {
             let id = index as u64 + 1;
-            let mut config = NodeConfig::single(id, [7; 16], [8; 16]);
-            config.voters = vec![1, 2, 3];
+            let config = if id <= 3 {
+                let mut config = NodeConfig::single(id, [7; 16], [8; 16]);
+                config.voters = vec![1, 2, 3];
+                config
+            } else {
+                NodeConfig::joining(id, [7; 16], [8; 16], vec![1, 2, 3], vec![])
+            };
             let mut service = ReplicaConfig::new(RootCommandId::from_u128(3));
             service.tick = Duration::from_millis(20);
             service.request_timeout = Duration::from_millis(500);
@@ -273,9 +287,46 @@ impl Fleet {
                 let tenant = budget.child(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
                 let node =
                     DurableNode::open_in(config, path.join(id.to_string()), &tenant).unwrap();
-                let session =
+                let session = if native {
+                    let content_dir = path.join(format!("content-{id}"));
+                    let store = focal_evidence::ContentStore::open(
+                        &content_dir,
+                        focal_evidence::StoreLimits {
+                            max_content_bytes: 64 << 20,
+                            max_staging_bytes: 128 << 20,
+                            max_uploads: 16,
+                            chunk_bytes: 4096,
+                            max_manifest_bytes: 1 << 20,
+                        },
+                    )
+                    .unwrap();
+                    drop(store);
+                    Session::from_node_in_hosted(
+                        ledger(),
+                        node,
+                        SessionLimits::default(),
+                        &tenant,
+                        focal_ledger::NativeHosting {
+                            limits: focal_ledger::NativeSessionLimits::standard(ContentDomainId(
+                                ledger().tenant.0,
+                            )),
+                            reader: focal_evidence::ContentReader::open(&content_dir).unwrap(),
+                            seeds: focal_evidence::SeedStore::open(
+                                content_dir.join("seeds"),
+                                focal_memory::DiskBudget::new(
+                                    focal_memory::DiskBudgetConfig::default(),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap(),
+                            range: focal_memory::RangeId(1),
+                        },
+                    )
+                    .unwrap()
+                } else {
                     Session::from_node_in(ledger(), node, SessionLimits::default(), &tenant)
-                        .unwrap();
+                        .unwrap()
+                };
                 let (mut hosts, owner, outgoing) = ReplicaFleet::spawn(
                     id,
                     vec![FleetReplica {
@@ -351,8 +402,8 @@ impl Fleet {
                 PeerConnectionPool::new(
                     pki.connector(identity),
                     PeerPoolLimits {
-                        max_routes: 3,
-                        max_connections: 3,
+                        max_routes: usize::try_from(members).unwrap(),
+                        max_connections: usize::try_from(members).unwrap(),
                         max_inflight: 8,
                         attempts: 1,
                         timeout: Duration::from_millis(500),
@@ -464,6 +515,16 @@ impl Fleet {
             replica.pool.replace_routes(self.revision, routes).unwrap();
         }
     }
+    /// Every replica reaches every other again, at a new route revision.
+    fn reconnect(&mut self) {
+        self.revision += 1;
+        for replica in &self.replicas {
+            replica
+                .pool
+                .replace_routes(self.revision, self.routes.clone())
+                .unwrap();
+        }
+    }
     async fn stop_node(&mut self, index: usize) {
         let replica = &mut self.replicas[index];
         if replica.owner.is_none() {
@@ -476,9 +537,14 @@ impl Fleet {
         replica.owner.take().unwrap().join().unwrap();
         let report = replica.driver.take().unwrap().await.unwrap().unwrap();
         assert!(report.peak_inflight <= 8);
+        // Every frame attempted was handed to a send or given up for the
+        // room (refused), and every frame sent was accepted, lost or
+        // refused at the pool's bound — none dropped in silence.
+        assert_eq!(report.attempted, report.sent + report.refused, "{report:?}");
         assert_eq!(
-            report.attempted,
-            report.accepted + report.lost + report.saturated
+            report.sent,
+            report.accepted + report.lost + report.saturated,
+            "{report:?}"
         );
         replica.serving.take().unwrap().await.unwrap().unwrap();
     }
@@ -602,3 +668,370 @@ async fn quorum_retry_and_recovery(grouped: bool) {
 
 #[path = "fleet_quic/managed.rs"]
 mod managed;
+
+/// The leader of the moment and its membership view: a fresh group may
+/// still be handing leadership on, and replicas sharing a machine with
+/// other tests re-elect, so a schedule follows the leader it finds, under
+/// a counted budget.
+async fn membership_on_leader(fleet: &Fleet) -> (usize, focal_node::fleet::MembershipReply) {
+    let mut moved = 0;
+    loop {
+        let leader = fleet.leader(None).await;
+        match fleet.replicas[leader].host.membership().await {
+            Ok(reply) => return (leader, reply),
+            Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                moved += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("membership: {error}; replicas={:?}", fleet.diagnostics()),
+        }
+    }
+}
+/// One membership change through the leader of the moment: asked again
+/// with its exact identity while its outcome is unknown, of the next
+/// leader when this one has handed on, under counted budgets. A learner
+/// behind is left to the caller.
+async fn change_on_leader(
+    fleet: &Fleet,
+    request: &SessionMembershipRequest,
+) -> Result<(usize, focal_node::fleet::MembershipReply), LedgerError> {
+    let (mut unknown, mut moved) = (0, 0);
+    loop {
+        let leader = fleet.leader(None).await;
+        match fleet.replicas[leader]
+            .host
+            .change_membership(request.clone())
+            .await
+        {
+            Ok(reply) => return Ok((leader, reply)),
+            Err(LedgerError::OutcomeUnknown) if unknown < 40 => {
+                unknown += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                moved += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind)) => {
+                return Err(LedgerError::Consensus(
+                    focal_consensus::ConsensusError::LearnerBehind,
+                ));
+            }
+            Err(error) => panic!(
+                "membership change: {error} after {unknown} unknown, {moved} moved; replicas={:?}",
+                fleet.diagnostics()
+            ),
+        }
+    }
+}
+/// Checkpoint on the leader of the moment; returns which replica did.
+async fn checkpoint_on_leader(fleet: &Fleet) -> usize {
+    let mut moved = 0;
+    loop {
+        let leader = fleet.leader(None).await;
+        match fleet.replicas[leader].host.checkpoint().await {
+            Ok(()) => return leader,
+            Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                moved += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("checkpoint: {error}; replicas={:?}", fleet.diagnostics()),
+        }
+    }
+}
+/// Hand leadership from whoever leads to `to` (a voter), and wait until it
+/// leads; asked again of the next leader when the asked one had handed on.
+async fn hand_off(fleet: &Fleet, to: usize) {
+    let mut moved = 0;
+    loop {
+        let (leader, view) = membership_on_leader(fleet).await;
+        if leader == to {
+            return;
+        }
+        match fleet.replicas[leader]
+            .host
+            .transfer_leader_checked(focal_control::ControlTransfer {
+                expected_configuration_index: view.view().configuration_index,
+                expected: view.view().configuration.clone(),
+                target: to as u64 + 1,
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                moved += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(error) => panic!("transfer: {error}; replicas={:?}", fleet.diagnostics()),
+        }
+        let led = tokio::time::timeout(Duration::from_secs(10), async {
+            while fleet.replicas[to].host.progress().leader != to as u64 + 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if led.is_ok() {
+            return;
+        }
+        moved += 1;
+        assert!(
+            moved < 40,
+            "leadership never moved to {to}: replicas={:?}",
+            fleet.diagnostics()
+        );
+    }
+}
+/// Promote `node` through the leader of the moment once it has caught up.
+async fn promote_when_caught_up(fleet: &Fleet, node: u64, id: [u8; 16]) {
+    let promoted = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (_, current) = membership_on_leader(fleet).await;
+            if current.view().configuration.voters.contains(&node) {
+                break current;
+            }
+            let promote = SessionMembershipRequest {
+                id,
+                expected_index: current.view().configuration_index,
+                expected: current.view().configuration.clone(),
+                change: MembershipChange::Promote { node },
+            };
+            match change_on_leader(fleet, &promote).await {
+                Ok((_, reply)) => break reply,
+                Err(LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("promotion: {error}; replicas={:?}", fleet.diagnostics()),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("promotion never took: replicas={:?}", fleet.diagnostics()));
+    assert!(promoted.view().configuration.voters.contains(&node));
+}
+/// Wait until `replica` applied at least `index` (and, when asked, is
+/// native), from its own diagnostics.
+async fn applied_at_least(fleet: &Fleet, replica: usize, index: u64, native: bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(reply) = fleet.replicas[replica].host.diagnostics().await
+                && reply.value().applied_index >= index
+                && (!native || reply.value().native_active)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "replica {replica} never reached {index}: replicas={:?}",
+            fleet.diagnostics()
+        )
+    });
+}
+
+/// A member whose log ends before the leader's first retained entry — one
+/// that was away while the leader checkpointed and compacted, as a
+/// replacement copy's empty log is to a leader that checkpointed — is
+/// brought up by a snapshot, by the leader that admitted it and by the one
+/// that leads after a hand-off before it caught up: a drained session
+/// leader's replacement stayed at index 0 for the whole budget on Linux CI
+/// (`drain_leader`, 2026-10-01/02) while its leader beat it and never
+/// appended to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_behind_a_compacted_log_is_brought_up_by_snapshot_by_any_leader() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut fleet = Fleet::open(directory.path(), true).await;
+    let (leader, initial) = membership_on_leader(&fleet).await;
+    let target = (leader + 1) % 3;
+    let target_node = target as u64 + 1;
+    // The target hears nothing more; it is removed and the leader
+    // checkpoints, so its log is retained only from the removal on.
+    fleet.isolate(target);
+    let removal = SessionMembershipRequest {
+        id: [11; 16],
+        expected_index: initial.view().configuration_index,
+        expected: initial.view().configuration.clone(),
+        change: MembershipChange::Remove { node: target_node },
+    };
+    let (_, removed) = change_on_leader(&fleet, &removal).await.unwrap();
+    assert_eq!(removed.view().configuration.voters.len(), 2);
+    let leader = checkpoint_on_leader(&fleet).await;
+    let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
+    let compacted_applied = compacted.value().applied_index;
+    assert_eq!(
+        compacted.value().log_entries_since_checkpoint,
+        0,
+        "{:?}",
+        compacted.value()
+    );
+    assert!(compacted_applied >= removed.view().configuration_index);
+    // Back, and admitted as a learner: what it lacks is behind the
+    // leader's first retained entry, so it comes by snapshot.
+    fleet.reconnect();
+    let (_, current) = membership_on_leader(&fleet).await;
+    let add = SessionMembershipRequest {
+        id: [12; 16],
+        expected_index: current.view().configuration_index,
+        expected: current.view().configuration.clone(),
+        change: MembershipChange::AddLearner { node: target_node },
+    };
+    let (leader, added) = change_on_leader(&fleet, &add).await.unwrap();
+    assert_eq!(added.view().configuration.learners, vec![target_node]);
+    // Leadership is handed to the other voter before the learner caught
+    // up: the new leader's view of the learner starts afresh, and it must
+    // snapshot it as the old one would have.
+    let other = (0..3)
+        .find(|index| *index != leader && *index != target)
+        .unwrap();
+    hand_off(&fleet, other).await;
+    applied_at_least(&fleet, target, compacted_applied, false).await;
+    promote_when_caught_up(&fleet, target_node, [13; 16]).await;
+    fleet.stop().await;
+}
+
+/// The replacement copy's own shape (`drain_leader`'s): a node never a
+/// member, with an empty log and a session not yet native, admitted as a
+/// learner to a group whose leader has checkpointed — it is brought up by
+/// that leader's snapshot, and by the next leader's after a hand-off before
+/// it caught up, and promoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_copy_with_an_empty_log_is_brought_up_by_snapshot_by_any_leader() {
+    let directory = tempfile::tempdir().unwrap();
+    let fleet = Fleet::open_with(directory.path(), true, 4, false).await;
+    let fresh = 3usize;
+    let fresh_node = 4u64;
+    // The leader checkpoints before the fresh copy is admitted: nothing of
+    // its log before the checkpoint is retained for a late member.
+    let leader = checkpoint_on_leader(&fleet).await;
+    let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
+    let compacted_applied = compacted.value().applied_index;
+    assert_eq!(
+        compacted.value().log_entries_since_checkpoint,
+        0,
+        "{:?}",
+        compacted.value()
+    );
+    assert!(compacted_applied > 0);
+    let (_, initial) = membership_on_leader(&fleet).await;
+    let add = SessionMembershipRequest {
+        id: [21; 16],
+        expected_index: initial.view().configuration_index,
+        expected: initial.view().configuration.clone(),
+        change: MembershipChange::AddLearner { node: fresh_node },
+    };
+    let (leader, added) = change_on_leader(&fleet, &add).await.unwrap();
+    assert_eq!(added.view().configuration.learners, vec![fresh_node]);
+    // Leadership moves before the learner caught up.
+    let other = (leader + 1) % 3;
+    hand_off(&fleet, other).await;
+    applied_at_least(&fleet, fresh, compacted_applied, false).await;
+    promote_when_caught_up(&fleet, fresh_node, [22; 16]).await;
+    fleet.stop().await;
+}
+
+/// The same, with the group native (the drained leader's session was): the
+/// snapshot the fresh copy restores carries a native section and an
+/// activation its own session has not applied; it comes up by it, from the
+/// leader that admitted it and from the one leading after a hand-off, and
+/// is promoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader() {
+    let directory = tempfile::tempdir().unwrap();
+    let fleet = Fleet::open_with(directory.path(), true, 4, true).await;
+    let fresh = 3usize;
+    let fresh_node = 4u64;
+    // The voters promise the native decoder to each other and the leader
+    // activates native over the empty prefix; the fresh copy, a member of
+    // nothing yet, is asked for its promise once it is admitted.
+    let leader = fleet.leader(None).await;
+    managed::install_support(&fleet, leader).await;
+    let mut moved = 0;
+    loop {
+        let leader = fleet.leader(None).await;
+        match fleet.replicas[leader]
+            .host
+            .activate_native(focal_node::fleet::ActivateNativeCall {
+                profile: focal_ledger::NativeContentProfile::AuthoredV1,
+                chunk_bytes: 1024 * 1024,
+                max_manifest_bytes: 8 * 1024 * 1024,
+            })
+            .await
+        {
+            Ok(()) => break,
+            Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                moved += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("activation: {error}; replicas={:?}", fleet.diagnostics()),
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let leader = fleet.leader(None).await;
+            if let Ok(reply) = fleet.replicas[leader].host.diagnostics().await
+                && reply.value().native_active
+                && reply.value().native_authoritative
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("native never activated: replicas={:?}", fleet.diagnostics()));
+    let leader = checkpoint_on_leader(&fleet).await;
+    let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
+    let compacted_applied = compacted.value().applied_index;
+    assert_eq!(
+        compacted.value().log_entries_since_checkpoint,
+        0,
+        "{:?}",
+        compacted.value()
+    );
+    let (_, initial) = membership_on_leader(&fleet).await;
+    let add = SessionMembershipRequest {
+        id: [31; 16],
+        expected_index: initial.view().configuration_index,
+        expected: initial.view().configuration.clone(),
+        change: MembershipChange::AddLearner { node: fresh_node },
+    };
+    // A native group admits a learner only once its leader has recorded
+    // the learner's promise, which it asks for once the admission is
+    // queued (the service's discovery asks the candidate first): the first
+    // ask is held and answered unknown, the promise is fetched, and the
+    // exact request passes.
+    let (leader, first) = {
+        let leader = fleet.leader(None).await;
+        (
+            leader,
+            fleet.replicas[leader]
+                .host
+                .change_membership(add.clone())
+                .await,
+        )
+    };
+    assert!(
+        matches!(
+            first,
+            Err(LedgerError::OutcomeUnknown | LedgerError::NotReady { .. })
+        ),
+        "{:?}",
+        first.as_ref().err().map(|error| error.to_string())
+    );
+    managed::promise_of(&fleet, leader, fresh_node).await;
+    let (leader, added) = change_on_leader(&fleet, &add).await.unwrap();
+    assert_eq!(added.view().configuration.learners, vec![fresh_node]);
+    let other = (leader + 1) % 3;
+    hand_off(&fleet, other).await;
+    applied_at_least(&fleet, fresh, compacted_applied, true).await;
+    // The promises the new leader holds were taken at the configuration
+    // before the admission; promotion wants the candidate's at the current
+    // one, which the service's discovery asks again for.
+    let (leader, _) = membership_on_leader(&fleet).await;
+    managed::promise_of(&fleet, leader, fresh_node).await;
+    promote_when_caught_up(&fleet, fresh_node, [32; 16]).await;
+    fleet.stop().await;
+}

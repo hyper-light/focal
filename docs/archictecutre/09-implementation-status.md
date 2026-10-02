@@ -12758,3 +12758,23 @@ the way, the first such run found the root preparing membership permits for
 session groups only, the directory handle counting the first partition as hosted
 everywhere, and a member's replica opening through the founder's bootstrap — each
 silent until node health named it (`partitions`, `partitions_pending`).
+
+### 2026-10-02 — what the drained leader's heal printed, and three schedules for a copy brought up by snapshot
+
+The Linux run of the drained leader's heal printed what the test had been given to
+print: the replacement's replica knew its leader through several terms and held
+nothing, while the leader and the other voter had checkpointed past everything it
+lacked. Three directed schedules on real QUIC replicas now guard the paths that were
+suspected, all passing in seconds: a member away while the leader checkpoints,
+re-admitted and handed to a new leader before it caught up; a fresh copy with an
+empty log admitted after the checkpoint; and the same with the group native — the
+harness opens a fourth, empty-logged replica for it, with native hosting when asked.
+Writing the native one found the gate the replacement most likely waits behind: a
+native group admits a learner only once its leader holds that node's promise of the
+native decoder at the current configuration index, a node not yet a member cannot
+push its promise, and the leader's discovery asks the candidate only while the
+admission is queued ([24 §21](24-placement-execution-and-fleet-control.md); the
+remediation record under the drained leader's heal). The replica diagnostics print
+the promises a replica holds and the index they stand at. On the way: the
+replication driver gave up nothing it still held for a peer's lane when its owner's
+egress ended, and dropped it uncounted; it gives them up and counts them now.

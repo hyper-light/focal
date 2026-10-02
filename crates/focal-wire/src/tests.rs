@@ -4130,12 +4130,33 @@ async fn a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carri
         unread.stalled
     );
     assert!(unread.after >= UNREAD_PERIOD, "{:?}", unread.after);
-    // What the others send in a period, and the periods it would have
-    // taken them to send what the stalled exchange had to.
+    // It ends by its own bytes' residency at the longest round trip the
+    // path showed, what was held to send beside it being no more than the
+    // others' one message at a time, a period more for the wait that finds
+    // the time spent — a bound in the path's terms, as the lossy variant
+    // states it (a Windows runner's loopback showed a round trip that
+    // took the stalled exchange 8.6 s where a fixed eighth of the old wait
+    // allowed 6.4 s, 2026-10-02).
+    let given = crate::frame::residency(STALLED + 2 * UNREAD_OTHER, unread.longest)
+        .max(UNREAD_PERIOD)
+        + UNREAD_PERIOD;
+    assert!(
+        unread.after <= given,
+        "{:?} of {given:?} at {:?}",
+        unread.after,
+        unread.longest
+    );
+    // And far less than the others would have kept it under the old wait:
+    // what they send in a period, and the periods it would have taken them
+    // to send what the stalled exchange had to.
     let moved = UNREAD_OTHER as u32 * (UNREAD_PERIOD.as_millis() / UNREAD_EVERY.as_millis()) as u32;
     let kept = UNREAD_PERIOD * (STALLED as u32 / moved);
     assert!(kept >= UNREAD_PERIOD * 100);
-    assert!(unread.after < kept / 8, "{:?} of {kept:?}", unread.after);
+    assert!(
+        given < kept / 2,
+        "{given:?} of {kept:?} at {:?}",
+        unread.longest
+    );
     assert!(unread.answered >= 1, "{}", unread.answered);
 }
 

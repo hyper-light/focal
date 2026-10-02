@@ -431,6 +431,19 @@ admin socket's answer while the partition host takes its turn: `partition_change
 re-drives a pending request under its exact identity before taking a new one, and
 apply retries `outcome_unknown` within its allowance.
 
+**What the push's CI found (1ee8f0a, 2026-10-02).** macOS: the CLI journey's apply,
+which now seats the root, the partition group (two learners hosted, caught up and
+promoted) and then the session, ran out of its 180 s allowance with the session step
+committed and not yet complete — the allowance covered one control group's seating
+before and covers two now; it is 300 s, as the work it watches grew, and the test's
+failure prints the apply's steps so the next slow step is named. Windows: the F38
+unread-stream test bounded the stalled exchange by a fixed eighth of the old wait
+(6.4 s); the Windows runner's loopback round trip took it 8.6 s, which is what the
+carriage's residency at that round trip gives; the bound is stated in the path's
+terms now, as its lossy variant already was (`residency(STALLED + 2 × UNREAD_OTHER,
+longest) + a period`, and that bound far under the old wait). Linux: the drained
+leader's heal again (the item below).
+
 **Tests (batch 2).** `focal-control/tests/membership_control.rs` (the record after
 an admission, the same on a follower, carried by the snapshot a learner catches up
 by, after a promotion, and on both replicas after a restart);
@@ -2514,7 +2527,51 @@ report's compare, not the plan's). The report could not tell whether the
 replacement's copy ever learned a leader or was ever appended to; the test now prints
 each node's `cluster replicas diagnostics` (leader, commit, apply per replica) and
 `cluster plan` (the controller's next actions) beside its health, so the next run says
-which.
+which. **It did (Linux, d5d4143, 2026-10-02):** the replacement's replica knew the
+leader (term 6, so it was beaten through several terms), held nothing (`applied 0`,
+`committed 0`, no delivery retained, no seed missing, native not yet active), and the
+leader and the other voter had checkpointed (eight entries since), so its log before
+the checkpoint was compacted: what the replacement needed was a snapshot, and none
+reached it in five minutes. A directed schedule now guards the path on real QUIC
+replicas (`fleet_quic::a_member_behind_a_compacted_log_is_brought_up_by_snapshot_by_
+any_leader`: a member away while the leader checkpoints, re-admitted as a learner,
+leadership handed to the other voter before it caught up — it comes up by the new
+leader's snapshot and is promoted, in under two seconds locally), so the hand-off and
+compaction alone are not it. What remains particular to the failing run: the
+replacement's log was empty (a fresh copy, never a member) and its session not yet
+native, where the schedule's member had been a voter. The two ways a snapshot is
+dropped on the sending side were read for a strand (the core moves a member out of
+its `Snapshot` state only on a snapshot status report; an unreachable report resets a
+replicating member alone): both — a frame refused by the owner's budget and one too
+large for the peer frame — settle the snapshot flight as failed (`snapshot_feedback`
+begins the flight before either check, and a dropped sender is a failure), so neither
+strands. The fresh-copy schedule now exists too (the harness opens a fourth, empty-logged
+replica, admitted to nothing until a test admits it, with native hosting when asked):
+`a_fresh_copy_with_an_empty_log_is_brought_up_by_snapshot_by_any_leader` and
+`a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader` — the native one
+promising the decoder among the voters, activating, checkpointing, admitting the
+fresh copy, handing leadership on, bringing it up natively by the new leader's
+snapshot and promoting it — both pass in under four seconds. Writing the native one
+found the gate the replacement most likely sits behind: a native group admits a
+learner, and promotes a voter, only once its leader holds that node's promise of the
+native decoder at the current configuration index (`native_membership_guard`); a node
+not yet a member cannot push its promise, so the leader's discovery asks the
+candidate of a membership change it holds queued, and the candidate answers only an
+asker in its own voters, learners or admitted members (the founder, for a fresh copy;
+others once the host's agent admitted them) — an admission queued as unsupported is
+answered unknown at the owner's deadline, and the controller asks again, so the loop
+closes only if discovery's ask of the candidate lands while the admission is queued.
+On a starved runner that window can be missed every time. The replica diagnostics
+now print the promises a replica holds and the index they stand at (`promises_at`,
+`managed_promises`, `native_promises`), so the next run of the heal shows whether the
+replacement's promise ever reached the leader; closing the window itself — asking a
+candidate's promise when the directory names it, not only while an admission is
+queued — is the next step. Writing the schedules also found the replication driver
+ending with frames still waiting for a peer's lane when its owner's egress ended —
+dropped without a count or a word to their owners; it gives them up as every frame
+not sent is now, and its report says so (`sent`, beside `attempted`, `accepted`,
+`lost`, `saturated` and `refused`; the QUIC harness asserts both halves of the
+identity at every stop).
 
 ## F48
 

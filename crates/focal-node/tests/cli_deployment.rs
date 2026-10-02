@@ -532,8 +532,12 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[committed_policy]"), "{report}");
 
-    // Apply the fleet plan: the policy commits, the session's placement
-    // request is journaled, and waiting sees it activated.
+    // Apply the fleet plan: the policy commits, the root's and the
+    // partition group's voters are seated (two learners hosted, caught up
+    // and promoted each, F24), the session's placement request is
+    // journaled, and waiting sees it activated. The allowance covers that
+    // whole sequence on a starved runner (macOS CI ran out of 180 s with
+    // the session step committed, 2026-10-02).
     let applied = success(
         founder,
         None,
@@ -543,7 +547,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
             "--plan-file",
             plan_file.to_str().unwrap(),
             "--wait",
-            "180",
+            "300",
         ],
     )["result"]
         .clone();

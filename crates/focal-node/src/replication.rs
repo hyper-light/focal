@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplicationReport {
     pub attempted: u64,
+    /// Handed to a send: every frame attempted is sent or refused, and
+    /// every frame sent is accepted, lost or refused at the pool's bound.
+    pub sent: u64,
     /// Accepted by remote ingress; this is never a Raft/quorum acknowledgment.
     pub accepted: u64,
     pub lost: u64,
@@ -312,6 +315,7 @@ async fn drive<C: Carrier>(
                 let peer = peers.entry(target).or_default();
                 if peer.sending < lane {
                     peer.sending = peer.sending.saturating_add(1);
+                    report.sent = report.sent.saturating_add(1);
                     tasks.push(send(frame));
                     report.peak_inflight = report.peak_inflight.max(tasks.len());
                     continue;
@@ -342,6 +346,7 @@ async fn drive<C: Carrier>(
                     match peer.next() {
                         Some(frame) => {
                             waiting = waiting.saturating_sub(1);
+                            report.sent = report.sent.saturating_add(1);
                             tasks.push(send(frame));
                         }
                         None => {
@@ -354,6 +359,16 @@ async fn drive<C: Carrier>(
                     peers.remove(&target);
                 }
             }
+        }
+    }
+    // What still waited for a peer's lane when the owner's egress ended is
+    // given up as every frame that is not sent is: counted, and its owner
+    // told — never dropped in silence, so every frame attempted is
+    // accepted, lost, refused at the pool's bound or given up.
+    for (_, mut peer) in peers {
+        while let Some(frame) = peer.next() {
+            report.refused = report.refused.saturating_add(1);
+            frame.give_up();
         }
     }
     Ok(report)
