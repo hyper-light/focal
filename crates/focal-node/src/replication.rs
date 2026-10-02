@@ -271,19 +271,29 @@ async fn drive<C: Carrier>(
                 let target = frame.target();
                 let held = peers.get(&target).map_or(0, Waiting::len);
                 if tasks.len().saturating_add(waiting) >= max_inflight {
-                    // Full. The peer that holds the most waiting gives up
-                    // its newest for this frame, unless it holds no more
-                    // than this frame's own peer; then this frame is given
-                    // up. Nothing being sent is given up: where nothing
-                    // waits there is no room to make.
+                    // Full. Of the other peers, the one that holds the most
+                    // waiting gives up its newest for this frame, unless
+                    // this frame's own peer holds more than it; then this
+                    // frame is given up. On a tie the other's goes: it is
+                    // the older of the two, and of a group's frames the
+                    // newer carries the more (an append supersedes the
+                    // appends before it; a heartbeat, the heartbeats). It
+                    // was this frame that went on a tie, and the test of a
+                    // dead peer beside a live one hung on it: with the
+                    // live peer's five frames arriving before the driver
+                    // saw any of them carried, the fifth found the two
+                    // peers holding two each and was given up. Nothing
+                    // being sent is given up: where nothing waits there is
+                    // no room to make.
                     let most = peers
                         .iter()
+                        .filter(|(peer, _)| **peer != target)
                         .map(|(peer, held)| (held.len(), *peer))
                         .max();
                     let made = match most {
-                        Some((length, peer)) if peer != target && length > held => peers
-                            .get_mut(&peer)
-                            .and_then(Waiting::newest),
+                        Some((length, peer)) if length >= held && length > 0 => {
+                            peers.get_mut(&peer).and_then(Waiting::newest)
+                        }
                         _ => None,
                     };
                     match made {

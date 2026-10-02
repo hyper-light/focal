@@ -1463,3 +1463,70 @@ async fn an_owner_refused_the_room_waits_and_goes_on() {
     host.stop().await.unwrap();
     owner.join().unwrap();
 }
+
+/// What comes while the owner decides another command waits its turn and
+/// is decided after it, in the order it came. A replica decides one command
+/// at a time, and what came meanwhile was refused for capacity: an
+/// operator's `membership remove` that met a placement intent of the node's
+/// own was told `[capacity]` (the macOS run of 2026-10-01), as four of these
+/// five writes are without the turn, and the transfer after them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
+    let keys = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        keys.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    rig.hosts[0].campaign().await.unwrap();
+    let leader = rig.leader(0).await;
+    let (leader, ControlReadResult::Configuration(configuration)) = rig
+        .read_on_leader(leader, 920, ControlRead::Configuration)
+        .await
+    else {
+        panic!("configuration")
+    };
+    let (leader, state) = rig.state_on_leader(leader).await;
+    let revision = state.revisions.root;
+    // Five writes at once, each expecting the revision the one before it
+    // leaves, and a transfer of leadership behind them.
+    let host = rig.hosts[leader].clone();
+    let write = |at: u64| {
+        let host = host.clone();
+        async move {
+            host.submit(
+                peer(PeerRole::Runtime),
+                request(at, region(revision + at - 1, u128::from(at))),
+            )
+            .await
+        }
+    };
+    let target = (leader as u64 + 1) % 3 + 1;
+    let transfer = host.transfer(
+        peer(PeerRole::Runtime),
+        RequestId::from_u128(921),
+        ControlTransfer {
+            expected_configuration_index: configuration.configuration_index,
+            expected: configuration.configuration.clone(),
+            target,
+        },
+    );
+    let (first, second, third, fourth, fifth, transferred) =
+        tokio::join!(write(1), write(2), write(3), write(4), write(5), transfer);
+    let receipts: Vec<ControlReceipt> = [first, second, third, fourth, fifth]
+        .into_iter()
+        .map(|answer| answer.expect("a write that waited its turn"))
+        .collect();
+    // Decided in the order they came.
+    assert!(
+        receipts
+            .windows(2)
+            .all(|pair| pair[0].committed_index < pair[1].committed_index),
+        "{receipts:?}"
+    );
+    assert_eq!(transferred, Ok(()));
+    rig.stop().await;
+}

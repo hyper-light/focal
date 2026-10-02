@@ -234,6 +234,7 @@ fn owner(
         progress,
         nonce: 0,
         dropped: 0,
+        took_turn: false,
         unreachable: 0,
         lost_sender: lost.0,
         lost: lost.1,

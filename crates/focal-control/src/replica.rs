@@ -236,6 +236,13 @@ impl ControlReplica {
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
+    /// The request that holds this owner's one proposal, if one does:
+    /// another is refused `Busy` until it is decided, and an owner that
+    /// serves callers keeps theirs until then instead of handing them the
+    /// refusal.
+    pub fn pending_request(&self) -> Option<ControlRequestId> {
+        self.pending.as_ref().map(|pending| pending.request)
+    }
     pub fn revisions(&self) -> ControlRevisions {
         self.machine.revisions()
     }

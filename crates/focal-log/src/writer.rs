@@ -236,6 +236,41 @@ struct Batch {
     _allocation: Allocation,
     _slot: Allocation,
 }
+impl Batch {
+    /// Tell the batch's caller it was refused or failed, once what the
+    /// batch held is given back: its bytes of the volume, its memory and
+    /// its slot. Told first, a caller that asked again at once, or looked at
+    /// what was outstanding, found its own refused batch still holding them.
+    fn refuse(self, error: LogError) {
+        let Batch {
+            reply,
+            disk,
+            encoded,
+            index,
+            _allocation,
+            _slot,
+            ..
+        } = self;
+        drop((disk, encoded, index, _allocation, _slot));
+        reply.finish(Err(error));
+    }
+    /// Tell the batch's caller where its records are durable, once its
+    /// bytes are charged to the volume and its memory and slot given back.
+    fn done(self, position: DurablePosition) {
+        let Batch {
+            reply,
+            disk,
+            encoded,
+            index,
+            _allocation,
+            _slot,
+            ..
+        } = self;
+        disk.commit();
+        drop((encoded, index, _allocation, _slot));
+        reply.finish(Ok(position));
+    }
+}
 struct RecoveredRecord {
     record: Record,
     _allocation: Allocation,
@@ -1283,7 +1318,7 @@ impl Writer {
                         .try_reserve_exact(self.limits.max_batch_requests)
                         .is_err()
                     {
-                        first.reply.finish(Err(LogError::Capacity));
+                        first.refuse(LogError::Capacity);
                         continue;
                     }
                     let mut bytes = first.bytes;
@@ -1308,7 +1343,7 @@ impl Writer {
                     self.append(batches);
                 }
                 Command::Checkpoint(batch) => self.checkpoint(batch),
-                Command::Lease(log, reply, _slot) => {
+                Command::Lease(log, reply, slot) => {
                     let result = (|| {
                         if self.wal.failed {
                             return Err(LogError::Failed);
@@ -1354,20 +1389,31 @@ impl Writer {
                             release,
                         })
                     })();
+                    drop(slot);
                     reply.finish(result);
                 }
-                Command::Identity(reply, _slot) => reply.finish(if self.wal.failed {
-                    Err(LogError::Failed)
-                } else {
-                    Ok(self.wal.options.identity)
-                }),
-                Command::Stats(reply, _slot) => reply.finish(Ok(WalWriterStats {
-                    indexed_records: self.index.records,
-                    physical_bytes: self.index.physical_bytes,
-                    live_bytes: self.index.live_bytes,
-                    ..self.stats
-                })),
-                Command::Fault(point, reply, _slot) => {
+                // A command's slot is given back before its caller is
+                // answered, as a batch's is (`Batch::refuse`): one that is
+                // answered and asks again at once finds its own slot free.
+                Command::Identity(reply, slot) => {
+                    drop(slot);
+                    reply.finish(if self.wal.failed {
+                        Err(LogError::Failed)
+                    } else {
+                        Ok(self.wal.options.identity)
+                    });
+                }
+                Command::Stats(reply, slot) => {
+                    drop(slot);
+                    reply.finish(Ok(WalWriterStats {
+                        indexed_records: self.index.records,
+                        physical_bytes: self.index.physical_bytes,
+                        live_bytes: self.index.live_bytes,
+                        ..self.stats
+                    }));
+                }
+                Command::Fault(point, reply, slot) => {
+                    drop(slot);
                     if self.wal.failed {
                         reply.finish(Err(LogError::Failed));
                     } else {
@@ -1375,11 +1421,12 @@ impl Writer {
                         reply.finish(Ok(()));
                     }
                 }
-                Command::Replay(log, generation, reply, _slot) => {
+                Command::Replay(log, generation, reply, slot) => {
                     let result = self.replay(log, generation, &reply);
                     if matches!(result, Err(LogError::Io(_) | LogError::Corruption { .. })) {
                         self.wal.failed = true;
                     }
+                    drop(slot);
                     let _ = reply.send(ReplayItem::Complete(result));
                 }
                 #[cfg(any(test, feature = "test-support"))]
@@ -1409,7 +1456,7 @@ impl Writer {
             || completed.try_reserve_exact(batches.len()).is_err()
         {
             for batch in batches {
-                batch.reply.finish(Err(LogError::Capacity));
+                batch.refuse(LogError::Capacity);
             }
             return;
         }
@@ -1432,13 +1479,13 @@ impl Writer {
                     // logical group stay healthy. Fail only this batch and keep
                     // the rest; the writer is poisoned only by post-write failures
                     // below, never by a recoverable prepare-phase condition.
-                    batch.reply.finish(Err(error));
+                    batch.refuse(error);
                 }
             }
         }
         if self.wal.failed {
             for (batch, _) in prepared {
-                batch.reply.finish(Err(LogError::Failed));
+                batch.refuse(LogError::Failed);
             }
             return;
         }
@@ -1456,7 +1503,7 @@ impl Writer {
             .is_err()
         {
             for (batch, _) in prepared {
-                batch.reply.finish(Err(LogError::Capacity));
+                batch.refuse(LogError::Capacity);
             }
             return;
         }
@@ -1511,14 +1558,12 @@ impl Writer {
                 }
                 self.wal.failed = failure.is_some();
                 for batch in completed {
-                    let Batch { reply, disk, .. } = batch;
                     if self.wal.failed {
-                        reply.finish(Err(failure.take().unwrap_or(LogError::Failed)));
+                        batch.refuse(failure.take().unwrap_or(LogError::Failed));
                     } else {
                         // The bytes are behind the durable fence: charge them
                         // to the volume rather than returning the promise.
-                        disk.commit();
-                        reply.finish(Ok(position));
+                        batch.done(position);
                     }
                 }
                 if !self.wal.failed {
@@ -1529,9 +1574,7 @@ impl Writer {
                 self.wal.failed = true;
                 let mut cause = Some(error);
                 for (batch, _) in prepared {
-                    batch
-                        .reply
-                        .finish(Err(cause.take().unwrap_or(LogError::Failed)));
+                    batch.refuse(cause.take().unwrap_or(LogError::Failed));
                 }
             }
         }
@@ -1577,7 +1620,7 @@ impl Writer {
             Ok(prepared) => prepared,
             Err(error) => {
                 // Nothing was written: the refusal is this batch's alone.
-                batch.reply.finish(Err(error));
+                batch.refuse(error);
                 return;
             }
         };
@@ -1597,22 +1640,21 @@ impl Writer {
             let position = self.wal.finish_append()?;
             Ok((position, cleaned))
         })();
-        let Batch { reply, disk, .. } = batch;
         match written {
             Ok((position, cleaned)) => {
                 self.stats.checkpoint_bytes =
                     self.stats.checkpoint_bytes.saturating_add(bytes as u64);
                 self.stats.group_commits = self.stats.group_commits.saturating_add(1);
-                disk.commit();
                 floor_disk.commit();
-                reply.finish(Ok(position));
+                batch.done(position);
                 self.cleaned(cleaned);
             }
             Err(error) => {
                 // Bytes may be on disk without their fence, and the index
                 // may say more than the log holds: only a reopen recovers.
                 self.wal.failed = true;
-                reply.finish(Err(error));
+                drop(floor_disk);
+                batch.refuse(error);
             }
         }
     }

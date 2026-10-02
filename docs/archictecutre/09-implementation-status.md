@@ -12664,3 +12664,15 @@ bits a second, carries a message of any size in the time it takes: a megabyte ov
 kbit/s in 136.7 s, 64 KiB over 8 kbit/s in 67 s and a megabyte in 1,078 s, with loss,
 jitter, asymmetry and outages shorter than the idle timeout. A stream its peer never reads ends in half a
 second where the other traffic of its connection kept it for twenty-five.
+
+### 2026-10-01 — Three defects CI found in the day's pushes
+
+Five of the day's CI runs failed where the local gate had passed, each on one test
+(the remediation record, "Found by CI"). A log writer answered a batch's caller before
+it gave back what the batch held, so a caller that looked at once found its own refused
+bytes outstanding: a batch now releases, or charges, before it answers. Every file lock
+but one was released by closing its file, which a child process a test or a node starts
+holds open for a moment: one owner type unlocks the file when it ends. And the control
+owner refused for capacity whatever came while it decided another command: it waits its
+turn now, in order. Each has a test that fails on the tree before. Open: a drained
+leader's replacement stayed `Installed` for 300 s on two macOS runs.

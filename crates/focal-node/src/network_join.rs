@@ -829,7 +829,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     }
     let lock = options.open(&lock_path)?;
     check_private(&lock_path)?;
-    focal_platform::try_lock_exclusive(&lock)?;
+    let _lock = focal_platform::FileLock::exclusive(lock)?;
     if fs::symlink_metadata(path).is_ok() {
         recover_output_link(path, &temporary)?;
         if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
@@ -898,7 +898,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     // Serialize concurrent publications of this exact output path.
     let lock = focal_platform::fs::open_private(&lock_path, true, true, true)?;
     check_private(&lock_path)?;
-    focal_platform::try_lock_exclusive(&lock)?;
+    let _lock = focal_platform::FileLock::exclusive(lock)?;
     // Republishing the identical bytes is success; different bytes at the same
     // path is a genuine conflict. The installed file is already durable, so no
     // read-time re-sync (FlushFileBuffers would reject a read-only handle).

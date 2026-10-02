@@ -237,7 +237,7 @@ pub struct ContentStore {
     /// digest (the audit's F19); a lock, since readers share the store
     /// across threads, held for one range's read; poisoned, it is an error.
     plans: Mutex<PlanCache>,
-    _writer_lock: File,
+    _writer_lock: focal_platform::FileLock,
 }
 
 /// A sealed object's chunks with each chunk's start: a range finds its first
@@ -365,7 +365,7 @@ impl ContentStore {
             .read(true)
             .write(true)
             .open(root.join("LOCK"))?;
-        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
+        let lock = focal_platform::FileLock::exclusive(lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 ContentError::Locked
             } else {

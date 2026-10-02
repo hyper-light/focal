@@ -126,6 +126,7 @@ impl ControlHost {
                             progress: progress.clone(),
                             nonce: 0,
                             dropped: 0,
+                            took_turn: false,
                             unreachable: 0,
                             failure: None,
                             pace: owner_pace,

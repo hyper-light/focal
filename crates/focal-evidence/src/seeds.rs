@@ -18,7 +18,7 @@ pub struct SeedStore {
     pub(super) failed: bool,
     /// A seed sweep in progress (26 §5).
     pub(super) sweep: Option<std::fs::ReadDir>,
-    _writer_lock: File,
+    _writer_lock: focal_platform::FileLock,
 }
 
 /// A read-only view of a seed directory another owner writes.
@@ -38,7 +38,7 @@ impl SeedStore {
             .read(true)
             .write(true)
             .open(root.join("LOCK"))?;
-        focal_platform::try_lock_exclusive(&lock).map_err(|error| {
+        let lock = focal_platform::FileLock::exclusive(lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 ContentError::Locked
             } else {

@@ -1924,7 +1924,9 @@ on sending ahead to a member that was receiving nothing.
 (`Waiting::sending`, the pool's own width); what has none waits in that peer's queue, a
 heartbeat, a vote or an answer before entries (`ReplicationFrame::urgent`). The driver
 never stops receiving and is sized to what the pool itself admits; when it is full the
-peer with the most waiting gives up its newest frame for a peer that holds less. Every
+other peer with the most waiting gives up its newest frame for the frame that came,
+unless that frame's own peer holds more (on a tie the other's goes, since 2026-10-01:
+below, "Found by CI"). Every
 frame that is not accepted is told to its owner — by the driver for what was lost, refused
 or given up, by the owners for what they drop themselves — and the core probes that
 member. The pool is behind a small trait (`Carrier`) so that the driver is tested with
@@ -2163,4 +2165,90 @@ delivered. All thirty-six narrow lossy exchanges are answered.
 **Residual.** The pool's five seconds and the connection's ten of idle are set, not
 derived (27 §8.4). A stream starved by others of its connection ends at its residency,
 which is long on a slow path; bandwidth is not reserved for a class (the audit's F40).
+
+## Found by CI (2026-10-01)
+
+Five of the day's twelve CI runs on `slates-port` failed, each on one test that
+passes on this machine. Each is a defect, not weather; three are mended here and
+the fourth is open below.
+
+**A batch's caller was told before what the batch held was given back**
+(`focal-log`; Linux run of 99191da,
+`a_checkpoint_writes_what_its_group_keeps_and_its_floor_and_asks_the_volume_for_those_bytes`:
+72 bytes of the volume outstanding after a refused checkpoint). *Cause.* The
+writer's thread answered the batch's reply and then dropped the batch, whose disk
+reservation, memory and slot were given back by the drop; a caller woken by the reply
+looked, or asked again, before that. *Fix.* `Batch::refuse` and `Batch::done`: what a
+batch holds is given back, or charged to the volume, before its caller is told, in
+every path of `append` and `checkpoint`; a command's slot is dropped before its reply
+likewise. *Test.* `a_batchs_caller_is_told_once_what_the_batch_held_is_given_back`
+asks the volume and the budget on the writer's own thread at the moment it answers
+(`Persisted`); with the reply first it sees the 72 bytes CI saw.
+
+**A lock stayed held by a descriptor a child inherited** (`focal-node`; Linux run of
+6af1c6b, `cli::context::tests::administration_resolves_selected_unix_node_and_rejects_remote_fallback`:
+`Locked` on the catalog the line before had written). *Cause.* Every lock but the
+client's was a bare `File` released by its close. A POSIX lock belongs to the open
+file, and a process that starts another copies its descriptors to the child for the
+moment before the child's program closes them, so a lock released by its close is held
+for that moment by a child that never knew of it. A test process that starts `focal`
+binaries meanwhile met it; a node that starts a validation handler would. *Fix.*
+`focal_platform::FileLock`, the one owner of a lock, `!Clone`, which unlocks the file
+when it ends; every lock site uses it (the log, the content and seed stores, the node
+directory, enrollment, the MCP bootstrap, the invitation output, the native journal's
+creation lock, the client's lock). *Test.*
+`a_lock_its_owner_let_go_is_free_while_a_copy_of_its_descriptor_is_open` shows the bare
+file's lock held by a copy and the owner's released past one.
+
+**What came while the control owner decided a command was refused for capacity**
+(`focal-node`; macOS run of f5f9cac,
+`cluster::actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restart_receipt`:
+`[capacity] metadata admission capacity exceeded` on `membership remove`). *Cause.* A
+control replica decides one command at a time (`Pending`) and answered `Busy` to a
+second, which the host told its caller as `Capacity`; the operator's removal met a
+placement intent of the node's own, which on a slow runner was still deciding. A
+caller's exact retry would have found its request, but a caller is not asked to retry
+what the owner can hold. *Fix.* `Waiting::Turn`: a write or a transfer that finds the
+proposal held waits its turn in the owner's list of pending requests, in the order it
+came, and is proposed by the drain in which the proposal frees; the list's own bound is
+the capacity refusal. *Test.*
+`what_comes_while_the_owner_decides_another_command_waits_its_turn` (five writes at
+once, each expecting the revision the one before leaves, and a transfer behind them:
+all committed, in order; without the turn, four of the five are refused).
+
+**The driver's test of a dead peer beside a live one hung** (`focal-node`, found by this
+batch's own run of the suite, not by CI: 2 of 60 runs of
+`a_peer_that_answers_nothing_holds_its_own_lane_and_nothing_of_anothers` under the rule
+before, each parked with nothing to wake it). *Cause.* When the driver is full and the
+frame that came finds its own peer holding as much as the peer that holds the most, the
+frame that came was given up. The live peer's five frames arrive behind the dead peer's
+twenty; whether the driver has seen any of the live peer's sends end before its fifth
+arrives is the order a `select!` of two ready branches takes, and when it has seen none,
+the fifth finds both peers holding two and goes — told to its owner, as the rule says,
+but the test waited for all five before it opened the dead peer's gate, so neither
+future ever woke. *Fix.* On a tie the other peer's newest goes: it is the older of the
+two, and of a group's frames the newer carries the more (an append supersedes the
+appends before it, a heartbeat the heartbeats). The frame that came is given up only
+when its own peer holds strictly the most. *Test.*
+`a_frame_whose_peer_holds_as_much_as_another_takes_the_others_newest_place` (both
+peers gated, a lane of one, a driver of four: the frame given up is the first peer's,
+told before anything moves; with the rule before, it is the second peer's). The test
+that hung is deterministic under the new rule: the live peer's frames are carried in
+every order.
+
+**Open: the drained leader's heal did not complete on macOS** (two runs, on the trees
+of F41 and F45, `a_drained_session_leader_hands_leadership_on_before_it_is_removed`:
+the replacement host's copy stayed `Installed`, `through 0`, for the whole 300 s budget
+while the two other voters were `CaughtUp`; leadership had moved from the drained host
+to the founder as designed). What the test printed says where to look: every owner ran
+its 100 ms periods with none longer than 165 ms and none refused, so no owner stalled;
+the replacement's session owner ran 3,174 periods, so it hosted the copy throughout;
+and its metrics named the founder as the session's leader, so its replica heard from the
+leader — and committed nothing in five minutes. That is a fresh learner the leader
+beats and never appends to, or whose appends it never takes. Seven local repetitions
+(three idle, four under the load of the other suites) pass in 50 to 67 s, and the four
+CI runs on the trees since F42 pass, whose rules for a member's heartbeat answers and
+probes are the ones that changed between. It is not reproduced and not mended; it stands
+here until a run on a current tree shows it again or a directed schedule of the core
+reaches it.
 

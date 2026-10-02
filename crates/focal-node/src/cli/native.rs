@@ -338,7 +338,7 @@ pub(super) fn store_in(
 }
 /// The exclusive creation lock `<name>.lock` beside the store, held only
 /// while the store is created; contenders wait for the short critical section.
-fn creation_lock(parent: &Path, name: &str) -> Result<std::fs::File> {
+fn creation_lock(parent: &Path, name: &str) -> Result<focal_platform::FileLock> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -351,9 +351,9 @@ fn creation_lock(parent: &Path, name: &str) -> Result<std::fs::File> {
         .checked_add(std::time::Duration::from_secs(5))
         .ok_or_else(|| CliError::Other("clock overflow".into()))?;
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
+        match focal_platform::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(focal_platform::FileLock::owning(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() >= deadline {
                     return Err(CliError::Other(
                         "another process is still creating the native request journal".into(),
@@ -361,7 +361,7 @@ fn creation_lock(parent: &Path, name: &str) -> Result<std::fs::File> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(error) => return Err(error.into()),
         }
     }
 }

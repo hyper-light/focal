@@ -207,7 +207,7 @@ pub enum LogError {
 pub struct Wal {
     directory: PathBuf,
     options: WalOptions,
-    _lock: File,
+    _lock: focal_platform::FileLock,
     active: File,
     position: DurablePosition,
     base: DurableBase,
@@ -269,7 +269,7 @@ impl Wal {
             .read(true)
             .write(true)
             .open(directory.join("LOCK"))?;
-        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
+        let lock = focal_platform::FileLock::exclusive(lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 LogError::Locked
             } else {

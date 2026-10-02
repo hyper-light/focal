@@ -18,11 +18,62 @@
 //! of its own; `scripts/check-contracts.py` enforces that the `unsafe` token
 //! appears nowhere else under `crates/`.
 //!
-//! Locks are advisory and process-scoped, released when the file's last
-//! descriptor closes; a lock owner is `!Clone` so a critical section has one
-//! release authority ([focal-client](../../focal-client/src/file_lock.rs)
-//! documents why).
+//! Locks are advisory, and a lock is held by an open file, not by the
+//! descriptor that took it: every copy of the descriptor holds it, and it is
+//! released when the last of them closes. A process that starts another
+//! copies its descriptors to the child for the moment before the child runs
+//! its program, so a lock released only by closing its file is still held,
+//! for that moment, by a child that never knew of it — and whoever asks for
+//! it then is told it is locked. A lock therefore has one owner
+//! ([`FileLock`]), `!Clone`, which unlocks the file itself when it ends,
+//! whatever copies of the descriptor there are.
 use std::{fs::File, io};
+
+/// The owner of a whole-file lock: the lock is released when the owner
+/// ends, by unlocking the file, not by closing it (the module's header says
+/// why that is not the same). A lock held by a bare `File` and released by
+/// its close was found held after its owner had let it go: the catalog a
+/// command line had just written was `Locked` to its next line, in a test
+/// process that started other processes meanwhile.
+#[derive(Debug)]
+pub struct FileLock {
+    file: File,
+}
+impl FileLock {
+    /// Take an exclusive lock on `file` without blocking, and own it. A
+    /// lock another owner holds is `io::ErrorKind::WouldBlock`.
+    pub fn exclusive(file: File) -> io::Result<Self> {
+        try_lock_exclusive(&file)?;
+        Ok(Self { file })
+    }
+    /// Take a shared lock on `file` without blocking, and own it;
+    /// `WouldBlock` when an exclusive lock is held.
+    pub fn shared(file: File) -> io::Result<Self> {
+        try_lock_shared(&file)?;
+        Ok(Self { file })
+    }
+    /// Own the lock `file` holds: one taken on it just before
+    /// ([`try_lock_exclusive`], [`try_lock_shared`]) by an owner that asks
+    /// more than once for a lock it waits for.
+    pub fn owning(file: File) -> Self {
+        Self { file }
+    }
+    /// The locked file, for what its owner reads or writes of it.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        loop {
+            match unlock(&self.file) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // A drop reports nothing: the file's close is what is left.
+                _ => break,
+            }
+        }
+    }
+}
 
 /// Take an exclusive whole-file lock without blocking. A lock another owner
 /// holds returns `io::ErrorKind::WouldBlock`, mapped from the standard
@@ -188,6 +239,65 @@ mod tests {
         );
         unlock(&owner).unwrap();
         try_lock_exclusive(&other).unwrap();
+    }
+
+    /// A lock its owner let go is free at once, though a copy of the
+    /// owner's descriptor is still open — which is what a process holds, for
+    /// a moment, of every file its parent had open when it was started. A
+    /// lock held by a bare file and released by its close stays held for as
+    /// long as the copy lives: the catalog of a command line was `Locked` to
+    /// the line after the one that wrote it.
+    #[test]
+    fn a_lock_its_owner_let_go_is_free_while_a_copy_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LOCK");
+        File::create(&path).unwrap();
+        let open = || File::options().read(true).write(true).open(&path).unwrap();
+        // Released by its close alone, it is held while the copy lives:
+        // where a lock is the open file's, which is every Unix.
+        #[cfg(unix)]
+        {
+            let bare = open();
+            try_lock_exclusive(&bare).unwrap();
+            let copy = bare.try_clone().unwrap();
+            drop(bare);
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(copy);
+        }
+        // Released by its owner, it is free whatever copies there are.
+        for shared in [false, true] {
+            let owner = if shared {
+                FileLock::shared(open()).unwrap()
+            } else {
+                FileLock::exclusive(open()).unwrap()
+            };
+            let copy = owner.file().try_clone().unwrap();
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(owner);
+            drop(FileLock::exclusive(open()).unwrap());
+            drop(copy);
+        }
+        // One that is refused a lock takes nothing from the one that holds it.
+        let owner = FileLock::exclusive(open()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        drop(owner);
+        drop(FileLock::owning({
+            let file = open();
+            try_lock_exclusive(&file).unwrap();
+            file
+        }));
+        FileLock::exclusive(open()).unwrap();
     }
 
     #[test]

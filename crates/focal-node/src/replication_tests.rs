@@ -221,6 +221,53 @@ async fn a_peer_that_answers_nothing_holds_its_own_lane_and_nothing_of_anothers(
     assert_eq!(budget.stats().used, 0);
 }
 
+/// A frame that finds the driver full, its own peer holding as much as
+/// another, takes the other's newest place: of a group's frames the newer
+/// carries the more, and the other's is the older. With a lane of one and
+/// a driver of four, a peer's two frames and another's three: the third of
+/// the second peer finds one waiting for each, and the first peer's goes.
+/// Before, the frame that came went on a tie, and the test above hung on
+/// it once in a while: the live peer's last frame given up before the driver
+/// had seen any of the four before it carried, so the five it waited for
+/// never were.
+#[tokio::test]
+async fn a_frame_whose_peer_holds_as_much_as_another_takes_the_others_newest_place() {
+    let paths = Paths::new(1, &[2, 3], &[]);
+    let budget = MemoryBudget::new(1024 * 1024, 0).unwrap();
+    let (lost_sender, lost) = std::sync::mpsc::sync_channel(8);
+    let (sender, receiver) = mpsc::channel(8);
+    for (target, id) in [(2, 1), (2, 2), (3, 3), (3, 4), (3, 5)] {
+        sender
+            .send(frame(target, id, &lost_sender, &budget))
+            .await
+            .unwrap();
+    }
+    drop(sender);
+    let (report, ()) = tokio::join!(drive(Receiver::Single(receiver), &paths, 4), async {
+        // The one given up is told at once: the first peer's second frame.
+        // Both gates are shut, so nothing else moves until it is.
+        let mut told = None;
+        for _ in 0..10_000 {
+            if let Ok(peer) = lost.try_recv() {
+                told = Some(peer);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(told, Some(2));
+        paths.open(2, 1);
+        paths.open(3, 3);
+    });
+    let report = report.unwrap();
+    assert_eq!((report.attempted, report.accepted), (5, 4));
+    assert_eq!((report.refused, report.lost, report.saturated), (1, 0, 0));
+    assert_eq!(paths.carried(2), vec![1]);
+    assert_eq!(paths.carried(3), vec![3, 4, 5]);
+    assert!(lost.try_recv().is_err());
+    drop(lost_sender);
+    assert_eq!(budget.stats().used, 0);
+}
+
 /// What waits for a peer's lane goes in the order it came, what a group
 /// cannot do without before its entries: a heartbeat that came behind three
 /// appends is carried as soon as the append under way is answered.

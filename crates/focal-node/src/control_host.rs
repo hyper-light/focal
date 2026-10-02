@@ -269,6 +269,14 @@ impl ControlOwner {
     }
 }
 enum Waiting {
+    /// What waits its turn for the replica's one proposal, which another
+    /// request holds: taken when it is proposed. A replica decides one
+    /// command at a time, and what came while it decided one was refused
+    /// for capacity — an operator's `membership remove` that met a
+    /// placement intent of the node's own, on a machine slow enough for
+    /// the two to meet. It waits here for its own time, in the order it
+    /// came, and is refused for capacity only when this list is full.
+    Turn(Option<Box<Turn>>),
     Write(ControlRequestId),
     Read {
         context: Vec<u8>,
@@ -278,6 +286,11 @@ enum Waiting {
         context: Vec<u8>,
         request: Option<Box<ControlRequest>>,
     },
+}
+/// What a caller asked that takes the replica's one proposal.
+enum Turn {
+    Submit(Box<ControlRequest>),
+    Transfer(ControlTransfer),
 }
 struct Pending {
     header: ResponseEnvelope,
@@ -319,6 +332,9 @@ struct Owner<V> {
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
+    /// Whether a request took its turn for the proposal in the drain under
+    /// way: the next drain proposes it.
+    took_turn: bool,
     unreachable: u64,
     failure: Option<String>,
     pub(crate) pace: TickPeriod,
@@ -616,6 +632,7 @@ impl ControlHost {
             progress,
             nonce: 0,
             dropped: 0,
+            took_turn: false,
             unreachable: 0,
             failure: None,
             pace: pace.clone(),
@@ -1424,12 +1441,17 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             match rpc {
                 ControlRpc::Transfer(request) => {
-                    self.replica
-                        .transfer(&request)
-                        .map_err(ControlFailure::from)?;
-                    Ok(ControlReply::TransferInitiated {
-                        target: request.target,
-                    })
+                    if self.replica.has_pending() {
+                        waiting = Some(Waiting::Turn(Some(Box::new(Turn::Transfer(request)))));
+                        Err(ControlFailure::OutcomeUnknown)
+                    } else {
+                        self.replica
+                            .transfer(&request)
+                            .map_err(ControlFailure::from)?;
+                        Ok(ControlReply::TransferInitiated {
+                            target: request.target,
+                        })
+                    }
                 }
                 ControlRpc::Submit(request) => {
                     if !contact && matches!(request.command, ControlCommand::NodeContact(_)) {
@@ -1450,17 +1472,28 @@ impl<V: AuthorityVerifier> Owner<V> {
                     if request.id.client != principal.0 && !root_intent {
                         return Err(ControlFailure::Unauthorized);
                     }
-                    match self
+                    if self
                         .replica
-                        .submit(request, &self.verifier)
-                        .map_err(ControlFailure::from)?
+                        .pending_request()
+                        .is_some_and(|held| held != request.id)
                     {
-                        ControlSubmission::Existing(receipt) => {
-                            Ok(ControlReply::Committed(receipt))
-                        }
-                        ControlSubmission::Pending(id) => {
-                            waiting = Some(Waiting::Write(id));
-                            Err(ControlFailure::OutcomeUnknown)
+                        waiting = Some(Waiting::Turn(Some(Box::new(Turn::Submit(Box::new(
+                            request,
+                        ))))));
+                        Err(ControlFailure::OutcomeUnknown)
+                    } else {
+                        match self
+                            .replica
+                            .submit(request, &self.verifier)
+                            .map_err(ControlFailure::from)?
+                        {
+                            ControlSubmission::Existing(receipt) => {
+                                Ok(ControlReply::Committed(receipt))
+                            }
+                            ControlSubmission::Pending(id) => {
+                                waiting = Some(Waiting::Write(id));
+                                Err(ControlFailure::OutcomeUnknown)
+                            }
                         }
                     }
                 }
@@ -1551,12 +1584,23 @@ impl<V: AuthorityVerifier> Owner<V> {
             )
     }
     fn drain(&mut self) -> Result<(), ControlError> {
-        let mut finished = Vec::new();
-        let drained = self.drain_events(&mut finished);
-        for (pending, result, output) in finished {
-            self.finish_charged(pending, result, output);
+        // What took its turn in a drain is proposed by the next: one more
+        // drain for each request that waits, at most, and none when none
+        // took a turn.
+        let mut turns = self.pending.len();
+        loop {
+            self.took_turn = false;
+            let mut finished = Vec::new();
+            let drained = self.drain_events(&mut finished);
+            for (pending, result, output) in finished {
+                self.finish_charged(pending, result, output);
+            }
+            drained?;
+            if !self.took_turn || turns == 0 {
+                return Ok(());
+            }
+            turns = turns.saturating_sub(1);
         }
-        drained
     }
     fn drain_events(&mut self, finished: &mut Vec<Finished>) -> Result<(), ControlError> {
         // Every request that waits may be answered by this drain.
@@ -1611,8 +1655,40 @@ impl<V: AuthorityVerifier> Owner<V> {
                 return Err(ControlError::Failed);
             };
             let mut read_charge = None;
-            let mut enrolled_write = None;
+            let mut written = None;
+            let mut turn = None;
             let ready = match &mut pending.waiting {
+                // Its turn has come: nothing holds the replica's proposal.
+                Waiting::Turn(waited)
+                    if pending.term == status.term
+                        && status.role == StateRole::Leader
+                        && !self.replica.has_pending() =>
+                {
+                    self.took_turn = true;
+                    match waited.take().map(|turn| *turn) {
+                        Some(Turn::Submit(request)) => {
+                            match self.replica.submit(*request, &self.verifier) {
+                                Ok(ControlSubmission::Existing(receipt)) => {
+                                    Some(Ok(ControlReply::Committed(receipt)))
+                                }
+                                Ok(ControlSubmission::Pending(id)) => {
+                                    written = Some(id);
+                                    None
+                                }
+                                Err(error) => Some(Err(ControlFailure::from(error))),
+                            }
+                        }
+                        Some(Turn::Transfer(request)) => Some(
+                            self.replica
+                                .transfer(&request)
+                                .map(|()| ControlReply::TransferInitiated {
+                                    target: request.target,
+                                })
+                                .map_err(ControlFailure::from),
+                        ),
+                        None => Some(Err(ControlFailure::Unavailable)),
+                    }
+                }
                 Waiting::Enrollment { context, request }
                     if pending.term == status.term
                         && status.role == StateRole::Leader
@@ -1634,6 +1710,16 @@ impl<V: AuthorityVerifier> Owner<V> {
                                 peer.key,
                             )?;
                         if let Some(request) = request.take() {
+                            // Admitted, and another request holds the
+                            // proposal: it waits its turn like any other.
+                            if self
+                                .replica
+                                .pending_request()
+                                .is_some_and(|held| held != request.id)
+                            {
+                                turn = Some(Turn::Submit(request));
+                                return Ok(None);
+                            }
                             match self
                                 .replica
                                 .submit(*request, &self.verifier)
@@ -1643,7 +1729,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                                     Ok(Some(ControlReply::Committed(receipt)))
                                 }
                                 ControlSubmission::Pending(id) => {
-                                    enrolled_write = Some(id);
+                                    written = Some(id);
                                     Ok(None)
                                 }
                             }
@@ -1704,8 +1790,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
                 _ => None,
             };
-            if let Some(id) = enrolled_write {
+            if let Some(id) = written {
                 pending.waiting = Waiting::Write(id);
+            }
+            if let Some(turn) = turn {
+                pending.waiting = Waiting::Turn(Some(Box::new(turn)));
             }
             if let Some(result) = ready {
                 let result = if pending.enrollment {

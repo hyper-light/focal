@@ -906,6 +906,85 @@ fn a_checkpoint_writes_what_its_group_keeps_and_its_floor_and_asks_the_volume_fo
     assert_eq!(records(&b), kept);
 }
 
+/// A batch's caller is told once what the batch held is given back, or
+/// charged: asked on the writer's own thread at the moment it answers
+/// (`Persisted`), the volume has nothing outstanding and the memory that
+/// waits holds the caller's receipt and nothing of the batch — for a
+/// checkpoint the volume refuses and for an append it takes. Told first, a
+/// caller that looked at once found its own refused batch's bytes still
+/// outstanding: `a_checkpoint_writes_what_its_group_keeps_...` met that on
+/// Linux, where the writer's thread let go later than the caller looked.
+#[test]
+fn a_batchs_caller_is_told_once_what_the_batch_held_is_given_back() {
+    use focal_memory::{DiskBudget, DiskBudgetConfig};
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::tempdir().unwrap();
+    let disk = DiskBudget::new(DiskBudgetConfig {
+        headroom: 0,
+        completion_reserve: 0,
+        sample_interval: u32::MAX,
+    })
+    .unwrap();
+    let budget = memory();
+    let shared = SharedWal::open_with_budgets(
+        dir.path(),
+        options(),
+        WalWriterLimits::default(),
+        budget.clone(),
+        disk.clone(),
+    )
+    .unwrap();
+    let mut a = shared.lease(LogicalLogId([1; 16])).unwrap();
+    a.append(&[record(1, 1)]).unwrap();
+    let waiting = |budget: &MemoryBudget| budget.stats().by_kind[BudgetKind::Pending as usize];
+    let at_rest = waiting(&budget);
+    type Seen = Arc<Mutex<Vec<(u64, usize)>>>;
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let look = |seen: &Seen| -> Persisted {
+        let (seen, disk, budget) = (seen.clone(), disk.clone(), budget.clone());
+        Box::new(move || {
+            seen.lock().unwrap().push((
+                disk.stats().outstanding,
+                budget.stats().by_kind[BudgetKind::Pending as usize],
+            ));
+        })
+    };
+    // A checkpoint whose own frame the volume has room for and whose floor
+    // it has not: refused by the writer, with the frame's bytes reserved.
+    let checkpoint = snapshot(1, 1);
+    let floor = frame(&Record {
+        log: LogicalLogId([1; 16]),
+        kind: RecordKind::Floor,
+        index: shared.stats().unwrap().appended_records + 1,
+        term: 1,
+        payload: Vec::new(),
+    });
+    disk.observe(frame(&checkpoint) + floor - 1);
+    let mut refused = a
+        .rewrite_checkpoint_async_notified(
+            std::slice::from_ref(&checkpoint),
+            BudgetLane::Completion,
+            Some(look(&seen)),
+        )
+        .unwrap();
+    assert!(matches!(refused.wait_blocking(), Err(LogError::Capacity)));
+    // An append the volume takes.
+    disk.observe(1 << 20);
+    let mut taken = a
+        .append_async_notified(&[record(1, 2)], BudgetLane::Ordinary, Some(look(&seen)))
+        .unwrap();
+    taken.wait_blocking().unwrap();
+    // The receipt a caller holds is its own; nothing else waited.
+    let receipt = waiting(&budget) - at_rest;
+    assert!(receipt > 0);
+    drop((refused, taken));
+    assert_eq!(waiting(&budget), at_rest);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(0, at_rest + receipt / 2), (0, at_rest + receipt)]
+    );
+}
+
 /// A cold group whose frames stand at the head of the log, behind a hot
 /// one that appends and checkpoints: the base meets the cold frames and
 /// writes them again at the tail, lap after lap, in the group's order; the
