@@ -26,6 +26,17 @@ pub enum SessionFact {
         next: focal_directory::GroupAuthorityGrant,
         record: crate::placement_proof::MembershipRecord,
     },
+    /// A delegation fence a partition group's voter approves — the group
+    /// a split's or merge's source (`source`) or its destination — signed
+    /// by a node that hosts a replica of the group (24 §13). The root
+    /// verifies the fence against the sealed state it names; a voter's
+    /// signature is the group's approval, a majority of its installed
+    /// voters' the proof.
+    Delegation {
+        group: focal_directory::LogGroupId,
+        fence: focal_directory::DelegationFence,
+        source: bool,
+    },
 }
 /// The body of `Operation::SessionSign`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +622,9 @@ pub async fn prepare_session_fact(
             }
             control.prepare_membership_proof(next, record, window).await
         }
+        // A delegation fence is a partition group's fact, under the
+        // directory's namespace.
+        SessionFact::Delegation { .. } => Err(PlacementProofError::Unauthorized),
     }
 }
 /// Witness a partition group's membership from this node's replica of it:
@@ -622,8 +636,24 @@ async fn prepare_partition_fact(
     fact: SessionFact,
     window: ProofWindow,
 ) -> Result<crate::placement_proof::SessionProofPermit, PlacementProofError> {
-    let SessionFact::Membership { next, record } = fact else {
-        return Err(PlacementProofError::Unauthorized);
+    let (next, record) = match fact {
+        SessionFact::Membership { next, record } => (next, record),
+        // A fence a voter of the group approves: signed where the node
+        // hosts a replica of the group — the control host checks that the
+        // node votes in it under the installed authority.
+        SessionFact::Delegation {
+            group,
+            fence,
+            source,
+        } => {
+            directory
+                .host_of_group(group.0)
+                .ok_or(PlacementProofError::Unauthorized)?;
+            return control
+                .prepare_delegation_proof(group, fence, source, window)
+                .await;
+        }
+        SessionFact::Placement(_) => return Err(PlacementProofError::Unauthorized),
     };
     let host = directory
         .host_of_group(next.group.0)

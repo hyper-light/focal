@@ -682,8 +682,23 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert_ne!(led["control"]["partitions"][0]["leader"], actor, "{led}");
     let removed = partition_change(actor_dir, "remove", &partition, victim);
     assert_eq!(removed["kind"], "committed", "{removed}");
-    let after = partition_shown(founder, &partition);
-    assert!(!ids(&after["voters"]).contains(&victim), "{after}");
+    // The founder's replica follows the group now: its view is what it
+    // applied, a moment behind the leader's commit (macOS CI read the
+    // victim still seated right after the receipt, 2026-10-02), so the
+    // fact is waited on, bounded.
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    let after = loop {
+        let shown = partition_shown(founder, &partition);
+        if !ids(&shown["voters"]).contains(&victim) {
+            break shown;
+        }
+        assert!(
+            deadline.open(),
+            "the founder never applied the victim's removal: {shown}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(!ids(&after["learners"]).contains(&victim), "{after}");
     let view = placement(founder).unwrap();
     assert_eq!(view["control"]["partitions"][0]["leader"], actor, "{view}");
     drop(servers);

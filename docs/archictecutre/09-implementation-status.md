@@ -12814,4 +12814,15 @@ here — a node whose replica votes and follows asks the leader for leadership a
 bounded, before it submits; one that cannot lead reports who does. Requests are never
 forwarded: a leader cannot derive another node's administrator principal (each node's
 issuer is its own), and admitting a claimed client would open another administrator's
-retry window.
+retry window. Batch 2's last open item closed the same day as well: a seated member of
+a split destination opens with the group's identity from the root's grant and no state,
+and is brought up by the founder's snapshot (the founder compacts before it admits its
+first member, refusing the admission until the floor stands; an entry from the log's
+beginning reaching an empty member is a stated corruption). Seating one in the in-process
+split test found the rest of the group's life: its merge fence signed as the founder's
+alone (a majority of each group's installed voters is collected now); a seal intended
+for a group another node leads (made where the group leads: the reshaper's node takes
+its leadership first); a merged-away group's grant kept forever (the root releases it
+once absorbed, `ReleaseGroup`, and the member's seat and record go with it); a seat
+watch that read an unobservable authority as unseated; a node's service ending when a
+hosted drive ended well; and the seat's own stop raced its own egress.

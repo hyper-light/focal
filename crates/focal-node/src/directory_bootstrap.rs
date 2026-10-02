@@ -125,6 +125,49 @@ impl PartitionPlan {
             .genesis;
         Ok(plan)
     }
+    /// The plan of a seated member of a split destination (24 §13): the
+    /// group's identity from the root's grant (its genesis) and the image's
+    /// digest from the delegation's fence, no image — the member opens with
+    /// the group's identity and no state, and is brought up by snapshot
+    /// (`ControlOptions::founded_elsewhere`).
+    pub fn split_member(
+        cluster: [u8; 16],
+        founder_node: u64,
+        delegation: Delegation,
+        genesis: [u8; 32],
+        image: ContentHash,
+        host: u64,
+    ) -> Result<Self, DirectoryBootstrapError> {
+        if cluster == [0; 16]
+            || founder_node == 0
+            || host == 0
+            || host == founder_node
+            || genesis == [0; 32]
+            || delegation.activation.is_none()
+        {
+            return Err(DirectoryBootstrapError::Unauthorized);
+        }
+        Ok(Self {
+            cluster,
+            founder_node,
+            partition: delegation.partition,
+            group: delegation.log_group,
+            namespace: rpc_namespace(cluster)?,
+            delegation,
+            image: Some(image),
+            genesis,
+            host,
+        })
+    }
+    /// The group's genesis as this plan carries it.
+    pub fn genesis(&self) -> [u8; 32] {
+        self.genesis
+    }
+    /// Whether this plan is a seated member's of a group founded on an image
+    /// elsewhere: it holds the image's digest and not the image.
+    pub fn founded_elsewhere(&self) -> bool {
+        self.image.is_some() && self.host != self.founder_node
+    }
     pub fn range(&self) -> NamespaceRange {
         self.delegation.namespace
     }
@@ -172,18 +215,23 @@ impl PartitionPlan {
         &self,
         image: Option<PartitionCheckpoint>,
     ) -> Result<ControlBootstrap, DirectoryBootstrapError> {
+        let empty = || PartitionCheckpoint {
+            schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
+            cluster: ClusterId(self.cluster),
+            delegation: self.delegation,
+            revision: 0,
+            sealed: None,
+            nodes: std::sync::Arc::new(BTreeMap::new()),
+            sessions: std::sync::Arc::new(BTreeMap::new()),
+            routes: std::sync::Arc::new(std::collections::VecDeque::new()),
+            routes_from: 0,
+        };
         let directory = match (self.image, image) {
-            (None, None) => PartitionCheckpoint {
-                schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
-                cluster: ClusterId(self.cluster),
-                delegation: self.delegation,
-                revision: 0,
-                sealed: None,
-                nodes: std::sync::Arc::new(BTreeMap::new()),
-                sessions: std::sync::Arc::new(BTreeMap::new()),
-                routes: std::sync::Arc::new(std::collections::VecDeque::new()),
-                routes_from: 0,
-            },
+            (None, None) => empty(),
+            // A seated member of a split destination holds no image: it
+            // opens on nothing, with the group's identity, and its state
+            // comes by snapshot (`ControlOptions::founded_elsewhere`).
+            (Some(_), None) if self.founded_elsewhere() => empty(),
             (Some(expected), Some(image)) => {
                 let digest = focal_directory::partition_checkpoint_digest(&image)
                     .map_err(|_| DirectoryBootstrapError::Inconsistent)?;
@@ -209,14 +257,19 @@ impl PartitionPlan {
     }
     fn options(&self) -> ControlOptions {
         // The founder alone founded the log; a later host replays the
-        // membership changes since from it (as a root learner does).
-        ControlOptions::new(NodeConfig::joining(
+        // membership changes since from it (as a root learner does) — or,
+        // for a group founded on an image, is brought up by snapshot.
+        let mut options = ControlOptions::new(NodeConfig::joining(
             self.host,
             self.cluster,
             self.group.0,
             vec![self.founder_node],
             Vec::new(),
-        ))
+        ));
+        if self.founded_elsewhere() {
+            options.founded_elsewhere = Some(self.genesis);
+        }
+        options
     }
     fn client(&self) -> Result<[u8; 16], DirectoryBootstrapError> {
         derived_id("focal.directory.authority-install-client.v1", self.cluster)

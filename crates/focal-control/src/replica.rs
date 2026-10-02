@@ -154,6 +154,8 @@ pub struct ControlReplica {
     membership: Option<ControlMembershipRecord>,
     drained: bool,
     failed: bool,
+    /// Founded here on a sealed image (`ControlBootstrap::is_image`).
+    founded_from_image: bool,
 }
 impl ControlReplica {
     pub fn open(
@@ -164,6 +166,7 @@ impl ControlReplica {
     ) -> Result<Self, ControlError> {
         options.validate()?;
         let identity = bootstrap.identity(&options)?;
+        let founded_from_image = bootstrap.is_image();
         let machine = Machine::restore(bootstrap, &options, &budget)?;
         let retries = RetryState::restore(BTreeMap::new(), &options.limits, &budget, 0)?;
         let mut node = DurableNode::open_in(options.consensus.clone(), directory, &budget)?;
@@ -184,6 +187,7 @@ impl ControlReplica {
             membership: None,
             drained: false,
             failed: false,
+            founded_from_image,
         })
     }
     pub fn open_on_wal(
@@ -194,6 +198,7 @@ impl ControlReplica {
     ) -> Result<Self, ControlError> {
         options.validate()?;
         let identity = bootstrap.identity(&options)?;
+        let founded_from_image = bootstrap.is_image();
         let machine = Machine::restore(bootstrap, &options, &budget)?;
         let retries = RetryState::restore(BTreeMap::new(), &options.limits, &budget, 0)?;
         let mut node = DurableNode::open_on_wal_in(options.consensus.clone(), wal, &budget)?;
@@ -212,6 +217,7 @@ impl ControlReplica {
             membership: None,
             drained: false,
             failed: false,
+            founded_from_image,
         })
     }
     pub fn identity(&self) -> ControlIdentity {
@@ -225,6 +231,12 @@ impl ControlReplica {
     }
     pub fn applied_index(&self) -> u64 {
         self.applied_index
+    }
+    /// Whether this replica's group was founded here on a sealed image (a
+    /// split destination's founder): its log begins after the image, so it
+    /// compacts at founding and no member is ever sent the image's prefix.
+    pub fn founded_from_image(&self) -> bool {
+        self.founded_from_image
     }
     /// The compaction floor: the index of the most recent installed snapshot,
     /// or zero if the log has never been compacted.
@@ -793,6 +805,31 @@ impl ControlReplica {
             None
         };
         if let ControlCommand::Membership(change) = &envelope.request.command {
+            // A group founded here on a sealed image compacts before it
+            // admits its first member: the member holds no image to replay
+            // the log's beginning onto, and once the floor stands past the
+            // image the first thing the member is sent is a snapshot, by
+            // construction — no tick's timing decides it (24 §13). A
+            // compaction refused for the moment answers not ready; the
+            // admission is asked again.
+            if self.founded_from_image
+                && self.node.snapshot_index() == 0
+                && matches!(
+                    change.change,
+                    focal_consensus::MembershipChange::AddLearner { .. }
+                )
+            {
+                // The checkpoint completes as it becomes durable; the floor
+                // stands only then, so the admission is refused until it
+                // does and asked again — never proposed on a log that still
+                // holds the image's prefix.
+                match self.checkpoint() {
+                    Ok(()) => {}
+                    Err(error) if self.checkpoint_retryable(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                return Err(ControlError::NotReady);
+            }
             self.node
                 .propose_membership(&change.expected, change.change, encoded)?;
         } else {
@@ -1085,6 +1122,26 @@ impl ControlReplica {
             self.machine = machine;
             self.retries = retries;
             self.applied_index = checkpoint.applied_index;
+        }
+        // A member of a group founded on an image it does not hold applies
+        // no entry before a snapshot: the founder compacted at founding, so
+        // an entry from the log's beginning reaching an empty replica is a
+        // law broken, not a state to build on (its state would diverge from
+        // the group's at the first command).
+        if self.options.founded_elsewhere.is_some()
+            && self.applied_index == 0
+            && (events
+                .committed
+                .first()
+                .is_some_and(|entry| entry.index == 1)
+                || events
+                    .membership
+                    .first()
+                    .is_some_and(|change| change.index == 1))
+        {
+            return Err(ControlError::Corrupt(
+                "a member founded elsewhere applies no entry before a snapshot",
+            ));
         }
         let mut ordinary = events.committed.into_iter().peekable();
         let mut configurations = events.membership.into_iter().peekable();

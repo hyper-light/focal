@@ -959,10 +959,25 @@ cannot lead reports who does — requests are never forwarded, since a leader
 cannot bind another node's administrator to a client of its retry window),
 and a leaving host's seat is vacated by `cluster nodes remove`
 before its root membership (handing the group's leadership on first where
-it led). The groups a split creates stay the founder's alone until a seated
-member can be founded on the sealed image — its genesis is the image's
-hash, which only the founder holds — so a split bounds each metadata
-owner's state but not yet the founder's total; a merge
+it led). The groups a split creates are seated like the first: a member's
+replica opens with the group's identity (the genesis the root's grant
+carries, the image digest the delegation's fence does) and no state, and is
+brought up by the founder's snapshot — the founder compacts before it
+admits its first member (in its own submit of the admission, so no tick's
+timing decides it), and its log begins after the image: no member is ever
+sent the image's prefix; an entry from the log's beginning reaching an empty member is a
+stated corruption (`ControlOptions::founded_elsewhere`). A split's and a
+merge's delegation fence is signed by a majority of each group's installed
+voters (`SessionFact::Delegation`, collected over `SessionSign`), the
+founder's alone only for a group seated on it alone. A member's seat stands
+while the root's grant seats it; a merge drops the source's delegation and
+keeps its grant until the destination has absorbed it — the absorb's fence
+needs the source group's majority — and the root then releases the group
+(`AuthorityOperation::ReleaseGroup`): its grant and every seat go, and the
+member's record goes with its seat. A seal
+the reshaper intends for a group another node leads is made where the
+group leads: the reshaper's node, a voter of the group, takes its
+leadership first and seals on its next pass; a merge
 moves at most 256 sessions because the absorb command carries the sealed
 checkpoint; the founder's session is the only session a test can create,
 so the split qualification uses a threshold of one; there is no route cache

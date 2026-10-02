@@ -129,6 +129,14 @@ pub enum AuthorityOperation {
     ChangeGroup {
         proof: AuthorityProof,
     },
+    /// A partition group whose partition was merged away and absorbed is
+    /// released: its grant, and with it every seat, goes (24 §13). The
+    /// grant outlives the delegation until then, since the absorb needs the
+    /// group's majority. The controller intends it once the destination
+    /// caught up; a session's group is never released this way.
+    ReleaseGroup {
+        group: LogGroupId,
+    },
 }
 struct AuthorityVersion {
     state: AuthorityCheckpoint,
@@ -295,6 +303,11 @@ impl AuthorityRegistry {
                     _ => return Err(DirectoryError::WrongOperation),
                 }
             }
+            AuthorityOperation::ReleaseGroup { group } => match self.root.state.groups.get(group) {
+                Some(grant) if matches!(grant.scope, GroupScope::Partition { .. }) => 0,
+                Some(_) => return Err(DirectoryError::WrongOperation),
+                None => return Err(DirectoryError::Missing),
+            },
         };
         let allocation = self
             .budget
@@ -366,6 +379,11 @@ impl AuthorityRegistry {
                 let mut grant = grant.clone();
                 grant.enrollment.attestation = node_digest(&next.anchor, &grant)?;
                 next.nodes.insert(grant.enrollment.node, grant);
+            }
+            AuthorityOperation::ReleaseGroup { group } => {
+                if next.groups.remove(group).is_none() {
+                    return Err(DirectoryError::Missing);
+                }
             }
             AuthorityOperation::BootstrapGroup { grant } => {
                 if next.groups.contains_key(&grant.group) {

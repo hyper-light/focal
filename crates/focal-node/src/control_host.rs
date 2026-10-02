@@ -2127,6 +2127,11 @@ impl<V: AuthorityVerifier> Owner<V> {
         if applied <= floor {
             return Ok(());
         }
+        // A group founded here on a sealed image compacts at founding: its
+        // log begins after the image, and a member seated later (24 §13)
+        // holds no image to replay it onto, so it is brought up by snapshot
+        // alone — never sent the log's beginning.
+        let founding = self.replica.founded_from_image() && floor == 0;
         let interval_reached = applied.saturating_sub(floor) >= self.config.checkpoint_interval;
         // The stored snapshot carries the configuration at its index. Once a
         // membership change commits above the floor, that snapshot excludes the
@@ -2135,7 +2140,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         // membership change (afterward the floor is at or above the change),
         // never per entry, so it cannot storm.
         let stale_configuration = floor < self.replica.configuration_index();
-        if !interval_reached && !stale_configuration {
+        if !interval_reached && !stale_configuration && !founding {
             return Ok(());
         }
         match self.replica.checkpoint() {

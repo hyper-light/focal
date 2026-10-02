@@ -1066,8 +1066,9 @@ impl PlacementAgent {
     /// Host a replica of a partition's group this node holds a seat in (a
     /// voter's or a learner's, by the root's grant) and does not host yet
     /// (F24). The first partition is opened from the group's genesis; a
-    /// split destination's replica needs the sealed image it was founded
-    /// on, which only its founder holds today (recorded as open).
+    /// split destination's member from the group's identity the root's
+    /// grant carries and the image digest its delegation's fence does,
+    /// brought up by snapshot (24 §13).
     fn host_seated_partition(
         &self,
         handles: &NetworkHandles,
@@ -1090,13 +1091,31 @@ impl PlacementAgent {
             return Ok(());
         }
         let first = handles.directory.plan();
-        if delegation.partition != first.partition() || delegation.log_group != first.group() {
-            return Ok(());
-        }
+        let plan =
+            if delegation.partition == first.partition() && delegation.log_group == first.group() {
+                first.hosted_by(node)
+            } else {
+                let Some(fence) = delegation.activation else {
+                    return Ok(());
+                };
+                match crate::directory_bootstrap::PartitionPlan::split_member(
+                    self.state.genesis.founder.cluster,
+                    self.state.genesis.founder.node,
+                    *delegation,
+                    grant.genesis.0,
+                    fence.destination_ready,
+                    node,
+                ) {
+                    Ok(plan) => plan,
+                    // A grant not yet shaped as a founded destination (its
+                    // delegation unfenced): seated on the next pass.
+                    Err(_) => return Ok(()),
+                }
+            };
         match handles
             .directory
             .request(crate::network_service::HostRequest::Host {
-                plan: Box::new(first.hosted_by(node)),
+                plan: Box::new(plan),
                 image: None,
             }) {
             // Asked already and not opened yet: asked again next pass.
@@ -3281,6 +3300,7 @@ fn intent_kind(command: &ControlCommand) -> &'static str {
                 "authority bootstrap group"
             }
             focal_directory::AuthorityOperation::ChangeGroup { .. } => "authority change group",
+            focal_directory::AuthorityOperation::ReleaseGroup { .. } => "authority release group",
         },
         ControlCommand::VerifiedRoot(_) => "verified root",
         ControlCommand::VerifiedPartition(command) => match &command.command.operation {

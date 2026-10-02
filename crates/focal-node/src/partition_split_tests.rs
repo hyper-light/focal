@@ -4,11 +4,68 @@
 //! are small; every step is a committed directory fact.
 use crate::{
     network_service::tests::{Running, settings, try_until, until},
-    placement_agent::tests::{observe, partition_host},
+    placement_agent::tests::{join_peer, observe, partition_host},
 };
-use focal_control::ControlBootstrap;
+use focal_consensus::MembershipChange;
+use focal_control::{
+    ControlBootstrap, ControlCommand, ControlMembershipCommand, ControlRequest, ControlRequestId,
+};
 use focal_directory::{NamespaceKey, NamespaceRange, PartitionCheckpoint, PartitionId};
-use std::{collections::BTreeMap, time::Duration};
+use focal_model::ParticipantId;
+use focal_wire::{AuthenticatedPeer, PeerGrant, PeerRole};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
+
+/// One membership change of a hosted partition group, submitted to the
+/// replica `running` hosts as an administrator would (24 §13): the
+/// administrator's principal is the request's client, the directory's
+/// namespace its tenant. Asked again — bounded — while the group is not
+/// ready for it (a learner catching up before its promotion).
+async fn change_group(
+    running: &Running,
+    partition: PartitionId,
+    client: [u8; 16],
+    sequence: u64,
+    change: MembershipChange,
+) {
+    let host = running.handles.directory.host_of(partition).unwrap();
+    let namespace = running.handles.directory.namespace();
+    let peer = AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId(client),
+        tenants: BTreeSet::from([namespace.tenant]),
+        role: PeerRole::Runtime,
+    })
+    .unwrap();
+    let committed = try_until(&[running], Duration::from_secs(60), async || {
+        let witness = host.witness_membership().await.ok()?;
+        let request = ControlRequest {
+            id: ControlRequestId { client, sequence },
+            acknowledged_through: sequence.checked_sub(1)?,
+            command: ControlCommand::Membership(ControlMembershipCommand {
+                expected_configuration_index: witness.configuration.configuration_index,
+                expected: witness.configuration.configuration.clone(),
+                change,
+            }),
+        };
+        match host.submit(peer.clone(), request).await {
+            Ok(receipt) => Some(receipt),
+            Err(
+                focal_control::ControlFailure::NotReady
+                | focal_control::ControlFailure::CompareFailed
+                | focal_control::ControlFailure::Unavailable
+                | focal_control::ControlFailure::OutcomeUnknown,
+            ) => None,
+            Err(error) => panic!("{change:?}: {error:?}"),
+        }
+    })
+    .await;
+    assert!(
+        committed.is_ok(),
+        "{change:?} never committed: {committed:?}"
+    );
+}
 
 async fn delegations(running: &Running) -> BTreeMap<NamespaceKey, focal_directory::Delegation> {
     let root = running.handles.control.observe_root().await.unwrap();
@@ -31,14 +88,37 @@ async fn wait_delegations(
         Ok(current) => current,
         Err(spent) => {
             let status = running.handles.placement.status().await;
+            // What each hosted partition stood at: sealed or not, its
+            // revision and epoch, and the configuration its group applied.
+            let mut hosted = Vec::new();
+            for partition in running.handles.directory.hosted() {
+                let state = partition_state(running, partition.plan.partition()).await;
+                let witness = partition.host.witness_membership().await.ok();
+                hosted.push((
+                    partition.plan.partition(),
+                    partition.host.progress().leader,
+                    state.as_ref().map(|state| {
+                        (
+                            state.revision,
+                            state.delegation.epoch,
+                            state
+                                .sealed
+                                .as_ref()
+                                .map(|seal| (seal.destination, seal.revision)),
+                        )
+                    }),
+                    witness.map(|witness| witness.configuration.configuration.voters.clone()),
+                ));
+            }
             panic!(
-                "root delegations never reached: {what}: {spent}; agent {:?}; hosted {}",
+                "root delegations never reached: {what}: {spent}; hosted {hosted:?}; agent {:?}; delegations {:?}",
                 status.map(|status| (
                     status.last_error,
+                    status.last_refusal,
                     status.root_intents,
                     status.partition_intents
                 )),
-                running.handles.directory.hosted().len()
+                delegations(running).await,
             )
         }
     }
@@ -172,6 +252,56 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
             == 1
     );
 
+    // A host joined after the split is seated in the destination's group
+    // (24 §13; the audit's F24): admitted as a learner through the founder's
+    // replica, the root's grant seats it and its agent hosts a replica from
+    // the group's identity the grant carries — no image — which the
+    // destination's founder, having compacted at founding, brings up by
+    // snapshot: the member's state shows the session it never replayed.
+    // Promoted once caught up, it votes through the merge below.
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer_settings = crate::network_service::tests::settings(peer_dir.path());
+    let (peer, peer_node) = join_peer(&founder, directory.path(), "host", &peer_settings).await;
+    let client = [7; 16];
+    change_group(
+        &founder,
+        upper.partition,
+        client,
+        1,
+        MembershipChange::AddLearner { node: peer_node },
+    )
+    .await;
+    let seated = wait_partition(
+        &peer,
+        upper.partition,
+        "member brought up by snapshot",
+        |state| state.sessions.contains_key(&ledger) && state.delegation.epoch == 2,
+    )
+    .await;
+    assert_eq!(seated.delegation, *upper);
+    assert_eq!(peer.handles.directory.hosted().len(), 1);
+    change_group(
+        &founder,
+        upper.partition,
+        client,
+        2,
+        MembershipChange::Promote { node: peer_node },
+    )
+    .await;
+    let witness = founder
+        .handles
+        .directory
+        .host_of(upper.partition)
+        .unwrap()
+        .witness_membership()
+        .await
+        .unwrap();
+    let mut voters = witness.configuration.configuration.voters.clone();
+    voters.sort_unstable();
+    let mut expected = vec![founder_node, peer_node];
+    expected.sort_unstable();
+    assert_eq!(voters, expected);
+
     // A restart reopens the hosted partition from its record and leaves the
     // delegations untouched.
     founder.stop().await;
@@ -228,5 +358,21 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
     .await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(delegations(&founder).await.len(), 1);
+    // The merged-away group's seat is gone with it: the member hosts
+    // nothing of it any more.
+    until(
+        "the member's seat in the merged-away group is gone",
+        &[&founder, &peer],
+        Duration::from_secs(30),
+        async || {
+            peer.handles
+                .directory
+                .host_of(upper.partition)
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
+    peer.stop().await;
     founder.stop().await;
 }

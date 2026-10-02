@@ -18,7 +18,7 @@ use tokio::sync::watch;
 pub const MAX_HOSTED_PARTITIONS: usize = 32;
 /// Schema 1 recorded a split destination's image; 2 records who hosts and
 /// an image where there is one.
-const RECORD_SCHEMA: u16 = 2;
+const RECORD_SCHEMA: u16 = 3;
 const RECORD_DIRECTORY: &str = "cluster/partitions";
 /// Root permits are retried this often while the root is not ready.
 const PERMIT_PAUSE: Duration = Duration::from_millis(250);
@@ -64,6 +64,20 @@ struct HostedRecord {
     image: Option<PartitionCheckpoint>,
     /// The node that hosts: the founder for a split destination of its
     /// own, a seated member otherwise.
+    host: u64,
+    /// A seated member of a split destination (schema 3): the group's
+    /// genesis and the image's digest, from the root — the member holds no
+    /// image (24 §13).
+    founded_elsewhere: Option<([u8; 32], focal_model::ContentHash)>,
+}
+/// What schema 2 recorded: a host, no founding elsewhere.
+#[derive(serde::Deserialize)]
+struct HostedRecordV2 {
+    schema: u16,
+    cluster: [u8; 16],
+    founder_node: u64,
+    delegation: Delegation,
+    image: Option<PartitionCheckpoint>,
     host: u64,
 }
 /// What schema 1 recorded: a split destination on the founder.
@@ -289,14 +303,17 @@ impl DirectoryStartup {
         for (plan, image) in records {
             driving.insert(plan.partition());
             extras.push(Box::pin(drive_hosted(
-                plan, image, root, pool, owners, wal, budget, hosted, pending,
+                plan, image, root, pool, owners, wal, budget, hosted, pending, plan_root,
             )));
         }
         loop {
             tokio::select! {
                 result = &mut first => return result,
                 Some(result) = extras.next(), if !extras.is_empty() => {
-                    return result.and(Err(ServiceError::Owner("hosted partition ended")));
+                    // A hosted drive that ended well — its seat gone, its
+                    // record forgotten — ends nothing else; one that failed
+                    // ends the service, as the first partition's would.
+                    result?;
                 }
                 request = self.requests.recv() => {
                     let Some(request) = request else {
@@ -319,6 +336,7 @@ impl DirectoryStartup {
                             driving.insert(plan.partition());
                             extras.push(Box::pin(drive_hosted(
                                 *plan, image, root, pool, owners, wal, budget, hosted, pending,
+                                plan_root,
                             )));
                         }
                         HostRequest::Retire { partition } => {
@@ -401,6 +419,7 @@ async fn drive_hosted(
     budget: &MemoryBudget,
     hosted: &watch::Sender<BTreeMap<PartitionId, HostedPartition>>,
     pending: &watch::Sender<BTreeMap<PartitionId, HostingAttempt>>,
+    records: &Path,
 ) -> Result<(), ServiceError> {
     let permit = permit(root, plan, Some(2_400), Some(pending)).await?;
     let installed_index = permit.root_index();
@@ -440,17 +459,45 @@ async fn drive_hosted(
     if plan.host() != plan.founder_node() {
         // A member's replica runs while the root's grant seats this node in
         // the group, and stops when the seat is gone (removed by the
-        // operator, or the group re-founded).
-        let seat = watch_seat(plan, root, &host);
+        // operator, the group re-founded or released). The seat's own stop
+        // ends the egress and the refresh too, and either may be seen
+        // first: once the seat says it is ending, theirs is its end, and
+        // the seat's word is waited for.
+        let ending = std::sync::atomic::AtomicBool::new(false);
+        let seat = watch_seat(plan, root, &host, &ending);
         tokio::pin!(seat);
         let result = tokio::select! {
-            result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("hosted partition egress ended"))),
-            result = &mut refresh => result,
+            biased;
             result = &mut seat => result,
+            result = &mut replication => {
+                if ending.load(std::sync::atomic::Ordering::Acquire) {
+                    seat.await
+                } else {
+                    result.map_err(ServiceError::from).and(Err(ServiceError::Owner("hosted partition egress ended")))
+                }
+            }
+            result = &mut refresh => {
+                if ending.load(std::sync::atomic::Ordering::Acquire) {
+                    seat.await
+                } else {
+                    result
+                }
+            }
         };
         hosted.send_modify(|map| {
             map.remove(&plan.partition());
         });
+        // A seat that ended is forgotten for restarts, as the founder's own
+        // retired hosting is: a record kept would reopen a replica of a
+        // group the root no longer seats this node in, and wait on a permit
+        // it is never given.
+        if result.is_ok() {
+            match std::fs::remove_file(record_path(records, plan.partition())) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         return result;
     }
     tokio::select! {
@@ -460,13 +507,17 @@ async fn drive_hosted(
 }
 /// Run a member's replica while the root's committed grant seats its host
 /// in the group, checked from the node's own root replica as the root
-/// moves, and stop it once the seat is gone: the replica is then no
-/// longer authorized and its record is dropped so a restart does not
-/// reopen it. Ends `Ok` when the host stops.
+/// moves, and stop it once the seat is gone — the node removed from the
+/// group, the group re-founded, or the group released once the partition
+/// it served was merged away and absorbed (24 §13; the grant outlives the
+/// delegation until then, since the absorb needs the group's majority):
+/// the replica is then no longer authorized and its record is dropped so
+/// a restart does not reopen it. Ends `Ok` when the host stops.
 async fn watch_seat(
     plan: PartitionPlan,
     root: &ControlHost,
     host: &ControlHost,
+    ending: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ServiceError> {
     let mut seen = 0u64;
     loop {
@@ -477,13 +528,15 @@ async fn watch_seat(
         if applied > seen {
             seen = applied;
             let seated = match root.observe_root().await {
-                Ok(observation) => observation
-                    .authority()
-                    .and_then(|authority| authority.groups.get(&plan.group()))
-                    .is_some_and(|grant| {
+                // An authority not yet observable decides nothing; a group
+                // the authority no longer holds, or holds without this
+                // node, ends the seat.
+                Ok(observation) => observation.authority().is_none_or(|authority| {
+                    authority.groups.get(&plan.group()).is_some_and(|grant| {
                         grant.voters.contains_key(&plan.host())
                             || grant.learners.contains_key(&plan.host())
-                    }),
+                    })
+                }),
                 // Not observable now: nothing is decided on it.
                 Err(
                     focal_control::ControlFailure::NotReady
@@ -492,6 +545,7 @@ async fn watch_seat(
                 Err(error) => return Err(error.into()),
             };
             if !seated {
+                ending.store(true, std::sync::atomic::Ordering::Release);
                 host.stop().await?;
                 return Ok(());
             }
@@ -519,6 +573,10 @@ fn record(
         delegation: plan.delegation(),
         image: image.cloned(),
         host: plan.host(),
+        founded_elsewhere: plan
+            .founded_elsewhere()
+            .then(|| plan.image().map(|digest| (plan.genesis(), digest)))
+            .flatten(),
     })
     .map_err(|_| ServiceError::Owner("hosted partition record"))?;
     crate::embedded::atomic_file(&record_path(root, plan.partition()), &bytes)?;
@@ -552,24 +610,37 @@ fn load_records(
             return Err(ServiceError::Owner("too many hosted partition records"));
         }
         let bytes = std::fs::read(entry.path())?;
-        // Schema 1 named no host: the founder's own split destinations.
+        // Schema 1 named no host: the founder's own split destinations;
+        // schema 2 named the host and no founding elsewhere.
         let record: HostedRecord = match postcard::from_bytes::<HostedRecord>(&bytes) {
             Ok(record) if record.schema == RECORD_SCHEMA => record,
-            _ => {
-                let old: HostedRecordV1 = postcard::from_bytes(&bytes)
-                    .map_err(|_| ServiceError::Owner("hosted partition record is corrupt"))?;
-                if old.schema != 1 {
-                    return Err(ServiceError::Owner("hosted partition record is corrupt"));
-                }
-                HostedRecord {
+            _ => match postcard::from_bytes::<HostedRecordV2>(&bytes) {
+                Ok(old) if old.schema == 2 => HostedRecord {
                     schema: RECORD_SCHEMA,
                     cluster: old.cluster,
                     founder_node: old.founder_node,
                     delegation: old.delegation,
-                    image: Some(old.image),
-                    host: old.founder_node,
+                    image: old.image,
+                    host: old.host,
+                    founded_elsewhere: None,
+                },
+                _ => {
+                    let old: HostedRecordV1 = postcard::from_bytes(&bytes)
+                        .map_err(|_| ServiceError::Owner("hosted partition record is corrupt"))?;
+                    if old.schema != 1 {
+                        return Err(ServiceError::Owner("hosted partition record is corrupt"));
+                    }
+                    HostedRecord {
+                        schema: RECORD_SCHEMA,
+                        cluster: old.cluster,
+                        founder_node: old.founder_node,
+                        delegation: old.delegation,
+                        image: Some(old.image),
+                        host: old.founder_node,
+                        founded_elsewhere: None,
+                    }
                 }
-            }
+            },
         };
         if record.cluster != first.cluster()
             || record.founder_node != first.founder_node()
@@ -577,16 +648,26 @@ fn load_records(
         {
             return Err(ServiceError::Owner("hosted partition record is foreign"));
         }
-        let plan = match &record.image {
-            Some(image) => PartitionPlan::split_destination(
+        let plan = match (&record.image, record.founded_elsewhere) {
+            (Some(image), _) => PartitionPlan::split_destination(
                 record.cluster,
                 record.founder_node,
                 record.delegation,
                 image,
             )?,
+            // A seated member of a split destination: the group's identity
+            // from the root, no image (24 §13).
+            (None, Some((genesis, digest))) => PartitionPlan::split_member(
+                record.cluster,
+                record.founder_node,
+                record.delegation,
+                genesis,
+                digest,
+                record.host,
+            )?,
             // A seated member's replica of the first partition: from the
             // group's genesis, as the founder's own.
-            None => {
+            (None, None) => {
                 if record.delegation.partition != first.partition()
                     || record.delegation.log_group != first.group()
                 {

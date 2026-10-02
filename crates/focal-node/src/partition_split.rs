@@ -150,6 +150,42 @@ impl PlacementAgent {
                     // the partition's own release or install catches up.
                     return Ok(None);
                 }
+                // A merge this partition absorbed: the source's group, whose
+                // majority signed the absorb, is released once the absorb
+                // stands — its grant, and with it every seat (24 §13). The
+                // root's leader intends it; released, the step is gone. A
+                // merge is told from a split, whose destination carries a
+                // fence of the same shape, by the source: merged away, the
+                // root delegates it no longer; split from, it still does.
+                if let Some(fence) = delegation.activation
+                    && fence.destination == own.partition
+                    && fence.source != own.partition
+                    && !root
+                        .delegations
+                        .values()
+                        .any(|other| other.partition == fence.source)
+                    && let Some(authority) = observation.authority()
+                    && let Some((group, _)) = authority.groups.iter().find(|(_, grant)| {
+                        matches!(
+                            grant.scope,
+                            focal_directory::GroupScope::Partition { partition, .. }
+                                if partition == fence.source
+                        )
+                    })
+                {
+                    let enrollment_revision = self.root_enrollment_revision(observation)?;
+                    let command = ControlCommand::Authority(focal_directory::AuthorityCommand {
+                        expected_revision: authority.revision,
+                        enrollment_revision,
+                        decided_at: now,
+                        operation: focal_directory::AuthorityOperation::ReleaseGroup {
+                            group: *group,
+                        },
+                    });
+                    let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
+                    journals.root.intend(&handles.control, command).await?;
+                    return Ok(Some(AgentStep::Advanced));
+                }
                 if directory.sessions.len() >= split_at {
                     // Split at the median of the keys strictly above the
                     // start; a partition whose sessions all share its start key
@@ -216,6 +252,19 @@ impl PlacementAgent {
                         {
                             return Ok(None);
                         }
+                        // The seal is the upper group's own change, made
+                        // where the group leads (24 §13): where this node
+                        // hosts a replica that follows — the group's
+                        // leadership moved to a seated member — it asks for
+                        // the leadership first, as a voter may, and seals on
+                        // its next pass. A seal sent through another node's
+                        // ingress is not that node's own fact and is refused.
+                        if let Some(right_host) = handles.directory.host_of(right.partition)
+                            && right_host.progress().leader != node
+                        {
+                            self.lead_group_here(handles, &right_host, node).await?;
+                            return Ok(Some(AgentStep::Idle));
+                        }
                         let operation =
                             reshape_operation(cluster, right.partition, right_state.revision);
                         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
@@ -267,7 +316,14 @@ impl PlacementAgent {
                             destination_ready: digest,
                         };
                         let proofs = self
-                            .delegation_proofs(handles, right.log_group, own.log_group, fence, now)
+                            .delegation_proofs(
+                                handles,
+                                pool,
+                                right.log_group,
+                                own.log_group,
+                                fence,
+                                now,
+                            )
                             .await?;
                         let command = ControlCommand::VerifiedRoot(VerifiedRootCommand {
                             command: RootCommand {
@@ -386,7 +442,7 @@ impl PlacementAgent {
         match root.delegations.get(&seal.moved.start) {
             None => {
                 let proofs = self
-                    .delegation_proofs(handles, own.log_group, group, fence, now)
+                    .delegation_proofs(handles, pool, own.log_group, group, fence, now)
                     .await?;
                 let mut proposed = destination;
                 proposed.activation = None;
@@ -422,7 +478,7 @@ impl PlacementAgent {
                     // under both groups' signatures at its installed authority.
                     let mut evidence = control_evidence(installed, cluster, now, &self.budget)?;
                     evidence.proofs = self
-                        .delegation_proofs(handles, own.log_group, group, fence, now)
+                        .delegation_proofs(handles, pool, own.log_group, group, fence, now)
                         .await?;
                     let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
                         command: PartitionCommand {
@@ -452,7 +508,7 @@ impl PlacementAgent {
                     observed_partition(observed, own.partition).ok_or(AgentError::Identity)?;
                 let mut evidence = control_evidence(source_installed, cluster, now, &self.budget)?;
                 evidence.proofs = self
-                    .delegation_proofs(handles, own.log_group, group, fence, now)
+                    .delegation_proofs(handles, pool, own.log_group, group, fence, now)
                     .await?;
                 let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
                     command: PartitionCommand {
@@ -511,6 +567,7 @@ impl PlacementAgent {
         evidence.proofs = self
             .delegation_proofs(
                 handles,
+                pool,
                 moved.delegation.log_group,
                 directory.delegation.log_group,
                 fence,
@@ -543,33 +600,123 @@ impl PlacementAgent {
         })?;
         Ok(step)
     }
-    /// Both groups' signatures over one delegation fence: this node signs as
-    /// the single voter of each (partition groups live on the founder).
+    /// Both groups' signatures over one delegation fence: a majority of
+    /// each group's installed voters, this node's own where it is one (a
+    /// group seated on it alone, the founder's as a split leaves it), the
+    /// others' collected over `SessionSign` — a split destination's seated
+    /// members vote in its merge (24 §13).
     async fn delegation_proofs(
         &mut self,
         handles: &NetworkHandles,
+        pool: &PeerConnectionPool,
         source_group: LogGroupId,
         destination_group: LogGroupId,
         fence: DelegationFence,
         now: i64,
     ) -> Result<Vec<focal_directory::AuthorityProof>, AgentError> {
         let window = self.window(now)?;
-        let source = handles
-            .control
-            .prepare_delegation_proof(source_group, fence, true, window)
-            .await?
-            .sign(&self.credentials)?;
-        let destination = handles
-            .control
-            .prepare_delegation_proof(destination_group, fence, false, window)
-            .await?
-            .sign(&self.credentials)?;
         let mut proofs = Vec::new();
         proofs
             .try_reserve_exact(2)
             .map_err(|_| AgentError::Capacity)?;
-        proofs.push(source.proof().clone());
-        proofs.push(destination.proof().clone());
+        for (group, source) in [(source_group, true), (destination_group, false)] {
+            let voters = self.group_voters(handles, group).await?;
+            let proof = if voters.as_slice() == [self.state.node] {
+                handles
+                    .control
+                    .prepare_delegation_proof(group, fence, source, window)
+                    .await?
+                    .sign(&self.credentials)?
+                    .proof()
+                    .clone()
+            } else {
+                self.collect(
+                    handles,
+                    pool,
+                    crate::placement_control::CollectRequest {
+                        ledger: handles.directory.namespace(),
+                        group: group.0,
+                        voters,
+                        fact: crate::placement_control::SessionFact::Delegation {
+                            group,
+                            fence,
+                            source,
+                        },
+                        window,
+                    },
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::placement_collect::CollectError::Capacity => AgentError::Capacity,
+                    _ => AgentError::Control(ControlFailure::NotReady),
+                })?
+            };
+            proofs.push(proof);
+        }
         Ok(proofs)
+    }
+    /// Ask a hosted partition group this node votes in, and does not lead,
+    /// for its leadership: one transfer message the leader answers by
+    /// timing this voter into a campaign (27 §5). Initiation only; the
+    /// next pass sees where the group leads. A group this node does not
+    /// vote in is left as it is.
+    async fn lead_group_here(
+        &mut self,
+        handles: &NetworkHandles,
+        host: &ControlHost,
+        node: u64,
+    ) -> Result<(), AgentError> {
+        let witness = host.witness_membership().await?;
+        if !witness.configuration.configuration.voters.contains(&node) {
+            return Ok(());
+        }
+        let client = Self::local_client(self.state.genesis.founder.cluster, node);
+        let peer = self.peer(client, handles.directory.namespace())?;
+        let id = self.next_request_id()?;
+        match host
+            .transfer(
+                peer,
+                id,
+                focal_control::ControlTransfer {
+                    expected_configuration_index: witness.configuration.configuration_index,
+                    expected: witness.configuration.configuration,
+                    target: node,
+                },
+            )
+            .await
+        {
+            // Refused while an election or an earlier transfer is under
+            // way, or the configuration moved: asked again next pass.
+            Ok(())
+            | Err(
+                ControlFailure::NotLeader { .. }
+                | ControlFailure::NotReady
+                | ControlFailure::CompareFailed
+                | ControlFailure::Unavailable,
+            ) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    /// The voters of a partition group as the root's installed grant seats
+    /// them (24 §13): this node alone for a group a split left on it.
+    async fn group_voters(
+        &self,
+        handles: &NetworkHandles,
+        group: LogGroupId,
+    ) -> Result<Vec<u64>, AgentError> {
+        let root = handles.control.observe_root().await?;
+        let grant = root
+            .authority()
+            .and_then(|authority| authority.groups.get(&group))
+            .ok_or(AgentError::Identity)?;
+        let mut voters = Vec::new();
+        voters
+            .try_reserve_exact(grant.voters.len())
+            .map_err(|_| AgentError::Capacity)?;
+        voters.extend(grant.voters.keys().copied());
+        if voters.is_empty() {
+            return Err(AgentError::Identity);
+        }
+        Ok(voters)
     }
 }

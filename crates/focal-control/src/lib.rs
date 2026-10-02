@@ -111,6 +111,12 @@ impl Default for ControlLimits {
 #[derive(Debug, Clone)]
 pub struct ControlOptions {
     pub consensus: focal_consensus::NodeConfig,
+    /// The genesis of a group founded on a sealed image this replica does
+    /// not hold (a seated member of a split destination, 24 §13): the
+    /// replica opens with the group's identity and no state, its state
+    /// comes by snapshot, and it applies no entry before one — the founder
+    /// compacted at founding, so none is ever sent.
+    pub founded_elsewhere: Option<[u8; 32]>,
     pub limits: ControlLimits,
     pub root: RootConfig,
     pub partition: PartitionConfig,
@@ -122,6 +128,7 @@ impl ControlOptions {
     pub fn new(consensus: focal_consensus::NodeConfig) -> Self {
         Self {
             consensus,
+            founded_elsewhere: None,
             limits: ControlLimits::default(),
             root: RootConfig::default(),
             partition: PartitionConfig::default(),

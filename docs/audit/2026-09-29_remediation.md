@@ -473,7 +473,58 @@ from its first entry onto an empty state (the founder's log begins *after* the i
 the founder of a split destination checkpoints at founding, so its first retained entry
 follows the image and every later member is brought up by snapshot — the schedules of
 batch 3 show the snapshot path holds for a member with an empty log — and a member's open
-for a split destination serves nothing before a snapshot has installed. A
+for a split destination serves nothing before a snapshot has installed. **Built (batch 6,
+2026-10-02):** `ControlOptions::founded_elsewhere` carries the genesis of a group founded
+on an image this replica does not hold — the identity is the grant's, the state comes by
+snapshot, and an entry from the log's beginning reaching the empty replica is a stated
+corruption, never a state to build on; a group founded here on an image compacts before
+it admits its first member (in the leader's own submit of the admission — a tick's
+opportunistic compaction raced the admission once and the member's fence stopped its
+owner, as it should) and at founding where a quiet tick allows, so no member is ever
+sent the image's prefix;
+`PartitionPlan::split_member` derives a seated member's plan from the root's grant
+(`genesis`) and the delegation's fence (`destination_ready`), the hosted record keeps both
+(schema 3), and `host_seated_partition` seats members of every partition the root grants
+them. The in-process split test seats a host joined after the split in the destination's
+group: it comes up by snapshot — its state shows the session it never replayed — is
+promoted, votes through the merge, and its seat goes with the merged-away group. Seating
+it found the merge: the split driver signed each group's delegation fence "as the single
+voter of each (partition groups live on the founder)", so a two-voter source's fence
+carried one signature of two, the root refused the merge, and the agent replanned
+forever. A fence is a partition group's fact now (`SessionFact::Delegation`, signed by a
+node that hosts the group through `prepare_delegation_proof`), and `delegation_proofs`
+collects a majority of each group's installed voters over `SessionSign` — the member
+votes in the merge. And after it: the root's merge drops the merged-away partition's
+delegation and keeps its group's grant, so the member's seat watch — which asked only
+whether the grant seats the node — kept its replica of a dead group running — and a seat
+that ends with the delegation would be too early, since the destination's absorb still
+needs the source group's majority (so taught the next run: the member gone, the
+founder's own replica of the group had no leader and the absorb's proof no quorum).
+The root releases the absorbed source's group once the destination caught up
+(`AuthorityOperation::ReleaseGroup`, intended by the root's leader in the reshape pass),
+its grant and every seat go with it, the member's seat watch ends on the grant as before,
+and a seat that ended forgets its hosted record (a restart would otherwise reopen the
+replica and wait on a permit never given). The release's first form read a split's fence
+— the same shape, source and destination — as a merge's and intended releasing the
+*first partition's* group two hundred times (refused, which the split test's load step
+then never passed); a merge is told from a split by the source: merged away, the root
+delegates it no longer. Three more from the runs that followed: the leader's compaction
+before an admission *begins* a checkpoint that completes as it becomes durable, so the
+floor still stood at zero when the admission went on and the member's fence stopped it
+again — the admission is refused `not_ready` until the floor stands, and asked again; the
+member's seat watch read an authority not yet observable as "unseated" and stopped a
+fresh member's replica — undecided decides nothing, a group the authority no longer holds
+ends the seat; and a hosted drive that ended well (its seat gone, as a release intends)
+ended the whole node's service — only a failed drive does; and the seat's own stop ends
+the replica's egress and its authority refresh as well, either of which the drive could
+see before the seat's word, reporting a legitimate end as "egress ended" — once the seat
+says it is ending, theirs is its end, and the seat's word is waited for. And before it, the reason the merge had stalled intermittently:
+once the member was promoted the upper group's leadership could move to it, and the
+reshaper's seal of the upper partition — journaled by the founder as a remote intent —
+was refused at the member's placement-control ingress, where a seal is not a node's own
+fact; the seal is the group's own change and is made where the group leads: the founder,
+a voter of the group, asks for its leadership first (the transfer a follower may ask for
+itself) and seals on the next pass. A
 partition membership change is submitted to the node the operator runs apply on,
 which must lead the group (the founder by default); a leader elsewhere refuses
 `not_leader` and the apply reports it — **closed (batch 5, 2026-10-02)**: an
@@ -561,7 +612,22 @@ and CLI deployment applies ran out again — at 360 s and 300 s, where they take
 committed: the allowance is not the cause; the session's placement on that runner is,
 at ten times the local time. The three journeys now print the placement and the
 founder's health when an apply is not complete, so the next run names the phase it
-stands in (open). The issuer's survival
+stands in (open). **CI of 6956bf2:** macOS the same two applies; Windows (push run) — the
+job ended with its A1 product-gate step unfinished after nine green steps: the step began
+at 17:33 and the job ended at 18:32 (the same step took 13.5 min on the green run of
+c028c87 an hour before), and the runner lost the job's log with the cut-off — a hang in
+the A1 CLI gate on Windows, an unbounded wait to find; the diff between the two runs is
+a test's lifetime constant, so the hang is not its doing. The step is a release build and
+`cli_native_a1` on the shipped binary; `windows.yml` sets the job no time limit, so the
+end at 77 minutes was the runner's. The next Windows run is the evidence (open). **CI of 364e3a4:** Windows green on both runs — the A1 hang did not
+recur; the two macOS deployment applies passed this run, so their stall is intermittent
+(the dumps stand for the next time); macOS found two more: the nodes journey read the
+founder's partition configuration right after the actor's change committed — the
+founder's replica follows the group now, and its view is what it applied, a moment
+behind — so the journey waits on the fact, bounded; and the managed fleet test's isolated
+leader answered a lookup `OutcomeUnknown` where `Unavailable` was expected — a read has
+no outcome to be unknown; the category is wrong at its source (open; seen once before on
+macOS, 2026-10-02, never locally). The issuer's survival
 is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone until
 then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands until
 both.
