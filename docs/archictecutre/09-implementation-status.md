@@ -12849,3 +12849,17 @@ its level from genesis. Measured under the forty-five-second test lifetime:
 activation within a second of the staging, the genesis issuer retired within
 two lifetimes, a chain of three certificates (about 1.6 KiB).
 
+### 2026-10-02 — a session plan is answered by its commit
+
+The macOS run of the drain journey waited three minutes on an activation that
+was never pending: `cluster sessions plan` had answered `planned` before the
+plan's intent was journaled, the request was already off the agent's queue,
+and the partition then refused the intent (its observation had gone stale),
+so the plan was lost while the operator was told it was under way — and the
+refusal's trace was cleared by the next commit of any kind. A plan is now
+answered by the intent's outcome ([24](24-placement-execution-and-fleet-control.md)
+§16): `planned` once it committed and the directory pends it, `compare_failed`
+when the partition refused it, so the operator plans again on the next
+observation; a request whose partition has an intent pending waits for it;
+a refusal stays visible until a commit of the same kind.
+

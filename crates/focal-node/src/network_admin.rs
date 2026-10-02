@@ -1839,17 +1839,35 @@ impl LocalNetworkAdmin {
             .as_ref()
             .ok_or(AccessError::Unavailable)?
             .plan_session(ledger, durability, dry_run)
-            .await
-            .map_err(|error| {
+            .await;
+        // A plan the partition refused — the observation it was made on
+        // went stale — is answered by name (24 §16): the operator replans.
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(crate::placement_agent::AgentError::Control(
+                ControlFailure::CompareFailed | ControlFailure::Rejected,
+            )) => {
+                return encode_reply(&SessionPlannedReply {
+                    schema: SESSION_PLANNED_REPLY_SCHEMA,
+                    tenant,
+                    session,
+                    operation: [0; 16],
+                    voters: Vec::new(),
+                    state: 3,
+                    dry_run,
+                });
+            }
+            Err(error) => {
                 use crate::placement_agent::AgentError;
-                match error {
+                return Err(match error {
                     AgentError::Capacity => AccessError::Capacity,
                     AgentError::Registration(_) | AgentError::Identity => {
                         AccessError::InvalidRequest
                     }
                     _ => AccessError::Unavailable,
-                }
-            })?;
+                });
+            }
+        };
         encode_reply(&SessionPlannedReply {
             schema: SESSION_PLANNED_REPLY_SCHEMA,
             tenant,

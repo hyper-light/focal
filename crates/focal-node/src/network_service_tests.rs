@@ -30,6 +30,9 @@ pub(crate) struct Running {
     pub(crate) data: DataService,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<ServiceStopped, ServiceError>>,
+    /// How the service ended, once it has, for a wait that failed to say
+    /// why: a service that ended is what every handle's `Unavailable` means.
+    ended: tokio::sync::watch::Receiver<Option<String>>,
 }
 impl Running {
     pub(crate) async fn start(settings: &TestSettings) -> Self {
@@ -41,8 +44,9 @@ impl Running {
         let (stop, receive) = oneshot::channel();
         let (ready, status) = oneshot::channel();
         let mut ready = Some(ready);
+        let (ended_send, ended) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
-            service
+            let outcome = service
                 .run_until(
                     async {
                         let _ = receive.await;
@@ -55,7 +59,9 @@ impl Running {
                         Ok(())
                     },
                 )
-                .await
+                .await;
+            let _ = ended_send.send(Some(format!("{outcome:?}")));
+            outcome
         });
         let mut task = task;
         let status = match tokio::time::timeout(Duration::from_secs(START_ALLOWANCE), status)
@@ -74,7 +80,13 @@ impl Running {
             data,
             stop: Some(stop),
             task,
+            ended,
         }
+    }
+    /// How the service ended, if it has: the word a failed wait prints
+    /// beside what its handles answered.
+    pub(crate) fn ended(&self) -> Option<String> {
+        self.ended.borrow().clone()
     }
     /// Stop and report how the service ended, without unwrapping.
     pub(crate) async fn outcome(mut self) -> Result<(), ServiceError> {
@@ -145,7 +157,13 @@ pub(crate) async fn until<T>(
 ) -> T {
     match try_until(services, allowance, poll).await {
         Ok(value) => value,
-        Err(spent) => panic!("never reached: {what}: {spent}"),
+        Err(spent) => panic!(
+            "never reached: {what}: {spent}; services ended {:?}",
+            services
+                .iter()
+                .map(|service| service.ended())
+                .collect::<Vec<_>>()
+        ),
     }
 }
 /// [`until`], for a caller that reports what it observed when the wait is

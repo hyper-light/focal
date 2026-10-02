@@ -523,7 +523,25 @@ then passed three times alone (26 s, 17 s, 18 s) and once in the whole node libr
 tests, four threads); in one full-library run before that it ran out of an owner budget
 at a partition wait, and the drain-leader journey run right after it ran out of its heal
 budget (3031 periods) — both green when run again alone; which step each stood in is what
-the next such run must print (open: intermittent under a loaded machine). And before it, the reason the merge had stalled intermittently:
+the next such run must print (open: intermittent under a loaded machine). The push's CI
+(388ab2d) printed both again: Linux ran out of the member's wait ("member brought up by
+snapshot … agent Unavailable; state None": the member's service had ended — the test
+harness now records how a service ended and every spent wait prints it, since the
+storage keeps no entry behind a snapshot and the "entry below the floor" reading cannot
+be it), and macOS ran out of the drain journey's activation wait (the plan answered
+`planned`, the founder's agent held eleven partition intents with no error, and the
+directory never showed the session pending — the apply stall the deployment journeys
+had shown intermittently, now with its dump). The stall's cause, read from the agent: a plan
+request was answered `planned` *before* its intent was journaled and after the request had
+been taken off the queue, so an intent the partition refused (`CompareFailed`: the
+observation it was planned on went stale between the planning and the commit) was lost
+with the operator told it was under way — and the refusal's trace was cleared by the next
+commit of any kind. Now a plan's waiters are answered by the intent's outcome (`planned`
+on the commit, the refusal by name — `compare_failed` — on a refusal, so the operator
+plans again), a request whose partition has an intent pending is held to the next
+observation, dry runs are answered at once, and a refusal stays visible until a commit of
+the same kind (`answer_plan_outcome`, `note_intent`; the drain journey plans again on
+`compare_failed`). The member's service end is the next batch's. And before it, the reason the merge had stalled intermittently:
 once the member was promoted the upper group's leadership could move to it, and the
 reshaper's seal of the upper partition — journaled by the founder as a remote intent —
 was refused at the member's placement-control ingress, where a seal is not a node's own

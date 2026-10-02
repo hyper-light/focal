@@ -409,6 +409,9 @@ pub struct PlacementAgent {
     /// The last intent the owner refused before admission, by kind and
     /// failure, cleared by the next intent that commits (24 §7).
     last_refusal: Option<String>,
+    /// The kind of intent `last_refusal` is about: a commit of another kind
+    /// does not clear it.
+    last_refusal_kind: Option<&'static str>,
     /// Where each session's log was last found to lead, from a leader's
     /// redirect, for sessions this node drives without leading (24 §9).
     session_leaders: BTreeMap<LedgerId, u64>,
@@ -538,6 +541,7 @@ impl PlacementAgent {
             last_ready: None,
             last_error: None,
             last_refusal: None,
+            last_refusal_kind: None,
             session_leaders: BTreeMap::new(),
             ticks: 0,
             last_observed: Vec::new(),
@@ -876,11 +880,13 @@ impl PlacementAgent {
                 .ok_or(AgentError::Identity)?;
             if let Some(pending) = journal.pending() {
                 let kind = intent_kind(&pending.command);
+                let planned = planned_session_of(&pending.command);
                 let submit = |request: ControlRequest| {
                     submit_partition(&access, pool, namespace, partition_peer.clone(), request)
                 };
                 let outcome = journal.advance(&handles.control, submit).await?;
                 self.note_intent(kind, &outcome);
+                self.answer_plan_outcome(planned, &outcome);
                 return Ok(AgentStep::Advanced);
             }
             if let Some((snapshot, installed)) = self
@@ -2278,21 +2284,70 @@ impl PlacementAgent {
                     )),
                 }
             };
-        let (_, waiters) = self
-            .plan_requests
-            .remove(&descriptor.ledger)
-            .ok_or(AgentError::Identity)?;
         match outcome {
-            Ok((planned, command)) => {
+            // A fact the directory already states, or a dry run: answered
+            // now. A plan to commit is journaled first, and its waiters are
+            // answered by the intent's outcome (`answer_plan_outcome`); a
+            // partition with an intent still pending is asked again at the
+            // next observation, with the request kept.
+            Ok((planned, Some(command))) => {
+                let partition = self.current_partition.ok_or(AgentError::Identity)?;
+                if self
+                    .journals
+                    .as_ref()
+                    .and_then(|journals| journals.partitions.get(&partition))
+                    .is_some_and(|journal| journal.pending().is_some())
+                {
+                    return Ok(None);
+                }
+                let (durability, waiters) = self
+                    .plan_requests
+                    .remove(&descriptor.ledger)
+                    .ok_or(AgentError::Identity)?;
+                let mut waiting = Vec::new();
+                waiting
+                    .try_reserve(waiters.len())
+                    .map_err(|_| AgentError::Capacity)?;
+                for (waiter, dry_run) in waiters {
+                    if dry_run {
+                        let _ = waiter.send(Ok(planned.clone()));
+                    } else {
+                        waiting.push((waiter, dry_run));
+                    }
+                }
+                if !waiting.is_empty() {
+                    self.plan_requests
+                        .insert(descriptor.ledger, (durability, waiting));
+                }
+                match self.intend_partition(handles, command).await {
+                    Ok(step) => Ok(Some(step)),
+                    Err(error) => {
+                        // Not journaled: the waiters hear it, and the
+                        // request is gone with them.
+                        if let Some((_, waiters)) = self.plan_requests.remove(&descriptor.ledger) {
+                            for (waiter, _) in waiters {
+                                let _ = waiter.send(Err(AgentError::Identity));
+                            }
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Ok((planned, None)) => {
+                let (_, waiters) = self
+                    .plan_requests
+                    .remove(&descriptor.ledger)
+                    .ok_or(AgentError::Identity)?;
                 for (waiter, _) in waiters {
                     let _ = waiter.send(Ok(planned.clone()));
                 }
-                match command {
-                    Some(command) => self.intend_partition(handles, command).await.map(Some),
-                    None => Ok(None),
-                }
+                Ok(None)
             }
             Err(error) => {
+                let (_, waiters) = self
+                    .plan_requests
+                    .remove(&descriptor.ledger)
+                    .ok_or(AgentError::Identity)?;
                 for (waiter, _) in waiters {
                     let _ = waiter.send(Err(AgentError::Registration(
                         SessionRegistrationError::PolicyUnsatisfied,
@@ -3178,11 +3233,40 @@ impl PlacementAgent {
     ) {
         use crate::placement_journal::IntentOutcome;
         match outcome {
-            IntentOutcome::Committed(_) => self.last_refusal = None,
+            IntentOutcome::Committed(_) if self.last_refusal_kind == Some(kind) => {
+                self.last_refusal = None;
+                self.last_refusal_kind = None;
+            }
+            IntentOutcome::Committed(_) => {}
             IntentOutcome::Refused(failure) => {
                 self.last_refusal = Some(format!("{kind}: {failure}"));
+                self.last_refusal_kind = Some(kind);
             }
             IntentOutcome::Retry => {}
+        }
+    }
+    /// Answer the operators waiting on a session plan by the intent's
+    /// outcome (24 §16): `planned` once the plan committed — the directory
+    /// pends it now — and the refusal itself when the partition refused it
+    /// (an observation gone stale), so an operator told `planned` is never
+    /// left waiting on a plan that was lost.
+    fn answer_plan_outcome(
+        &mut self,
+        planned: Option<(LedgerId, focal_directory::OperationId, Vec<u64>)>,
+        outcome: &crate::placement_journal::IntentOutcome,
+    ) {
+        let Some(planned) = planned else {
+            return;
+        };
+        if plan_answer(&planned, outcome).is_none() {
+            return;
+        }
+        if let Some((_, waiters)) = self.plan_requests.remove(&planned.0) {
+            for (waiter, _) in waiters {
+                if let Some(answer) = plan_answer(&planned, outcome) {
+                    let _ = waiter.send(answer);
+                }
+            }
         }
     }
     pub fn node(&self) -> u64 {
@@ -3287,6 +3371,51 @@ pub mod split;
 pub(crate) mod tests;
 
 /// A bounded name for an intent's command, for diagnostics.
+/// What a session plan's waiters hear from its intent's outcome (24 §16):
+/// `planned` once it committed — the directory pends it from that commit —
+/// the refusal itself when the partition refused it, and nothing while it
+/// is still retried.
+fn plan_answer(
+    planned: &(LedgerId, focal_directory::OperationId, Vec<u64>),
+    outcome: &crate::placement_journal::IntentOutcome,
+) -> Option<Result<PlannedSession, AgentError>> {
+    use crate::placement_journal::IntentOutcome;
+    let (ledger, operation, voters) = planned;
+    match outcome {
+        IntentOutcome::Committed(_) => Some(Ok(PlannedSession {
+            ledger: *ledger,
+            operation: *operation,
+            voters: voters.clone(),
+            state: PlanState::Planned,
+        })),
+        IntentOutcome::Refused(failure) => Some(Err(AgentError::Control(*failure))),
+        IntentOutcome::Retry => None,
+    }
+}
+/// The session plan a journaled intent carries, if it is one: whose
+/// waiters its outcome answers (`answer_plan_outcome`).
+fn planned_session_of(
+    command: &ControlCommand,
+) -> Option<(LedgerId, focal_directory::OperationId, Vec<u64>)> {
+    let ControlCommand::VerifiedPartition(command) = command else {
+        return None;
+    };
+    let PartitionOperation::Session {
+        ledger,
+        change: SessionChange::Plan {
+            operation, desired, ..
+        },
+        ..
+    } = &command.command.operation
+    else {
+        return None;
+    };
+    Some((
+        *ledger,
+        *operation,
+        desired.placement.voters.keys().copied().collect(),
+    ))
+}
 fn intent_kind(command: &ControlCommand) -> &'static str {
     match command {
         ControlCommand::Root(_) => "root",

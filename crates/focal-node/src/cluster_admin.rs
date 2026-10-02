@@ -1883,6 +1883,11 @@ impl ClusterAdmin {
         let reply = self
             .plan_session_reply(tenant, session, survive_code, max_failures, dry_run)
             .await?;
+        // The partition refused the plan: its observation went stale between
+        // the planning and the commit. The operator plans again (24 §16).
+        if reply.state == 3 {
+            return Err(ClusterAdminError::Control(ControlFailure::CompareFailed));
+        }
         Ok(AdminResult::SessionPlanned {
             tenant: focal_model::TenantId(reply.tenant).to_string(),
             session: focal_model::SessionId(reply.session).to_string(),

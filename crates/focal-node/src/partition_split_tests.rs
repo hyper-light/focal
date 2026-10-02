@@ -148,7 +148,8 @@ async fn wait_partition(
         Err(spent) => {
             let status = running.handles.placement.status().await;
             panic!(
-                "partition never reached: {what}: {spent}; agent {:?}; state {:?}",
+                "partition never reached: {what}: {spent}; service ended {:?}; agent {:?}; state {:?}",
+                running.ended(),
                 status.map(|status| (
                     status.last_error,
                     status.root_intents,

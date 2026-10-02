@@ -306,7 +306,8 @@ pub struct PlannedPartition {
 /// How a plan request was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanState {
-    /// A plan under the requested durability was journaled for the partition.
+    /// A plan under the requested durability committed: the directory pends
+    /// it, and the controller executes it from here.
     Planned,
     /// The session already has a pending plan; this is it.
     Pending,

@@ -1562,3 +1562,46 @@ fn a_death_stands_for_one_election_window_of_the_group() {
     assert_eq!(retirement_hold(ms(100), 0), 1);
     assert_eq!(retirement_hold(Duration::MAX, u64::MAX), i64::MAX);
 }
+
+/// A session plan's waiters hear the intent's outcome, not its journaling
+/// (24 §16): `planned` once it committed, the partition's refusal by name,
+/// and nothing while the intent is still retried — so an operator told
+/// `planned` is never waiting on a plan the partition refused.
+#[test]
+fn a_plan_is_answered_by_its_commit_or_its_refusal_and_not_before() {
+    use crate::placement_journal::IntentOutcome;
+    let ledger = LedgerId {
+        tenant: focal_model::TenantId([3; 16]),
+        session: focal_model::SessionId([4; 16]),
+    };
+    let planned = (ledger, OperationId([5; 16]), vec![7, 8, 9]);
+    let receipt = focal_control::ControlReceipt {
+        request: ControlRequestId {
+            client: [1; 16],
+            sequence: 1,
+        },
+        request_hash: [2; 32],
+        committed_index: 10,
+        committed_term: 1,
+        revisions: focal_control::ControlRevisions::default(),
+    };
+    match plan_answer(&planned, &IntentOutcome::Committed(receipt)) {
+        Some(Ok(answer)) => {
+            assert_eq!(answer.ledger, ledger);
+            assert_eq!(answer.operation, OperationId([5; 16]));
+            assert_eq!(answer.voters, vec![7, 8, 9]);
+            assert_eq!(answer.state, PlanState::Planned);
+        }
+        other => panic!("a committed plan is planned: {other:?}"),
+    }
+    assert!(matches!(
+        plan_answer(
+            &planned,
+            &IntentOutcome::Refused(focal_control::ControlFailure::CompareFailed)
+        ),
+        Some(Err(AgentError::Control(
+            focal_control::ControlFailure::CompareFailed
+        )))
+    ));
+    assert!(plan_answer(&planned, &IntentOutcome::Retry).is_none());
+}

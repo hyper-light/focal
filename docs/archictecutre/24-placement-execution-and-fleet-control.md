@@ -1294,8 +1294,17 @@ active placement whose policy already carries the durability and still
 verifies against the live registry is `satisfied`; otherwise the planner
 (`propose_placement`) picks live, eligible nodes under the active policy
 with the requested durability, the agent journals `SessionChange::Plan` for
-the partition (`planned`), and the controller executes it unattended as it
-executes every plan ([§9](#9-the-controller)). The plan's identity derives
+the partition and answers `planned` once it committed — the directory pends
+it from that commit, and the controller executes it unattended as it
+executes every plan ([§9](#9-the-controller)). A plan the partition refused
+(`CompareFailed`: the observation it was planned on went stale between the
+planning and the commit) is answered by name, `compare_failed`, and the
+operator plans again on the next observation; until 2026-10-02 the request
+was answered `planned` before the intent was journaled, so a refused plan
+was lost with the operator told it was under way — the macOS run of the
+drain journey waited three minutes on an activation that was never pending.
+A request whose partition has an intent still pending is held, with its
+waiters, to the next observation. The plan's identity derives
 from the session, its authority record and the requested durability
 (`focal.placement.request.v1`), so a retry names the same plan, and a
 request under a different durability replaces a queued one. Requests wait

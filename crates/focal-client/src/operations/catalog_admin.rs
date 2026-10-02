@@ -1125,7 +1125,7 @@ const CLUSTER_SESSIONS_CREATE: OperationDescriptor = OperationDescriptor {
 const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     name: "cluster.sessions.plan",
     version: 2,
-    description: "Plan a session's placement under a requested durability (survive node, zone or region with up to N failures): the planner picks live, eligible nodes from the committed directory and the controller executes the plan unattended (install, catch up, promote, cut over, activate). The reply names the plan: planned, pending when one is already under way, or satisfied when the active placement already provides it. With dry_run the same plan is reported without being journaled, so nothing changes. Exact on retry.",
+    description: "Plan a session's placement under a requested durability (survive node, zone or region with up to N failures): the planner picks live, eligible nodes from the committed directory and the controller executes the plan unattended (install, catch up, promote, cut over, activate). The reply names the plan once it committed: planned, pending when one is already under way, or satisfied when the active placement already provides it; a plan the partition refused (planned on an observation that went stale) is compare_failed, and the caller plans again. With dry_run the same plan is reported without being journaled, so nothing changes. Exact on retry.",
     capability: Capability::Node,
     mutation: true,
     destructive: false,

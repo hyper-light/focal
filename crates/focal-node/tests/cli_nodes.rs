@@ -338,7 +338,10 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let tenant = registered["tenant"].as_str().unwrap().to_owned();
     let ledger = registered["session"].as_str().unwrap().to_owned();
     // One tolerated node loss: three of the four hosts become voters.
-    let planned = success(
+    // A plan is answered once it committed; one the partition refused —
+    // planned on an observation that went stale — is answered
+    // `compare_failed`, and the operator plans again (24 §16).
+    let planned = plan_until_planned(
         founder,
         &[
             "cluster",
@@ -351,8 +354,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
             "--max-failures",
             "1",
         ],
-    )["result"]
-        .clone();
+    );
     assert_eq!(planned["state"], "planned");
     let view = wait_for(founder, "activation", Duration::from_secs(180), |view| {
         settled(view, &all, 1)
@@ -732,6 +734,21 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         "{again}"
     );
     drop(servers);
+}
+/// A plan refused as `compare_failed` was made on an observation that went
+/// stale; the operator plans again, on the next.
+fn plan_until_planned(founder: &Path, args: &[&str]) -> Value {
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
+    loop {
+        let output = command(founder, args);
+        if output.status.success() {
+            return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("[compare_failed]"), "{stderr}");
+        assert!(deadline.open(), "the plan stayed refused: {stderr}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 /// Removal waits for the retiring copies to leave the directory; until
 /// then it is refused as holding.
