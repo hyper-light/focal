@@ -12805,3 +12805,6 @@ admitting a sender's local client in its decoder but not in its `Submit` and `Re
 checks; and `nodes remove` reading a placement not yet observed as an unknown node.
 Node health now shows what a hosted partition's authority refresh last installed and
 why it last refused, and `drain_pending` names the generations and the group's leader.
+The Windows run of the day found the short-lifetime renewal test committing a lifetime
+(12 s) shorter than the start the harness allows a node (15 s): the lifetime is derived
+— three start allowances — and the test's bounds are multiples of it.

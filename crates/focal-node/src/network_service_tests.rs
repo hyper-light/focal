@@ -19,6 +19,10 @@ fn network_service_requires_runtime_before_starting_physical_owners() {
     assert!(!directory.path().join("IDENTITY").exists());
 }
 
+/// The allowance a starting node has to report ready, in seconds: what a
+/// test that commits a credential lifetime derives the lifetime from, since
+/// a host's credential, issued at its join, must outlive its start.
+pub(crate) const START_ALLOWANCE: u64 = 15;
 pub(crate) struct Running {
     pub(crate) handles: NetworkHandles,
     pub(crate) status: NetworkServiceStatus,
@@ -54,7 +58,7 @@ impl Running {
                 .await
         });
         let mut task = task;
-        let status = match tokio::time::timeout(Duration::from_secs(15), status)
+        let status = match tokio::time::timeout(Duration::from_secs(START_ALLOWANCE), status)
             .await
             .expect("service did not publish startup status")
         {

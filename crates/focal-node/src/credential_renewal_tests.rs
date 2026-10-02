@@ -4,7 +4,7 @@ use crate::{
     network_bootstrap::{NetworkError, signer_principal, unix_time},
     network_service::{
         ServiceError,
-        tests::{Running, TestSettings, settings, try_until, until},
+        tests::{Running, START_ALLOWANCE, TestSettings, settings, try_until, until},
     },
     placement_agent::tests::join_peer,
 };
@@ -478,8 +478,12 @@ async fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_
 }
 
 /// A lifetime short enough for the test to watch a credential renew itself
-/// twice: its window is four seconds, so a renewal has that long to commit.
-const SHORT_LIFETIME: u64 = 12;
+/// twice, and long enough that a start the harness allows a node fits in
+/// its first two thirds: three start allowances, the last third its
+/// renewal window (`START_ALLOWANCE` seconds). Until 2026-10-02 it was 12 s,
+/// less than the start allowance, and a Windows runner's late joiner opened
+/// to a credential that had expired between its join and its start.
+const SHORT_LIFETIME: u64 = 3 * START_ALLOWANCE;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_late_joiner() {
@@ -520,12 +524,16 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
     let joined = peer.handles.credentials.current().await.unwrap();
     assert_eq!(joined.expires_at - joined.issued_at, SHORT_LIFETIME as i64);
     // Each renews itself in the last third of its lifetime, twice over,
-    // without being asked.
-    let renewed = try_until(&[&founder, &peer], Duration::from_secs(60), async || {
-        let founder = founder.handles.credentials.current().await.ok()?;
-        let peer = peer.handles.credentials.current().await.ok()?;
-        (founder.renewals >= 2 && peer.renewals >= 2).then_some((founder, peer))
-    })
+    // without being asked: two renewals within two lifetimes.
+    let renewed = try_until(
+        &[&founder, &peer],
+        Duration::from_secs(2 * SHORT_LIFETIME),
+        async || {
+            let founder = founder.handles.credentials.current().await.ok()?;
+            let peer = peer.handles.credentials.current().await.ok()?;
+            (founder.renewals >= 2 && peer.renewals >= 2).then_some((founder, peer))
+        },
+    )
     .await;
     let (founder_renewed, peer_renewed) = match renewed {
         Ok(renewed) => renewed,
@@ -576,7 +584,7 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
     let succeeded = until(
         "the bootstrap server certificate succeeds itself",
         &[&founder, &peer],
-        Duration::from_secs(60),
+        Duration::from_secs(SHORT_LIFETIME),
         async || {
             let registry = root_registry(&founder, founder_dir.path()).await;
             (registry.bootstrap().current.fingerprint != genesis_bootstrap.fingerprint)
@@ -594,7 +602,7 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
     let peer_after = until(
         "the host renews through the succeeded bootstrap server certificate",
         &[&founder, &peer],
-        Duration::from_secs(30),
+        Duration::from_secs(SHORT_LIFETIME),
         async || match peer.handles.credentials.renew().await {
             Ok(renewed) => Some(renewed),
             Err(_) => {

@@ -532,8 +532,13 @@ open, `Controller(Identity)`: its enrollment receipt had expired (the test commi
 12 s lifetime so two renewals are seen within a minute; on the starved Windows debug
 runner the join-to-open took longer than that, and the controller rightly refuses a
 receipt past its expiry). The lifetime a test commits must exceed the slowest runner's
-join-to-open with the renewals still observable in the bound — sized as its own item
-(open). The issuer's survival
+join-to-open with the renewals still observable in the bound. Derived rather than
+picked: the harness gives a starting node 15 s to report ready (`Running::start`), so a
+lifetime of 12 s let a start the harness allows outlive the credential by construction;
+the lifetime is three times the start allowance (the start fits in the first two thirds,
+the last third is the renewal window) and every observation bound in that test is a
+multiple of the lifetime (two renewals within two lifetimes; a succession within one; a
+renewal through it within one). The issuer's survival
 is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone until
 then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands until
 both.
