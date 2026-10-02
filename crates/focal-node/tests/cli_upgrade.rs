@@ -273,7 +273,12 @@ fn the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_ref
     assert_eq!(code, 5, "{report}");
     assert!(report.contains("[members_behind]"), "{report}");
     // Only the founder raises the fence: a host asking for the level every
-    // node now supports is refused at the founder's authority.
+    // node now supports is refused at the founder's authority. The host
+    // reads the levels from its own view of the root, which must hold the
+    // fact first.
+    wait_for_upgrade(host, "the host sees both at the binary's level", |view| {
+        capability(view, founder_node) == compiled && capability(view, node) == compiled
+    });
     let (code, report) = failure(
         host,
         &["cluster", "upgrade", "activate", "--fence", &compiled_text],
