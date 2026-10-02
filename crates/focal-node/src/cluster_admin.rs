@@ -1613,6 +1613,40 @@ impl ClusterAdmin {
             _ => Err(ClusterAdminError::Invalid),
         }
     }
+    /// An administrator's change is made where the root leads: when this
+    /// node's replica follows and votes, it asks the leader for leadership
+    /// (one transfer message the leader answers by timing this voter into a
+    /// campaign, 27 §5) and waits — bounded — until it leads; a node that
+    /// cannot lead reports who does, for the operator to ask there. Requests
+    /// are never forwarded: a leader cannot bind another node's administrator
+    /// to a client of its retry window (each node's admin principal is
+    /// derived from a key only that node holds).
+    async fn lead_here(&self) -> Result<()> {
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let AdminResult::Membership { leader, voters, .. } =
+                self.read(AdminRead::Membership).await?
+            else {
+                return Err(ClusterAdminError::Invalid);
+            };
+            if leader == self.identity.node {
+                return Ok(());
+            }
+            if !voters.contains(&self.identity.node) {
+                return Err(ControlFailure::NotLeader { leader }.into());
+            }
+            if leader != 0 {
+                match self.transfer(self.identity.node, None).await {
+                    Ok(_) | Err(ClusterAdminError::Control(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        let AdminResult::Membership { leader, .. } = self.read(AdminRead::Membership).await? else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        Err(ControlFailure::NotLeader { leader }.into())
+    }
     async fn drive(&self, journal: &mut PrivateJournal, saved: &mut Saved) -> Result<AdminResult> {
         let latest = saved.latest.as_ref().ok_or(ClusterAdminError::Corrupt)?;
         if let Some(receipt) = latest.receipt {
@@ -1621,6 +1655,7 @@ impl ClusterAdmin {
         if latest.superseded {
             return Err(ClusterAdminError::Expired);
         }
+        self.lead_here().await?;
         let operation = latest.operation;
         let request = latest.request.clone();
         let ControlReply::Committed(receipt) =

@@ -201,7 +201,14 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
             "300",
         ],
     );
-    assert_eq!(applied["result"]["outcome"], "Complete", "{applied}");
+    if applied["result"]["outcome"] != "Complete" {
+        // What the placement and the founder say when an apply runs out of
+        // its allowance (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 300 s).
+        let view = placement(&founder);
+        let health = admin(&founder, &["cluster", "node", "health"]);
+        panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
+    }
     let view = wait_for(
         &founder,
         "node survival",
@@ -291,7 +298,14 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
             "180",
         ],
     );
-    assert_eq!(applied["result"]["outcome"], "Complete", "{applied}");
+    if applied["result"]["outcome"] != "Complete" {
+        // What the placement and the founder say when an apply runs out of
+        // its allowance (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 300 s).
+        let view = placement(&founder);
+        let health = admin(&founder, &["cluster", "node", "health"]);
+        panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
+    }
     let explained = journey.admin(&founder, "explain", &[], &["deployment", "explain"]);
     assert_eq!(explained["committed_revision"], 3, "{explained}");
     // The early plan was made at revision 2; the policy is at 3 now, so it

@@ -953,8 +953,11 @@ epoch say exactly which step is next.
 **Limits.** The first partition's group is seated across hosts by the
 deployment's plan (§15) or by hand (`cluster partitions
 show|add-learner|promote|remove|transfer`, each one exact journaled request
-under `PARTITION.admin`, served by the replica the node hosts when it leads
-the group), and a leaving host's seat is vacated by `cluster nodes remove`
+under `PARTITION.admin`, made where the group leads: a node whose replica
+votes and follows asks for leadership first and waits, bounded, and one that
+cannot lead reports who does — requests are never forwarded, since a leader
+cannot bind another node's administrator to a client of its retry window),
+and a leaving host's seat is vacated by `cluster nodes remove`
 before its root membership (handing the group's leadership on first where
 it led). The groups a split creates stay the founder's alone until a seated
 member can be founded on the sealed image — its genesis is the image's

@@ -136,7 +136,14 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
             "360",
         ],
     );
-    assert_eq!(applied["result"]["outcome"], "Complete", "{applied}");
+    if applied["result"]["outcome"] != "Complete" {
+        // What the placement and the founder say when an apply runs out of
+        // its allowance (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 360 s).
+        let view = placement(&founder);
+        let health = admin(&founder, &["cluster", "node", "health"]);
+        panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
+    }
     let mut voters = ids(&configuration(&founder)["voters"]);
     voters.sort_unstable();
     assert_eq!(voters, expected);

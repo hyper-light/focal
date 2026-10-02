@@ -299,6 +299,44 @@ impl ClusterAdmin {
             partition: hex(&partition),
         })
     }
+    /// An administrator's change is made where the group leads (as the
+    /// root's, `ClusterAdmin::lead_here`): a voter's replica that follows
+    /// asks for leadership and waits, bounded; a node that cannot lead
+    /// reports who does.
+    async fn partition_lead_here(&self, partition: [u8; 16]) -> Result<()> {
+        let node = self.identity.node;
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let current = self.partition_configuration(partition).await?;
+            if current.leader == node {
+                return Ok(());
+            }
+            if !current.configuration.configuration.voters.contains(&node) {
+                return Err(ControlFailure::NotLeader {
+                    leader: current.leader,
+                }
+                .into());
+            }
+            if current.leader != 0 {
+                match self
+                    .partition_transfer(
+                        partition,
+                        node,
+                        Some(current.configuration.configuration_index),
+                    )
+                    .await
+                {
+                    Ok(_) | Err(ClusterAdminError::Control(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        let current = self.partition_configuration(partition).await?;
+        Err(ControlFailure::NotLeader {
+            leader: current.leader,
+        }
+        .into())
+    }
     /// Hand a partition group's leadership away from `leaving`: to this
     /// node when it votes in the group (it may ask to lead itself through
     /// the leader), else to another voter; bounded, as the root's is.
@@ -403,6 +441,7 @@ impl ClusterAdmin {
         if latest.superseded {
             return Err(ClusterAdminError::Expired);
         }
+        self.partition_lead_here(latest.partition).await?;
         let operation = latest.operation;
         let request = latest.request.clone();
         let PartitionAdminReply::Committed {

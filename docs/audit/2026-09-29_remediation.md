@@ -464,10 +464,27 @@ Measurements: see doc 09's entry.
 is the hash of the sealed image it was founded on, which only its founder holds; a
 seated member of such a group needs the image carried to it (the Raft snapshot path
 carries the current state, not the genesis) — `host_seated_partition` hosts the first
-partition's group only, and a split's groups stay the founder's until then. A
+partition's group only, and a split's groups stay the founder's until then. *Design
+(2026-10-02, not yet built):* the root's group grant already carries the destination's
+`genesis` (`BootstrapGroup { grant.genesis }`) and the delegation's fence its image digest
+(`destination_ready`), so a seated member derives its identity and plan from the root
+alone, without the image. What a member must never do is replay the destination's log
+from its first entry onto an empty state (the founder's log begins *after* the image):
+the founder of a split destination checkpoints at founding, so its first retained entry
+follows the image and every later member is brought up by snapshot — the schedules of
+batch 3 show the snapshot path holds for a member with an empty log — and a member's open
+for a split destination serves nothing before a snapshot has installed. A
 partition membership change is submitted to the node the operator runs apply on,
 which must lead the group (the founder by default); a leader elsewhere refuses
-`not_leader` and the apply reports it. **Closed (batch 3, 2026-10-02):** `cluster
+`not_leader` and the apply reports it — **closed (batch 5, 2026-10-02)**: an
+administrator's change is made where the group leads by making the group lead here: a
+node whose replica votes and follows asks the leader for leadership (the transfer a
+follower may ask for itself, batch 3) and waits, bounded, before submitting; a node that
+cannot lead reports who does. Requests are not forwarded: a leader cannot derive another
+node's administrator principal (its issuer is the node's own, random at creation), and
+admitting a claimed client would let a node reach into another administrator's retry
+window; leadership moves instead, for the root (`lead_here`) and the partition groups
+(`partition_lead_here`) alike. **Closed (batch 3, 2026-10-02):** `cluster
 partitions show|add-learner|promote|remove|transfer` drive a partition group's
 membership and leadership by hand (descriptors, MCP tools, the focal-cluster skill);
 `cluster nodes remove` vacates a leaving node's seats in every partition group before
@@ -538,7 +555,13 @@ lifetime of 12 s let a start the harness allows outlive the credential by constr
 the lifetime is three times the start allowance (the start fits in the first two thirds,
 the last third is the renewal window) and every observation bound in that test is a
 multiple of the lifetime (two renewals within two lifetimes; a succession within one; a
-renewal through it within one). The issuer's survival
+renewal through it within one). **CI of c028c87, macOS (both runs):** the control-plane
+and CLI deployment applies ran out again — at 360 s and 300 s, where they take 34 s and
+49 s locally — with the root and the partition group seated and the session step
+committed: the allowance is not the cause; the session's placement on that runner is,
+at ten times the local time. The three journeys now print the placement and the
+founder's health when an apply is not complete, so the next run names the phase it
+stands in (open). The issuer's survival
 is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone until
 then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands until
 both.

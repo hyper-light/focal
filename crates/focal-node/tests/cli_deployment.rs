@@ -513,7 +513,18 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         ],
     )["result"]
         .clone();
-    assert_eq!(applied["outcome"], "Complete", "{applied}");
+    if applied["outcome"] != "Complete" {
+        // What the placement and the hosts say when an apply runs out of
+        // its allowance: the session's plan phase and progress, and each
+        // node's health (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 300 s).
+        let view = placement(founder);
+        let health = command(founder, None, &["cluster", "node", "health"]);
+        panic!(
+            "apply not complete: {applied}\nplacement: {view:?}\nhealth: {}",
+            String::from_utf8_lossy(&health.stdout)
+        );
+    }
     assert_eq!(committed_revision(laptop, Some(&laptop_config)), 2);
     drop(laptop_server);
     // The laptop restarts under its committed policy with the file that
@@ -553,7 +564,18 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         .clone();
     assert_eq!(applied["kind"], "deployment_applied");
     assert_eq!(applied["plan_id"], plan_id);
-    assert_eq!(applied["outcome"], "Complete", "{applied}");
+    if applied["outcome"] != "Complete" {
+        // What the placement and the hosts say when an apply runs out of
+        // its allowance: the session's plan phase and progress, and each
+        // node's health (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 300 s).
+        let view = placement(founder);
+        let health = command(founder, None, &["cluster", "node", "health"]);
+        panic!(
+            "apply not complete: {applied}\nplacement: {view:?}\nhealth: {}",
+            String::from_utf8_lossy(&health.stdout)
+        );
+    }
     let steps = applied["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 4);
     assert_eq!(steps[0]["phase"], "Complete");

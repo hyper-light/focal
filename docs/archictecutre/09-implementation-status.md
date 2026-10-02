@@ -12807,4 +12807,11 @@ Node health now shows what a hosted partition's authority refresh last installed
 why it last refused, and `drain_pending` names the generations and the group's leader.
 The Windows run of the day found the short-lifetime renewal test committing a lifetime
 (12 s) shorter than the start the harness allows a node (15 s): the lifetime is derived
-— three start allowances — and the test's bounds are multiples of it.
+— three start allowances — and the test's bounds are multiples of it. Batch 2's last
+open item but the split destination closed the same day: an administrator's change of
+the root or of a partition group is made where the group leads by making the group lead
+here — a node whose replica votes and follows asks the leader for leadership and waits,
+bounded, before it submits; one that cannot lead reports who does. Requests are never
+forwarded: a leader cannot derive another node's administrator principal (each node's
+issuer is its own), and admitting a claimed client would open another administrator's
+retry window.

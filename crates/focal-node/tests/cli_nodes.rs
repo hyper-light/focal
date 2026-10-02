@@ -247,7 +247,20 @@ fn partition_change(founder: &Path, verb: &str, partition: &str, node: u64) -> V
                 || stderr.contains("[outcome_unknown]"),
             "{verb} of {node}: {stderr}"
         );
-        assert!(deadline.open(), "{verb} of {node} stayed refused: {stderr}");
+        if !deadline.open() {
+            let health = command(founder, &["cluster", "node", "health"]);
+            let shown = command(
+                founder,
+                &["cluster", "partitions", "show", "--partition", partition],
+            );
+            let view = command(founder, &["cluster", "placement"]);
+            panic!(
+                "{verb} of {node} stayed refused: {stderr}\nhealth: {}\nshown: {}\nplacement: {}",
+                String::from_utf8_lossy(&health.stdout),
+                String::from_utf8_lossy(&shown.stdout),
+                String::from_utf8_lossy(&view.stdout),
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -653,6 +666,26 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let final_voters = ids(&session(&view).unwrap()["voters"]);
     assert!(final_voters.contains(&node_d), "{view}");
     assert!(!final_voters.contains(&victim));
+
+    // An administrator's change is made where the partition group leads
+    // (24 §13): from a host whose replica votes and follows — neither the
+    // founder, which leads, nor the drained victim, whose seat is what the
+    // operator vacates by hand — the node takes the group's leadership
+    // first and the change commits there.
+    let before = partition_shown(founder, &partition);
+    let actor = *ids(&before["voters"])
+        .iter()
+        .find(|id| **id != founder_node && **id != victim)
+        .unwrap();
+    let actor_dir = dirs[all.iter().position(|id| *id == actor).unwrap()].path();
+    let led = placement(founder).unwrap();
+    assert_ne!(led["control"]["partitions"][0]["leader"], actor, "{led}");
+    let removed = partition_change(actor_dir, "remove", &partition, victim);
+    assert_eq!(removed["kind"], "committed", "{removed}");
+    let after = partition_shown(founder, &partition);
+    assert!(!ids(&after["voters"]).contains(&victim), "{after}");
+    let view = placement(founder).unwrap();
+    assert_eq!(view["control"]["partitions"][0]["leader"], actor, "{view}");
     drop(servers);
 }
 /// Removal waits for the retiring copies to leave the directory; until
