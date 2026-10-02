@@ -1,7 +1,8 @@
 //! What planning and applying observe: the committed policy and the
 //! directory's sessions as the placement agent reports them.
 use super::plan::{
-    DeploymentIdentity, Observation, ObservedControl, ObservedNode, ObservedSession, SessionEpochs,
+    DeploymentIdentity, Observation, ObservedControl, ObservedNode, ObservedPartition,
+    ObservedSession, SessionEpochs,
 };
 use super::{DeploymentError, GuaranteeLevel, parse_survive};
 use crate::{cluster_admin::ClusterAdmin, config::policy::read_committed};
@@ -37,15 +38,40 @@ pub async fn observe(admin: &ClusterAdmin, network: bool) -> Result<Observation,
     if !nodes.iter().any(|node| node.node == identity.node) {
         return Err(DeploymentError::NotObserved);
     }
-    let control = view.control.as_ref().map(|control| ObservedControl {
-        voters: control.root.voters.clone(),
-        learners: control.root.learners.clone(),
-        configuration_index: control.root.configuration_index,
-        tolerates_node: control.root.tolerates_node,
-        tolerates_zone: control.root.tolerates_zone,
-        tolerates_region: control.root.tolerates_region,
-        blocked_by: control.root.blocked_by.clone(),
-    });
+    let control = match view.control.as_ref() {
+        Some(control) => {
+            let mut partitions = Vec::new();
+            partitions
+                .try_reserve_exact(control.partitions.len())
+                .map_err(|_| DeploymentError::Capacity)?;
+            for group in &control.partitions {
+                let partition = group.partition.as_deref().ok_or(DeploymentError::Corrupt(
+                    "directory view names a partition group without its partition",
+                ))?;
+                partitions.push(ObservedPartition {
+                    partition: id(partition)?,
+                    group: id(&group.group)?,
+                    voters: group.voters.clone(),
+                    learners: group.learners.clone(),
+                    tolerates_node: group.tolerates_node,
+                    tolerates_zone: group.tolerates_zone,
+                    tolerates_region: group.tolerates_region,
+                    blocked_by: group.blocked_by.clone(),
+                });
+            }
+            Some(ObservedControl {
+                voters: control.root.voters.clone(),
+                learners: control.root.learners.clone(),
+                configuration_index: control.root.configuration_index,
+                tolerates_node: control.root.tolerates_node,
+                tolerates_zone: control.root.tolerates_zone,
+                tolerates_region: control.root.tolerates_region,
+                blocked_by: control.root.blocked_by.clone(),
+                partitions,
+            })
+        }
+        None => None,
+    };
     Ok(Observation {
         deployment,
         committed,

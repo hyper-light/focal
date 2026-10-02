@@ -271,7 +271,7 @@ impl PlacementAgent {
     }
 }
 
-fn same_members(applied: &[u64], granted: &BTreeMap<u64, u64>) -> bool {
+pub(super) fn same_members(applied: &[u64], granted: &BTreeMap<u64, u64>) -> bool {
     applied.iter().copied().eq(granted.keys().copied())
 }
 
@@ -812,7 +812,10 @@ impl PlacementAgent {
             expires_at: now.checked_add(PROOF_WINDOW).ok_or(AgentError::Capacity)?,
         })
     }
-    fn root_enrollment_revision(&self, root: &RootObservation) -> Result<u64, AgentError> {
+    pub(super) fn root_enrollment_revision(
+        &self,
+        root: &RootObservation,
+    ) -> Result<u64, AgentError> {
         let ControlBootstrap::Root { enrollment, .. } = &root.snapshot().state else {
             return Err(AgentError::Identity);
         };

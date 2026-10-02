@@ -23,9 +23,11 @@ const DIRECTORY: &str = "CLUSTER.admin";
 const MARKER: &str = "CLUSTER.admin.initialized";
 const LIMIT: usize = 55 * 1024;
 mod mcp;
+mod partitions;
 mod replicas;
 #[cfg(test)]
 mod tests;
+pub use partitions::{PartitionConfiguration, partition_reference};
 
 /// A remove that follows its drain waits this long, in this many polls, for the
 /// placement partition to observe the committed ineligibility.
@@ -1791,6 +1793,14 @@ impl ClusterAdmin {
             || reply.voters.is_empty()
             || reply.voters.len() > 64
             || !matches!(reply.state, 0 | 2)
+            || reply.partitions.len() > crate::deployment::plan::MAX_PARTITIONS
+            || reply.partitions.iter().any(|group| {
+                group.partition == [0; 16]
+                    || group.group == [0; 16]
+                    || group.voters.is_empty()
+                    || group.voters.len() > 64
+                    || !matches!(group.state, 0 | 2 | 3)
+            })
         {
             return Err(ClusterAdminError::Invalid);
         }

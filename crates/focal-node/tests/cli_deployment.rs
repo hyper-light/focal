@@ -298,7 +298,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(plan["requested"]["durability"]["max_failures"], 1);
     assert_eq!(plan["blocked"], serde_json::json!([]));
     let changes = plan["changes"].as_array().unwrap();
-    assert_eq!(changes.len(), 3, "{plan}");
+    assert_eq!(changes.len(), 4, "{plan}");
     assert_eq!(changes[0]["change"], "commit_policy");
     assert_eq!(changes[0]["from_revision"], 1);
     assert_eq!(changes[0]["to_revision"], 2);
@@ -319,13 +319,21 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     };
     assert_eq!(changes[1]["change"], "plan_root");
     assert_eq!(sorted(&changes[1]["voters"]), all, "{plan}");
-    assert_eq!(changes[2]["change"], "plan_session");
-    assert_eq!(changes[2]["tenant"], tenant);
-    assert_eq!(changes[2]["session"], ledger);
-    assert_eq!(changes[2]["pending"], false);
-    assert_eq!(changes[2]["expected_route_epoch"], 1);
-    assert_eq!(sorted(&changes[2]["voters"]), all);
-    let operation = changes[2]["operation"].as_str().unwrap().to_owned();
+    // The directory's partition group is seated after the root and before
+    // the session (F24): a session is routed and placed by both.
+    assert_eq!(changes[2]["change"], "plan_partition", "{plan}");
+    assert_eq!(sorted(&changes[2]["voters"]), all, "{plan}");
+    assert_eq!(
+        changes[2]["partition"], plan["observed"]["control"]["partitions"][0]["partition"],
+        "{plan}"
+    );
+    assert_eq!(changes[3]["change"], "plan_session");
+    assert_eq!(changes[3]["tenant"], tenant);
+    assert_eq!(changes[3]["session"], ledger);
+    assert_eq!(changes[3]["pending"], false);
+    assert_eq!(changes[3]["expected_route_epoch"], 1);
+    assert_eq!(sorted(&changes[3]["voters"]), all);
+    let operation = changes[3]["operation"].as_str().unwrap().to_owned();
     assert_eq!(plan["guarantee"]["before"]["max_failures"], 0);
     assert_eq!(plan["guarantee"]["during"]["max_failures"], 0);
     assert_eq!(plan["guarantee"]["after"]["max_failures"], 1);
@@ -543,12 +551,14 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(applied["plan_id"], plan_id);
     assert_eq!(applied["outcome"], "Complete", "{applied}");
     let steps = applied["steps"].as_array().unwrap();
-    assert_eq!(steps.len(), 3);
+    assert_eq!(steps.len(), 4);
     assert_eq!(steps[0]["phase"], "Complete");
     assert_eq!(steps[1]["phase"], "Complete");
     assert_eq!(steps[1]["change"]["change"], "plan_root");
-    assert_eq!(steps[2]["phase"], "Complete");
-    assert_eq!(steps[2]["operation"], operation);
+    assert_eq!(steps[2]["phase"], "Complete", "{applied}");
+    assert_eq!(steps[2]["change"]["change"], "plan_partition");
+    assert_eq!(steps[3]["phase"], "Complete");
+    assert_eq!(steps[3]["operation"], operation);
     assert_eq!(committed_revision(founder, None), 2);
     // The root's voters are the three, and the view says what they survive.
     let configuration =
@@ -557,7 +567,13 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(sorted(&configuration["voters"]), all, "{configuration}");
     let control = placement(founder).unwrap()["control"].clone();
     assert_eq!(control["root"]["tolerates_node"], 1, "{control}");
-    assert_eq!(control["partitions"][0]["tolerates_node"], 0, "{control}");
+    // The partition group's voters are the three as well, and said to be.
+    assert_eq!(
+        sorted(&control["partitions"][0]["voters"]),
+        all,
+        "{control}"
+    );
+    assert_eq!(control["partitions"][0]["tolerates_node"], 1, "{control}");
     let journal = founder.join("cluster/apply").join(&plan_id);
     assert!(journal.join("JOURNAL").is_file());
     assert_eq!(std::fs::read(journal.join("PLAN")).unwrap(), bytes);
@@ -661,7 +677,19 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         }
         last
     };
-    assert_eq!(explained["condition"], "PlanValid", "{explained}");
+    assert_eq!(
+        explained["condition"],
+        "PlanValid",
+        "{explained}; founder health {}; placement {}; nodes {}; routes {}",
+        String::from_utf8_lossy(&command(founder, None, &["cluster", "node", "health"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["cluster", "placement"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["cluster", "nodes", "list"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["cluster", "node", "metrics"]).stdout)
+            .lines()
+            .filter(|line| line.contains("route") || line.contains("peer"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     assert_eq!(explained["activated"], true, "{explained}");
     assert_eq!(explained["committed_revision"], 2);
     assert_eq!(explained["effective"]["durability"]["max_failures"], 1);

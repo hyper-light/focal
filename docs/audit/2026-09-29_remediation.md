@@ -338,14 +338,128 @@ every member that applied them; it no longer asks who leads. The CLI deployment
 test's founder restart under a three-voter root is the regression (`cli_deployment`,
 line 591 of its journey), beside the control-plane test.
 
-**Open (batch 2).** The directory partition groups: hosted by the founder alone, so
-placement, session creation and membership operations wait for it while the root
-answers from another zone; they are reported as such (`partitions[].tolerates_*` 0).
-The host machinery of a split destination (`HostRequest::Host`, a root permit, a
-sealed image) is what a partition learner on another node generalizes. The issuer's
-survival is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone
-until then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands
-until both.
+**Fix (the partition groups, batch 2, 2026-10-02).** A directory partition group is
+seated like the root, by the same request, and hosted wherever the root's grant seats
+a node. *Who may host.* `PartitionPlan` names its host beside its founder
+(`hosted_by`); the permit (`authorize_first_directory`) admits the host that holds a
+seat in the group's grant — a voter's or a learner's, at or below its generation —
+instead of the founder's single seat, and `validate_destination` accepts a replica
+whose configuration names its host or is still the founder's alone (a learner opened
+before it applied the change that seated it). The directory startup runs on every
+node (`DirectoryStartup::new(node, ..)`): the founder hosts the first partition from
+the start, a member hosts what it is asked to and recorded (`HostRequest::Host { plan,
+image: None }`, hosted-partition record schema 2 naming the host; schema 1 records
+load as the founder's own destinations), and opens its replica with `NodeConfig::
+joining(host, .., [founder])` to catch up from the founder's log. *Who asks.* The
+placement agent, each pass: a node the root's grant seats in the first partition's
+group and that does not host it asks to (`host_seated_partition`); a replica that
+follows submits the node's own partition intents where the group leads
+(`PartitionAccess::Remote { target: leader }`), and a node that hosts nothing reaches
+a voter the failure detector does not hold dead, the founder first (`partition_
+target`). *How the grant follows the log.* The control replica keeps the record of
+the entry that last changed its configuration (`ControlMembershipRecord`: index, term,
+request hash — the entry's own digest for a change made without a request — and the
+configuration; checkpoint schema 8, served by `ControlRead::MembershipRecord` and the
+host's `witness_membership`), so every member attests the same committed record. On
+the partition's leader the agent compares the group's applied configuration with the
+grant and, when they differ, collects the installed voters' signatures over
+`SessionFact::Membership { next, record }` under the directory's namespace — a member
+witnesses from its own replica of the group (`prepare_partition_fact`), the root
+prepares the permit as for a session's group — and intends `ChangeGroup { proof }` on
+the root (`follow_partition_grant`); the root's placement-control ingress admits a
+`ChangeGroup` from whichever node leads the group, the proof being its authority.
+*What the operator asks.* `AdminCommand::PlanControl` plans every partition group by
+the root's rule (`plan_group`: the grant's voters as incumbents, the group's applied
+configuration index from this node's replica or the founder's answer; `ControlPlanned
+Reply` schema 2 carries `partitions[]`, `refused` where no set of nodes seats one);
+the plan composes `Change::PlanPartition { partition, group, voters, expected_
+configuration_index }` after `plan_root` and before the sessions (plan schema 3;
+`ObservedControl.partitions`; the control guarantee is the weakest of the root's and
+every partition group's; a refused partition is `blocked_control` naming it); apply
+admits each planned voter the group does not hold as a learner — no controller admits
+partition learners — then promotes it once it hosts a replica and has caught up, one
+exact `p1:` request each through `AdminCommand::Partition` (`PartitionAdminCommand::
+{Configuration, Change}` → the hosted partition's control host where this node leads
+it; `ClusterAdmin::partition_change`, journaled under `PARTITION.admin` with one
+retry window per group), asked again on `not_ready`, `compare_failed`, `pending` or
+`unavailable` within `--wait`; preflight fences a partition whose group changed or a
+planned voter the directory no longer knows. `cluster placement` reports each
+partition group's leader and applied configuration index from the replicas this node
+hosts (0 where it hosts none), and readiness `control_satisfied` holds the committed
+policy to every control group.
+
+**Found on the way (batch 2).** Three refusals the first three-zone run met, each
+silent until the node's health said so. The root prepared a membership permit for
+a session's group only (`placement_proof::prepare_membership_proof` matched
+`GroupScope::Session`), so a partition group's grant never followed its log; the
+scope check admits both now, the conditions being the same, and
+`placement_proof_tests::a_partition_groups_membership_permit_is_prepared_for_its_
+voter` guards it. The directory handle counted the first partition as hosted on
+every node (`is_hosted`, `host_of`, `host_of_group` answered from the handle's plan,
+which is the first partition's everywhere), so a seated member never asked to host
+it and would not have found its replica once opened; the first partition is hosted
+where a host exists, falling back to the hosted map. And every replica opened
+through the founder's single-voter bootstrap (`permit.open`: a campaign, a barrier
+held alone, the activation and the authority installed as leader), which neither a
+member's replica nor the founder reopening a group that grew past it may do — the
+founder's restart under three partition voters died of it (`directory egress
+ended`), the control plane's own survival test. A group with other members opens by
+recovery alone: the activation and every install are in the log, whichever replica
+leads refreshes the root's authority (the owner answers `unavailable` where it
+follows, and the refresh waits), and a member's replica also watches its seat in the
+root's grant (`watch_seat`), stopping when the seat is gone. Then the founder, restarted into a
+partition it followed, reported Ready only once it led it (the startup wait asked
+`leader == node` of the partition; readiness never requires leadership, F25, and asks
+a known leader now) and, following, asked the group's identity of the founder — itself,
+to which it has no route — on every pass, so it observed nothing and `deployment
+explain` saw no directory (`remote_identity` dials the node the access reaches the
+group at); and once it reached it, its partition intent journal, named by its local
+client while it led, refused to open under the principal it submits as when it
+follows (`placement intent journal is inconsistent with this node`). A node names its
+partition intents by its local client where it leads the partition and by its
+enrolled principal where it follows, so the journal keeps a retry window per client
+(schema 2; a journal with nothing pending adopts the client it is opened with and
+resumes that client's window where it stood, never crossing the owner's retry floor),
+and the root's and the partitions' ingress admit a node's local client beside its
+principal and its root-intent client — all three bound to the node — so an intent
+journaled while it led still resolves through the node that leads now. Node health now lists
+the partitions a node hosts (leader, term, applied index) and those it was asked to
+host and has not opened, with their permit refusals (`partitions`, `partitions_
+pending`), so none of these is silent again; a progress named the founder as a hosted
+replica's node, and names its host. The admin's partition write may outlive the
+admin socket's answer while the partition host takes its turn: `partition_change`
+re-drives a pending request under its exact identity before taking a new one, and
+apply retries `outcome_unknown` within its allowance.
+
+**Tests (batch 2).** `focal-control/tests/membership_control.rs` (the record after
+an admission, the same on a follower, carried by the snapshot a learner catches up
+by, after a promotion, and on both replicas after a restart);
+`control_host::membership_requires_runtime_and_returns_only_committed_configuration_
+receipts` (the record read equals the receipt); `directory_bootstrap::a_host_without_
+a_seat_in_the_partitions_group_is_refused_a_replica_of_it`; `network_directory::
+hosted_records_of_both_schemas_load_and_name_their_host`; `deployment/tests.rs::the_
+partition_groups_are_planned_after_the_root_and_weaken_the_control_promise` (order,
+the weakest-of rule, the artifact, preflight by group and members, a refused
+partition blocks and is named); `cli_deployment` (four changes, four steps, the
+partition's voters and node/1 after apply); real binaries, `deployment_control_plane`
+extended: `plan_partition` names the three after `plan_root`; after apply the
+partition group's three voters tolerate zone/1; with the founder's zone silenced the
+partition is led from another zone and `cluster sessions create` succeeds on host-b.
+Measurements: see doc 09's entry.
+
+**Open after batch 2.** A split destination's replica on another node: its genesis
+is the hash of the sealed image it was founded on, which only its founder holds; a
+seated member of such a group needs the image carried to it (the Raft snapshot path
+carries the current state, not the genesis) — `host_seated_partition` hosts the first
+partition's group only, and a split's groups stay the founder's until then. A
+partition membership change is submitted to the node the operator runs apply on,
+which must lead the group (the founder by default); a leader elsewhere refuses
+`not_leader` and the apply reports it. No hand verb drives a partition group's
+membership yet (the deployment's apply does); `cluster nodes remove` does not yet
+take a removed node out of the partition groups it votes in. The issuer's survival
+is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone until
+then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands until
+both.
 
 ## F27
 

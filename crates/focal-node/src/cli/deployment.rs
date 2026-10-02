@@ -395,16 +395,41 @@ fn plan(
         let survive = deployment::survive_code(requested.durability.survive);
         // The root group first (F24): the voters the durability needs,
         // proposed by the directory's solver and journaled nowhere.
+        let mut partitions = Vec::new();
         let control = if network {
             match admin
                 .plan_control_reply(survive, requested.durability.max_failures)
                 .await
             {
-                Ok(reply) if reply.state == 2 => ControlProposal::Satisfied,
-                Ok(reply) => ControlProposal::Planned {
-                    voters: reply.voters,
-                    configuration_index: reply.configuration_index,
-                },
+                Ok(reply) => {
+                    partitions
+                        .try_reserve_exact(reply.partitions.len())
+                        .map_err(|_| DeploymentError::Capacity)?;
+                    for group in reply.partitions {
+                        partitions.push(deployment::plan::PartitionProposal {
+                            partition: group.partition,
+                            group: group.group,
+                            proposal: match group.state {
+                                2 => ControlProposal::Satisfied,
+                                3 => ControlProposal::Refused(
+                                    "no set of enrolled, live nodes seats the partition group under the requested durability".into(),
+                                ),
+                                _ => ControlProposal::Planned {
+                                    voters: group.voters,
+                                    configuration_index: group.configuration_index,
+                                },
+                            },
+                        });
+                    }
+                    if reply.state == 2 {
+                        ControlProposal::Satisfied
+                    } else {
+                        ControlProposal::Planned {
+                            voters: reply.voters,
+                            configuration_index: reply.configuration_index,
+                        }
+                    }
+                }
                 Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {
                     ControlProposal::Refused(
                         "no set of enrolled, live nodes seats the root group under the requested durability".into(),
@@ -447,11 +472,12 @@ fn plan(
             };
             proposals.push(proposal);
         }
-        deployment::plan::compose(
+        deployment::plan::compose_with_partitions(
             &observation,
             &requested,
             &proposals,
             &control,
+            &partitions,
             deployment::now_ms()?,
         )
     })?;

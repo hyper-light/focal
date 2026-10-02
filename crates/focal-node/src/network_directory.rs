@@ -3,6 +3,9 @@
 //! further control group on the same WAL, bootstrapped from the source's
 //! sealed image under its own root permit, recorded durably so a restart
 //! reopens it, and reached through the same handle by partition or by group.
+//! A member the root seated in a partition's group (the audit's F24) hosts
+//! a replica of it the same way, from the group's genesis, and catches up
+//! from the founder's log as a root learner does.
 use super::*;
 use crate::directory_bootstrap::{DirectoryBootstrapError, PartitionPlan};
 use focal_directory::{Delegation, PartitionCheckpoint, PartitionId};
@@ -13,7 +16,9 @@ use tokio::sync::watch;
 /// Partitions one node hosts besides the first; the owner registry keeps a
 /// slot for each.
 pub const MAX_HOSTED_PARTITIONS: usize = 32;
-const RECORD_SCHEMA: u16 = 1;
+/// Schema 1 recorded a split destination's image; 2 records who hosts and
+/// an image where there is one.
+const RECORD_SCHEMA: u16 = 2;
 const RECORD_DIRECTORY: &str = "cluster/partitions";
 /// Root permits are retried this often while the root is not ready.
 const PERMIT_PAUSE: Duration = Duration::from_millis(250);
@@ -26,11 +31,13 @@ pub struct HostedPartition {
 }
 /// What the placement agent asks of the host manager.
 pub enum HostRequest {
-    /// Host `plan` from the sealed `image` it was planned on; durable before
-    /// any group opens, idempotent while the partition is already hosted.
+    /// Host `plan` from the sealed `image` it was planned on, or from the
+    /// group's genesis where there is none (a seated member's replica);
+    /// durable before any group opens, idempotent while the partition is
+    /// already hosted.
     Host {
         plan: Box<PartitionPlan>,
-        image: Box<PartitionCheckpoint>,
+        image: Option<Box<PartitionCheckpoint>>,
     },
     /// Forget a partition that merged away: its record is removed so a restart
     /// does not reopen it; the sealed group keeps refusing until shutdown.
@@ -43,6 +50,19 @@ struct HostedRecord {
     cluster: [u8; 16],
     founder_node: u64,
     delegation: Delegation,
+    image: Option<PartitionCheckpoint>,
+    /// The node that hosts: the founder for a split destination of its
+    /// own, a seated member otherwise.
+    host: u64,
+}
+/// What schema 1 recorded: a split destination on the founder.
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct HostedRecordV1 {
+    schema: u16,
+    cluster: [u8; 16],
+    founder_node: u64,
+    delegation: Delegation,
     image: PartitionCheckpoint,
 }
 
@@ -51,9 +71,28 @@ pub struct DirectoryHandle {
     plan: PartitionPlan,
     state: watch::Receiver<Option<ControlHost>>,
     hosted: watch::Receiver<BTreeMap<PartitionId, HostedPartition>>,
+    pending: watch::Receiver<BTreeMap<PartitionId, HostingAttempt>>,
     requests: async_mpsc::Sender<HostRequest>,
 }
+/// A partition this node was asked to host and has not opened yet: how
+/// often its permit was asked for and why it was last refused (F24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostingAttempt {
+    pub group: [u8; 16],
+    pub host: u64,
+    pub attempts: u32,
+    pub last_refusal: Option<String>,
+}
 impl DirectoryHandle {
+    /// The partitions whose hosting is under way, with their last refusal.
+    pub fn pending(&self) -> Vec<(PartitionId, HostingAttempt)> {
+        let pending = self.pending.borrow();
+        let mut all = Vec::new();
+        if all.try_reserve_exact(pending.len()).is_ok() {
+            all.extend(pending.iter().map(|(id, attempt)| (*id, attempt.clone())));
+        }
+        all
+    }
     pub fn namespace(&self) -> LedgerId {
         self.plan.namespace()
     }
@@ -69,9 +108,14 @@ impl DirectoryHandle {
     pub fn host(&self) -> Option<ControlHost> {
         self.state.borrow().clone()
     }
+    /// The first partition is the founder's own slot where this node
+    /// founded it, and a hosted replica like any other where a seated
+    /// member opened it (F24).
     pub fn host_of(&self, partition: PartitionId) -> Option<ControlHost> {
-        if partition == self.plan.partition() {
-            return self.host();
+        if partition == self.plan.partition()
+            && let Some(host) = self.host()
+        {
+            return Some(host);
         }
         self.hosted
             .borrow()
@@ -79,8 +123,10 @@ impl DirectoryHandle {
             .map(|hosted| hosted.host.clone())
     }
     pub fn host_of_group(&self, group: [u8; 16]) -> Option<ControlHost> {
-        if group == self.group() {
-            return self.host();
+        if group == self.group()
+            && let Some(host) = self.host()
+        {
+            return Some(host);
         }
         self.hosted
             .borrow()
@@ -106,7 +152,8 @@ impl DirectoryHandle {
         all
     }
     pub fn is_hosted(&self, partition: PartitionId) -> bool {
-        partition == self.plan.partition() || self.hosted.borrow().contains_key(&partition)
+        (partition == self.plan.partition() && self.host().is_some())
+            || self.hosted.borrow().contains_key(&partition)
     }
     pub fn request(&self, request: HostRequest) -> Result<(), DirectoryBootstrapError> {
         self.requests
@@ -120,8 +167,13 @@ impl DirectoryHandle {
 
 pub(super) struct DirectoryStartup {
     plan: PartitionPlan,
+    /// Whether this node founded the first partition: it hosts it from
+    /// the start; a member hosts what the root seats it in, when asked.
+    founder: bool,
+    node: u64,
     state: watch::Sender<Option<ControlHost>>,
     hosted: watch::Sender<BTreeMap<PartitionId, HostedPartition>>,
+    pending: watch::Sender<BTreeMap<PartitionId, HostingAttempt>>,
     requests: async_mpsc::Receiver<HostRequest>,
     wal: SharedWal,
     budget: MemoryBudget,
@@ -129,32 +181,37 @@ pub(super) struct DirectoryStartup {
 }
 impl DirectoryStartup {
     pub(super) fn new(
-        assigned: bool,
+        node: u64,
         cluster: [u8; 16],
         founder: u64,
         wal: SharedWal,
         budget: MemoryBudget,
         root: PathBuf,
-    ) -> Result<(DirectoryHandle, Option<Self>), DirectoryBootstrapError> {
+    ) -> Result<(DirectoryHandle, Self), DirectoryBootstrapError> {
         let plan = PartitionPlan::derive(cluster, founder)?;
         let (state, receiver) = watch::channel(None);
         let (hosted, hosted_receiver) = watch::channel(BTreeMap::new());
+        let (pending, pending_receiver) = watch::channel(BTreeMap::new());
         let (requests, request_receiver) = async_mpsc::channel(8);
         let handle = DirectoryHandle {
             plan,
             state: receiver,
             hosted: hosted_receiver,
+            pending: pending_receiver,
             requests,
         };
-        let startup = assigned.then_some(Self {
+        let startup = Self {
             plan,
+            founder: node == founder,
+            node,
             state,
             hosted,
+            pending,
             requests: request_receiver,
             wal,
             budget,
             root,
-        });
+        };
         Ok((handle, startup))
     }
 
@@ -164,36 +221,52 @@ impl DirectoryStartup {
         pool: &PeerConnectionPool,
         owners: &OwnerGate,
     ) -> Result<(), ServiceError> {
-        let permit = permit(root, self.plan, None).await?;
-        // Spawning, registering, and publishing are synchronous in this poll.
-        // Cancellation cannot strand an untracked disk owner between awaits.
-        let installed_index = permit.root_index();
-        let expires_at = permit.expires_at();
-        let (host, owner, output) =
-            ControlHost::spawn_directory(permit, self.wal.clone(), self.budget.clone(), None)?;
-        owners.register(PhysicalOwner::Control(owner))?;
-        self.state.send_replace(Some(host.clone()));
-        let replication = crate::replication::drive_directory_replication(
-            output,
-            pool,
-            pool.limits().max_inflight,
-        );
-        let refresh = refresh_authority(self.plan, root, &host, installed_index, expires_at);
-        let first = async {
-            tokio::pin!(replication, refresh);
-            tokio::select! {
-                result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("directory egress ended"))),
-                result = &mut refresh => result,
-            }
+        // The founder hosts the first partition from the start; a member
+        // hosts nothing until the root seats it in a group, and keeps
+        // hosting what it recorded across a restart.
+        let first: HostedFuture<'_> = if self.founder {
+            let permit = permit(root, self.plan, None, Some(&self.pending)).await?;
+            self.pending.send_modify(|map| {
+                map.remove(&self.plan.partition());
+            });
+            // Spawning, registering, and publishing are synchronous in this poll.
+            // Cancellation cannot strand an untracked disk owner between awaits.
+            let installed_index = permit.root_index();
+            let expires_at = permit.expires_at();
+            let (host, owner, output) =
+                ControlHost::spawn_directory(permit, self.wal.clone(), self.budget.clone(), None)?;
+            owners.register(PhysicalOwner::Control(owner))?;
+            self.state.send_replace(Some(host.clone()));
+            let plan = self.plan;
+            Box::pin(async move {
+                let replication = crate::replication::drive_directory_replication(
+                    output,
+                    pool,
+                    pool.limits().max_inflight,
+                );
+                let refresh = refresh_authority(plan, root, &host, installed_index, expires_at);
+                tokio::pin!(replication, refresh);
+                tokio::select! {
+                    result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("directory egress ended"))),
+                    result = &mut refresh => result,
+                }
+            })
+        } else {
+            Box::pin(std::future::pending())
         };
         tokio::pin!(first);
         let mut extras: FuturesUnordered<HostedFuture<'_>> = FuturesUnordered::new();
-        let records = load_records(&self.root, self.plan)?;
+        let records = load_records(&self.root, self.plan, self.node)?;
         let hosted = &self.hosted;
+        let pending = &self.pending;
         let (wal, budget, plan_root) = (&self.wal, &self.budget, &self.root);
+        // Every partition whose drive began, hosted or still being
+        // permitted: a request repeated meanwhile starts no second one.
+        let mut driving = std::collections::BTreeSet::new();
         for (plan, image) in records {
+            driving.insert(plan.partition());
             extras.push(Box::pin(drive_hosted(
-                plan, image, root, pool, owners, wal, budget, hosted,
+                plan, image, root, pool, owners, wal, budget, hosted, pending,
             )));
         }
         loop {
@@ -208,17 +281,21 @@ impl DirectoryStartup {
                     };
                     match request {
                         HostRequest::Host { plan, image } => {
-                            if hosted.borrow().contains_key(&plan.partition())
-                                || plan.partition() == self.plan.partition()
+                            if plan.host() != self.node
+                                || driving.contains(&plan.partition())
+                                || hosted.borrow().contains_key(&plan.partition())
+                                || (self.founder && plan.partition() == self.plan.partition())
                             {
                                 continue;
                             }
-                            if hosted.borrow().len() >= MAX_HOSTED_PARTITIONS {
+                            if driving.len() >= MAX_HOSTED_PARTITIONS {
                                 continue;
                             }
-                            record(plan_root, *plan, &image)?;
+                            let image = image.map(|image| *image);
+                            record(plan_root, *plan, image.as_ref())?;
+                            driving.insert(plan.partition());
                             extras.push(Box::pin(drive_hosted(
-                                *plan, *image, root, pool, owners, wal, budget, hosted,
+                                *plan, image, root, pool, owners, wal, budget, hosted, pending,
                             )));
                         }
                         HostRequest::Retire { partition } => {
@@ -246,6 +323,7 @@ async fn permit(
     root: &ControlHost,
     plan: PartitionPlan,
     rounds: Option<u32>,
+    pending: Option<&watch::Sender<BTreeMap<PartitionId, HostingAttempt>>>,
 ) -> Result<crate::directory_bootstrap::PartitionBootstrapPermit, ServiceError> {
     let mut remaining = rounds;
     loop {
@@ -255,11 +333,25 @@ async fn permit(
         match root.prepare_directory(plan).await {
             Ok(permit) => return Ok(permit),
             Err(
-                DirectoryBootstrapError::Unauthorized
+                error @ (DirectoryBootstrapError::Unauthorized
                 | DirectoryBootstrapError::Unavailable
                 | DirectoryBootstrapError::NotReady
-                | DirectoryBootstrapError::Capacity,
+                | DirectoryBootstrapError::Capacity),
             ) => {
+                // Why the last round was refused, for the node's health: a
+                // replica that never opens says so instead of nothing.
+                if let Some(pending) = pending {
+                    pending.send_modify(|map| {
+                        let entry = map.entry(plan.partition()).or_insert(HostingAttempt {
+                            group: plan.group().0,
+                            host: plan.host(),
+                            attempts: 0,
+                            last_refusal: None,
+                        });
+                        entry.attempts = entry.attempts.saturating_add(1);
+                        entry.last_refusal = Some(error.to_string());
+                    });
+                }
                 if let Some(left) = &mut remaining {
                     if *left == 0 {
                         return Err(DirectoryBootstrapError::Unavailable.into());
@@ -278,20 +370,24 @@ async fn permit(
 )]
 async fn drive_hosted(
     plan: PartitionPlan,
-    image: PartitionCheckpoint,
+    image: Option<PartitionCheckpoint>,
     root: &ControlHost,
     pool: &PeerConnectionPool,
     owners: &OwnerGate,
     wal: &SharedWal,
     budget: &MemoryBudget,
     hosted: &watch::Sender<BTreeMap<PartitionId, HostedPartition>>,
+    pending: &watch::Sender<BTreeMap<PartitionId, HostingAttempt>>,
 ) -> Result<(), ServiceError> {
-    let permit = permit(root, plan, Some(2_400)).await?;
+    let permit = permit(root, plan, Some(2_400), Some(pending)).await?;
     let installed_index = permit.root_index();
     let expires_at = permit.expires_at();
     let (host, owner, output) =
-        ControlHost::spawn_directory(permit, wal.clone(), budget.clone(), Some(image))?;
+        ControlHost::spawn_directory(permit, wal.clone(), budget.clone(), image)?;
     owners.register(PhysicalOwner::Control(owner))?;
+    pending.send_modify(|map| {
+        map.remove(&plan.partition());
+    });
     hosted.send_modify(|map| {
         map.insert(
             plan.partition(),
@@ -303,11 +399,71 @@ async fn drive_hosted(
     });
     let replication =
         crate::replication::drive_directory_replication(output, pool, pool.limits().max_inflight);
+    tokio::pin!(replication);
+    // Whichever replica leads the group refreshes the root's authority in
+    // it; one that follows is told so and waits.
     let refresh = refresh_authority(plan, root, &host, installed_index, expires_at);
-    tokio::pin!(replication, refresh);
+    tokio::pin!(refresh);
+    if plan.host() != plan.founder_node() {
+        // A member's replica runs while the root's grant seats this node in
+        // the group, and stops when the seat is gone (removed by the
+        // operator, or the group re-founded).
+        let seat = watch_seat(plan, root, &host);
+        tokio::pin!(seat);
+        let result = tokio::select! {
+            result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("hosted partition egress ended"))),
+            result = &mut refresh => result,
+            result = &mut seat => result,
+        };
+        hosted.send_modify(|map| {
+            map.remove(&plan.partition());
+        });
+        return result;
+    }
     tokio::select! {
         result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("hosted partition egress ended"))),
         result = &mut refresh => result,
+    }
+}
+/// Run a member's replica while the root's committed grant seats its host
+/// in the group, checked from the node's own root replica as the root
+/// moves, and stop it once the seat is gone: the replica is then no
+/// longer authorized and its record is dropped so a restart does not
+/// reopen it. Ends `Ok` when the host stops.
+async fn watch_seat(
+    plan: PartitionPlan,
+    root: &ControlHost,
+    host: &ControlHost,
+) -> Result<(), ServiceError> {
+    let mut seen = 0u64;
+    loop {
+        if root.progress().stopped || host.progress().stopped {
+            return Err(ServiceError::Owner("directory member owner ended"));
+        }
+        let applied = root.progress().applied_index;
+        if applied > seen {
+            seen = applied;
+            let seated = match root.observe_root().await {
+                Ok(observation) => observation
+                    .authority()
+                    .and_then(|authority| authority.groups.get(&plan.group()))
+                    .is_some_and(|grant| {
+                        grant.voters.contains_key(&plan.host())
+                            || grant.learners.contains_key(&plan.host())
+                    }),
+                // Not observable now: nothing is decided on it.
+                Err(
+                    focal_control::ControlFailure::NotReady
+                    | focal_control::ControlFailure::Capacity,
+                ) => true,
+                Err(error) => return Err(error.into()),
+            };
+            if !seated {
+                host.stop().await?;
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(PERMIT_PAUSE).await;
     }
 }
 fn record_path(root: &Path, partition: PartitionId) -> PathBuf {
@@ -319,7 +475,7 @@ fn record_path(root: &Path, partition: PartitionId) -> PathBuf {
 fn record(
     root: &Path,
     plan: PartitionPlan,
-    image: &PartitionCheckpoint,
+    image: Option<&PartitionCheckpoint>,
 ) -> Result<(), ServiceError> {
     let directory = root.join(RECORD_DIRECTORY);
     std::fs::create_dir_all(&directory)?;
@@ -328,7 +484,8 @@ fn record(
         cluster: plan.cluster(),
         founder_node: plan.founder_node(),
         delegation: plan.delegation(),
-        image: image.clone(),
+        image: image.cloned(),
+        host: plan.host(),
     })
     .map_err(|_| ServiceError::Owner("hosted partition record"))?;
     crate::embedded::atomic_file(&record_path(root, plan.partition()), &bytes)?;
@@ -340,7 +497,8 @@ fn record(
 fn load_records(
     root: &Path,
     first: PartitionPlan,
-) -> Result<Vec<(PartitionPlan, PartitionCheckpoint)>, ServiceError> {
+    node: u64,
+) -> Result<Vec<(PartitionPlan, Option<PartitionCheckpoint>)>, ServiceError> {
     let directory = root.join(RECORD_DIRECTORY);
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -361,20 +519,50 @@ fn load_records(
             return Err(ServiceError::Owner("too many hosted partition records"));
         }
         let bytes = std::fs::read(entry.path())?;
-        let record: HostedRecord = postcard::from_bytes(&bytes)
-            .map_err(|_| ServiceError::Owner("hosted partition record is corrupt"))?;
-        if record.schema != RECORD_SCHEMA
-            || record.cluster != first.cluster()
+        // Schema 1 named no host: the founder's own split destinations.
+        let record: HostedRecord = match postcard::from_bytes::<HostedRecord>(&bytes) {
+            Ok(record) if record.schema == RECORD_SCHEMA => record,
+            _ => {
+                let old: HostedRecordV1 = postcard::from_bytes(&bytes)
+                    .map_err(|_| ServiceError::Owner("hosted partition record is corrupt"))?;
+                if old.schema != 1 {
+                    return Err(ServiceError::Owner("hosted partition record is corrupt"));
+                }
+                HostedRecord {
+                    schema: RECORD_SCHEMA,
+                    cluster: old.cluster,
+                    founder_node: old.founder_node,
+                    delegation: old.delegation,
+                    image: Some(old.image),
+                    host: old.founder_node,
+                }
+            }
+        };
+        if record.cluster != first.cluster()
             || record.founder_node != first.founder_node()
+            || record.host != node
         {
             return Err(ServiceError::Owner("hosted partition record is foreign"));
         }
-        let plan = PartitionPlan::split_destination(
-            record.cluster,
-            record.founder_node,
-            record.delegation,
-            &record.image,
-        )?;
+        let plan = match &record.image {
+            Some(image) => PartitionPlan::split_destination(
+                record.cluster,
+                record.founder_node,
+                record.delegation,
+                image,
+            )?,
+            // A seated member's replica of the first partition: from the
+            // group's genesis, as the founder's own.
+            None => {
+                if record.delegation.partition != first.partition()
+                    || record.delegation.log_group != first.group()
+                {
+                    return Err(ServiceError::Owner("hosted partition record is foreign"));
+                }
+                first
+            }
+        }
+        .hosted_by(record.host);
         records
             .try_reserve(1)
             .map_err(|_| ServiceError::Owner("hosted partition records"))?;
@@ -427,5 +615,102 @@ async fn refresh_authority(
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use focal_directory::{
+        ClusterId, DelegationFence, NamespaceKey, NamespaceRange, OperationId, PartitionId,
+        PartitionSeal, RegionId,
+    };
+
+    /// A record written before hosts were recorded (schema 1) is the
+    /// founder's own split destination; one written since names its host,
+    /// and a node loads only the records that name it.
+    #[test]
+    fn hosted_records_of_both_schemas_load_and_name_their_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster = [3; 16];
+        let first = PartitionPlan::derive(cluster, 7).unwrap();
+        let moved = NamespaceRange {
+            start: NamespaceKey([8; 32]),
+            end: None,
+        };
+        let delegation = Delegation {
+            namespace: moved,
+            partition: PartitionId([9; 16]),
+            region: RegionId::UNKNOWN,
+            log_group: focal_directory::LogGroupId([10; 16]),
+            epoch: 2,
+            activation: Some(DelegationFence {
+                cluster: ClusterId(cluster),
+                operation: OperationId([11; 16]),
+                source: first.partition(),
+                destination: PartitionId([9; 16]),
+                namespace: moved,
+                from_epoch: 1,
+                to_epoch: 2,
+                sealed_revision: 4,
+                checkpoint: focal_model::ContentHash([12; 32]),
+                destination_ready: focal_model::ContentHash([13; 32]),
+            }),
+        };
+        let image = PartitionCheckpoint {
+            schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
+            cluster: ClusterId(cluster),
+            delegation,
+            revision: 4,
+            sealed: Some(PartitionSeal {
+                operation: OperationId([11; 16]),
+                destination: PartitionId([9; 16]),
+                next_epoch: 2,
+                revision: 4,
+                moved,
+                source: first.partition(),
+            }),
+            nodes: std::sync::Arc::new(BTreeMap::new()),
+            sessions: std::sync::Arc::new(BTreeMap::new()),
+            routes: std::sync::Arc::new(std::collections::VecDeque::new()),
+            routes_from: 0,
+        };
+        let records = dir.path().join(RECORD_DIRECTORY);
+        std::fs::create_dir_all(&records).unwrap();
+        let old = postcard::to_stdvec(&HostedRecordV1 {
+            schema: 1,
+            cluster,
+            founder_node: 7,
+            delegation,
+            image: image.clone(),
+        })
+        .unwrap();
+        std::fs::write(records.join("old.partition"), old).unwrap();
+        // The founder loads its old record as its own split destination.
+        let loaded = load_records(dir.path(), first, 7).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.host(), 7);
+        assert_eq!(loaded[0].0.partition(), PartitionId([9; 16]));
+        assert_eq!(loaded[0].1.as_ref(), Some(&image));
+        // Another node is not named by it.
+        assert!(load_records(dir.path(), first, 8).is_err());
+        // A member's replica of the first partition is recorded without an
+        // image and loaded as the first plan hosted by it.
+        let member = tempfile::tempdir().unwrap();
+        record(member.path(), first.hosted_by(8), None).unwrap();
+        let loaded = load_records(member.path(), first, 8).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.host(), 8);
+        assert_eq!(loaded[0].0.partition(), first.partition());
+        assert_eq!(loaded[0].0.identity().unwrap(), first.identity().unwrap());
+        assert!(loaded[0].1.is_none());
+        assert!(load_records(member.path(), first, 7).is_err());
     }
 }

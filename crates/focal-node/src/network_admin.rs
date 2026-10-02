@@ -28,6 +28,9 @@ const WORKSPACE: usize = 2 * 1024 * 1024;
 #[path = "replica_admin_protocol.rs"]
 mod replicas;
 pub use replicas::{ReplicaAdminCommand, ReplicaAdminReply, ReplicaAdminStatus};
+#[path = "partition_admin_protocol.rs"]
+mod partitions;
+pub use partitions::{PartitionAdminCommand, PartitionAdminReply};
 #[path = "operator_admin.rs"]
 pub(crate) mod operator;
 pub use operator::OperatorRead;
@@ -59,6 +62,9 @@ pub enum AdminCommand {
         name: String,
     },
     Replica(Box<ReplicaAdminCommand>),
+    /// A directory partition group this node hosts (24 §13; F24): its
+    /// configuration, or one membership change where this node leads it.
+    Partition(Box<PartitionAdminCommand>),
     Operator(OperatorRead),
     /// Renew this node's own credential now.
     RenewCredential,
@@ -220,8 +226,20 @@ pub struct ControlPlannedReply {
     /// `planned` (0) or `satisfied` (2): the current voters already tolerate
     /// the requested failures.
     pub state: u8,
+    /// The directory's partition groups under the same request (F24).
+    pub partitions: Vec<PartitionPlannedReply>,
 }
-pub const CONTROL_PLANNED_REPLY_SCHEMA: u16 = 1;
+/// One partition group's plan: `planned` (0), `satisfied` (2) or `refused`
+/// (3, no set of nodes seats it; `voters` are then the current ones).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionPlannedReply {
+    pub partition: [u8; 16],
+    pub group: [u8; 16],
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    pub state: u8,
+}
+pub const CONTROL_PLANNED_REPLY_SCHEMA: u16 = 2;
 /// The tenants the cluster serves: the founder's own and every admitted one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantsReply {
@@ -298,6 +316,9 @@ pub(crate) struct ControlFacts {
     pub leader: u64,
     pub configuration: focal_control::ControlConfiguration,
     pub authority: Option<focal_directory::AuthorityCheckpoint>,
+    /// The partition groups this node hosts, by group: where each leads and
+    /// the configuration index its replica applied (F24).
+    pub hosted: std::collections::BTreeMap<[u8; 16], (u64, u64)>,
     /// The nodes holding the issuer's signing key: the founder, until the
     /// issuer is handed on (F13 stage 3).
     pub issuer_holders: Vec<u64>,
@@ -652,17 +673,23 @@ fn control_plane(
         .iter()
         .flat_map(|authority| authority.groups.values())
         .filter_map(|grant| match &grant.scope {
-            focal_directory::GroupScope::Partition { partition, .. } => Some(control_group(
-                "partition",
-                grant.group.0,
-                Some(hex(&partition.0)),
-                // The root's observation names no partition leader.
-                0,
-                grant.membership_epoch,
-                grant.voters.keys().copied().collect(),
-                grant.learners.keys().copied().collect(),
-                nodes,
-            )),
+            focal_directory::GroupScope::Partition { partition, .. } => {
+                // Where this node hosts the group it knows the leader and
+                // the applied configuration; elsewhere the root's grant
+                // names the seats and neither.
+                let (leader, configuration_index) =
+                    facts.hosted.get(&grant.group.0).copied().unwrap_or((0, 0));
+                Some(control_group(
+                    "partition",
+                    grant.group.0,
+                    Some(hex(&partition.0)),
+                    leader,
+                    configuration_index,
+                    grant.voters.keys().copied().collect(),
+                    grant.learners.keys().copied().collect(),
+                    nodes,
+                ))
+            }
             focal_directory::GroupScope::Session(_) => None,
         })
         .collect();
@@ -774,6 +801,7 @@ impl AdminCommand {
         match self {
             Self::Operator(read) => read.validate(),
             Self::Replica(command) => command.validate(),
+            Self::Partition(command) => command.validate(),
             Self::RenewCredential | Self::RotateCredential | Self::Placement | Self::Tenants => {
                 Ok(())
             }
@@ -1045,6 +1073,8 @@ pub struct LocalNetworkAdmin {
     enrollment: Option<QuorumEnrollmentHost>,
     control: Option<crate::control_host::ControlHost>,
     fleet: Option<crate::fleet::FleetManager>,
+    /// The partitions this node hosts (F24).
+    partitions: Option<crate::network_service::DirectoryHandle>,
     content: Option<crate::content_host::ContentHost>,
     credentials: Option<crate::credential_renewal::CredentialHandle>,
     placement: Option<crate::placement_control::PlacementHandle>,
@@ -1086,6 +1116,7 @@ impl LocalNetworkAdmin {
             enrollment: Some(enrollment),
             control: None,
             fleet: None,
+            partitions: None,
             content: None,
             credentials: None,
             placement: None,
@@ -1126,6 +1157,7 @@ impl LocalNetworkAdmin {
             enrollment,
             control: None,
             fleet: None,
+            partitions: None,
             content: None,
             credentials: None,
             placement: None,
@@ -1393,15 +1425,30 @@ impl LocalNetworkAdmin {
                     _ => AccessError::Unavailable,
                 }
             })?;
+        let state = |state: crate::placement_control::PlanState| match state {
+            crate::placement_control::PlanState::Planned => 0,
+            crate::placement_control::PlanState::Pending => 1,
+            crate::placement_control::PlanState::Satisfied => 2,
+        };
+        let mut partitions = Vec::new();
+        partitions
+            .try_reserve_exact(planned.partitions.len())
+            .map_err(|_| AccessError::Capacity)?;
+        for group in planned.partitions {
+            partitions.push(PartitionPlannedReply {
+                partition: group.partition,
+                group: group.group,
+                voters: group.voters,
+                configuration_index: group.configuration_index,
+                state: if group.refused { 3 } else { state(group.state) },
+            });
+        }
         encode_reply(&ControlPlannedReply {
             schema: CONTROL_PLANNED_REPLY_SCHEMA,
             voters: planned.voters,
             configuration_index: planned.configuration_index,
-            state: match planned.state {
-                crate::placement_control::PlanState::Planned => 0,
-                crate::placement_control::PlanState::Pending => 1,
-                crate::placement_control::PlanState::Satisfied => 2,
-            },
+            state: state(planned.state),
+            partitions,
         })
     }
     /// The controller's clock, and for how long a death of each session of
@@ -1479,11 +1526,24 @@ impl LocalNetworkAdmin {
                     .collect()
             });
         }
+        let mut hosted = std::collections::BTreeMap::new();
+        if let Some(directory) = &self.partitions {
+            for partition in directory.hosted() {
+                let progress = partition.host.progress();
+                if let Ok(witness) = partition.host.witness_membership().await {
+                    hosted.insert(
+                        progress.identity.group,
+                        (progress.leader, witness.configuration.configuration_index),
+                    );
+                }
+            }
+        }
         labels.control = Some(ControlFacts {
             root_group: self.root.group,
             leader: control.progress().leader,
             configuration: observation.configuration().clone(),
             authority: observation.authority().cloned(),
+            hosted,
             issuer_holders: vec![self.founder],
         });
         for contact in &observation.contacts().contacts.records {
@@ -1878,6 +1938,9 @@ impl LocalNetworkAdmin {
         if let AdminCommand::Replica(command) = command {
             return self.replica_command(*command).await;
         }
+        if let AdminCommand::Partition(command) = command {
+            return self.partition_command(*command).await;
+        }
         if let AdminCommand::RenewCredential = command {
             return self.renew_credential().await;
         }
@@ -2106,6 +2169,7 @@ impl LocalNetworkAdmin {
             | AdminCommand::InviteClient { .. }
             | AdminCommand::Operator(_)
             | AdminCommand::Replica(_)
+            | AdminCommand::Partition(_)
             | AdminCommand::RenewCredential
             | AdminCommand::RotateCredential
             | AdminCommand::Placement

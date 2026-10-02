@@ -27,6 +27,37 @@ pub struct AdminNodeHealth {
     /// a network service.
     #[serde(default)]
     pub placement: Option<AdminPlacementAgent>,
+    /// The directory partition groups this node hosts a replica of (24 §13;
+    /// the audit's F24), each with where it stands.
+    #[serde(default)]
+    pub partitions: Vec<AdminHostedPartition>,
+    /// The partitions this node was asked to host and has not opened yet,
+    /// with the permit refusals so far.
+    #[serde(default)]
+    pub partitions_pending: Vec<AdminPendingPartition>,
+}
+/// A partition whose hosting is under way on this node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPendingPartition {
+    pub partition: String,
+    pub group: String,
+    pub host: u64,
+    pub attempts: u32,
+    pub last_refusal: Option<String>,
+}
+/// One hosted partition replica's progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminHostedPartition {
+    pub partition: String,
+    pub group: String,
+    /// The node this replica runs as: the founder, or a seated member.
+    pub host: u64,
+    pub leader: u64,
+    pub term: u64,
+    pub applied_index: u64,
+    pub stopped: bool,
 }
 /// The node's readiness (doc 08 §9): the five probes a supervisor asks,
 /// with the facts they are derived from. `alive` holds whenever the node

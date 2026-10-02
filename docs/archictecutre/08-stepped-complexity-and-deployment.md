@@ -304,11 +304,13 @@ Focal validates the promised zone-failure combinations for ordering voters, arti
 custody, metadata routes, archive dependencies, and surviving RAM/recovery capacity.
 The planner names any missing zone or dependent storage placement. It does not claim
 zone survival because three pods happened to be scheduled on three machines. The root
-group is seated across the zones by the same plan (`plan_root` before the sessions'
-changes) and its promise is stated apart from the data's (`control_guarantee`;
-`cluster placement` → `control`): what the root, the directory partitions and the
-issuer each survive, measured by one rule ([24 §15](24-placement-execution-and-fleet-control.md); the
-audit's F24). What the founder alone still hosts is reported as surviving nothing.
+group and the directory's partition groups are seated across the zones by the same
+plan (`plan_root`, then `plan_partition`, before the sessions' changes) and their
+promise is stated apart from the data's (`control_guarantee`; `cluster placement` →
+`control`): what the root, the directory partitions and the issuer each survive,
+measured by one rule ([24 §15](24-placement-execution-and-fleet-control.md); the
+audit's F24). What the founder alone still hosts — the issuer's key, a split
+partition's groups — is reported as surviving nothing.
 
 The Kubernetes package derives required scheduling/anti-colocation constraints from
 the chosen policy, and unsatisfiable placement stays pending. VM and bare-metal members
@@ -444,14 +446,19 @@ directory and journals nothing, so planning creates no file, ticket or directory
 The plan's changes are ordered: the policy commit (revision *n* → *n*+1) when the request
 differs, then the root group's voters the durability needs (`plan_root`, the voters and
 the root configuration they were planned against; absent when the root already
-tolerates it; 2026-10-02, the audit's F24), then per session either the placement
+tolerates it; 2026-10-02, the audit's F24), then each directory partition group's
+(`plan_partition`: the partition, its group, the voters and the group's configuration
+they were planned against; absent when the group already tolerates it), then per
+session either the placement
 request it denotes (the exact operation
 identity, the voters the planner picked, the epochs it expects) or no change when the
 active placement already provides the durability. A session the planner refuses is
 listed as blocked and the guarantee after the plan stays the guarantee before it (the
 weakest achieved level across the sessions, or the committed level without sessions);
-a root that cannot be seated is `blocked_control`, and the plan's `control_guarantee`
-states what the root tolerates before and after, apart from the data's;
+a root or a partition group that cannot be seated is `blocked_control` (naming the
+partition), and the plan's `control_guarantee` states what the control plane — the
+root and every partition group, the weakest of them — tolerates before and after,
+apart from the data's;
 the guarantee during the plan is the guarantee before it, because the old contract holds
 until the new placement is verified. The artifact is `FCLPLAN1` (magic, postcard body,
 BLAKE3 trailer) whose identity is derived from the facts alone, so the same observation
@@ -468,7 +475,10 @@ operation) and complete (no plan pending and the achieved guarantee covers the r
 `--wait` bounds how long apply watches; a `plan_root` step promotes each planned voter
 through the root once it is held as a learner, one exact request each, asked again as
 the root moves while a learner is behind or a request is still deciding, and is complete
-when every planned voter votes. A repeated apply resumes the journal and repeats
+when every planned voter votes; a `plan_partition` step admits each planned voter the
+group does not hold as a learner, which then hosts a replica of the group once the
+root's grant seats it, and promotes it once it has caught up — one exact `p1:` request
+each through the node that leads the group — and is complete the same way. A repeated apply resumes the journal and repeats
 nothing; `deployment status` re-checks journaled plans against the directory. A
 committed policy stronger than one host provides no longer refuses the founder's
 restart: the local solve pins only the first policy, the directory satisfies committed

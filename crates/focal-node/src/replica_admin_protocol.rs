@@ -127,6 +127,11 @@ impl LocalNetworkAdmin {
         self.fleet = Some(fleet);
         Ok(self)
     }
+    /// Administer the partition groups this node hosts (F24).
+    pub fn with_directory(mut self, directory: crate::network_service::DirectoryHandle) -> Self {
+        self.partitions = Some(directory);
+        self
+    }
     /// The exclusive content writer, needed to seal inline legacy payloads
     /// before a populated ledger's import is proposed.
     pub fn with_content(mut self, content: crate::content_host::ContentHost) -> Self {

@@ -419,6 +419,119 @@ fn session_progress_follows_the_directory() {
 }
 
 #[test]
+fn the_partition_groups_are_planned_after_the_root_and_weaken_the_control_promise() {
+    use super::plan::{ObservedPartition, PartitionProposal, compose_with_partitions};
+    let mut observation = observation(vec![session(2, Some(GuaranteeLevel::NONE))]);
+    observation.nodes.extend([8, 9].map(|node| ObservedNode {
+        node,
+        generation: 1,
+        alive: true,
+        eligible: true,
+        disk_available: Some(1 << 30),
+        region: None,
+        zone: None,
+    }));
+    let partition = ObservedPartition {
+        partition: [5; 16],
+        group: [6; 16],
+        voters: vec![7],
+        learners: Vec::new(),
+        tolerates_node: Some(0),
+        tolerates_zone: None,
+        tolerates_region: None,
+        blocked_by: Vec::new(),
+    };
+    observation.control = Some(ObservedControl {
+        voters: vec![7, 8, 9],
+        learners: Vec::new(),
+        configuration_index: 3,
+        tolerates_node: Some(1),
+        tolerates_zone: None,
+        tolerates_region: None,
+        blocked_by: Vec::new(),
+        partitions: vec![partition.clone()],
+    });
+    // The control plane is as weak as its weakest group: a root that
+    // tolerates one node and a partition that tolerates none promise none.
+    assert_eq!(
+        observation
+            .control
+            .as_ref()
+            .unwrap()
+            .level(FailureDomain::Node),
+        GuaranteeLevel::NONE
+    );
+    let requested = intent(FailureDomain::Node, 1);
+    let proposals = [Proposal::Planned {
+        operation: [4; 16],
+        voters: vec![7, 8, 9],
+    }];
+    let plan = compose_with_partitions(
+        &observation,
+        &requested,
+        &proposals,
+        &ControlProposal::Satisfied,
+        &[PartitionProposal {
+            partition: [5; 16],
+            group: [6; 16],
+            proposal: ControlProposal::Planned {
+                voters: vec![7, 8, 9],
+                configuration_index: 2,
+            },
+        }],
+        10,
+    )
+    .unwrap();
+    assert!(matches!(plan.body.changes[0], Change::CommitPolicy { .. }));
+    assert!(matches!(
+        &plan.body.changes[1],
+        Change::PlanPartition { partition, group, voters, expected_configuration_index: 2 }
+            if *partition == [5; 16] && *group == [6; 16] && voters == &[7, 8, 9]
+    ));
+    assert!(matches!(plan.body.changes[2], Change::PlanSession { .. }));
+    assert_eq!(plan.body.control_guarantee.before, GuaranteeLevel::NONE);
+    assert_eq!(plan.body.control_guarantee.after, NODE_1);
+    assert!(plan.body.blocked_control.is_none());
+    let bytes = plan.encode().unwrap();
+    assert_eq!(DeploymentPlan::decode(&bytes).unwrap(), plan);
+    // The plan is stale once the partition's group is another, or a
+    // planned voter is gone; the group's moving index does not stale it.
+    let journal = Journal::new(&plan, 5).unwrap();
+    assert!(preflight(&plan, &journal, &Current::of(&observation)).is_ok());
+    let mut regrouped = observation.clone();
+    regrouped.control.as_mut().unwrap().partitions[0].group = [7; 16];
+    assert!(matches!(
+        preflight(&plan, &journal, &Current::of(&regrouped)),
+        Err(super::DeploymentError::Stale { field, .. }) if field == "group"
+    ));
+    // A partition no set of nodes seats blocks the control plane's promise
+    // as a refused root does, naming the partition.
+    let refused = compose_with_partitions(
+        &observation,
+        &requested,
+        &proposals,
+        &ControlProposal::Satisfied,
+        &[PartitionProposal {
+            partition: [5; 16],
+            group: [6; 16],
+            proposal: ControlProposal::Refused("no nodes".into()),
+        }],
+        10,
+    )
+    .unwrap();
+    assert_eq!(refused.body.control_guarantee.after, GuaranteeLevel::NONE);
+    assert!(
+        refused
+            .body
+            .blocked_control
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("partition 05050505")),
+        "{:?}",
+        refused.body.blocked_control
+    );
+}
+
+#[test]
 fn the_root_group_is_planned_before_the_sessions_and_its_promise_is_stated_apart() {
     let mut observation = observation(vec![session(2, Some(GuaranteeLevel::NONE))]);
     observation.nodes.extend([8, 9].map(|node| ObservedNode {
@@ -438,6 +551,7 @@ fn the_root_group_is_planned_before_the_sessions_and_its_promise_is_stated_apart
         tolerates_zone: None,
         tolerates_region: None,
         blocked_by: Vec::new(),
+        partitions: Vec::new(),
     });
     let requested = intent(FailureDomain::Node, 1);
     let proposals = [Proposal::Planned {

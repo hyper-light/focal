@@ -182,13 +182,24 @@ does at most one thing:
    (`placement_journal.rs`, directories `cluster/placement-root` and
    `cluster/placement-partition`, markers `PLACEMENT-ROOT.initialized` and
    `PLACEMENT-PARTITION.initialized`) hold the agent's last unresolved
-   `ControlRequest` per metadata owner under one stable client identity
-   (`PlacementAgent::client(cluster, node)`). An intent is journaled before it
-   is proposed and resubmitted with the identical request identity until the
-   owner returns a receipt or refuses it before admission (a stale compare, an
-   unverified proof, an invalid or foreign command); not-leader, not-ready,
-   capacity, unavailable and unknown outcomes keep it pending. A restart reopens
-   both journals, so a decision is neither repeated nor lost.
+   `ControlRequest` per metadata owner under a client identity bound to the
+   node: its local client (`PlacementAgent::local_client(cluster, node)`) where
+   it submits to an owner it leads, its enrolled principal where it submits
+   through the owner's leader (§16; a root intent is named by the client derived
+   from the principal). A node that leads a partition at one time and follows it
+   at another — the founder restarted into a group that grew past it (the
+   audit's F24) — names the same journal by both in turn: the journal keeps one
+   retry window per client (schema 2, at most four), adopts the client it is
+   opened with whenever nothing is pending and resumes that client's window
+   where it stood, so the owner's retry floor for a client is never crossed; and
+   the owners' placement-control ingress admits a node's local client beside its
+   principal and its root-intent client, so an intent journaled while the node
+   led still resolves through the node that leads now. An intent is journaled
+   before it is proposed and resubmitted with the identical request identity
+   until the owner returns a receipt or refuses it before admission (a stale
+   compare, an unverified proof, an invalid or foreign command); not-leader,
+   not-ready, capacity, unavailable and unknown outcomes keep it pending. A
+   restart reopens both journals, so a decision is neither repeated nor lost.
 2. **Register the founder's session.** From the hosted replica's exported
    facts (`ReplicaHost::registration_facts`, read on the owner thread) the
    agent captures the existing `FirstSessionPlan`, submits the root
@@ -1213,7 +1224,14 @@ Apply promotes each planned voter once the root holds it as a learner (the
 network controller admits every enrolled node as one), one exact `a1:`
 request each; a learner behind or a request still deciding is asked again
 as the root moves, within the operator's allowance, and a repeated apply
-resumes what is journaled. Zone survival asked of a deployment is thereby
+resumes what is journaled. The directory's partition groups follow (batch
+2): planned by the same rule from the grant's voters (`plan_partition`), each
+planned voter admitted as a learner by apply, hosting a replica of the group
+once the root's grant seats it (§13: the permit admits the seat, voter's or
+learner's; the replica catches up from the founder's log) and promoted once
+caught up; the root's grant follows the group's committed configuration by
+the installed voters' attestation of the entry that changed it
+(`ControlMembershipRecord`, `ChangeGroup`), as a session's does. Zone survival asked of a deployment is thereby
 zone survival of the root too; the partition groups and the issuer are
 reported as the founder's until they follow (§15).
 

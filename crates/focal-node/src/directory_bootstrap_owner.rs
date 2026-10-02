@@ -70,7 +70,7 @@ impl ControlHost {
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity,
-                node: plan.founder_node(),
+                node: plan.host(),
                 leader: 0,
                 term: 0,
                 applied_index: 0,
@@ -98,7 +98,7 @@ impl ControlHost {
             pace,
         };
         let thread = std::thread::Builder::new()
-            .name(format!("focal-directory-{}", plan.founder_node()))
+            .name(format!("focal-directory-{}", plan.host()))
             .stack_size(DIRECTORY_STACK_BYTES)
             .spawn(move || {
                 let _outcome = catch_unwind(AssertUnwindSafe(

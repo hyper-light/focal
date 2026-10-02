@@ -44,6 +44,10 @@ pub enum ControlRead {
         node: u64,
         eligible: bool,
     },
+    /// The entry that last changed this group's configuration, as applied
+    /// here (`None` before any change): what a voter attests to the root
+    /// for the grant to follow the log. Local or peer-control ingress.
+    MembershipRecord,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -129,6 +133,7 @@ pub enum ControlReadResult {
     },
     Route(Option<focal_directory::SessionRoute>),
     RouteChanges(focal_directory::InvalidationBatch),
+    MembershipRecord(Option<ControlMembershipRecord>),
     PreparedRevocation {
         identity: ControlIdentity,
         applied_index: u64,

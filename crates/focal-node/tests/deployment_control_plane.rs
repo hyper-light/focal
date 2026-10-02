@@ -12,12 +12,14 @@
 //! deployment that asks for zone survival seats the root group's voters
 //! across the zones as it seats the session's; `cluster placement` states
 //! what the root, the directory partitions and the issuer survive, apart
-//! from the data; readiness holds the committed policy to the root as well;
-//! and with the founder's zone silent the root is led by another zone and
-//! answers, while the partition hosted by the founder alone and the issuer
-//! it holds are reported as what they are. Before, the plan placed the
-//! session's three voters across the zones and left the root with the
-//! founder's single vote (the KIND campaign of 2026-09-29, D5).
+//! from the data; readiness holds the committed policy to the root and the
+//! partition groups as well; and with the founder's zone silent the root
+//! and the directory's partition are led by another zone and answer — a
+//! session is created there — while the issuer the founder alone holds is
+//! reported as what it is. Before, the plan placed the session's three
+//! voters across the zones and left the root with the founder's single
+//! vote (the KIND campaign of 2026-09-29, D5), and the partition group,
+//! hosted by the founder alone, fell silent with it (batch 2).
 #[path = "support/fleet.rs"]
 mod fleet;
 use fleet::*;
@@ -48,7 +50,7 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
     activate_native(&founder);
     let founder_server = start(&founder, &["--advertise", &addresses[0]]);
-    let (founder_node, _tenant, ledger) = identity(&founder);
+    let (founder_node, tenant, ledger) = identity(&founder);
     let (_server_b, node_b) = join_start(&founder, &host_b, "host-b", &addresses[1]);
     let (_server_c, node_c) = join_start(&founder, &host_c, "host-c", &addresses[2]);
     let all = [founder_node, node_b, node_c];
@@ -107,7 +109,11 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let mut expected = all.to_vec();
     expected.sort_unstable();
     assert_eq!(root_voters, expected, "{planned}");
-    assert_eq!(changes[2]["change"], "plan_session", "{planned}");
+    assert_eq!(changes[2]["change"], "plan_partition", "{planned}");
+    let mut partition_voters = ids(&changes[2]["voters"]);
+    partition_voters.sort_unstable();
+    assert_eq!(partition_voters, expected, "{planned}");
+    assert_eq!(changes[3]["change"], "plan_session", "{planned}");
     assert_eq!(plan["control_guarantee"]["before"]["max_failures"], 0);
     assert_eq!(plan["control_guarantee"]["after"]["survive"], "zone");
     assert_eq!(plan["control_guarantee"]["after"]["max_failures"], 1);
@@ -133,7 +139,11 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
         &founder,
         "zone survival",
         Duration::from_secs(240),
-        |view| settled(view, &ledger, &all, 1) && control(view)["root"]["tolerates_zone"] == 1,
+        |view| {
+            settled(view, &ledger, &all, 1)
+                && control(view)["root"]["tolerates_zone"] == 1
+                && control(view)["partitions"][0]["tolerates_zone"] == 1
+        },
     );
     assert_eq!(control(&view)["root"]["tolerates_node"], 1, "{view}");
     assert_eq!(
@@ -143,9 +153,13 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
             .len(),
         0
     );
-    // The partition group and the issuer are still the founder's alone,
-    // and said to be: the data's promise is not the whole product's.
-    assert_eq!(control(&view)["partitions"][0]["tolerates_zone"], 0);
+    // The partition group's voters are the three as well: its replicas on
+    // the hosts were seated by the root's grant, caught up and promoted.
+    // The issuer is still the founder's alone, and said to be: the data's
+    // promise is not the whole product's.
+    let mut partition_voters = ids(&control(&view)["partitions"][0]["voters"]);
+    partition_voters.sort_unstable();
+    assert_eq!(partition_voters, expected, "{view}");
     assert_eq!(control(&view)["issuer"]["tolerates_node"], 0);
     let ready = readiness(&founder);
     assert_eq!(ready["control_satisfied"], true, "{ready}");
@@ -192,6 +206,43 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let founder_down = readiness(&host_b);
     assert_eq!(founder_down["alive"], true, "{founder_down}");
     assert_eq!(founder_down["root"]["leader"], led, "{founder_down}");
+    // The directory's partition is led from another zone too, and serves:
+    // a session is created on a host while the founder is silent, placed
+    // by the partition the hosts now lead.
+    let mut wait = Progress::begin(&[&host_b], Duration::from_secs(180));
+    let partition_leader = loop {
+        let view = placement(&host_b);
+        let leader = view
+            .as_ref()
+            .map(|view| {
+                control(view)["partitions"][0]["leader"]
+                    .as_u64()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        if leader != 0 && leader != founder_node {
+            break leader;
+        }
+        if let Some(spent) = wait.spent() {
+            panic!("the partition was not led from another zone: {spent}; {view:?}");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(all.contains(&partition_leader) && partition_leader != founder_node);
+    let created = admin(
+        &host_b,
+        &[
+            "cluster",
+            "sessions",
+            "create",
+            "--tenant",
+            &tenant,
+            "--name",
+            "f24-while-founder-silent",
+        ],
+    );
+    assert_eq!(created["result"]["kind"], "session_created", "{created}");
+    assert_eq!(created["result"]["existing"], false, "{created}");
     // The founder returns: it follows or leads again, and the policy holds.
     founder_server.resume();
     let mut wait = Progress::begin(&[&founder], Duration::from_secs(180));

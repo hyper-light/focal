@@ -150,6 +150,13 @@ enum Work {
         oneshot::Sender<Result<RootObservation, ControlFailure>>,
         Allocation,
     ),
+    /// The configuration this replica applied and the entry that last
+    /// changed it: what a voter witnesses from its own log before it signs
+    /// the group's membership fact for the root (F24).
+    WitnessMembership(
+        oneshot::Sender<Result<MembershipWitness, ControlFailure>>,
+        Allocation,
+    ),
     PrepareSessionProof {
         witness: Box<focal_ledger::CommittedPlacement>,
         window: crate::placement_proof::ProofWindow,
@@ -262,6 +269,12 @@ impl RootObservation {
     pub fn authority(&self) -> Option<&focal_directory::AuthorityCheckpoint> {
         self.authority.as_ref()
     }
+}
+/// A replica's applied configuration and the entry that last changed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipWitness {
+    pub configuration: ControlConfiguration,
+    pub record: Option<focal_control::ControlMembershipRecord>,
 }
 impl ControlOwner {
     pub fn join(self) -> Result<(), ControlFailure> {
@@ -508,6 +521,23 @@ impl ControlHost {
         let (send, receive) = oneshot::channel();
         self.sender
             .try_send(Work::ObserveRoot(send, charge))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ControlFailure::Capacity,
+                mpsc::TrySendError::Disconnected(_) => ControlFailure::Unavailable,
+            })?;
+        receive.await.map_err(|_| ControlFailure::Unavailable)?
+    }
+    /// What this replica applied of its own group's configuration, from its
+    /// owner thread: no quorum read, a follower's committed view (F24).
+    pub async fn witness_membership(&self) -> Result<MembershipWitness, ControlFailure> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
+            .map_err(|_| ControlFailure::Capacity)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::WitnessMembership(send, charge))
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => ControlFailure::Capacity,
                 mpsc::TrySendError::Disconnected(_) => ControlFailure::Unavailable,
@@ -1120,6 +1150,13 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let result = self.observe_root(input);
                 let _ = response.send(result);
             }
+            Work::WitnessMembership(response, _input) => {
+                self.drain()?;
+                let _ = response.send(Ok(MembershipWitness {
+                    configuration: self.replica.configuration(),
+                    record: self.replica.membership_record().cloned(),
+                }));
+            }
             Work::Request(request, response, charge) => {
                 let waiting = self.replica.reads_waiting();
                 self.request(*request, response, charge);
@@ -1403,7 +1440,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                         .map_err(|_| ControlFailure::Unauthorized)?,
                 )
             } else if placement {
-                crate::placement_control::decode_placement_control(&verified, bytes)?
+                crate::placement_control::decode_placement_control(
+                    &verified,
+                    bytes,
+                    self.replica.identity().cluster.0,
+                )?
             } else {
                 ControlRpc::decode(bytes, self.replica.limits().max_command_bytes)
                     .map_err(ControlFailure::from)?

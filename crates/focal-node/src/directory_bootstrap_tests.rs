@@ -255,6 +255,28 @@ async fn directory_permit_rejects_wrong_assignment_revocation_expiry_and_unfunde
     assert_eq!(budget.stats().used, 0);
 }
 
+/// A replica of the first partition opened by another node (F24) is
+/// permitted by the seat the root's grant gives that node, voter or
+/// learner: a node the grant does not seat is refused, and the plan it
+/// would open with names the founder's log to catch up from.
+#[tokio::test]
+async fn a_host_without_a_seat_in_the_partitions_group_is_refused_a_replica_of_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let (network, plan) = prepared_network(directory.path()).await;
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+    let hosted = plan.hosted_by(plan.founder_node + 1);
+    assert_eq!(hosted.host(), plan.founder_node + 1);
+    assert_eq!(hosted.founder_node(), plan.founder_node);
+    assert_eq!(hosted.identity().unwrap(), plan.identity().unwrap());
+    assert!(matches!(
+        authorize_first_directory(&network.control, hosted, unix_time().unwrap(), &budget),
+        Err(DirectoryBootstrapError::Unauthorized)
+    ));
+    // The founder's own permit is unchanged by the host's refusal.
+    authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
+    assert_eq!(budget.stats().used, 0);
+}
+
 #[tokio::test]
 async fn first_directory_planner_uses_owned_root_observation_and_committed_comparisons() {
     use crate::control_host::{ControlHost, ControlHostConfig};

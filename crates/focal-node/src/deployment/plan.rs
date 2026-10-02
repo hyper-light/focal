@@ -8,12 +8,17 @@ use serde::{Deserialize, Serialize};
 
 /// `FCLPLAN1`: magic, postcard body, then the BLAKE3 hash of both.
 pub const MAGIC: &[u8; 8] = b"FCLPLAN1";
-pub const SCHEMA: u16 = 2;
+/// Schema 3 records the directory partition groups beside the root and
+/// plans their voters (F24); a plan written by an older binary is refused.
+pub const SCHEMA: u16 = 3;
 /// A plan file never exceeds this; the directory view it is built from is
 /// itself bounded.
 pub const MAX_PLAN_BYTES: usize = 4 * 1024 * 1024;
 /// Sessions one plan names at most.
 pub const MAX_SESSIONS: usize = 4096;
+/// The partition groups one plan seats: every partition a node may host and
+/// the first (`network_directory::MAX_HOSTED_PARTITIONS` + 1).
+pub const MAX_PARTITIONS: usize = 33;
 const PLAN_ID_CONTEXT: &str = "focal.deployment.plan.v1";
 
 /// The deployment a plan was made for.
@@ -67,6 +72,47 @@ pub struct ObservedControl {
     pub tolerates_zone: Option<u16>,
     pub tolerates_region: Option<u16>,
     pub blocked_by: Vec<String>,
+    /// The directory's partition groups, as the root's authority grants
+    /// them (F24): the control plane is the root and these together.
+    pub partitions: Vec<ObservedPartition>,
+}
+/// One partition group of the directory as observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedPartition {
+    pub partition: [u8; 16],
+    pub group: [u8; 16],
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub tolerates_node: Option<u16>,
+    pub tolerates_zone: Option<u16>,
+    pub tolerates_region: Option<u16>,
+    pub blocked_by: Vec<String>,
+}
+fn group_level(
+    tolerates: Option<u16>,
+    blocked_by: &[String],
+    survive: FailureDomain,
+) -> GuaranteeLevel {
+    GuaranteeLevel {
+        survive,
+        max_failures: if blocked_by.is_empty() {
+            tolerates.unwrap_or(0)
+        } else {
+            0
+        },
+    }
+}
+impl ObservedPartition {
+    pub fn tolerates(&self, survive: FailureDomain) -> Option<u16> {
+        match survive {
+            FailureDomain::Node => self.tolerates_node,
+            FailureDomain::Zone => self.tolerates_zone,
+            FailureDomain::Region => self.tolerates_region,
+        }
+    }
+    pub fn level(&self, survive: FailureDomain) -> GuaranteeLevel {
+        group_level(self.tolerates(survive), &self.blocked_by, survive)
+    }
 }
 impl ObservedControl {
     pub fn tolerates(&self, survive: FailureDomain) -> Option<u16> {
@@ -78,15 +124,19 @@ impl ObservedControl {
     }
     /// The level the root's voters provide in the class asked for: none
     /// where a voter's domain is unknown or a voter is blocked.
+    pub fn root_level(&self, survive: FailureDomain) -> GuaranteeLevel {
+        group_level(self.tolerates(survive), &self.blocked_by, survive)
+    }
+    /// The level the control plane provides: the weakest of the root's
+    /// and every partition group's, since a session is placed and routed
+    /// by both (F24).
     pub fn level(&self, survive: FailureDomain) -> GuaranteeLevel {
-        GuaranteeLevel {
-            survive,
-            max_failures: if self.blocked_by.is_empty() {
-                self.tolerates(survive).unwrap_or(0)
-            } else {
-                0
-            },
-        }
+        self.partitions
+            .iter()
+            .map(|partition| partition.level(survive))
+            .fold(self.root_level(survive), |weakest, level| {
+                weakest.weaker(level)
+            })
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +165,18 @@ pub enum Change {
     PlanRoot {
         voters: Vec<u64>,
         /// The root configuration the voters were planned against.
+        expected_configuration_index: u64,
+    },
+    /// Seat a directory partition group's voters (F24), after the root and
+    /// before the sessions: each planned voter the group does not hold is
+    /// admitted as a learner, hosts a replica of the group once the root's
+    /// grant seats it, and is promoted once it has caught up — one exact
+    /// request each, through the node that leads the group.
+    PlanPartition {
+        partition: [u8; 16],
+        group: [u8; 16],
+        voters: Vec<u64>,
+        /// The group's configuration the voters were planned against.
         expected_configuration_index: u64,
     },
     /// Request the session's placement under the requested durability; the
@@ -155,6 +217,13 @@ pub struct PlanBody {
     pub control_guarantee: Guarantee,
     /// Why the root group cannot be seated under the request, when it cannot.
     pub blocked_control: Option<String>,
+}
+/// The answer a dry-run plan produced for one partition group (F24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionProposal {
+    pub partition: [u8; 16],
+    pub group: [u8; 16],
+    pub proposal: ControlProposal,
 }
 /// The answer a dry-run root plan produced (`cluster placement`'s solver).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,12 +307,35 @@ pub fn compose(
     control: &ControlProposal,
     created_ms: u64,
 ) -> Result<DeploymentPlan, DeploymentError> {
-    if observation.sessions.len() > MAX_SESSIONS || proposals.len() != observation.sessions.len() {
+    compose_with_partitions(observation, requested, proposals, control, &[], created_ms)
+}
+/// `compose`, with the directory's partition groups planned after the
+/// root (F24): one change per partition group the solver seats, in the
+/// order given; a group that cannot be seated blocks the control plane's
+/// promise as a refused root does.
+pub fn compose_with_partitions(
+    observation: &Observation,
+    requested: &PolicyIntent,
+    proposals: &[Proposal],
+    control: &ControlProposal,
+    partitions: &[PartitionProposal],
+    created_ms: u64,
+) -> Result<DeploymentPlan, DeploymentError> {
+    if observation.sessions.len() > MAX_SESSIONS
+        || proposals.len() != observation.sessions.len()
+        || partitions.len() > MAX_PARTITIONS
+    {
         return Err(DeploymentError::Capacity);
     }
     let mut changes = Vec::new();
     changes
-        .try_reserve_exact(observation.sessions.len().saturating_add(2))
+        .try_reserve_exact(
+            observation
+                .sessions
+                .len()
+                .saturating_add(2)
+                .saturating_add(partitions.len()),
+        )
         .map_err(|_| DeploymentError::Capacity)?;
     let mut blocked = Vec::new();
     let committed = &observation.committed;
@@ -280,6 +372,33 @@ pub fn compose(
         }
         ControlProposal::Satisfied | ControlProposal::Unobserved => {}
         ControlProposal::Refused(reason) => blocked_control = Some(reason.clone()),
+    }
+    for partition in partitions {
+        match &partition.proposal {
+            ControlProposal::Planned {
+                voters,
+                configuration_index,
+            } => {
+                let mut copied = Vec::new();
+                copied
+                    .try_reserve_exact(voters.len())
+                    .map_err(|_| DeploymentError::Capacity)?;
+                copied.extend_from_slice(voters);
+                changes.push(Change::PlanPartition {
+                    partition: partition.partition,
+                    group: partition.group,
+                    voters: copied,
+                    expected_configuration_index: *configuration_index,
+                });
+            }
+            ControlProposal::Satisfied | ControlProposal::Unobserved => {}
+            ControlProposal::Refused(reason) => {
+                if blocked_control.is_none() {
+                    blocked_control =
+                        Some(format!("partition {}: {reason}", hex(&partition.partition)));
+                }
+            }
+        }
     }
     let control_after = if blocked_control.is_some() {
         control_before
@@ -416,7 +535,10 @@ impl DeploymentPlan {
                 "plan identity does not match its body",
             ));
         }
-        if plan.body.changes.len() > MAX_SESSIONS.saturating_add(2)
+        if plan.body.changes.len()
+            > MAX_SESSIONS
+                .saturating_add(2)
+                .saturating_add(MAX_PARTITIONS)
             || plan.body.observed.sessions.len() > MAX_SESSIONS
         {
             return Err(DeploymentError::Capacity);
@@ -467,7 +589,12 @@ impl DeploymentPlan {
                     })
                     .collect(),
                 nodes: self.body.observed.nodes.clone(),
-                control: self.body.observed.control.clone(),
+                control: self
+                    .body
+                    .observed
+                    .control
+                    .as_ref()
+                    .map(ObservedControlView::of),
             },
             requested: self.body.requested.clone(),
             policy_hash: hex(&self.body.policy_hash),
@@ -526,7 +653,57 @@ pub struct ObservedView {
     pub policy: PolicyIntent,
     pub sessions: Vec<ObservedSessionView>,
     pub nodes: Vec<ObservedNode>,
-    pub control: Option<ObservedControl>,
+    pub control: Option<ObservedControlView>,
+}
+/// The observed control plane, its identities in hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObservedControlView {
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub configuration_index: u64,
+    pub tolerates_node: Option<u16>,
+    pub tolerates_zone: Option<u16>,
+    pub tolerates_region: Option<u16>,
+    pub blocked_by: Vec<String>,
+    pub partitions: Vec<ObservedPartitionView>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObservedPartitionView {
+    pub partition: String,
+    pub group: String,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub tolerates_node: Option<u16>,
+    pub tolerates_zone: Option<u16>,
+    pub tolerates_region: Option<u16>,
+    pub blocked_by: Vec<String>,
+}
+impl ObservedControlView {
+    fn of(control: &ObservedControl) -> Self {
+        Self {
+            voters: control.voters.clone(),
+            learners: control.learners.clone(),
+            configuration_index: control.configuration_index,
+            tolerates_node: control.tolerates_node,
+            tolerates_zone: control.tolerates_zone,
+            tolerates_region: control.tolerates_region,
+            blocked_by: control.blocked_by.clone(),
+            partitions: control
+                .partitions
+                .iter()
+                .map(|partition| ObservedPartitionView {
+                    partition: hex(&partition.partition),
+                    group: hex(&partition.group),
+                    voters: partition.voters.clone(),
+                    learners: partition.learners.clone(),
+                    tolerates_node: partition.tolerates_node,
+                    tolerates_zone: partition.tolerates_zone,
+                    tolerates_region: partition.tolerates_region,
+                    blocked_by: partition.blocked_by.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservedSessionView {
@@ -571,6 +748,12 @@ pub enum ChangeView {
         voters: Vec<u64>,
         expected_configuration_index: u64,
     },
+    PlanPartition {
+        partition: String,
+        group: String,
+        voters: Vec<u64>,
+        expected_configuration_index: u64,
+    },
     PlanSession {
         tenant: String,
         session: String,
@@ -602,6 +785,17 @@ impl ChangeView {
                 voters,
                 expected_configuration_index,
             } => Self::PlanRoot {
+                voters: voters.clone(),
+                expected_configuration_index: *expected_configuration_index,
+            },
+            Change::PlanPartition {
+                partition,
+                group,
+                voters,
+                expected_configuration_index,
+            } => Self::PlanPartition {
+                partition: hex(partition),
+                group: hex(group),
                 voters: voters.clone(),
                 expected_configuration_index: *expected_configuration_index,
             },

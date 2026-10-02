@@ -12734,3 +12734,27 @@ seal, asked once its exchange gave up, ran beside the first and pushed the same 
 again, every byte twice; it runs after the first now. Measured over relays: at 128 kbit/s
 the copy holds the megabyte 75.9 s after the upload began on a 65 s path, 1.10 chunks
 crossing; at 64 kbit/s 152.9 s on a 131 s path.
+
+### 2026-10-02 — F24 batch 2: the directory's partition groups survive what the data does
+
+The directory's partition group was the founder's alone: its replica, its permit and
+every placement, session-creation and membership operation that passes through it
+waited for the founder while the root answered from another zone. A partition group
+is now seated by the same plan as the root (`plan_partition` after `plan_root`) and
+hosted wherever the root's grant seats a node: the permit admits the seat, voter's or
+learner's; the member's replica catches up from the founder's log; the root's grant
+follows the group's committed configuration by the installed voters' attestation of
+the entry that changed it, which every replica keeps on record and across its
+checkpoints ([24 §13, §15](24-placement-execution-and-fleet-control.md); [08 §9](08-stepped-complexity-and-deployment.md);
+the remediation record, F24). The control plane's promise is the weakest of the
+root's and every partition group's, and readiness holds the policy to all of them.
+Measured on three real processes across three zones (`deployment_control_plane`,
+macOS, 2026-10-02): the plan names the partition group's three voters after the
+root's; `deployment apply` completes in 18 s with the root and the partition group
+each at three voters tolerating zone/1 and node/1, every host running a replica of
+the partition at the leader's applied index; with the founder's zone silenced, the
+partition is led from another zone and a session is created on a host there. On
+the way, the first such run found the root preparing membership permits for
+session groups only, the directory handle counting the first partition as hosted
+everywhere, and a member's replica opening through the founder's bootstrap — each
+silent until node health named it (`partitions`, `partitions_pending`).

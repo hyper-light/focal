@@ -51,7 +51,9 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 #[path = "network_directory.rs"]
 mod network_directory;
 use network_directory::DirectoryStartup;
-pub use network_directory::{DirectoryHandle, HostRequest, HostedPartition, MAX_HOSTED_PARTITIONS};
+pub use network_directory::{
+    DirectoryHandle, HostRequest, HostedPartition, HostingAttempt, MAX_HOSTED_PARTITIONS,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -651,7 +653,7 @@ impl NetworkService {
         owners.hold(directory, wal.clone())?;
         let founder = identity.node == state.genesis.founder.node;
         let (directory, directory_startup) = DirectoryStartup::new(
-            founder,
+            identity.node,
             state.genesis.founder.cluster,
             state.genesis.founder.node,
             wal.clone(),
@@ -1086,6 +1088,7 @@ impl NetworkService {
                 handler
                     .with_control(control.clone())?
                     .with_fleet(fleet.clone())?
+                    .with_directory(directory.clone())
                     .with_content(content.clone())
                     .with_credentials(credential_handle.clone())
                     .with_placement(placement_handle.clone())
@@ -1101,7 +1104,7 @@ impl NetworkService {
             directory: directory.clone(),
             liveness: liveness_handle.clone(),
             ledger: ManagedService::new(fleet.clone(), content.clone(), coordinator.clone())
-                .with_signing(control.clone(), placement_handle.clone())
+                .with_signing(control.clone(), placement_handle.clone(), directory.clone())
                 .with_liveness(liveness_handle.clone())
                 .with_routes(
                     route_handle.clone(),
@@ -1141,7 +1144,7 @@ impl NetworkService {
             archive_agent: Some(archive_agent),
             liveness: Some(liveness_driver),
             routes: Some(route_driver),
-            directory_startup,
+            directory_startup: Some(directory_startup),
             control_output: Some(control_output),
             ledger_output: Some(ledger_output),
             evidence: Some(evidence),
@@ -1743,10 +1746,11 @@ impl NetworkService {
                         let progress = ledger.progress();
                         !progress.stopped && progress.leader != 0
                     } && self.handles.directory.host().is_some_and(|host| {
+                        // The partition's replica likewise: it leads, or it
+                        // follows a known leader among the voters the group
+                        // grew to (F24); readiness never requires leadership.
                         let progress = host.progress();
-                        !progress.stopped
-                            && progress.applied_index > 0
-                            && progress.leader == progress.node
+                        !progress.stopped && progress.applied_index > 0 && progress.leader != 0
                     }) {
                         break;
                     }

@@ -164,6 +164,47 @@ impl LocalNetworkAdmin {
                     }),
                     None => None,
                 };
+                let partitions = self
+                    .partitions
+                    .as_ref()
+                    .map(|directory| {
+                        directory
+                            .hosted()
+                            .iter()
+                            .map(|hosted| {
+                                let progress = hosted.host.progress();
+                                focal_client::admin::AdminHostedPartition {
+                                    partition: hex(&hosted.plan.partition().0),
+                                    group: hex(&hosted.plan.group().0),
+                                    host: hosted.plan.host(),
+                                    leader: progress.leader,
+                                    term: progress.term,
+                                    applied_index: progress.applied_index,
+                                    stopped: progress.stopped,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let partitions_pending = self
+                    .partitions
+                    .as_ref()
+                    .map(|directory| {
+                        directory
+                            .pending()
+                            .into_iter()
+                            .map(|(partition, attempt)| {
+                                focal_client::admin::AdminPendingPartition {
+                                    partition: hex(&partition.0),
+                                    group: hex(&attempt.group),
+                                    host: attempt.host,
+                                    attempts: attempt.attempts,
+                                    last_refusal: attempt.last_refusal,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(OperatorReply::Health(AdminNodeHealth {
                     node: self.identity.node,
                     root_stopped: root.stopped,
@@ -174,6 +215,8 @@ impl LocalNetworkAdmin {
                     installed: fleet.installed,
                     running: fleet.running,
                     placement,
+                    partitions,
+                    partitions_pending,
                 }))
             }
             OperatorRead::Replica { session } => {
@@ -466,14 +509,21 @@ impl LocalNetworkAdmin {
             .and_then(|reply| reply.placement.control.as_ref())
             .zip(committed.as_ref())
             .is_some_and(|(control, policy)| {
-                let tolerates = match policy.intent.durability.survive {
-                    crate::config::FailureDomain::Node => control.root.tolerates_node,
-                    crate::config::FailureDomain::Zone => control.root.tolerates_zone,
-                    crate::config::FailureDomain::Region => control.root.tolerates_region,
-                };
-                control.root.blocked_by.is_empty()
-                    && tolerates
-                        .is_some_and(|tolerates| tolerates >= policy.intent.durability.max_failures)
+                // The root and every partition group: a session is routed
+                // and placed by both.
+                std::iter::once(&control.root)
+                    .chain(&control.partitions)
+                    .all(|group| {
+                        let tolerates = match policy.intent.durability.survive {
+                            crate::config::FailureDomain::Node => group.tolerates_node,
+                            crate::config::FailureDomain::Zone => group.tolerates_zone,
+                            crate::config::FailureDomain::Region => group.tolerates_region,
+                        };
+                        group.blocked_by.is_empty()
+                            && tolerates.is_some_and(|tolerates| {
+                                tolerates >= policy.intent.durability.max_failures
+                            })
+                    })
             });
         let policy_satisfied = !truncated
             && control_satisfied

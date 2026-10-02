@@ -266,10 +266,13 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
         matches!(found.page.result,RequestStreamReadResult::Receipt{resolution:ManagedReceiptResolution::Retained(ref receipt),..} if **receipt==cursor_receipt.receipt)
     );
     fleet.isolate(leader);
-    assert!(matches!(
-        exchange(&fleet, leader, &lookup).await,
-        Response::Error(AccessError::Unavailable)
-    ));
+    // An isolated leader answers nothing it cannot prove current: not from
+    // its own state as leader, not as the follower it becomes.
+    let isolated = exchange(&fleet, leader, &lookup).await;
+    assert!(
+        matches!(isolated, Response::Error(AccessError::Unavailable)),
+        "the isolated leader answered {isolated:?}"
+    );
     let next = current_leader(&fleet, Some(leader)).await;
     let Response::Managed(retried) = exchange(&fleet, next, &mutation).await else {
         panic!("retry")

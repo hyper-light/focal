@@ -1236,6 +1236,19 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
     };
     assert_eq!(after.configuration_index, added.committed_index);
     assert_eq!(after.configuration.learners, vec![4]);
+    // The entry that changed the configuration is on record, the same on
+    // the leader and on a follower: what the group's voters attest to the
+    // root when its grant follows the log (F24).
+    let (leader, ControlReadResult::MembershipRecord(Some(record))) = rig
+        .read_on_leader(leader, 912, ControlRead::MembershipRecord)
+        .await
+    else {
+        panic!("membership record")
+    };
+    assert_eq!(record.index, added.committed_index);
+    assert_eq!(record.term, added.committed_term);
+    assert_eq!(record.request_hash, added.request_hash);
+    assert_eq!(record.configuration, after.configuration);
     // A follower answers the exact request from what was committed.
     let mut follower = (leader + 1) % 3;
     assert_eq!(

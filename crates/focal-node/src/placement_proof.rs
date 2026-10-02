@@ -434,8 +434,12 @@ pub fn prepare_membership_proof(
         .node(node)
         .ok_or(PlacementProofError::Unauthorized)?;
     let generation = signer.enrollment.generation;
-    if !matches!(current.scope, GroupScope::Session(_))
-        || next.scope != current.scope
+    // A session's group or a directory partition's (F24): both change their
+    // grant by their installed voters' attestation of the committed entry.
+    if !matches!(
+        current.scope,
+        GroupScope::Session(_) | GroupScope::Partition { .. }
+    ) || next.scope != current.scope
         || next.genesis != current.genesis
         || !(current
             .voters

@@ -47,6 +47,7 @@ pub enum SessionSignReply {
 pub(crate) fn decode_placement_control(
     verified: &VerifiedRequest,
     bytes: &[u8],
+    cluster: [u8; 16],
 ) -> Result<ControlRpc, ControlFailure> {
     let PeerRole::Node { node_id } = verified.peer().role() else {
         return Err(ControlFailure::Unauthorized);
@@ -65,13 +66,31 @@ pub(crate) fn decode_placement_control(
             let ControlRpc::Submit(request) = &rpc else {
                 return Err(ControlFailure::Unauthorized);
             };
-            // The request client is the sender's enrolled principal, or the
+            // The request client is the sender's enrolled principal, the
             // client its root intents are named by (distinct from its
-            // partition intents, which share this owner's receipt space).
+            // partition intents, which share this owner's receipt space),
+            // or the local client its own agent is named by — bound to the
+            // node as the others are, and the name of a partition intent it
+            // journaled while it led the partition and now submits through
+            // the node that leads it (F24).
             let principal = verified.peer().principal().0;
-            if request.id.client != principal && request.id.client != root_intent_client(principal)
+            if request.id.client != principal
+                && request.id.client != root_intent_client(principal)
+                && request.id.client
+                    != crate::placement_agent::PlacementAgent::local_client(cluster, node_id)
             {
                 return Err(ControlFailure::Unauthorized);
+            }
+            // A group's membership change carries its own authority: the
+            // proof the group's installed voters signed, which the root
+            // verifies (24 §13). Whichever node leads the group intends it,
+            // the root's leader included (F24).
+            if let ControlCommand::Authority(focal_directory::AuthorityCommand {
+                operation: focal_directory::AuthorityOperation::ChangeGroup { .. },
+                ..
+            }) = &request.command
+            {
+                return Ok(rpc);
             }
             // A node bootstraps the group of a session it created alone: a
             // grant naming only itself (24 §16); every other root authority
@@ -258,6 +277,20 @@ pub struct PlannedControl {
     pub voters: Vec<u64>,
     pub configuration_index: u64,
     pub state: PlanState,
+    /// The directory's partition groups, planned by the same rule (F24).
+    pub partitions: Vec<PlannedPartition>,
+}
+/// One partition group's voters under the requested durability, at the
+/// group's configuration they were planned against; `Refused` where no set
+/// of nodes seats it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPartition {
+    pub partition: [u8; 16],
+    pub group: [u8; 16],
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    pub state: PlanState,
+    pub refused: bool,
 }
 /// How a plan request was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,23 +532,30 @@ impl PlacementHandle {
 pub async fn sign_session_fact(
     fleet: &FleetManager,
     control: &ControlHost,
+    directory: &crate::network_service::DirectoryHandle,
     signer: &PlacementHandle,
     ledger: focal_model::LedgerId,
     fact: SessionFact,
     window: ProofWindow,
 ) -> Result<AccountedAuthorityProof, PlacementProofError> {
-    let permit = prepare_session_fact(fleet, control, ledger, fact, window).await?;
+    let permit = prepare_session_fact(fleet, control, directory, ledger, fact, window).await?;
     signer.sign(permit).await
 }
 
-/// Witness `fact` locally and prepare the permit; the caller signs it.
+/// Witness `fact` locally and prepare the permit; the caller signs it. A
+/// fact under the directory's own namespace is a partition group's (F24):
+/// its membership is witnessed from this node's replica of that group.
 pub async fn prepare_session_fact(
     fleet: &FleetManager,
     control: &ControlHost,
+    directory: &crate::network_service::DirectoryHandle,
     ledger: focal_model::LedgerId,
     fact: SessionFact,
     window: ProofWindow,
 ) -> Result<crate::placement_proof::SessionProofPermit, PlacementProofError> {
+    if ledger == directory.namespace() {
+        return prepare_partition_fact(control, directory, fact, window).await;
+    }
     let host = fleet
         .current_host(ledger)
         .map_err(|_| PlacementProofError::Unauthorized)?;
@@ -572,4 +612,51 @@ pub async fn prepare_session_fact(
             control.prepare_membership_proof(next, record, window).await
         }
     }
+}
+/// Witness a partition group's membership from this node's replica of it:
+/// the configuration it applied and the entry that changed it, the same on
+/// every member, so the root's grant follows the group's log (F24).
+async fn prepare_partition_fact(
+    control: &ControlHost,
+    directory: &crate::network_service::DirectoryHandle,
+    fact: SessionFact,
+    window: ProofWindow,
+) -> Result<crate::placement_proof::SessionProofPermit, PlacementProofError> {
+    let SessionFact::Membership { next, record } = fact else {
+        return Err(PlacementProofError::Unauthorized);
+    };
+    let host = directory
+        .host_of_group(next.group.0)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let witness = host
+        .witness_membership()
+        .await
+        .map_err(|error| match error {
+            focal_control::ControlFailure::Capacity => PlacementProofError::Capacity,
+            focal_control::ControlFailure::Unavailable
+            | focal_control::ControlFailure::NotReady => PlacementProofError::Unavailable,
+            _ => PlacementProofError::Unauthorized,
+        })?;
+    let configuration = &witness.configuration.configuration;
+    let same = |applied: &[u64], granted: &std::collections::BTreeMap<u64, u64>| {
+        applied.iter().copied().eq(granted.keys().copied())
+    };
+    let latest = witness
+        .record
+        .as_ref()
+        .ok_or(PlacementProofError::Unauthorized)?;
+    if !same(&configuration.voters, &next.voters)
+        || !same(&configuration.voters_outgoing, &next.outgoing_voters)
+        || !same(&configuration.learners, &next.learners)
+        || !configuration.learners_next.is_empty()
+        || configuration.auto_leave
+        || latest.index != witness.configuration.configuration_index
+        || latest.index != record.index.0
+        || latest.term != record.term.0
+        || latest.request_hash != record.record_hash.0
+        || latest.configuration != *configuration
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    control.prepare_membership_proof(next, record, window).await
 }

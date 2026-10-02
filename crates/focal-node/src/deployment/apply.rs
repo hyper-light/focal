@@ -223,6 +223,30 @@ pub fn preflight(
                     return Err(stale("root".into(), "members"));
                 }
             }
+            Change::PlanPartition {
+                partition,
+                group,
+                voters,
+                ..
+            } => {
+                let name = partition_name(partition);
+                let observed = current
+                    .control
+                    .as_ref()
+                    .and_then(|control| {
+                        control
+                            .partitions
+                            .iter()
+                            .find(|observed| observed.partition == *partition)
+                    })
+                    .ok_or_else(|| stale(name.clone(), "presence"))?;
+                if observed.group != *group {
+                    return Err(stale(name, "group"));
+                }
+                if voters.iter().any(|voter| !current.nodes.contains(voter)) {
+                    return Err(stale(name, "members"));
+                }
+            }
             Change::PlanSession {
                 tenant,
                 session,
@@ -274,6 +298,9 @@ pub fn session_progress(
     Phase::Committed
 }
 
+fn partition_name(partition: &[u8; 16]) -> String {
+    format!("partition {}", super::hex(partition))
+}
 pub fn journal_dir(root: &Path, plan_id: &[u8; 16]) -> PathBuf {
     root.join("cluster").join("apply").join(hex(plan_id))
 }
@@ -504,6 +531,73 @@ pub async fn apply(
                     tokio::time::sleep(POLL).await;
                 }
             }
+            Change::PlanPartition {
+                partition, voters, ..
+            } => {
+                if journal.phase(index).is_none() {
+                    journal.record(index, Phase::Prepared, None, now_ms()?)?;
+                    write_journal(&dir, &journal)?;
+                }
+                // Each planned voter the group does not hold is admitted as
+                // a learner first — no controller admits partition learners
+                // on its own — then promoted once it votes nowhere yet, has
+                // a replica (the root's grant seats it and it hosts one)
+                // and has caught up; refusals for a learner behind, a group
+                // not ready or a configuration that moved are asked again
+                // within the operator's allowance, as the root's are.
+                loop {
+                    let current = admin.partition_configuration(*partition).await?;
+                    let configuration = &current.configuration.configuration;
+                    let next = voters
+                        .iter()
+                        .copied()
+                        .find(|voter| !configuration.voters.contains(voter));
+                    let Some(node) = next else {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        write_journal(&dir, &journal)?;
+                        break;
+                    };
+                    let mut advanced = false;
+                    if configuration.voters_outgoing.is_empty() {
+                        let change = if configuration.learners.contains(&node) {
+                            focal_consensus::MembershipChange::Promote { node }
+                        } else {
+                            focal_consensus::MembershipChange::AddLearner { node }
+                        };
+                        match admin
+                            .partition_change(
+                                *partition,
+                                change,
+                                Some(current.configuration.configuration_index),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                journal.record(index, Phase::Committed, None, now_ms()?)?;
+                                write_journal(&dir, &journal)?;
+                                advanced = true;
+                            }
+                            Err(
+                                ClusterAdminError::Pending
+                                | ClusterAdminError::Control(
+                                    focal_control::ControlFailure::NotReady
+                                    | focal_control::ControlFailure::CompareFailed
+                                    | focal_control::ControlFailure::Unavailable
+                                    | focal_control::ControlFailure::OutcomeUnknown,
+                                ),
+                            ) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    if advanced {
+                        continue;
+                    }
+                    if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+            }
             Change::PlanSession {
                 tenant,
                 session,
@@ -653,6 +747,28 @@ pub async fn status(
                         .as_ref()
                         .and_then(|current| current.control.as_ref())
                         .is_some_and(|root| voters.iter().all(|voter| root.voters.contains(voter)));
+                    if seated {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        changed = true;
+                    }
+                    continue;
+                }
+                if let Change::PlanPartition {
+                    partition, voters, ..
+                } = change
+                {
+                    let seated = current
+                        .as_ref()
+                        .and_then(|current| current.control.as_ref())
+                        .and_then(|control| {
+                            control
+                                .partitions
+                                .iter()
+                                .find(|observed| observed.partition == *partition)
+                        })
+                        .is_some_and(|group| {
+                            voters.iter().all(|voter| group.voters.contains(voter))
+                        });
                     if seated {
                         journal.record(index, Phase::Complete, None, now_ms()?)?;
                         changed = true;

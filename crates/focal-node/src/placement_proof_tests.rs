@@ -253,3 +253,97 @@ async fn only_installed_group_and_real_committed_fence_can_produce_an_accounted_
     drop(proof);
     assert_eq!(owner_budget.stats().used, 0);
 }
+
+/// A directory partition group changes its grant as a session's does (the
+/// audit's F24): the root prepares the permit for its installed voter's
+/// attestation of the committed entry, and refuses a node that is not a
+/// voter of it — the same conditions, whichever scope the group serves.
+#[tokio::test]
+async fn a_partition_groups_membership_permit_is_prepared_for_its_voter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut network, plan) = crate::directory_bootstrap::tests::prepared_network(dir.path()).await;
+    let now = unix_time().unwrap();
+    let budget = MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+    // The founder re-granted at its next generation (a topology re-grant,
+    // 24 §22): the group's grant follows it without a change of voters,
+    // which is the smallest change a grant may attest.
+    let founder = network
+        .control
+        .authority()
+        .unwrap()
+        .node(plan.founder_node())
+        .unwrap()
+        .clone();
+    let revision = network.control.authority().unwrap().revision();
+    let mut regrant = founder.clone();
+    regrant.enrollment.generation = 2;
+    // A command carries no attestation; the installed grant's is the
+    // verified one.
+    regrant.enrollment.attestation = ContentHash([0; 32]);
+    crate::directory_bootstrap::tests::commit(
+        &mut network.control,
+        5,
+        ControlCommand::Authority(AuthorityCommand {
+            expected_revision: revision,
+            enrollment_revision: 1,
+            decided_at: now,
+            operation: AuthorityOperation::GrantNode {
+                grant: regrant,
+                expected_generation: Some(1),
+            },
+        }),
+    );
+    let current = network
+        .control
+        .authority()
+        .unwrap()
+        .group(plan.group())
+        .unwrap()
+        .clone();
+    assert!(matches!(current.scope, GroupScope::Partition { .. }));
+    let next = GroupAuthorityGrant {
+        voters: BTreeMap::from([(plan.founder_node(), 2)]),
+        ..current.clone()
+    };
+    let record = MembershipRecord {
+        index: RaftIndex(3),
+        term: RaftTerm(1),
+        record_hash: ContentHash([9; 32]),
+    };
+    let window = ProofWindow {
+        issued_at: now,
+        expires_at: now + 60,
+    };
+    let permit = prepare_membership_proof(
+        &network.control,
+        plan.founder_node(),
+        &next,
+        &record,
+        window,
+        now,
+        &budget,
+    )
+    .unwrap();
+    let proof = permit.sign(&network.credentials).unwrap();
+    assert!(matches!(
+        &proof.proof().statement.fact,
+        AuthorityFact::Membership { next: attested, index, .. }
+            if attested.group == plan.group() && *index == RaftIndex(3)
+    ));
+    drop(proof);
+    assert_eq!(budget.stats().used, 0);
+    // A node that holds no seat in the group signs nothing for it.
+    assert!(matches!(
+        prepare_membership_proof(
+            &network.control,
+            plan.founder_node() + 1,
+            &next,
+            &record,
+            window,
+            now,
+            &budget,
+        ),
+        Err(PlacementProofError::Unauthorized)
+    ));
+    assert_eq!(budget.stats().used, 0);
+}

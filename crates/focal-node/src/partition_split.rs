@@ -371,7 +371,7 @@ impl PlacementAgent {
             }
             handles.directory.request(HostRequest::Host {
                 plan: Box::new(plan),
-                image: Box::new(image),
+                image: Some(Box::new(image)),
             })?;
             return Ok(Some(AgentStep::Advanced));
         };

@@ -86,7 +86,21 @@ struct CheckpointV7<S = ControlBootstrap> {
     configuration_index: u64,
     contacts: Option<ContactCheckpoint>,
 }
-const CHECKPOINT_SCHEMA: u16 = 7;
+/// Schema 8: the record of the latest configuration change, so a restarted
+/// replica still attests it (the audit's F24).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV8<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
+    contacts: Option<ContactCheckpoint>,
+    membership: Option<ControlMembershipRecord>,
+}
+const CHECKPOINT_SCHEMA: u16 = 8;
 const COMMAND_SCHEMA: u16 = 2;
 struct Pending {
     request: ControlRequestId,
@@ -136,6 +150,8 @@ pub struct ControlReplica {
     pending: Option<Pending>,
     applied_index: u64,
     configuration_index: u64,
+    /// The entry that last changed the configuration, once one has.
+    membership: Option<ControlMembershipRecord>,
     drained: bool,
     failed: bool,
 }
@@ -165,6 +181,7 @@ impl ControlReplica {
             pending: None,
             applied_index: 0,
             configuration_index: 0,
+            membership: None,
             drained: false,
             failed: false,
         })
@@ -192,6 +209,7 @@ impl ControlReplica {
             pending: None,
             applied_index: 0,
             configuration_index: 0,
+            membership: None,
             drained: false,
             failed: false,
         })
@@ -256,7 +274,7 @@ impl ControlReplica {
             ControlRead::Receipt(_) => 4096,
             ControlRead::Membership => 2048 * 16 + 4096,
             ControlRead::Authority => self.machine.authority_estimate()?,
-            ControlRead::Configuration => 2048 * 16 + 4096,
+            ControlRead::Configuration | ControlRead::MembershipRecord => 2048 * 16 + 4096,
             ControlRead::Contacts => self.machine.contact_charge(),
             ControlRead::InvitationPage { limit, .. } => {
                 if *limit == 0 || *limit > 64 {
@@ -398,6 +416,9 @@ impl ControlReplica {
                     command: Some(Box::new(command)),
                 })
             }
+            ControlRead::MembershipRecord => {
+                Ok(ControlReadResult::MembershipRecord(self.membership.clone()))
+            }
             ControlRead::Configuration => {
                 Ok(ControlReadResult::Configuration(self.configuration()))
             }
@@ -518,6 +539,10 @@ impl ControlReplica {
             configuration_index: self.configuration_index,
             configuration: self.node.membership_configuration(),
         }
+    }
+    /// The entry that last changed the configuration, as applied here.
+    pub fn membership_record(&self) -> Option<&ControlMembershipRecord> {
+        self.membership.as_ref()
     }
     pub fn accepts_peer(&self, node: u64) -> bool {
         self.node.membership_configuration().contains(node)
@@ -861,7 +886,7 @@ impl ControlReplica {
             )?;
             let (schema, _) = postcard::take_from_bytes::<u16>(&snapshot.data)?;
             let limit = self.options.limits.max_checkpoint_bytes;
-            let (checkpoint, authority, configuration_index, contacts) = match schema {
+            let (checkpoint, authority, configuration_index, contacts, membership) = match schema {
                 1 => {
                     let legacy: Checkpoint<LegacyControlBootstrap> = decode(&snapshot.data, limit)?;
                     (
@@ -874,6 +899,7 @@ impl ControlReplica {
                         },
                         None,
                         0,
+                        None,
                         None,
                     )
                 }
@@ -891,6 +917,7 @@ impl ControlReplica {
                         Some(newer.authority),
                         0,
                         None,
+                        None,
                     )
                 }
                 3 => {
@@ -907,6 +934,7 @@ impl ControlReplica {
                         newer.authority,
                         newer.configuration_index,
                         newer.contacts.map(ContactCheckpoint::from),
+                        None,
                     )
                 }
                 4 => {
@@ -922,6 +950,7 @@ impl ControlReplica {
                         newer.authority,
                         newer.configuration_index,
                         newer.contacts.map(ContactCheckpoint::from),
+                        None,
                     )
                 }
                 5 => {
@@ -937,6 +966,7 @@ impl ControlReplica {
                         newer.authority,
                         newer.configuration_index,
                         newer.contacts.map(ContactCheckpoint::from),
+                        None,
                     )
                 }
                 6 => {
@@ -952,6 +982,7 @@ impl ControlReplica {
                         newer.authority,
                         newer.configuration_index,
                         newer.contacts.map(ContactCheckpoint::from),
+                        None,
                     )
                 }
                 7 => {
@@ -967,6 +998,23 @@ impl ControlReplica {
                         newer.authority,
                         newer.configuration_index,
                         newer.contacts,
+                        None,
+                    )
+                }
+                8 => {
+                    let newer: CheckpointV8 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts,
+                        newer.membership,
                     )
                 }
                 _ => return Err(ControlError::Corrupt("checkpoint schema")),
@@ -1015,6 +1063,13 @@ impl ControlReplica {
                 return Err(ControlError::Corrupt("contacts cannot disappear"));
             }
             self.configuration_index = configuration_index;
+            if membership
+                .as_ref()
+                .is_some_and(|record| record.index != configuration_index)
+            {
+                return Err(ControlError::Corrupt("checkpoint membership record"));
+            }
+            self.membership = membership;
             if let Some(pending) = self.pending.take() {
                 output.uncertain = Some(pending.request);
             }
@@ -1052,9 +1107,14 @@ impl ControlReplica {
                 return Err(ControlError::Corrupt("application index regression"));
             }
             let prior_configuration = self.configuration_index;
-            if membership.is_some() {
+            if let Some(applied) = &membership {
                 self.configuration_index = entry.index;
                 if entry.data.is_empty() {
+                    self.membership = Some(ControlMembershipRecord::of_entry(
+                        entry.index,
+                        entry.term,
+                        applied.after.clone(),
+                    )?);
                     self.applied_index = entry.index;
                     continue;
                 }
@@ -1091,6 +1151,14 @@ impl ControlReplica {
                     self.machine.revisions(),
                 )?;
                 self.retries = retries;
+                if let Some(applied) = &membership {
+                    self.membership = Some(ControlMembershipRecord {
+                        index: entry.index,
+                        term: entry.term,
+                        request_hash: pending.request_hash,
+                        configuration: applied.after.clone(),
+                    });
+                }
                 self.applied_index = entry.index;
                 output.completed = Some(receipt);
                 continue;
@@ -1126,6 +1194,14 @@ impl ControlReplica {
                 _ => {}
             }
             let request_hash = envelope.request.digest()?;
+            if let Some(applied) = &membership {
+                self.membership = Some(ControlMembershipRecord {
+                    index: entry.index,
+                    term: entry.term,
+                    request_hash,
+                    configuration: applied.after.clone(),
+                });
+            }
             if let Some(existing) = self.retries.existing(&envelope.request, request_hash)? {
                 if self
                     .pending
@@ -1219,7 +1295,7 @@ impl ControlReplica {
             .machine
             .export_authority(self.identity, self.applied_index)?;
         let bytes = encode(
-            &CheckpointV7 {
+            &CheckpointV8 {
                 schema: CHECKPOINT_SCHEMA,
                 identity: self.identity,
                 applied_index: self.applied_index,
@@ -1228,6 +1304,7 @@ impl ControlReplica {
                 authority,
                 configuration_index: self.configuration_index,
                 contacts: self.machine.contacts().cloned(),
+                membership: self.membership.clone(),
             },
             self.options.limits.max_checkpoint_bytes,
         )?;
