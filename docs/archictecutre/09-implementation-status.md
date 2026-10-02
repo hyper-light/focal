@@ -12778,3 +12778,8 @@ remediation record under the drained leader's heal). The replica diagnostics pri
 the promises a replica holds and the index they stand at. On the way: the
 replication driver gave up nothing it still held for a peer's lane when its owner's
 egress ended, and dropped it uncounted; it gives them up and counts them now.
+Then the gate was opened at its cause: the discovery's round-robin covers, beside the
+voters, the learners and the nodes the directory names for the session that the log
+does not hold yet (the placement agent admits a pending plan's voters on every hosted
+copy before the log names them), so a replacement copy is asked for its promise ahead
+of its admission, and the admission waits on nothing.

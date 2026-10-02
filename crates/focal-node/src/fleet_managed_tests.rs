@@ -193,6 +193,45 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
     drop(outgoing);
     assert_eq!(budget.stats().used, 0);
 }
+/// A node the directory names for the session that the log does not hold
+/// yet — a healing placement's replacement copy, admitted by the agent on
+/// every hosted copy before the log names it — is asked for its promise
+/// before any admission of it is queued: a native group admits a learner
+/// only once its leader holds the promise, and the node cannot push it,
+/// not being a member (the drained leader's heal, 2026-10-02). A learner
+/// is asked too: its promotion wants its promise at the configuration
+/// that admitted it.
+#[test]
+fn discovery_asks_the_nodes_the_directory_names_before_the_log_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut initial = session(&directory.path().join("one"), 1);
+    initial.begin_managed_support().unwrap();
+    initial.poll().unwrap();
+    let (mut owner, outgoing, budget) = assemble(initial);
+    // Alone, nothing to ask: the only voter is this node.
+    let alone = support(&mut owner).unwrap();
+    assert_eq!(alone.targets().count(), 0);
+    drop(alone);
+    // Named by the directory, not by the log: asked.
+    owner.admitted = vec![2];
+    let named = support(&mut owner).unwrap();
+    assert_eq!(named.targets().collect::<Vec<_>>(), [2]);
+    drop(named);
+    // Once its promise is held at the current configuration, no longer.
+    let mut joined = session(&directory.path().join("two"), 2);
+    joined.begin_managed_support().unwrap();
+    joined.poll().unwrap();
+    let fact = joined.managed_support().unwrap();
+    owner.session.record_managed_support(2, fact).unwrap();
+    let held = support(&mut owner).unwrap();
+    assert_eq!(held.targets().count(), 0);
+    drop(held);
+    owner.close();
+    drop(owner);
+    drop(outgoing);
+    drop(joined);
+    assert_eq!(budget.stats().used, 0);
+}
 #[test]
 fn trusted_membership_nominates_real_joining_decoder_and_waits_for_fact() {
     let directory = tempfile::tempdir().unwrap();

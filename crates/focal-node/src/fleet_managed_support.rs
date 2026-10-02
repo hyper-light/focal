@@ -131,10 +131,21 @@ impl Owner {
                 if targets.get(slot).is_some_and(Option::is_some) {
                     continue;
                 }
+                // Every node whose promise this replica may come to need:
+                // the voters, the learners (a promotion wants the learner's
+                // promise at the configuration that admitted it) and the
+                // nodes the directory names for this session that the log
+                // does not hold yet (a healing placement's replacement copy,
+                // whose admission a native group holds until its leader has
+                // the promise — and which cannot push it, not being a
+                // member; the drained leader's heal, 2026-10-02).
                 let eligible = || {
                     fact.voters
                         .iter()
                         .chain(&fact.voters_outgoing)
+                        .chain(&fact.learners)
+                        .chain(&fact.learners_next)
+                        .chain(&self.admitted)
                         .copied()
                         .filter(|node| {
                             (!self.session.managed_protocol_active()

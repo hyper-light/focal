@@ -2566,7 +2566,14 @@ now print the promises a replica holds and the index they stand at (`promises_at
 `managed_promises`, `native_promises`), so the next run of the heal shows whether the
 replacement's promise ever reached the leader; closing the window itself — asking a
 candidate's promise when the directory names it, not only while an admission is
-queued — is the next step. Writing the schedules also found the replication driver
+queued — was the next step, and is done: the discovery's round-robin now covers,
+beside the voters, the learners (a promotion wants the learner's promise at the
+configuration that admitted it) and the nodes the directory names for the session
+that the log does not hold yet (the placement agent admits a pending plan's voters on
+every hosted copy, the leader's included, before the log names them), so a healing
+placement's replacement is asked for its promise before its admission is asked for,
+and the admission waits on nothing; guarded in `fleet_managed_tests.rs`. Writing the
+schedules also found the replication driver
 ending with frames still waiting for a peer's lane when its owner's egress ended —
 dropped without a count or a word to their owners; it gives them up as every frame
 not sent is now, and its report says so (`sent`, beside `attempted`, `accepted`,
