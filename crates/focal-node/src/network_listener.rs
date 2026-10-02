@@ -6,7 +6,6 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_wire::{ALPN, PeerRegistry, RequestHandler, TlsIdentity, WireError, WireLimits};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustls::{
-    pki_types::CertificateDer,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -79,21 +78,19 @@ impl ResolvesServerCert for ProtocolCertificate {
 fn server_config(
     node: &CredentialMaterial,
     enrollment: Option<&CredentialMaterial>,
-    ca: &[u8],
+    roots: &[Vec<u8>],
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(ca))
-        .map_err(|_| WireError::Authentication)?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
+    // A client's chain is verified against the issuers this node trusts,
+    // and through a predecessor's endorsement when the client's issuer
+    // succeeded one of them since (24 §11); the enrollment protocol
+    // authenticates a joiner without a certificate.
+    let verifier = focal_wire::EndorsingClientVerifier::new(
+        focal_wire::TrustRoots::new(roots.to_vec())?,
         provider.clone(),
-    )
-    .allow_unauthenticated()
-    .build()
-    .map_err(|_| WireError::Authentication)?;
+        true,
+    )?;
     let identity = TlsIdentity::from_pkcs8(
         node.certificate_chain().to_vec(),
         node.private_key_der().to_vec(),
@@ -125,19 +122,20 @@ fn server_config(
 #[derive(Clone)]
 pub struct ListenerIdentity {
     endpoint: quinn::Endpoint,
-    ca: Vec<u8>,
     limits: WireLimits,
 }
 impl ListenerIdentity {
     /// Present `node` as the data identity and `enrollment` as the
     /// enrollment identity (the founder's; none elsewhere) from the next
-    /// handshake on.
+    /// handshake on, verifying clients against `roots` — the issuers the
+    /// committed registry names (24 §11), as the controller holds them.
     pub fn replace(
         &self,
         node: &CredentialMaterial,
         enrollment: Option<&CredentialMaterial>,
+        roots: &[Vec<u8>],
     ) -> Result<(), WireError> {
-        let config = server_config(node, enrollment, &self.ca, &self.limits)?;
+        let config = server_config(node, enrollment, roots, &self.limits)?;
         self.endpoint.set_server_config(Some(config));
         Ok(())
     }
@@ -154,22 +152,22 @@ pub struct NetworkListener {
     /// the identity they authenticated as.
     admission: focal_wire::Admission,
     budget: MemoryBudget,
-    ca: Vec<u8>,
 }
 impl NetworkListener {
     /// A handle that swaps the identity this endpoint presents.
     pub fn identity(&self) -> Result<ListenerIdentity, WireError> {
         Ok(ListenerIdentity {
             endpoint: self.endpoint.clone().ok_or(WireError::Connection)?,
-            ca: self.ca.clone(),
             limits: self.limits.clone(),
         })
     }
+    /// `roots`: the issuers' certificates clients' chains are verified
+    /// against (24 §11).
     pub fn bind(
         address: SocketAddr,
         node: &CredentialMaterial,
         enrollment: Option<&CredentialMaterial>,
-        ca: &[u8],
+        roots: &[Vec<u8>],
         registry: PeerRegistry,
         limits: WireLimits,
         budget: MemoryBudget,
@@ -179,7 +177,7 @@ impl NetworkListener {
             UdpSocket::bind(address)?,
             node,
             enrollment,
-            ca,
+            roots,
             registry,
             limits,
             budget,
@@ -189,14 +187,14 @@ impl NetworkListener {
         socket: UdpSocket,
         node: &CredentialMaterial,
         enrollment: Option<&CredentialMaterial>,
-        ca: &[u8],
+        roots: &[Vec<u8>],
         registry: PeerRegistry,
         limits: WireLimits,
         budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
         limits.validate()?;
-        let config = server_config(node, enrollment, ca, &limits)?;
+        let config = server_config(node, enrollment, roots, &limits)?;
         let join_limits = TransportLimits::default();
         let allocation = budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)
@@ -237,7 +235,6 @@ impl NetworkListener {
             admission,
             join_limits,
             budget,
-            ca: ca.to_vec(),
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {

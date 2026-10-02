@@ -816,6 +816,7 @@ mod tests {
             1,
             [32; 16],
             EnrollmentLimits::default(),
+            0,
             NOW,
         )
         .unwrap();

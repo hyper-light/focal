@@ -25,6 +25,9 @@ impl FoundingEnrollmentDraft {
     /// so retries cannot replace a certificate after a lost genesis response.
     /// This constructor has no existing-registry argument: replacing an already
     /// installed genesis is never an enrollment operation supported by this API.
+    /// `level` is the founding binary's capability level, the fence the
+    /// cluster holds from genesis (24 §21); zero founds without one.
+    #[allow(clippy::too_many_arguments)] // One founding: the place, the authority, the key, the identity, the policy, the level and the moment, each its own fact.
     pub fn open_or_create(
         path: impl AsRef<Path>,
         authority: &BootstrapAuthority,
@@ -32,6 +35,7 @@ impl FoundingEnrollmentDraft {
         node: u64,
         principal: [u8; 16],
         limits: EnrollmentLimits,
+        level: u32,
         now: i64,
     ) -> Result<Self, EnrollmentError> {
         if node == 0 || principal == [0; 16] || key.cluster() != authority.cluster() {
@@ -49,8 +53,9 @@ impl FoundingEnrollmentDraft {
                 (registry, saved.receipt)
             }
             None => {
-                let (registry, receipt) =
-                    EnrollmentRegistry::founding(authority, key, node, principal, limits, now)?;
+                let (registry, receipt) = EnrollmentRegistry::founding(
+                    authority, key, node, principal, limits, level, now,
+                )?;
                 let saved = SavedFounder {
                     schema: 1,
                     registry: registry.checkpoint()?,
@@ -92,7 +97,7 @@ impl FoundingEnrollmentDraft {
         {
             return Err(EnrollmentError::Conflict);
         }
-        crate::pki::verify_issued(&receipt, authority.ca_certificate())?;
+        crate::pki::verify_issued(&receipt, registry.trust_roots())?;
         Ok(Self {
             registry,
             receipt,
@@ -134,6 +139,7 @@ mod tests {
             41,
             [6; 16],
             EnrollmentLimits::default(),
+            0,
             now(),
         )
         .unwrap();
@@ -156,6 +162,7 @@ mod tests {
             41,
             [6; 16],
             EnrollmentLimits::default(),
+            0,
             now() + 1,
         )
         .unwrap();
@@ -166,7 +173,7 @@ mod tests {
         assert_eq!(restored.enrollments().next(), Some(&receipt));
         // The owner may complete local key custody only after installing genesis.
         let material = key
-            .complete(&receipt, authority.ca_certificate(), now())
+            .complete(&receipt, authority.issuers().unwrap().trusted(), now())
             .unwrap();
         assert_eq!(
             material.certificate_chain().first(),
@@ -181,6 +188,7 @@ mod tests {
                 42,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Conflict)
@@ -193,6 +201,7 @@ mod tests {
                 41,
                 [7; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Conflict)
@@ -206,6 +215,7 @@ mod tests {
                 41,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Conflict)
@@ -219,6 +229,7 @@ mod tests {
                 41,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Corrupt)
@@ -243,6 +254,7 @@ mod tests {
                 41,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::WrongCluster)
@@ -256,6 +268,7 @@ mod tests {
                 u64::MAX,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Capacity)

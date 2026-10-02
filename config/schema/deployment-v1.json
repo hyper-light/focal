@@ -16,7 +16,8 @@
         "seeds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
         "max_tenants": { "type": ["integer", "null"], "minimum": 1, "maximum": 1024 },
         "metrics_listen": { "type": ["string", "null"] },
-        "credential_lifetime_seconds": { "type": ["integer", "null"], "minimum": 3, "maximum": 31536000 }
+        "credential_lifetime_seconds": { "type": ["integer", "null"], "minimum": 3, "maximum": 31536000 },
+        "issuer_lifetime_seconds": { "type": ["integer", "null"], "minimum": 18, "maximum": 315360000 }
       }
     },
     "topology": {

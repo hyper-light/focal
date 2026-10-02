@@ -681,24 +681,35 @@ fn runbook_interrupted_upgrade() {
             .and_then(|nodes| nodes.iter().find(|entry| entry["node"] == node))
             .and_then(|entry| entry["capability"].as_u64())
     };
-    wait_until("both nodes report level 1", Duration::from_secs(90), || {
-        let view = admin(&founder, &["cluster", "upgrade", "status"])["result"]["upgrade"].clone();
-        level(&view, founder_id) == Some(1) && level(&view, host_id) == Some(1)
-    });
+    let compiled = focal_node::upgrade::CAPABILITY_LEVEL;
+    let compiled_text = compiled.to_string();
+    wait_until(
+        "both nodes report the binary's level",
+        Duration::from_secs(90),
+        || {
+            let view =
+                admin(&founder, &["cluster", "upgrade", "status"])["result"]["upgrade"].clone();
+            level(&view, founder_id) == Some(u64::from(compiled))
+                && level(&view, host_id) == Some(u64::from(compiled))
+        },
+    );
+    // A cluster founded by this binary holds the fence at its founder's
+    // level from genesis (24 §21); raising it there reads as done.
     let activated = admin(
         &founder,
-        &["cluster", "upgrade", "activate", "--fence", "1"],
+        &["cluster", "upgrade", "activate", "--fence", &compiled_text],
     );
     assert_eq!(
         activated["result"]["kind"], "fence_activated",
         "{activated}"
     );
     wait_until("the host sees the fence", Duration::from_secs(60), || {
-        admin(&host, &["cluster", "upgrade", "status"])["result"]["upgrade"]["fence_level"] == 1
+        admin(&host, &["cluster", "upgrade", "status"])["result"]["upgrade"]["fence_level"]
+            == compiled
     });
     // A binary below the fence refuses to serve; the fence never lowers.
     drop(server);
-    let (mut child, receive) = spawn(&host, &[], &[("FOCAL_CAPABILITY_LEVEL", "0")]);
+    let (mut child, receive) = spawn(&host, &[], &[("FOCAL_CAPABILITY_LEVEL", "1")]);
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -725,7 +736,7 @@ fn runbook_interrupted_upgrade() {
         Duration::from_secs(60),
         || {
             let view = admin(&host, &["cluster", "upgrade", "status"])["result"]["upgrade"].clone();
-            view["fence_level"] == 1 && view["announced_level"] == 1
+            view["fence_level"] == compiled && view["announced_level"] == compiled
         },
     );
 }

@@ -1346,9 +1346,10 @@ mod tests {
         assert!(used >= 3);
         let text = snapshot(memory).render();
         assert!(text.contains("# TYPE focal_node_info gauge"));
-        assert!(text.contains(
-            "focal_node_info{node=\"7\",cluster=\"ab\\\"cd\",role=\"founder\",region=\"eu-a\",zone=\"\",capability=\"1\"} 1"
-        ));
+        assert!(text.contains(&format!(
+            "focal_node_info{{node=\"7\",cluster=\"ab\\\"cd\",role=\"founder\",region=\"eu-a\",zone=\"\",capability=\"{}\"}} 1",
+            crate::upgrade::CAPABILITY_LEVEL
+        )));
         assert!(text.contains(&format!(
             "focal_memory_used_bytes{{node=\"7\",cluster=\"ab\\\"cd\"}} {used}"
         )));

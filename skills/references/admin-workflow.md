@@ -43,6 +43,15 @@ invitations enroll Actor participants. Preserve the original key, CSR, invitatio
 and saved request throughout a retry. Issuance and revocation operate on identity,
 not consensus membership or application custody.
 
-No tool in this skill drains a placement, renews an existing credential, installs
-a lifecycle format, launches workers, or certifies global protection. Report
-only the concrete state returned by the relevant authoritative subsystem.
+The issuer every credential chains to succeeds itself (24 §11).
+`cluster.credentials.issuers` reads the committed issuers: the one issuing,
+one staged (trusted everywhere from its staging), one retiring (trusted while
+a credential issued under it lives), and the upgrade fence the succession is
+gated on. `cluster.credentials.rotate_issuer` (founder only) stages the
+successor now; the controller activates it at its next step, every node
+renews under it, and the predecessor retires once nothing live was issued
+under it. A `fenced` refusal names the fence to raise first.
+
+No tool in this skill drains a placement, installs a lifecycle format,
+launches workers, or certifies global protection. Report only the concrete
+state returned by the relevant authoritative subsystem.

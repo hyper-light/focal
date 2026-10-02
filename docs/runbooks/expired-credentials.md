@@ -29,7 +29,10 @@ focal --data-dir NODE cluster node health
 [24 §11](../archictecutre/24-placement-execution-and-fleet-control.md)); a credential is
 past its lifetime only when the node could not reach the founder for that long, or its
 invitation was revoked. The founder renews its own the same way, through the enrollment
-host it runs.
+host it runs. The issuer the credentials chain to succeeds itself as well, in the last
+third of its committed lifetime (`node.issuer_lifetime_seconds`) or on `cluster
+credentials rotate-issuer`; `cluster credentials issuers` shows the one issuing, one
+staged and one retiring, and the upgrade fence the succession waits on.
 
 **Commands.** Within the grace the sponsor allows: `focal --data-dir NODE cluster
 credentials renew` on the node (the same key under a fresh certificate). Beyond it, or

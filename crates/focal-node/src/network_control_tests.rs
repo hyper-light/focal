@@ -228,13 +228,18 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         founder.node,
         founder.issuer.0,
         EnrollmentLimits::default(),
+        0,
         now(),
     )
     .unwrap();
     let bootstrap = ControlBootstrap::root(&root, draft.registry()).unwrap();
     let mut materials = vec![
         founder_key
-            .complete(draft.receipt(), authority.ca_certificate(), now())
+            .complete(
+                draft.receipt(),
+                authority.issuers().unwrap().trusted(),
+                now(),
+            )
             .unwrap(),
     ];
     let mut receipts = vec![draft.receipt().clone()];
@@ -311,7 +316,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             .unwrap();
         assert_eq!(receipt.identity.node_id, Some(node));
         materials.push(
-            key.complete(&receipt, authority.ca_certificate(), now())
+            key.complete(&receipt, authority.issuers().unwrap().trusted(), now())
                 .unwrap(),
         );
         receipts.push(receipt);

@@ -124,6 +124,8 @@ pub enum AdminAction {
     },
     RenewCredential,
     RotateCredential,
+    Issuers,
+    RotateIssuer,
     Placement,
     Plan,
     InviteClient {
@@ -639,6 +641,8 @@ pub(crate) fn parse(
         | "cluster.request.inspect"
         | "cluster.credentials.renew"
         | "cluster.credentials.rotate"
+        | "cluster.credentials.issuers"
+        | "cluster.credentials.rotate_issuer"
         | "cluster.placement"
         | "cluster.plan"
         | "cluster.tenants.list" => {
@@ -650,6 +654,8 @@ pub(crate) fn parse(
                 "cluster.nodes.list" => AdminAction::Contacts,
                 "cluster.credentials.renew" => AdminAction::RenewCredential,
                 "cluster.credentials.rotate" => AdminAction::RotateCredential,
+                "cluster.credentials.issuers" => AdminAction::Issuers,
+                "cluster.credentials.rotate_issuer" => AdminAction::RotateIssuer,
                 "cluster.placement" => AdminAction::Placement,
                 "cluster.plan" => AdminAction::Plan,
                 "cluster.tenants.list" => AdminAction::Tenants,

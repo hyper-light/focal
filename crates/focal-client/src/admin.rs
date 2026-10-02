@@ -648,6 +648,18 @@ pub struct AdminRangeView {
     pub pending: Option<AdminRangePending>,
     pub history: Vec<AdminRangeHistory>,
 }
+/// An issuer credentials chain to, as the admin reports it (24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminIssuerRecord {
+    pub fingerprint: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    /// Endorsed by the issuer it succeeded: presented beside it in every
+    /// chain, so a verifier holding the predecessor alone accepts it.
+    pub endorsed: bool,
+    /// When it was staged, for a successor not yet issuing.
+    pub staged_at: Option<i64>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminResult {
@@ -861,6 +873,17 @@ pub enum AdminResult {
         key_identity: String,
         renewals: u64,
         rotations: u64,
+    },
+    /// The issuers the cluster's credentials chain to, as committed (24
+    /// §11): the one issuing, one staged to succeed it, the one it
+    /// succeeded while a credential issued under it lives, and the upgrade
+    /// fence the succession is gated on.
+    Issuers {
+        current: AdminIssuerRecord,
+        successor: Option<AdminIssuerRecord>,
+        retiring: Option<AdminIssuerRecord>,
+        fence_level: u32,
+        succession_level: u32,
     },
     /// Every directory partition this node acts on, with each session's
     /// desired and achieved guarantee and what blocks it.

@@ -435,7 +435,7 @@ impl PendingJoin {
         }
         Ok(self
             .key
-            .complete(receipt, &self.bundle.invitation.trust().ca_certificate, now)?)
+            .complete(receipt, self.bundle.invitation.trust().issuers.iter(), now)?)
     }
     /// Retire this pending join (24 §24): its journal and never-enrolled key
     /// move under a marker named by the invitation they were for, so a
@@ -634,7 +634,7 @@ impl JoinedNode {
                         self.credentials.certificate_chain().to_vec(),
                         self.credentials.private_key_der().to_vec(),
                     ),
-                    vec![self.state.sponsor.ca_certificate.clone()],
+                    self.state.sponsor.root_certificates(),
                     &limits,
                 )?,
                 limits.clone(),

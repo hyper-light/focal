@@ -136,7 +136,10 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     let base = format!("node=\"{node}\",cluster=\"");
     assert!(text.contains(&format!("focal_node_info{{{base}")), "{text}");
     assert!(
-        text.contains("role=\"founder\",region=\"eu-a\",zone=\"eu-a-1\",capability=\"1\"} 1"),
+        text.contains(&format!(
+            "role=\"founder\",region=\"eu-a\",zone=\"eu-a-1\",capability=\"{}\"}} 1",
+            focal_node::upgrade::CAPABILITY_LEVEL
+        )),
         "{text}"
     );
     for series in [

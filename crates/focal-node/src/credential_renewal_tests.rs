@@ -678,6 +678,28 @@ async fn the_credential_lifetime_is_committed_at_genesis_and_a_later_change_is_r
         ),
         "{error}"
     );
+    // The issuer lifetime is committed with it: derived at genesis (twelve
+    // credential lifetimes), and a start naming another is refused too.
+    let changed_issuer = TestSettings {
+        value: {
+            let mut value = founder_settings.value.clone();
+            value.node.issuer_lifetime_seconds = Some(6 * 3600);
+            value
+        },
+        socket: founder_settings.socket.try_clone().unwrap(),
+    };
+    let error = changed_issuer.open().await.err().unwrap();
+    assert!(
+        matches!(
+            error,
+            ServiceError::Bootstrap(NetworkError::Node(NodeError::Config(
+                ConfigError::CommittedPolicyChange {
+                    field: "node.issuer_lifetime_seconds"
+                }
+            )))
+        ),
+        "{error}"
+    );
     let founder = Running::start(&founder_settings).await;
     let restarted = founder.handles.credentials.current().await.unwrap();
     assert_eq!(restarted.expires_at, genesis.expires_at);
@@ -763,5 +785,178 @@ async fn a_host_that_joins_after_the_founders_genesis_certificate_expired_is_adm
     .await;
     late.stop().await;
     peer.stop().await;
+    founder.stop().await;
+}
+
+/// The issuer succeeds itself in a running cluster (24 §11; the audit's
+/// F13, stage 3). A cluster founded by this binary is fenced at its level
+/// from genesis, so the succession is open; the operator stages the
+/// successor — endorsed by the genesis issuer, committed so every node
+/// trusts it before anything is issued under it — the controller activates
+/// it at its next step, every node renews under it ahead of expiry and
+/// presents the endorsed chain, the bootstrap server certificate moves
+/// under it, and the genesis issuer retires once nothing live was issued
+/// under it. A late host joins under the successor alone; the founder
+/// restarts on it and enrolls another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_genesis_issuer_retires()
+{
+    let founder_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let mut founder_settings = settings(founder_dir.path());
+    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+    let peer_settings = settings(peer_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let founder_id = founder_node(founder_dir.path());
+    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+    let genesis_registry = root_registry(&founder, founder_dir.path()).await;
+    let genesis = genesis_registry.issuers().clone();
+    assert!(genesis.successor.is_none() && genesis.retiring.is_none());
+    assert!(genesis.current.endorsement.is_none());
+    assert_eq!(
+        genesis.current.certificate,
+        genesis_registry.ca_certificate()
+    );
+    assert_eq!(
+        genesis_registry.limits().issuer_lifetime,
+        focal_enrollment::DEFAULT_ISSUER_LIFETIMES * SHORT_LIFETIME
+    );
+    // Founded at this binary's level: the succession is open from genesis.
+    assert_eq!(
+        genesis_registry.fence().level,
+        crate::upgrade::CAPABILITY_LEVEL
+    );
+    assert!(crate::upgrade::opened(
+        genesis_registry.fence(),
+        crate::upgrade::ISSUER_SUCCESSION_LEVEL
+    ));
+    drop(genesis_registry);
+    // The operator stages the successor; asked again, it is the same one,
+    // staged or issuing by then.
+    let enrollment = founder.handles.enrollment.clone().unwrap();
+    let staged = enrollment
+        .rotate_issuer(unix_time().unwrap())
+        .await
+        .unwrap();
+    let successor = staged.successor.clone().unwrap().record;
+    assert!(successor.endorsement.is_some());
+    assert_ne!(successor.fingerprint, genesis.current.fingerprint);
+    assert_eq!(staged.current, genesis.current);
+    assert!(
+        focal_wire::issued_by(
+            successor.endorsement.as_ref().unwrap(),
+            &genesis.current.certificate
+        )
+        .unwrap()
+    );
+    let again = enrollment
+        .rotate_issuer(unix_time().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        again
+            .successor
+            .as_ref()
+            .is_some_and(|staged| staged.record == successor)
+            || again.current == successor,
+        "{again:?}"
+    );
+    // Activated at the controller's next step: the successor issues and
+    // the genesis issuer retires.
+    let activated = until(
+        "the successor issues",
+        &[&founder, &peer],
+        Duration::from_secs(SHORT_LIFETIME),
+        async || {
+            let registry = root_registry(&founder, founder_dir.path()).await;
+            (registry.issuers().current == successor).then(|| registry.issuers().clone())
+        },
+    )
+    .await;
+    assert_eq!(activated.retiring, Some(genesis.current.clone()));
+    assert!(activated.successor.is_none());
+    // Every node renews under it ahead of expiry: the registry lists each
+    // under a certificate the successor issued.
+    let under = |registry: &EnrollmentRegistry, listed: u64| {
+        registry
+            .enrollments()
+            .find(|receipt| receipt.identity.node_id == Some(listed))
+            .is_some_and(|receipt| {
+                focal_wire::issued_by(&receipt.certificate, &successor.certificate).unwrap_or(false)
+            })
+    };
+    until(
+        "every node renews under the successor",
+        &[&founder, &peer],
+        Duration::from_secs(2 * SHORT_LIFETIME),
+        async || {
+            let registry = root_registry(&founder, founder_dir.path()).await;
+            (under(&registry, founder_id) && under(&registry, node)).then_some(())
+        },
+    )
+    .await;
+    // The host renews through the founder under the issuers it adopted —
+    // the enrollment endpoint presenting a chain its trust verifies — when
+    // asked now.
+    let peer_renewed = until(
+        "the host renews under the successor when asked",
+        &[&founder, &peer],
+        Duration::from_secs(SHORT_LIFETIME),
+        async || match peer.handles.credentials.renew().await {
+            Ok(renewed) => Some(renewed),
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                None
+            }
+        },
+    )
+    .await;
+    assert_eq!(peer_renewed.node, node);
+    // The genesis issuer retires once nothing live was issued under it —
+    // every credential issued under it expired, the bootstrap server
+    // certificate succeeded itself under the successor — within a lifetime
+    // of the activation and the last credential it issued.
+    let retired = until(
+        "the genesis issuer retires",
+        &[&founder, &peer],
+        Duration::from_secs(3 * SHORT_LIFETIME),
+        async || {
+            let registry = root_registry(&founder, founder_dir.path()).await;
+            (registry.issuers().retiring.is_none() && registry.issuers().current == successor)
+                .then_some(registry)
+        },
+    )
+    .await;
+    assert_eq!(retired.trust_roots().count(), 1);
+    // The genesis issuer stays the cluster's identity.
+    assert_eq!(retired.ca_certificate(), genesis.current.certificate);
+    drop(retired);
+    // A late host joins with an invitation naming the successor alone, and
+    // is issued under it.
+    let late_dir = tempfile::tempdir().unwrap();
+    let late_settings = settings(late_dir.path());
+    let (late, late_node) = join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
+    let listed = root_registry(&founder, founder_dir.path()).await;
+    assert!(under(&listed, late_node), "{:?}", listed.issuers());
+    drop(listed);
+    late.stop().await;
+    peer.stop().await;
+    // The founder restarts on the successor — its authority holds it, the
+    // registry names it — and enrolls another host.
+    founder.stop().await;
+    let founder = Running::start(&founder_settings).await;
+    let restarted = root_registry(&founder, founder_dir.path()).await;
+    assert_eq!(restarted.issuers().current, successor);
+    assert!(restarted.issuers().retiring.is_none());
+    drop(restarted);
+    let after_dir = tempfile::tempdir().unwrap();
+    let after_settings = settings(after_dir.path());
+    let (after, after_node) =
+        join_peer(&founder, founder_dir.path(), "after", &after_settings).await;
+    assert_ne!(after_node, late_node);
+    let listed = root_registry(&founder, founder_dir.path()).await;
+    assert!(under(&listed, after_node));
+    drop(listed);
+    after.stop().await;
     founder.stop().await;
 }

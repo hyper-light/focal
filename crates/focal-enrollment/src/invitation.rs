@@ -18,12 +18,19 @@ pub enum EnrollmentRole {
 pub struct ServerTrust {
     pub endpoint: String,
     pub server_name: String,
+    /// The genesis issuer's certificate: the cluster's identity (24 §11),
+    /// never the trust — the issuers are.
     pub ca_certificate: Vec<u8>,
     pub server_fingerprint: Fingerprint,
     /// The bootstrap server certificate staged to succeed the pinned one
     /// (24 §11), accepted as it is: an invitation issued while one is staged
     /// carries both, and a joined node learns both from the registry.
     pub successor_fingerprint: Option<Fingerprint>,
+    /// The issuers trusted when this trust was written (24 §11): what
+    /// chains are verified against, through an endorsement when a chain's
+    /// issuer succeeded one of them since. A joined node adopts the
+    /// committed set on every refresh.
+    pub issuers: Vec<IssuerRecord>,
 }
 /// The trust as schema 1 invitations and network states wrote it: one pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,21 +40,51 @@ pub struct ServerTrustV1 {
     pub ca_certificate: Vec<u8>,
     pub server_fingerprint: Fingerprint,
 }
-impl From<ServerTrustV1> for ServerTrust {
-    fn from(legacy: ServerTrustV1) -> Self {
-        Self {
+/// The trust as schema 2 invitations and schema 3 network states wrote it:
+/// two pins, the genesis issuer as the one root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerTrustV2 {
+    pub endpoint: String,
+    pub server_name: String,
+    pub ca_certificate: Vec<u8>,
+    pub server_fingerprint: Fingerprint,
+    pub successor_fingerprint: Option<Fingerprint>,
+}
+impl TryFrom<ServerTrustV1> for ServerTrust {
+    type Error = EnrollmentError;
+    fn try_from(legacy: ServerTrustV1) -> Result<Self, EnrollmentError> {
+        Ok(Self {
+            issuers: vec![IssuerRecord::of(&legacy.ca_certificate, None)?],
             endpoint: legacy.endpoint,
             server_name: legacy.server_name,
             ca_certificate: legacy.ca_certificate,
             server_fingerprint: legacy.server_fingerprint,
             successor_fingerprint: None,
-        }
+        })
+    }
+}
+impl TryFrom<ServerTrustV2> for ServerTrust {
+    type Error = EnrollmentError;
+    fn try_from(legacy: ServerTrustV2) -> Result<Self, EnrollmentError> {
+        Ok(Self {
+            issuers: vec![IssuerRecord::of(&legacy.ca_certificate, None)?],
+            endpoint: legacy.endpoint,
+            server_name: legacy.server_name,
+            ca_certificate: legacy.ca_certificate,
+            server_fingerprint: legacy.server_fingerprint,
+            successor_fingerprint: legacy.successor_fingerprint,
+        })
     }
 }
 /// The invitation schema whose trust carries one pin.
 pub(crate) const INVITATION_SCHEMA_V1: u16 = 1;
 /// The invitation schema whose trust may carry a staged successor's pin.
-pub(crate) const INVITATION_SCHEMA: u16 = 2;
+pub(crate) const INVITATION_SCHEMA_V2: u16 = 2;
+/// The invitation schema whose trust carries the issuers.
+pub(crate) const INVITATION_SCHEMA: u16 = 3;
+/// The most issuers a trust carries: current, staged, retiring, and the
+/// genesis identity an older trust names as its root.
+pub const MAX_TRUSTED_ISSUERS: usize = focal_wire::MAX_TRUST_ROOTS;
 impl ServerTrust {
     /// Validate persisted trust before using its endpoint or building TLS state.
     pub fn validate(&self) -> Result<(), EnrollmentError> {
@@ -55,11 +92,26 @@ impl ServerTrust {
             || self.endpoint.len() > 512
             || self.server_name.len() > 253
             || self.ca_certificate.len() > 4096
+            || self.issuers.len() > MAX_TRUSTED_ISSUERS
         {
             return Err(EnrollmentError::Capacity);
         }
-        if self.server_fingerprint == [0; 32] || self.ca_certificate.is_empty() {
+        if self.server_fingerprint == [0; 32]
+            || self.ca_certificate.is_empty()
+            || self.issuers.is_empty()
+        {
             return Err(EnrollmentError::Invalid);
+        }
+        for (index, issuer) in self.issuers.iter().enumerate() {
+            if issuer.fingerprint != crate::registry::issuer_fingerprint(&issuer.certificate)
+                || self
+                    .issuers
+                    .iter()
+                    .take(index)
+                    .any(|other| other.fingerprint == issuer.fingerprint)
+            {
+                return Err(EnrollmentError::Invalid);
+            }
         }
         if self
             .successor_fingerprint
@@ -71,14 +123,23 @@ impl ServerTrust {
         self.roots()?;
         Ok(())
     }
+    /// The issuers' certificates: the roots a verifier of this cluster's
+    /// credentials holds.
+    pub fn root_certificates(&self) -> Vec<Vec<u8>> {
+        self.issuers
+            .iter()
+            .map(|issuer| issuer.certificate.clone())
+            .collect()
+    }
     /// Whether `fingerprint` is a pin this trust accepts: the pinned
     /// certificate's, or its staged successor's.
     pub fn accepts(&self, fingerprint: Fingerprint) -> bool {
         fingerprint == self.server_fingerprint || Some(fingerprint) == self.successor_fingerprint
     }
     /// Whether this trust names the same sponsor as `other`: the same
-    /// endpoint, name and CA. The pins are facts the registry moves as the
-    /// bootstrap server certificate succeeds itself (24 §11).
+    /// endpoint, name and genesis issuer. The pins and the issuers are
+    /// facts the registry moves as the bootstrap server certificate and
+    /// the issuer succeed themselves (24 §11).
     pub fn same_sponsor(&self, other: &Self) -> bool {
         self.endpoint == other.endpoint
             && self.server_name == other.server_name
@@ -88,8 +149,15 @@ impl ServerTrust {
     /// the encoding that schema wrote, so an invitation issued before the
     /// successor pin existed still matches the record it made.
     pub(crate) fn fingerprint_as(&self, schema: u16) -> Result<Fingerprint, EnrollmentError> {
+        // An older schema named the genesis issuer as its one root.
+        let genesis_alone = || {
+            self.issuers.len() == 1
+                && self.issuers.first().is_some_and(|issuer| {
+                    issuer.certificate == self.ca_certificate && issuer.endorsement.is_none()
+                })
+        };
         if schema == INVITATION_SCHEMA_V1 {
-            if self.successor_fingerprint.is_some() {
+            if self.successor_fingerprint.is_some() || !genesis_alone() {
                 return Err(EnrollmentError::Invalid);
             }
             let legacy = ServerTrustV1 {
@@ -100,7 +168,37 @@ impl ServerTrust {
             };
             return Ok(hash("focal.enrollment.server-trust.v1", &encode(&legacy)?));
         }
+        if schema == INVITATION_SCHEMA_V2 {
+            if !genesis_alone() {
+                return Err(EnrollmentError::Invalid);
+            }
+            let legacy = ServerTrustV2 {
+                endpoint: self.endpoint.clone(),
+                server_name: self.server_name.clone(),
+                ca_certificate: self.ca_certificate.clone(),
+                server_fingerprint: self.server_fingerprint,
+                successor_fingerprint: self.successor_fingerprint,
+            };
+            return Ok(hash("focal.enrollment.server-trust.v1", &encode(&legacy)?));
+        }
         Ok(hash("focal.enrollment.server-trust.v1", &encode(self)?))
+    }
+    /// The verifier of a bootstrap connection's chain: the issuers this
+    /// trust holds, bridged by an endorsement when the chain's issuer
+    /// succeeded one of them since (24 §11).
+    fn verifier(
+        &self,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<Arc<focal_wire::EndorsingServerVerifier>, EnrollmentError> {
+        let roots = focal_wire::TrustRoots::new(
+            self.issuers
+                .iter()
+                .map(|issuer| issuer.certificate.clone())
+                .collect(),
+        )
+        .map_err(|_| EnrollmentError::Invalid)?;
+        focal_wire::EndorsingServerVerifier::new(roots, provider)
+            .map_err(|_| EnrollmentError::Crypto)
     }
     /// Ordinary TLS 1.3 chain/name verification against the pinned CA, for
     /// an enrollment connection made by a node that already holds a
@@ -108,10 +206,12 @@ impl ServerTrust {
     pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
         self.validate()?;
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = self.verifier(provider.clone())?;
         let mut config = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| EnrollmentError::Crypto)?
-            .with_root_certificates(self.roots()?)
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
         config.alpn_protocols = vec![ENROLLMENT_ALPN.to_vec()];
         config.enable_early_data = false;
@@ -143,9 +243,11 @@ impl ServerTrust {
     }
     fn roots(&self) -> Result<rustls::RootCertStore, EnrollmentError> {
         let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(self.ca_certificate.clone()))
-            .map_err(|_| EnrollmentError::Invalid)?;
+        for issuer in &self.issuers {
+            roots
+                .add(CertificateDer::from(issuer.certificate.clone()))
+                .map_err(|_| EnrollmentError::Invalid)?;
+        }
         Ok(roots)
     }
     pub(crate) fn verify_chain(
@@ -157,12 +259,7 @@ impl ServerTrust {
             .split_first()
             .ok_or(EnrollmentError::Unauthorized)?;
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::new(self.roots()?),
-            provider,
-        )
-        .build()
-        .map_err(|_| EnrollmentError::Crypto)?;
+        let verifier = self.verifier(provider)?;
         let now = UnixTime::since_unix_epoch(Duration::from_secs(
             u64::try_from(now).map_err(|_| EnrollmentError::Invalid)?,
         ));
@@ -208,8 +305,22 @@ struct InvitationDataV1 {
     secret: SecretBytes,
     trust: ServerTrustV1,
 }
+/// The invitation as schema 2 wrote it: two pins, the genesis issuer as
+/// the one root.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct InvitationDataV2 {
+    schema: u16,
+    id: InvitationId,
+    cluster: ClusterId,
+    role: EnrollmentRole,
+    expires_at: i64,
+    secret: SecretBytes,
+    trust: ServerTrustV2,
+}
 impl InvitationData {
-    /// Decode an invitation of either schema; schema 1 carries one pin.
+    /// Decode an invitation of any schema; schema 1 carries one pin, schema
+    /// 2 two pins and the genesis issuer alone.
     pub(crate) fn decode_any(bytes: &[u8]) -> Result<Self, EnrollmentError> {
         let (schema, _) = postcard::take_from_bytes::<u16>(bytes)?;
         if schema == INVITATION_SCHEMA_V1 {
@@ -221,7 +332,19 @@ impl InvitationData {
                 role: legacy.role,
                 expires_at: legacy.expires_at,
                 secret: legacy.secret,
-                trust: legacy.trust.into(),
+                trust: legacy.trust.try_into()?,
+            });
+        }
+        if schema == INVITATION_SCHEMA_V2 {
+            let legacy: InvitationDataV2 = decode(bytes)?;
+            return Ok(Self {
+                schema: legacy.schema,
+                id: legacy.id,
+                cluster: legacy.cluster,
+                role: legacy.role,
+                expires_at: legacy.expires_at,
+                secret: legacy.secret,
+                trust: legacy.trust.try_into()?,
             });
         }
         decode(bytes)
@@ -267,7 +390,7 @@ impl Invitation {
     pub(crate) fn expose_token_as_schema_one_for_tests(
         &self,
     ) -> Result<Zeroizing<String>, EnrollmentError> {
-        if self.data.trust.successor_fingerprint.is_some() {
+        if self.data.trust.successor_fingerprint.is_some() || self.data.trust.issuers.len() != 1 {
             return Err(EnrollmentError::Invalid);
         }
         let legacy = InvitationDataV1 {
@@ -311,7 +434,9 @@ impl Invitation {
             bytes.push((digit(*high)? << 4) | digit(*low)?);
         }
         let data = InvitationData::decode_any(&bytes)?;
-        if !(data.schema == INVITATION_SCHEMA_V1 || data.schema == INVITATION_SCHEMA)
+        if !(data.schema == INVITATION_SCHEMA_V1
+            || data.schema == INVITATION_SCHEMA_V2
+            || data.schema == INVITATION_SCHEMA)
             || data.id == [0; 16]
             || data.cluster == [0; 16]
             || data.secret.0.len() != 32
@@ -323,16 +448,7 @@ impl Invitation {
     }
     /// Ordinary TLS 1.3 chain/name verification; no custom verifier or 0-RTT.
     pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
-        self.data.trust.validate()?;
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| EnrollmentError::Crypto)?
-            .with_root_certificates(self.data.trust.roots()?)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![ENROLLMENT_ALPN.to_vec()];
-        config.enable_early_data = false;
-        Ok(config)
+        self.data.trust.client_config()
     }
     /// Call only on the established connection that will carry this request.
     /// There is no token-bearing request until normal PKI and the exact leaf pin

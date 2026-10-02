@@ -114,7 +114,7 @@ pub struct NetworkState {
     pub sponsor: focal_enrollment::ServerTrust,
     pub genesis: NetworkGenesis,
 }
-pub const NETWORK_STATE_SCHEMA: u16 = 3;
+pub const NETWORK_STATE_SCHEMA: u16 = 4;
 /// The shape schema 1 wrote: no advertised name, a sponsor with one pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NetworkStateV1 {
@@ -135,6 +135,18 @@ struct NetworkStateV2 {
     advertise: SocketAddr,
     endpoint: Option<String>,
     sponsor: focal_enrollment::ServerTrustV1,
+    genesis: NetworkGenesis,
+}
+/// The shape schema 3 wrote: a sponsor with two pins and the genesis
+/// issuer as its one root (before the issuer could succeed itself, 24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NetworkStateV3 {
+    schema: u16,
+    node: u64,
+    listen: SocketAddr,
+    advertise: SocketAddr,
+    endpoint: Option<String>,
+    sponsor: focal_enrollment::ServerTrustV2,
     genesis: NetworkGenesis,
 }
 /// The addresses a start resolved against the saved state (24 §24).
@@ -223,7 +235,7 @@ impl NetworkState {
                     listen: legacy.listen,
                     advertise: legacy.advertise,
                     endpoint: None,
-                    sponsor: legacy.sponsor.into(),
+                    sponsor: legacy.sponsor.try_into().map_err(|_| NodeError::Identity)?,
                     genesis: legacy.genesis,
                 }
             }
@@ -238,7 +250,22 @@ impl NetworkState {
                     listen: legacy.listen,
                     advertise: legacy.advertise,
                     endpoint: legacy.endpoint,
-                    sponsor: legacy.sponsor.into(),
+                    sponsor: legacy.sponsor.try_into().map_err(|_| NodeError::Identity)?,
+                    genesis: legacy.genesis,
+                }
+            }
+            3 => {
+                let (legacy, trailing): (NetworkStateV3, _) = postcard::take_from_bytes(payload)?;
+                if !trailing.is_empty() {
+                    return Err(NodeError::Identity);
+                }
+                Self {
+                    schema: NETWORK_STATE_SCHEMA,
+                    node: legacy.node,
+                    listen: legacy.listen,
+                    advertise: legacy.advertise,
+                    endpoint: legacy.endpoint,
+                    sponsor: legacy.sponsor.try_into().map_err(|_| NodeError::Identity)?,
                     genesis: legacy.genesis,
                 }
             }

@@ -685,6 +685,72 @@ the key its unrevoked enrollment holds (`authorize_node_peer`,
 `focal_control::authorize_enrolled_key`), so the renewal's own commit is
 accepted from the node that renewed.
 
+**The issuer (2026-10-02; the audit's F13, stage 3).** The issuer every
+credential chains to succeeds itself as the certificates it issues do. An
+issuer lasts `node.issuer_lifetime_seconds` ([08](08-stepped-complexity-and-deployment.md)
+§2; committed at genesis in `EnrollmentLimits::issuer_lifetime`, twelve
+credential lifetimes by default — Let's Encrypt's ratio of intermediate to
+leaf — and six at least: its succession is staged in the last third of its
+lifetime, and that third holds the activation and the retirement of the
+issuer it succeeded, a credential lifetime each; ten years at most, the
+lifetime the genesis issuer was created with before). The registry (schema
+6) names the issuers as committed, `IssuerSuccession { current, successor,
+retiring }`, each an `IssuerRecord` — the self-signed certificate, its
+*endorsement*, its validity — and `Change::Issuer` moves them three ways
+under the founder authority: a successor staged (`IssuerChange::Stage`,
+refused while one is staged or retiring, or when the endorsement is not the
+current issuer's), the staged one activated (`Activate`: it issues from now,
+the one it succeeds retires), the retiring one retired (`Retire`, refused
+while a receipt issued under it lives). The genesis issuer stays the
+cluster's *identity* (`ca_certificate` in the registry, the sponsor's trust
+and the authority anchor, compared wherever it was); the issuers are the
+*trust*: every verifier's roots are the committed set (`trust_roots`), the
+listener's for clients, the pool's and the joiner's for peers, an
+invitation's for the bootstrap endpoint (`ServerTrust.issuers`, invitations
+schema 3, network states schema 4; older ones decode with the genesis issuer
+alone), adopted by every node on each refresh (`NetworkController::refresh`,
+re-presented to the listener and the pool when they change). A verifier
+that has not adopted a successor yet — a node behind the commit, a client
+holding the trust its invitation carried — would refuse every credential
+issued under it and could never catch up through the peers it refuses (the
+class of hole the renewal's enrolled-key rule closed), so a successor is
+endorsed by its predecessor: a CA certificate for the successor's key and
+name under the predecessor's signature (`BootstrapAuthority::stage_issuer`
+issues both; `endorses` checks the pair), committed beside the self-signed
+one and presented in every chain (`[leaf, issuer, endorsement]`,
+`JoinKey::complete`/`renew`/`rotate_into`, the bootstrap server's
+`server_identity`). The genesis issuer has a path length of zero, so X.509
+path building cannot cross it; the bridge is the verifier's own explicit
+rule (`focal_wire::trust`, `EndorsingServerVerifier`/`EndorsingClientVerifier`
+in both TLS directions and the enrollment trust's `verify_chain`): a chain
+whose issuer is unknown is accepted when a presented CA certificate, valid
+now, verifies under a known root's key, and the leaf is then verified under
+it as under any anchor; at most four presented certificates, four roots.
+The founder's authority (bundle schema 3) keeps the staged successor's key
+and endorsement, the current issuer's endorsement, and the issuer it
+succeeded while the bootstrap server certificate it issued is still
+presented; `activate_issuer` adopts a committed activation. The controller
+steps the succession at the cadence of a credential's retries
+(`QuorumEnrollmentHost::maintain_issuer`): the successor is staged in the
+last third of the issuer's lifetime, or when the operator asks (`cluster
+credentials rotate-issuer`, `cluster.credentials.rotate_issuer`, founder
+only; `cluster credentials issuers` reads the set), activated at the next
+step, and the predecessor retired once nothing live was issued under it —
+no receipt in the registry, current or retired, that is unexpired, and not
+the bootstrap server certificate, which is staged under the new issuer as
+soon as it is not under the one issuing and succeeds itself as §11 says —
+a fact, reached within a credential lifetime of the activation. The
+succession is the first behaviour gated on the upgrade fence (§21,
+`upgrade::ISSUER_SUCCESSION_LEVEL`, 2): a binary below it cannot verify an
+endorsed chain, so staging is refused (`Fenced`, by name) until the fence
+is at the level; a cluster founded by such a binary holds the fence at the
+level its founder announces from genesis (`EnrollmentRegistry::founding`
+with `upgrade::announced_level()`: its one node runs it), so a fresh
+cluster is never behind an operator step its own issuer's expiry would wait
+on. An expired
+receipt in a checkpoint may have been issued under an issuer retired since;
+`restore` holds it to its shape and verifies the signature of the live ones.
+
 **Rotation (2026-09-10, R9.3).** `cluster credentials rotate`
 (`AdminCommand::RotateCredential`, `cluster.credentials.rotate`) moves a
 node's credential to a fresh key under the same identity. The holder stages
@@ -1513,7 +1579,7 @@ refuses a differing existing file.
 Upgrades roll one binary at a time and activate incompatible behaviour only
 behind a committed fence ([08](08-stepped-complexity-and-deployment.md)
 §10). Each binary implements a capability level (`upgrade::CAPABILITY_LEVEL`,
-1 for this release) and announces it — the compiled level, or a lower one
+2 for this release) and announces it — the compiled level, or a lower one
 the operator sets through `FOCAL_CAPABILITY_LEVEL` for a staged rollout or
 a rehearsal; the variable never raises it — in every load report
 (`NodeLoad::capability`; the frozen V1 row codec restores it as zero,
@@ -1545,9 +1611,17 @@ the fence is above it (`ControllerError::Fenced`, exit `upgrade_fenced`):
 a binary rolled back past the fence stops as soon as its root replica
 applies the activation, and does not start again while its applied registry
 carries it. Behaviour gated on a level opens when `upgrade::opened(fence,
-level)` holds; this release gates nothing yet, so the fence's first work is
-the rollback refusal the release qualification (R10) needs. A rollback past
-the fence is a restore from a verified backup (26 §6), never a downgrade.
+level)` holds; the issuer's succession is gated on level 2
+(`upgrade::ISSUER_SUCCESSION_LEVEL`, §11): a binary below it cannot verify
+the endorsed chain a credential issued under a successor presents, so the
+founder refuses to stage one until every node runs at the level and the
+fence says so. A cluster founded by a binary holds the fence at the level
+its founder *announces* from genesis (its one node runs it; a founder
+staging a rollout at a lower level founds at that level, never at one it
+would refuse to serve under), so what the fence gates is open to a fresh
+cluster without an operator's step. A rollback
+past the fence is a restore from a verified backup (26 §6), never a
+downgrade.
 
 ## 22. Topology facts and the residency fence
 

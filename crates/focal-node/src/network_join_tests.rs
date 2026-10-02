@@ -47,6 +47,7 @@ impl Fixture {
             identity.node,
             identity.issuer.0,
             EnrollmentLimits::default(),
+            0,
             now(),
         )
         .unwrap();

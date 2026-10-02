@@ -724,7 +724,7 @@ fn a_credential_is_retired_by_what_the_registry_knows_of_it_not_by_its_absence()
     let first = registry.release(&request, now).unwrap();
     let node = first.identity.node_id.unwrap();
     let material = key
-        .complete(&first, authority.ca_certificate(), now)
+        .complete(&first, authority.issuers().unwrap().trusted(), now)
         .unwrap();
     // The certificate listed, authorizing.
     assert!(!credential_retired(&registry, node, &first, now));

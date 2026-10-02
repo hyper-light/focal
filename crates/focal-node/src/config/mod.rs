@@ -71,6 +71,13 @@ pub struct NodeSettings {
     /// three seconds to a year), and a start that asks for another is
     /// refused as a committed-policy change (08 §2).
     pub credential_lifetime_seconds: Option<u64>,
+    /// How long an issuer the cluster creates lasts, in seconds — the
+    /// genesis issuer and every successor, each staged in the last third of
+    /// it (24 §11). The founder commits it at genesis (default twelve
+    /// credential lifetimes; from six credential lifetimes to ten years),
+    /// and a start that asks for another is refused as a committed-policy
+    /// change (08 §2).
+    pub issuer_lifetime_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,11 +157,15 @@ impl Settings {
     /// founder commits at genesis (24 §11).
     pub fn enrollment_limits(&self) -> focal_enrollment::EnrollmentLimits {
         let standard = focal_enrollment::EnrollmentLimits::default();
+        let credential_lifetime = self
+            .node
+            .credential_lifetime_seconds
+            .unwrap_or(standard.credential_lifetime);
         focal_enrollment::EnrollmentLimits {
-            credential_lifetime: self
-                .node
-                .credential_lifetime_seconds
-                .unwrap_or(standard.credential_lifetime),
+            credential_lifetime,
+            issuer_lifetime: self.node.issuer_lifetime_seconds.unwrap_or_else(|| {
+                focal_enrollment::EnrollmentLimits::issuer_lifetime_for(credential_lifetime)
+            }),
             ..standard
         }
     }
@@ -219,6 +230,22 @@ impl Settings {
                 field: "node.credential_lifetime_seconds",
                 reason: "must be between 3 seconds and a year (31536000)",
             });
+        }
+        if let Some(issuer) = self.node.issuer_lifetime_seconds {
+            let credential = self
+                .node
+                .credential_lifetime_seconds
+                .unwrap_or(focal_enrollment::EnrollmentLimits::default().credential_lifetime);
+            if credential
+                .checked_mul(focal_enrollment::MIN_ISSUER_LIFETIMES)
+                .is_none_or(|least| issuer < least)
+                || issuer > focal_enrollment::MAX_ISSUER_LIFETIME
+            {
+                return Err(ConfigError::Invalid {
+                    field: "node.issuer_lifetime_seconds",
+                    reason: "must be between six credential lifetimes and ten years (315360000)",
+                });
+            }
         }
         if self
             .node
@@ -373,6 +400,44 @@ mod tests {
         );
         assert!(Settings::from_yaml("version: 1\nshards: 3").is_err());
         assert!(Settings::from_yaml("version: 1\nnode:\n  shards: 3").is_err());
+    }
+    #[test]
+    fn the_issuer_lifetime_is_derived_from_the_credential_lifetime_unless_set_and_is_bounded() {
+        assert_eq!(Settings::default().node.issuer_lifetime_seconds, None);
+        let derived = Settings::from_yaml("version: 1\nnode:\n  credential_lifetime_seconds: 3600")
+            .unwrap()
+            .enrollment_limits();
+        assert_eq!(derived.credential_lifetime, 3600);
+        assert_eq!(
+            derived.issuer_lifetime,
+            focal_enrollment::DEFAULT_ISSUER_LIFETIMES * 3600
+        );
+        let set = Settings::from_yaml(
+            "version: 1\nnode:\n  credential_lifetime_seconds: 3600\n  issuer_lifetime_seconds: 86400",
+        )
+        .unwrap();
+        assert_eq!(set.enrollment_limits().issuer_lifetime, 86400);
+        for (credential, issuer) in [(3600, 21599), (3600, 315360001), (30 * 86400, 86400)] {
+            assert!(
+                matches!(
+                    Settings::from_yaml(&format!(
+                        "version: 1\nnode:\n  credential_lifetime_seconds: {credential}\n  issuer_lifetime_seconds: {issuer}"
+                    )),
+                    Err(ConfigError::Invalid {
+                        field: "node.issuer_lifetime_seconds",
+                        ..
+                    })
+                ),
+                "{credential} {issuer}"
+            );
+        }
+        assert_eq!(
+            Settings::from_yaml("version: 1\nnode:\n  credential_lifetime_seconds: 3600\n  issuer_lifetime_seconds: 21600")
+                .unwrap()
+                .enrollment_limits()
+                .issuer_lifetime,
+            21600
+        );
     }
     #[test]
     fn the_credential_lifetime_is_optional_and_bounded_by_what_the_registry_admits() {

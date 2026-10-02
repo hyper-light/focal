@@ -356,7 +356,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
             .unwrap();
         assert_eq!(receipt.identity.node_id, Some(node));
         let material = key
-            .complete(&receipt, authority.ca_certificate(), now)
+            .complete(&receipt, authority.issuers().unwrap().trusted(), now)
             .unwrap();
         identities.push(Identity {
             certificate: receipt.certificate.clone(),

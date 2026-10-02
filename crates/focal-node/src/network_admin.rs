@@ -70,6 +70,10 @@ pub enum AdminCommand {
     RenewCredential,
     /// Rotate this node's own credential to a fresh key now (24 §11).
     RotateCredential,
+    /// The issuers credentials chain to, as committed (24 §11).
+    Issuers,
+    /// Stage the issuer's successor now; founder only (24 §11).
+    RotateIssuer,
     /// The placement view and the controller's next actions.
     Placement,
     /// Admit a tenant the cluster serves; founder only, exact on retry
@@ -802,9 +806,12 @@ impl AdminCommand {
             Self::Operator(read) => read.validate(),
             Self::Replica(command) => command.validate(),
             Self::Partition(command) => command.validate(),
-            Self::RenewCredential | Self::RotateCredential | Self::Placement | Self::Tenants => {
-                Ok(())
-            }
+            Self::RenewCredential
+            | Self::RotateCredential
+            | Self::Issuers
+            | Self::RotateIssuer
+            | Self::Placement
+            | Self::Tenants => Ok(()),
             Self::AdmitTenant { tenant } if *tenant == [0; 16] => Err(AccessError::InvalidRequest),
             Self::AdmitTenant { .. } => Ok(()),
             Self::UpgradeStatus => Ok(()),
@@ -1876,6 +1883,47 @@ impl LocalNetworkAdmin {
         encode_credential_reply(&reply)
     }
 }
+impl LocalNetworkAdmin {
+    /// The issuers as the committed registry names them (24 §11).
+    async fn issuers(&self, id: RequestId) -> Result<Vec<u8>, AccessError> {
+        use crate::credential_renewal::{IssuerReply, IssuerSummary};
+        let (_, registry) = self.read_registry(id).await?;
+        encode_reply(&IssuerReply::Issuers(Box::new(IssuerSummary::of(
+            registry.issuers(),
+            registry.fence().level,
+        ))))
+    }
+    /// Stage the issuer's successor through the founder's enrollment
+    /// authority (24 §11), then answer with the issuers as committed; a
+    /// fence below the succession's level is answered by name.
+    async fn rotate_issuer(&self, id: RequestId) -> Result<Vec<u8>, AccessError> {
+        use crate::credential_renewal::{IssuerReply, IssuerSummary};
+        let enrollment = self.enrollment.as_ref().ok_or(AccessError::Unauthorized)?;
+        let now = unix_now()?;
+        match enrollment.rotate_issuer(now).await {
+            Ok(issuers) => {
+                let (_, registry) = self.read_registry(id).await?;
+                encode_reply(&IssuerReply::Issuers(Box::new(IssuerSummary::of(
+                    &issuers,
+                    registry.fence().level,
+                ))))
+            }
+            Err(QuorumEnrollmentError::Fenced { level, needed }) => {
+                encode_reply(&IssuerReply::Fenced { level, needed })
+            }
+            Err(error) => Err(enrollment_error(error)),
+        }
+    }
+}
+fn unix_now() -> Result<i64, AccessError> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| AccessError::Unavailable)?
+            .as_secs(),
+    )
+    .map_err(|_| AccessError::Unavailable)
+}
 fn encode_credential_reply(
     reply: &crate::credential_renewal::CredentialReply,
 ) -> Result<Vec<u8>, AccessError> {
@@ -1946,6 +1994,12 @@ impl LocalNetworkAdmin {
         }
         if let AdminCommand::RotateCredential = command {
             return self.rotate_credential().await;
+        }
+        if let AdminCommand::Issuers = command {
+            return self.issuers(request.request_id).await;
+        }
+        if let AdminCommand::RotateIssuer = command {
+            return self.rotate_issuer(request.request_id).await;
         }
         if let AdminCommand::Placement = command {
             return self.placement().await;
@@ -2172,6 +2226,8 @@ impl LocalNetworkAdmin {
             | AdminCommand::Partition(_)
             | AdminCommand::RenewCredential
             | AdminCommand::RotateCredential
+            | AdminCommand::Issuers
+            | AdminCommand::RotateIssuer
             | AdminCommand::Placement
             | AdminCommand::AdmitTenant { .. }
             | AdminCommand::Tenants
@@ -2234,6 +2290,7 @@ fn enrollment_error(error: QuorumEnrollmentError) -> AccessError {
         }
         QuorumEnrollmentError::Stopped => AccessError::OutcomeUnknown,
         QuorumEnrollmentError::Identity => AccessError::Unauthorized,
+        QuorumEnrollmentError::Fenced { .. } => AccessError::Unavailable,
         QuorumEnrollmentError::IntentConflict => AccessError::InvalidRequest,
         QuorumEnrollmentError::Enrollment(
             EnrollmentError::Invalid

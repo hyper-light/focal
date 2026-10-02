@@ -1,6 +1,6 @@
 use crate::{
     invitation::InvitationData,
-    pki::{SecretBytes, csr_key_hash, verify_issued},
+    pki::{SecretBytes, csr_key_hash, verify_issued, verify_issued_shape},
     *,
 };
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,27 @@ pub struct EnrollmentLimits {
     pub max_checkpoint_bytes: usize,
     /// Tenants the cluster may admit; every grant names the admitted ones.
     pub max_tenants: usize,
+    /// How long an issuer the cluster creates lasts (24 §11): the genesis
+    /// issuer and every successor, each staged in the last third of it.
+    /// Committed policy, as the credential lifetime is; at least
+    /// `MIN_ISSUER_LIFETIMES` credential lifetimes.
+    pub issuer_lifetime: u64,
 }
+/// The issuer lifetime a founding takes when its operator names none:
+/// `DEFAULT_ISSUER_LIFETIMES` credential lifetimes — the ratio Let's
+/// Encrypt keeps between its intermediates (three years) and the leaves
+/// they issue (ninety days).
+pub const DEFAULT_ISSUER_LIFETIMES: u64 = 12;
+/// The least an issuer lasts, in credential lifetimes: its succession is
+/// staged in the last third of its lifetime, and that third must hold the
+/// activation — within a credential lifetime, every holder renews — and the
+/// retirement of the issuer it succeeded, once every credential issued
+/// under it has expired: another lifetime. A third of six is two.
+pub const MIN_ISSUER_LIFETIMES: u64 = 6;
+/// The longest an issuer lasts: ten years, the lifetime the genesis issuer
+/// was created with before its succession existed — no successor outlives
+/// what the cluster has lived with.
+pub const MAX_ISSUER_LIFETIME: u64 = 10 * 365 * 86400;
 impl Default for EnrollmentLimits {
     fn default() -> Self {
         Self {
@@ -26,6 +46,7 @@ impl Default for EnrollmentLimits {
             max_enrollments: 4096,
             max_invitation_lifetime: 86400,
             credential_lifetime: 30 * 86400,
+            issuer_lifetime: DEFAULT_ISSUER_LIFETIMES * 30 * 86400,
             max_checkpoint_bytes: 8 * 1024 * 1024,
             max_tenants: 1024,
         }
@@ -39,10 +60,16 @@ impl Default for EnrollmentLimits {
 /// three seconds at least: one to be issued in, one to renew in, one to
 /// expire in.
 pub const MIN_CREDENTIAL_LIFETIME: u64 = 3;
-/// The longest credential lifetime a registry admits: a year, the bound the
-/// bootstrap server certificate is issued for.
+/// The longest credential lifetime a registry admits: a year.
 pub const MAX_CREDENTIAL_LIFETIME: u64 = 365 * 86400;
 impl EnrollmentLimits {
+    /// The issuer lifetime a cluster of `credential_lifetime` takes when
+    /// none was committed: the default ratio, within the bound.
+    pub fn issuer_lifetime_for(credential_lifetime: u64) -> u64 {
+        credential_lifetime
+            .saturating_mul(DEFAULT_ISSUER_LIFETIMES)
+            .min(MAX_ISSUER_LIFETIME)
+    }
     /// The capacity limits: what the process restoring a registry bounds
     /// (its memory), as opposed to the lifetimes, which are the committed
     /// policy of the cluster the registry belongs to.
@@ -63,6 +90,11 @@ impl EnrollmentLimits {
             || self.max_invitation_lifetime > 7 * 86400
             || self.credential_lifetime < MIN_CREDENTIAL_LIFETIME
             || self.credential_lifetime > MAX_CREDENTIAL_LIFETIME
+            || self
+                .credential_lifetime
+                .checked_mul(MIN_ISSUER_LIFETIMES)
+                .is_none_or(|least| self.issuer_lifetime < least)
+            || self.issuer_lifetime > MAX_ISSUER_LIFETIME
             || !(16 * 1024..=64 * 1024 * 1024).contains(&self.max_checkpoint_bytes)
             || self.max_tenants == 0
             || self.max_tenants > 65536
@@ -176,6 +208,158 @@ impl BootstrapServer {
         Ok(())
     }
 }
+/// The domain an issuer's fingerprint is taken in.
+pub fn issuer_fingerprint(certificate: &[u8]) -> Fingerprint {
+    hash("focal.enrollment.issuer.v1", certificate)
+}
+/// An issuer as the registry names it (24 §11): the self-signed CA
+/// certificate credentials chain to, its endorsement by the issuer it
+/// succeeded — a CA certificate for the same key and name under the
+/// predecessor's signature, none for the genesis issuer — and its
+/// validity. Every verifier adopts the record from the registry; one that
+/// has not yet verifies a chain through the endorsement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerRecord {
+    pub fingerprint: Fingerprint,
+    pub certificate: Vec<u8>,
+    pub endorsement: Option<Vec<u8>>,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+/// The most an issuer's certificate or endorsement may be.
+const MAX_ISSUER_BYTES: usize = 4096;
+impl IssuerRecord {
+    pub fn of(certificate: &[u8], endorsement: Option<&[u8]>) -> Result<Self, EnrollmentError> {
+        let (issued_at, expires_at) = crate::pki::certificate_validity(certificate)?;
+        let record = Self {
+            fingerprint: issuer_fingerprint(certificate),
+            certificate: certificate.to_vec(),
+            endorsement: endorsement.map(<[u8]>::to_vec),
+            issued_at,
+            expires_at,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+    /// The certificates a credential issued under this issuer presents
+    /// beside its leaf: the issuer's own, then its endorsement.
+    pub fn chain(&self) -> impl Iterator<Item = &[u8]> {
+        std::iter::once(self.certificate.as_slice()).chain(self.endorsement.as_deref())
+    }
+    fn charge(&self) -> Result<usize, EnrollmentError> {
+        self.certificate
+            .len()
+            .checked_add(self.endorsement.as_ref().map_or(0, Vec::len))
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or(EnrollmentError::Capacity)
+    }
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        if self.certificate.len() > MAX_ISSUER_BYTES
+            || self
+                .endorsement
+                .as_ref()
+                .is_some_and(|endorsement| endorsement.len() > MAX_ISSUER_BYTES)
+        {
+            return Err(EnrollmentError::Capacity);
+        }
+        if self.fingerprint != issuer_fingerprint(&self.certificate)
+            || crate::pki::certificate_validity(&self.certificate)?
+                != (self.issued_at, self.expires_at)
+            || self.issued_at <= 0
+            || self.expires_at <= self.issued_at
+            || !crate::pki::is_issuer(&self.certificate)?
+        {
+            return Err(EnrollmentError::Invalid);
+        }
+        if let Some(endorsement) = &self.endorsement
+            && !crate::pki::endorses(endorsement, &self.certificate)?
+        {
+            return Err(EnrollmentError::Invalid);
+        }
+        Ok(())
+    }
+}
+/// An issuer staged to succeed the current one: committed, so every node
+/// adopts it before anything is issued under it; activated at the next step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedIssuer {
+    pub record: IssuerRecord,
+    pub staged_at: i64,
+}
+/// The cluster's issuers as committed (24 §11): the one issuing now, one
+/// staged to succeed it, and the one it succeeded while a credential
+/// issued under it still lives. At most two generations overlap: a
+/// successor is staged only once the previous issuer has retired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerSuccession {
+    pub current: IssuerRecord,
+    pub successor: Option<StagedIssuer>,
+    pub retiring: Option<IssuerRecord>,
+}
+impl IssuerSuccession {
+    /// The genesis issuer alone: the cluster's identity, issuing.
+    pub fn genesis(ca_certificate: &[u8]) -> Result<Self, EnrollmentError> {
+        Ok(Self {
+            current: IssuerRecord::of(ca_certificate, None)?,
+            successor: None,
+            retiring: None,
+        })
+    }
+    /// Every issuer a verifier trusts: current, staged, retiring.
+    pub fn trusted(&self) -> impl Iterator<Item = &IssuerRecord> {
+        std::iter::once(&self.current)
+            .chain(self.successor.as_ref().map(|staged| &staged.record))
+            .chain(self.retiring.as_ref())
+    }
+    /// The trusted issuers' certificates: the roots a verifier holds.
+    pub fn roots(&self) -> impl Iterator<Item = &[u8]> {
+        self.trusted().map(|record| record.certificate.as_slice())
+    }
+    /// The issuer that issued `certificate`, if a trusted one did.
+    pub fn issuer_of(&self, certificate: &[u8]) -> Option<&IssuerRecord> {
+        self.trusted()
+            .find(|record| focal_wire::issued_by(certificate, &record.certificate).unwrap_or(false))
+    }
+    fn charge(&self) -> Result<usize, EnrollmentError> {
+        self.trusted().try_fold(0usize, |total, record| {
+            total
+                .checked_add(record.charge()?)
+                .ok_or(EnrollmentError::Capacity)
+        })
+    }
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        for record in self.trusted() {
+            record.validate()?;
+        }
+        let mut fingerprints: Vec<Fingerprint> =
+            self.trusted().map(|record| record.fingerprint).collect();
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        if fingerprints.len() != self.trusted().count() {
+            return Err(EnrollmentError::Invalid);
+        }
+        if let Some(staged) = &self.successor
+            && (staged.staged_at <= 0
+                || staged.record.endorsement.is_none()
+                || self.retiring.is_some())
+        {
+            return Err(EnrollmentError::Invalid);
+        }
+        Ok(())
+    }
+}
+/// A move of the issuer succession under the founder authority (24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssuerChange {
+    /// A successor the authority issued, endorsed by the current issuer.
+    Stage(StagedIssuer),
+    /// The staged successor issues from now; the current issuer retires
+    /// once nothing live was issued under it.
+    Activate,
+    /// The retiring issuer is trusted no more: nothing live was issued
+    /// under it.
+    Retire,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentReceipt {
     pub invitation: InvitationId,
@@ -242,6 +426,10 @@ pub(crate) enum Change {
         current: ServerRecord,
         successor: Option<StagedRecord>,
     },
+    /// The issuer succession moved under the founder authority (24 §11):
+    /// a successor staged, the staged one activated, the retiring one
+    /// retired.
+    Issuer(IssuerChange),
 }
 /// A certificate a renewal replaced: still authorized for the grace the
 /// authority decided, so connections and statements in flight complete.
@@ -598,6 +786,76 @@ pub struct EnrollmentRegistry {
     /// The bootstrap server certificate the enrollment endpoint presents
     /// (24 §11); unknown in a registry founded before it was recorded.
     bootstrap: BootstrapServer,
+    /// The issuers credentials chain to (24 §11): the genesis issuer in a
+    /// registry founded before the succession was recorded.
+    issuer: IssuerSuccession,
+}
+/// The limits as schemas 3 to 5 wrote them, before the issuer lifetime.
+#[derive(Deserialize)]
+struct LimitsV3 {
+    max_invitations: usize,
+    max_enrollments: usize,
+    max_invitation_lifetime: u64,
+    credential_lifetime: u64,
+    max_checkpoint_bytes: usize,
+    max_tenants: usize,
+}
+impl From<LimitsV3> for EnrollmentLimits {
+    fn from(legacy: LimitsV3) -> Self {
+        Self {
+            max_invitations: legacy.max_invitations,
+            max_enrollments: legacy.max_enrollments,
+            max_invitation_lifetime: legacy.max_invitation_lifetime,
+            credential_lifetime: legacy.credential_lifetime,
+            max_checkpoint_bytes: legacy.max_checkpoint_bytes,
+            max_tenants: legacy.max_tenants,
+            issuer_lifetime: Self::issuer_lifetime_for(legacy.credential_lifetime),
+        }
+    }
+}
+/// The limits as schemas 3 to 5 wrote them, for the upgrade tests.
+#[cfg(test)]
+#[derive(Serialize)]
+struct LegacyLimits {
+    max_invitations: usize,
+    max_enrollments: usize,
+    max_invitation_lifetime: u64,
+    credential_lifetime: u64,
+    max_checkpoint_bytes: usize,
+    max_tenants: usize,
+}
+#[cfg(test)]
+impl LegacyLimits {
+    fn of(limits: &EnrollmentLimits) -> Self {
+        Self {
+            max_invitations: limits.max_invitations,
+            max_enrollments: limits.max_enrollments,
+            max_invitation_lifetime: limits.max_invitation_lifetime,
+            credential_lifetime: limits.credential_lifetime,
+            max_checkpoint_bytes: limits.max_checkpoint_bytes,
+            max_tenants: limits.max_tenants,
+        }
+    }
+}
+/// The registry as schema 5 wrote it, before the issuer succession.
+#[derive(Deserialize)]
+struct RegistryV5 {
+    schema: u16,
+    cluster: ClusterId,
+    ca_certificate: Vec<u8>,
+    limits: LimitsV3,
+    revision: u64,
+    applied_index: u64,
+    time_floor: i64,
+    next_node: u64,
+    charged_bytes: usize,
+    records: BTreeMap<InvitationId, InviteMetadata>,
+    certificates: BTreeMap<Fingerprint, InvitationId>,
+    enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
+    retired: BTreeMap<Fingerprint, RetiredCredential>,
+    tenants: std::collections::BTreeSet<[u8; 16]>,
+    fence: UpgradeFence,
+    bootstrap: BootstrapServer,
 }
 /// The registry as schema 4 wrote it, before the bootstrap server record.
 #[derive(Deserialize)]
@@ -605,7 +863,7 @@ struct RegistryV4 {
     schema: u16,
     cluster: ClusterId,
     ca_certificate: Vec<u8>,
-    limits: EnrollmentLimits,
+    limits: LimitsV3,
     revision: u64,
     applied_index: u64,
     time_floor: i64,
@@ -624,7 +882,7 @@ struct RegistryV3 {
     schema: u16,
     cluster: ClusterId,
     ca_certificate: Vec<u8>,
-    limits: EnrollmentLimits,
+    limits: LimitsV3,
     revision: u64,
     applied_index: u64,
     time_floor: i64,
@@ -638,8 +896,9 @@ struct RegistryV3 {
 }
 /// The registry's persisted layout; schema 2 (before admitted tenants)
 /// restores with none, schema 3 without a fence, schema 4 without the
-/// bootstrap server record; any other schema is not this registry.
-const REGISTRY_SCHEMA: u16 = 5;
+/// bootstrap server record, schema 5 with the genesis issuer alone; any
+/// other schema is not this registry.
+const REGISTRY_SCHEMA: u16 = 6;
 /// The schema 2 layout, converted on restore.
 #[derive(Deserialize)]
 struct RegistryV2 {
@@ -680,6 +939,10 @@ impl EnrollmentRegistry {
         roots
             .add(ca_certificate.clone().into())
             .map_err(|_| EnrollmentError::Invalid)?;
+        let issuer = IssuerSuccession::genesis(&ca_certificate)?;
+        let charged_bytes = 8192usize
+            .checked_add(issuer.charge()?)
+            .ok_or(EnrollmentError::Capacity)?;
         Ok(Self {
             owner: Some(random()?),
             schema: REGISTRY_SCHEMA,
@@ -690,7 +953,7 @@ impl EnrollmentRegistry {
             applied_index: 0,
             time_floor: 0,
             next_node,
-            charged_bytes: 8192,
+            charged_bytes,
             records: BTreeMap::new(),
             certificates: BTreeMap::new(),
             enrolled_keys: BTreeMap::new(),
@@ -698,6 +961,7 @@ impl EnrollmentRegistry {
             tenants: std::collections::BTreeSet::new(),
             fence: UpgradeFence::default(),
             bootstrap: BootstrapServer::default(),
+            issuer,
         })
     }
     // Only the private new-genesis draft constructor can select the existing
@@ -708,6 +972,7 @@ impl EnrollmentRegistry {
         node: u64,
         principal: [u8; 16],
         limits: EnrollmentLimits,
+        level: u32,
         now: i64,
     ) -> Result<(Self, EnrollmentReceipt), EnrollmentError> {
         let next_node = node.checked_add(1).ok_or(EnrollmentError::Capacity)?;
@@ -740,7 +1005,19 @@ impl EnrollmentRegistry {
             certificate: authority.issue_founder(key.csr(), &receipt.identity, now, lifetime)?,
             ..receipt
         };
-        verify_issued(&receipt, authority.ca_certificate())?;
+        verify_issued(&receipt, registry.trust_roots())?;
+        // The cluster is founded at the founding binary's capability level
+        // (24 §21): its one node runs it, so the fence is that level from
+        // genesis, and behaviour gated on it is open from the start.
+        registry.fence = if level == 0 {
+            UpgradeFence::default()
+        } else {
+            UpgradeFence {
+                level,
+                activated_at: now,
+                revision: 1,
+            }
+        };
         let record = InviteMetadata {
             id: receipt.invitation,
             cluster: registry.cluster,
@@ -856,6 +1133,39 @@ impl EnrollmentRegistry {
     }
     pub fn admits_tenant(&self, tenant: [u8; 16]) -> bool {
         self.tenants.contains(&tenant)
+    }
+    /// The issuers credentials chain to, as committed (24 §11).
+    pub fn issuers(&self) -> &IssuerSuccession {
+        &self.issuer
+    }
+    /// The roots a verifier of this cluster's credentials holds.
+    pub fn trust_roots(&self) -> impl Iterator<Item = &[u8]> {
+        self.issuer.roots()
+    }
+    /// Whether a credential issued under the retiring issuer still lives
+    /// at `now` — a reason the issuer is trusted on — or the bootstrap
+    /// server certificate the authority presents is under it.
+    pub fn retiring_issuer_in_use(&self, authority: &BootstrapAuthority, now: i64) -> bool {
+        let Some(retiring) = &self.issuer.retiring else {
+            return false;
+        };
+        // A certificate that cannot be read is held to be under it: the
+        // retiring issuer stays trusted rather than be dropped on a doubt.
+        let under = |certificate: &[u8]| {
+            focal_wire::issued_by(certificate, &retiring.certificate).unwrap_or(true)
+        };
+        self.live_receipts(now)
+            .any(|receipt| under(&receipt.certificate))
+            || under(authority.server_certificate())
+    }
+    /// Every receipt — current or retired — whose certificate is valid at
+    /// `now`.
+    fn live_receipts(&self, now: i64) -> impl Iterator<Item = &EnrollmentReceipt> {
+        self.records
+            .values()
+            .filter_map(|record| record.receipt.as_ref())
+            .chain(self.retired.values().map(|retired| &retired.receipt))
+            .filter(move |receipt| receipt.expires_at > now)
     }
     /// The committed upgrade fence (24 §21).
     pub fn fence(&self) -> UpgradeFence {
@@ -973,6 +1283,68 @@ impl EnrollmentRegistry {
             change: Change::ActivateFence { level },
         })
     }
+    /// The next committed step of the issuer succession under the founder
+    /// authority (24 §11), from what the authority holds: the staging of a
+    /// successor the authority issued and endorsed, the activation of a
+    /// staged successor, or the retirement of the issuer it succeeded once
+    /// nothing live was issued under it. None when the registry says what
+    /// the authority holds, or an activation committed that the authority
+    /// has yet to adopt (`BootstrapAuthority::activate_issuer`).
+    pub fn prepare_issuer(
+        &self,
+        authority: &BootstrapAuthority,
+        now: i64,
+    ) -> Result<Option<EnrollmentCommand>, EnrollmentError> {
+        self.check_time(now)?;
+        self.check_authority(authority)?;
+        let issuing = authority.issuer_record()?;
+        let change = match (&self.issuer.successor, authority.issuer_successor()?) {
+            // The registry names the successor the authority staged; the
+            // authority still issues under the predecessor: activate.
+            (Some(staged), Some(held)) if staged.record == held => IssuerChange::Activate,
+            // The registry's current issuer is what the authority staged:
+            // the activation committed and the authority adopts it.
+            (_, Some(held)) if self.issuer.current == held => return Ok(None),
+            (None, Some(held)) => {
+                if self.issuer.retiring.is_some() || self.issuer.current != issuing {
+                    return Ok(None);
+                }
+                IssuerChange::Stage(StagedIssuer {
+                    record: held,
+                    staged_at: now,
+                })
+            }
+            (Some(_), Some(_)) => return Err(EnrollmentError::Conflict),
+            (Some(_), None) => {
+                // A staged successor the authority no longer holds: the
+                // authority adopted it, the registry has yet to.
+                if self
+                    .issuer
+                    .successor
+                    .as_ref()
+                    .is_some_and(|staged| staged.record == issuing)
+                {
+                    IssuerChange::Activate
+                } else {
+                    return Err(EnrollmentError::Conflict);
+                }
+            }
+            (None, None) => {
+                if self.issuer.current != issuing {
+                    return Err(EnrollmentError::Conflict);
+                }
+                if self.issuer.retiring.is_none() || self.retiring_issuer_in_use(authority, now) {
+                    return Ok(None);
+                }
+                IssuerChange::Retire
+            }
+        };
+        Ok(Some(EnrollmentCommand {
+            revision: self.revision,
+            decided_at: now,
+            change: Change::Issuer(change),
+        }))
+    }
     /// Admit a tenant under the founder authority: a conflict when it is
     /// admitted already (an operator's retry reads that as done).
     pub fn prepare_admit_tenant(
@@ -1028,9 +1400,16 @@ impl EnrollmentRegistry {
             ca_certificate: self.ca_certificate.clone(),
             server_fingerprint: server_fingerprint(authority.server_certificate()),
             successor_fingerprint,
+            issuers: self.issuer.trusted().cloned().collect(),
         };
         trust.validate()?;
-        trust.verify_chain(&[authority.server_certificate().to_vec().into()], now)?;
+        let chain: Vec<rustls::pki_types::CertificateDer<'_>> = authority
+            .server_identity()
+            .certificate_chain()
+            .iter()
+            .map(|certificate| certificate.clone().into())
+            .collect();
+        trust.verify_chain(&chain, now)?;
         let data = InvitationData {
             schema: crate::invitation::INVITATION_SCHEMA,
             id: random()?,
@@ -1465,7 +1844,7 @@ impl EnrollmentRegistry {
                 {
                     return Err(EnrollmentError::Invalid);
                 }
-                verify_issued(receipt, &self.ca_certificate)?;
+                verify_issued(receipt, self.trust_roots())?;
                 let next_node = if expected.node_id.is_some() {
                     self.next_node
                         .checked_add(1)
@@ -1553,6 +1932,78 @@ impl EnrollmentRegistry {
                     .ok_or(EnrollmentError::Corrupt)?;
                 self.bootstrap = next;
             }
+            Change::Issuer(change) => {
+                let previous = &self.issuer;
+                let next =
+                    match change {
+                        IssuerChange::Stage(staged) => {
+                            // One generation at a time: nothing staged, nothing
+                            // retiring; the successor is endorsed by the issuer it
+                            // succeeds and is not that issuer.
+                            if previous.successor.is_some()
+                                || previous.retiring.is_some()
+                                || staged.staged_at != command.decided_at
+                                || staged.record.expires_at <= command.decided_at
+                                || staged.record.fingerprint == previous.current.fingerprint
+                                || !staged.record.endorsement.as_deref().is_some_and(
+                                    |endorsement| {
+                                        focal_wire::issued_by(
+                                            endorsement,
+                                            &previous.current.certificate,
+                                        )
+                                        .unwrap_or(false)
+                                    },
+                                )
+                            {
+                                return Err(EnrollmentError::Invalid);
+                            }
+                            IssuerSuccession {
+                                current: previous.current.clone(),
+                                successor: Some(staged.clone()),
+                                retiring: None,
+                            }
+                        }
+                        IssuerChange::Activate => {
+                            let staged = previous
+                                .successor
+                                .as_ref()
+                                .ok_or(EnrollmentError::Invalid)?;
+                            IssuerSuccession {
+                                current: staged.record.clone(),
+                                successor: None,
+                                retiring: Some(previous.current.clone()),
+                            }
+                        }
+                        IssuerChange::Retire => {
+                            let retiring =
+                                previous.retiring.as_ref().ok_or(EnrollmentError::Invalid)?;
+                            // Nothing live was issued under it, at the decision.
+                            if self.live_receipts(command.decided_at).any(|receipt| {
+                                focal_wire::issued_by(&receipt.certificate, &retiring.certificate)
+                                    .unwrap_or(true)
+                            }) {
+                                return Err(EnrollmentError::Invalid);
+                            }
+                            IssuerSuccession {
+                                current: previous.current.clone(),
+                                successor: previous.successor.clone(),
+                                retiring: None,
+                            }
+                        }
+                    };
+                next.validate()?;
+                let before = previous.charge()?;
+                let after = next.charge()?;
+                if let Some(more) = after.checked_sub(before).filter(|more| *more > 0) {
+                    self.reserve(more)?;
+                }
+                self.charged_bytes = self
+                    .charged_bytes
+                    .checked_sub(before)
+                    .and_then(|bytes| bytes.checked_add(after))
+                    .ok_or(EnrollmentError::Corrupt)?;
+                self.issuer = next;
+            }
             Change::AdmitTenant { tenant } => {
                 if *tenant == [0; 16] || self.tenants.contains(tenant) {
                     return Err(EnrollmentError::Invalid);
@@ -1600,7 +2051,7 @@ impl EnrollmentRegistry {
                 {
                     return Err(EnrollmentError::Invalid);
                 }
-                verify_issued(receipt, &self.ca_certificate)?;
+                verify_issued(receipt, self.trust_roots())?;
                 if !crate::pki::identity_bound(receipt)? {
                     return Err(EnrollmentError::Invalid);
                 }
@@ -1664,7 +2115,7 @@ impl EnrollmentRegistry {
                 {
                     return Err(EnrollmentError::Invalid);
                 }
-                verify_issued(receipt, &self.ca_certificate)?;
+                verify_issued(receipt, self.trust_roots())?;
                 if !crate::pki::identity_bound(receipt)? {
                     return Err(EnrollmentError::Invalid);
                 }
@@ -1761,7 +2212,7 @@ impl EnrollmentRegistry {
                 if now < held.issued_at || now >= held.expires_at {
                     return Err(EnrollmentError::Expired);
                 }
-                verify_issued(held, &self.ca_certificate)?;
+                verify_issued(held, self.trust_roots())?;
                 if !crate::pki::identity_bound(held)? {
                     return Err(EnrollmentError::Unauthorized);
                 }
@@ -1824,6 +2275,50 @@ impl EnrollmentRegistry {
         bytes.truncate(length);
         Ok(bytes)
     }
+    /// The schema 5 encoding of this registry, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn encode_as_schema_five_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            schema: u16,
+            cluster: ClusterId,
+            ca_certificate: &'a [u8],
+            limits: LegacyLimits,
+            revision: u64,
+            applied_index: u64,
+            time_floor: i64,
+            next_node: u64,
+            charged_bytes: usize,
+            records: &'a BTreeMap<InvitationId, InviteMetadata>,
+            certificates: &'a BTreeMap<Fingerprint, InvitationId>,
+            enrolled_keys: &'a BTreeMap<Fingerprint, InvitationId>,
+            retired: &'a BTreeMap<Fingerprint, RetiredCredential>,
+            tenants: &'a std::collections::BTreeSet<[u8; 16]>,
+            fence: UpgradeFence,
+            bootstrap: &'a BootstrapServer,
+        }
+        encode(&Legacy {
+            schema: 5,
+            cluster: self.cluster,
+            ca_certificate: &self.ca_certificate,
+            limits: LegacyLimits::of(&self.limits),
+            revision: self.revision,
+            applied_index: self.applied_index,
+            time_floor: self.time_floor,
+            next_node: self.next_node,
+            charged_bytes: self
+                .charged_bytes
+                .checked_sub(self.issuer.charge()?)
+                .ok_or(EnrollmentError::Corrupt)?,
+            records: &self.records,
+            certificates: &self.certificates,
+            enrolled_keys: &self.enrolled_keys,
+            retired: &self.retired,
+            tenants: &self.tenants,
+            fence: self.fence,
+            bootstrap: &self.bootstrap,
+        })
+    }
     /// The schema 4 encoding of this registry, for the upgrade test.
     #[cfg(test)]
     pub(crate) fn encode_as_schema_four_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
@@ -1832,7 +2327,7 @@ impl EnrollmentRegistry {
             schema: u16,
             cluster: ClusterId,
             ca_certificate: &'a [u8],
-            limits: &'a EnrollmentLimits,
+            limits: LegacyLimits,
             revision: u64,
             applied_index: u64,
             time_floor: i64,
@@ -1849,7 +2344,7 @@ impl EnrollmentRegistry {
             schema: 4,
             cluster: self.cluster,
             ca_certificate: &self.ca_certificate,
-            limits: &self.limits,
+            limits: LegacyLimits::of(&self.limits),
             revision: self.revision,
             applied_index: self.applied_index,
             time_floor: self.time_floor,
@@ -1857,6 +2352,7 @@ impl EnrollmentRegistry {
             charged_bytes: self
                 .charged_bytes
                 .checked_sub(self.bootstrap.charge()?)
+                .and_then(|bytes| bytes.checked_sub(self.issuer.charge().ok()?))
                 .ok_or(EnrollmentError::Corrupt)?,
             records: &self.records,
             certificates: &self.certificates,
@@ -1874,7 +2370,7 @@ impl EnrollmentRegistry {
             schema: u16,
             cluster: ClusterId,
             ca_certificate: &'a [u8],
-            limits: &'a EnrollmentLimits,
+            limits: LegacyLimits,
             revision: u64,
             applied_index: u64,
             time_floor: i64,
@@ -1890,12 +2386,16 @@ impl EnrollmentRegistry {
             schema: 3,
             cluster: self.cluster,
             ca_certificate: &self.ca_certificate,
-            limits: &self.limits,
+            limits: LegacyLimits::of(&self.limits),
             revision: self.revision,
             applied_index: self.applied_index,
             time_floor: self.time_floor,
             next_node: self.next_node,
-            charged_bytes: self.charged_bytes,
+            // A schema-3 checkpoint charged no issuer.
+            charged_bytes: self
+                .charged_bytes
+                .checked_sub(self.issuer.charge()?)
+                .ok_or(EnrollmentError::Corrupt)?,
             records: &self.records,
             certificates: &self.certificates,
             enrolled_keys: &self.enrolled_keys,
@@ -1937,10 +2437,12 @@ impl EnrollmentRegistry {
             applied_index: self.applied_index,
             time_floor: self.time_floor,
             next_node: self.next_node,
-            // A schema-2 checkpoint never charged tenants.
+            // A schema-2 checkpoint never charged tenants, nor an issuer.
             charged_bytes: self
                 .charged_bytes
-                .saturating_sub(self.tenants.len().saturating_mul(64)),
+                .saturating_sub(self.tenants.len().saturating_mul(64))
+                .checked_sub(self.issuer.charge()?)
+                .ok_or(EnrollmentError::Corrupt)?,
             records: &self.records,
             certificates: &self.certificates,
             enrolled_keys: &self.enrolled_keys,
@@ -1974,7 +2476,7 @@ impl EnrollmentRegistry {
                     owner: None,
                     schema: REGISTRY_SCHEMA,
                     cluster: legacy.cluster,
-                    ca_certificate: legacy.ca_certificate,
+                    ca_certificate: legacy.ca_certificate.clone(),
                     limits: EnrollmentLimits {
                         max_invitations,
                         max_enrollments,
@@ -1982,6 +2484,7 @@ impl EnrollmentRegistry {
                         credential_lifetime,
                         max_checkpoint_bytes,
                         max_tenants: limits.max_tenants,
+                        issuer_lifetime: EnrollmentLimits::issuer_lifetime_for(credential_lifetime),
                     },
                     revision: legacy.revision,
                     applied_index: legacy.applied_index,
@@ -1995,6 +2498,7 @@ impl EnrollmentRegistry {
                     tenants: std::collections::BTreeSet::new(),
                     fence: UpgradeFence::default(),
                     bootstrap: BootstrapServer::default(),
+                    issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
                 },
                 rest,
             )
@@ -2009,8 +2513,8 @@ impl EnrollmentRegistry {
                     owner: None,
                     schema: REGISTRY_SCHEMA,
                     cluster: legacy.cluster,
-                    ca_certificate: legacy.ca_certificate,
-                    limits: legacy.limits,
+                    ca_certificate: legacy.ca_certificate.clone(),
+                    limits: legacy.limits.into(),
                     revision: legacy.revision,
                     applied_index: legacy.applied_index,
                     time_floor: legacy.time_floor,
@@ -2023,6 +2527,7 @@ impl EnrollmentRegistry {
                     tenants: legacy.tenants,
                     fence: UpgradeFence::default(),
                     bootstrap: BootstrapServer::default(),
+                    issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
                 },
                 rest,
             )
@@ -2038,8 +2543,8 @@ impl EnrollmentRegistry {
                     owner: None,
                     schema: REGISTRY_SCHEMA,
                     cluster: legacy.cluster,
-                    ca_certificate: legacy.ca_certificate,
-                    limits: legacy.limits,
+                    ca_certificate: legacy.ca_certificate.clone(),
+                    limits: legacy.limits.into(),
                     revision: legacy.revision,
                     applied_index: legacy.applied_index,
                     time_floor: legacy.time_floor,
@@ -2052,12 +2557,54 @@ impl EnrollmentRegistry {
                     tenants: legacy.tenants,
                     fence: legacy.fence,
                     bootstrap: BootstrapServer::default(),
+                    issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
+                },
+                rest,
+            )
+        } else if schema == 5 {
+            // A schema-5 checkpoint names its genesis issuer alone (24 §11).
+            let (legacy, rest): (RegistryV5, &[u8]) = postcard::take_from_bytes(bytes)?;
+            if legacy.schema != 5 {
+                return Err(EnrollmentError::Corrupt);
+            }
+            (
+                Self {
+                    owner: None,
+                    schema: REGISTRY_SCHEMA,
+                    cluster: legacy.cluster,
+                    issuer: IssuerSuccession::genesis(&legacy.ca_certificate)?,
+                    ca_certificate: legacy.ca_certificate.clone(),
+                    limits: legacy.limits.into(),
+                    revision: legacy.revision,
+                    applied_index: legacy.applied_index,
+                    time_floor: legacy.time_floor,
+                    next_node: legacy.next_node,
+                    charged_bytes: legacy.charged_bytes,
+                    records: legacy.records,
+                    certificates: legacy.certificates,
+                    enrolled_keys: legacy.enrolled_keys,
+                    retired: legacy.retired,
+                    tenants: legacy.tenants,
+                    fence: legacy.fence,
+                    bootstrap: legacy.bootstrap,
                 },
                 rest,
             )
         } else {
             postcard::take_from_bytes(bytes)?
         };
+        // A checkpoint written before the succession was recorded charged
+        // nothing for its issuer; the genesis record is charged now.
+        if schema < REGISTRY_SCHEMA {
+            registry.charged_bytes = registry
+                .charged_bytes
+                .checked_add(registry.issuer.charge()?)
+                .ok_or(EnrollmentError::Capacity)?;
+        }
+        registry
+            .issuer
+            .validate()
+            .map_err(|_| EnrollmentError::Corrupt)?;
         registry
             .bootstrap
             .validate(limits.max_invitations)
@@ -2115,7 +2662,14 @@ impl EnrollmentRegistry {
                 {
                     return Err(EnrollmentError::Corrupt);
                 }
-                verify_issued(receipt, &registry.ca_certificate)?;
+                // A live receipt chains to a trusted issuer; one that expired
+                // may have been issued under an issuer retired since, and is
+                // held to its shape alone — it authorizes nothing.
+                if receipt.expires_at > registry.time_floor {
+                    verify_issued(receipt, registry.issuer.roots())?;
+                } else {
+                    verify_issued_shape(receipt)?;
+                }
                 if certificates
                     .insert(server_fingerprint(&receipt.certificate), *id)
                     .is_some()
@@ -2179,7 +2733,11 @@ impl EnrollmentRegistry {
             {
                 return Err(EnrollmentError::Corrupt);
             }
-            verify_issued(&retired.receipt, &registry.ca_certificate)?;
+            if retired.receipt.expires_at > registry.time_floor {
+                verify_issued(&retired.receipt, registry.issuer.roots())?;
+            } else {
+                verify_issued_shape(&retired.receipt)?;
+            }
         }
         charged_bytes = charged_bytes
             .checked_add(
@@ -2190,6 +2748,7 @@ impl EnrollmentRegistry {
                     .ok_or(EnrollmentError::Capacity)?,
             )
             .and_then(|bytes| bytes.checked_add(registry.bootstrap.charge().ok()?))
+            .and_then(|bytes| bytes.checked_add(registry.issuer.charge().ok()?))
             .ok_or(EnrollmentError::Capacity)?;
         if charged_bytes != registry.charged_bytes || charged_bytes > limits.max_checkpoint_bytes {
             return Err(EnrollmentError::Corrupt);

@@ -244,7 +244,7 @@ impl PendingClientJoin {
         }
         Ok(self.key.complete(
             receipt,
-            &self.bundle.invitation().trust().ca_certificate,
+            self.bundle.invitation().trust().issuers.iter(),
             now,
         )?)
     }

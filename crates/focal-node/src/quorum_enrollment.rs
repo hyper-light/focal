@@ -74,6 +74,9 @@ pub enum QuorumEnrollmentError {
     Control(#[from] ControlFailure),
     #[error("signer, root authority, or authenticated principal does not match")]
     Identity,
+    /// The upgrade fence is below the level a behaviour needs (24 §21).
+    #[error("the upgrade fence ({level}) is below the level needed ({needed})")]
+    Fenced { level: u32, needed: u32 },
     #[error("invitation request identity conflicts with its saved intent")]
     IntentConflict,
     #[error("enrollment owner has stopped or its disk state is ambiguous")]
@@ -149,6 +152,13 @@ enum Action {
     AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
     ActivateFence(u32, oneshot::Sender<Answer<focal_enrollment::UpgradeFence>>),
     MaintainBootstrapServer(i64, oneshot::Sender<Answer<Option<CredentialMaterial>>>),
+    /// One step of the issuer succession (24 §11), staged now when the
+    /// operator asked (`true`).
+    MaintainIssuer(
+        i64,
+        bool,
+        oneshot::Sender<Answer<focal_enrollment::IssuerSuccession>>,
+    ),
     Stop(oneshot::Sender<()>),
 }
 struct Work {
@@ -381,6 +391,36 @@ impl QuorumEnrollmentHost {
             .map_err(|_| QuorumEnrollmentError::Stopped)?
             .result
     }
+    /// One step of the issuer succession (24 §11): a successor staged in
+    /// the last third of the issuer's lifetime, activated once committed,
+    /// the predecessor retired once nothing live was issued under it. The
+    /// issuers as committed after the step.
+    pub async fn maintain_issuer(
+        &self,
+        now: i64,
+    ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::MaintainIssuer(now, false, send), 8192)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
+    /// Stage the issuer's successor now, as the operator asked (24 §11): a
+    /// successor already staged or committed is answered as it is; refused
+    /// `Fenced` while the upgrade fence is below the level that verifies an
+    /// endorsed chain.
+    pub async fn rotate_issuer(
+        &self,
+        now: i64,
+    ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::MaintainIssuer(now, true, send), 8192)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
     pub async fn authorize_certificate(
         &self,
         certificate: Vec<u8>,
@@ -488,6 +528,13 @@ impl QuorumEnrollmentDriver {
                 }
                 Action::MaintainBootstrapServer(now, send) => {
                     let result = self.maintain_bootstrap_server(control, now).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::MaintainIssuer(now, requested, send) => {
+                    let result = self.maintain_issuer(control, now, requested).await;
                     let _ = send.send(Answer {
                         result,
                         _charge: work._charge,
@@ -850,7 +897,16 @@ impl QuorumEnrollmentDriver {
         if self.authority.successor().is_none() && !registry.bootstrap().current.is_unknown() {
             let (issued_at, expires_at) = self.authority.server_validity()?;
             let window = crate::credential_renewal::window_of(issued_at, expires_at);
-            if now >= expires_at.saturating_sub(window) {
+            // Staged in the last third of its lifetime, or as soon as the
+            // issuer succeeded itself: the certificate presented is then
+            // under the issuer that retires, and must move under the one
+            // that issues before the retirement (24 §11).
+            let under_issuer = focal_wire::issued_by(
+                self.authority.server_certificate(),
+                self.authority.issuer_certificate(),
+            )
+            .unwrap_or(false);
+            if now >= expires_at.saturating_sub(window) || !under_issuer {
                 self.authority
                     .stage_successor(now, registry.limits().credential_lifetime)?;
             }
@@ -866,6 +922,70 @@ impl QuorumEnrollmentDriver {
             return Ok(Some(self.authority.activate_successor()?));
         }
         Ok(None)
+    }
+    /// The issuer's succession (24 §11), one step: an activation the
+    /// registry committed before this authority adopted it (a crash between
+    /// the two) is adopted now; a successor is staged in the last third of
+    /// the issuer's lifetime, or when the operator asks, once the upgrade
+    /// fence says every node verifies an endorsed chain; the registry is
+    /// told what the authority holds (the staging, the activation, or the
+    /// retirement once nothing live was issued under the predecessor); an
+    /// activation just committed is adopted. The issuers as committed after
+    /// the step.
+    async fn maintain_issuer(
+        &mut self,
+        control: &impl EnrollmentControl,
+        now: i64,
+        requested: bool,
+    ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        let activated = |authority: &BootstrapAuthority,
+                         registry: &EnrollmentRegistry|
+         -> Result<bool, EnrollmentError> {
+            Ok(authority
+                .issuer_successor()?
+                .is_some_and(|held| registry.issuers().current == held))
+        };
+        if activated(&self.authority, &registry)? {
+            drop(registry);
+            drop(charge);
+            self.authority.activate_issuer()?;
+            let (registry, _charge) = self.registry(control).await?;
+            return Ok(registry.issuers().clone());
+        }
+        let issuers = registry.issuers();
+        if self.authority.issuer_successor()?.is_none()
+            && issuers.successor.is_none()
+            && issuers.retiring.is_none()
+        {
+            let opened =
+                crate::upgrade::opened(registry.fence(), crate::upgrade::ISSUER_SUCCESSION_LEVEL);
+            let (issued_at, expires_at) = self.authority.issuer_validity()?;
+            let window = crate::credential_renewal::window_of(issued_at, expires_at);
+            let due = now >= expires_at.saturating_sub(window);
+            if requested && !opened {
+                return Err(QuorumEnrollmentError::Fenced {
+                    level: registry.fence().level,
+                    needed: crate::upgrade::ISSUER_SUCCESSION_LEVEL,
+                });
+            }
+            if opened && (requested || due) {
+                self.authority
+                    .stage_issuer(now, registry.limits().issuer_lifetime)?;
+            }
+        }
+        let Some(command) = registry.prepare_issuer(&self.authority, now)? else {
+            return Ok(registry.issuers().clone());
+        };
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if activated(&self.authority, &registry)? {
+            self.authority.activate_issuer()?;
+        }
+        Ok(registry.issuers().clone())
     }
     /// The grant a certificate earns: the configured tenants and every tenant
     /// the committed registry admits, so admission never needs a restart and

@@ -26,6 +26,23 @@ impl EnrollmentCommand {
             _ => None,
         }
     }
+    /// The change this command commits.
+    #[cfg(test)]
+    pub(crate) fn change(&self) -> &Change {
+        &self.change
+    }
+    /// This command with another change, for a refusal test.
+    #[cfg(test)]
+    pub(crate) fn with_change(mut self, change: Change) -> Self {
+        self.change = change;
+        self
+    }
+    /// This command decided at another moment, for a refusal test.
+    #[cfg(test)]
+    pub(crate) fn with_decided_at(mut self, decided_at: i64) -> Self {
+        self.decided_at = decided_at;
+        self
+    }
     /// Identifies a renewal or rotation, which only the enrollment host may
     /// commit.
     pub fn renewed_invitation(&self) -> Option<InvitationId> {

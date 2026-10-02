@@ -30,18 +30,6 @@ impl TlsIdentity {
         }
     }
 }
-fn roots(certificates: Vec<Vec<u8>>) -> Result<rustls::RootCertStore, WireError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in certificates {
-        roots
-            .add(CertificateDer::from(certificate))
-            .map_err(|_| WireError::Authentication)?;
-    }
-    if roots.is_empty() {
-        return Err(WireError::Authentication);
-    }
-    Ok(roots)
-}
 // Quinn/rustls retain shared configurations across their internal connection
 // tasks; these Arc types are required by those libraries' public APIs.
 /// Longest silence before a QUIC connection is considered dead.
@@ -351,12 +339,14 @@ pub fn server_tls(
 ) -> Result<quinn::ServerConfig, WireError> {
     limits.validate()?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots(client_roots)?),
+    // A client's chain is verified against the roots this server knows,
+    // and through a predecessor's endorsement when the client's issuer
+    // succeeded one of them since (`trust`).
+    let verifier = crate::EndorsingClientVerifier::new(
+        crate::TrustRoots::new(client_roots)?,
         provider.clone(),
-    )
-    .build()
-    .map_err(|_| WireError::Authentication)?;
+        false,
+    )?;
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?
@@ -389,10 +379,18 @@ pub fn client_tls(
 ) -> Result<quinn::ClientConfig, WireError> {
     limits.validate()?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // The server's chain is verified against the roots this client knows,
+    // and through a predecessor's endorsement when the server's issuer
+    // succeeded one of them since (`trust`).
+    let verifier = crate::EndorsingServerVerifier::new(
+        crate::TrustRoots::new(server_roots)?,
+        provider.clone(),
+    )?;
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?
-        .with_root_certificates(roots(server_roots)?)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(identity.certificate_chain, identity.private_key)
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];

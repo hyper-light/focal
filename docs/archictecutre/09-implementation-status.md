@@ -12826,3 +12826,26 @@ its leadership first); a merged-away group's grant kept forever (the root releas
 once absorbed, `ReleaseGroup`, and the member's seat and record go with it); a seat
 watch that read an unobservable authority as unseated; a node's service ending when a
 hosted drive ended well; and the seat's own stop raced its own egress.
+
+### 2026-10-02 — F13 stage 3: the issuer succeeds itself
+
+The CA every credential chains to was created once, for ten years, and pinned
+everywhere; a cluster that outlived it, or whose issuer's key was exposed, had
+no move but a re-founding. Now the issuer succeeds itself as the certificates it
+issues do ([24](24-placement-execution-and-fleet-control.md) §11): identity by
+genesis (the genesis issuer stays what every identity check compares), trust by
+the committed set (the registry's `IssuerSuccession`, adopted by every node and
+carried by every invitation), bridged by endorsement (a successor's certificate
+is also issued under its predecessor's signature and presented in every chain,
+so a verifier that has not adopted it yet — a lagging node, a client holding an
+older trust — accepts the chain through the endorsement instead of being cut
+off for good). The succession is staged in the last third of the issuer's
+committed lifetime (`node.issuer_lifetime_seconds`, twelve credential lifetimes
+by default, six at least) or when the operator asks (`cluster credentials
+rotate-issuer`), activated at the next step, and the predecessor retires once
+nothing live was issued under it. It is the first behaviour gated on the
+upgrade fence (level 2); a cluster founded by this binary holds the fence at
+its level from genesis. Measured under the forty-five-second test lifetime:
+activation within a second of the staging, the genesis issuer retired within
+two lifetimes, a chain of three certificates (about 1.6 KiB).
+

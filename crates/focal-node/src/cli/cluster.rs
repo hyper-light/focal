@@ -358,6 +358,13 @@ pub(crate) enum CredentialCommand {
     /// Rotate this node's own credential to a fresh key under the same
     /// identity; the previous certificate authorizes through the grace.
     Rotate,
+    /// The issuers the cluster's credentials chain to, as committed: the
+    /// one issuing, one staged, the one retiring, and the upgrade fence.
+    Issuers,
+    /// Stage the issuer's successor now (founder only): committed so every
+    /// node trusts it, then activated; the current issuer retires once
+    /// nothing live was issued under it.
+    RotateIssuer,
 }
 #[derive(Subcommand)]
 pub(crate) enum MembershipCommand {
@@ -727,6 +734,8 @@ pub(crate) fn run(
             )),
             CredentialCommand::Renew => runtime.block_on(admin.renew_credential()),
             CredentialCommand::Rotate => runtime.block_on(admin.rotate_credential()),
+            CredentialCommand::Issuers => runtime.block_on(admin.issuers()),
+            CredentialCommand::RotateIssuer => runtime.block_on(admin.rotate_issuer()),
         },
         ClusterCommand::Membership { command } => match command {
             MembershipCommand::Show => runtime.block_on(admin.read(AdminRead::Configuration)),

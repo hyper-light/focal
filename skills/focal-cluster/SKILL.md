@@ -84,7 +84,16 @@ renewal. `cluster.credentials.rotate` moves the local node's credential to a
 fresh key under the same identity: the previous certificate authorizes
 through the grace, the root re-grants the node under its new key, and the
 reply names the new `key_identity`. The founder's identity is neither
-renewed nor rotated this way.
+renewed nor rotated this way. `cluster.credentials.issuers` reads the issuers
+every credential chains to as committed — the one issuing, one staged, one
+retiring, and the upgrade fence the succession is gated on.
+`cluster.credentials.rotate_issuer` (founder only) stages the successor now:
+endorsed by the current issuer, trusted everywhere from its staging, issuing
+from the next step; every node renews under it, and the current issuer
+retires once nothing live was issued under it. Completion: `issuers` shows
+the successor staged, then issuing with the predecessor retiring, then alone.
+A `fenced` refusal names the upgrade fence to raise first
+(`cluster.upgrade.activate`).
 
 ## Inspect placement and the controller's plan
 

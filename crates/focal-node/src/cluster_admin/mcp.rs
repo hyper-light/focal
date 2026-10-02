@@ -192,6 +192,8 @@ impl AdminBackend for ClusterAdmin {
                 } => self.revoke(id, expected_revision).await,
                 AdminAction::RenewCredential => self.renew_credential().await,
                 AdminAction::RotateCredential => self.rotate_credential().await,
+                AdminAction::Issuers => self.issuers().await,
+                AdminAction::RotateIssuer => self.rotate_issuer().await,
                 AdminAction::Placement => self.placement().await,
                 AdminAction::Plan => self.plan().await,
                 AdminAction::AdmitTenant { tenant } => self.admit_tenant(tenant).await,

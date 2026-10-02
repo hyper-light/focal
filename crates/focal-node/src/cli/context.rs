@@ -623,7 +623,7 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                     credentials.certificate_chain().to_vec(),
                     credentials.private_key_der().to_vec(),
                 ),
-                vec![trust.ca_certificate.clone()],
+                trust.root_certificates(),
                 &limits,
             )
             .map_err(other)?;

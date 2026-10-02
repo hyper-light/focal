@@ -310,9 +310,9 @@ focal --data-dir <client> --client-context alice artifact submit --claim <id> --
 focal --data-dir <founder> get claim <id> --format json
 focal --data-dir <founder> get artifact <id> --format json
 focal --data-dir <founder> cluster upgrade status
-focal --data-dir <host> cluster upgrade activate --fence 1
+focal --data-dir <host> cluster upgrade activate --fence 3
+focal --data-dir <founder> cluster upgrade activate --fence 3
 focal --data-dir <founder> cluster upgrade activate --fence 2
-focal --data-dir <founder> cluster upgrade activate --fence 1
 focal --data-dir <founder> get claim <id> --format json
 focal --data-dir <founder> get artifact <id> --format json
 focal --data-dir <host> start --advertise <address>

@@ -962,6 +962,42 @@ const CLUSTER_CREDENTIALS_RENEW: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_CREDENTIALS_ISSUERS: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.issuers",
+    version: 1,
+    description: "The issuers the cluster's credentials chain to, as committed (24 §11): the one issuing, one staged to succeed it (trusted from its staging, endorsed by the one it succeeds), the one it succeeded while a credential issued under it still lives, each with its fingerprint and validity, and the upgrade fence the succession is gated on (24 §21). A read of committed enrollment facts.",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials issuers"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_CREDENTIALS_ROTATE_ISSUER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.rotate_issuer",
+    version: 1,
+    description: "Stage the issuer's successor now (24 §11), under the founder's authority: a fresh issuer, endorsed by the current one, committed so every node trusts it before anything is issued under it; the next step activates it, every credential renews under it, and the current issuer retires once nothing live was issued under it. Refused by name while the upgrade fence is below the level that verifies an endorsed chain (24 §21); a successor already staged or committed is answered as it is. Answers with the issuers as committed.",
+    capability: Capability::FounderNode,
+    mutation: true,
+    destructive: false,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials rotate-issuer"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_PLACEMENT: OperationDescriptor = OperationDescriptor {
     name: "cluster.placement",
     version: 1,
@@ -1104,7 +1140,7 @@ const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
-pub const ADMIN_TOOL_COUNT: usize = 62;
+pub const ADMIN_TOOL_COUNT: usize = 64;
 const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_NODE_IDENTITY,
     CLUSTER_NODE_HEALTH,
@@ -1159,6 +1195,8 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_CREDENTIALS_REVOKE,
     CLUSTER_CREDENTIALS_RENEW,
     CLUSTER_CREDENTIALS_ROTATE,
+    CLUSTER_CREDENTIALS_ISSUERS,
+    CLUSTER_CREDENTIALS_ROTATE_ISSUER,
     CLUSTER_CLIENT_INVITE,
     CLUSTER_PLACEMENT,
     CLUSTER_PLAN,

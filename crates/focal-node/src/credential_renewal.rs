@@ -135,6 +135,64 @@ pub enum CredentialReply {
     Renewed(CredentialSummary),
     Failed(RenewalError),
 }
+/// An issuer as the admin reports it (24 §11): its fingerprint, validity,
+/// whether its predecessor endorsed it, and when it was staged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerDigest {
+    pub fingerprint: [u8; 32],
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub endorsed: bool,
+    pub staged_at: Option<i64>,
+}
+impl IssuerDigest {
+    pub fn of(record: &focal_enrollment::IssuerRecord, staged_at: Option<i64>) -> Self {
+        Self {
+            fingerprint: record.fingerprint,
+            issued_at: record.issued_at,
+            expires_at: record.expires_at,
+            endorsed: record.endorsement.is_some(),
+            staged_at,
+        }
+    }
+}
+/// The issuers as committed (24 §11), with the fence the succession is
+/// gated on (24 §21).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerSummary {
+    pub current: IssuerDigest,
+    pub successor: Option<IssuerDigest>,
+    pub retiring: Option<IssuerDigest>,
+    pub fence_level: u32,
+    pub succession_level: u32,
+}
+impl IssuerSummary {
+    pub fn of(issuers: &focal_enrollment::IssuerSuccession, fence_level: u32) -> Self {
+        Self {
+            current: IssuerDigest::of(&issuers.current, None),
+            successor: issuers
+                .successor
+                .as_ref()
+                .map(|staged| IssuerDigest::of(&staged.record, Some(staged.staged_at))),
+            retiring: issuers
+                .retiring
+                .as_ref()
+                .map(|record| IssuerDigest::of(record, None)),
+            fence_level,
+            succession_level: crate::upgrade::ISSUER_SUCCESSION_LEVEL,
+        }
+    }
+}
+/// The reply the local admin transport carries for the issuers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IssuerReply {
+    Issuers(Box<IssuerSummary>),
+    /// The upgrade fence is below the level the succession needs.
+    Fenced {
+        level: u32,
+        needed: u32,
+    },
+}
 #[cfg(test)]
 #[path = "credential_renewal_tests.rs"]
 mod tests;

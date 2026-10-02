@@ -212,6 +212,11 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     )
     .unwrap();
     let ca = authority.ca_certificate().to_vec();
+    // The issuers as the authority holds them at genesis, and its server
+    // certificate, for what the test needs after the authority moves into
+    // its driver.
+    let issuers = authority.issuers().unwrap();
+    let authority_server = authority.server_certificate().to_vec();
     let enrollment_identity = authority.server_identity();
     let key = JoinKey::open_or_create(disk.path().join("founder-key"), CLUSTER).unwrap();
     let draft = FoundingEnrollmentDraft::open_or_create(
@@ -221,6 +226,7 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
         1,
         [1; 16],
         EnrollmentLimits::default(),
+        0,
         now(),
     )
     .unwrap();
@@ -244,7 +250,13 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     control.read_index(b"founding-genesis".to_vec()).unwrap();
     assert!(!control.drain(&NoAuthority).unwrap().read_states.is_empty());
     let founder_name = draft.receipt().identity.server_name.clone();
-    let founder = key.complete(draft.receipt(), &ca, now()).unwrap();
+    let founder = key
+        .complete(
+            draft.receipt(),
+            authority.issuers().unwrap().trusted(),
+            now(),
+        )
+        .unwrap();
     assert_ne!(
         founder.certificate_chain()[0],
         enrollment_identity.certificate_chain()[0]
@@ -286,7 +298,7 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
             "127.0.0.1:0".parse().unwrap(),
             &founder,
             Some(&enrollment_identity),
-            &ca,
+            std::slice::from_ref(&ca),
             registry.clone(),
             limits(),
             network_budget.clone(),
@@ -358,14 +370,17 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     .unwrap();
     // Changing only the leaf pin keeps normal CA/name validation valid, but no
     // application request or invitation secret may reach the handler. The
-    // token ends with the pin and the byte that says no successor is staged
-    // (24 §11): the pin's last digit is the third character from the end.
+    // pin is the server certificate's fingerprint, encoded once in the
+    // token (24 §11): its last digit is flipped where it stands.
     let mut rogue_token = invitation.expose_token().unwrap().to_string();
-    let absent = rogue_token.split_off(rogue_token.len() - 2);
-    assert_eq!(absent, "00");
-    let last = rogue_token.pop().unwrap();
-    rogue_token.push(if last == '0' { '1' } else { '0' });
-    rogue_token.push_str(&absent);
+    let pin: String = server_fingerprint(authority_server.as_slice())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(rogue_token.matches(&pin).count(), 1, "{rogue_token}");
+    let at = rogue_token.find(&pin).unwrap() + pin.len() - 1;
+    let last = rogue_token.remove(at);
+    rogue_token.insert(at, if last == '0' { '1' } else { '0' });
     let rogue = Invitation::parse(&rogue_token).unwrap();
     assert!(
         client
@@ -388,7 +403,9 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
             .unwrap(),
         receipt
     );
-    let credentials = joining_key.complete(&receipt, &ca, now()).unwrap();
+    let credentials = joining_key
+        .complete(&receipt, issuers.trusted(), now())
+        .unwrap();
     let connector = connector(&credentials, &ca);
     // TLS issuance alone does not grant the data path admission.
     assert!(connector.connect(address, &founder_name).await.is_err());
@@ -641,7 +658,7 @@ fn listener_bind_rejects_runtimes_missing_drivers() {
                 "127.0.0.1:0".parse().unwrap(),
                 &identity,
                 None,
-                authority.ca_certificate(),
+                &[authority.ca_certificate().to_vec()],
                 PeerRegistry::new(1).unwrap(),
                 limits(),
                 memory.clone(),

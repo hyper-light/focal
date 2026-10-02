@@ -16,7 +16,7 @@
     },
     {
       "path": "references/admin-workflow.md",
-      "blake3": "5a57272861e188911edf45bb8127d521fb01708c93a7e5852709d631dc69bdd8"
+      "blake3": "9243a3fbc9108b5bc989083c0a2565432f319a31b7c351a73c7810f7485b5305"
     },
     {
       "path": "references/peer-workflows.md",
@@ -616,9 +616,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 19,
+      "version": 20,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "060156c623a384fc6ca9fe579b8187edbdac3c577631fb85612b0ad025995d9f",
+      "blake3": "593290f3cd58bf4b85a403f2200356f87dfae6bbbc3c2429c334f879cc6b2dce",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -653,6 +653,14 @@
         },
         {
           "name": "cluster.credentials.rotate",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.issuers",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.rotate_issuer",
           "version": 1
         },
         {

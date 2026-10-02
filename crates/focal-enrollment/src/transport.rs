@@ -365,7 +365,15 @@ impl EnrollmentClient {
                     || receipt.csr_hash != hash("focal.enrollment.csr.v1", key.csr())
                     || receipt.public_key != pki::csr_key_hash(key.csr())?
                     || receipt.expires_at <= now
-                    || pki::verify_issued(&receipt, &invitation.trust().ca_certificate).is_err()
+                    || pki::verify_issued(
+                        &receipt,
+                        invitation
+                            .trust()
+                            .issuers
+                            .iter()
+                            .map(|issuer| issuer.certificate.as_slice()),
+                    )
+                    .is_err()
                 {
                     return Err(JoinTransportError::OutcomeUnknown);
                 }
@@ -431,7 +439,14 @@ impl EnrollmentClient {
                     || receipt.identity.cluster != trust_cluster(&request)
                     || receipt.expires_at <= now
                     || receipt.expires_at <= request.holds_until()
-                    || pki::verify_issued(&receipt, &trust.ca_certificate).is_err()
+                    || pki::verify_issued(
+                        &receipt,
+                        trust
+                            .issuers
+                            .iter()
+                            .map(|issuer| issuer.certificate.as_slice()),
+                    )
+                    .is_err()
                 {
                     return Err(JoinTransportError::OutcomeUnknown);
                 }

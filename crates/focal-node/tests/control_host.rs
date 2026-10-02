@@ -979,6 +979,7 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
         1,
         OPERATOR,
         EnrollmentLimits::default(),
+        0,
         now(),
     )
     .unwrap();

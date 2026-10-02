@@ -214,7 +214,7 @@ fn committed_metadata_precedes_delivery_and_exact_retry_survives_restart() {
             .unwrap(),
         receipt.identity
     );
-    key.complete(&receipt, authority.ca_certificate(), now())
+    key.complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     let original_csr = key.csr().to_vec();
     drop(key);
@@ -455,9 +455,9 @@ fn caller_csr_names_and_privileges_are_replaced_by_assigned_identity() {
     assert_eq!(receipt.identity.role, EnrollmentRole::Client);
     assert_eq!(receipt.identity.node_id, None);
     assert!(!receipt.identity.server_name.contains("admin"));
-    crate::pki::verify_issued(&receipt, authority.ca_certificate()).unwrap();
+    crate::pki::verify_issued(&receipt, std::iter::once(authority.ca_certificate())).unwrap();
     assert!(
-        key.complete(&receipt, authority.ca_certificate(), now())
+        key.complete(&receipt, authority.issuers().unwrap().trusted(), now())
             .is_err()
     );
 }
@@ -493,6 +493,7 @@ fn tls_ca_and_name_verification_does_not_replace_the_exact_invited_leaf_pin() {
                 ca_certificate: ca.der().to_vec(),
                 server_fingerprint: server_fingerprint(invited_leaf.der()),
                 successor_fingerprint: None,
+                issuers: vec![IssuerRecord::of(ca.der(), None).unwrap()],
             },
         },
     };
@@ -749,7 +750,7 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
     assert_eq!(receipt.identity.node_id, Some(2));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(registry.lock().unwrap().enrollments().count(), 1);
-    key.complete(&receipt, authority.ca_certificate(), now())
+    key.complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     client.close();
     server.close();
@@ -822,7 +823,7 @@ fn node_statements_bind_payload_cluster_certificate_role_and_revocation() {
     commit(&mut registry, prepared);
     let receipt = registry.release(&request, now()).unwrap();
     let credential = key
-        .complete(&receipt, authority.ca_certificate(), now())
+        .complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     let statement = b"exact scoped public statement";
     let proof = credential
@@ -885,7 +886,7 @@ fn node_statements_bind_payload_cluster_certificate_role_and_revocation() {
     commit(&mut registry, prepared);
     let receipt = registry.release(&request, now()).unwrap();
     let credential = key
-        .complete(&receipt, authority.ca_certificate(), now())
+        .complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     let proof = credential
         .sign_node_statement(authority.cluster(), statement)
@@ -911,7 +912,7 @@ fn enroll_node(
     );
     let receipt = registry.release(&request, now()).unwrap();
     let material = key
-        .complete(&receipt, authority.ca_certificate(), now())
+        .complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     (key, receipt, material)
 }
@@ -997,15 +998,18 @@ fn a_renewal_keeps_the_key_and_identity_retires_the_old_certificate_after_grace_
         Err(EnrollmentError::Expired)
     ));
     // Under the renewed credential a further renewal commits again.
-    let material = key.renew(&renewed, authority.ca_certificate(), at).unwrap();
+    let material = key
+        .renew(&renewed, authority.issuers().unwrap().trusted(), at)
+        .unwrap();
     assert_eq!(material.certificate_chain()[0], renewed.certificate);
     assert_eq!(key.enrollment().unwrap().unwrap(), renewed);
     // Installing the older receipt again is refused; the same one is a no-op.
     assert!(matches!(
-        key.renew(&first, authority.ca_certificate(), at),
+        key.renew(&first, authority.issuers().unwrap().trusted(), at),
         Err(EnrollmentError::Conflict)
     ));
-    key.renew(&renewed, authority.ca_certificate(), at).unwrap();
+    key.renew(&renewed, authority.issuers().unwrap().trusted(), at)
+        .unwrap();
     let again = material.renewal_request(&key, &renewed).unwrap();
     let RenewPreparation::Commit(second) = registry
         .prepare_renew(&authority, &again, at + 40, 30)
@@ -1187,7 +1191,11 @@ fn renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment() {
     commit(&mut registry, preparation);
     let client_receipt = registry.release(&request, now()).unwrap();
     let client_material = client_key
-        .complete(&client_receipt, authority.ca_certificate(), now())
+        .complete(
+            &client_receipt,
+            authority.issuers().unwrap().trusted(),
+            now(),
+        )
         .unwrap();
     let client_request = client_material
         .renewal_request(&client_key, &client_receipt)
@@ -1287,6 +1295,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
         ca_certificate: authority.ca_certificate().to_vec(),
         server_fingerprint: server_fingerprint(authority.server_certificate()),
         successor_fingerprint: None,
+        issuers: authority.issuers().unwrap().trusted().cloned().collect(),
     };
     let request = material.renewal_request(&key, &receipt).unwrap();
     let renewed = client
@@ -1513,7 +1522,7 @@ fn a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only
     // The holder adopts the rotation: the primary directory now holds the
     // new key and receipt, the staged material is cleared.
     let adopted = key
-        .rotate_into(&next, &rotated, authority.ca_certificate(), at)
+        .rotate_into(&next, &rotated, authority.issuers().unwrap().trusted(), at)
         .unwrap();
     assert_eq!(adopted.certificate_chain()[0], rotated.certificate);
     drop(key);
@@ -1623,9 +1632,9 @@ fn founder(
 ) {
     let key = JoinKey::open_or_create(dir.path().join(name), [1; 16]).unwrap();
     let (registry, receipt) =
-        EnrollmentRegistry::founding(authority, &key, 1, [7; 16], limits, now()).unwrap();
+        EnrollmentRegistry::founding(authority, &key, 1, [7; 16], limits, 0, now()).unwrap();
     let material = key
-        .complete(&receipt, authority.ca_certificate(), now())
+        .complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     (registry, key, receipt, material)
 }
@@ -1697,7 +1706,9 @@ fn the_founder_renews_under_its_founding_subject_and_rotates_carrying_its_princi
         genesis.identity
     );
     // The holder installs the renewal over the genesis receipt under its key.
-    let material = key.renew(&renewed, authority.ca_certificate(), at).unwrap();
+    let material = key
+        .renew(&renewed, authority.issuers().unwrap().trusted(), at)
+        .unwrap();
     assert_eq!(material.certificate_chain()[0], renewed.certificate);
     assert_eq!(key.enrollment().unwrap().unwrap(), renewed);
     // A rotation of the founder's key carries the assigned principal to the
@@ -1719,7 +1730,12 @@ fn the_founder_renews_under_its_founding_subject_and_rotates_carrying_its_princi
     assert!(crate::pki::carried_principal(&rotated).unwrap());
     assert!(!crate::pki::founding_principal(&rotated).unwrap());
     let rotated_material = key
-        .rotate_into(&next, &rotated, authority.ca_certificate(), at + 5)
+        .rotate_into(
+            &next,
+            &rotated,
+            authority.issuers().unwrap().trusted(),
+            at + 5,
+        )
         .unwrap();
     assert_eq!(rotated_material.certificate_chain()[0], rotated.certificate);
     drop(key);
@@ -1784,6 +1800,7 @@ fn a_restored_registry_keeps_the_lifetimes_it_committed_and_the_capacities_it_is
                     credential_lifetime: lifetime,
                     ..EnrollmentLimits::default()
                 },
+                0,
                 now(),
             ),
             Err(EnrollmentError::Capacity)
@@ -1821,6 +1838,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
         [1; 16],
         vec!["localhost".into()],
         3600,
+        EnrollmentLimits::issuer_lifetime_for(3600),
         now(),
     )
     .unwrap();
@@ -1942,6 +1960,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
         [1; 16],
         vec!["localhost".into()],
         3600,
+        EnrollmentLimits::issuer_lifetime_for(3600),
         now(),
     )
     .unwrap();
@@ -2004,6 +2023,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
         [1; 16],
         vec!["localhost".into()],
         3600,
+        EnrollmentLimits::issuer_lifetime_for(3600),
         now(),
     )
     .unwrap();
@@ -2033,4 +2053,362 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
         decoded.data.trust_fingerprint().unwrap(),
         plain.data.trust_fingerprint().unwrap()
     );
+}
+
+/// The issuer succeeds itself (24 §11, the audit's F13 stage 3): a
+/// successor the authority issues and the current issuer endorses is
+/// staged — committed, so every verifier trusts it before anything is
+/// issued under it — then activated; a credential renewed under it presents
+/// the endorsed chain; the predecessor retires once nothing live was issued
+/// under it, the bootstrap server certificate included; older checkpoints
+/// restore with the genesis issuer alone; the moves refuse what they must.
+#[test]
+fn the_issuer_succeeds_itself_endorsed_by_its_predecessor_and_retires_once_nothing_live_was_issued_under_it()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let lifetime = 3600u64;
+    let issuer_lifetime = EnrollmentLimits::issuer_lifetime_for(lifetime);
+    let limits = EnrollmentLimits {
+        credential_lifetime: lifetime,
+        issuer_lifetime,
+        ..EnrollmentLimits::default()
+    };
+    let mut authority = BootstrapAuthority::open_or_create_for(
+        dir.path().join("authority"),
+        [1; 16],
+        vec!["localhost".into()],
+        lifetime,
+        issuer_lifetime,
+        now(),
+    )
+    .unwrap();
+    let (issued_at, expires_at) = authority.issuer_validity().unwrap();
+    assert_eq!(expires_at - issued_at, issuer_lifetime as i64);
+    let (mut registry, _founder_key, founder_receipt, _material) =
+        founder(&dir, &authority, "founder-key", limits.clone());
+    // The genesis issuer alone, named from the start, unendorsed.
+    let genesis = registry.issuers().clone();
+    assert_eq!(genesis.current.certificate, authority.ca_certificate());
+    assert!(genesis.current.endorsement.is_none());
+    assert!(genesis.successor.is_none() && genesis.retiring.is_none());
+    assert_eq!(genesis.current, authority.issuer_record().unwrap());
+    assert!(
+        registry
+            .prepare_issuer(&authority, now())
+            .unwrap()
+            .is_none()
+    );
+    let early = registry.clone();
+    // A credential issued under it chains to it alone.
+    let (node_key, receipt, material) = enroll_node(&dir, &mut registry, &authority, "node-key");
+    assert_eq!(material.certificate_chain().len(), 2);
+    // Staged: a fresh issuer, endorsed by the genesis issuer (once; asked
+    // again it is the same), committed with when it was staged.
+    let at = now();
+    let staged = authority.stage_issuer(at, issuer_lifetime).unwrap();
+    assert_eq!(
+        authority.stage_issuer(at + 5, issuer_lifetime).unwrap(),
+        staged
+    );
+    assert_ne!(staged.fingerprint, genesis.current.fingerprint);
+    assert_eq!(staged.expires_at - staged.issued_at, issuer_lifetime as i64);
+    let endorsement = staged.endorsement.clone().unwrap();
+    assert!(focal_wire::issued_by(&endorsement, authority.ca_certificate()).unwrap());
+    assert!(crate::pki::endorses(&endorsement, &staged.certificate).unwrap());
+    let command = registry.prepare_issuer(&authority, at).unwrap().unwrap();
+    assert!(matches!(
+        command.change(),
+        Change::Issuer(IssuerChange::Stage(s)) if s.record == staged && s.staged_at == at
+    ));
+    // A staging whose endorsement is not the current issuer's is refused.
+    let stranger = BootstrapAuthority::open_or_create_for(
+        dir.path().join("stranger"),
+        [1; 16],
+        vec!["localhost".into()],
+        lifetime,
+        issuer_lifetime,
+        at,
+    )
+    .unwrap();
+    let forged = command
+        .clone()
+        .with_change(Change::Issuer(IssuerChange::Stage(StagedIssuer {
+            record: IssuerRecord {
+                endorsement: Some(stranger.ca_certificate().to_vec()),
+                ..staged.clone()
+            },
+            staged_at: at,
+        })));
+    assert!(matches!(
+        registry.apply_committed(&forged, registry.applied_index() + 1),
+        Err(EnrollmentError::Invalid)
+    ));
+    // Nor an activation or a retirement with nothing staged or retiring.
+    for change in [IssuerChange::Activate, IssuerChange::Retire] {
+        let premature = command.clone().with_change(Change::Issuer(change));
+        assert!(matches!(
+            registry.apply_committed(&premature, registry.applied_index() + 1),
+            Err(EnrollmentError::Invalid)
+        ));
+    }
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    assert_eq!(
+        registry.issuers().successor.as_ref().unwrap().record,
+        staged
+    );
+    assert_eq!(registry.issuers().current, genesis.current);
+    assert_eq!(registry.trust_roots().count(), 2);
+    // An invitation issued now carries both issuers; a credential is still
+    // the genesis issuer's until the activation.
+    let invitation = invite(&mut registry, &authority, EnrollmentRole::Node);
+    assert_eq!(invitation.trust().issuers.len(), 2);
+    assert_eq!(
+        invitation.trust().ca_certificate,
+        genesis.current.certificate
+    );
+    // Activated at the next step: the successor issues, the genesis issuer
+    // retires once nothing live was issued under it.
+    let command = registry
+        .prepare_issuer(&authority, at + 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        command.change(),
+        Change::Issuer(IssuerChange::Activate)
+    ));
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    assert_eq!(registry.issuers().current, staged);
+    assert_eq!(registry.issuers().retiring, Some(genesis.current.clone()));
+    assert!(registry.issuers().successor.is_none());
+    // The activation committed; the authority has yet to adopt it: nothing
+    // more to commit until it does.
+    assert!(
+        registry
+            .prepare_issuer(&authority, at + 2)
+            .unwrap()
+            .is_none()
+    );
+    authority.activate_issuer().unwrap();
+    assert_eq!(authority.issuer_record().unwrap(), staged);
+    assert!(authority.issuer_successor().unwrap().is_none());
+    // The bootstrap server certificate is still the genesis issuer's, and
+    // its chain says so.
+    let server = authority.server_identity();
+    assert_eq!(server.certificate_chain().len(), 2);
+    assert_eq!(server.certificate_chain()[1], genesis.current.certificate);
+    // A renewal is issued under the successor and presents the endorsed
+    // chain: the certificate, the successor, its endorsement.
+    let at = at + 3;
+    let request = material.renewal_request(&node_key, &receipt).unwrap();
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, at, 30)
+        .unwrap()
+    else {
+        panic!("a renewal under the successor commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry.release_renewal(&request, at).unwrap();
+    assert!(focal_wire::issued_by(&renewed.certificate, &staged.certificate).unwrap());
+    let material = node_key
+        .renew(&renewed, registry.issuers().trusted(), at)
+        .unwrap();
+    assert_eq!(material.certificate_chain().len(), 3);
+    assert_eq!(material.certificate_chain()[1], staged.certificate);
+    assert_eq!(material.certificate_chain()[2], endorsement);
+    // The genesis issuer is in use while a credential issued under it lives
+    // — the founder's, the retired previous certificate — and while the
+    // bootstrap server certificate is under it: nothing to commit.
+    assert!(registry.retiring_issuer_in_use(&authority, at));
+    assert!(registry.prepare_issuer(&authority, at).unwrap().is_none());
+    // The bootstrap server certificate moves under the successor: staged
+    // because it is not under the issuer, activated once the invitation
+    // open at the staging has closed.
+    authority.stage_successor(at, lifetime).unwrap();
+    let command = registry
+        .prepare_bootstrap_server(&authority, at)
+        .unwrap()
+        .unwrap();
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let closed = at + 700;
+    assert!(registry.bootstrap_ready_to_activate(closed));
+    let command = registry
+        .prepare_bootstrap_server(&authority, closed)
+        .unwrap()
+        .unwrap();
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let presented = authority.activate_successor().unwrap();
+    assert_eq!(presented.certificate_chain().len(), 3);
+    assert_eq!(presented.certificate_chain()[1], staged.certificate);
+    assert!(focal_wire::issued_by(authority.server_certificate(), &staged.certificate).unwrap());
+    // Still in use: the founder's genesis-issued credential lives.
+    assert!(registry.retiring_issuer_in_use(&authority, closed));
+    assert!(closed < founder_receipt.expires_at);
+    // Once every credential issued under it has expired, it retires: the
+    // successor is the one trusted issuer.
+    let later = founder_receipt.expires_at.max(receipt.expires_at) + 1;
+    assert!(!registry.retiring_issuer_in_use(&authority, later));
+    let command = registry.prepare_issuer(&authority, later).unwrap().unwrap();
+    assert!(matches!(
+        command.change(),
+        Change::Issuer(IssuerChange::Retire)
+    ));
+    // A retirement decided while one still lived would be refused.
+    let too_early = command.clone().with_decided_at(closed);
+    assert!(matches!(
+        registry.apply_committed(&too_early, registry.applied_index() + 1),
+        Err(EnrollmentError::Invalid)
+    ));
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    assert!(registry.issuers().retiring.is_none());
+    assert_eq!(registry.trust_roots().count(), 1);
+    assert_eq!(registry.issuers().current, staged);
+    assert!(
+        registry
+            .prepare_issuer(&authority, later)
+            .unwrap()
+            .is_none()
+    );
+    // The authority holds what the registry names.
+    let held = authority.issuers().unwrap();
+    assert_eq!(held.current, staged);
+    assert!(held.successor.is_none() && held.retiring.is_none());
+    // The genesis issuer stays the cluster's identity.
+    assert_eq!(registry.ca_certificate(), genesis.current.certificate);
+    assert!(
+        registry
+            .prepare_invitation(
+                &authority,
+                InviteOptions {
+                    endpoint: "127.0.0.1:8443".into(),
+                    server_name: "localhost".into(),
+                    role: EnrollmentRole::Node,
+                    expires_at: later + 600,
+                },
+                later,
+            )
+            .is_ok()
+    );
+    // The succession restores; a schema-5 checkpoint restores with the
+    // genesis issuer alone.
+    let restored =
+        EnrollmentRegistry::restore(&registry.checkpoint().unwrap(), [1; 16], limits.clone())
+            .unwrap();
+    assert_eq!(restored.issuers(), registry.issuers());
+    assert_eq!(restored.charged_bytes(), registry.charged_bytes());
+    let five = EnrollmentRegistry::restore(
+        &early.encode_as_schema_five_for_tests().unwrap(),
+        [1; 16],
+        limits.clone(),
+    )
+    .unwrap();
+    assert_eq!(five.issuers(), early.issuers());
+    assert_eq!(five.charged_bytes(), early.charged_bytes());
+    assert_eq!(five.limits().issuer_lifetime, issuer_lifetime);
+    // The authority reopens on the successor with the bundle it saved.
+    drop(authority);
+    let reopened = BootstrapAuthority::open_or_create_for(
+        dir.path().join("authority"),
+        [1; 16],
+        vec!["localhost".into()],
+        lifetime,
+        issuer_lifetime,
+        later,
+    )
+    .unwrap();
+    assert_eq!(reopened.issuer_record().unwrap(), staged);
+    assert_eq!(reopened.issuer_certificate(), staged.certificate);
+    assert_eq!(reopened.ca_certificate(), genesis.current.certificate);
+    assert_eq!(reopened.server_identity().certificate_chain().len(), 3);
+}
+
+/// A trust holding the genesis issuer alone verifies the bootstrap server's
+/// chain under a successor through the endorsement, and refuses a chain
+/// without it or endorsed by a stranger (24 §11).
+#[test]
+fn an_older_trust_verifies_an_endorsed_chain_and_refuses_an_unendorsed_or_forged_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let lifetime = 3600u64;
+    let issuer_lifetime = EnrollmentLimits::issuer_lifetime_for(lifetime);
+    let mut authority = BootstrapAuthority::open_or_create_for(
+        dir.path().join("authority"),
+        [1; 16],
+        vec!["localhost".into()],
+        lifetime,
+        issuer_lifetime,
+        now(),
+    )
+    .unwrap();
+    let (registry, _key, _genesis, _material) =
+        founder(&dir, &authority, "founder-key", EnrollmentLimits::default());
+    let older = invite(&mut registry.clone(), &authority, EnrollmentRole::Node);
+    assert_eq!(older.trust().issuers.len(), 1);
+    let at = now();
+    let staged = authority.stage_issuer(at, issuer_lifetime).unwrap();
+    authority.activate_issuer().unwrap();
+    authority.stage_successor(at, lifetime).unwrap();
+    let presented = authority.activate_successor().unwrap();
+    let chain: Vec<rustls::pki_types::CertificateDer<'_>> = presented
+        .certificate_chain()
+        .iter()
+        .map(|certificate| certificate.clone().into())
+        .collect();
+    assert_eq!(chain.len(), 3);
+    // Through the endorsement: accepted. The pin is the staged server
+    // certificate's, which the older trust does not carry, so the pin
+    // alone refuses; a trust pinning it verifies the chain.
+    let pinned = ServerTrust {
+        server_fingerprint: server_fingerprint(authority.server_certificate()),
+        ..older.trust().clone()
+    };
+    pinned.verify_chain(&chain, at).unwrap();
+    assert!(matches!(
+        older.trust().verify_chain(&chain, at),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // Without the endorsement: refused.
+    assert!(matches!(
+        pinned.verify_chain(&chain[..2], at),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // Endorsed by a stranger: refused.
+    let stranger = BootstrapAuthority::open_or_create_for(
+        dir.path().join("stranger"),
+        [1; 16],
+        vec!["localhost".into()],
+        lifetime,
+        issuer_lifetime,
+        at,
+    )
+    .unwrap();
+    let forged: Vec<rustls::pki_types::CertificateDer<'_>> = vec![
+        chain[0].clone(),
+        chain[1].clone(),
+        stranger.ca_certificate().to_vec().into(),
+    ];
+    assert!(matches!(
+        pinned.verify_chain(&forged, at),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // A trust that holds the successor needs no endorsement.
+    let newer = ServerTrust {
+        issuers: vec![staged.clone()],
+        ..pinned.clone()
+    };
+    newer.verify_chain(&chain[..1], at).unwrap();
+    // More certificates than a chain may carry: refused.
+    let padded: Vec<rustls::pki_types::CertificateDer<'_>> =
+        std::iter::repeat_n(chain[1].clone(), 6).collect();
+    assert!(pinned.verify_chain(&padded, at).is_err());
 }

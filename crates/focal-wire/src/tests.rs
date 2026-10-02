@@ -5021,3 +5021,204 @@ async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
     drop(remote);
     peer.abort();
 }
+
+/// A peer whose issuer succeeded one the verifier knows is admitted through
+/// the predecessor's endorsement (24 §11): a CA certificate for the
+/// successor's key under the predecessor's signature, presented beside the
+/// successor's own. Without it, or endorsed by a stranger, the chain is
+/// refused — in both directions.
+#[tokio::test]
+async fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_endorsement() {
+    fn issuer_params(name: &str) -> CertificateParams {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params
+    }
+    fn constrained(name: &str) -> (Certificate, KeyPair) {
+        let key = KeyPair::generate().unwrap();
+        let ca = issuer_params(name).self_signed(&key).unwrap();
+        (ca, key)
+    }
+    fn issue(ca: &Certificate, key: &KeyPair, server: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.extended_key_usages = vec![if server {
+            ExtendedKeyUsagePurpose::ServerAuth
+        } else {
+            ExtendedKeyUsagePurpose::ClientAuth
+        }];
+        let leaf = KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&leaf, ca, key).unwrap();
+        (certificate.der().to_vec(), leaf.serialize_der())
+    }
+    // The genesis issuer, with a path length of zero as the cluster's has;
+    // its successor, endorsed by it; a stranger.
+    let (genesis, genesis_key) = constrained("genesis");
+    let (successor, successor_key) = constrained("successor");
+    let endorsement = issuer_params("successor")
+        .signed_by(&successor_key, &genesis, &genesis_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    let (stranger, stranger_key) = constrained("stranger");
+    let forged = issuer_params("successor")
+        .signed_by(&successor_key, &stranger, &stranger_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    let roots = vec![genesis.der().to_vec()];
+    // A client issued under the successor, dialing a server that trusts the
+    // genesis issuer alone.
+    let (client_leaf, client_key) = issue(&successor, &successor_key, false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&client_leaf, grant())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async move { response(verified.request()) }
+    });
+    let (server_leaf, server_key) = issue(&genesis, &genesis_key, true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_leaf, genesis.der().to_vec()], server_key),
+        roots.clone(),
+        &limits(),
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            limits(),
+            budget(),
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let task = tokio::spawn(async move { running.serve(handler).await });
+    let address = server.local_addr().unwrap();
+    let dial = |chain: Vec<Vec<u8>>| {
+        QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_tls(
+                TlsIdentity::from_pkcs8(chain, client_key.clone()),
+                roots.clone(),
+                &limits(),
+            )
+            .unwrap(),
+            limits(),
+        )
+        .unwrap()
+    };
+    // Without the endorsement: refused before any dispatch.
+    assert!(
+        dial(vec![client_leaf.clone(), successor.der().to_vec()])
+            .connect(address, "localhost")
+            .await
+            .is_err()
+    );
+    // Endorsed by a stranger: refused.
+    assert!(
+        dial(vec![
+            client_leaf.clone(),
+            successor.der().to_vec(),
+            forged.clone()
+        ])
+        .connect(address, "localhost")
+        .await
+        .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // With the endorsement: admitted, and its requests dispatch.
+    let remote = dial(vec![
+        client_leaf.clone(),
+        successor.der().to_vec(),
+        endorsement.clone(),
+    ])
+    .connect(address, "localhost")
+    .await
+    .unwrap();
+    let reply = remote.request(&request(1)).await.unwrap();
+    assert_eq!(reply.request_id, request(1).request_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.close();
+    task.await.unwrap().unwrap();
+    // The other direction: a server issued under the successor, dialed by
+    // a client that trusts the genesis issuer alone.
+    let (server_leaf, server_key) = issue(&successor, &successor_key, true);
+    let (client_leaf, client_key) = issue(&genesis, &genesis_key, false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&client_leaf, grant())
+        .unwrap();
+    let serve = |chain: Vec<Vec<u8>>| {
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(chain, server_key.clone()),
+            vec![genesis.der().to_vec(), successor.der().to_vec()],
+            &limits(),
+        )
+        .unwrap();
+        Arc::new(
+            QuicServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry.clone(),
+                limits(),
+                budget(),
+            )
+            .unwrap(),
+        )
+    };
+    let connector = QuicConnector::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_tls(
+            TlsIdentity::from_pkcs8(vec![client_leaf, genesis.der().to_vec()], client_key),
+            roots.clone(),
+            &limits(),
+        )
+        .unwrap(),
+        limits(),
+    )
+    .unwrap();
+    for (chain, admitted) in [
+        (vec![server_leaf.clone(), successor.der().to_vec()], false),
+        (
+            vec![
+                server_leaf.clone(),
+                successor.der().to_vec(),
+                forged.clone(),
+            ],
+            false,
+        ),
+        (
+            vec![
+                server_leaf.clone(),
+                successor.der().to_vec(),
+                endorsement.clone(),
+            ],
+            true,
+        ),
+    ] {
+        let server = serve(chain);
+        let running = server.clone();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let task = tokio::spawn(async move { running.serve(handler).await });
+        let outcome = connector
+            .connect(server.local_addr().unwrap(), "localhost")
+            .await;
+        assert_eq!(outcome.is_ok(), admitted, "{:?}", outcome.as_ref().err());
+        if let Ok(remote) = outcome {
+            let reply = remote.request(&request(2)).await.unwrap();
+            assert_eq!(reply.request_id, request(2).request_id);
+        }
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+}

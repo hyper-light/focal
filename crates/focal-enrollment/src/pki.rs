@@ -31,6 +31,46 @@ struct AuthorityBundle {
     /// §11): issued, committed in the registry, presented once every
     /// invitation issued before it was staged has closed.
     successor: Option<StagedServer>,
+    /// The endorsement of `ca` by the issuer it succeeded (24 §11): a CA
+    /// certificate for its key and name under the predecessor's signature,
+    /// presented in every chain so a verifier holding the predecessor alone
+    /// accepts it. None for the genesis issuer.
+    ca_endorsement: Option<Vec<u8>>,
+    /// An issuer staged to succeed `ca`: its key, its self-signed
+    /// certificate and `ca`'s endorsement of it, until the registry commits
+    /// the activation and `activate_issuer` adopts it.
+    issuer_successor: Option<StagedIssuerMaterial>,
+    /// The issuer `ca` succeeded, while the bootstrap server certificate it
+    /// issued is still presented: the chain behind that certificate.
+    retired_issuer: Option<RetiredIssuer>,
+    /// The genesis issuer's certificate: the cluster's identity (24 §11),
+    /// what every identity check compares, unchanged by any succession.
+    identity: Vec<u8>,
+}
+/// The bundle as schema 2 wrote it, before an issuer could be staged.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct AuthorityBundleV2 {
+    schema: u16,
+    cluster: ClusterId,
+    names: Vec<String>,
+    ca: Vec<u8>,
+    ca_key: SecretBytes,
+    server: Vec<u8>,
+    server_key: SecretBytes,
+    successor: Option<StagedServer>,
+}
+#[derive(Serialize, Deserialize)]
+struct StagedIssuerMaterial {
+    certificate: Vec<u8>,
+    key: SecretBytes,
+    endorsement: Vec<u8>,
+    staged_at: i64,
+}
+#[derive(Serialize, Deserialize)]
+struct RetiredIssuer {
+    certificate: Vec<u8>,
+    endorsement: Option<Vec<u8>>,
 }
 /// The bundle as schema 1 wrote it, before a successor could be staged.
 #[derive(Deserialize)]
@@ -50,7 +90,36 @@ struct StagedServer {
     key: SecretBytes,
     staged_at: i64,
 }
-const AUTHORITY_SCHEMA: u16 = 2;
+const AUTHORITY_SCHEMA: u16 = 3;
+/// How an issuer's certificate names it: the cluster, and for a successor
+/// the identity of its key, so two issuers of one cluster never share a
+/// subject and a chain names the one it was issued under.
+fn issuer_name(cluster: &ClusterId, key: Option<&KeyPair>) -> String {
+    match key {
+        None => format!("Focal cluster {}", hex(cluster)),
+        Some(key) => format!(
+            "Focal cluster {} issuer {}",
+            hex(cluster),
+            hex(&blake3::hash(&key.subject_public_key_info()).as_bytes()[..8])
+        ),
+    }
+}
+/// The parameters of an issuer's certificate: a CA for `lifetime` seconds
+/// that signs credentials and nothing below them.
+fn issuer_params(
+    cluster: &ClusterId,
+    key: Option<&KeyPair>,
+    now: i64,
+    lifetime: u64,
+) -> Result<CertificateParams, EnrollmentError> {
+    let mut params = params(vec![], now, lifetime)?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
+        .distinguished_name
+        .push(DnType::CommonName, issuer_name(cluster, key));
+    Ok(params)
+}
 /// When a certificate was issued and when it expires, in Unix seconds.
 pub fn certificate_validity(certificate: &[u8]) -> Result<(i64, i64), EnrollmentError> {
     if certificate.len() > 4096 {
@@ -76,31 +145,37 @@ pub struct BootstrapAuthority {
     _directory: PrivateDirectory,
 }
 impl BootstrapAuthority {
-    /// Open the authority, or create it with a bootstrap server certificate
-    /// for the longest lifetime a registry admits (a year).
+    /// Open the authority, or create it under the standard policy: the
+    /// bootstrap server certificate for the standard credential lifetime
+    /// and the issuer for the standard issuer lifetime (24 §11) — what a
+    /// founding without a committed policy of its own takes.
     pub fn open_or_create(
         path: impl AsRef<Path>,
         cluster: ClusterId,
         server_names: Vec<String>,
         now: i64,
     ) -> Result<Self, EnrollmentError> {
+        let standard = crate::registry::EnrollmentLimits::default();
         Self::open_or_create_for(
             path,
             cluster,
             server_names,
-            crate::registry::MAX_CREDENTIAL_LIFETIME,
+            standard.credential_lifetime,
+            standard.issuer_lifetime,
             now,
         )
     }
-    /// Open the authority, or create it: a self-signed CA and the bootstrap
-    /// server certificate the enrollment endpoint presents, issued for
-    /// `lifetime` seconds — the cluster's credential lifetime, the one
-    /// lifetime for everything it issues (24 §11).
+    /// Open the authority, or create it: a self-signed CA issued for
+    /// `issuer_lifetime` seconds and the bootstrap server certificate the
+    /// enrollment endpoint presents, issued for `lifetime` seconds — the
+    /// cluster's credential lifetime, the one lifetime for everything the
+    /// issuer issues (24 §11).
     pub fn open_or_create_for(
         path: impl AsRef<Path>,
         cluster: ClusterId,
         server_names: Vec<String>,
         lifetime: u64,
+        issuer_lifetime: u64,
         now: i64,
     ) -> Result<Self, EnrollmentError> {
         if cluster == [0; 16]
@@ -108,6 +183,7 @@ impl BootstrapAuthority {
             || server_names.len() > 16
             || server_names.iter().any(|n| n.is_empty() || n.len() > 253)
             || lifetime == 0
+            || issuer_lifetime < lifetime
         {
             return Err(EnrollmentError::Invalid);
         }
@@ -123,25 +199,41 @@ impl BootstrapAuthority {
                     schema: AUTHORITY_SCHEMA,
                     cluster: legacy.cluster,
                     names: legacy.names,
+                    identity: legacy.ca.clone(),
                     ca: legacy.ca,
                     ca_key: legacy.ca_key,
                     server: legacy.server,
                     server_key: legacy.server_key,
                     successor: None,
+                    ca_endorsement: None,
+                    issuer_successor: None,
+                    retired_issuer: None,
+                }
+            } else if schema == 2 {
+                let legacy: AuthorityBundleV2 = decode(&bytes)?;
+                if legacy.schema != 2 {
+                    return Err(EnrollmentError::Corrupt);
+                }
+                AuthorityBundle {
+                    schema: AUTHORITY_SCHEMA,
+                    cluster: legacy.cluster,
+                    names: legacy.names,
+                    identity: legacy.ca.clone(),
+                    ca: legacy.ca,
+                    ca_key: legacy.ca_key,
+                    server: legacy.server,
+                    server_key: legacy.server_key,
+                    successor: legacy.successor,
+                    ca_endorsement: None,
+                    issuer_successor: None,
+                    retired_issuer: None,
                 }
             } else {
                 decode(&bytes)?
             }
         } else {
             let key = KeyPair::generate()?;
-            let mut ca_params = params(vec![], now, 10 * 365 * 86400)?;
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-            ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-            ca_params.distinguished_name.push(
-                DnType::CommonName,
-                format!("Focal cluster {}", hex(&cluster)),
-            );
-            let ca = ca_params.self_signed(&key)?;
+            let ca = issuer_params(&cluster, None, now, issuer_lifetime)?.self_signed(&key)?;
             let issuer = Issuer::from_ca_cert_der(ca.der(), &key)?;
             let server_key = KeyPair::generate()?;
             let mut server_params = params(server_names.clone(), now, lifetime)?;
@@ -156,6 +248,10 @@ impl BootstrapAuthority {
                 server: server.der().to_vec(),
                 server_key: SecretBytes(server_key.serialize_der()),
                 successor: None,
+                ca_endorsement: None,
+                issuer_successor: None,
+                retired_issuer: None,
+                identity: ca.der().to_vec(),
             };
             let bytes = Zeroizing::new(encode(&bundle)?);
             directory.install_new("authority.bin", &bytes)?;
@@ -173,15 +269,61 @@ impl BootstrapAuthority {
         if ca.public_key().raw != key.subject_public_key_info() {
             return Err(EnrollmentError::Corrupt);
         }
+        // The identity is the genesis issuer: the issuer itself until it
+        // succeeded itself, a certificate of its own after.
+        let (rest, _) =
+            X509Certificate::from_der(&bundle.identity).map_err(|_| EnrollmentError::Corrupt)?;
+        if !rest.is_empty() || (bundle.identity != bundle.ca && bundle.ca_endorsement.is_none()) {
+            return Err(EnrollmentError::Corrupt);
+        }
         let server_key = KeyPair::try_from(bundle.server_key.0.as_slice())?;
         let (_, server) =
             X509Certificate::from_der(&bundle.server).map_err(|_| EnrollmentError::Corrupt)?;
         if server.public_key().raw != server_key.subject_public_key_info() {
             return Err(EnrollmentError::Corrupt);
         }
-        server
-            .verify_signature(Some(ca.public_key()))
-            .map_err(|_| EnrollmentError::Corrupt)?;
+        // The bootstrap server certificate chains to the issuer, or to the
+        // one the issuer succeeded while it is still presented.
+        let server_verified = match &bundle.retired_issuer {
+            Some(retired)
+                if !focal_wire::issued_by(&bundle.server, &bundle.ca)
+                    .map_err(|_| EnrollmentError::Corrupt)? =>
+            {
+                let (_, retired_ca) = X509Certificate::from_der(&retired.certificate)
+                    .map_err(|_| EnrollmentError::Corrupt)?;
+                if let Some(endorsement) = &retired.endorsement
+                    && !endorses(endorsement, &retired.certificate)?
+                {
+                    return Err(EnrollmentError::Corrupt);
+                }
+                server
+                    .verify_signature(Some(retired_ca.public_key()))
+                    .is_ok()
+            }
+            _ => server.verify_signature(Some(ca.public_key())).is_ok(),
+        };
+        if !server_verified {
+            return Err(EnrollmentError::Corrupt);
+        }
+        if let Some(endorsement) = &bundle.ca_endorsement
+            && !endorses(endorsement, &bundle.ca)?
+        {
+            return Err(EnrollmentError::Corrupt);
+        }
+        if let Some(staged) = &bundle.issuer_successor {
+            let staged_key = KeyPair::try_from(staged.key.0.as_slice())?;
+            let (_, certificate) = X509Certificate::from_der(&staged.certificate)
+                .map_err(|_| EnrollmentError::Corrupt)?;
+            if certificate.public_key().raw != staged_key.subject_public_key_info()
+                || staged.staged_at <= 0
+                || !certificate.is_ca()
+                || !endorses(&staged.endorsement, &staged.certificate)?
+                || !focal_wire::issued_by(&staged.endorsement, &bundle.ca)
+                    .map_err(|_| EnrollmentError::Corrupt)?
+            {
+                return Err(EnrollmentError::Corrupt);
+            }
+        }
         if let Some(staged) = &bundle.successor {
             let staged_key = KeyPair::try_from(staged.key.0.as_slice())?;
             let (_, certificate) = X509Certificate::from_der(&staged.certificate)
@@ -208,6 +350,9 @@ impl BootstrapAuthority {
     /// Write the bundle as schema 1 wrote it, for the upgrade test.
     #[cfg(test)]
     pub(crate) fn save_as_schema_one_for_tests(&self) -> Result<(), EnrollmentError> {
+        if self.bundle.ca_endorsement.is_some() || self.bundle.retired_issuer.is_some() {
+            return Err(EnrollmentError::Invalid);
+        }
         if self.bundle.successor.is_some() {
             return Err(EnrollmentError::Invalid);
         }
@@ -271,21 +416,160 @@ impl BootstrapAuthority {
             .ok_or(EnrollmentError::NotCommitted)?;
         self.bundle.server = staged.certificate;
         self.bundle.server_key = staged.key;
+        self.drop_retired_issuer();
         self.save()?;
         Ok(self.server_identity())
+    }
+    /// The bootstrap server certificate presented from now on is the staged
+    /// successor, and it is issued by the current issuer: the issuer the
+    /// current one succeeded is presented no more.
+    fn drop_retired_issuer(&mut self) {
+        if focal_wire::issued_by(&self.bundle.server, &self.bundle.ca).unwrap_or(false) {
+            self.bundle.retired_issuer = None;
+        }
+    }
+    /// The issuer as the registry records it: its certificate and the
+    /// endorsement of the issuer it succeeded.
+    pub fn issuer_record(&self) -> Result<IssuerRecord, EnrollmentError> {
+        IssuerRecord::of(&self.bundle.ca, self.bundle.ca_endorsement.as_deref())
+    }
+    /// The issuer staged to succeed the current one, as the registry would
+    /// record it, with when it was staged.
+    pub fn issuer_successor(&self) -> Result<Option<IssuerRecord>, EnrollmentError> {
+        self.bundle
+            .issuer_successor
+            .as_ref()
+            .map(|staged| IssuerRecord::of(&staged.certificate, Some(&staged.endorsement)))
+            .transpose()
+    }
+    /// The issuers as this authority holds them: the one issuing, one
+    /// staged, and the one succeeded while the bootstrap server certificate
+    /// it issued is still presented. The registry's committed set is the
+    /// trust; this is what the founder completes its own credentials with
+    /// before the registry runs, and what a test holds.
+    pub fn issuers(&self) -> Result<IssuerSuccession, EnrollmentError> {
+        Ok(IssuerSuccession {
+            current: self.issuer_record()?,
+            successor: match (&self.bundle.issuer_successor, self.issuer_successor()?) {
+                (Some(staged), Some(record)) => Some(StagedIssuer {
+                    record,
+                    staged_at: staged.staged_at,
+                }),
+                _ => None,
+            },
+            retiring: self
+                .bundle
+                .retired_issuer
+                .as_ref()
+                .map(|retired| {
+                    IssuerRecord::of(&retired.certificate, retired.endorsement.as_deref())
+                })
+                .transpose()?,
+        })
+    }
+    /// When the issuer was issued and when it expires.
+    pub fn issuer_validity(&self) -> Result<(i64, i64), EnrollmentError> {
+        certificate_validity(&self.bundle.ca)
+    }
+    /// Stage a successor to the issuer (24 §11): a fresh key, its
+    /// self-signed certificate for `lifetime` seconds, and the current
+    /// issuer's endorsement of it — a CA certificate for the same key and
+    /// name under the current issuer's signature. Kept beside the current
+    /// issuer until the registry commits the activation. A successor
+    /// already staged is answered as it is; refused while the issuer the
+    /// current one succeeded is still presented behind the bootstrap
+    /// server certificate.
+    pub fn stage_issuer(
+        &mut self,
+        now: i64,
+        lifetime: u64,
+    ) -> Result<IssuerRecord, EnrollmentError> {
+        if let Some(staged) = &self.bundle.issuer_successor {
+            return IssuerRecord::of(&staged.certificate, Some(&staged.endorsement));
+        }
+        if lifetime == 0 || now <= 0 {
+            return Err(EnrollmentError::Invalid);
+        }
+        if self.bundle.retired_issuer.is_some() {
+            return Err(EnrollmentError::Conflict);
+        }
+        let key = KeyPair::generate()?;
+        let params = issuer_params(&self.bundle.cluster, Some(&key), now, lifetime)?;
+        let certificate = params.self_signed(&key)?.der().to_vec();
+        let issuer =
+            Issuer::from_ca_cert_der(&CertificateDer::from(self.bundle.ca.as_slice()), &self.key)?;
+        let endorsement = issuer_params(&self.bundle.cluster, Some(&key), now, lifetime)?
+            .signed_by(&key, &issuer)?
+            .der()
+            .to_vec();
+        let record = IssuerRecord::of(&certificate, Some(&endorsement))?;
+        self.bundle.issuer_successor = Some(StagedIssuerMaterial {
+            certificate,
+            key: SecretBytes(key.serialize_der()),
+            endorsement,
+            staged_at: now,
+        });
+        self.save()?;
+        Ok(record)
+    }
+    /// Issue under the staged successor from now on: it becomes the issuer,
+    /// with its endorsement; the issuer it succeeds stays behind the
+    /// bootstrap server certificate it issued until that certificate
+    /// succeeds itself. Refused when nothing is staged.
+    pub fn activate_issuer(&mut self) -> Result<(), EnrollmentError> {
+        let staged = self
+            .bundle
+            .issuer_successor
+            .take()
+            .ok_or(EnrollmentError::NotCommitted)?;
+        let key = KeyPair::try_from(staged.key.0.as_slice())?;
+        let retired = RetiredIssuer {
+            certificate: std::mem::replace(&mut self.bundle.ca, staged.certificate),
+            endorsement: self.bundle.ca_endorsement.replace(staged.endorsement),
+        };
+        self.bundle.ca_key = staged.key;
+        self.bundle.retired_issuer = Some(retired);
+        self.key = key;
+        self.drop_retired_issuer();
+        self.save()
     }
     pub fn cluster(&self) -> ClusterId {
         self.bundle.cluster
     }
+    /// The genesis issuer's certificate: the cluster's identity, what the
+    /// registry, every trust and the authority anchor name as `ca_certificate`
+    /// and compare by; never the issuer issuing now (`issuer_certificate`).
     pub fn ca_certificate(&self) -> &[u8] {
+        &self.bundle.identity
+    }
+    /// The certificate of the issuer issuing now (24 §11): the genesis
+    /// issuer's until it succeeded itself.
+    pub fn issuer_certificate(&self) -> &[u8] {
         &self.bundle.ca
     }
     pub fn server_certificate(&self) -> &[u8] {
         &self.bundle.server
     }
+    /// The chain behind the bootstrap server certificate: the issuer that
+    /// issued it — the current one, or the one it succeeded while this
+    /// certificate is still presented — and that issuer's endorsement.
     pub fn server_identity(&self) -> CredentialMaterial {
+        let mut certificate_chain = vec![self.bundle.server.clone()];
+        match &self.bundle.retired_issuer {
+            Some(retired)
+                if !focal_wire::issued_by(&self.bundle.server, &self.bundle.ca)
+                    .unwrap_or(false) =>
+            {
+                certificate_chain.push(retired.certificate.clone());
+                certificate_chain.extend(retired.endorsement.clone());
+            }
+            _ => {
+                certificate_chain.push(self.bundle.ca.clone());
+                certificate_chain.extend(self.bundle.ca_endorsement.clone());
+            }
+        }
         CredentialMaterial {
-            certificate_chain: vec![self.bundle.server.clone(), self.bundle.ca.clone()],
+            certificate_chain,
             private_key: Zeroizing::new(self.bundle.server_key.0.clone()),
         }
     }
@@ -434,11 +718,11 @@ impl JoinKey {
     /// generating a key, or repairing persistence. Inputs are decoded private
     /// record payloads, bounded by the existing enrollment message limit.
     /// This proves the saved identity binding, not current registry activation.
-    pub fn inspect_saved(
+    pub fn inspect_saved<'a>(
         key_bytes: &[u8],
         receipt_bytes: &[u8],
         cluster: ClusterId,
-        ca_certificate: &[u8],
+        issuers: impl IntoIterator<Item = &'a IssuerRecord>,
         now: i64,
     ) -> Result<(EnrollmentReceipt, Fingerprint), EnrollmentError> {
         let bundle: JoinKeyBundle = decode(key_bytes)?;
@@ -460,7 +744,12 @@ impl JoinKey {
         {
             return Err(EnrollmentError::Unauthorized);
         }
-        verify_issued(&receipt, ca_certificate)?;
+        verify_issued(
+            &receipt,
+            issuers
+                .into_iter()
+                .map(|issuer| issuer.certificate.as_slice()),
+        )?;
         if !identity_bound(&receipt)? {
             return Err(EnrollmentError::Unauthorized);
         }
@@ -537,10 +826,10 @@ impl JoinKey {
     pub fn csr(&self) -> &[u8] {
         &self.bundle.csr
     }
-    pub fn complete(
+    pub fn complete<'a>(
         &self,
         receipt: &EnrollmentReceipt,
-        ca_certificate: &[u8],
+        issuers: impl IntoIterator<Item = &'a IssuerRecord>,
         now: i64,
     ) -> Result<CredentialMaterial, EnrollmentError> {
         if receipt.identity.cluster != self.bundle.cluster {
@@ -553,9 +842,8 @@ impl JoinKey {
         {
             return Err(EnrollmentError::Unauthorized);
         }
-        verify_issued(receipt, ca_certificate)?;
         let material = CredentialMaterial {
-            certificate_chain: vec![receipt.certificate.clone(), ca_certificate.to_vec()],
+            certificate_chain: issued_chain(receipt, issuers)?,
             private_key: Zeroizing::new(self.bundle.key.0.clone()),
         };
         let bytes = encode(receipt)?;
@@ -578,11 +866,11 @@ impl JoinKey {
     /// later rotation stages a fresh key. The credential returned is the
     /// new key's. Refused when the receipt is not `next`'s or the identity
     /// differs from the one held.
-    pub fn rotate_into(
+    pub fn rotate_into<'a>(
         &self,
         next: &Self,
         receipt: &EnrollmentReceipt,
-        ca_certificate: &[u8],
+        issuers: impl IntoIterator<Item = &'a IssuerRecord>,
         now: i64,
     ) -> Result<CredentialMaterial, EnrollmentError> {
         if receipt.identity.cluster != self.bundle.cluster
@@ -597,7 +885,7 @@ impl JoinKey {
         {
             return Err(EnrollmentError::Unauthorized);
         }
-        verify_issued(receipt, ca_certificate)?;
+        let certificate_chain = issued_chain(receipt, issuers)?;
         let held = self.enrollment()?.ok_or(EnrollmentError::NotCommitted)?;
         if held.identity != receipt.identity {
             return Err(EnrollmentError::Conflict);
@@ -622,7 +910,7 @@ impl JoinKey {
         next._directory.remove("enrollment.bin")?;
         next._directory.remove("join-key.bin")?;
         Ok(CredentialMaterial {
-            certificate_chain: vec![receipt.certificate.clone(), ca_certificate.to_vec()],
+            certificate_chain,
             private_key: Zeroizing::new(next.bundle.key.0.clone()),
         })
     }
@@ -634,10 +922,10 @@ impl JoinKey {
     /// Install a renewed receipt of this key over the one held: the same
     /// request and CSR under a fresh certificate that expires later. A held
     /// receipt that is already as new is kept; an older one is refused.
-    pub fn renew(
+    pub fn renew<'a>(
         &self,
         receipt: &EnrollmentReceipt,
-        ca_certificate: &[u8],
+        issuers: impl IntoIterator<Item = &'a IssuerRecord>,
         now: i64,
     ) -> Result<CredentialMaterial, EnrollmentError> {
         if receipt.identity.cluster != self.bundle.cluster {
@@ -650,7 +938,7 @@ impl JoinKey {
         {
             return Err(EnrollmentError::Unauthorized);
         }
-        verify_issued(receipt, ca_certificate)?;
+        let certificate_chain = issued_chain(receipt, issuers)?;
         let held = self.enrollment()?.ok_or(EnrollmentError::NotCommitted)?;
         if held.identity != receipt.identity || held.public_key != receipt.public_key {
             return Err(EnrollmentError::Conflict);
@@ -663,10 +951,35 @@ impl JoinKey {
                 .replace("enrollment.bin", &encode(receipt)?)?;
         }
         Ok(CredentialMaterial {
-            certificate_chain: vec![receipt.certificate.clone(), ca_certificate.to_vec()],
+            certificate_chain,
             private_key: Zeroizing::new(self.bundle.key.0.clone()),
         })
     }
+}
+/// The chain a credential presents: its certificate, the issuer that
+/// issued it and that issuer's endorsement (24 §11). Verified against the
+/// trusted issuers first.
+fn issued_chain<'a>(
+    receipt: &EnrollmentReceipt,
+    issuers: impl IntoIterator<Item = &'a IssuerRecord>,
+) -> Result<Vec<Vec<u8>>, EnrollmentError> {
+    let issuers: Vec<&IssuerRecord> = issuers.into_iter().collect();
+    if issuers.len() > focal_wire::MAX_TRUST_ROOTS {
+        return Err(EnrollmentError::Capacity);
+    }
+    verify_issued(
+        receipt,
+        issuers.iter().map(|issuer| issuer.certificate.as_slice()),
+    )?;
+    let issuer = issuers
+        .iter()
+        .find(|issuer| {
+            focal_wire::issued_by(&receipt.certificate, &issuer.certificate).unwrap_or(false)
+        })
+        .ok_or(EnrollmentError::Unauthorized)?;
+    let mut chain = vec![receipt.certificate.clone()];
+    chain.extend(issuer.chain().map(<[u8]>::to_vec));
+    Ok(chain)
 }
 
 fn params(
@@ -723,8 +1036,79 @@ pub fn certificate_key_hash(certificate: &[u8]) -> Result<Fingerprint, Enrollmen
         certificate.public_key().raw,
     ))
 }
-pub(crate) fn verify_issued(receipt: &EnrollmentReceipt, ca: &[u8]) -> Result<(), EnrollmentError> {
-    if receipt.certificate.len() > 4096 || ca.len() > 4096 {
+/// Whether `certificate` is an issuer's: a CA certificate that signs
+/// certificates.
+pub(crate) fn is_issuer(certificate: &[u8]) -> Result<bool, EnrollmentError> {
+    if certificate.len() > 4096 {
+        return Err(EnrollmentError::Capacity);
+    }
+    let (rest, certificate) =
+        X509Certificate::from_der(certificate).map_err(|_| EnrollmentError::Corrupt)?;
+    if !rest.is_empty() {
+        return Err(EnrollmentError::Corrupt);
+    }
+    Ok(certificate.is_ca()
+        && certificate
+            .key_usage()
+            .map_err(|_| EnrollmentError::Corrupt)?
+            .is_some_and(|usage| usage.value.key_cert_sign()))
+}
+/// Whether `endorsement` endorses the issuer `certificate`: a CA
+/// certificate for the same key and subject, valid over the same span, so
+/// a chain to the issuer verifies under the endorsement's signer as under
+/// the issuer itself (24 §11).
+pub(crate) fn endorses(endorsement: &[u8], certificate: &[u8]) -> Result<bool, EnrollmentError> {
+    if endorsement.len() > 4096 || certificate.len() > 4096 {
+        return Err(EnrollmentError::Capacity);
+    }
+    let (rest, endorsement) =
+        X509Certificate::from_der(endorsement).map_err(|_| EnrollmentError::Corrupt)?;
+    if !rest.is_empty() {
+        return Err(EnrollmentError::Corrupt);
+    }
+    let (rest, certificate) =
+        X509Certificate::from_der(certificate).map_err(|_| EnrollmentError::Corrupt)?;
+    if !rest.is_empty() {
+        return Err(EnrollmentError::Corrupt);
+    }
+    Ok(endorsement.is_ca()
+        && endorsement.public_key().raw == certificate.public_key().raw
+        && endorsement.subject().as_raw() == certificate.subject().as_raw()
+        && endorsement.issuer().as_raw() != endorsement.subject().as_raw()
+        && endorsement.validity().not_after == certificate.validity().not_after)
+}
+/// Verify a receipt's certificate: its shape, and its signature under one
+/// of `roots` — the issuers the registry trusts.
+pub(crate) fn verify_issued<'a>(
+    receipt: &EnrollmentReceipt,
+    roots: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<(), EnrollmentError> {
+    verify_issued_shape(receipt)?;
+    let (_, certificate) =
+        X509Certificate::from_der(&receipt.certificate).map_err(|_| EnrollmentError::Corrupt)?;
+    for root in roots {
+        if root.len() > 4096 {
+            return Err(EnrollmentError::Capacity);
+        }
+        let (rest, root) = X509Certificate::from_der(root).map_err(|_| EnrollmentError::Corrupt)?;
+        if !rest.is_empty() {
+            return Err(EnrollmentError::Corrupt);
+        }
+        if certificate.issuer().as_raw() == root.subject().as_raw()
+            && certificate
+                .verify_signature(Some(root.public_key()))
+                .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(EnrollmentError::Unauthorized)
+}
+/// Verify a receipt's certificate by what it is — its key, expiry, name
+/// and usages agree with the receipt — and not by who issued it: what an
+/// expired receipt is held to, its issuer possibly retired since.
+pub(crate) fn verify_issued_shape(receipt: &EnrollmentReceipt) -> Result<(), EnrollmentError> {
+    if receipt.certificate.len() > 4096 {
         return Err(EnrollmentError::Capacity);
     }
     let (rest, certificate) =
@@ -732,13 +1116,6 @@ pub(crate) fn verify_issued(receipt: &EnrollmentReceipt, ca: &[u8]) -> Result<()
     if !rest.is_empty() {
         return Err(EnrollmentError::Corrupt);
     }
-    let (rest, ca) = X509Certificate::from_der(ca).map_err(|_| EnrollmentError::Corrupt)?;
-    if !rest.is_empty() {
-        return Err(EnrollmentError::Corrupt);
-    }
-    certificate
-        .verify_signature(Some(ca.public_key()))
-        .map_err(|_| EnrollmentError::Unauthorized)?;
     if hash(
         "focal.enrollment.public-key.v1",
         certificate.public_key().raw,

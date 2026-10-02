@@ -79,7 +79,7 @@ async fn root_metadata_commits_before_invite_and_join_release_and_recovers_exact
     assert_eq!(receipt.identity.node_id, Some(founder + 1));
     assert_eq!(receipt.identity.cluster, cluster);
     let material = key
-        .complete(&receipt, &invitation.trust().ca_certificate, now())
+        .complete(&receipt, invitation.trust().issuers.iter(), now())
         .unwrap();
     assert_eq!(material.certificate_chain()[0], receipt.certificate);
     assert_eq!(

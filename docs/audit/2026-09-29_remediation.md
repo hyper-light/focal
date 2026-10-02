@@ -25,7 +25,7 @@ ruling before work starts).
 | F10 | P2 | in tree | 4 | [F10](#f10) |
 | F11 | P2 | in tree | 4 | [F11](#f11) |
 | F12 | P1 | in tree | 5 | [F12](#f12) |
-| F13 | P1 | in tree (stages 1–2; 3 designed) | 5 | [F13](#f13) |
+| F13 | P1 | in tree (stages 1–3) | 5 | [F13](#f13) |
 | F14 | P1 | in tree | 6 | [F14](#f14) |
 | F15 | P2 | in tree | 3 | [F15](#f15) |
 | F16 | P2 | in tree | 3 | [F16](#f16) |
@@ -518,7 +518,12 @@ ends the seat; and a hosted drive that ended well (its seat gone, as a release i
 ended the whole node's service — only a failed drive does; and the seat's own stop ends
 the replica's egress and its authority refresh as well, either of which the drive could
 see before the seat's word, reporting a legitimate end as "egress ended" — once the seat
-says it is ending, theirs is its end, and the seat's word is waited for. And before it, the reason the merge had stalled intermittently:
+says it is ending, theirs is its end, and the seat's word is waited for. The split test
+then passed three times alone (26 s, 17 s, 18 s) and once in the whole node library (293
+tests, four threads); in one full-library run before that it ran out of an owner budget
+at a partition wait, and the drain-leader journey run right after it ran out of its heal
+budget (3031 periods) — both green when run again alone; which step each stood in is what
+the next such run must print (open: intermittent under a loaded machine). And before it, the reason the merge had stalled intermittently:
 once the member was promoted the upper group's leadership could move to it, and the
 reshaper's seal of the upper partition — journaled by the founder as a remote intent —
 was refused at the member's placement-control ingress, where a seal is not a node's own
@@ -1890,24 +1895,77 @@ pool under the cluster's roots and the founder's name. *Test.* Node
 replicates the root and renews); it fails on the rule before, the host never past the
 genesis.
 
-**Residual (designed, next batch).** Stage 3 — issuer succession. Facts the design rests
-on (read 2026-09-30): the root is issued with path length zero (`pki.rs`,
-`BasicConstraints::Constrained(0)`), so it cannot sign an intermediate and a successor
-cannot be cross-certified under it; and the CA is pinned as bytes or by hash in the
-registry (`ca_certificate`, `check_authority`), every `ServerTrust`, the listener's and the
-pool's trust roots, `verify_issued`, the saved network state, and the root authority's
-anchor (`AuthorityAnchor.enrollment_ca`, which every proof statement carries). The
-succession is therefore a second root every verifier holds beside the first: the registry
-commits the successor (`Change::Issuer`, staged then activated as the bootstrap server is),
-trust becomes a set of at most two roots (the listener, the pool, `ServerTrust`,
-`verify_issued`), the anchor names the successor's hash beside the first, issuance moves
-to the successor at activation, and the first root retires one credential lifetime after
-it, when every credential issued under it has been renewed. Recovery of a lost
-`authority.bin` (the CA key is custody, never replicated: a verified backup of the private
-directory, or a documented re-founding with re-enrollment; the operator decides whether
-the private directory is part of `cluster backup`). A founder whose credential expired
-outright (down for the last third of its lifetime and longer) cannot sign a renewal
-request: the runbook's escalation stands.
+**Stage 3 (2026-10-02): the issuer succeeds itself.** *Cause.* The CA every credential
+chains to was created once for ten years (`pki.rs`, `10 * 365 * 86400`), pinned as bytes
+or by hash everywhere a chain is verified (the registry's `ca_certificate` and
+`verify_issued`, every `ServerTrust`, the listener's and the pool's roots, the saved
+network state, the anchor's `enrollment_ca`), and nothing could replace it: a cluster
+that outlived its issuer, or whose issuer's key was exposed, had no move but a
+re-founding. The facts the design rests on, read 2026-09-30: the root has a path length
+of zero, so a successor cannot be cross-certified *as an intermediate* under it; and the
+verifiers a succession must reach include ones that have not seen it — a node behind the
+commit, a client holding the trust its invitation carried — which, refused by every peer
+issued under the successor, could never catch up (the hole stage 2 closed for renewals
+with the enrolled-key rule, reopened one level up). *Fix.* Identity by genesis, trust by
+the committed set, bridged by endorsement. The genesis issuer stays the cluster's
+identity (`ca_certificate`, the anchor, `same_sponsor`, every equality that was an
+identity check); the trust is the registry's `IssuerSuccession { current, successor,
+retiring }` (schema 6; `IssuerRecord` with certificate, endorsement and validity;
+`Change::Issuer` stages, activates, retires under the founder authority; every verifier's
+roots are `trust_roots()`: the listener for clients, the pool and the joiner for peers,
+`ServerTrust.issuers` for the bootstrap endpoint — invitations schema 3, network states
+schema 4 — adopted on every refresh and re-presented when they change). A successor is
+*endorsed* by its predecessor: a CA certificate for the successor's key and name under
+the predecessor's signature, issued with the self-signed one (`stage_issuer`), committed
+beside it and presented in every chain (`[leaf, issuer, endorsement]`); a verifier that
+knows only the predecessor accepts the chain through the endorsement — the custom
+verifiers in `focal_wire::trust` for both TLS directions and the enrollment trust's
+`verify_chain`: a presented CA certificate, valid now, whose signature verifies under a
+known root's key anchors the leaf — so no verifier is ever cut off and no per-node
+acknowledgement is needed before activation. The predecessor retires on a fact: no
+receipt issued under it lives (records and retired, unexpired) and the bootstrap server
+certificate is under the new issuer (it is staged under the new issuer as soon as it is
+not under the one issuing, and succeeds itself as stage 2 made it) — within a credential
+lifetime of the activation. The issuer's lifetime is committed policy
+(`node.issuer_lifetime_seconds`, `EnrollmentLimits.issuer_lifetime`; default twelve
+credential lifetimes, Let's Encrypt's intermediate-to-leaf ratio; at least six — the
+last third must hold activation and retirement, a lifetime each; at most ten years, what
+the genesis issuer had), and the succession is staged in the last third of it or when
+the operator asks (`cluster credentials rotate-issuer`; `cluster credentials issuers`
+reads the set). It is the first behaviour gated on the upgrade fence
+(`ISSUER_SUCCESSION_LEVEL` 2; `CAPABILITY_LEVEL` 2): an older binary cannot verify an
+endorsed chain, so staging is refused by name (`Fenced`) until the fence is at the
+level, and a cluster founded by a binary holds the fence at the level its founder
+announces from genesis (its one node runs it; a rollout staged at a lower level founds at
+that level), so no fresh cluster waits on an operator's step for its own issuer's expiry
+— the upgrade journeys now rehearse the rollout from the level before to the binary's. Found on the way: an expired receipt kept in a checkpoint may have been issued
+under an issuer retired since — `restore` holds it to its shape and verifies the
+signature of the live ones; the limits' persisted shape changed with the field, so
+schemas 3–5 decode `LimitsV3` and derive the default. *Tests.* Enrollment
+`the_issuer_succeeds_itself_endorsed_by_its_predecessor_and_retires_once_nothing_live_was_issued_under_it`
+(genesis alone; stage once; a forged endorsement, a premature activation and retirement
+refused; invitations carry both; activate; the authority adopts; a renewal under the
+successor presents the three-certificate chain; in use while a genesis credential or the
+bootstrap server certificate lives; the server certificate moves under the successor;
+retire once nothing lives, refused a second earlier; identity unchanged; schema 5 and
+current restores; the authority reopens on the successor) and
+`an_older_trust_verifies_an_endorsed_chain_and_refuses_an_unendorsed_or_forged_one`;
+wire `a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_endorsement`
+(both directions; refused without the endorsement or endorsed by a stranger); node
+`the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_genesis_issuer_retires`
+(the fence at genesis; stage and the same again; activation at the next step; every node
+renewed under the successor; the host renews through the endpoint it adopted; the genesis
+issuer retires; a late host joins under the successor alone; the founder restarts on it);
+settings bounds and derivation; the committed-policy refusal; the CLI journey's
+`credentials issuers` and `rotate-issuer`; the descriptor, MCP and skills contracts (64
+tools, manifest v20). *Measurements.* under the forty-five-second test lifetime the
+succession activates within a second of the staging and the genesis issuer retires
+within two lifetimes; a chain grows from two certificates to three (about 1.6 KiB).
+*Residual.* Recovery of a lost `authority.bin` (the issuer's key is custody, never
+replicated: a verified backup of the private directory, or a re-founding with
+re-enrollment). A founder whose credential expired outright cannot sign a renewal
+request: the runbook's escalation stands. A client context adopts a successor it verified
+by endorsement only at its next enrollment or renewal (recorded for the client batch).
 
 ## F14
 

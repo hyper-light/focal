@@ -966,6 +966,11 @@ pub struct NetworkController {
     enrollment_identity: Option<CredentialMaterial>,
     /// When the bootstrap server certificate's succession was last stepped.
     last_bootstrap_attempt: i64,
+    /// When the issuer succession was last stepped (24 §11).
+    last_issuer_attempt: i64,
+    /// The issuers adopted from the registry changed since they were
+    /// presented to the listener and the pool.
+    trust_changed: bool,
     /// The enrollment identity above has yet to reach the listener: the
     /// replacement failed and is tried again on every round.
     enrollment_unpresented: bool,
@@ -1085,6 +1090,8 @@ impl NetworkController {
             presented: None,
             enrollment_identity: None,
             last_bootstrap_attempt: 0,
+            last_issuer_attempt: 0,
+            trust_changed: false,
             enrollment_unpresented: false,
             receipt,
             credentials,
@@ -1213,6 +1220,8 @@ impl NetworkController {
             }
             self.maintain_credential(pool, &swap, now).await;
             self.maintain_bootstrap_server(&swap, now).await;
+            self.maintain_issuer(now).await;
+            self.present_trust(pool, &swap)?;
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_millis(250)) => {}
                 request = swap.requests.recv() => {
@@ -1298,9 +1307,12 @@ impl NetworkController {
         };
         // A succeeded certificate the listener has not taken yet is
         // presented before anything else: the registry already names it.
+        let roots = self.state.sponsor.root_certificates();
         if self.enrollment_unpresented
             && let (Some(listener), Some(identity)) = (&swap.listener, &self.enrollment_identity)
-            && listener.replace(&self.credentials, Some(identity)).is_ok()
+            && listener
+                .replace(&self.credentials, Some(identity), &roots)
+                .is_ok()
         {
             self.enrollment_unpresented = false;
         }
@@ -1313,10 +1325,57 @@ impl NetworkController {
         // cadence above: the certificate presented serves on.
         if let Ok(Some(identity)) = sponsor.maintain_bootstrap_server(now).await {
             self.enrollment_unpresented = !swap.listener.as_ref().is_some_and(|listener| {
-                listener.replace(&self.credentials, Some(&identity)).is_ok()
+                listener
+                    .replace(&self.credentials, Some(&identity), &roots)
+                    .is_ok()
             });
             self.enrollment_identity = Some(identity);
         }
+    }
+    /// Step the issuer succession at the cadence of a credential's retries
+    /// (24 §11), where this node sponsors: a step that failed is taken
+    /// again at the next.
+    async fn maintain_issuer(&mut self, now: i64) {
+        let Some(sponsor) = self.local_sponsor.clone() else {
+            return;
+        };
+        let retry = renewal_retry(renewal_window(&self.receipt));
+        if now.saturating_sub(self.last_issuer_attempt) < retry {
+            return;
+        }
+        self.last_issuer_attempt = now;
+        let _ = sponsor.maintain_issuer(now).await;
+    }
+    /// Present the issuers adopted from the registry (24 §11) to the
+    /// listener — for the clients it verifies — and to the pool — for the
+    /// peers it dials — once they changed.
+    fn present_trust(
+        &mut self,
+        pool: &PeerConnectionPool,
+        swap: &CredentialSwap,
+    ) -> Result<(), ControllerError> {
+        if !self.trust_changed {
+            return Ok(());
+        }
+        let roots = self.state.sponsor.root_certificates();
+        if let Some(listener) = &swap.listener {
+            listener
+                .replace(&self.credentials, self.enrollment_identity.as_ref(), &roots)
+                .map_err(|_| ControllerError::Identity)?;
+        }
+        let tls = client_tls(
+            TlsIdentity::from_pkcs8(
+                self.credentials.certificate_chain().to_vec(),
+                self.credentials.private_key_der().to_vec(),
+            ),
+            roots,
+            &ControlHost::wire_limits(),
+        )
+        .map_err(|_| ControllerError::Identity)?;
+        pool.replace_identity(tls)
+            .map_err(|_| ControllerError::Identity)?;
+        self.trust_changed = false;
+        Ok(())
     }
     /// Present a credential everywhere at once: the listener, the peer
     /// pool and the placement agent.
@@ -1330,14 +1389,18 @@ impl NetworkController {
         swap.listener
             .as_ref()
             .ok_or(RenewalError::Install)?
-            .replace(&material, self.enrollment_identity.as_ref())
+            .replace(
+                &material,
+                self.enrollment_identity.as_ref(),
+                &self.state.sponsor.root_certificates(),
+            )
             .map_err(|_| RenewalError::Install)?;
         let tls = client_tls(
             TlsIdentity::from_pkcs8(
                 material.certificate_chain().to_vec(),
                 material.private_key_der().to_vec(),
             ),
-            vec![self.state.sponsor.ca_certificate.clone()],
+            self.state.sponsor.root_certificates(),
             &ControlHost::wire_limits(),
         )
         .map_err(|_| RenewalError::Install)?;
@@ -1398,7 +1461,7 @@ impl NetworkController {
         let receipt = self.ask_sponsor(request, now).await?;
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
-            .rotate_into(&next, &receipt, &self.state.sponsor.ca_certificate, now)
+            .rotate_into(&next, &receipt, self.state.sponsor.issuers.iter(), now)
             .map_err(|_| RenewalError::Install)?;
         drop(key);
         drop(next);
@@ -1423,7 +1486,7 @@ impl NetworkController {
         let receipt = self.ask_sponsor(request, now).await?;
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
-            .rotate_into(&next, &receipt, &self.state.sponsor.ca_certificate, now)
+            .rotate_into(&next, &receipt, self.state.sponsor.issuers.iter(), now)
             .map_err(|_| RenewalError::Install)?;
         drop(key);
         drop(next);
@@ -1493,7 +1556,7 @@ impl NetworkController {
         // The receipt is issued at the sponsor's clock after the exchange.
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
-            .renew(&receipt, &self.state.sponsor.ca_certificate, now)
+            .renew(&receipt, self.state.sponsor.issuers.iter(), now)
             .map_err(|_| RenewalError::Install)?;
         drop(key);
         self.present(pool, swap, material, receipt)?;
@@ -1664,12 +1727,22 @@ impl NetworkController {
                 .successor
                 .as_ref()
                 .map(|staged| staged.record.fingerprint);
+            // The issuers too (24 §11): a successor is trusted from its
+            // staging, before anything is issued under it, and a retired
+            // issuer is trusted no more.
+            let issuers: Vec<focal_enrollment::IssuerRecord> =
+                enrollment.issuers().trusted().cloned().collect();
             if self.state.sponsor.server_fingerprint != bootstrap.current.fingerprint
                 || self.state.sponsor.successor_fingerprint != successor
+                || self.state.sponsor.issuers != issuers
             {
                 let mut sponsor = self.state.sponsor.clone();
                 sponsor.server_fingerprint = bootstrap.current.fingerprint;
                 sponsor.successor_fingerprint = successor;
+                if sponsor.issuers != issuers {
+                    sponsor.issuers = issuers;
+                    self.trust_changed = true;
+                }
                 sponsor.validate().map_err(|_| ControllerError::Identity)?;
                 self.state.sponsor = sponsor;
                 self.state

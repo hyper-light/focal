@@ -701,6 +701,36 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert!(!ids(&after["learners"]).contains(&victim), "{after}");
     let view = placement(founder).unwrap();
     assert_eq!(view["control"]["partitions"][0]["leader"], actor, "{view}");
+    // The issuers the cluster's credentials chain to (24 §11): the genesis
+    // issuer alone, under a fence a cluster founded by this binary holds at
+    // its level from genesis. The operator stages the successor: endorsed
+    // by the genesis issuer, trusted everywhere from its staging, issuing
+    // from the controller's next step; asked again, it is answered as it is.
+    let issuers = success(founder, &["cluster", "credentials", "issuers"])["result"].clone();
+    assert!(issuers["successor"].is_null(), "{issuers}");
+    assert!(issuers["retiring"].is_null(), "{issuers}");
+    assert_eq!(issuers["current"]["endorsed"], false, "{issuers}");
+    assert_eq!(
+        issuers["fence_level"], issuers["succession_level"],
+        "{issuers}"
+    );
+    let genesis_issuer = issuers["current"]["fingerprint"].clone();
+    let rotated = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+    let staged = rotated["successor"].clone();
+    assert_eq!(staged["endorsed"], true, "{rotated}");
+    assert!(staged["staged_at"].is_number(), "{rotated}");
+    assert_ne!(staged["fingerprint"], genesis_issuer, "{rotated}");
+    assert_eq!(
+        rotated["current"]["fingerprint"], genesis_issuer,
+        "{rotated}"
+    );
+    let again = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+    assert!(
+        again["successor"]["fingerprint"] == staged["fingerprint"]
+            || (again["current"]["fingerprint"] == staged["fingerprint"]
+                && again["retiring"]["fingerprint"] == genesis_issuer),
+        "{again}"
+    );
     drop(servers);
 }
 /// Removal waits for the retiring copies to leave the directory; until

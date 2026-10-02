@@ -79,6 +79,12 @@ pub enum ClusterAdminError {
     },
     #[error("the group's configuration as read is inconsistent: {0}")]
     Inconsistent(&'static str),
+    /// The upgrade fence is below the level the issuer succession needs
+    /// (24 §11, §21): raise it first.
+    #[error(
+        "the upgrade fence ({level}) is below the level the issuer succession needs ({needed}); raise it with `cluster upgrade activate --fence {needed}` once every node runs a binary at that level"
+    )]
+    Fenced { level: u32, needed: u32 },
     #[error("invitation was not found in the committed enrollment registry")]
     NotFound,
     #[error(
@@ -489,6 +495,18 @@ impl ClusterAdmin {
             CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
             CredentialReply::Failed(error) => Err(error.into()),
         }
+    }
+    /// The issuers credentials chain to, as committed (24 §11).
+    pub async fn issuers(&self) -> Result<AdminResult> {
+        let bytes = self.exchange_bytes(AdminCommand::Issuers).await?;
+        issuers_result(&bytes)
+    }
+    /// Stage the issuer's successor now (24 §11); founder only. The
+    /// issuers as committed after the step; a successor already staged or
+    /// committed is answered as it is.
+    pub async fn rotate_issuer(&self) -> Result<AdminResult> {
+        let bytes = self.exchange_bytes(AdminCommand::RotateIssuer).await?;
+        issuers_result(&bytes)
     }
     /// Rotate this node's own credential to a fresh key under the same
     /// identity (24 §11); the founder's identity is never rotated here.
@@ -2223,5 +2241,31 @@ fn invitations_view(
             })
             .collect(),
         next: next.map(|id| hex(&id)),
+    }
+}
+/// The issuers an admin reply carries, as the client reports them.
+fn issuers_result(bytes: &[u8]) -> Result<AdminResult> {
+    use crate::credential_renewal::{IssuerDigest, IssuerReply};
+    let (reply, tail): (IssuerReply, _) =
+        postcard::take_from_bytes(bytes).map_err(|_| ClusterAdminError::Invalid)?;
+    if !tail.is_empty() {
+        return Err(ClusterAdminError::Invalid);
+    }
+    let digest = |digest: &IssuerDigest| focal_client::admin::AdminIssuerRecord {
+        fingerprint: hex(&digest.fingerprint),
+        issued_at: digest.issued_at,
+        expires_at: digest.expires_at,
+        endorsed: digest.endorsed,
+        staged_at: digest.staged_at,
+    };
+    match reply {
+        IssuerReply::Issuers(summary) => Ok(AdminResult::Issuers {
+            current: digest(&summary.current),
+            successor: summary.successor.as_ref().map(digest),
+            retiring: summary.retiring.as_ref().map(digest),
+            fence_level: summary.fence_level,
+            succession_level: summary.succession_level,
+        }),
+        IssuerReply::Fenced { level, needed } => Err(ClusterAdminError::Fenced { level, needed }),
     }
 }

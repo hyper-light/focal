@@ -72,7 +72,7 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
                 "focal-evidence" => 9,
                 "focal-validation" => 4,
                 "focal-peers" => 2,
-                "focal-cluster" => 19,
+                "focal-cluster" => 20,
                 _ => 2,
             }
         );

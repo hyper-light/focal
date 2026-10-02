@@ -210,6 +210,7 @@ impl FoundingNetwork {
             identity.cluster,
             names.clone(),
             limits.credential_lifetime,
+            limits.issuer_lifetime,
             now,
         )?;
         let key = JoinKey::open_or_create(private.join("node-key"), identity.cluster)?;
@@ -220,6 +221,11 @@ impl FoundingNetwork {
             identity.node,
             identity.issuer.0,
             limits.clone(),
+            // The fence a fresh cluster holds from genesis is what its
+            // founder announces (24 §21): the compiled level, or the lower
+            // one an operator staged a rollout at — never a level the
+            // founder itself would refuse to serve under.
+            crate::upgrade::announced_level(),
             now,
         )?;
         // The credential lifetime is the cluster's policy, committed in the
@@ -229,6 +235,14 @@ impl FoundingNetwork {
             return Err(
                 NodeError::Config(crate::config::ConfigError::CommittedPolicyChange {
                     field: "node.credential_lifetime_seconds",
+                })
+                .into(),
+            );
+        }
+        if founder.registry().limits().issuer_lifetime != limits.issuer_lifetime {
+            return Err(
+                NodeError::Config(crate::config::ConfigError::CommittedPolicyChange {
+                    field: "node.issuer_lifetime_seconds",
                 })
                 .into(),
             );
@@ -261,6 +275,7 @@ impl FoundingNetwork {
                 successor_fingerprint: authority
                     .successor()
                     .map(|(certificate, _)| server_fingerprint(certificate)),
+                issuers: founder.registry().issuers().trusted().cloned().collect(),
             },
             genesis: NetworkGenesis {
                 founder: identity.clone(),
@@ -337,7 +352,11 @@ impl FoundingNetwork {
         // registry committed for a staged key is left to the controller,
         // which adopts it from that key.
         if key.enrollment()?.is_none() {
-            key.complete(founder.receipt(), authority.ca_certificate(), now)?;
+            key.complete(
+                founder.receipt(),
+                founder.registry().issuers().trusted(),
+                now,
+            )?;
         }
         let held = key.enrollment()?.ok_or(NodeError::Identity)?;
         let committed = enrollment
@@ -359,7 +378,7 @@ impl FoundingNetwork {
         // apply: the replica follows the root's leader as any member's
         // does, and a restart knows only what its log says committed.
         enrollment.authorize_held(&receipt, now)?;
-        let credentials = key.renew(&receipt, authority.ca_certificate(), now)?;
+        let credentials = key.renew(&receipt, enrollment.issuers().trusted(), now)?;
         let enrollment_identity = authority.server_identity();
         let principal = signer_principal(identity.cluster);
         let config = QuorumEnrollmentConfig::new(

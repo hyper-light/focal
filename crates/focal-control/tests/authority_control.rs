@@ -223,6 +223,7 @@ fn activated_roots(path: &Path) -> Group {
         1,
         [5; 16],
         EnrollmentLimits::default(),
+        0,
         NOW,
     )
     .unwrap();
@@ -498,6 +499,7 @@ fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_aut
         1,
         [5; 16],
         EnrollmentLimits::default(),
+        0,
         NOW,
     )
     .unwrap();

@@ -117,7 +117,7 @@ impl Fixture {
             let node = receipt.identity.node_id.unwrap();
             credentials.insert(
                 node,
-                key.complete(&receipt, issuer.ca_certificate(), now)
+                key.complete(&receipt, issuer.issuers().unwrap().trusted(), now)
                     .unwrap(),
             );
             receipts.insert(node, receipt);
