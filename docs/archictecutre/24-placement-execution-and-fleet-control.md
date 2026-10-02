@@ -1050,10 +1050,35 @@ due). Two descriptors expose it on every surface: `cluster placement` /
 `cluster.placement` and `cluster plan` / `cluster.plan` (client
 `AdminResult::{Placement, Plan}`, the cluster skill at version 4).
 
+**The control plane in the view (2026-10-02, the audit's F24).** The
+reply carries `control`: the root group (its voters and learners from the
+node's own observation of its root replica, its leader and configuration
+index), every directory partition's group from the root's authority grants,
+and the issuer (the nodes holding its signing key: the founder, until F13
+stage 3 hands it on), each measured against the partition's live nodes by
+the rule the sessions are measured by (`focal_directory::voters_tolerance`,
+the voter half of `effective_guarantee`): what the voters tolerate of nodes,
+zones and regions as a quorum, and what blocks them. A session's data is
+only as available as the metadata that routes to and places it; the view
+says both, never one for the other. Readiness's `policy_satisfied` holds the
+committed policy to the root as well (`control_satisfied`), and
+`root.peers` names where each member's log stands as the leader knows it.
+A control read is answered on a follower too: the replica asks through the
+leader it knows (the core forwards the read index; 27 §5) and serves the
+read once it has applied the index the leader named — so a node whose root
+follows another voter still answers `membership show`, its own startup's
+membership read and the agent's root reads; before, every control read
+needed the leader, which the founder had always been. The permit a hosted
+partition opens with is minted by the node's root replica on the same
+terms — committed facts behind the barrier — leading or following, so the
+founder reopens its partition after a restart whichever voter leads.
+
 **Limits.** The view is the agent's last observation, up to one tick old;
 on a node that leads no partition it is what the founder answered; there is
 no session creation for a second tenant yet, so every placement view of a
-fresh cluster shows the founder's session alone.
+fresh cluster shows the founder's session alone. A partition group's leader
+is not named (the root's observation does not know it) and its groups are
+the founder's alone until they are placed like the root (F24, open).
 
 **Readiness (2026-09-10, R9.3).** `OperatorRead::Readiness` derives the
 four probes of [08 §9](08-stepped-complexity-and-deployment.md) from what
@@ -1176,6 +1201,21 @@ in the agent's memory only; one that outlives the agent is answered again by
 its exact retry. The reply names the plan's operation, its voters and its
 state. R9's `deployment plan/apply` composes this request with observed
 revisions and rollback bounds; it does not replace it.
+
+**The root group under the same request (2026-10-02, F24).** A plan seats
+the root's voters before the sessions': `AdminCommand::PlanControl` asks the
+agent for the voters the durability needs — those there are, when they
+already tolerate it (`voters_tolerance`), else what `propose_placement_
+keeping` seats among the live, eligible nodes keeping the incumbents, under
+the founder's session's residency and home regions — and the plan carries
+`plan_root` with its own promise (`control_guarantee`) beside the data's.
+Apply promotes each planned voter once the root holds it as a learner (the
+network controller admits every enrolled node as one), one exact `a1:`
+request each; a learner behind or a request still deciding is asked again
+as the root moves, within the operator's allowance, and a repeated apply
+resumes what is journaled. Zone survival asked of a deployment is thereby
+zone survival of the root too; the partition groups and the issuer are
+reported as the founder's until they follow (§15).
 
 **Qualification on real binaries** (`crates/focal-node/tests/placement_binary.rs`):
 three `focal` processes over QUIC (founder, two invited and joined hosts),

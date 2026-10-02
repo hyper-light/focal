@@ -11,8 +11,8 @@ use super::{
     Guarantee, GuaranteeLevel,
     apply::{Current, Journal, Outcome, Phase, preflight, session_progress},
     plan::{
-        Change, DeploymentIdentity, DeploymentPlan, Observation, ObservedNode, ObservedSession,
-        Proposal, SessionEpochs, compose,
+        Change, ControlProposal, DeploymentIdentity, DeploymentPlan, Observation, ObservedControl,
+        ObservedNode, ObservedSession, Proposal, SessionEpochs, compose,
     },
 };
 use crate::config::{
@@ -70,6 +70,7 @@ fn observation(sessions: Vec<ObservedSession>) -> Observation {
             region: None,
             zone: None,
         }],
+        control: None,
     }
 }
 const NODE_1: GuaranteeLevel = GuaranteeLevel {
@@ -91,7 +92,14 @@ fn a_plan_orders_the_policy_commit_first_and_derives_its_identity_from_facts_alo
         },
         Proposal::Satisfied,
     ];
-    let plan = compose(&observation, &requested, &proposals, 10).unwrap();
+    let plan = compose(
+        &observation,
+        &requested,
+        &proposals,
+        &ControlProposal::Unobserved,
+        10,
+    )
+    .unwrap();
     assert_eq!(plan.body.changes.len(), 3);
     assert!(matches!(
         plan.body.changes[0],
@@ -123,7 +131,14 @@ fn a_plan_orders_the_policy_commit_first_and_derives_its_identity_from_facts_alo
     // Time is not identity: the same facts make the same plan.
     let mut later = observation.clone();
     later.observed_at += 60;
-    let again = compose(&later, &requested, &proposals, 99).unwrap();
+    let again = compose(
+        &later,
+        &requested,
+        &proposals,
+        &ControlProposal::Unobserved,
+        99,
+    )
+    .unwrap();
     assert_eq!(again.plan_id, plan.plan_id);
     assert_ne!(again.created_ms, plan.created_ms);
     // A different request is a different plan.
@@ -131,6 +146,7 @@ fn a_plan_orders_the_policy_commit_first_and_derives_its_identity_from_facts_alo
         &observation,
         &intent(FailureDomain::Zone, 1),
         &proposals,
+        &ControlProposal::Unobserved,
         10,
     )
     .unwrap();
@@ -140,6 +156,7 @@ fn a_plan_orders_the_policy_commit_first_and_derives_its_identity_from_facts_alo
         &observation,
         &intent(FailureDomain::Node, 0),
         &[Proposal::Satisfied, Proposal::Satisfied],
+        &ControlProposal::Unobserved,
         10,
     )
     .unwrap();
@@ -163,6 +180,7 @@ fn a_refused_session_is_named_as_blocked_and_the_guarantee_after_stays_the_guara
                 voters: vec![7, 8, 9],
             },
         ],
+        &ControlProposal::Unobserved,
         10,
     )
     .unwrap();
@@ -177,7 +195,14 @@ fn a_refused_session_is_named_as_blocked_and_the_guarantee_after_stays_the_guara
     let mut alone = observation.clone();
     alone.sessions.clear();
     alone.committed = committed(3, intent(FailureDomain::Zone, 1));
-    let plan = compose(&alone, &intent(FailureDomain::Zone, 1), &[], 10).unwrap();
+    let plan = compose(
+        &alone,
+        &intent(FailureDomain::Zone, 1),
+        &[],
+        &ControlProposal::Unobserved,
+        10,
+    )
+    .unwrap();
     assert!(plan.body.changes.is_empty());
     assert_eq!(
         plan.body.guarantee.before,
@@ -191,7 +216,8 @@ fn a_refused_session_is_named_as_blocked_and_the_guarantee_after_stays_the_guara
             &alone,
             &intent(FailureDomain::Zone, 1),
             &[Proposal::Satisfied],
-            10
+            &ControlProposal::Unobserved,
+            10,
         )
         .is_err()
     );
@@ -207,6 +233,7 @@ fn the_plan_artifact_round_trips_and_every_tamper_is_refused() {
             operation: [4; 16],
             voters: vec![7, 8, 9],
         }],
+        &ControlProposal::Unobserved,
         10,
     )
     .unwrap();
@@ -254,6 +281,7 @@ fn preflight_refuses_a_stale_plan_by_the_fact_that_moved_and_skips_committed_ste
             operation: [4; 16],
             voters: vec![7, 8, 9],
         }],
+        &ControlProposal::Unobserved,
         10,
     )
     .unwrap();
@@ -323,6 +351,7 @@ fn the_journal_round_trips_and_only_advances() {
         &observation,
         &intent(FailureDomain::Node, 0),
         &[Proposal::Satisfied],
+        &ControlProposal::Unobserved,
         10,
     )
     .unwrap();
@@ -387,4 +416,98 @@ fn session_progress_follows_the_directory() {
     };
     assert_eq!(NODE_1.weaker(zone_0), zone_0);
     assert_eq!(zone_0.weaker(NODE_1), zone_0);
+}
+
+#[test]
+fn the_root_group_is_planned_before_the_sessions_and_its_promise_is_stated_apart() {
+    let mut observation = observation(vec![session(2, Some(GuaranteeLevel::NONE))]);
+    observation.nodes.extend([8, 9].map(|node| ObservedNode {
+        node,
+        generation: 1,
+        alive: true,
+        eligible: true,
+        disk_available: Some(1 << 30),
+        region: None,
+        zone: None,
+    }));
+    observation.control = Some(ObservedControl {
+        voters: vec![7],
+        learners: vec![8, 9],
+        configuration_index: 3,
+        tolerates_node: Some(0),
+        tolerates_zone: None,
+        tolerates_region: None,
+        blocked_by: Vec::new(),
+    });
+    let requested = intent(FailureDomain::Node, 1);
+    let proposals = [Proposal::Planned {
+        operation: [4; 16],
+        voters: vec![7, 8, 9],
+    }];
+    let plan = compose(
+        &observation,
+        &requested,
+        &proposals,
+        &ControlProposal::Planned {
+            voters: vec![7, 8, 9],
+            configuration_index: 3,
+        },
+        10,
+    )
+    .unwrap();
+    assert!(matches!(plan.body.changes[0], Change::CommitPolicy { .. }));
+    assert!(matches!(
+        &plan.body.changes[1],
+        Change::PlanRoot { voters, expected_configuration_index: 3 } if voters == &[7, 8, 9]
+    ));
+    assert!(matches!(plan.body.changes[2], Change::PlanSession { .. }));
+    assert_eq!(plan.body.control_guarantee.before, GuaranteeLevel::NONE);
+    assert_eq!(plan.body.control_guarantee.after, NODE_1);
+    assert_eq!(plan.body.guarantee.after, NODE_1);
+    assert!(plan.body.blocked_control.is_none());
+    assert_eq!(plan.view().changes.len(), 3);
+    // The artifact carries it, and the planned voters are fenced by the
+    // nodes the directory knows, not by the root's moving index.
+    let bytes = plan.encode().unwrap();
+    assert_eq!(DeploymentPlan::decode(&bytes).unwrap(), plan);
+    let journal = Journal::new(&plan, 5).unwrap();
+    assert!(preflight(&plan, &journal, &Current::of(&observation)).is_ok());
+    let mut moved = observation.clone();
+    moved.control.as_mut().unwrap().configuration_index = 4;
+    assert!(preflight(&plan, &journal, &Current::of(&moved)).is_ok());
+    let mut gone = observation.clone();
+    gone.nodes.retain(|node| node.node != 9);
+    assert!(matches!(
+        preflight(&plan, &journal, &Current::of(&gone)),
+        Err(super::DeploymentError::Stale { subject, field: "members" }) if subject == "root"
+    ));
+    // A root that already tolerates the failures changes nothing of its
+    // own; one that cannot be seated blocks the control promise and leaves
+    // it where it was, while the data's plan stands.
+    let same = compose(
+        &observation,
+        &requested,
+        &proposals,
+        &ControlProposal::Satisfied,
+        10,
+    )
+    .unwrap();
+    assert_eq!(same.body.changes.len(), 2);
+    assert_eq!(same.body.control_guarantee.after, NODE_1);
+    let refused = compose(
+        &observation,
+        &requested,
+        &proposals,
+        &ControlProposal::Refused("one zone".into()),
+        10,
+    )
+    .unwrap();
+    assert_eq!(refused.body.blocked_control.as_deref(), Some("one zone"));
+    assert_eq!(refused.body.control_guarantee.after, GuaranteeLevel::NONE);
+    assert_eq!(refused.body.guarantee.after, NODE_1);
+    assert_ne!(refused.plan_id, plan.plan_id);
+    // The root's level in a class a voter has no domain in is none.
+    let root = observation.control.as_ref().unwrap();
+    assert_eq!(root.level(FailureDomain::Zone).max_failures, 0);
+    assert_eq!(root.level(FailureDomain::Node).max_failures, 0);
 }

@@ -36,7 +36,7 @@ ruling before work starts).
 | F21 | P1 | open | 7 | — |
 | F22 | P1 | open | 5 | — |
 | F23 | P2 | open | 6 | — |
-| F24 | P1 | designed | 5 | [F24](#f24) |
+| F24 | P1 | in tree (root group; partition groups open) | 5 | [F24](#f24) |
 | F25 | P2 | in tree | 5 | [F25](#f25) |
 | F26 | P2 | open | 7 | — |
 | F27 | P3 | closed (a6cb86e) | 1 | [F27](#f27) |
@@ -253,10 +253,99 @@ since no external pressure reaches the reconstruction alone once the entry appli
 
 ## F24
 
-Designed as the metadata-plane package (root voters by policy, the guarantee counting
-the control plane, a founder that returns to lead, replicated partition groups, the PDB
-last): `docs/qualification/campaigns/2026-09-29-kind.md` D5 and the design note kept
-with the program. Needs the operator's ordering against the other batches.
+**Cause.** The deployment plan placed the sessions' data under the requested durability
+and nothing else: `Change::{CommitPolicy, PlanSession, NoChange}` and a guarantee
+derived from the sessions' achieved levels alone. The root group kept the founder's
+single vote (every enrolled node is admitted as a root learner by the network
+controller; promotion was `cluster membership promote`, by hand, mentioned nowhere a
+zone-survival request leads), the directory partition is hosted by the founder alone
+(24 §13), and the issuer's key is the founder's. The KIND campaign of 2026-09-29 (D5)
+saw it: three session voters across zones, `root_leader=not_leader` while the founder
+was down, no placement, membership or metadata operation until it returned. The
+operator asked for "survive zone, max_failures 1" and was told it was achieved.
+
+**Fix (the root group, 2026-10-02).** The control plane is measured, planned, applied
+and reported beside the data. One rule measures both: `focal_directory::
+voters_tolerance` (the voter half of `effective_guarantee`, factored out) counts a
+group's voters per failure domain and answers the largest f whose f fullest domains'
+loss leaves a quorum, with the same blockers (missing, ineligible, dead, unknown
+domain); a control voter is named by the log's configuration, without a generation. The
+root's own observation (`ControlHost::observe_root`: its configuration and the authority
+checkpoint) gives every node the root's voters and learners, each partition group's
+grant and the issuer's holder, and `cluster placement` carries them as `control`
+(`AdminControlPlane`: the root, the partition groups and the issuer, each with what it
+tolerates of nodes, zones and regions and what blocks it). The deployment plan asks the
+placement agent for the root's voters as it asks for a session's (`AdminCommand::
+PlanControl`, `PlacementAgent::plan_control`: the voters there are when they already
+tolerate the request, else `propose_placement_keeping` over the live, eligible nodes,
+keeping the incumbents, under the founder's session's residency and home regions;
+journaled nowhere), and composes `Change::PlanRoot { voters, expected_configuration_
+index }` after the policy commit and before the sessions, with its own
+`control_guarantee` before/during/after and `blocked_control` when the root cannot be
+seated (apply refuses such a plan as it refuses a blocked session). Apply promotes each
+planned voter through the root once the root holds it as a learner — one exact `a1:`
+request each (`ClusterAdmin::membership`), a learner behind, a request decided meanwhile
+or an earlier request still deciding asked again as the root moves within the operator's
+allowance, the rest journaled as under way and resumed by a repeated apply; the step
+is complete when every planned voter votes, and `deployment status` sees it. Preflight
+fences a planned voter the directory no longer knows (`stale: root members`), never
+the root's index, which moves as the controller admits learners. Readiness
+(`policy_satisfied`) now also requires the root to tolerate what the committed policy
+promises (`control_satisfied`, from the same measurement), and `root.peers` names
+where each member's log stands as the leader knows it, what a promotion waits on.
+
+**Tests.** `focal-directory/tests/placement_progress.rs::the_control_groups_voters_
+are_measured_by_the_sessions_rule` (one, three, two sharing a region, dead, missing,
+ineligible, unknown zone, a re-enrolled voter at its current grant, the sessions'
+measurement unchanged). `deployment/tests.rs::the_root_group_is_planned_before_the_
+sessions_and_its_promise_is_stated_apart` (order, the two guarantees, the artifact,
+preflight by members not by index, satisfied and refused). Real binaries,
+`tests/deployment_control_plane.rs`: three zones; before the plan the view says the
+root is the founder's vote alone, as are the partition and the issuer; `deployment
+plan` names `plan_root` with the three before `plan_session`, the control promise
+zone/1; `deployment apply --wait 240` completes with three root voters, `cluster
+placement` measures the root at zone/1 and node/1, the partition still at 0,
+readiness holds the policy and lists two peers; the same plan applied again is
+exact; the founder's zone silenced (SIGSTOP), the root is led from another zone and
+answers the operator on host-b with its three voters; the founder returns and the
+policy holds again. The KIND campaign's D5 is this test's premise.
+
+**Found on the way: a control read was served by the leader alone.** The first root
+with three voters showed it: a founder restarted under its committed policy never
+reported `Ready` — its startup asks its own root for the membership, a quorum read,
+and its root now followed a host — and `cluster membership show` on any non-leader
+node was refused `not_leader`; the F24 fleet's session plan stalled the same way once
+root leadership had moved, the agent's root reads refused. The core forwards a
+follower's read index to its leader and answers with the leader's commit (27 §5),
+and the control replica refused to ask (`check_ready` demanded leadership of every
+read). `ControlReplica::read_index` now asks through the leader a follower knows,
+and the control host serves the read once the replica has applied the index the
+barrier named; a write or a turn still needs the leader, a read no longer. Test:
+`control_host::a_follower_answers_a_read_through_its_leader` (a membership read on a
+follower of the rig answers with the follower's node and the leader's). The paced
+turn test's rig is given forty ticks of silence before an election, since its holds
+hold heartbeats too.
+
+**Found on the way: the partition permit demanded that the root lead.** The
+same restart showed the second assumption: the permit the founder's own partition
+opens with was refused unless the root replica led — at its admission
+(`Owner::prepare_directory`), at its barrier (`complete_directory`) and in its
+minting (`authorize_first_directory`) — so a founder whose root followed another
+voter never reopened the partition it hosts — no `Ready`, no directory view (`cluster placement` empty), the agent's root
+intents refused for want of a route. The permit is minted on committed facts behind
+a quorum barrier — asked through the leader where the replica follows — the same on
+every member that applied them; it no longer asks who leads. The CLI deployment
+test's founder restart under a three-voter root is the regression (`cli_deployment`,
+line 591 of its journey), beside the control-plane test.
+
+**Open (batch 2).** The directory partition groups: hosted by the founder alone, so
+placement, session creation and membership operations wait for it while the root
+answers from another zone; they are reported as such (`partitions[].tolerates_*` 0).
+The host machinery of a split destination (`HostRequest::Host`, a root permit, a
+sealed image) is what a partition learner on another node generalizes. The issuer's
+survival is F13 stage 3 (3a held, 3b in progress); reported as the founder's alone
+until then. The founder's Kubernetes disruption budget (`maxUnavailable: 0`) stands
+until both.
 
 ## F27
 
@@ -2228,9 +2317,11 @@ wait is charged to the progress of what it waits on — the commands decided bef
 at most as many as the owner admits — never to the time they took; a turn that passes
 to no one leaves every waiter's deadline where it was, so a stalled group still gives
 them up in one request time. *Test.* The same test, paced: the rig's routers hold the
-group at each applied index until the test allows the next, one commit at a time six
-of the leader's periods apart, four of which hold more than the request time of
-fourteen; every write is decided, and without the renewal the fifth is given up.
+group at each applied index until the test allows the next, one commit at a time,
+each hold more than half the request time so that four holds outlast it (a request
+time of a second and forty ticks of silence before an election, since the holds hold
+heartbeats and a loaded host's commit must fit beside a hold); every write is
+decided, and without the renewal the fifth is given up.
 
 **The driver's test of a dead peer beside a live one hung** (`focal-node`, found by this
 batch's own run of the suite: 2 of 60 runs of

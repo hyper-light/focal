@@ -281,9 +281,11 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[invalid_input]"), "{report}");
 
-    // A dry run prints the plan: the policy commit first, then the session's
-    // placement request, the guarantee before and after; nothing is created
-    // and the directory journals nothing.
+    // A dry run prints the plan: the policy commit first, then the root
+    // group's voters the durability needs (F24), then the session's
+    // placement request, the guarantee before and after for the data and
+    // for the control plane; nothing is created and the directory journals
+    // nothing.
     let dry =
         success(founder, Some(&node_1), &["deployment", "plan", "--dry-run"])["result"].clone();
     assert_eq!(dry["dry_run"], true);
@@ -296,32 +298,45 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(plan["requested"]["durability"]["max_failures"], 1);
     assert_eq!(plan["blocked"], serde_json::json!([]));
     let changes = plan["changes"].as_array().unwrap();
-    assert_eq!(changes.len(), 2, "{plan}");
+    assert_eq!(changes.len(), 3, "{plan}");
     assert_eq!(changes[0]["change"], "commit_policy");
     assert_eq!(changes[0]["from_revision"], 1);
     assert_eq!(changes[0]["to_revision"], 2);
-    assert_eq!(changes[1]["change"], "plan_session");
-    assert_eq!(changes[1]["tenant"], tenant);
-    assert_eq!(changes[1]["session"], ledger);
-    assert_eq!(changes[1]["pending"], false);
-    assert_eq!(changes[1]["expected_route_epoch"], 1);
-    let mut voters: Vec<u64> = changes[1]["voters"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap())
-        .collect();
-    voters.sort_unstable();
-    assert_eq!(voters, {
+    let sorted = |value: &Value| {
+        let mut ids: Vec<u64> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let all = {
         let mut all = vec![founder_node, node_a, node_b];
         all.sort_unstable();
         all
-    });
-    let operation = changes[1]["operation"].as_str().unwrap().to_owned();
+    };
+    assert_eq!(changes[1]["change"], "plan_root");
+    assert_eq!(sorted(&changes[1]["voters"]), all, "{plan}");
+    assert_eq!(changes[2]["change"], "plan_session");
+    assert_eq!(changes[2]["tenant"], tenant);
+    assert_eq!(changes[2]["session"], ledger);
+    assert_eq!(changes[2]["pending"], false);
+    assert_eq!(changes[2]["expected_route_epoch"], 1);
+    assert_eq!(sorted(&changes[2]["voters"]), all);
+    let operation = changes[2]["operation"].as_str().unwrap().to_owned();
     assert_eq!(plan["guarantee"]["before"]["max_failures"], 0);
     assert_eq!(plan["guarantee"]["during"]["max_failures"], 0);
     assert_eq!(plan["guarantee"]["after"]["max_failures"], 1);
     assert_eq!(plan["guarantee"]["after"]["survive"], "node");
+    assert_eq!(plan["control_guarantee"]["before"]["max_failures"], 0);
+    assert_eq!(plan["control_guarantee"]["after"]["max_failures"], 1);
+    assert_eq!(plan["blocked_control"], Value::Null);
+    assert_eq!(
+        plan["observed"]["control"]["voters"],
+        serde_json::json!([founder_node])
+    );
     let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
     assert!(!founder.join("cluster/apply").exists());
     assert_eq!(committed_revision(founder, None), 1);
@@ -354,6 +369,12 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     );
     assert_eq!(blocked["plan"]["blocked"][0]["session"], ledger);
     assert_eq!(blocked["plan"]["guarantee"]["after"]["max_failures"], 0);
+    // Nor can the root be seated for two losses among three hosts.
+    assert!(blocked["plan"]["blocked_control"].is_string(), "{blocked}");
+    assert_eq!(
+        blocked["plan"]["control_guarantee"]["after"]["max_failures"],
+        0
+    );
     assert!(blocked_file.is_file());
     let (code, report) = failure(
         founder,
@@ -522,11 +543,21 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(applied["plan_id"], plan_id);
     assert_eq!(applied["outcome"], "Complete", "{applied}");
     let steps = applied["steps"].as_array().unwrap();
-    assert_eq!(steps.len(), 2);
+    assert_eq!(steps.len(), 3);
     assert_eq!(steps[0]["phase"], "Complete");
     assert_eq!(steps[1]["phase"], "Complete");
-    assert_eq!(steps[1]["operation"], operation);
+    assert_eq!(steps[1]["change"]["change"], "plan_root");
+    assert_eq!(steps[2]["phase"], "Complete");
+    assert_eq!(steps[2]["operation"], operation);
     assert_eq!(committed_revision(founder, None), 2);
+    // The root's voters are the three, and the view says what they survive.
+    let configuration =
+        success(founder, None, &["cluster", "membership", "show"])["result"]["configuration"]
+            .clone();
+    assert_eq!(sorted(&configuration["voters"]), all, "{configuration}");
+    let control = placement(founder).unwrap()["control"].clone();
+    assert_eq!(control["root"]["tolerates_node"], 1, "{control}");
+    assert_eq!(control["partitions"][0]["tolerates_node"], 0, "{control}");
     let journal = founder.join("cluster/apply").join(&plan_id);
     assert!(journal.join("JOURNAL").is_file());
     assert_eq!(std::fs::read(journal.join("PLAN")).unwrap(), bytes);

@@ -214,6 +214,148 @@ fn push(blocked_by: &mut Vec<Blocker>, blocker: Blocker) -> Result<(), Directory
     Ok(())
 }
 
+/// The largest number of failures of `class` a set of members tolerates: the
+/// members the registry knows, at their generation where one is named,
+/// eligible, alive and in a known domain, counted per domain; the largest f
+/// whose worst-case loss (the f fullest domains) still leaves `needed`
+/// members — a majority for a quorum, one copy otherwise. A member in no
+/// known domain makes the set unevaluable. One function measures a
+/// session's placement and a control group's voters alike: the root's and a
+/// partition's survival is stated by the same rule as the data's.
+fn tolerance_of(
+    members: impl Iterator<Item = (u64, Option<u64>)>,
+    class: FailureClass,
+    quorum: bool,
+    nodes: &BTreeMap<u64, NodeRecord>,
+    blocked_by: &mut Vec<Blocker>,
+    evaluable: &mut bool,
+) -> Result<u16, DirectoryError> {
+    let mut domains = BTreeMap::new();
+    let mut alive = 0_usize;
+    let mut named = 0_usize;
+    for (id, generation) in members {
+        named = add(named, 1)?;
+        let Some(node) = nodes.get(&id) else {
+            push(
+                blocked_by,
+                Blocker {
+                    node: Some(id),
+                    reason: BlockReason::MissingNode,
+                },
+            )?;
+            continue;
+        };
+        if generation.is_some_and(|generation| node.enrollment.generation != generation) {
+            push(
+                blocked_by,
+                Blocker {
+                    node: Some(id),
+                    reason: BlockReason::StaleNode,
+                },
+            )?;
+            continue;
+        }
+        if !node.enrollment.eligible {
+            push(
+                blocked_by,
+                Blocker {
+                    node: Some(id),
+                    reason: BlockReason::IneligibleNode,
+                },
+            )?;
+            continue;
+        }
+        if !node.is_alive() {
+            push(
+                blocked_by,
+                Blocker {
+                    node: Some(id),
+                    reason: BlockReason::DeadNode,
+                },
+            )?;
+            continue;
+        }
+        let Ok(domain) = placement::failure_domain(&node.enrollment, class) else {
+            *evaluable = false;
+            push(
+                blocked_by,
+                Blocker {
+                    node: Some(id),
+                    reason: BlockReason::UnknownDomain,
+                },
+            )?;
+            continue;
+        };
+        alive = add(alive, 1)?;
+        let count = domains.entry(domain).or_insert(0_usize);
+        *count = add(*count, 1)?;
+    }
+    let mut counts: Vec<usize> = Vec::new();
+    counts
+        .try_reserve_exact(domains.len())
+        .map_err(|_| DirectoryError::Memory(focal_memory::MemoryError::AllocationFailed))?;
+    counts.extend(domains.into_values());
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    let needed = if quorum {
+        named.saturating_div(2).saturating_add(1)
+    } else {
+        1
+    };
+    // The largest f whose worst-case loss (the f fullest domains) still
+    // leaves `needed` members: a linear scan over at most `named` domains.
+    let mut survivable = 0_u16;
+    let mut remaining = alive;
+    for count in counts {
+        let after = remaining.saturating_sub(count);
+        if after < needed {
+            break;
+        }
+        remaining = after;
+        survivable = survivable.saturating_add(1);
+    }
+    if alive < needed {
+        survivable = 0;
+    }
+    Ok(survivable)
+}
+
+/// What a set of voters tolerates, and what stands in the way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tolerance {
+    /// None when a voter's failure domain of the class is unknown.
+    pub achieved: Option<u16>,
+    pub blocked_by: Vec<Blocker>,
+}
+/// The failures of `class` a group's voters tolerate as a quorum, measured
+/// against the node registry: the root's voters, a directory partition's,
+/// or any set a control group is made of. Voters are named without a
+/// generation: a control group's membership is its log's configuration,
+/// which names nodes, and the node's current grant is the one measured.
+pub fn voters_tolerance(
+    voters: impl Iterator<Item = u64>,
+    class: FailureClass,
+    nodes: &BTreeMap<u64, NodeRecord>,
+) -> Result<Tolerance, DirectoryError> {
+    let mut blocked_by = Vec::new();
+    blocked_by
+        .try_reserve_exact(MAX_BLOCKERS)
+        .map_err(|_| DirectoryError::Memory(focal_memory::MemoryError::AllocationFailed))?;
+    let mut evaluable = true;
+    let survivable = tolerance_of(
+        voters.map(|id| (id, None)),
+        class,
+        true,
+        nodes,
+        &mut blocked_by,
+        &mut evaluable,
+    )?;
+    blocked_by.shrink_to_fit();
+    Ok(Tolerance {
+        achieved: evaluable.then_some(survivable),
+        blocked_by,
+    })
+}
+
 pub fn effective_guarantee(
     session: &SessionDescriptor,
     nodes: &BTreeMap<u64, NodeRecord>,
@@ -236,90 +378,16 @@ pub fn effective_guarantee(
         (&session.active.placement.materializers, false),
         (&session.active.placement.content_copies, false),
     ] {
-        let mut domains = BTreeMap::new();
-        let mut alive = 0_usize;
-        for (id, generation) in members {
-            let Some(node) = nodes.get(id) else {
-                push(
-                    &mut blocked_by,
-                    Blocker {
-                        node: Some(*id),
-                        reason: BlockReason::MissingNode,
-                    },
-                )?;
-                continue;
-            };
-            if node.enrollment.generation != *generation {
-                push(
-                    &mut blocked_by,
-                    Blocker {
-                        node: Some(*id),
-                        reason: BlockReason::StaleNode,
-                    },
-                )?;
-                continue;
-            }
-            if !node.enrollment.eligible {
-                push(
-                    &mut blocked_by,
-                    Blocker {
-                        node: Some(*id),
-                        reason: BlockReason::IneligibleNode,
-                    },
-                )?;
-                continue;
-            }
-            if !node.is_alive() {
-                push(
-                    &mut blocked_by,
-                    Blocker {
-                        node: Some(*id),
-                        reason: BlockReason::DeadNode,
-                    },
-                )?;
-                continue;
-            }
-            let Ok(domain) = placement::failure_domain(&node.enrollment, class) else {
-                evaluable = false;
-                push(
-                    &mut blocked_by,
-                    Blocker {
-                        node: Some(*id),
-                        reason: BlockReason::UnknownDomain,
-                    },
-                )?;
-                continue;
-            };
-            alive = add(alive, 1)?;
-            let count = domains.entry(domain).or_insert(0_usize);
-            *count = add(*count, 1)?;
-        }
-        let mut counts: Vec<usize> = Vec::new();
-        counts
-            .try_reserve_exact(domains.len())
-            .map_err(|_| DirectoryError::Memory(focal_memory::MemoryError::AllocationFailed))?;
-        counts.extend(domains.into_values());
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let needed = if quorum {
-            members.len().saturating_div(2).saturating_add(1)
-        } else {
-            1
-        };
-        // The largest f whose worst-case loss (the f fullest domains) still
-        // leaves `needed` members: a linear scan over at most `members` domains.
-        let mut survivable = 0_u16;
-        let mut remaining = alive;
-        for count in counts {
-            let after = remaining.saturating_sub(count);
-            if after < needed {
-                break;
-            }
-            remaining = after;
-            survivable = survivable.saturating_add(1);
-        }
-        if alive < needed {
-            survivable = 0;
-        }
+        let survivable = tolerance_of(
+            members
+                .iter()
+                .map(|(id, generation)| (*id, Some(*generation))),
+            class,
+            quorum,
+            nodes,
+            &mut blocked_by,
+            &mut evaluable,
+        )?;
         tolerated = tolerated.min(survivable);
     }
     if tolerated == u16::MAX {

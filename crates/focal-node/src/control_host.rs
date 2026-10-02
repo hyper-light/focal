@@ -1690,9 +1690,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                         None => Some(Err(ControlFailure::Unavailable)),
                     }
                 }
+                // A read barrier confirmed, by this replica as leader or
+                // by the leader it asked through (27 §5): the read is
+                // served from what this replica has applied past it.
                 Waiting::Enrollment { context, request }
                     if pending.term == status.term
-                        && status.role == StateRole::Leader
                         && events.read_states.iter().any(|read| {
                             &read.context == context && read.index <= self.replica.applied_index()
                         }) =>
@@ -1765,7 +1767,6 @@ impl<V: AuthorityVerifier> Owner<V> {
                     .map(Ok),
                 Waiting::Read { context, query, .. }
                     if pending.term == status.term
-                        && status.role == StateRole::Leader
                         && events.read_states.iter().any(|read| {
                             &read.context == context && read.index <= self.replica.applied_index()
                         }) =>
@@ -1844,7 +1845,10 @@ impl<V: AuthorityVerifier> Owner<V> {
             } else if pending.response.is_closed() {
                 drop(pending);
             } else if pending.term != status.term
-                || status.role != StateRole::Leader
+                // A write and a turn need this replica to lead; a read
+                // waits on a barrier a follower is answered too.
+                || (status.role != StateRole::Leader
+                    && matches!(pending.waiting, Waiting::Write(_) | Waiting::Turn(_)))
                 || self.pace.periods() >= pending.deadline
             {
                 let failure = match pending.waiting {

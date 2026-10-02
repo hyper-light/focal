@@ -3,16 +3,16 @@
 use super::{
     DeploymentError, GuaranteeLevel, hex, now_ms,
     observe::observe,
-    plan::{Change, DeploymentPlan, Observation, ObservedSession},
+    plan::{Change, DeploymentPlan, Observation, ObservedControl, ObservedSession},
     survive_code,
 };
 use crate::{
-    cluster_admin::ClusterAdmin,
+    cluster_admin::{ClusterAdmin, ClusterAdminError},
     config::policy::{self, PolicyRevision},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -153,6 +153,9 @@ impl Journal {
 pub struct Current {
     pub policy_revision: u64,
     pub sessions: BTreeMap<([u8; 16], [u8; 16]), ObservedSession>,
+    /// The nodes the directory knows now.
+    pub nodes: BTreeSet<u64>,
+    pub control: Option<ObservedControl>,
 }
 impl Current {
     pub fn of(observation: &Observation) -> Self {
@@ -163,6 +166,8 @@ impl Current {
                 .iter()
                 .map(|session| ((session.tenant, session.session), session.clone()))
                 .collect(),
+            nodes: observation.nodes.iter().map(|node| node.node).collect(),
+            control: observation.control.clone(),
         }
     }
 }
@@ -189,6 +194,7 @@ pub fn preflight(
                 "membership_epoch" => "membership_epoch",
                 "placement_epoch" => "placement_epoch",
                 "operation" => "operation",
+                "members" => "members",
                 _ => "presence",
             },
         });
@@ -204,6 +210,17 @@ pub fn preflight(
             Change::CommitPolicy { from_revision, .. } => {
                 if current.policy_revision != *from_revision {
                     return Err(stale("policy".into(), "committed_revision"));
+                }
+            }
+            // The root's configuration moves as the controller admits
+            // learners, so its index is not a fence; a planned voter the
+            // directory no longer knows is.
+            Change::PlanRoot { voters, .. } => {
+                if current.control.is_none() {
+                    return Err(stale("root".into(), "presence"));
+                }
+                if voters.iter().any(|voter| !current.nodes.contains(voter)) {
+                    return Err(stale("root".into(), "members"));
                 }
             }
             Change::PlanSession {
@@ -359,8 +376,13 @@ pub async fn apply(
     if plan.body.deployment.cluster != admin.identity().cluster {
         return Err(DeploymentError::WrongDeployment);
     }
-    if !plan.body.blocked.is_empty() {
-        return Err(DeploymentError::Blocked(plan.body.blocked.len()));
+    if !plan.body.blocked.is_empty() || plan.body.blocked_control.is_some() {
+        return Err(DeploymentError::Blocked(
+            plan.body
+                .blocked
+                .len()
+                .saturating_add(usize::from(plan.body.blocked_control.is_some())),
+        ));
     }
     let observation = observe(admin, network).await?;
     // The journal exists only once the plan passed preflight at least once,
@@ -421,6 +443,66 @@ pub async fn apply(
                 current.policy_revision = committed.revision.0;
                 journal.record(index, Phase::Complete, None, now_ms()?)?;
                 write_journal(&dir, &journal)?;
+            }
+            Change::PlanRoot { voters, .. } => {
+                if journal.phase(index).is_none() {
+                    journal.record(index, Phase::Prepared, None, now_ms()?)?;
+                    write_journal(&dir, &journal)?;
+                }
+                // Each planned voter the root does not hold as a voter yet is
+                // promoted once the root holds it as a learner (the
+                // controller admits every enrolled node as one) and it has
+                // caught up: a promotion refused for a learner behind, a
+                // request decided meanwhile or an earlier request still
+                // deciding is asked again as the root moves, within the
+                // operator's allowance; what is not done stays journaled
+                // as under way and a repeated apply resumes it.
+                loop {
+                    let configuration = admin.configuration().await?;
+                    let voting: BTreeSet<u64> =
+                        configuration.configuration.voters.iter().copied().collect();
+                    let next = voters.iter().copied().find(|voter| !voting.contains(voter));
+                    let Some(node) = next else {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        write_journal(&dir, &journal)?;
+                        break;
+                    };
+                    let mut advanced = false;
+                    // A joint configuration (one change still leaving) takes
+                    // no other change: asked again once it has left.
+                    if configuration.configuration.voters_outgoing.is_empty()
+                        && configuration.configuration.learners.contains(&node)
+                    {
+                        match admin
+                            .membership(
+                                focal_consensus::MembershipChange::Promote { node },
+                                Some(configuration.configuration_index),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                journal.record(index, Phase::Committed, None, now_ms()?)?;
+                                write_journal(&dir, &journal)?;
+                                advanced = true;
+                            }
+                            Err(
+                                ClusterAdminError::Pending
+                                | ClusterAdminError::Control(
+                                    focal_control::ControlFailure::NotReady
+                                    | focal_control::ControlFailure::CompareFailed,
+                                ),
+                            ) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    if advanced {
+                        continue;
+                    }
+                    if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
             }
             Change::PlanSession {
                 tenant,
@@ -562,6 +644,21 @@ pub async fn status(
             let current = observation.as_ref().map(Current::of);
             let mut changed = false;
             for (index, change) in (0u32..).zip(&plan.body.changes) {
+                let recorded = journal.phase(index).unwrap_or(Phase::Prepared);
+                if recorded < Phase::Committed || recorded == Phase::Complete {
+                    continue;
+                }
+                if let Change::PlanRoot { voters, .. } = change {
+                    let seated = current
+                        .as_ref()
+                        .and_then(|current| current.control.as_ref())
+                        .is_some_and(|root| voters.iter().all(|voter| root.voters.contains(voter)));
+                    if seated {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        changed = true;
+                    }
+                    continue;
+                }
                 let Change::PlanSession {
                     tenant,
                     session,
@@ -573,10 +670,6 @@ pub async fn status(
                 else {
                     continue;
                 };
-                let recorded = journal.phase(index).unwrap_or(Phase::Prepared);
-                if recorded < Phase::Committed || recorded == Phase::Complete {
-                    continue;
-                }
                 let progress = session_progress(
                     current
                         .as_ref()

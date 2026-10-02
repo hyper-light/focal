@@ -146,11 +146,26 @@ struct Rig {
     /// test lets the next one through: a commit at a time, at the test's
     /// pace. `u64::MAX` holds nothing.
     allowed: Arc<AtomicU64>,
+    /// The replicas' election timeout, in ticks.
+    election_tick: usize,
+    /// The owners' request time.
+    request_timeout: Duration,
     bootstrap: ControlBootstrap,
     group: [u8; 16],
 }
 impl Rig {
     fn new(bootstrap: ControlBootstrap, group: [u8; 16]) -> Self {
+        Self::with_timing(bootstrap, group, 10, Duration::from_millis(350))
+    }
+    /// A rig whose replicas campaign only after `election_tick` ticks of
+    /// silence and whose owners give a request `request_timeout`: for a
+    /// test that holds the group's frames on purpose.
+    fn with_timing(
+        bootstrap: ControlBootstrap,
+        group: [u8; 16],
+        election_tick: usize,
+        request_timeout: Duration,
+    ) -> Self {
         let mut value = Self {
             directories: (0..3).map(|_| tempfile::tempdir().unwrap()).collect(),
             hosts: vec![],
@@ -158,6 +173,8 @@ impl Rig {
             routers: vec![],
             isolated: Arc::new(AtomicU64::new(0)),
             allowed: Arc::new(AtomicU64::new(u64::MAX)),
+            election_tick,
+            request_timeout,
             bootstrap,
             group,
         };
@@ -170,6 +187,7 @@ impl Rig {
             let id = offset as u64 + 1;
             let mut config = NodeConfig::single(id, CLUSTER, self.group);
             config.voters = vec![1, 2, 3];
+            config.election_tick = self.election_tick;
             let allowance = budget();
             let replica = ControlReplica::open(
                 ControlOptions::new(config),
@@ -180,7 +198,7 @@ impl Rig {
             .unwrap();
             let mut config = ControlHostConfig::new(namespace());
             config.tick = RIG_TICK;
-            config.request_timeout = Duration::from_millis(350);
+            config.request_timeout = self.request_timeout;
             let (host, owner, channel) =
                 ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();
             self.hosts.push(host);
@@ -1490,8 +1508,11 @@ async fn an_owner_refused_the_room_waits_and_goes_on() {
 /// turn, and the transfer after them. Then the fifth was given one request
 /// time for all five, from when it came, and given up on a slow disk (the
 /// macOS run of the day after): here the group commits one write at a time,
-/// six of the owner's periods apart, four of which hold more than the
-/// request time of fourteen, and every write is decided.
+/// held apart for more than half the request time each, so that four holds
+/// outlast the request time and the fifth write's turn comes only after it;
+/// every write is decided. The holds hold heartbeats too, so the replicas
+/// are given forty ticks of silence before they campaign; and the request
+/// time is a second, so that a commit on a loaded host fits beside a hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
     let keys = tempfile::tempdir().unwrap();
@@ -1502,7 +1523,8 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
         now(),
     )
     .unwrap();
-    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    const REQUEST: Duration = Duration::from_secs(1);
+    let mut rig = Rig::with_timing(root_bootstrap(&authority), GROUP, 40, REQUEST);
     rig.hosts[0].campaign().await.unwrap();
     let leader = rig.leader(0).await;
     let (leader, ControlReadResult::Configuration(configuration)) = rig
@@ -1536,9 +1558,12 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
             target,
         },
     );
-    // One commit at a time: the routers hold the group at each, for six
-    // of the leader's periods, before the next is let through.
-    const HOLD: u64 = 6;
+    // One commit at a time: the routers hold the group at each, for more
+    // than half the request time in the leader's periods, before the next
+    // is let through; four holds then outlast the request time.
+    let request = focal_timing::ProgressDeadline::periods(REQUEST, RIG_TICK);
+    let hold = request / 2 + 1;
+    assert!(hold * 4 > request && hold * 2 < request + request / 2);
     let applied = host.progress().applied_index;
     rig.allowed.store(applied + 1, Ordering::SeqCst);
     let paced = async {
@@ -1557,8 +1582,8 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
                 break;
             }
             let from = host.periods();
-            let mut wait = focal_timing::ProgressDeadline::begin(&[from], HOLD + 1, FROZEN);
-            while host.periods() < from + HOLD {
+            let mut wait = focal_timing::ProgressDeadline::begin(&[from], hold + 1, FROZEN);
+            while host.periods() < from + hold {
                 if let Err(spent) = wait.check(&[host.periods()]) {
                     panic!("the leader's periods stopped: {spent}");
                 }
@@ -1589,5 +1614,54 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
         "{receipts:?}"
     );
     assert_eq!(transferred, Ok(()));
+    rig.stop().await;
+}
+
+/// A follower answers a read through its leader (27 §5). The root's reads
+/// were served by its leader alone, so once a root had three voters a node
+/// whose root followed another — the founder restarted under its committed
+/// policy, asking its own root for the membership before it reports `Ready`;
+/// any operator's `membership show` on a non-leader — was refused
+/// `not_leader` (the F24 fleet, 2026-10-02).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_answers_a_read_through_its_leader() {
+    let keys = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        keys.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    rig.hosts[0].campaign().await.unwrap();
+    let leader = rig.leader(0).await;
+    let follower = (leader + 1) % 3;
+    let mut wait = rig.deadline();
+    let mut asked = 930u128;
+    let answered = loop {
+        asked += 1;
+        match rig.hosts[follower]
+            .read(
+                peer(PeerRole::Runtime),
+                RequestId::from_u128(asked),
+                ControlRead::Membership,
+            )
+            .await
+        {
+            Ok(ControlReadResult::Membership(membership)) => break membership,
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => {
+                if let Err(spent) = wait.check(&rig.periods()) {
+                    panic!("the follower never answered: {spent}; last {error:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(answered.node, rig.hosts[follower].progress().node);
+    assert_eq!(answered.leader, rig.hosts[leader].progress().node);
+    assert_ne!(answered.node, answered.leader);
+    assert_eq!(answered.voters.len(), 3, "{answered:?}");
     rig.stop().await;
 }

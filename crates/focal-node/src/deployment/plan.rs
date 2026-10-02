@@ -1,11 +1,14 @@
 //! The plan artifact (`FCLPLAN1`) and its composition from observations.
 use super::{DeploymentError, Guarantee, GuaranteeLevel, hex, survive_name};
-use crate::config::policy::{CommittedPolicy, PolicyIntent};
+use crate::config::{
+    FailureDomain,
+    policy::{CommittedPolicy, PolicyIntent},
+};
 use serde::{Deserialize, Serialize};
 
 /// `FCLPLAN1`: magic, postcard body, then the BLAKE3 hash of both.
 pub const MAGIC: &[u8; 8] = b"FCLPLAN1";
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 /// A plan file never exceeds this; the directory view it is built from is
 /// itself bounded.
 pub const MAX_PLAN_BYTES: usize = 4 * 1024 * 1024;
@@ -52,6 +55,40 @@ pub struct ObservedNode {
     pub region: Option<String>,
     pub zone: Option<String>,
 }
+/// The root group as observed (the audit's F24): its members and what its
+/// voters tolerate of each failure class, measured by the directory as a
+/// session's placement is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedControl {
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub configuration_index: u64,
+    pub tolerates_node: Option<u16>,
+    pub tolerates_zone: Option<u16>,
+    pub tolerates_region: Option<u16>,
+    pub blocked_by: Vec<String>,
+}
+impl ObservedControl {
+    pub fn tolerates(&self, survive: FailureDomain) -> Option<u16> {
+        match survive {
+            FailureDomain::Node => self.tolerates_node,
+            FailureDomain::Zone => self.tolerates_zone,
+            FailureDomain::Region => self.tolerates_region,
+        }
+    }
+    /// The level the root's voters provide in the class asked for: none
+    /// where a voter's domain is unknown or a voter is blocked.
+    pub fn level(&self, survive: FailureDomain) -> GuaranteeLevel {
+        GuaranteeLevel {
+            survive,
+            max_failures: if self.blocked_by.is_empty() {
+                self.tolerates(survive).unwrap_or(0)
+            } else {
+                0
+            },
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observed {
     pub policy_revision: u64,
@@ -59,6 +96,8 @@ pub struct Observed {
     pub policy: PolicyIntent,
     pub sessions: Vec<ObservedSession>,
     pub nodes: Vec<ObservedNode>,
+    /// The root group, where the node observed it.
+    pub control: Option<ObservedControl>,
 }
 /// One ordered change of a plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +106,16 @@ pub enum Change {
     CommitPolicy {
         from_revision: u64,
         to_revision: u64,
+    },
+    /// Seat the root group's voters the requested durability needs (F24):
+    /// each one not voting yet is promoted through the root, one exact
+    /// request each, once the root holds it as a learner and it has caught
+    /// up. Before the sessions: a session's data is only as available as
+    /// the metadata that routes to and places it.
+    PlanRoot {
+        voters: Vec<u64>,
+        /// The root configuration the voters were planned against.
+        expected_configuration_index: u64,
     },
     /// Request the session's placement under the requested durability; the
     /// operation is the exact identity the request denotes.
@@ -98,8 +147,27 @@ pub struct PlanBody {
     pub requested: PolicyIntent,
     pub policy_hash: [u8; 32],
     pub changes: Vec<Change>,
+    /// What the sessions' data survives.
     pub guarantee: Guarantee,
     pub blocked: Vec<Blocked>,
+    /// What the root group survives (F24): the control plane's own promise,
+    /// stated beside the data's and never implied by it.
+    pub control_guarantee: Guarantee,
+    /// Why the root group cannot be seated under the request, when it cannot.
+    pub blocked_control: Option<String>,
+}
+/// The answer a dry-run root plan produced (`cluster placement`'s solver).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlProposal {
+    Planned {
+        voters: Vec<u64>,
+        configuration_index: u64,
+    },
+    /// The root's voters already tolerate the requested failures.
+    Satisfied,
+    Refused(String),
+    /// No directory to ask: the node's own facts were checked instead.
+    Unobserved,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentPlan {
@@ -136,6 +204,7 @@ pub struct Observation {
     pub observed_at: i64,
     pub sessions: Vec<ObservedSession>,
     pub nodes: Vec<ObservedNode>,
+    pub control: Option<ObservedControl>,
 }
 
 fn encode_body(body: &PlanBody) -> Result<Vec<u8>, DeploymentError> {
@@ -156,14 +225,17 @@ pub fn level(intent: &PolicyIntent) -> GuaranteeLevel {
 }
 
 /// Compose a plan: the policy commit first when the request differs from the
-/// committed intent, then one change per observed session in observation
-/// order (`proposals` answers them in the same order). Sessions whose
-/// request was refused are listed as blocked and the guarantee after the
-/// plan stays the guarantee before it.
+/// committed intent, then the root group's voters (`control`), then one
+/// change per observed session in observation order (`proposals` answers
+/// them in the same order). Sessions whose request was refused are listed
+/// as blocked and the guarantee after the plan stays the guarantee before
+/// it; a root that cannot be seated is `blocked_control` and the control
+/// guarantee after stays what it was.
 pub fn compose(
     observation: &Observation,
     requested: &PolicyIntent,
     proposals: &[Proposal],
+    control: &ControlProposal,
     created_ms: u64,
 ) -> Result<DeploymentPlan, DeploymentError> {
     if observation.sessions.len() > MAX_SESSIONS || proposals.len() != observation.sessions.len() {
@@ -171,7 +243,7 @@ pub fn compose(
     }
     let mut changes = Vec::new();
     changes
-        .try_reserve_exact(observation.sessions.len().saturating_add(1))
+        .try_reserve_exact(observation.sessions.len().saturating_add(2))
         .map_err(|_| DeploymentError::Capacity)?;
     let mut blocked = Vec::new();
     let committed = &observation.committed;
@@ -183,6 +255,37 @@ pub fn compose(
         });
     }
     let target = level(requested);
+    // The control plane: what the root's voters tolerate now in the class
+    // asked for (the committed level where no root was observed, as for
+    // the sessions), and what they will once seated.
+    let control_before = observation.control.as_ref().map_or_else(
+        || level(&committed.intent),
+        |root| root.level(target.survive),
+    );
+    let mut blocked_control = None;
+    match control {
+        ControlProposal::Planned {
+            voters,
+            configuration_index,
+        } => {
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(voters.len())
+                .map_err(|_| DeploymentError::Capacity)?;
+            copied.extend_from_slice(voters);
+            changes.push(Change::PlanRoot {
+                voters: copied,
+                expected_configuration_index: *configuration_index,
+            });
+        }
+        ControlProposal::Satisfied | ControlProposal::Unobserved => {}
+        ControlProposal::Refused(reason) => blocked_control = Some(reason.clone()),
+    }
+    let control_after = if blocked_control.is_some() {
+        control_before
+    } else {
+        target
+    };
     let mut before = None;
     for (session, proposal) in observation.sessions.iter().zip(proposals) {
         let achieved = session.achieved.unwrap_or(GuaranteeLevel::NONE);
@@ -232,6 +335,7 @@ pub fn compose(
             policy: committed.intent.clone(),
             sessions: observation.sessions.clone(),
             nodes: observation.nodes.clone(),
+            control: observation.control.clone(),
         },
         requested: requested.clone(),
         policy_hash,
@@ -242,6 +346,12 @@ pub fn compose(
             after,
         },
         blocked,
+        control_guarantee: Guarantee {
+            before: control_before,
+            during: control_before,
+            after: control_after,
+        },
+        blocked_control,
     };
     Ok(DeploymentPlan {
         schema: SCHEMA,
@@ -306,7 +416,7 @@ impl DeploymentPlan {
                 "plan identity does not match its body",
             ));
         }
-        if plan.body.changes.len() > MAX_SESSIONS.saturating_add(1)
+        if plan.body.changes.len() > MAX_SESSIONS.saturating_add(2)
             || plan.body.observed.sessions.len() > MAX_SESSIONS
         {
             return Err(DeploymentError::Capacity);
@@ -357,6 +467,7 @@ impl DeploymentPlan {
                     })
                     .collect(),
                 nodes: self.body.observed.nodes.clone(),
+                control: self.body.observed.control.clone(),
             },
             requested: self.body.requested.clone(),
             policy_hash: hex(&self.body.policy_hash),
@@ -366,6 +477,12 @@ impl DeploymentPlan {
                 during: LevelView::of(self.body.guarantee.during),
                 after: LevelView::of(self.body.guarantee.after),
             },
+            control_guarantee: GuaranteeView {
+                before: LevelView::of(self.body.control_guarantee.before),
+                during: LevelView::of(self.body.control_guarantee.during),
+                after: LevelView::of(self.body.control_guarantee.after),
+            },
+            blocked_control: self.body.blocked_control.clone(),
             blocked: self
                 .body
                 .blocked
@@ -394,6 +511,8 @@ pub struct PlanView {
     pub changes: Vec<ChangeView>,
     pub guarantee: GuaranteeView,
     pub blocked: Vec<BlockedView>,
+    pub control_guarantee: GuaranteeView,
+    pub blocked_control: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeploymentView {
@@ -407,6 +526,7 @@ pub struct ObservedView {
     pub policy: PolicyIntent,
     pub sessions: Vec<ObservedSessionView>,
     pub nodes: Vec<ObservedNode>,
+    pub control: Option<ObservedControl>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservedSessionView {
@@ -447,6 +567,10 @@ pub enum ChangeView {
         from_revision: u64,
         to_revision: u64,
     },
+    PlanRoot {
+        voters: Vec<u64>,
+        expected_configuration_index: u64,
+    },
     PlanSession {
         tenant: String,
         session: String,
@@ -473,6 +597,13 @@ impl ChangeView {
             } => Self::CommitPolicy {
                 from_revision: *from_revision,
                 to_revision: *to_revision,
+            },
+            Change::PlanRoot {
+                voters,
+                expected_configuration_index,
+            } => Self::PlanRoot {
+                voters: voters.clone(),
+                expected_configuration_index: *expected_configuration_index,
             },
             Change::PlanSession {
                 tenant,

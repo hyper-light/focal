@@ -303,7 +303,12 @@ mapping, including storage and network dependencies shared by nominally separate
 Focal validates the promised zone-failure combinations for ordering voters, artifact
 custody, metadata routes, archive dependencies, and surviving RAM/recovery capacity.
 The planner names any missing zone or dependent storage placement. It does not claim
-zone survival because three pods happened to be scheduled on three machines.
+zone survival because three pods happened to be scheduled on three machines. The root
+group is seated across the zones by the same plan (`plan_root` before the sessions'
+changes) and its promise is stated apart from the data's (`control_guarantee`;
+`cluster placement` → `control`): what the root, the directory partitions and the
+issuer each survive, measured by one rule ([24 §15](24-placement-execution-and-fleet-control.md); the
+audit's F24). What the founder alone still hosts is reported as surviving nothing.
 
 The Kubernetes package derives required scheduling/anti-colocation constraints from
 the chosen policy, and unsatisfiable placement stays pending. VM and bare-metal members
@@ -437,11 +442,16 @@ policy fields take the committed values). Each session is asked as a dry run
 (`cluster sessions plan --dry-run`): the placement agent proposes from the committed
 directory and journals nothing, so planning creates no file, ticket or directory record.
 The plan's changes are ordered: the policy commit (revision *n* → *n*+1) when the request
-differs, then per session either the placement request it denotes (the exact operation
+differs, then the root group's voters the durability needs (`plan_root`, the voters and
+the root configuration they were planned against; absent when the root already
+tolerates it; 2026-10-02, the audit's F24), then per session either the placement
+request it denotes (the exact operation
 identity, the voters the planner picked, the epochs it expects) or no change when the
 active placement already provides the durability. A session the planner refuses is
 listed as blocked and the guarantee after the plan stays the guarantee before it (the
 weakest achieved level across the sessions, or the committed level without sessions);
+a root that cannot be seated is `blocked_control`, and the plan's `control_guarantee`
+states what the root tolerates before and after, apart from the data's;
 the guarantee during the plan is the guarantee before it, because the old contract holds
 until the new placement is verified. The artifact is `FCLPLAN1` (magic, postcard body,
 BLAKE3 trailer) whose identity is derived from the facts alone, so the same observation
@@ -455,7 +465,10 @@ beside it) through `Prepared → Committed → Verified → Complete`: the polic
 as the next revision and read back; the placement request is sent (a reply naming
 another operation marks the plan stale), then observed under way (`pending` names the
 operation) and complete (no plan pending and the achieved guarantee covers the request);
-`--wait` bounds how long apply watches. A repeated apply resumes the journal and repeats
+`--wait` bounds how long apply watches; a `plan_root` step promotes each planned voter
+through the root once it is held as a learner, one exact request each, asked again as
+the root moves while a learner is behind or a request is still deciding, and is complete
+when every planned voter votes. A repeated apply resumes the journal and repeats
 nothing; `deployment status` re-checks journaled plans against the directory. A
 committed policy stronger than one host provides no longer refuses the founder's
 restart: the local solve pins only the first policy, the directory satisfies committed

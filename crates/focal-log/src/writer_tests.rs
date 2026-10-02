@@ -968,12 +968,27 @@ fn a_batchs_caller_is_told_once_what_the_batch_held_is_given_back() {
         )
         .unwrap();
     assert!(matches!(refused.wait_blocking(), Err(LogError::Capacity)));
+    // The look is taken on the writer's thread after the answer is sent
+    // (the wake follows the answer, so an owner woken finds it there): the
+    // caller waits for it before it asks again, or the look would see what
+    // the caller asked next.
+    let looked = |seen: &Seen, times: usize| {
+        for _ in 0..10_000 {
+            if seen.lock().unwrap().len() >= times {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the writer never looked: {:?}", seen.lock().unwrap());
+    };
+    looked(&seen, 1);
     // An append the volume takes.
     disk.observe(1 << 20);
     let mut taken = a
         .append_async_notified(&[record(1, 2)], BudgetLane::Ordinary, Some(look(&seen)))
         .unwrap();
     taken.wait_blocking().unwrap();
+    looked(&seen, 2);
     // The receipt a caller holds is its own; nothing else waited.
     let receipt = waiting(&budget) - at_rest;
     assert!(receipt > 0);

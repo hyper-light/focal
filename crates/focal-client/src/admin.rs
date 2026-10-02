@@ -51,6 +51,10 @@ pub struct AdminReadiness {
     pub catching_up: bool,
     pub authoritative: bool,
     pub policy_satisfied: bool,
+    /// The root group's voters tolerate the failures the committed policy
+    /// promises (the audit's F24); part of `policy_satisfied`.
+    #[serde(default)]
+    pub control_satisfied: bool,
     pub root: AdminRootProgress,
     pub sessions: Vec<AdminSessionReadiness>,
     /// Sessions beyond the report bound were left out (and count as not
@@ -64,6 +68,17 @@ pub struct AdminRootProgress {
     pub term: u64,
     pub applied_index: u64,
     pub stopped: bool,
+    /// Where each other member's log stands as this node, when it leads,
+    /// knows it: what a promotion waits on (the audit's F24).
+    #[serde(default)]
+    pub peers: Vec<AdminPeerProgress>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPeerProgress {
+    pub node: u64,
+    pub matched: u64,
+    pub recent_active: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -849,6 +864,50 @@ pub struct AdminPlacement {
     /// When the agent last observed these partitions (unix seconds).
     pub observed_at: i64,
     pub partitions: Vec<AdminPartition>,
+    /// The control plane's own survival (24 §15, the audit's F24): the root
+    /// group, every directory partition's group and the issuer, each
+    /// measured against the live nodes by the rule the sessions are. Absent
+    /// when the node could not observe its root.
+    #[serde(default)]
+    pub control: Option<AdminControlPlane>,
+}
+/// What the control plane survives: a session's data is only as available
+/// as the metadata that routes to it, places it and admits its members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminControlPlane {
+    pub root: AdminControlGroup,
+    /// The directory partitions' groups, in the root's delegation order.
+    pub partitions: Vec<AdminControlGroup>,
+    pub issuer: AdminIssuer,
+}
+/// One control group: its voters, what they tolerate of each failure class
+/// as a quorum, and what stands in the way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminControlGroup {
+    /// `root` or `partition`.
+    pub kind: String,
+    pub group: String,
+    /// The partition a partition group serves.
+    pub partition: Option<String>,
+    pub leader: u64,
+    pub configuration_index: u64,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    /// The failures of nodes, zones and regions the voters tolerate; absent
+    /// for a class a voter's domain is unknown in.
+    pub tolerates_node: Option<u16>,
+    pub tolerates_zone: Option<u16>,
+    pub tolerates_region: Option<u16>,
+    pub blocked_by: Vec<String>,
+}
+/// Who can sign credentials: the issuer's key is held by the nodes listed,
+/// and the signing service tolerates the loss of all but one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminIssuer {
+    pub holders: Vec<u64>,
+    pub tolerates_node: u16,
+    /// What limits the issuer's survival, in words an operator acts on.
+    pub note: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminPartition {

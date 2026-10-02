@@ -449,7 +449,30 @@ impl LocalNetworkAdmin {
                     && !session.import_pending
                     && !session.custody_pending
             });
+        // The control plane holds the committed policy too (the audit's
+        // F24): the root's voters tolerate the failures the node's own
+        // policy promises, by the rule the sessions are measured by. A
+        // node without a committed policy, or one whose root could not be
+        // observed, does not satisfy it.
+        let committed = crate::config::policy::read_committed(&self.directory)
+            .ok()
+            .flatten();
+        let control_satisfied = placement
+            .as_ref()
+            .and_then(|reply| reply.placement.control.as_ref())
+            .zip(committed.as_ref())
+            .is_some_and(|(control, policy)| {
+                let tolerates = match policy.intent.durability.survive {
+                    crate::config::FailureDomain::Node => control.root.tolerates_node,
+                    crate::config::FailureDomain::Zone => control.root.tolerates_zone,
+                    crate::config::FailureDomain::Region => control.root.tolerates_region,
+                };
+                control.root.blocked_by.is_empty()
+                    && tolerates
+                        .is_some_and(|tolerates| tolerates >= policy.intent.durability.max_failures)
+            });
         let policy_satisfied = !truncated
+            && control_satisfied
             && sessions.iter().all(|session| {
                 session.blocked_by.is_empty()
                     && match (session.desired_max_failures, session.achieved_max_failures) {
@@ -457,6 +480,18 @@ impl LocalNetworkAdmin {
                         _ => false,
                     }
             });
+        let mut peers = Vec::new();
+        if peers.try_reserve_exact(root.peers.len()).is_ok() {
+            peers.extend(
+                root.peers
+                    .iter()
+                    .map(|peer| focal_client::admin::AdminPeerProgress {
+                        node: peer.node,
+                        matched: peer.matched,
+                        recent_active: peer.recent_active,
+                    }),
+            );
+        }
         Ok(AdminReadiness {
             node,
             alive: true,
@@ -464,11 +499,13 @@ impl LocalNetworkAdmin {
             catching_up: following && !authoritative,
             authoritative,
             policy_satisfied,
+            control_satisfied,
             root: AdminRootProgress {
                 leader: root.leader,
                 term: root.term,
                 applied_index: root.applied_index,
                 stopped: root.stopped,
+                peers,
             },
             sessions,
             truncated,

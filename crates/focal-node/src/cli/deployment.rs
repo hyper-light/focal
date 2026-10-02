@@ -386,12 +386,35 @@ fn plan(
         .map_err(DeploymentError::Unsatisfiable)?;
     }
     let plan = runtime.block_on(async {
+        use deployment::plan::ControlProposal;
         let observation = deployment::observe::observe(&admin, network).await?;
         let mut proposals = Vec::new();
         proposals
             .try_reserve_exact(observation.sessions.len())
             .map_err(|_| DeploymentError::Capacity)?;
         let survive = deployment::survive_code(requested.durability.survive);
+        // The root group first (F24): the voters the durability needs,
+        // proposed by the directory's solver and journaled nowhere.
+        let control = if network {
+            match admin
+                .plan_control_reply(survive, requested.durability.max_failures)
+                .await
+            {
+                Ok(reply) if reply.state == 2 => ControlProposal::Satisfied,
+                Ok(reply) => ControlProposal::Planned {
+                    voters: reply.voters,
+                    configuration_index: reply.configuration_index,
+                },
+                Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {
+                    ControlProposal::Refused(
+                        "no set of enrolled, live nodes seats the root group under the requested durability".into(),
+                    )
+                }
+                Err(error) => return Err(DeploymentError::Admin(error)),
+            }
+        } else {
+            ControlProposal::Unobserved
+        };
         for session in &observation.sessions {
             // Dry runs: the agent proposes and journals nothing.
             let proposal = match admin
@@ -424,7 +447,13 @@ fn plan(
             };
             proposals.push(proposal);
         }
-        deployment::plan::compose(&observation, &requested, &proposals, deployment::now_ms()?)
+        deployment::plan::compose(
+            &observation,
+            &requested,
+            &proposals,
+            &control,
+            deployment::now_ms()?,
+        )
     })?;
     if let Some(output) = output {
         write_new(output, &plan.encode()?)?;

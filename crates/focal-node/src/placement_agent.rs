@@ -643,6 +643,11 @@ impl PlacementAgent {
                                 } = *job;
                                 self.queue_plan_request(ledger, durability, dry_run, reply);
                             }
+                            Some(AgentJob::PlanControl(job)) => {
+                                let crate::placement_control::PlanControlJob { durability, reply } = *job;
+                                let result = self.plan_control(handles, durability).await;
+                                let _ = reply.send(result);
+                            }
                             Some(AgentJob::MoveRange(job)) => {
                                 if self.move_requests.len() >= MAX_MOVE_REQUESTS
                                     || self.move_requests.try_reserve(1).is_err()
@@ -1687,6 +1692,96 @@ impl PlacementAgent {
                 self.plan_requests.insert(ledger, (durability, waiters));
             }
         }
+    }
+    /// The root group's voters under `durability` (the audit's F24): the
+    /// voters there are, where they already tolerate the failures asked for
+    /// as a quorum (`voters_tolerance`, the rule a session's placement is
+    /// measured by); else what the directory's solver seats among the live,
+    /// eligible nodes, keeping the voters there are (`propose_placement_
+    /// keeping`), under the founder's session's residency and home regions
+    /// — the metadata bounded by the same geography as the data. Answered
+    /// from the partition as last observed and the root as observed now;
+    /// nothing is journaled, since promotion is the operator's own exact
+    /// request through the root, and the plan is read-only (doc 08 §9).
+    async fn plan_control(
+        &self,
+        handles: &NetworkHandles,
+        durability: focal_directory::DurabilityIntent,
+    ) -> Result<crate::placement_control::PlannedControl, AgentError> {
+        use crate::placement_control::{PlanState, PlannedControl};
+        if durability.max_failures > u16::from(u8::MAX) {
+            return Err(AgentError::Registration(
+                SessionRegistrationError::PolicyUnsatisfied,
+            ));
+        }
+        // Not observed yet: the request waits for a pass, like a plan.
+        let Some((_, directory)) = self.last_observed.first() else {
+            return Err(AgentError::Behind);
+        };
+        let observation = handles.control.observe_root().await?;
+        let configuration = observation.configuration();
+        let current = &configuration.configuration.voters;
+        let tolerance = focal_directory::voters_tolerance(
+            current.iter().copied(),
+            durability.survive,
+            &directory.nodes,
+        )
+        .map_err(|_| AgentError::Capacity)?;
+        if tolerance.blocked_by.is_empty()
+            && tolerance
+                .achieved
+                .is_some_and(|achieved| achieved >= durability.max_failures)
+        {
+            return Ok(PlannedControl {
+                voters: current.clone(),
+                configuration_index: configuration.configuration_index,
+                state: PlanState::Satisfied,
+            });
+        }
+        let base = directory
+            .sessions
+            .get(&self.identity.ledger)
+            .map(|descriptor| descriptor.active.policy.clone());
+        let policy = focal_directory::PlacementPolicy {
+            durability,
+            residency: base
+                .as_ref()
+                .map(|policy| policy.residency.clone())
+                .unwrap_or_default(),
+            home_regions: base
+                .as_ref()
+                .map(|policy| policy.home_regions.clone())
+                .unwrap_or_default(),
+            required_memory: 0,
+        };
+        let incumbents: BTreeMap<u64, u64> = current
+            .iter()
+            .filter_map(|voter| {
+                directory
+                    .nodes
+                    .get(voter)
+                    .map(|node| (*voter, node.enrollment.generation))
+            })
+            .collect();
+        let config = self.partition_config();
+        let proposal = focal_directory::propose_placement_keeping(
+            &directory.nodes,
+            &policy,
+            &incumbents,
+            config.max_members,
+            config.min_disk_available,
+        )
+        .map_err(|_| AgentError::Registration(SessionRegistrationError::PolicyUnsatisfied))?;
+        let mut voters = Vec::new();
+        voters
+            .try_reserve_exact(proposal.spec.placement.voters.len())
+            .map_err(|_| AgentError::Capacity)?;
+        voters.extend(proposal.spec.placement.voters.keys().copied());
+        Ok(PlannedControl {
+            voters,
+            configuration_index: configuration.configuration_index,
+            state: PlanState::Planned,
+        })
     }
     /// The identity of an operator's plan: exact for one session, one
     /// authority record and one requested durability, so a retry finds the

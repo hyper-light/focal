@@ -2262,7 +2262,10 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
     // period and what the path takes to carry the first of an answer
     // (`Carriage`); on a path whose round trip the megabyte stretched,
     // that can outlast the peer's own time for its handler (one second
-    // here), and then the peer says it gave the request up.
+    // here), and then the peer says it gave the request up: `Unavailable`
+    // when it had not begun, `OutcomeUnknown` when its handler was given
+    // up on (a cancel is a mutation; `dispatch_accounted`). Which of the
+    // two is the peer's scheduling (the Windows run saw the second).
     let began = std::time::Instant::now();
     let unanswered = remote
         .request_within(
@@ -2275,7 +2278,7 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
             &unanswered,
             Err(WireError::Timeout)
                 | Ok(ResponseEnvelope {
-                    result: Response::Error(AccessError::Unavailable),
+                    result: Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown),
                     ..
                 })
         ),

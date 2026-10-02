@@ -1,6 +1,8 @@
 //! What planning and applying observe: the committed policy and the
 //! directory's sessions as the placement agent reports them.
-use super::plan::{DeploymentIdentity, Observation, ObservedNode, ObservedSession, SessionEpochs};
+use super::plan::{
+    DeploymentIdentity, Observation, ObservedControl, ObservedNode, ObservedSession, SessionEpochs,
+};
 use super::{DeploymentError, GuaranteeLevel, parse_survive};
 use crate::{cluster_admin::ClusterAdmin, config::policy::read_committed};
 use focal_client::admin::AdminPlacement;
@@ -27,6 +29,7 @@ pub async fn observe(admin: &ClusterAdmin, network: bool) -> Result<Observation,
             observed_at: 0,
             sessions: Vec::new(),
             nodes: Vec::new(),
+            control: None,
         });
     }
     let view = admin.placement_view().await?;
@@ -34,12 +37,22 @@ pub async fn observe(admin: &ClusterAdmin, network: bool) -> Result<Observation,
     if !nodes.iter().any(|node| node.node == identity.node) {
         return Err(DeploymentError::NotObserved);
     }
+    let control = view.control.as_ref().map(|control| ObservedControl {
+        voters: control.root.voters.clone(),
+        learners: control.root.learners.clone(),
+        configuration_index: control.root.configuration_index,
+        tolerates_node: control.root.tolerates_node,
+        tolerates_zone: control.root.tolerates_zone,
+        tolerates_region: control.root.tolerates_region,
+        blocked_by: control.root.blocked_by.clone(),
+    });
     Ok(Observation {
         deployment,
         committed,
         observed_at: view.observed_at,
         sessions,
         nodes,
+        control,
     })
 }
 fn id(text: &str) -> Result<[u8; 16], DeploymentError> {

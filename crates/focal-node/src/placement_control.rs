@@ -210,6 +210,9 @@ pub enum AgentJob {
     CreateSession(Box<CreateSessionJob>),
     /// Plan a session's placement under a requested durability.
     PlanSession(Box<PlanSessionJob>),
+    /// Plan the root group's voters under a requested durability (the
+    /// audit's F24).
+    PlanControl(Box<PlanControlJob>),
     /// Move one member of a session's range group to a node (25 §6).
     MoveRange(Box<MoveRangeJob>),
     /// Restore a session from a verified backup onto this node (26 §6).
@@ -238,6 +241,23 @@ pub struct PlanSessionJob {
     /// Propose and report without journaling a plan (doc 08 §9).
     pub dry_run: bool,
     pub reply: oneshot::Sender<Result<PlannedSession, crate::placement_agent::AgentError>>,
+}
+/// One operator request for the root group's voters under a durability,
+/// answered from the partition as last observed and the root as observed
+/// now; nothing is journaled, promotion being the operator's own exact
+/// request through the root (F24).
+pub struct PlanControlJob {
+    pub durability: focal_directory::DurabilityIntent,
+    pub reply: oneshot::Sender<Result<PlannedControl, crate::placement_agent::AgentError>>,
+}
+/// The root voters a durability needs, at the root configuration they were
+/// planned against: `Satisfied` with the voters there are when those already
+/// tolerate the failures asked for, `Planned` with the solver's otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedControl {
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    pub state: PlanState,
 }
 /// How a plan request was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +402,24 @@ impl PlacementHandle {
             ledger,
             durability,
             dry_run,
+            reply,
+        })))
+        .map_err(|error| match error {
+            PlacementProofError::Capacity => crate::placement_agent::AgentError::Capacity,
+            _ => crate::placement_agent::AgentError::Stopped,
+        })?;
+        receive
+            .await
+            .map_err(|_| crate::placement_agent::AgentError::Stopped)?
+    }
+    /// The root group's voters under `durability` (F24).
+    pub async fn plan_control(
+        &self,
+        durability: focal_directory::DurabilityIntent,
+    ) -> Result<PlannedControl, crate::placement_agent::AgentError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::PlanControl(Box::new(PlanControlJob {
+            durability,
             reply,
         })))
         .map_err(|error| match error {

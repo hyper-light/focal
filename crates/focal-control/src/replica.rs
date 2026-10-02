@@ -618,8 +618,30 @@ impl ControlReplica {
     pub fn reads_waiting(&self) -> usize {
         self.node.reads_waiting()
     }
+    /// Ask the group's leader for the index a read is served at: a leader
+    /// confirms it itself, once ready; a follower asks through the leader
+    /// it knows (the core forwards the read and the answer names the
+    /// leader's commit; 27 §5, follower reads) and serves the read once it
+    /// has applied that index. Before, a read was served by the leader
+    /// alone, so every control read on a node whose root followed another
+    /// voter — the founder's own startup asking for the membership, an
+    /// operator's `membership show` — was refused `not_leader` (2026-10-02,
+    /// the first root with three voters).
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ControlError> {
-        self.check_ready()?;
+        self.check()?;
+        let status = self.node.status();
+        if status.role == StateRole::Leader {
+            self.check_ready()?;
+        } else {
+            if status.leader_id == 0 {
+                return Err(ControlError::Consensus(
+                    focal_consensus::ConsensusError::NotLeader { leader: 0 },
+                ));
+            }
+            if !self.drained {
+                return Err(ControlError::NotReady);
+            }
+        }
         self.node.read_index(context)?;
         Ok(())
     }

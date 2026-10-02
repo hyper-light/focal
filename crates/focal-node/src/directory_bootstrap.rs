@@ -441,6 +441,14 @@ impl BootstrappedDirectory {
 /// Invoke in the root owner immediately after a fresh ReadIndex barrier. This
 /// synchronous validation reads one already-published owner prefix; it cannot
 /// turn a previously decoded snapshot or a Node certificate into authority.
+/// The root replica this node runs mints it, leading or following: the
+/// barrier is the leader's commit, asked through it where this replica
+/// follows (27 §5), and the facts behind it — the delegation, the group's
+/// grant, the founder's enrollment — are committed state, the same on every
+/// member that applied it. Before, the permit demanded that this replica
+/// lead, so a founder whose root followed another voter after a restart
+/// could not reopen the partition it hosts, never reported `Ready`, and
+/// served no placement (the first root with three voters, 2026-10-02).
 pub(crate) fn authorize_first_directory(
     owner: &ControlReplica,
     plan: FirstDirectoryPlan,
@@ -461,7 +469,6 @@ pub(crate) fn authorize_first_directory(
     if owner.identity().scope != ControlScope::Root
         || owner.identity().cluster.0 != plan.cluster
         || owner.identity().group != crate::network_state::root_group(plan.cluster)
-        || status.role != StateRole::Leader
         || status.applied_index != owner.applied_index()
         || status.committed_index != owner.applied_index()
         || owner.applied_index() == 0

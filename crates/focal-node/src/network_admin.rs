@@ -89,6 +89,14 @@ pub enum AdminCommand {
         /// Propose and report without journaling a plan.
         dry_run: bool,
     },
+    /// Plan the root group's voters under a requested durability
+    /// (`survive`: 0 node, 1 zone, 2 region; the audit's F24): what the
+    /// directory's solver would seat, reported and never journaled — the
+    /// deployment's apply promotes them, one exact request each.
+    PlanControl {
+        survive: u8,
+        max_failures: u16,
+    },
     /// Move one member of a session's range group to a node (25 §6).
     MoveRange {
         tenant: [u8; 16],
@@ -202,6 +210,18 @@ pub struct SessionPlannedReply {
     pub dry_run: bool,
 }
 pub const SESSION_PLANNED_REPLY_SCHEMA: u16 = 2;
+/// The reply to [`AdminCommand::PlanControl`]: the root voters the requested
+/// durability needs, at the configuration they were planned against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlannedReply {
+    pub schema: u16,
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    /// `planned` (0) or `satisfied` (2): the current voters already tolerate
+    /// the requested failures.
+    pub state: u8,
+}
+pub const CONTROL_PLANNED_REPLY_SCHEMA: u16 = 1;
 /// The tenants the cluster serves: the founder's own and every admitted one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantsReply {
@@ -243,7 +263,7 @@ pub struct PlacementReply {
     pub placement: focal_client::admin::AdminPlacement,
     pub actions: Vec<focal_client::admin::AdminPlannedAction>,
 }
-pub const PLACEMENT_REPLY_SCHEMA: u16 = 1;
+pub const PLACEMENT_REPLY_SCHEMA: u16 = 2;
 /// The view fits one admin frame: sessions and nodes beyond these bounds are
 /// reported as truncated.
 const MAX_REPORT_SESSIONS: usize = 48;
@@ -267,6 +287,20 @@ pub(crate) struct TopologyLabels {
     /// The nodes whose credential the enrollment registry still authorizes;
     /// `None` when the registry could not be read.
     pub credentialed: Option<std::collections::BTreeSet<u64>>,
+    /// The control groups as the root observation names them (F24).
+    pub control: Option<ControlFacts>,
+}
+/// The root's configuration and the groups its authority grants, from one
+/// local observation of the root replica.
+#[derive(Debug, Clone)]
+pub(crate) struct ControlFacts {
+    pub root_group: [u8; 16],
+    pub leader: u64,
+    pub configuration: focal_control::ControlConfiguration,
+    pub authority: Option<focal_directory::AuthorityCheckpoint>,
+    /// The nodes holding the issuer's signing key: the founder, until the
+    /// issuer is handed on (F13 stage 3).
+    pub issuer_holders: Vec<u64>,
 }
 /// What a node's committed contact says about it (24 §22, §24).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -304,6 +338,13 @@ pub(crate) fn placement_reply(
     };
     let mut partitions = Vec::new();
     let mut actions = Vec::new();
+    // The control plane measured by the first partition's registry: the
+    // nodes every partition knows are the same nodes.
+    let control = labels
+        .control
+        .as_ref()
+        .zip(report.partitions.first())
+        .map(|(facts, (_, checkpoint))| control_plane(facts, &checkpoint.nodes));
     for (delegation, checkpoint) in report.partitions {
         let (split_at, merge_at) = crate::placement_agent::split::thresholds(checkpoint.cluster.0);
         let partition = hex(&delegation.partition.0);
@@ -536,8 +577,106 @@ pub(crate) fn placement_reply(
         placement: AdminPlacement {
             observed_at: report.observed_at,
             partitions,
+            control,
         },
         actions,
+    }
+}
+/// One control group for the operator: its voters and what they tolerate
+/// of each failure class as a quorum, by the rule a session's placement is
+/// measured by (`voters_tolerance`, the audit's F24).
+#[allow(clippy::too_many_arguments)]
+fn control_group(
+    kind: &str,
+    group: [u8; 16],
+    partition: Option<String>,
+    leader: u64,
+    configuration_index: u64,
+    voters: Vec<u64>,
+    learners: Vec<u64>,
+    nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+) -> focal_client::admin::AdminControlGroup {
+    let measure = |class: focal_directory::FailureClass| {
+        focal_directory::voters_tolerance(voters.iter().copied(), class, nodes).ok()
+    };
+    let node = measure(focal_directory::FailureClass::Node);
+    let zone = measure(focal_directory::FailureClass::Zone);
+    let region = measure(focal_directory::FailureClass::Region);
+    focal_client::admin::AdminControlGroup {
+        kind: kind.to_owned(),
+        group: hex(&group),
+        partition,
+        leader,
+        configuration_index,
+        tolerates_node: node.as_ref().and_then(|tolerance| tolerance.achieved),
+        tolerates_zone: zone.as_ref().and_then(|tolerance| tolerance.achieved),
+        tolerates_region: region.as_ref().and_then(|tolerance| tolerance.achieved),
+        // What blocks a voter blocks it in every class; the node class
+        // names them without the unknown domains the broader classes add.
+        blocked_by: node
+            .as_ref()
+            .map(|tolerance| {
+                tolerance
+                    .blocked_by
+                    .iter()
+                    .map(|blocker| match blocker.node {
+                        Some(node) => format!("{:?} on node {node}", blocker.reason),
+                        None => format!("{:?}", blocker.reason),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        voters,
+        learners,
+    }
+}
+/// The control plane's survival (24 §15, F24): the root group from its
+/// configuration, every partition group from the root's authority grants,
+/// and the issuer from where its key is held.
+fn control_plane(
+    facts: &ControlFacts,
+    nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+) -> focal_client::admin::AdminControlPlane {
+    let root = control_group(
+        "root",
+        facts.root_group,
+        None,
+        facts.leader,
+        facts.configuration.configuration_index,
+        facts.configuration.configuration.voters.clone(),
+        facts.configuration.configuration.learners.clone(),
+        nodes,
+    );
+    let partitions = facts
+        .authority
+        .iter()
+        .flat_map(|authority| authority.groups.values())
+        .filter_map(|grant| match &grant.scope {
+            focal_directory::GroupScope::Partition { partition, .. } => Some(control_group(
+                "partition",
+                grant.group.0,
+                Some(hex(&partition.0)),
+                // The root's observation names no partition leader.
+                0,
+                grant.membership_epoch,
+                grant.voters.keys().copied().collect(),
+                grant.learners.keys().copied().collect(),
+                nodes,
+            )),
+            focal_directory::GroupScope::Session(_) => None,
+        })
+        .collect();
+    focal_client::admin::AdminControlPlane {
+        root,
+        partitions,
+        issuer: focal_client::admin::AdminIssuer {
+            tolerates_node: u16::try_from(facts.issuer_holders.len().saturating_sub(1))
+                .unwrap_or(u16::MAX),
+            holders: facts.issuer_holders.clone(),
+            note: "the issuer's signing key is held by the founder alone: enrollment, \
+                   credential renewal and rotation wait for it (24 §11)"
+                .into(),
+        },
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -658,6 +797,15 @@ impl AdminCommand {
             } => {
                 if *tenant == [0; 16] || *session == [0; 16] || *survive > 2 || *max_failures > 255
                 {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::PlanControl {
+                survive,
+                max_failures,
+            } => {
+                if *survive > 2 || *max_failures > 255 {
                     return Err(AccessError::InvalidRequest);
                 }
                 Ok(())
@@ -888,6 +1036,8 @@ pub struct LocalNetworkAdmin {
     directory: PathBuf,
     identity: NodeIdentity,
     root: ControlIdentity,
+    /// The founder's node: the issuer's key is held there (24 §11).
+    founder: u64,
     advertise: SocketAddr,
     /// The name this node advertises (24 §24), when it has one.
     endpoint: Option<String>,
@@ -929,6 +1079,7 @@ impl LocalNetworkAdmin {
             directory: directory.root().to_path_buf(),
             identity: directory.identity().clone(),
             root,
+            founder: state.genesis.founder.node,
             advertise,
             endpoint: state.endpoint.clone(),
             listen: state.listen,
@@ -968,6 +1119,7 @@ impl LocalNetworkAdmin {
             directory: directory.root().to_path_buf(),
             identity: directory.identity().clone(),
             root,
+            founder: state.genesis.founder.node,
             advertise,
             endpoint: state.endpoint.clone(),
             listen: state.listen,
@@ -1213,6 +1365,45 @@ impl LocalNetworkAdmin {
         postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
         Ok(bytes)
     }
+    /// The root group's voters a durability needs (F24; `survive` 0 node,
+    /// 1 zone, 2 region).
+    async fn plan_control(&self, survive: u8, max_failures: u16) -> Result<Vec<u8>, AccessError> {
+        let durability = focal_directory::DurabilityIntent {
+            survive: match survive {
+                0 => focal_directory::FailureClass::Node,
+                1 => focal_directory::FailureClass::Zone,
+                2 => focal_directory::FailureClass::Region,
+                _ => return Err(AccessError::InvalidRequest),
+            },
+            max_failures,
+        };
+        let planned = self
+            .placement
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .plan_control(durability)
+            .await
+            .map_err(|error| {
+                use crate::placement_agent::AgentError;
+                match error {
+                    AgentError::Capacity => AccessError::Capacity,
+                    AgentError::Registration(_) | AgentError::Identity => {
+                        AccessError::InvalidRequest
+                    }
+                    _ => AccessError::Unavailable,
+                }
+            })?;
+        encode_reply(&ControlPlannedReply {
+            schema: CONTROL_PLANNED_REPLY_SCHEMA,
+            voters: planned.voters,
+            configuration_index: planned.configuration_index,
+            state: match planned.state {
+                crate::placement_control::PlanState::Planned => 0,
+                crate::placement_control::PlanState::Pending => 1,
+                crate::placement_control::PlanState::Satisfied => 2,
+            },
+        })
+    }
     /// The controller's clock, and for how long a death of each session of
     /// `report` stands before its seat moves (27 §5): one election window
     /// of the session's group where this node hosts a copy of it, and of
@@ -1288,6 +1479,13 @@ impl LocalNetworkAdmin {
                     .collect()
             });
         }
+        labels.control = Some(ControlFacts {
+            root_group: self.root.group,
+            leader: control.progress().leader,
+            configuration: observation.configuration().clone(),
+            authority: observation.authority().cloned(),
+            issuer_holders: vec![self.founder],
+        });
         for contact in &observation.contacts().contacts.records {
             labels.contacts.insert(
                 contact.node,
@@ -1745,6 +1943,13 @@ impl LocalNetworkAdmin {
                 .plan_session(tenant, session, survive, max_failures, dry_run)
                 .await;
         }
+        if let AdminCommand::PlanControl {
+            survive,
+            max_failures,
+        } = command
+        {
+            return self.plan_control(survive, max_failures).await;
+        }
         if let AdminCommand::MoveRange {
             tenant,
             session,
@@ -1908,6 +2113,7 @@ impl LocalNetworkAdmin {
             | AdminCommand::Tenants
             | AdminCommand::CreateSession { .. }
             | AdminCommand::PlanSession { .. }
+            | AdminCommand::PlanControl { .. }
             | AdminCommand::MoveRange { .. }
             | AdminCommand::GcRestore { .. }
             | AdminCommand::BackupCreate { .. }

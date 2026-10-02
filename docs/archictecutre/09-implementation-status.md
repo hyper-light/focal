@@ -12681,6 +12681,25 @@ frame that came was given up; the other peer's older frame goes now. Each has a 
 that fails on the tree before. Open: a drained leader's replacement stayed `Installed`
 for 300 s on two macOS runs.
 
+### 2026-10-02 — F24: the control plane survives what the data does
+
+A deployment that asked for zone survival placed the session's voters across the zones
+and left the root group with the founder's single vote, the directory partition and the
+issuer with the founder (the KIND campaign's D5): metadata operations stopped while the
+founder was down, and the operator was told the guarantee was achieved. The plan now
+seats the root's voters before the sessions' (`plan_root`), apply promotes them through
+the root one exact request each, `cluster placement` states what the root, the partition
+groups and the issuer each survive by the rule the sessions are measured by, and
+readiness holds the committed policy to the root ([24 §15, §17](24-placement-execution-and-fleet-control.md);
+the remediation record, F24). On real binaries across three zones the root is led from
+another zone while the founder's is silent. Found on the way: a control read was
+served by the leader alone, so a founder whose root followed a host after a restart
+never reported `Ready` and `membership show` on a non-leader was refused; a follower
+asks through its leader now (27 §5) and serves the read at the index it named; and the
+partition permit no longer demands that the root lead, so the founder reopens its
+partition after a restart whichever voter leads. Open:
+the partition groups on other hosts; the issuer with F13 stage 3.
+
 ### 2026-10-02 — F48 and F49: a promise across a slow path, a megabyte across a slower one
 
 Native activation and every promotion of a learner need each voter's recorded promise

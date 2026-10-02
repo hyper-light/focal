@@ -905,7 +905,8 @@ impl ClusterAdmin {
             _ => Err(ClusterAdminError::Invalid),
         }
     }
-    async fn configuration(&self) -> Result<ControlConfiguration> {
+    /// The root group's configuration: its voters, learners and index.
+    pub async fn configuration(&self) -> Result<ControlConfiguration> {
         match self
             .exchange(AdminCommand::Read(AdminRead::Configuration))
             .await?
@@ -1766,6 +1767,34 @@ impl ClusterAdmin {
             .into(),
             dry_run,
         })
+    }
+    /// The root voters a durability needs (F24; survive code 0 node, 1
+    /// zone, 2 region): reported, never journaled.
+    pub async fn plan_control_reply(
+        &self,
+        survive_code: u8,
+        max_failures: u16,
+    ) -> Result<crate::network_admin::ControlPlannedReply> {
+        if max_failures > 255 || survive_code > 2 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let bytes = self
+            .exchange_bytes(AdminCommand::PlanControl {
+                survive: survive_code,
+                max_failures,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::ControlPlannedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::CONTROL_PLANNED_REPLY_SCHEMA
+            || reply.voters.is_empty()
+            || reply.voters.len() > 64
+            || !matches!(reply.state, 0 | 2)
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
     }
     /// The validated placement request reply (survive code 0 node, 1 zone,
     /// 2 region).
