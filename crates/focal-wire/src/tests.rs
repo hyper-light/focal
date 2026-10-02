@@ -2059,38 +2059,41 @@ async fn narrow(
     shaped(server, Shape::even(bits)).await
 }
 
-/// A payload's residency is priced by the round trip the path shows while
-/// the payload arrives, not by the one it showed before: a path's idle
-/// round trip is its handshake's, and a narrow path takes longer than that
-/// to carry two datagrams, so a live sender filling it was given less than
-/// the path delivers in, and given up on (one run in a dozen of
-/// `narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given`,
-/// whose receiver measured 7.9 ms before a megabyte that took 3.1 s and
-/// 67 ms by its end). A sender slower than two datagrams a round trip of
-/// the longest the path has shown is still given up on.
+/// A payload that keeps arriving is never given up, however slowly it
+/// comes against the path's round trip, and one that stops is given up
+/// within a judgement (`Arriving`, the port's finding). It was priced by
+/// its residency — two datagrams a probe timeout of the longest round trip
+/// the path showed while it arrived — which a sender limited by its path
+/// alone keeps and one that writes as it has, shares its connection or is
+/// short of CPU does not: a datagram every five milliseconds on a path of
+/// one millisecond, three times slower than that pace, was given up with
+/// most of the payload arriving.
 #[tokio::test(start_paused = true)]
-async fn a_payload_is_given_the_round_trip_the_path_shows_while_it_arrives() {
-    use std::sync::atomic::{AtomicU64, Ordering};
+async fn a_payload_that_keeps_arriving_is_never_given_up_and_one_that_stops_is() {
     const PAYLOAD: usize = 256 * 1024;
     const EVERY: Duration = Duration::from_millis(5);
     let wait = Duration::from_millis(100);
-    // A datagram every five milliseconds: the payload takes about 1.1 s.
-    let send = |mut writer: tokio::io::DuplexStream| async move {
+    // A datagram every five milliseconds, `stop_after` of them at most.
+    let send = |mut writer: tokio::io::DuplexStream, stop_after: usize| async move {
         use tokio::io::AsyncWriteExt;
         let datagram = [7u8; LEAST_PROGRESS];
         let mut left = PAYLOAD;
-        while left > 0 {
+        let mut sent = 0usize;
+        while left > 0 && sent < stop_after {
             let take = left.min(datagram.len());
             if writer.write_all(&datagram[..take]).await.is_err() {
                 return;
             }
             left -= take;
+            sent += 1;
             tokio::time::sleep(EVERY).await;
         }
+        // Stopped: the stream stays open and silent.
+        std::future::pending::<()>().await;
     };
-    let read = |measured: Arc<AtomicU64>| async move {
+    let read = |stop_after: usize| async move {
         let (writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let sender = tokio::spawn(send(writer));
+        let sender = tokio::spawn(send(writer, stop_after));
         let frame = read_frame_header(
             &mut &request_header(PAYLOAD as u32)[..],
             FrameKind::Request,
@@ -2099,38 +2102,113 @@ async fn a_payload_is_given_the_round_trip_the_path_shows_while_it_arrives() {
         .await
         .unwrap();
         let began = tokio::time::Instant::now();
-        let arrived: Result<Vec<u8>, WireError> =
-            read_payload_arriving(&mut reader, frame, wait, || {
-                Duration::from_micros(measured.load(Ordering::Relaxed))
-            })
-            .await;
+        let alone = crate::frame::AloneDelivery::default();
+        let arrived: Result<Vec<u8>, WireError> = read_payload_arriving(
+            &mut reader,
+            frame,
+            wait,
+            || Duration::from_millis(1),
+            &alone,
+            0,
+        )
+        .await;
         sender.abort();
-        (arrived.map(|_| ()), began.elapsed())
+        (arrived.map(|_| ()), began.elapsed(), alone)
     };
-    // The path showed one millisecond when the payload began: 110 probe
-    // timeouts of it are 330 ms, and the payload takes three times that.
-    let idle = Arc::new(AtomicU64::new(1_000));
-    let (given_up, after) = read(idle.clone()).await;
-    assert!(matches!(given_up, Err(WireError::Timeout)), "{given_up:?}");
-    assert!(after <= residency(PAYLOAD, Duration::from_millis(1)).max(wait) + EVERY);
-    // The same sender, on a path whose round trip the payload's own
-    // datagrams lengthen to twenty milliseconds once they queue: the
-    // payload is given what the path takes, and arrives.
-    let loaded = Arc::new(AtomicU64::new(1_000));
-    let lengthen = loaded.clone();
-    let queueing = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        lengthen.store(20_000, Ordering::Relaxed);
-    });
-    let (arrived, took) = read(loaded).await;
-    queueing.await.unwrap();
-    // The payload is not a frame's encoding: it arrived whole and was
-    // read as far as its decoding, which the path does not answer for.
+    // Sent to the end: the payload arrives, 1.1 s after it began, three
+    // times the residency it was given before. It is not a frame's encoding,
+    // so it is read as far as its decoding, which the path does not answer
+    // for; and the delivery it was declared to has nothing of it left owed.
+    let (arrived, took, alone) = read(usize::MAX).await;
     assert!(
         !matches!(arrived, Err(WireError::Timeout)),
         "given up after {took:?}"
     );
     assert!(took >= Duration::from_secs(1), "{took:?}");
+    assert_eq!(alone.backlog(0), 0);
+    assert_eq!(alone.delivered(0), PAYLOAD as u64);
+    // Stopped a third of the way in: given up at the first judgement that
+    // brought less than a datagram, one wait after the last datagram, and
+    // what was not read is released.
+    let stop_after = PAYLOAD / LEAST_PROGRESS / 3;
+    let (given_up, after, alone) = read(stop_after).await;
+    assert!(matches!(given_up, Err(WireError::Timeout)), "{given_up:?}");
+    let sent = EVERY * stop_after as u32;
+    assert!(
+        after >= sent && after <= sent + wait * 2,
+        "{after:?} for {sent:?}"
+    );
+    assert_eq!(alone.backlog(0), 0);
+    assert_eq!(alone.delivered(0), (stop_after * LEAST_PROGRESS) as u64);
+}
+
+/// The judgement a body's arrival is charged by, apart from any stream
+/// (`Arriving`): what hyper-raft's port of the law tests of its own.
+#[test]
+fn a_bodys_arrival_is_charged_with_what_arrives_against_what_is_owed() {
+    use crate::frame::{Arriving, Moved};
+    const PERIOD: Duration = Duration::from_millis(100);
+    let moved = |received: u64, delivered: u64| Moved {
+        received,
+        delivered,
+    };
+    let start = tokio::time::Instant::now();
+    // A megabyte at 12,000 bytes a period, 84 periods: never cut off while
+    // bytes keep arriving, however short the path's round trip.
+    let mut body = Arriving::begin(start, moved(0, 0), 1_000_000, 1_000_000, PERIOD);
+    for period in 1..=83u32 {
+        let arrived = 12_000 * u64::from(period);
+        body.judge(
+            start + PERIOD * period,
+            moved(arrived, arrived),
+            1_000_000 - arrived,
+            PERIOD,
+        )
+        .unwrap();
+        body.arrived(12_000);
+    }
+    // One that stops arriving ends at the period that brought less than a
+    // datagram; one not yet due is not judged.
+    let mut body = Arriving::begin(start, moved(0, 0), 24_000, 24_000, PERIOD);
+    body.judge(start + PERIOD / 2, moved(0, 0), 24_000, PERIOD)
+        .unwrap();
+    assert!(matches!(
+        body.judge(start + PERIOD, moved(100, 100), 24_000, PERIOD),
+        Err(WireError::Timeout)
+    ));
+    // A body of fewer bytes than a datagram needs only itself.
+    let mut tail = Arriving::begin(start, moved(0, 0), 300, 300, PERIOD);
+    tail.arrived(300);
+    tail.judge(start + PERIOD, moved(300, 300), 0, PERIOD)
+        .unwrap();
+    // A body the peer withholds while it delivers others: a more urgent
+    // class's megabyte is not charged; the other bodies owed are; a period
+    // after everything owed was delivered, still busy and still not this
+    // body, it ends.
+    let mut withheld = Arriving::begin(start, moved(0, 0), 10_000, 60_000, PERIOD);
+    withheld
+        .judge(start + PERIOD, moved(1_000_000, 0), 60_000, PERIOD)
+        .unwrap();
+    withheld
+        .judge(start + PERIOD * 2, moved(1_050_000, 50_000), 20_000, PERIOD)
+        .unwrap();
+    withheld
+        .judge(start + PERIOD * 3, moved(1_060_000, 60_000), 10_000, PERIOD)
+        .unwrap();
+    assert!(matches!(
+        withheld.judge(start + PERIOD * 4, moved(2_000_000, 60_000), 10_000, PERIOD),
+        Err(WireError::Timeout)
+    ));
+    // The judgement stretches with the path: a period that the longest
+    // round trip's probe timeout exceeds is that probe timeout.
+    assert_eq!(
+        crate::frame::judgement(PERIOD, Duration::from_millis(10)),
+        PERIOD
+    );
+    assert_eq!(
+        crate::frame::judgement(PERIOD, Duration::from_millis(50)),
+        Duration::from_millis(150)
+    );
 }
 
 /// A megabyte over a path that takes longer to carry it than a request is
@@ -3934,12 +4012,17 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
                 continue;
             }
             tokio::spawn(async move {
-                let asked: RequestEnvelope =
-                    read_payload_arriving(&mut recv, header, UNREAD_PERIOD, || {
-                        Duration::from_millis(1)
-                    })
-                    .await
-                    .unwrap();
+                let alone = crate::frame::AloneDelivery::default();
+                let asked: RequestEnvelope = read_payload_arriving(
+                    &mut recv,
+                    header,
+                    UNREAD_PERIOD,
+                    || Duration::from_millis(1),
+                    &alone,
+                    0,
+                )
+                .await
+                .unwrap();
                 write_frame(
                     &mut send,
                     FrameKind::Response,
@@ -4685,4 +4768,243 @@ async fn slow_path_one() {
         if down { "asked" } else { "sent" },
         began.elapsed()
     );
+}
+
+/// How a paced peer answers one request: the reply's bytes, written whole
+/// in pieces behind the replies before it, or its header alone.
+#[derive(Clone, Copy)]
+enum PacedReply {
+    Whole(u32),
+    Withheld(u32),
+}
+const PACED_PIECE: usize = 64 * 1024;
+const PACED_EVERY: Duration = Duration::from_millis(50);
+/// A peer that reads every request and answers each download as `policy`
+/// says: every reply's header leaves as soon as its request is read, and
+/// the bodies leave one after another in the order the requests came, a
+/// piece every `PACED_EVERY` — a peer whose owner writes as it has, behind
+/// the replies before it. A withheld reply's header leaves and its body
+/// never does; the stream stays open.
+async fn paced_peer(
+    wire: WireLimits,
+    policy: impl Fn(u128) -> PacedReply + Send + Sync + 'static,
+) -> (QuicRemote, tokio::task::JoinHandle<()>) {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let (server_certificate, server_key) = pki.issue(true);
+    let config = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let limits = wire.clone();
+    let peer = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await.unwrap();
+        write_frame(
+            &mut send,
+            FrameKind::HelloReply,
+            &HelloReply::Accepted(limits.negotiate(&hello).unwrap()),
+            4096,
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+        // Bodies in the order their requests came, one at a time.
+        let (queue, mut bodies) =
+            tokio::sync::mpsc::unbounded_channel::<(quinn::SendStream, Vec<u8>)>();
+        let writer = tokio::spawn(async move {
+            while let Some((mut send, body)) = bodies.recv().await {
+                for piece in body.chunks(PACED_PIECE) {
+                    if send.write_all(piece).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(PACED_EVERY).await;
+                }
+                let _ = send.finish();
+                let _ = send.stopped().await;
+            }
+        });
+        let mut withheld = Vec::new();
+        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let header = read_frame_header(&mut recv, FrameKind::Request, limits.max_frame_bytes)
+                .await
+                .unwrap();
+            let alone = crate::frame::AloneDelivery::default();
+            let asked: RequestEnvelope = read_payload_arriving(
+                &mut recv,
+                header,
+                limits.request_timeout,
+                || Duration::from_millis(1),
+                &alone,
+                0,
+            )
+            .await
+            .unwrap();
+            let id = u128::from_be_bytes(asked.request_id.0);
+            let (bytes, whole) = match policy(id) {
+                PacedReply::Whole(bytes) => (bytes, true),
+                PacedReply::Withheld(bytes) => (bytes, false),
+            };
+            let reply = asked.reply(Response::Content(ContentChunk {
+                offset: 0,
+                eof: true,
+                bytes: vec![7; bytes as usize],
+            }));
+            let body = encode_payload(&reply, limits.max_frame_bytes).unwrap();
+            let mut frame = [0u8; HEADER_BYTES];
+            frame[..8].copy_from_slice(b"FOCALQ01");
+            frame[8..10].copy_from_slice(&1u16.to_be_bytes());
+            frame[10..12].copy_from_slice(&(FrameKind::Response as u16).to_be_bytes());
+            frame[12..16].copy_from_slice(&(body.len() as u32).to_be_bytes());
+            send.write_all(&frame).await.unwrap();
+            if whole {
+                queue.send((send, body)).unwrap();
+            } else {
+                withheld.push(send);
+            }
+        }
+        drop(queue);
+        let _ = writer.await;
+        drop(withheld);
+    });
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let remote = connector.connect(address, "localhost").await.unwrap();
+    (remote, peer)
+}
+fn paced_download(id: u128, bytes: u32) -> RequestEnvelope {
+    let mut request = download_request(bytes);
+    request.request_id = RequestId::from_u128(id);
+    request
+}
+
+/// A reply queued behind the peer's other replies is not refused while the
+/// connection carries them: sixteen downloads of 128 KiB, their headers at
+/// once and their bodies one after another at 64 KiB every 50 ms, so the
+/// last body begins a second and a half after its header, five times the
+/// 300 ms the exchange is given. Before, a body was given its residency
+/// from its header — on loopback, the period — and the first judgement
+/// after it refused a body not yet begun, however much the connection
+/// carried (hyper-raft's port: a 64 KiB reply refused with none of it read
+/// while its period brought 464 KB, 3 of 24 loaded macOS runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_queued_behind_the_peers_others_is_not_refused_while_they_arrive() {
+    const REPLIES: u128 = 16;
+    const BYTES: u32 = 128 * 1024;
+    let wire = WireLimits {
+        request_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let (remote, peer) = paced_peer(wire.clone(), |_| PacedReply::Whole(BYTES)).await;
+    let began = std::time::Instant::now();
+    let asked: Vec<_> = (0..REPLIES)
+        .map(|id| {
+            let remote = remote.clone();
+            async move {
+                remote
+                    .request_within(&paced_download(id, BYTES), wire.request_timeout)
+                    .await
+            }
+        })
+        .collect();
+    let answers = futures_util::future::join_all(asked).await;
+    let took = began.elapsed();
+    for (id, answer) in answers.iter().enumerate() {
+        match answer {
+            Ok(ResponseEnvelope {
+                result: Response::Content(chunk),
+                ..
+            }) => assert_eq!(chunk.bytes.len(), BYTES as usize, "reply {id}"),
+            other => panic!("reply {id}: {other:?} after {took:?}"),
+        }
+    }
+    // The bodies took their turns: the last began at least fifteen
+    // pieces' pacing after the first.
+    assert!(took >= PACED_EVERY * 30, "{took:?}");
+    drop(remote);
+    peer.abort();
+}
+
+/// A peer that answers with a header, declares a body and never sends it,
+/// while it keeps the connection busy with the replies to the requests that
+/// follow, is still given up: once the connection has delivered everything
+/// the peer owed, the withheld body has a judgement more and no longer,
+/// though every judgement brings more than a datagram; and the others
+/// arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
+    const OTHERS: u128 = 12;
+    const OTHER_BYTES: u32 = 256 * 1024;
+    const WITHHELD_BYTES: u32 = 64 * 1024;
+    let wire = WireLimits {
+        request_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let (remote, peer) = paced_peer(wire.clone(), |id| {
+        if id == 0 {
+            PacedReply::Withheld(WITHHELD_BYTES)
+        } else {
+            PacedReply::Whole(OTHER_BYTES)
+        }
+    })
+    .await;
+    let began = std::time::Instant::now();
+    let asked: Vec<_> = (0..=OTHERS)
+        .map(|id| {
+            let remote = remote.clone();
+            async move {
+                let bytes = if id == 0 { WITHHELD_BYTES } else { OTHER_BYTES };
+                let answer = remote
+                    .request_within(&paced_download(id, bytes), wire.request_timeout)
+                    .await;
+                (answer, began.elapsed())
+            }
+        })
+        .collect();
+    let answers = futures_util::future::join_all(asked).await;
+    // The others arrive, one after another.
+    let mut last_other = Duration::ZERO;
+    for (id, (answer, at)) in answers.iter().enumerate().skip(1) {
+        assert!(
+            matches!(
+                answer,
+                Ok(ResponseEnvelope {
+                    result: Response::Content(_),
+                    ..
+                })
+            ),
+            "reply {id}: {answer:?} at {at:?}"
+        );
+        last_other = last_other.max(*at);
+    }
+    let pieces = u32::try_from(OTHERS).unwrap() * OTHER_BYTES.div_ceil(PACED_PIECE as u32);
+    assert!(last_other >= PACED_EVERY * pieces, "{last_other:?}");
+    // The withheld body is given up once everything else owed had
+    // arrived: not before the last of the others by more than a
+    // judgement, and within three judgements after it.
+    let (withheld, at) = &answers[0];
+    assert!(
+        matches!(withheld, Err(WireError::Timeout)),
+        "{withheld:?} at {at:?}"
+    );
+    assert!(
+        *at + wire.request_timeout >= last_other,
+        "{at:?} long before the others' {last_other:?}"
+    );
+    assert!(
+        *at <= last_other + wire.request_timeout * 3,
+        "{at:?} long after the others' {last_other:?}"
+    );
+    drop(remote);
+    peer.abort();
 }

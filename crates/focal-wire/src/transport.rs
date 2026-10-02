@@ -101,6 +101,32 @@ pub fn bulk_width(window: u64, most: usize) -> usize {
 /// What the exchanges under way on a connection have to send, in bytes.
 #[derive(Default)]
 struct Held(std::sync::atomic::AtomicU64);
+/// One connection's delivery for its readers (`frame::Delivery`): what the
+/// connection received, and what each class declared and read.
+struct ConnectionDelivery<'a> {
+    connection: &'a Connection,
+    counts: &'a crate::frame::Counts,
+}
+impl crate::frame::Delivery for ConnectionDelivery<'_> {
+    fn received(&self) -> u64 {
+        self.connection.stats().udp_rx.bytes
+    }
+    fn delivered(&self, rank: u8) -> u64 {
+        self.counts.delivered(rank)
+    }
+    fn backlog(&self, rank: u8) -> u64 {
+        self.counts.backlog(rank)
+    }
+    fn declared(&self, rank: u8, bytes: u64) {
+        self.counts.declared(rank, bytes);
+    }
+    fn read(&self, rank: u8, bytes: u64) {
+        self.counts.read(rank, bytes);
+    }
+    fn released(&self, rank: u8, bytes: u64) {
+        self.counts.released(rank, bytes);
+    }
+}
 /// What one exchange has to send, held until it ends.
 struct Sending<'a> {
     held: &'a Held,
@@ -590,6 +616,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
     let mut tasks = JoinSet::new();
     // What the answers under way on this connection have to send.
     let held = Arc::new(Held::default());
+    let counts = Arc::new(crate::frame::Counts::default());
     loop {
         tokio::select! {
             Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
@@ -597,7 +624,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                 let Ok((mut send,mut recv))=streams else{break};
                 if let Some(admitted) = &admitted { admitted.used(); }
                 if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
-                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();let lane=lane.clone();
+                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();let lane=lane.clone();let counts=counts.clone();
                 tasks.spawn(async move {
                     // Each part of an exchange has its own wait: what is
                     // asked as it arrives, its handler the time of a
@@ -624,7 +651,9 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                                 return Err(WireError::Access(AccessError::Capacity));
                             }
                         };
-                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout,||carrying.rtt()).await?;
+                        // A request's class is in its body: until it is read it is the most urgent.
+                        let delivery=ConnectionDelivery{connection:&carrying,counts:&counts};
+                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout,||carrying.rtt(),&delivery,0).await?;
                         // The end of the stream is the last thing the path carries of it.
                         tokio::time::timeout(limits.request_timeout.max(residency(1,carrying.rtt())),require_end(&mut recv))
                             .await.map_err(|_|WireError::Timeout)??;
@@ -1087,6 +1116,7 @@ async fn open_remote(
             data: Semaphore::new(limits.streams_per_connection as usize),
             control: Semaphore::new(limits.control_streams as usize),
             held: Held::default(),
+            counts: crate::frame::Counts::default(),
         }),
     })
 }
@@ -1104,6 +1134,8 @@ struct RemoteCapacity {
     control: Semaphore,
     /// What the requests under way on the connection have to send.
     held: Held,
+    /// What the answers under way declared and delivered, by class.
+    counts: crate::frame::Counts,
 }
 impl QuicRemote {
     pub fn negotiated(&self) -> Negotiated {
@@ -1201,8 +1233,19 @@ impl QuicRemote {
             }
         };
         drop(carriage);
-        let response: ResponseEnvelope =
-            read_payload_arriving(&mut recv, header, period, || self.connection.rtt()).await?;
+        let delivery = ConnectionDelivery {
+            connection: &self.connection,
+            counts: &self.capacity.counts,
+        };
+        let response: ResponseEnvelope = read_payload_arriving(
+            &mut recv,
+            header,
+            period,
+            || self.connection.rtt(),
+            &delivery,
+            request.operation.class().rank(),
+        )
+        .await?;
         // The end of the stream is the last thing the path carries of it.
         tokio::time::timeout(
             period.max(residency(1, self.connection.rtt())),

@@ -257,6 +257,18 @@ impl TrafficClass {
             Self::Control => 10,
         }
     }
+    /// The class's rank among the classes a connection carries under
+    /// strict priority: zero the most urgent. A body of a class may come
+    /// behind everything of a lower rank ([`crate::frame::Delivery`]).
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Exchange => 1,
+            Self::Bulk => 2,
+        }
+    }
+    /// How many ranks there are.
+    pub const RANKS: usize = 3;
 }
 /// One movement fact request: an operation, a member and a kind.
 pub const MAX_RANGE_CONTROL_REQUEST_BYTES: usize = 4 * 1024;

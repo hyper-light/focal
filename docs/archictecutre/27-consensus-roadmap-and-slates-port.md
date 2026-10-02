@@ -765,12 +765,34 @@ and each its own wait (`PeerConnectionPool::send_bounded`, `transport::Carriage`
 | Its turn on the peer's lane, and its connection | It has them | The pool's time for each (`PeerPoolLimits::timeout`). The dial goes on without the caller, for the next: it is given what the connector gives a handshake (`request_timeout`, for the connection's and for the protocol's) |
 | What is sent | The peer has acknowledged the whole of its stream, or has answered | The residency of what the connection held to send beside it is spent; never before a period |
 | The peer's answer | It begins | A period after the peer had the request, and what the path is given to carry the first of it |
-| What arrives | Its last byte | Its residency is spent; never before a period |
+| What arrives | Its last byte | It stopped arriving: a judgement (a period, or the probe timeout of the longest round trip seen) brought less than a datagram of the connection's bytes, or began with everything the peer owed of its class and the less urgent ones delivered and the body still not among it (`frame::Arriving`, 2026-10-02) |
 | The handler | It answers | The time of a request, as before |
 
 The period is the pool's time. A group's exchange that ends by time is not asked again
 by the pool: its owner asks again by its own clock, and a second time would hold the
 peer's lane as long again.
+
+**What arrives is charged with what arrives (2026-10-02; found by hyper-raft's port of
+this law, ca8d44f).** A body was given its residency — its bytes at two datagrams of the
+least size a probe timeout of the longest round trip the path showed while it arrived,
+and a period at least. That is the pace of a sender limited by its path alone. A peer
+whose owner writes a body as it has it, whose exchanges share the connection under
+strict priority, or that is short of CPU, sends slower than its path, on a path whose
+round trip says nothing of when the body ends: at the 395 µs QUIC measures on loopback
+an 8 MiB body got one period, and the first judgement after it refused the body however
+much was arriving (under a CPU quota, 7 of 15 runs at half a core, 25 of 30 at a fifth;
+the rare refusals CI saw on ubuntu-24.04 and windows-11-arm). A body's arrival is now
+judged once a period — the peer's time, or the probe timeout of the longest round trip
+seen, whichever is longer, since a lost flight is sent again when the probe timer ends —
+and given up when a judgement brought less than a datagram of the connection's bytes
+(silence), or began with everything the peer owed delivered and the body still not among
+it: the wait is charged with the stream bytes the connection delivered of the body's
+class and the less urgent ones (`TrafficClass::rank`; a request's body, whose class is in
+it, counts as the most urgent) against what the peer declared of them and has still to
+deliver, this body included (`frame::Delivery`, one per connection on either role). A
+peer that withholds a body while it sends others is given up once it has sent everything
+it owed; one that sends nothing, within a judgement. What a slow body holds is bounded by
+the identity's share of the listener's ingress (F03), not by time.
 
 **What a sender knows of its own stream** is one thing: that the peer has acknowledged
 all of it, or stopped taking it (`SendStream::stopped`). What the connection sent is in

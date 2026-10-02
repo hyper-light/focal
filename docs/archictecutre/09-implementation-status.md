@@ -12681,6 +12681,18 @@ frame that came was given up; the other peer's older frame goes now. Each has a 
 that fails on the tree before. Open: a drained leader's replacement stayed `Installed`
 for 300 s on two macOS runs.
 
+### 2026-10-02 — a body still arriving is never refused
+
+hyper-raft's port of focal's residency law (ca8d44f) found that a body was given one
+budget from its first byte, its residency at the path's round trip and a period at
+least: a peer that writes slower than its path — its owner writing as it has, its
+exchanges sharing the connection under strict priority, its process short of CPU — was
+refused while the body still arrived, at will under a CPU quota and rarely in focal's
+own CI. A body's arrival is charged with what arrives now: judged once a period, given
+up on silence or when everything the peer owed of its class and the less urgent ones
+has arrived without it ([27 §7](27-consensus-roadmap-and-slates-port.md); the remediation
+record under F38 and F36).
+
 ### 2026-10-02 — F24: the control plane survives what the data does
 
 A deployment that asked for zone survival placed the session's voters across the zones

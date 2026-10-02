@@ -2174,6 +2174,28 @@ one a peer never answers ends at its own time whatever else the connection carri
 
 ## F38 and F36
 
+**Found by the port (2026-10-02; hyper-raft ca8d44f, told by the mantle session): a body
+still arriving was refused.** `frame::read_payload_arriving` gave a body one budget from
+its first byte, its residency at the longest round trip seen and a period at least — a
+sender limited by its path alone keeps that pace; one that writes as it has, shares its
+connection under strict priority or is short of CPU does not, and on a short round trip
+the budget is a period. hyper-raft reproduced it at will under a CPU quota (macOS 3/24,
+Linux at half a core 7/15, at a fifth 25/30); focal's CI saw it as rare refusals on
+ubuntu-24.04 and windows-11-arm. A body's arrival is now charged with what arrives
+(`frame::Arriving`, judged every period or probe timeout of the longest round trip; the
+connection's delivered bytes of the body's class and the less urgent ones against what
+the peer owes of them; silence or a withheld body alone give it up), with one
+`frame::Delivery` per connection on either role (27 §7). Tests:
+`a_payload_that_keeps_arriving_is_never_given_up_and_one_that_stops_is` (a datagram every
+five milliseconds on a one-millisecond path arrives, three times slower than the
+residency allowed; a sender that stops is given up one judgement after its last
+datagram), `a_bodys_arrival_is_charged_with_what_arrives_against_what_is_owed` (the
+judgement apart from any stream: steady arrival never cut off, silence, a body shorter
+than a datagram, a body withheld behind others of a more urgent class and of its own,
+the judgement stretching with the path), and the F36/F38 measurements unchanged. The
+test that priced a payload by its residency was rewritten: its first half asserted the
+old law.
+
 Measured first, on the tree as it was (`slow_paths_measured`: the pool as a node
 configures it, one message of a group, through a relay that carries so many bits a second
 each way): nothing was delivered at or below 8 kbit/s, and nothing that takes its path

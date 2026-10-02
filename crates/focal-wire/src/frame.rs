@@ -225,58 +225,306 @@ pub fn residency(bytes: usize, rtt: std::time::Duration) -> std::time::Duration 
     probe_timeout(rtt).saturating_mul(u32::try_from(probes).unwrap_or(u32::MAX))
 }
 
-/// Read the payload of `header` and decode it, however long the path
-/// takes to carry it: a payload is given up when its [`residency`] is
-/// spent (`wait` at least), and by nothing else. So a megabyte arrives
-/// over a path that carries a megabit in a second as over one that
-/// carries a thousand, and no buffer is held for longer than its bytes
-/// take at the least a live path delivers.
+/// Where a body's bytes stand among what its connection carries: what a
+/// body's arrival is charged with (`Arriving`). A connection keeps one for
+/// all its readers; a reader without a connection (a test's pipe) keeps its
+/// own (`AloneDelivery`).
+pub trait Delivery: Send + Sync {
+    /// Bytes the connection has received so far, of anything.
+    fn received(&self) -> u64;
+    /// Stream bytes the connection's readers of `rank`'s class and the less
+    /// urgent ones have read so far.
+    fn delivered(&self, rank: u8) -> u64;
+    /// Payload bytes the peer declared on the connection, of `rank`'s class
+    /// and the less urgent ones, that no reader has read yet.
+    fn backlog(&self, rank: u8) -> u64;
+    /// A body of `bytes` of `rank`'s class was declared: its header read.
+    fn declared(&self, rank: u8, bytes: u64);
+    /// `bytes` of a declared body of `rank`'s class were read.
+    fn read(&self, rank: u8, bytes: u64);
+    /// `bytes` of a declared body of `rank`'s class will not be read: the
+    /// reader gave it up.
+    fn released(&self, rank: u8, bytes: u64);
+}
+/// The delivery a reader keeps for itself where no connection does: what it
+/// read is all it knows was received or delivered, and all it is owed is
+/// its own body.
+#[derive(Debug, Default)]
+pub struct AloneDelivery {
+    read: std::sync::atomic::AtomicU64,
+    owed: std::sync::atomic::AtomicU64,
+}
+impl Delivery for AloneDelivery {
+    fn received(&self) -> u64 {
+        self.read.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn delivered(&self, _rank: u8) -> u64 {
+        self.read.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn backlog(&self, _rank: u8) -> u64 {
+        self.owed.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn declared(&self, _rank: u8, bytes: u64) {
+        self.owed
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+    fn read(&self, _rank: u8, bytes: u64) {
+        self.read
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        saturating_sub_atomic(&self.owed, bytes);
+    }
+    fn released(&self, _rank: u8, bytes: u64) {
+        saturating_sub_atomic(&self.owed, bytes);
+    }
+}
+/// The delivery one connection keeps for all its readers: what each class
+/// declared and read, beside what the connection received.
+#[derive(Debug, Default)]
+pub struct Counts {
+    delivered: [std::sync::atomic::AtomicU64; crate::TrafficClass::RANKS],
+    declared: [std::sync::atomic::AtomicU64; crate::TrafficClass::RANKS],
+}
+impl Counts {
+    fn slot(
+        ranked: &[std::sync::atomic::AtomicU64],
+        rank: u8,
+    ) -> Option<&std::sync::atomic::AtomicU64> {
+        ranked.get(usize::from(rank)).or_else(|| ranked.last())
+    }
+    fn from_rank(ranked: &[std::sync::atomic::AtomicU64], rank: u8) -> u64 {
+        ranked
+            .iter()
+            .skip(usize::from(rank))
+            .fold(0u64, |sum, count| {
+                sum.saturating_add(count.load(std::sync::atomic::Ordering::Acquire))
+            })
+    }
+    /// What the connection's readers of `rank`'s class and the less urgent
+    /// ones have read.
+    pub fn delivered(&self, rank: u8) -> u64 {
+        Self::from_rank(&self.delivered, rank)
+    }
+    /// What the peer declared of those classes and no reader has read.
+    pub fn backlog(&self, rank: u8) -> u64 {
+        Self::from_rank(&self.declared, rank)
+    }
+    pub fn declared(&self, rank: u8, bytes: u64) {
+        if let Some(count) = Self::slot(&self.declared, rank) {
+            count.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    pub fn read(&self, rank: u8, bytes: u64) {
+        if let Some(count) = Self::slot(&self.delivered, rank) {
+            count.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+        if let Some(count) = Self::slot(&self.declared, rank) {
+            saturating_sub_atomic(count, bytes);
+        }
+    }
+    pub fn released(&self, rank: u8, bytes: u64) {
+        if let Some(count) = Self::slot(&self.declared, rank) {
+            saturating_sub_atomic(count, bytes);
+        }
+    }
+}
+fn saturating_sub_atomic(count: &std::sync::atomic::AtomicU64, bytes: u64) {
+    use std::sync::atomic::Ordering;
+    let mut before = count.load(Ordering::Acquire);
+    while let Err(found) = count.compare_exchange_weak(
+        before,
+        before.saturating_sub(bytes),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        before = found;
+    }
+}
+/// What a connection had moved when a body was judged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Moved {
+    pub received: u64,
+    pub delivered: u64,
+}
+/// A body's arrival, charged with what arrives: judged once a period, and
+/// given up only when a period brought less than a datagram of the
+/// connection's bytes (silence), or began with everything the peer owed of
+/// the body's class and the less urgent ones delivered and the body still
+/// not among it (the peer withholds it while it sends others). A body may
+/// come behind what the peer sends first — the more urgent classes under
+/// strict priority, and what it declared on other bodies of its class or
+/// less urgent — so the wait is charged with the bytes the connection
+/// delivered of its class and the less urgent ones, against what the peer
+/// declared of them and has still to deliver, this body included: the most
+/// that was found to be.
 ///
-/// A payload was also given up when a `wait` brought less than a datagram
-/// of it. That asked of every path a datagram a wait, and of a sender that
-/// it lose nothing: one whose flight is lost sends again when its probe
-/// timer ends, three round trips on, which on a path that carries four
-/// kilobits a second is half a minute in which nothing arrives and nothing
-/// is wrong (the audit's F36, `narrow_lossy_paths_measured`: sixteen
-/// kilobytes arriving a datagram every 2.6 s were given up five seconds
-/// into such a silence, with 175 s of their residency left). A sender that
-/// stops for good is given up when the residency is spent, and one whose
-/// connection carries nothing at all when the connection ends.
+/// The wait was the body's residency, its bytes at two datagrams of the
+/// least size a probe timeout of the path, and a period at least: the pace
+/// of a sender limited by its path alone. A peer whose owner writes a body
+/// as it has it, whose exchanges share the connection under strict
+/// priority, or that is short of CPU, sends slower than its path on a path
+/// whose round trip says nothing of when the body ends: at the 395 µs QUIC
+/// measures on loopback an 8 MiB body got one period, and the first
+/// judgement after it refused the body however much was arriving
+/// (hyper-raft's port of this law, under a CPU quota: 7 of 15 runs at half
+/// a core, 25 of 30 at a fifth; the rare refusals focal's CI saw on
+/// ubuntu-24.04 and windows-11-arm). What a slow body holds is bounded by
+/// the identity's share of the listener's ingress (F03), not by time.
+#[derive(Clone, Copy, Debug)]
+pub struct Arriving {
+    next: tokio::time::Instant,
+    before: Moved,
+    owed: u64,
+    charged: u64,
+    had: bool,
+    remaining: u64,
+}
+impl Arriving {
+    /// A body of `remaining` bytes begins to arrive at `now`, the peer owing
+    /// `backlog` of its class and the less urgent ones, the body included;
+    /// first judged a `period` on.
+    pub fn begin(
+        now: tokio::time::Instant,
+        moved: Moved,
+        remaining: u64,
+        backlog: u64,
+        period: std::time::Duration,
+    ) -> Self {
+        Self {
+            next: now.checked_add(period).unwrap_or(now),
+            before: moved,
+            owed: backlog.max(remaining),
+            charged: 0,
+            had: false,
+            remaining,
+        }
+    }
+    /// `bytes` of the body arrived.
+    pub fn arrived(&mut self, bytes: u64) {
+        self.remaining = self.remaining.saturating_sub(bytes);
+    }
+    /// When the body is next judged.
+    pub fn due(&self) -> tokio::time::Instant {
+        self.next
+    }
+    /// Judge the body at `now` if a judgement is due: `moved` is what the
+    /// connection has moved, `backlog` what the peer owes now of the body's
+    /// class and the less urgent ones; the next judgement is a `period` on.
+    pub fn judge(
+        &mut self,
+        now: tokio::time::Instant,
+        moved: Moved,
+        backlog: u64,
+        period: std::time::Duration,
+    ) -> Result<(), WireError> {
+        if now < self.next {
+            return Ok(());
+        }
+        let before = std::mem::replace(&mut self.before, moved);
+        self.next = now.checked_add(period).unwrap_or(now);
+        let received = moved.received.saturating_sub(before.received);
+        let least = u64::try_from(LEAST_PROGRESS)
+            .unwrap_or(u64::MAX)
+            .min(self.remaining);
+        if self.had || received < least {
+            return Err(WireError::Timeout);
+        }
+        self.charged = self
+            .charged
+            .saturating_add(moved.delivered.saturating_sub(before.delivered));
+        self.owed = self.owed.max(backlog);
+        self.had = self.charged >= self.owed;
+        Ok(())
+    }
+}
+/// What a body is judged by: the period the peer is given, or the probe
+/// timeout of the longest round trip the path has shown while the body
+/// arrives, whichever is longer — a lost flight is sent again when the
+/// probe timer ends (RFC 9002 §6.2.4), and a path that carries four
+/// kilobits a second takes longer than a short period to carry one datagram
+/// (the audit's F36, `narrow_lossy_paths_measured`).
+pub fn judgement(wait: std::time::Duration, longest: std::time::Duration) -> std::time::Duration {
+    wait.max(probe_timeout(longest))
+}
+/// A body declared to its connection's delivery, read into it as it
+/// arrives, and released if given up.
+struct Declared<'a> {
+    delivery: &'a (dyn Delivery + Sync),
+    rank: u8,
+    unread: u64,
+}
+impl Declared<'_> {
+    fn read(&mut self, bytes: u64) {
+        self.delivery.read(self.rank, bytes);
+        self.unread = self.unread.saturating_sub(bytes);
+    }
+}
+impl Drop for Declared<'_> {
+    fn drop(&mut self) {
+        if self.unread > 0 {
+            self.delivery.released(self.rank, self.unread);
+        }
+    }
+}
+/// Read the payload of `header` and decode it, however long the path and
+/// the peer take to carry it: a body is given up when it stops arriving
+/// ([`Arriving`]), and by nothing else. So a megabyte arrives over a path
+/// that carries a megabit in a second as over one that carries a thousand,
+/// from a peer that writes it as fast as its path carries as from one that
+/// writes it slower; and a peer that stops is given up within a judgement.
 ///
 /// `round_trip` is the path's round trip as the connection measures it,
-/// asked as the payload arrives, and the residency is priced by the longest
-/// it has answered: the round trip a payload's own datagrams take. One
-/// measured before the payload began was measured on an idle path, whose
-/// handshake did not queue behind anything; a narrow path takes longer to
-/// carry two datagrams than that, so a live sender filling it was given
-/// less than the path can deliver in, and given up on.
+/// asked as the payload arrives; a judgement is a `wait` or the probe
+/// timeout of the longest round trip seen ([`judgement`]). `delivery` is
+/// the connection's, and `rank` the body's class among what the connection
+/// carries ([`crate::TrafficClass::rank`]; a body whose class is not known
+/// yet, a request's, is the most urgent).
 pub async fn read_payload_arriving<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     header: FrameHeader,
     wait: std::time::Duration,
     round_trip: impl Fn() -> std::time::Duration,
+    delivery: &(dyn Delivery + Sync),
+    rank: u8,
 ) -> Result<T, WireError> {
     let mut bytes = payload_buffer(header.payload_bytes())?;
+    let length = u64::try_from(bytes.len()).map_err(|_| WireError::Limit)?;
+    delivery.declared(rank, length);
+    let mut declared = Declared {
+        delivery,
+        rank,
+        unread: length,
+    };
+    let moved = || Moved {
+        received: delivery.received(),
+        delivered: delivery.delivered(rank),
+    };
+    let mut longest = round_trip();
+    let mut arriving = Arriving::begin(
+        tokio::time::Instant::now(),
+        moved(),
+        length,
+        delivery.backlog(rank),
+        judgement(wait, longest),
+    );
     let mut filled = 0_usize;
-    let began = tokio::time::Instant::now();
-    let mut longest = std::time::Duration::ZERO;
     while filled < bytes.len() {
         longest = longest.max(round_trip());
-        let spent = began
-            .checked_add(residency(bytes.len(), longest).max(wait))
-            .ok_or(WireError::Timeout)?;
-        let remaining = spent.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(WireError::Timeout);
-        }
-        // The round trip is asked again every wait, whatever arrived in it.
+        arriving.judge(
+            tokio::time::Instant::now(),
+            moved(),
+            delivery.backlog(rank),
+            judgement(wait, longest),
+        )?;
         let rest = bytes.get_mut(filled..).ok_or(WireError::Limit)?;
-        if let Ok(read) = tokio::time::timeout(wait.min(remaining), reader.read(rest)).await {
+        if let Ok(read) = tokio::time::timeout_at(arriving.due(), reader.read(rest)).await {
             let read = read?;
             if read == 0 {
                 return Err(WireError::InvalidFrame);
             }
             filled = filled.saturating_add(read);
+            let read = u64::try_from(read).map_err(|_| WireError::Limit)?;
+            declared.read(read);
+            arriving.arrived(read);
         }
     }
     decode_payload(&bytes)
