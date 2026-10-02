@@ -189,6 +189,18 @@ impl FleetManager {
     pub fn status(&self) -> FleetStatus {
         self.state.borrow().status
     }
+    /// How many installed hosts say of themselves that they stopped: a
+    /// host publishes it before its stop is answered, where the fleet's
+    /// `running` follows a round of the worker later. What asks whether
+    /// the owners run (readiness's `serving`, 24 §15) asks the hosts.
+    pub fn stopped_hosts(&self) -> usize {
+        self.state
+            .borrow()
+            .entries
+            .values()
+            .filter(|entry| entry.host.progress().stopped)
+            .count()
+    }
     /// Trusted in-process routing lookup. The caller must authorize the tenant
     /// before calling. A short watch borrow clones only the current fenced host;
     /// no owner round trip or mutable session access is involved.

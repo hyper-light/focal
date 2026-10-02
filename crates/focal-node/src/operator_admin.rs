@@ -430,11 +430,15 @@ impl LocalNetworkAdmin {
         // Serving is the owners running: the root's and every installed
         // session's — a session stopped on a failure leaves the fleet's
         // running count below its installed count, a planned stop the same
-        // — with no leadership or quorum asked of them.
+        // — with no leadership or quorum asked of them. A host says of
+        // itself that it stopped before its stop is answered; the fleet's
+        // count follows a round later, so both are asked (a Windows run of
+        // 2026-10-02 found a stopped owner still serving by the count).
         let fleet_status = fleet.status();
         let serving = !root.stopped
             && !fleet_status.stopped
-            && fleet_status.running == fleet_status.installed;
+            && fleet_status.running == fleet_status.installed
+            && fleet.stopped_hosts() == 0;
         let leads_root = root.leader == node && !root.stopped;
         let authoritative = leads_root
             || sessions

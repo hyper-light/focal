@@ -161,11 +161,19 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
                 .iter()
                 .map(|node| {
                     format!(
-                        "leader {:?}; health {}; periods {}",
+                        "leader {:?}; health {}; replicas {}; plan {}; periods {}",
                         session_leader(node, &ledger),
                         String::from_utf8_lossy(
                             &run(node, None, &["cluster", "node", "health"]).stdout
                         ),
+                        // Which replica of the session each node runs, with
+                        // its leader, commit and apply: a replacement stuck
+                        // at `Installed` is one that never caught up, or never
+                        // learned a leader (three CI runs of 2026-10-01/02).
+                        String::from_utf8_lossy(
+                            &run(node, None, &["cluster", "replicas", "diagnostics"]).stdout
+                        ),
+                        String::from_utf8_lossy(&run(node, None, &["cluster", "plan"]).stdout),
                         String::from_utf8_lossy(
                             &run(node, None, &["cluster", "node", "metrics"]).stdout
                         )

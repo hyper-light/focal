@@ -12675,7 +12675,9 @@ but one was released by closing its file, which a child process a test or a node
 holds open for a moment: one owner type unlocks the file when it ends. And the control
 owner refused for capacity whatever came while it decided another command: it waits its
 turn now, in order, and is given its request time from its turn, not from when it came
-(the macOS run of the day after gave up the fifth of five). And the replication driver's own test of a dead peer beside a live
+(the macOS run of the day after gave up the fifth of five). A stopped session owner was still
+serving by the fleet's count, which follows a round later than the host's own word: the
+probe asks the hosts too (a Windows run of 2026-10-02). And the replication driver's own test of a dead peer beside a live
 one hung in two runs of sixty, and had held a macOS runner for two hours: on a tie the
 frame that came was given up; the other peer's older frame goes now. Each has a test
 that fails on the tree before. Open: a drained leader's replacement stayed `Installed`

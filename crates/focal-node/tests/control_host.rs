@@ -1511,8 +1511,11 @@ async fn an_owner_refused_the_room_waits_and_goes_on() {
 /// held apart for more than half the request time each, so that four holds
 /// outlast the request time and the fifth write's turn comes only after it;
 /// every write is decided. The holds hold heartbeats too, so the replicas
-/// are given forty ticks of silence before they campaign; and the request
-/// time is a second, so that a commit on a loaded host fits beside a hold.
+/// are given as many ticks of silence as the request time holds before
+/// they campaign; and the request time is four seconds, so that a commit
+/// on a starved runner — two seconds after a hold on one macOS run of
+/// 2026-10-02, four tests of three owners each sharing two cores — fits
+/// beside a hold of half of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
     let keys = tempfile::tempdir().unwrap();
@@ -1523,8 +1526,14 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
         now(),
     )
     .unwrap();
-    const REQUEST: Duration = Duration::from_secs(1);
-    let mut rig = Rig::with_timing(root_bootstrap(&authority), GROUP, 40, REQUEST);
+    const REQUEST: Duration = Duration::from_secs(4);
+    let request_periods = focal_timing::ProgressDeadline::periods(REQUEST, RIG_TICK);
+    let mut rig = Rig::with_timing(
+        root_bootstrap(&authority),
+        GROUP,
+        usize::try_from(request_periods).unwrap(),
+        REQUEST,
+    );
     rig.hosts[0].campaign().await.unwrap();
     let leader = rig.leader(0).await;
     let (leader, ControlReadResult::Configuration(configuration)) = rig
@@ -1561,9 +1570,8 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
     // One commit at a time: the routers hold the group at each, for more
     // than half the request time in the leader's periods, before the next
     // is let through; four holds then outlast the request time.
-    let request = focal_timing::ProgressDeadline::periods(REQUEST, RIG_TICK);
-    let hold = request / 2 + 1;
-    assert!(hold * 4 > request && hold * 2 < request + request / 2);
+    let hold = request_periods / 2 + 1;
+    assert!(hold * 4 > request_periods && hold * 2 < request_periods + request_periods / 2);
     let applied = host.progress().applied_index;
     rig.allowed.store(applied + 1, Ordering::SeqCst);
     let paced = async {

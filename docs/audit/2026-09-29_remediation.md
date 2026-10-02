@@ -2341,9 +2341,20 @@ to no one leaves every waiter's deadline where it was, so a stalled group still 
 them up in one request time. *Test.* The same test, paced: the rig's routers hold the
 group at each applied index until the test allows the next, one commit at a time,
 each hold more than half the request time so that four holds outlast it (a request
-time of a second and forty ticks of silence before an election, since the holds hold
-heartbeats and a loaded host's commit must fit beside a hold); every write is
-decided, and without the renewal the fifth is given up.
+time of four seconds and as many ticks of silence before an election, since the holds
+hold heartbeats and a starved runner's commit — two seconds after a hold on a macOS
+run — must fit beside a hold); every write is decided, and without the renewal the
+fifth is given up.
+
+**A stopped session owner was still serving, by the count** (`focal-node`; Windows run
+of 7a6170e, `network_service::tests::a_node_whose_session_owner_stopped_is_alive_and_not_serving`:
+`serving: true` with the session gone from the list). *Cause.* Readiness's `serving`
+asked the fleet's count, `running == installed`, and the count follows a round of the
+fleet's worker after the owner stopped, while the host says of itself that it stopped
+before its stop is answered; a probe between the two found every owner running. *Fix.*
+`FleetManager::stopped_hosts` counts the installed hosts whose own progress says they
+stopped, and `serving` asks the hosts beside the count. *Test.* The same test, which
+asks the probe the moment the stop is answered.
 
 **The driver's test of a dead peer beside a live one hung** (`focal-node`, found by this
 batch's own run of the suite: 2 of 60 runs of
@@ -2380,7 +2391,16 @@ beats and never appends to, or whose appends it never takes. Seven local repetit
 CI runs on the trees since F42 pass, whose rules for a member's heartbeat answers and
 probes are the ones that changed between. It is not reproduced and not mended; it stands
 here until a run on a current tree shows it again or a directed schedule of the core
-reaches it.
+reaches it. **A run on a current tree showed it again (Linux, 7a6170e, 2026-10-02):**
+the same state — the replacement `Installed`, `through 0`, the two others `CaughtUp`,
+the active placement still naming the drained host, the plan in `Catchup` for 300 s —
+with the replacement's health naming no error and the third host's last refusal a
+load report whose revision had moved (`metadata comparison failed`, the periodic
+report's compare, not the plan's). The report could not tell whether the
+replacement's copy ever learned a leader or was ever appended to; the test now prints
+each node's `cluster replicas diagnostics` (leader, commit, apply per replica) and
+`cluster plan` (the controller's next actions) beside its health, so the next run says
+which.
 
 ## F48
 
