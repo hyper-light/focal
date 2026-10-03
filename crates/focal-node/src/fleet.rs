@@ -1621,7 +1621,7 @@ impl Owner {
     fn beats(&self) -> bool {
         self.pace
             .stretched(self.config.tick, self.config.tick_ceiling)
-            && self.session.status().role == StateRole::Leader
+            && self.session.scalars().role == StateRole::Leader
     }
     fn beat_if_due(&mut self) -> Result<(), LedgerError> {
         if !self.beats() || Instant::now() < self.next_beat {
@@ -1806,7 +1806,7 @@ impl Owner {
         // current logs, so leadership returns to where placement put it and
         // a voter that merely timed out first does not take it. Policy from
         // committed state, applied by the owner; never from liveness.
-        let priority = self.rank(self.session.status().node_id);
+        let priority = self.rank(self.session.scalars().node_id);
         if self.session.priority() != priority {
             self.session.set_priority(priority)?;
         }
@@ -1825,7 +1825,7 @@ impl Owner {
             Err(error) => return Err(error),
         }
         self.return_leadership()?;
-        if self.session.status().role == StateRole::Leader {
+        if self.session.scalars().role == StateRole::Leader {
             let now = wall_ms()?.max(self.session.cursor_clock());
             match self.session.propose_cursor_clock(now) {
                 Ok(_) | Err(LedgerError::Capacity | LedgerError::NotReady { .. }) => {}
@@ -1868,12 +1868,13 @@ impl Owner {
     /// is counted and rested on; only a failure of the session itself is
     /// an error.
     fn return_leadership(&mut self) -> Result<(), LedgerError> {
-        let status = self.session.status();
+        let status = self.session.scalars();
+        let membership = self.session.members();
         let leads = self.session.is_authoritative();
         let own = self.rank(status.node_id);
         let votes = |node: u64| {
             node != status.node_id
-                && status.voters.contains(&node)
+                && membership.voters.contains(&node)
                 && self
                     .session
                     .active_placement()
@@ -2144,7 +2145,7 @@ impl Owner {
                     if let Some(fence) = &fence {
                         if !self.session.is_authoritative() {
                             return Err(LedgerError::NotReady {
-                                leader: self.session.status().leader_id,
+                                leader: self.session.scalars().leader_id,
                             });
                         }
                         if self.session.pending_count() != 0 {
@@ -2361,6 +2362,7 @@ impl Owner {
     /// leader does, so the heir is caught up and asked. A leader that went
     /// silent cost the survivors that whole timeout, for every log it led.
     fn hand_off(&mut self) -> Result<(), LedgerError> {
+        // Once a stop: the owned status, which the heir is chosen from.
         let status = self.session.status();
         if status.role != StateRole::Leader {
             return Ok(());
@@ -2410,7 +2412,7 @@ impl Owner {
         let Some(bound) = self.handing_off else {
             return false;
         };
-        let leads = self.session.status().role == StateRole::Leader;
+        let leads = self.session.scalars().role == StateRole::Leader;
         if leads && self.pace.periods() < bound {
             return true;
         }
@@ -2515,11 +2517,10 @@ impl Owner {
     /// admitted participant work cannot refuse the acknowledgments its own
     /// completion waits on, and peers cannot crowd the participants out.
     fn peer_reserve(&self) -> usize {
-        let status = self.session.status();
-        let members = status
-            .voters
+        let members = self
+            .session
+            .members()
             .len()
-            .saturating_add(status.learners.len())
             .saturating_add(self.admitted.len())
             .max(1);
         members.saturating_mul(self.session.inflight_window())
@@ -2550,13 +2551,10 @@ impl Owner {
         if self.resequencer.expire(self.pace.periods()).is_ok() {
             self.step_due();
         }
-        let status = self.session.status();
+        let membership = self.session.members();
         let admitted = &self.admitted;
-        let member = |source: u64| {
-            status.voters.contains(&source)
-                || status.learners.contains(&source)
-                || admitted.binary_search(&source).is_ok()
-        };
+        let member =
+            |source: u64| membership.holds(source) || admitted.binary_search(&source).is_ok();
         let mut gone = Vec::new();
         if self.resequencer.prune(&member, &mut gone).is_ok() {
             for held in gone {
@@ -2596,10 +2594,8 @@ impl Owner {
         let PeerRole::Node { node_id } = verified.peer().role() else {
             return Err(AccessError::Unauthorized);
         };
-        let status = self.session.status();
         if group != self.session.group_id()
-            || (!status.voters.contains(&node_id)
-                && !status.learners.contains(&node_id)
+            || (!self.session.members().holds(node_id)
                 && self.admitted.binary_search(&node_id).is_err())
         {
             return Err(AccessError::Unauthorized);
@@ -2692,7 +2688,7 @@ impl Owner {
                     header,
                     response,
                     waiting: WaitingFor::PeerPersistence,
-                    term: self.session.status().term,
+                    term: self.session.scalars().term,
                     deadline,
                     _charge: charge,
                 }),
@@ -2716,7 +2712,7 @@ impl Owner {
                             header,
                             response,
                             waiting: WaitingFor::PeerPersistence,
-                            term: self.session.status().term,
+                            term: self.session.scalars().term,
                             deadline,
                             _charge: charge,
                         },
@@ -2748,9 +2744,7 @@ impl Owner {
                 let PeerRole::Node { node_id } = peer.role() else {
                     return Err(AccessError::Unauthorized);
                 };
-                let status = self.session.status();
-                if (!status.voters.contains(&node_id)
-                    && !status.learners.contains(&node_id)
+                if (!self.session.members().holds(node_id)
                     && self.admitted.binary_search(&node_id).is_err())
                     || *group != self.session.group_id()
                     || request.route_epoch != self.config.route_epoch
@@ -2825,7 +2819,7 @@ impl Owner {
                                         route_epoch: self.config.route_epoch,
                                         policy_revision: self.config.policy_revision,
                                     },
-                                    &self.session.status().voters,
+                                    self.session.members().voters,
                                 )?,
                         ]
                     } else {
@@ -2944,7 +2938,7 @@ impl Owner {
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.managed.read.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
-                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
@@ -2983,7 +2977,7 @@ impl Owner {
                                 route_epoch: self.config.route_epoch,
                                 policy_revision: self.config.policy_revision,
                             },
-                            &self.session.status().voters,
+                            self.session.members().voters,
                         )?]
                     } else {
                         Vec::new()
@@ -3043,7 +3037,7 @@ impl Owner {
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.monitor.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
-                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
@@ -3063,7 +3057,7 @@ impl Owner {
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.summary.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
-                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
@@ -3083,7 +3077,7 @@ impl Owner {
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.reconcile.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
-                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
@@ -3112,7 +3106,7 @@ impl Owner {
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.list.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
-                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
@@ -3157,7 +3151,7 @@ impl Owner {
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.selection.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
-                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
@@ -3202,7 +3196,7 @@ impl Owner {
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.validators.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
-                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
@@ -3247,7 +3241,7 @@ impl Owner {
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.traversal.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
-                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
@@ -3288,7 +3282,7 @@ impl Owner {
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.read.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
-                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
@@ -3378,7 +3372,7 @@ impl Owner {
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let correlation = crate::native_reads::correlation(
-                            self.session.status().node_id,
+                            self.session.scalars().node_id,
                             self.incarnation,
                             peer.principal(),
                             request.request_id,
@@ -3450,7 +3444,7 @@ impl Owner {
                 header,
                 response,
                 waiting,
-                term: self.session.status().term,
+                term: self.session.scalars().term,
                 deadline,
                 _charge: charge,
             });
@@ -3643,7 +3637,7 @@ impl Owner {
                 continue;
             };
             self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
-            let id = ((u128::from(self.session.status().node_id) << 64) | u128::from(self.nonce))
+            let id = ((u128::from(self.session.scalars().node_id) << 64) | u128::from(self.nonce))
                 .to_be_bytes();
             let group = self.session.group_id();
             let urgent = urgent(message);
@@ -3703,14 +3697,14 @@ impl Owner {
     }
     fn poll_snapshot_feedback(&mut self) -> Result<(), LedgerError> {
         self.snapshot_feedback
-            .poll(self.session.status().term, |peer, term, index, status| {
+            .poll(self.session.scalars().term, |peer, term, index, status| {
                 self.session.report_snapshot_at(peer, term, index, status)
             })
     }
     fn resolve(&mut self, events: &SessionEvents) -> Result<(), LedgerError> {
         self.resolve_memberships(events)?;
         self.resolve_placement(events)?;
-        let status = self.session.status();
+        let status = self.session.scalars();
         let count = self.pending.len();
         for _ in 0..count {
             let mut pending = self.pending.pop_front().ok_or(LedgerError::Corrupt)?;
@@ -4217,7 +4211,7 @@ impl Owner {
                 }
             } else if !self.session.is_authoritative() {
                 return Err(LedgerError::NotReady {
-                    leader: self.session.status().leader_id,
+                    leader: self.session.scalars().leader_id,
                 });
             }
             Ok((deadline, proposed))
@@ -4227,7 +4221,7 @@ impl Owner {
                 call,
                 proposed,
                 context: None,
-                term: self.session.status().term,
+                term: self.session.scalars().term,
                 deadline,
                 charge,
             }),
@@ -4242,7 +4236,7 @@ impl Owner {
         }
     }
     fn resolve_memberships(&mut self, events: &SessionEvents) -> Result<(), LedgerError> {
-        let status = self.session.status();
+        let status = self.session.scalars();
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(mut pending) = self.memberships.pop_front() else {

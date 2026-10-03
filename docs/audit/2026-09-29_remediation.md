@@ -65,7 +65,7 @@ ruling before work starts).
 | F50 | P2 | in tree | 11 | [F50](#f50) |
 | F51 | P2 | open | 11 | — |
 | F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
-| F53 | P2 | open | 10 | — |
+| F53 | P2 | in tree | 10 | [F53](#f53) |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
 | F55 | P1 | in tree | 13 | [F55](#f55) |
 | F56 | P1 | in tree | 13 | [F56](#f56) |
@@ -3344,3 +3344,46 @@ itself (`evidence_quic`, a copy stalled at its first entry) was not this but the
 residual's (the F42 section, "A replica's own owner let held frames go").
 
 **Measured.** Over relays of 2 ms at 100 Mbit/s, three replicas, the copy on node 2: a first object of four 64 KiB chunks is sealed with all four on the copy; a second, differing in its second chunk alone, crossed toward the copy with 69,559 bytes under the inventory (one chunk of 65,536, the manifest, the open, the seal and the cancel) and 203,932 under the older ask (three chunks); the first run of the test measured 204,246 under the inventory too, because the harness's handler wrapper kept the trait's default offers and the connection negotiated the native profile — the wrapper forwards its service's offers now, and a mixed window is what `Slow::old` makes on purpose. Tags: `OpenHeld` is the 11th variant of its enum and `OpenedHeld` the 10th (postcard indices 10 and 9), both appended, so an older binary's tags keep their meaning.
+
+## F53
+
+**Cause.** A check that needed one scalar of a replica's status — its term, its role,
+its leader — built the whole owned status (`DurableNode::status()`), cloning the
+configuration's voters and learners every time; the fleet owner asked for it some thirty
+times on its paths, several times for every request and every period, and the session
+and its native engine on every delivery and read. And every read barrier completed was
+compared against the readiness marker by building the marker afresh
+(`readiness_context(term)`: a `to_vec` and a growth) — the one reallocation of a
+linearizable read, and an allocation, for a comparison.
+
+**Fix.** The node offers its status in two borrowed parts besides the owned one:
+`DurableNode::scalars()`, the scalars copied (`NodeScalars`, `Copy`), and
+`DurableNode::membership()`, the configuration's voters and learners read in place
+(`MembershipView`: `holds`, `len`); `status()` stays for what is published. The session
+forwards both (`Session::{scalars, members}`), the native engine's checks take the
+scalars, and the fleet owner reads the scalars or the view on its paths (admission,
+reserves, the held frames' member check, its timers) — the owned status is kept only
+where it is published (`ReplicaProgress`) and for a stop's hand-off. The readiness
+marker is told in place (`readiness_term`: the prefix stripped, the eight bytes of the
+term read), and built once, exactly reserved, for the request that asks it.
+
+**Tests.** `the_scalar_and_member_views_agree_with_the_owned_status` (a node before and
+after its election); `a_readiness_marker_is_read_in_place` (every term back; a context a
+byte, a length or a correlation away from the marker is no marker); the ledger, fleet and
+control suites unchanged.
+
+**Measured.** `FOCAL_LOAD_CLAIMS=1000 cargo bench -p focal-load --bench allocs --locked` (macOS
+arm64, the release profile; exact counts, the counting gate opened around each phase), at
+916afbf and on this change:
+
+| Phase (1,000 operations) | allocations/op before | after | reallocations/op before | after |
+|---|---:|---:|---:|---:|
+| linearizable read | 26.00 | 20.00 | 1.000 | 0.000 |
+| committed claim | 340.89 | 336.79 | 5.046 | 5.043 |
+| node open (once) | 692 | 659 | 237 | 233 |
+
+A read's six allocations were the five status builds on its path, each cloning the
+group's one voter (the 16-byte class: 6,000 allocations per thousand reads before, 1,000
+after), and the readiness marker built for the comparison (the 64-byte class: 5,000 to
+4,000), whose growth was the read's one reallocation (19 bytes moved per read, none
+after). Bytes requested per read: 11,236.9 before, 11,139.9 after.

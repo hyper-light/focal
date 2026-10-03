@@ -661,7 +661,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         self.consensus.status()
     }
     pub fn is_authoritative(&self) -> bool {
-        self.engine.is_authoritative(&self.consensus.status())
+        self.engine.is_authoritative(&self.consensus.scalars())
     }
     pub fn genesis(&self) -> Option<ContentHash> {
         self.engine.genesis()
@@ -868,7 +868,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         boundary: NativeReadBoundary,
     ) -> Result<&Core<NativeState>, NativeSessionError> {
         self.engine
-            .read_at_least(boundary, &self.consensus.status())
+            .read_at_least(boundary, &self.consensus.scalars())
     }
     pub fn campaign(&mut self) -> Result<(), NativeSessionError> {
         self.engine.check()?;

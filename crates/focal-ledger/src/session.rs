@@ -513,7 +513,7 @@ impl Session {
     /// accepted locally; callers observe status to learn whether it completed.
     pub fn transfer_leader(&mut self, target: u64) -> Result<(), LedgerError> {
         self.check()?;
-        if target == 0 || !self.status().voters.contains(&target) {
+        if target == 0 || !self.members().voters.contains(&target) {
             return Err(ConsensusError::Configuration("transfer target must be a voter").into());
         }
         self.consensus.transfer_leader(target)?;
@@ -646,6 +646,16 @@ impl Session {
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
     }
+    /// The status's scalars, copied (the audit's F53).
+    pub fn scalars(&self) -> focal_consensus::NodeScalars {
+        self.consensus.scalars()
+    }
+    /// The members as the node holds them, borrowed: the voters and the
+    /// learners of its configuration (`membership()` is the ledger's
+    /// committed membership, answered to a request).
+    pub fn members(&self) -> focal_consensus::MembershipView<'_> {
+        self.consensus.membership()
+    }
     /// The messages the core lets one peer have in flight at once.
     pub fn inflight_window(&self) -> usize {
         self.consensus.inflight_window()
@@ -653,7 +663,7 @@ impl Session {
     /// Current-term authority has crossed the committed ReadIndex barrier.
     /// Recovered workers must check this before dispatch, even without a write.
     pub fn is_authoritative(&self) -> bool {
-        let status = self.status();
+        let status = self.scalars();
         !self.failed && status.role == StateRole::Leader && self.ready_term == Some(status.term)
     }
     pub fn sequence(&self) -> SessionSeq {
@@ -807,7 +817,7 @@ impl Session {
     }
     fn propose_inner(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
         self.check()?;
-        let status = self.status();
+        let status = self.scalars();
         if status.role != StateRole::Leader || self.ready_term != Some(status.term) {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
@@ -986,8 +996,9 @@ impl Session {
     /// Convenience for embedded one-voter operation. For a fleet, transport pumps
     /// poll/step and matches the durable receipt asynchronously instead.
     pub fn submit_local(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
-        let status = self.status();
-        if status.voters != [status.node_id] || !status.learners.is_empty() {
+        let status = self.scalars();
+        let members = self.members();
+        if members.voters != [status.node_id] || !members.learners.is_empty() {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
             });
@@ -1168,8 +1179,8 @@ impl Session {
             Err(error) => Err(error),
         }
     }
-    fn observe_authority(&mut self) -> (NodeStatus, bool) {
-        let status = self.status();
+    fn observe_authority(&mut self) -> (focal_consensus::NodeScalars, bool) {
+        let status = self.scalars();
         let leader = status.role == StateRole::Leader;
         if self.last_term != status.term || self.was_leader != leader {
             self.clear_pending();
@@ -1553,10 +1564,10 @@ impl Session {
         &mut self,
         barrier: &focal_consensus::ReadBarrier,
         leader: bool,
-        status: &NodeStatus,
+        status: &focal_consensus::NodeScalars,
         delivery: &mut PendingDelivery,
     ) -> Result<(), LedgerError> {
-        if barrier.context == readiness_context(status.term) {
+        if readiness_term(&barrier.context) == Some(status.term) {
             self.ready_term = Some(status.term);
             if leader && let Some(engine) = self.native.as_deref_mut() {
                 engine.promote(status.term, &self.consensus)?;
@@ -1714,10 +1725,30 @@ pub fn mutation_lane(command: &Command) -> BudgetLane {
     }
 }
 
+/// What a readiness barrier's context begins with; the term follows it.
+const READINESS_PREFIX: &[u8] = b"focal.leader-ready\0";
+/// The context of the readiness barrier of `term`, built once for the
+/// request that asks it (the audit's F53: a comparison builds none).
 fn readiness_context(term: u64) -> Vec<u8> {
-    let mut bytes = b"focal.leader-ready\0".to_vec();
-    bytes.extend_from_slice(&term.to_be_bytes());
+    let mut bytes = Vec::new();
+    // A context of twenty-seven bytes; a reservation that fails leaves a
+    // shorter one, which no barrier matches and the request refuses.
+    if bytes
+        .try_reserve_exact(READINESS_PREFIX.len().saturating_add(size_of::<u64>()))
+        .is_ok()
+    {
+        bytes.extend_from_slice(READINESS_PREFIX);
+        bytes.extend_from_slice(&term.to_be_bytes());
+    }
     bytes
+}
+/// The term a readiness barrier's context names; `None` for any other
+/// context. Read in place: comparing a barrier to the readiness marker
+/// allocated a marker to compare with, for every barrier completed.
+fn readiness_term(context: &[u8]) -> Option<u64> {
+    let term = context.strip_prefix(READINESS_PREFIX)?;
+    let bytes: [u8; 8] = term.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }
 
 include!("native_hosting.rs");
@@ -1739,6 +1770,28 @@ mod native_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A readiness barrier is told by its context in place (the audit's
+    /// F53): the marker of a term reads back as that term, and a context a
+    /// byte or a length away from it — a caller's correlated read among
+    /// them — is no readiness barrier.
+    #[test]
+    fn a_readiness_marker_is_read_in_place() {
+        for term in [0, 1, 7, u64::MAX] {
+            let context = readiness_context(term);
+            assert_eq!(context.len(), READINESS_PREFIX.len() + 8);
+            assert_eq!(readiness_term(&context), Some(term));
+        }
+        let mut other = readiness_context(5);
+        other[0] ^= 1;
+        assert_eq!(readiness_term(&other), None);
+        let mut longer = readiness_context(5);
+        longer.push(0);
+        assert_eq!(readiness_term(&longer), None);
+        let shorter = &readiness_context(5)[..READINESS_PREFIX.len() + 7];
+        assert_eq!(readiness_term(shorter), None);
+        assert_eq!(readiness_term(&[7; 16]), None);
+        assert_eq!(readiness_term(&[]), None);
+    }
     fn identity() -> LedgerId {
         LedgerId {
             tenant: TenantId::from_u128(1),

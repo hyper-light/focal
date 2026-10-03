@@ -303,7 +303,7 @@ impl Session {
             && self
                 .native
                 .as_ref()
-                .is_some_and(|engine| engine.is_authoritative(&self.consensus.status()))
+                .is_some_and(|engine| engine.is_authoritative(&self.consensus.scalars()))
     }
     fn native_engine(&self) -> Result<&engine::NativeEngine<BuiltinNativeSchemas>, LedgerError> {
         self.check()?;
@@ -478,7 +478,7 @@ impl Session {
         self.check()?;
         if !self.is_authoritative() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
         if self.hosting.is_none() {
@@ -605,7 +605,7 @@ impl Session {
             }
         }
         engine.set_activation_index(entry.index);
-        let status = self.consensus.status();
+        let status = self.consensus.scalars();
         engine.observe(&status);
         // An authority already past this term's readiness barrier has applied
         // every earlier committed entry; activation is the next one in order,
@@ -826,7 +826,7 @@ impl Session {
             },
             BuiltinNativeSchemas,
         )?;
-        engine.observe(&self.consensus.status());
+        engine.observe(&self.consensus.scalars());
         // A restore that found objects missing names them for the host
         // before the engine it would have built is dropped (24 §20).
         let restored = engine.restore_from(native, index, term, configuration, &self.consensus);
@@ -865,7 +865,7 @@ impl Session {
         self.check()?;
         if !self.is_authoritative() || self.retained.is_some() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
         let engine = self
@@ -1124,7 +1124,7 @@ impl Session {
             .native
             .as_deref()
             .ok_or(LedgerError::NativeUnsupported)?;
-        engine.check_retirement(&self.consensus.status())?;
+        engine.check_retirement(&self.consensus.scalars())?;
         Ok(())
     }
     /// Committed retirement records this replica applied nothing for since
@@ -1140,7 +1140,7 @@ impl Session {
             .native
             .as_deref()
             .ok_or(LedgerError::NativeUnsupported)?;
-        engine.check_seal(&self.consensus.status())?;
+        engine.check_seal(&self.consensus.scalars())?;
         Ok(())
     }
     /// Propose one seal of closed outcomes as a session decision (F12).
@@ -1213,7 +1213,7 @@ impl Session {
     ) -> Result<&Core<NativeState>, LedgerError> {
         Ok(self
             .native_engine()?
-            .read_at_least(boundary, &self.consensus.status())?)
+            .read_at_least(boundary, &self.consensus.scalars())?)
     }
     /// Request a quorum read barrier for a native read; its boundary arrives
     /// in a later poll under the same correlation.
@@ -1225,13 +1225,13 @@ impl Session {
             && self
                 .native
                 .as_deref()
-                .is_some_and(|engine| engine.serves_reads(&self.consensus.status()))
+                .is_some_and(|engine| engine.serves_reads(&self.consensus.scalars()))
     }
     pub fn native_read_index(&mut self, correlation: ReadCorrelation) -> Result<(), LedgerError> {
         self.check()?;
         if !self.serves_native_reads() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
         self.refuse_at_parked_bound()?;

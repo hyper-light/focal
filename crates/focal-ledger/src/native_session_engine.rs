@@ -245,7 +245,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     /// Current-term authority past its committed readiness barrier, with the
     /// genesis applied, the owner reconstructed and no delivery in flight.
-    pub(crate) fn is_authoritative(&self, status: &NodeStatus) -> bool {
+    pub(crate) fn is_authoritative(&self, status: &focal_consensus::NodeScalars) -> bool {
         !self.failed
             && self.delivery.is_none()
             && status.role == StateRole::Leader
@@ -276,7 +276,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         operation: super::range::LayoutOperation,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
@@ -387,7 +387,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// The gates a retirement passes before its family is derived (26 §4):
     /// authority, no retirement, layout change or movement step in flight,
     /// no pending candidate and no delivery.
-    fn retirement_gates(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+    fn retirement_gates(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
         self.require_authority(status)?;
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
@@ -435,7 +438,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// gates and the owner's reservation `propose_retirement` applies, short
     /// of the family itself. The archive agent asks before it seals a
     /// bundle, so nothing is sealed for a family that cannot be proposed.
-    pub(crate) fn check_retirement(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+    pub(crate) fn check_retirement(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
         self.retirement_gates(status)?;
         self.retirement_reservation()
     }
@@ -456,7 +462,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         bytes: u64,
         through: SessionSeq,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.retirement_gates(&status)?;
         let core = self.committed_core()?;
         let family = core
@@ -500,7 +506,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// Whether this authority could propose a seal now (F12): the gates a
     /// retirement passes, and the owner's reservation of outcomes for the
     /// reports it promised (the seal publishes one outcome of its own).
-    pub(crate) fn check_seal(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+    pub(crate) fn check_seal(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
         self.retirement_gates(status)?;
         self.retirement_reservation()
     }
@@ -516,7 +525,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         bytes: u64,
         fold: Option<focal_core::native::seal::Fold>,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.retirement_gates(&status)?;
         let core = self.committed_core()?;
         let prefix = core.native_sequence();
@@ -574,7 +583,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         operation: focal_ranges::RangeOperation,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
@@ -734,7 +743,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn read_at_least(
         &self,
         boundary: NativeReadBoundary,
-        status: &NodeStatus,
+        status: &focal_consensus::NodeScalars,
     ) -> Result<&Core<NativeState>, NativeSessionError> {
         let core = self.committed_core()?;
         if self.applied_raft < boundary.raft_index
@@ -746,7 +755,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         Ok(core)
     }
-    pub(super) fn require_authority(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+    pub(super) fn require_authority(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
         self.check()?;
         if !self.is_authoritative(status) {
             return Err(NativeSessionError::NotReady {
@@ -759,14 +771,17 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// or as a follower that knows its leader — the read's barrier goes to
     /// the leader through the core, and the answer waits for this copy to
     /// have applied the index it names (27 §5, follower reads).
-    pub(crate) fn serves_reads(&self, status: &NodeStatus) -> bool {
+    pub(crate) fn serves_reads(&self, status: &focal_consensus::NodeScalars) -> bool {
         self.is_authoritative(status)
             || (!self.failed
                 && status.leader_id != 0
                 && self.genesis.is_some()
                 && self.domain.is_some())
     }
-    pub(super) fn require_reader(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+    pub(super) fn require_reader(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
         self.check()?;
         if !self.serves_reads(status) {
             return Err(NativeSessionError::NotReady {
@@ -843,7 +858,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             ContentDomainId,
         ) -> Result<NativeStaging, NativeOwnerError>,
     ) -> Result<NativeSubmission, NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);

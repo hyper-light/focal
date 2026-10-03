@@ -108,7 +108,7 @@ impl Session {
         self.check()?;
         if !self.is_authoritative() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
         let _scratch = self.budget.reserve(

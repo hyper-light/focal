@@ -42,7 +42,7 @@ impl Session {
         if self.consensus.decoder_floor_ready(managed_format_hash()) {
             return Ok(());
         }
-        if message.to != self.status().node_id || message.from == 0 {
+        if message.to != self.scalars().node_id || message.from == 0 {
             return Err(
                 ConsensusError::Configuration("wrong destination or missing sender").into(),
             );
@@ -95,7 +95,7 @@ impl Session {
     }
 
     pub fn needs_managed_support(&self, node: u64) -> bool {
-        node != self.status().node_id
+        node != self.scalars().node_id
             && (self.managed_support.configuration_index
                 != Some(self.membership_state.configuration_index)
                 || !self.managed_support.nodes.contains(&node)
@@ -125,7 +125,7 @@ impl Session {
         if current.configuration.voters.is_empty() {
             return Err(ManagedError::Unsupported.into());
         }
-        let local = self.status().node_id;
+        let local = self.scalars().node_id;
         for node in current
             .configuration
             .voters
@@ -166,7 +166,7 @@ impl Session {
             cluster: self.cluster_id(),
             ledger: self.ledger,
             group: self.group_id(),
-            node: self.status().node_id,
+            node: self.scalars().node_id,
             configuration_index: membership.configuration_index,
             voters: configuration.voters,
             voters_outgoing: configuration.voters_outgoing,
@@ -301,7 +301,7 @@ impl Session {
         if self.managed_protocol_active() {
             return Ok(());
         }
-        let local = self.status().node_id;
+        let local = self.scalars().node_id;
         for node in current
             .configuration
             .voters

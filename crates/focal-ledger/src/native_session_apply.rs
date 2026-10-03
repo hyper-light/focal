@@ -587,7 +587,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     /// Term and role observation. A change alone leaves unresolved candidates
     /// and grants intact; only committed evidence may discard them.
-    pub(crate) fn observe(&mut self, status: &NodeStatus) {
+    pub(crate) fn observe(&mut self, status: &focal_consensus::NodeScalars) {
         let leader = status.role == StateRole::Leader;
         if status.term != self.observed_term || leader != self.observed_leader {
             self.ready_term = None;
@@ -1005,7 +1005,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// leader without a genesis proposes it.
     pub(crate) fn settle(
         &mut self,
-        status: &NodeStatus,
+        status: &focal_consensus::NodeScalars,
         consensus: &mut DurableNode,
     ) -> Result<(), NativeSessionError> {
         let leader = status.role == StateRole::Leader;
@@ -1043,7 +1043,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         consensus: &mut DurableNode,
     ) -> Option<NativeSessionError> {
-        if !self.is_authoritative(&consensus.status()) {
+        if !self.is_authoritative(&consensus.scalars()) {
             return None;
         }
         match self.flush_proposals(consensus) {
@@ -1061,7 +1061,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         delivery: &mut Delivery,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         let leader = status.role == StateRole::Leader;
         self.observe(&status);
         if delivery.output.is_none() {
@@ -1164,7 +1164,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         barrier: &focal_consensus::ReadBarrier,
         leader: bool,
-        status: &NodeStatus,
+        status: &focal_consensus::NodeScalars,
         consensus: &mut DurableNode,
         delivery: &mut Delivery,
     ) -> Result<(), NativeSessionError> {
@@ -1206,7 +1206,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         correlation: ReadCorrelation,
     ) -> Result<(), NativeSessionError> {
-        self.require_reader(&consensus.status())?;
+        self.require_reader(&consensus.scalars())?;
         // A copy whose parked reads are at their bound is too far behind to
         // take another: refused here, typed, not dropped when answered.
         if self.parked_reads.len() >= consensus.pending_reads() {

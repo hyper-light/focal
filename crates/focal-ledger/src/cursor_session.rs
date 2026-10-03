@@ -166,8 +166,9 @@ impl Session {
         input: &CursorInput,
         control: bool,
     ) -> Result<CursorSubmission, LedgerError> {
-        let status = self.status();
-        if status.voters != [status.node_id] || !status.learners.is_empty() {
+        let status = self.scalars();
+        let members = self.members();
+        if members.voters != [status.node_id] || !members.learners.is_empty() {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
             });
@@ -192,7 +193,7 @@ impl Session {
         control: bool,
     ) -> Result<CursorSubmission, LedgerError> {
         self.check()?;
-        let status = self.status();
+        let status = self.scalars();
         if status.role != StateRole::Leader || self.ready_term != Some(status.term) {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,

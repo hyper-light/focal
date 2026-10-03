@@ -101,6 +101,44 @@ fn deeply_nested_unknown_protobuf_groups_fail_without_stack_overflow() {
 pub(crate) fn config(id: u64) -> NodeConfig {
     NodeConfig::single(id, [1; 16], [2; 16])
 }
+/// The scalar and borrowed views say what the owned status says (the
+/// audit's F53): the scalars copied, the members read in place.
+#[test]
+fn the_scalar_and_member_views_agree_with_the_owned_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = DurableNode::open(config(1), dir.path()).unwrap();
+    for _ in 0..2 {
+        let status = node.status();
+        let scalars = node.scalars();
+        assert_eq!(
+            (
+                scalars.node_id,
+                scalars.leader_id,
+                scalars.term,
+                scalars.committed_index,
+                scalars.applied_index,
+                scalars.role,
+            ),
+            (
+                status.node_id,
+                status.leader_id,
+                status.term,
+                status.committed_index,
+                status.applied_index,
+                status.role,
+            )
+        );
+        let members = node.membership();
+        assert_eq!(members.voters, status.voters.as_slice());
+        assert_eq!(members.learners, status.learners.as_slice());
+        assert_eq!(members.len(), status.voters.len() + status.learners.len());
+        assert!(members.holds(1));
+        assert!(!members.holds(2));
+        node.campaign().unwrap();
+        node.drain().unwrap();
+    }
+    assert_eq!(node.scalars().role, StateRole::Leader);
+}
 #[test]
 fn single_voter_restart_and_quorum_read_index() {
     let dir = tempfile::tempdir().unwrap();

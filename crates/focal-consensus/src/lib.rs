@@ -292,6 +292,39 @@ pub struct NodeStatus {
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
 }
+/// The scalars of a [`NodeStatus`] without its membership (the audit's
+/// F53): what a check of the term, the role, the leader or an index reads,
+/// copied, so a scalar check allocates nothing. The owned status stays for
+/// what is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeScalars {
+    pub node_id: u64,
+    pub leader_id: u64,
+    pub term: u64,
+    pub committed_index: u64,
+    pub applied_index: u64,
+    pub role: StateRole,
+}
+/// The node's membership as it holds it, borrowed: a check of who is a
+/// voter or a learner reads it in place.
+#[derive(Clone, Copy, Debug)]
+pub struct MembershipView<'a> {
+    pub voters: &'a [u64],
+    pub learners: &'a [u64],
+}
+impl MembershipView<'_> {
+    /// Whether `node` is a voter or a learner.
+    pub fn holds(&self, node: u64) -> bool {
+        self.voters.contains(&node) || self.learners.contains(&node)
+    }
+    /// The voters and the learners together.
+    pub fn len(&self) -> usize {
+        self.voters.len().saturating_add(self.learners.len())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.voters.is_empty() && self.learners.is_empty()
+    }
+}
 
 pub struct DurableNode {
     config: NodeConfig,
@@ -1350,15 +1383,36 @@ impl DurableNode {
     }
     pub fn status(&self) -> NodeStatus {
         let conf = &self.raw.store().conf_state;
+        let scalars = self.scalars();
         NodeStatus {
+            node_id: scalars.node_id,
+            leader_id: scalars.leader_id,
+            term: scalars.term,
+            committed_index: scalars.committed_index,
+            applied_index: scalars.applied_index,
+            role: scalars.role,
+            voters: conf.voters.clone(),
+            learners: conf.learners.clone(),
+        }
+    }
+    /// The status's scalars, copied: a check that needs no membership
+    /// allocates nothing (the audit's F53).
+    pub fn scalars(&self) -> NodeScalars {
+        NodeScalars {
             node_id: self.config.node_id,
             leader_id: self.raw.raft.leader_id(),
             term: self.raw.raft.term(),
             committed_index: self.raw.raft.log().committed(),
             applied_index: self.delivered_index,
             role: self.raw.raft.state(),
-            voters: conf.voters.clone(),
-            learners: conf.learners.clone(),
+        }
+    }
+    /// The membership as this node holds it, borrowed.
+    pub fn membership(&self) -> MembershipView<'_> {
+        let conf = &self.raw.store().conf_state;
+        MembershipView {
+            voters: &conf.voters,
+            learners: &conf.learners,
         }
     }
     /// Per-peer replication progress this node tracks as leader (empty when not

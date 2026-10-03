@@ -13013,3 +13013,14 @@ after: none. The lossy-path fleet test's retries are charged to the replicas' pe
 and paced a period apart, the upgrade journey prints every node's health when a level
 never comes, and the collector journey judges its second restore across a window no
 pass entered (a pass between the two requests takes the orphan again, rightly).
+
+### 2026-10-03 — a scalar check reads a scalar
+
+The audit's F53: the replica's status was built whole, with its configuration's
+voters and learners cloned, for every check of one scalar, and every read barrier was
+compared against a readiness marker built afresh. The node offers the scalars copied
+and the configuration borrowed (`DurableNode::{scalars, membership}`), the session,
+the native engine and the fleet owner read those on their paths, and the readiness
+marker is read in place. With focal-load's allocation bench (1,000 claims, macOS arm64, exact
+counts): a linearizable read takes 20 allocations and no reallocation, 26 and one at
+916afbf; a committed claim 336.79 allocations, 340.89 before.

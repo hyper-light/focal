@@ -144,7 +144,7 @@ impl Session {
             .commit();
         let placement = CommittedPlacement {
             stored: stored.clone(),
-            node: self.status().node_id,
+            node: self.scalars().node_id,
             cluster: self.cluster_id(),
             _allocation: allocation,
         };
