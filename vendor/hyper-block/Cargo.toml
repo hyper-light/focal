@@ -1,0 +1,40 @@
+[package]
+name = "hyper-block"
+version = "0.1.0"
+edition = "2024"
+# focal's toolchain (rust-toolchain.toml); this snapshot builds on it, which focal's gates show.
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+
+[features]
+# Test support for other crates: the simulated power-loss file and, on macOS, a disk image
+# attached as a device node.
+sim = []
+
+[dependencies]
+crc32c = "0.6"
+getrandom = "0.4"
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Performance",
+  "Win32_System_Ioctl",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
+# suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
+[workspace]

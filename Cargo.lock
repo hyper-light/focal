@@ -522,6 +522,7 @@ dependencies = [
  "focal-sim",
  "focal-timing",
  "getrandom 0.3.4",
+ "hyper-durable",
  "hyper-raft",
  "postcard",
  "raft-proto",
@@ -999,6 +1000,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hyper-block"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "rustix 1.1.4",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hyper-durable"
+version = "0.1.0"
+dependencies = [
+ "hyper-block",
+ "hyper-liveness",
+ "hyper-log",
+ "hyper-raft",
+ "hyper-timing",
+ "thiserror",
+]
+
+[[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+dependencies = [
+ "hyper-timing",
+]
+
+[[package]]
+name = "hyper-log"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-block",
+ "thiserror",
 ]
 
 [[package]]
