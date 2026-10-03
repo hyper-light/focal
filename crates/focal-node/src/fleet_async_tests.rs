@@ -456,9 +456,12 @@ async fn stopping_last_session_on_a_stalled_writer_does_not_join_it_on_the_fleet
 /// With the log held and one session, a hundred and a thousand, each with a
 /// write out:
 /// the owner asks about each write as it queues it and not again; and when
-/// the log answers, every write is committed long before the owners' ticks
-/// — which are stretched to ten seconds here, the longest an owner's may
-/// be, so that nothing but the log's own word can have woken them.
+/// the log answers, its answer wakes every session that waited on it — each
+/// one's count of the log's answers grows — and every write is committed.
+/// The owners' ticks are stretched to ten seconds here, the longest an
+/// owner's may be, so that a wake the log's answer failed to deliver is
+/// left to a tick. A first statement held the commits to five seconds of
+/// the clock, which three suites at once passed (2026-10-03).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits() {
     for sessions in [1u128, 100, 1_000] {
@@ -534,9 +537,12 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
         let waiting: Vec<bool> = writes.iter().map(|write| !write.is_finished()).collect();
         let unanswered = waiting.iter().filter(|waits| **waits).count();
         assert_eq!(unanswered as u128, sessions);
+        // What each session had heard from the log before it answers.
+        let answered_before: Vec<u64> = (1..=sessions)
+            .map(|index| fixture.hosts[&ledger(index)].progress().waits_answered)
+            .collect();
         resume.send(()).unwrap();
         drop(disk.join().unwrap());
-        let resumed = std::time::Instant::now();
         // Those that waited on the held log are answered as it answers.
         let mut answers = Vec::new();
         let mut refused = Vec::new();
@@ -548,18 +554,25 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
                 refused.push(write);
             }
         }
-        let woken = resumed.elapsed();
+        // An answer that is not yet a commit is asked again, the wait charged
+        // to the commits as they come: it ends when they stop coming.
         let mut refused = refused.into_iter();
-        let mut committed = true;
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &[0],
+            u64::try_from(sessions).unwrap(),
+            crate::network_service::tests::FROZEN,
+        );
         for (position, answer) in answers.into_iter().enumerate() {
             let index = position as u128 + 1;
+            // The commits before this one.
+            let committed = u64::try_from(position).unwrap();
             let mut answer = match answer {
                 Some(answer) => answer,
                 None => refused.next().unwrap().await.unwrap().result,
             };
-            for _ in 0..40 {
-                if matches!(answer, Response::Submitted(MutationReply::Committed(_))) {
-                    break;
+            while !matches!(answer, Response::Submitted(MutationReply::Committed(_))) {
+                if let Err(spent) = wait.check(&[committed]) {
+                    panic!("session {index} was not committed: {spent}: {answer:?}");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 answer = dispatch(
@@ -576,10 +589,20 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
                 .await
                 .result;
             }
-            committed &= matches!(answer, Response::Submitted(MutationReply::Committed(_)));
         }
+        // The log's answer woke every session that waited on it.
+        let unwoken: Vec<u128> = (1..=sessions)
+            .filter(|index| {
+                fixture.hosts[&ledger(*index)].progress().waits_answered
+                    <= answered_before[usize::try_from(*index - 1).unwrap()]
+            })
+            .collect();
         shutdown(fixture).await;
-        assert!(committed);
+        assert!(
+            unwoken.is_empty(),
+            "{} of {sessions} sessions were not woken by the log's answer: {unwoken:?}",
+            unwoken.len()
+        );
         // While the log was held nothing was asked: a session asks once as
         // it queues its write (a second time if a request arrived for it
         // meanwhile), never at intervals.
@@ -593,11 +616,6 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
             queued - asked_before <= 2 * sessions as u64,
             "{sessions} sessions asked {} times as they queued",
             queued - asked_before
-        );
-        // And the answer woke them: no owner's tick came in between.
-        assert!(
-            woken < Duration::from_secs(5),
-            "{sessions} sessions were committed {woken:?} after the log answered"
         );
     }
 }

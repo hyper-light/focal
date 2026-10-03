@@ -13065,3 +13065,15 @@ refusal by the pin (`EnrollmentError::Unpinned`) from one by the chain; on it th
 controller learns the pins at a control read that begins after the refusal — answered
 once its replica applied what the root's leader confirmed — and dials again (24 §11). The
 test alone, three copies at once under load: 3 of 3 failed before, 0 of 30 after.
+
+### 2026-10-03 — what two and three suites at once found
+
+The held-log test held a thousand sessions' commits to five seconds of the clock; under
+three suites at once they took nineteen. The owner now counts the wakes the log's answer
+delivers (`ReplicaProgress::waits_answered`) and the test asserts each waiting session
+was woken — which holds under that load. The laptop-expansion test asked the founder for
+a quorum read only the leader serves, wherever the planner made another host the
+preferred leader; it asks the voter that leads. Two waits that ran out under a peer's
+load did not recur in 58 copies and seven suite runs; their failures now print each
+replica's role, its owner's periods and the periods without its tick, and the
+activation's pending placement.

@@ -222,6 +222,9 @@ pub struct ReplicaProgress {
     pub node: u64,
     pub leader: u64,
     pub term: u64,
+    /// The replica's role in its term: a member that names no leader is
+    /// told apart as following, asking for votes or holding them.
+    pub role: StateRole,
     /// The hand-off a planned stop made, once the stop began.
     pub stop_hand_off: Option<StopHandOff>,
     pub sequence: SessionSeq,
@@ -250,6 +253,10 @@ pub struct ReplicaProgress {
     /// found its write still out. An owner the log wakes asks once as it
     /// queues a write, and again only at its tick (27 §9).
     pub waits_asked: u64,
+    /// The times the log's answer to this replica's write woke its owner
+    /// (`Session::notify_persisted`, on an owner that shares its thread
+    /// among sessions): the answer to `waits_asked` (27 §9).
+    pub waits_answered: u64,
     pub stopped: bool,
     /// The group's voters as this replica's committed configuration names
     /// them; the paths a pace is derived from (27 §3.1 P2).
@@ -742,6 +749,8 @@ struct Owner {
     lost_dropped: u64,
     /// `ReplicaProgress::waits_asked`.
     waits_asked: u64,
+    /// `ReplicaProgress::waits_answered`.
+    waits_answered: u64,
     progress: watch::Sender<ProgressState>,
     /// Drawn when this owner started: with the node id it scopes every read
     /// context the owner mints, so a nonce that restarts from zero, or one
@@ -879,6 +888,7 @@ impl ReplicaHost {
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
+                role: status.role,
                 stop_hand_off: None,
                 sequence: session.sequence(),
                 dropped_replication: 0,
@@ -890,6 +900,7 @@ impl ReplicaHost {
                 peer_reports_coalesced: 0,
                 peer_reports_dropped: 0,
                 waits_asked: 0,
+                waits_answered: 0,
                 stopped: false,
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
@@ -949,6 +960,7 @@ impl ReplicaHost {
             lost_coalesced: 0,
             lost_dropped: 0,
             waits_asked: 0,
+            waits_answered: 0,
             progress,
             incarnation,
             nonce: 0,
@@ -2463,6 +2475,7 @@ impl Owner {
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
+                role: status.role,
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 peers_unreachable: self.unreachable,
@@ -2473,6 +2486,7 @@ impl Owner {
                 peer_reports_coalesced: self.lost_coalesced,
                 peer_reports_dropped: self.lost_dropped,
                 waits_asked: self.waits_asked,
+                waits_answered: self.waits_answered,
                 stopped,
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),

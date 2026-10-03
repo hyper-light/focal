@@ -1041,18 +1041,30 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
     assert_eq!(grant.membership_epoch, 3);
     assert_eq!(grant.voters.len(), 3);
     assert!(grant.learners.is_empty());
-    // Losing one host keeps a quorum: the founder still answers a quorum read
-    // of its membership, and a voter that is still there leads. Which one is
-    // the placement's: it prefers the node the planner put first by load,
-    // and the leader hands over to that one (27 §5), so the founder leads
-    // only where it is preferred or the preferred one is the host lost.
+    // Losing one host keeps a quorum: a voter that is still there leads, and
+    // answers a quorum read of its membership — a read only the leader
+    // serves, a follower naming it instead. Which one leads is the
+    // placement's: it prefers the node the planner put first by load, and the
+    // leader hands over to that one (27 §5), so the founder leads only where
+    // it is preferred or the preferred one is the host lost. Asked of the
+    // founder alone, the read failed wherever the planner put another first
+    // (three suites at once, 2026-10-03).
     let preferred = active.active.placement.preferred_leader;
     peer_b.stop().await;
     let replica = founder.handles.ledger.as_ref().unwrap();
     if let Err(spent) = try_until(&[&founder, &peer_a], Duration::from_secs(20), async || {
         let leader = replica.progress().leader;
-        (replica.membership().await.is_ok() && (leader == founder_node || leader == node_a))
-            .then_some(())
+        let answered = if leader == founder_node {
+            replica.membership().await.is_ok()
+        } else if leader == node_a {
+            match peer_a.handles.fleet.current_host(ledger) {
+                Ok(host) => host.membership().await.is_ok(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        answered.then_some(())
     })
     .await
     {
@@ -1447,8 +1459,29 @@ async fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
             state.sessions[&ledger].pending.is_none()
                 && state.sessions[&ledger].route_epoch == RouteEpoch(2)
         },
-    );
-    activated.await.unwrap().unwrap();
+    )
+    .await;
+    if !matches!(activated, Ok(Some(_))) {
+        let mut seen = Vec::new();
+        for (name, running) in [("founder", &founder), ("a", &peer_a), ("b", &peer_b)] {
+            seen.push(format!(
+                "{name}: replica {:?}; agent {:?}",
+                running
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|replica| replica.progress()),
+                running.handles.placement.status().await
+            ));
+        }
+        panic!(
+            "the placement never activated: {:?}: {seen:#?}; session {:#?}",
+            activated.map(|_| "the service ended"),
+            observe(&founder, &host, 997)
+                .await
+                .map(|(state, _, _)| state.sessions[&ledger].clone())
+        );
+    }
 
     // A replacement joins; then a voter stops, and is drained.
     let (peer_c, node_c) =

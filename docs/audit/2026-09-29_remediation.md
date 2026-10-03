@@ -3215,6 +3215,36 @@ before, 0 of 30 after (ten rounds). The enrollment tests that present a wrong le
 the right chain now say `Unpinned`; those whose chain does not verify still say
 `Unauthorized`.
 
+**Found running two and three focal-node suites at once** (2026-10-03, to reproduce a peer
+session's loaded failures). *A held log's wake held to the clock.*
+`fleet::async_tests::a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits`
+held a thousand sessions' commits to five seconds after the log answered — a guess of the
+clock, which three suites at once passed in 19.2 s and 19.3 s. What it claims is that the
+log's answer wakes every session that waited on it, not left to the owner's tick (ten
+seconds away there). *Fix.* The owner counts the wakes the log's answer delivered
+(`ReplicaProgress::waits_answered`, the answer to `waits_asked`), the test asserts that
+each waiting session's count grew, and its wait for the commits is charged to the commits
+as they come. Three copies beside a whole suite: every session woken by the log's answer,
+no wake lost; the nineteen seconds were the load. *A quorum read asked of the wrong
+member.* `the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`
+asked the founder's replica for a quorum read of its membership after one host's loss —
+a read only the leader serves, a follower naming it instead — while the leader that
+stays is the placement's preferred one, the founder only where it is preferred: wherever
+the planner put the other host first by load, as under three suites at once, the read
+could never succeed (`NotReady { leader }` for 200 periods beside a leader holding a
+quorum). It is asked of the voter that leads now. *Open: two waits that ran out under the
+peer's load.* `a_dead_voter_is_drained_and_replaced_without_waiting_it_out` (its first
+activation, `Budget { periods: 82 }`) and the leader return's
+`leadership_returns_to_the_preferred_leader_once_and_only_when_it_is_there` (node 2, the
+preferred leader, naming no leader at term 15 while nodes 1 and 3 named it, for 500
+periods), each 1 of 4 of the peer's loaded runs on 9e1e463. Not reproduced: 58 copies of
+the two alone, and seven whole-suite runs two and three at a time. Their failures now say
+why: the activation wait prints each node's replica and agent and the session's pending
+placement; the leader return's wait prints each replica's role (`ReplicaProgress::role`,
+added), its owner's periods, the periods without its tick and its longest. A trace of the
+owners every 25 periods under the suites showed leaders stepping down within their term
+for want of a quorum (39 in 36 runs) and patience of 35 ticks at most.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

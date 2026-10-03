@@ -607,6 +607,9 @@ impl GroupOwner {
         let Signal::Persisted(ledger) = signal else {
             return;
         };
+        if let Some(owner) = self.sessions.get_mut(&ledger) {
+            owner.waits_answered = owner.waits_answered.saturating_add(1);
+        }
         self.due(ledger);
         if let Some(waiting) = self.unwoken.pop_first() {
             self.due(waiting);
