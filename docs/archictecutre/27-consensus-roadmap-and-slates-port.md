@@ -1303,7 +1303,10 @@ focal's `WalOptions` (a 64 MiB segment, a 16 MiB record, a 64 MiB batch) go with
 ### 15.4 The group files
 
 **Format.** Each file holds a magic number, a version, the payload's length, the payload
-(postcard), and a CRC32C of everything before it. The checksum is verified on every read, and a
+(postcard), and a CRC-32 of everything before it, summed as focal-log's records are (crc32fast).
+Each bound is derived from what the file holds: a group's records from the largest configuration
+(`hyper_raft::MAX_MEMBERS` members in each of its lists, every number at postcard's longest
+varint), an image from the state machine's own bound on its checkpoint. The checksum is verified on every read, and a
 mismatch is `ConsensusError::Corruption` naming the file. A version this binary does not know is
 refused.
 

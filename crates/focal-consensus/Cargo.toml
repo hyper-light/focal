@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+crc32fast.workspace = true
 focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 getrandom.workspace = true
 hyper-raft.workspace = true
