@@ -12906,3 +12906,14 @@ inconsistent response; a stood-down leader answering a read `OutcomeUnknown`
 where it took nothing (`host::barrier_refused`); and a shaped-path fleet dialling
 under the loopback's half second (`Slow::dial`).
 
+### 2026-10-02 — a chunk's part is what the path delivered
+
+The gate run of the day's batches failed the 128 kbit/s crossing under the
+suite's load: 1.68 chunks crossed for one. A part was sized by the path's law
+— the window over the round trip, stretched over an exchange time — and cold,
+that made a first part of 307 KiB on a path of 16 KiB a second; one such part
+given up under load was sent again whole. A part is now what the last bulk
+exchange the peer answered delivered, over an exchange time, bounded by the
+law; before any, one window's worth (`PeerConnectionPool::part_bytes`,
+`part_for`; the record's F49).
+

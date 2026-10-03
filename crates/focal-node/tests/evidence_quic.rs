@@ -1178,18 +1178,29 @@ async fn evidence_scenario(managed: bool) {
 async fn a_chunk_reaches_its_copy_across(bits: u64) {
     const BYTES: usize = 1024 * 1024 + 7;
     let data = tempfile::tempdir().unwrap();
-    let fleet = Fleet::open_with(
-        data.path(),
-        false,
-        Some(Slow {
-            bits,
-            delay: Duration::from_millis(10),
-            chunk_bytes: 1024 * 1024,
-        }),
-    )
-    .await;
+    let slow = Slow {
+        bits,
+        delay: Duration::from_millis(10),
+        chunk_bytes: 1024 * 1024,
+    };
+    let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
     let leader = fleet.leader().await;
     assert_eq!(leader, 0);
+    // Before the copy has answered a bulk exchange, a part is one window's
+    // worth of the path, what it is known to accept in flight: the cold
+    // window over the cold round trip, stretched over an exchange time,
+    // made a first part of 307 KiB here, twenty seconds on the path and
+    // every byte of it sent again when its exchange failed under load.
+    let pool = &fleet.replicas[leader].pool;
+    let window = pool.window(2).expect("the leader's connection to the copy");
+    let first = pool.part_bytes(2, BYTES);
+    assert!(
+        first
+            <= usize::try_from(window)
+                .unwrap()
+                .max(focal_wire::LEAST_PROGRESS),
+        "a first part of {first} bytes for a window of {window}"
+    );
     let mut bytes = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     bytes.resize_with(BYTES, || {
@@ -1245,6 +1256,15 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
     assert!(
         crossed < (BYTES as u64) * 3 / 2,
         "{crossed} bytes crossed toward the copy for a chunk of {BYTES}"
+    );
+    // A part is now what the path delivered in an exchange's time: at most
+    // twice what the path carries in it (the measurement may lag the path
+    // by one part).
+    let part = pool.part_bytes(2, BYTES);
+    let carries = usize::try_from(bits * slow.dial().as_millis() as u64 / 8 / 1000).unwrap();
+    assert!(
+        part <= carries * 2,
+        "a part of {part} bytes for a path that carries {carries} in an exchange time"
     );
     for index in [0, 1] {
         assert_bytes(

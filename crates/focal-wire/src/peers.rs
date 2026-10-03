@@ -240,9 +240,47 @@ struct Exchange {
     /// that made a round give up too early is not fed by the exchange it
     /// gave up on, and would otherwise never grow.
     abandoned: u32,
+    /// The last bulk exchange the peer answered: its bytes and the
+    /// nanoseconds it took — the rate the path showed, which sizes the
+    /// next part sent it ([`PeerConnectionPool::part_bytes`]).
+    delivered: Option<(u64, u64)>,
 }
 /// The most doublings an estimate takes.
 const MAX_BACKOFF: u32 = 6;
+/// The part of a chunk sent a peer at once ([`PeerConnectionPool::part_bytes`]):
+/// what the path delivered in its last answered bulk exchange (`delivered`:
+/// bytes, nanoseconds), stretched over `timeout`, never more than its law
+/// holds in flight (`window`) over its `round_trip` stretched the same; one
+/// window's worth before any bulk exchange was answered; at least a
+/// datagram of the least size, at most the chunk.
+pub(crate) fn part_for(
+    window: u64,
+    round_trip: Duration,
+    delivered: Option<(u64, u64)>,
+    timeout: Duration,
+    chunk: usize,
+) -> usize {
+    let period = timeout.as_nanos();
+    let law = u128::from(window)
+        .saturating_mul(period)
+        .checked_div(round_trip.as_nanos().max(1))
+        .unwrap_or(u128::MAX);
+    let carried = match delivered {
+        Some((bytes, nanos)) => u128::from(bytes)
+            .saturating_mul(period)
+            .checked_div(u128::from(nanos.max(1)))
+            .unwrap_or(u128::MAX)
+            .min(law),
+        None => u128::from(window).min(law),
+    };
+    usize::try_from(carried)
+        .unwrap_or(usize::MAX)
+        .clamp(
+            crate::frame::LEAST_PROGRESS,
+            chunk.max(crate::frame::LEAST_PROGRESS),
+        )
+        .min(chunk)
+}
 /// Whether an exchange that failed on the wire with `failure` says that its
 /// connection failed, and is to be closed and dialed again: the connection
 /// has `closed` already; the peer did not speak the protocol on it, or the
@@ -266,6 +304,10 @@ struct Asked<'a> {
     /// Whether this operation's exchanges are measured at all.
     measured: bool,
     answered: bool,
+    /// The request's bytes, and whether it is bulk: what an answered bulk
+    /// exchange says the path delivered in the time it took.
+    bytes: u64,
+    bulk: bool,
 }
 impl Asked<'_> {
     fn answered(&mut self, taken: Duration) {
@@ -277,10 +319,12 @@ impl Asked<'_> {
             && state.routes.contains_key(&self.target)
         {
             let exchange = state.exchanges.entry(self.target).or_default();
-            exchange
-                .taken
-                .on_sample(u64::try_from(taken.as_nanos()).unwrap_or(u64::MAX));
+            let nanos = u64::try_from(taken.as_nanos()).unwrap_or(u64::MAX);
+            exchange.taken.on_sample(nanos);
             exchange.abandoned = 0;
+            if self.bulk {
+                exchange.delivered = Some((self.bytes, nanos.max(1)));
+            }
         }
     }
     /// The peer refused: it was reached and decided, which is no sample of
@@ -480,15 +524,23 @@ impl PeerConnectionPool {
         cached.as_ref().map(|entry| entry.remote.round_trip())
     }
     /// How much of a chunk of `chunk` bytes to send `target` at once: what
-    /// the path to it carries in the time the pool gives an exchange
-    /// (`PeerPoolLimits::timeout`), at the rate its law holds in flight
-    /// over its round trip — a datagram at least, the chunk at most. A
-    /// part so sized crosses within one exchange time at the rate the path
-    /// shows, and the lease a receiver holds a transfer under, which every
+    /// the path to it delivered, in the time the pool gives an exchange
+    /// (`PeerPoolLimits::timeout`) — a datagram at least, the chunk at most.
+    /// A part so sized crosses within one exchange time at the rate the path
+    /// showed, and the lease a receiver holds a transfer under, which every
     /// part renews, outlives many of them (the audit's F49: a chunk that
     /// takes its path longer than the lease arrived to a transfer that had
-    /// expired). Where the path is not yet measured, the chunk goes whole,
-    /// as it did.
+    /// expired). The rate is what the last bulk exchange the peer answered
+    /// delivered in the time it took, never more than the law holds in
+    /// flight over a round trip; a path that has answered no bulk exchange
+    /// yet is sent one window's worth, what it is known to accept in
+    /// flight. It was the law's estimate alone — the window over the round
+    /// trip, both cold — stretched over the whole exchange time: the first
+    /// part to a copy across 128 kbit/s was 307 KiB, twenty seconds on the
+    /// path, and the part that failed under a loaded gate run was 700 KiB
+    /// sent again from where the copy held it (`evidence_quic`, 1.68
+    /// chunks crossing for one). Where the path is not yet measured at all,
+    /// the chunk goes whole, as it did. [`part_for`] is the rule.
     pub fn part_bytes(&self, target: u64, chunk: usize) -> usize {
         let Some(window) = self.window(target) else {
             return chunk;
@@ -496,18 +548,13 @@ impl PeerConnectionPool {
         let Some(round_trip) = self.round_trip(target) else {
             return chunk;
         };
-        let round_trip = round_trip.as_nanos().max(1);
-        let carried = u128::from(window)
-            .saturating_mul(self.limits.timeout.as_nanos())
-            .checked_div(round_trip)
-            .unwrap_or(u128::MAX);
-        usize::try_from(carried)
-            .unwrap_or(usize::MAX)
-            .clamp(
-                crate::frame::LEAST_PROGRESS,
-                chunk.max(crate::frame::LEAST_PROGRESS),
-            )
-            .min(chunk)
+        let delivered = self.state.lock().ok().and_then(|state| {
+            state
+                .exchanges
+                .get(&target)
+                .and_then(|exchange| exchange.delivered)
+        });
+        part_for(window, round_trip, delivered, self.limits.timeout, chunk)
     }
     /// What an exchange with `target` is expected to take, its work
     /// included: the tail of the exchanges it answered, doubled for each
@@ -841,13 +888,16 @@ impl PeerConnectionPool {
                 }
             || request.request_epoch.0 == 0
             || request.request_id.is_zero()
-            || postcard::experimental::serialized_size(request)
-                .map_err(|_| PeerSendError::InvalidRequest)?
-                > self.connector.limits().max_frame_bytes as usize
         {
             return Err(PeerSendError::InvalidRequest);
         }
+        let bytes = postcard::experimental::serialized_size(request)
+            .map_err(|_| PeerSendError::InvalidRequest)?;
+        if bytes > self.connector.limits().max_frame_bytes as usize {
+            return Err(PeerSendError::InvalidRequest);
+        }
         let probe = matches!(request.operation, Operation::Probe { .. });
+        let bulk = !probe && request.operation.class() == TrafficClass::Bulk;
         // Replication and probes measure the path; every other exchange
         // measures what the peer takes to answer it.
         let mut asked = Asked {
@@ -855,8 +905,9 @@ impl PeerConnectionPool {
             target,
             measured: !probe && !matches!(request.operation, Operation::Raft { .. }),
             answered: false,
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            bulk,
         };
-        let bulk = !probe && request.operation.class() == TrafficClass::Bulk;
         let _inflight = if probe {
             &self.probe_inflight
         } else if bulk {

@@ -3049,3 +3049,26 @@ running beside the first it crosses 1.9 chunks.
 it: a megabyte read for each part. The lease's sixty seconds are set, not derived; what is
 derived is that a part crosses in a twelfth of them at the rate the path showed.
 
+**A part sized by a cold estimate (2026-10-02, the gate run of the day's batches).** The
+128 kbit/s crossing failed under the full suite's load: 1,763,623 bytes crossed toward the
+copy for a chunk of 1,048,583, the seal at 123 s. A part was "what the path carries in an
+exchange time at the rate its law holds in flight over its round trip" — the window over
+the round trip — and before the path had carried anything both were cold: an initial
+window of 11,552 bytes over the loopback's 40 ms, stretched over the exchange time, made
+a first part of 307 KiB (measured with throwaway diagnostics: twenty seconds on a path
+that carries 16 KiB a second; the parts after it, with the round trip inflated by the
+relay's queue to a second, were 7 to 27 KiB). A first part of 700 KiB whose exchange was
+given up under the load — the harness's exchange time had grown with the dial budget,
+and the part with it — was sent again from where the copy held it. *Fix.* A part is what
+the path *delivered*: the pool keeps, per peer, the bytes and time of the last bulk
+exchange the peer answered, and sizes the next part at that rate over the exchange time,
+never more than the law holds in flight; a peer that has answered no bulk exchange yet is
+sent one window's worth, what the path is known to accept in flight (`part_for`; its unit
+test holds the cold case to the window, the measured case to the rate, the law's bound,
+the fast path's whole chunk and the clamps). The crossing asserts a first part no larger
+than the window and a part after the transfer no larger than twice what the path carries
+in an exchange time. Under a six-process CPU load, with the cold rule, the crossing passed
+twice (74–79 s, 1.13 MB crossed): the failure needs the first part's exchange to be given
+up, which the suite's load did and the hogs alone did not; the amplifier is gone either
+way.
+

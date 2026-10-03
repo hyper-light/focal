@@ -5345,3 +5345,67 @@ fn webpki_crosses_a_zero_length_anchor_through_an_endorsement() {
     assert!(with_endorsement.is_ok(), "{with_endorsement:?}");
     assert!(without.is_err(), "{without:?}");
 }
+/// A part of a chunk is what the path delivered in an exchange's time
+/// (`part_for`, the audit's F49): one window's worth before the peer
+/// answered any bulk exchange — not the cold window over the cold round
+/// trip stretched over the whole time, which sized a first part at 307 KiB
+/// for a path of 128 kbit/s — then the last answered bulk exchange's rate,
+/// never more than the law holds in flight over a round trip, a datagram
+/// at least and the chunk at most.
+#[test]
+fn a_part_is_what_the_path_delivered_in_an_exchange_time() {
+    use crate::peers::part_for;
+    let timeout = Duration::from_millis(1070);
+    let chunk = 1024 * 1024;
+    // Cold: a window of 11,552 bytes over a 40 ms round trip would have
+    // made 307 KiB; the first part is the window.
+    assert_eq!(
+        part_for(11_552, Duration::from_millis(40), None, timeout, chunk),
+        11_552
+    );
+    // Measured: 11,552 bytes answered in 1 s is 12,360 in 1.07 s.
+    assert_eq!(
+        part_for(
+            11_552,
+            Duration::from_millis(40),
+            Some((11_552, 1_000_000_000)),
+            timeout,
+            chunk
+        ),
+        12_360
+    );
+    // The law bounds what a measurement claims: a window of 2,948 over a
+    // 414 ms round trip holds 7,619 in the time, whatever the last
+    // exchange delivered.
+    assert_eq!(
+        part_for(
+            2_948,
+            Duration::from_millis(414),
+            Some((1_000_000, 1_000_000)),
+            timeout,
+            chunk
+        ),
+        7_619
+    );
+    // A fast path reaches the whole chunk after one window: 11,552 bytes
+    // in 3 ms.
+    assert_eq!(
+        part_for(
+            1 << 20,
+            Duration::from_micros(500),
+            Some((11_552, 3_000_000)),
+            timeout,
+            chunk
+        ),
+        chunk
+    );
+    // A datagram at least, the chunk at most.
+    assert_eq!(
+        part_for(100, Duration::from_secs(1), None, timeout, chunk),
+        crate::frame::LEAST_PROGRESS
+    );
+    assert_eq!(
+        part_for(1 << 30, Duration::from_micros(1), None, timeout, 4096),
+        4096
+    );
+}
