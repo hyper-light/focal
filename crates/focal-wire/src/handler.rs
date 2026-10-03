@@ -65,6 +65,12 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_native_requests(&self) -> bool {
         false
     }
+    /// The handler steps a peer's bulk frames in the order they left it
+    /// ([`Operation::RaftOrdered`], 27 §12): the node's replication
+    /// handlers, which hold a frame that overtook the one before it.
+    fn supports_ordered_replication(&self) -> bool {
+        false
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a>;
     fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
@@ -124,6 +130,19 @@ pub async fn dispatch_accounted(
     request: RequestEnvelope,
     limits: &WireLimits,
 ) -> OwnedResponse {
+    dispatch_accounted_by(handler, peer, request, limits, std::time::Duration::ZERO).await
+}
+/// [`dispatch_accounted`] for a request that came by a path whose round
+/// trip is `path`, as the serving connection measures it: what a handler
+/// holds a frame that overtook another for (27 §12). Zero where there is
+/// no path.
+pub async fn dispatch_accounted_by(
+    handler: &dyn RequestHandler,
+    peer: AuthenticatedPeer,
+    request: RequestEnvelope,
+    limits: &WireLimits,
+    path: std::time::Duration,
+) -> OwnedResponse {
     if let Err(error) = limits.validate() {
         return OwnedResponse::new(request.reply(Response::Error(error)));
     }
@@ -142,7 +161,7 @@ pub async fn dispatch_accounted(
         request.request_id,
     );
     let verified = match verify_request(peer, request, limits) {
-        Ok(value) => value,
+        Ok(value) => value.with_path(path),
         Err(error) => {
             return OwnedResponse::new(ResponseEnvelope {
                 protocol,
@@ -684,7 +703,12 @@ pub fn validate_response(
                 return Err(WireError::Limit);
             }
         }
-        Response::PeerAccepted if !matches!(request.operation, Operation::Raft { .. }) => {
+        Response::PeerAccepted
+            if !matches!(
+                request.operation,
+                Operation::Raft { .. } | Operation::RaftOrdered { .. }
+            ) =>
+        {
             return Err(WireError::InvalidFrame);
         }
         Response::Stream(reply) => {

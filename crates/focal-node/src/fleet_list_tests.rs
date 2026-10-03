@@ -143,7 +143,9 @@ impl Fixture {
             }
         }
         for (sender, frame) in messages {
-            let Operation::Raft { message, .. } = &frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                &frame.request.operation
+            else {
                 panic!("Raft expected")
             };
             self.owners[frame.target as usize - 1]

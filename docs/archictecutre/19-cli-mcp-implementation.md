@@ -316,6 +316,11 @@ Peer mutations use explicitly negotiated wire protocol 3. The server advertises
 that profile only through a handler implementing participant admission. Profiles
 1 and 2 retain their previous capability restrictions. A profile 3 envelope for
 another operation is rejected; a node certificate is not participant authority.
+Above it, profile 4 carries native frames (above) and profile 5, the ordered
+replication profile, is a node's alone: a node's replication handlers advertise
+it, a connection between nodes negotiates the highest profile both offer, and
+`Operation::RaftOrdered` is held to profile 5 as the plain `Raft` frame is held
+to the base ([27](27-consensus-roadmap-and-slates-port.md) §12).
 
 The ledger owner checks committed immutable issuer/producer identity before
 allowing an individual legacy runtime-gated command. Authentication alone leaves

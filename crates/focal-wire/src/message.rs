@@ -234,6 +234,22 @@ pub enum Operation {
         #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
+    /// A group's message to a peer, stepped in the order the sender's bulk
+    /// frames left it (27 §12): `sequence` counts the sender's ordered
+    /// frames to this peer within `epoch`, the sender's incarnation. The
+    /// receiver holds a frame that overtook the one before it for the probe
+    /// timeout of the path as it measures it — past that the predecessor
+    /// was lost, and the leader is probing. Carried only on a connection
+    /// that negotiated the ordered profile
+    /// ([`crate::ORDERED_PROTOCOL_VERSION`]); the pool sends `Raft` on one
+    /// that did not.
+    RaftOrdered {
+        group: [u8; 16],
+        epoch: u64,
+        sequence: u64,
+        #[serde(with = "focal_memory::serde_bytes")]
+        message: Vec<u8>,
+    },
 }
 /// What a request is to the connection that carries it; see
 /// [`Operation::class`].
@@ -320,6 +336,7 @@ impl Operation {
             Self::Probe { .. } => 30,
             Self::RangeControl { .. } => 31,
             Self::SessionControl { .. } => 32,
+            Self::RaftOrdered { .. } => 33,
         }
     }
     /// What goes first where one connection carries several requests at
@@ -330,6 +347,7 @@ impl Operation {
     pub fn class(&self) -> TrafficClass {
         match self {
             Self::Raft { .. }
+            | Self::RaftOrdered { .. }
             | Self::Probe { .. }
             | Self::Control { .. }
             | Self::PeerControl { .. }
@@ -816,6 +834,14 @@ impl Negotiated {
                         | PEER_PROTOCOL_VERSION
                         | crate::NATIVE_PROTOCOL_VERSION
                 )
+                | (
+                    crate::ORDERED_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
+                        | crate::ORDERED_PROTOCOL_VERSION
+                )
         )
     }
 }
@@ -915,10 +941,30 @@ impl WireLimits {
         participant: bool,
         native: bool,
     ) -> Result<Negotiated, AccessError> {
+        self.negotiate_ordered(hello, managed, participant, native, false)
+    }
+    /// The ordered profile is offered by a handler that steps a peer's
+    /// frames in the order they left it (27 §12, [`Operation::RaftOrdered`]);
+    /// it implies every earlier profile.
+    pub fn negotiate_ordered(
+        &self,
+        hello: &Hello,
+        managed: bool,
+        participant: bool,
+        native: bool,
+        ordered: bool,
+    ) -> Result<Negotiated, AccessError> {
         if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
         let protocol = if managed
+            && participant
+            && native
+            && ordered
+            && hello.versions.contains(&crate::ORDERED_PROTOCOL_VERSION)
+        {
+            crate::ORDERED_PROTOCOL_VERSION
+        } else if managed
             && participant
             && native
             && hello.versions.contains(&crate::NATIVE_PROTOCOL_VERSION)

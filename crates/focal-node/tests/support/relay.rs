@@ -1,7 +1,8 @@
 //! A path between real nodes, as a relay shapes it: every datagram each
-//! way travels a delay, with jitter drawn for each, and where a rate is
-//! given waits its turn behind those before it at that rate, one that
-//! finds the queue full dropped. A node binds where the
+//! way travels a delay, with jitter drawn for each, where a rate is given
+//! waits its turn behind those before it at that rate, one that finds the
+//! queue full dropped, and where a loss is given is lost one in so many,
+//! as a link loses it. A node binds where the
 //! relay forwards to (`--listen`) and advertises the relay's front, so what
 //! its peers send it, and what it answers, cross the relay. The relay keeps
 //! one socket per client it has seen, so the node behind it sees each
@@ -52,27 +53,75 @@ impl Ord for Travelling {
     }
 }
 
+/// How a relay shapes the path each way.
+#[derive(Clone, Copy)]
+struct Shape {
+    delay: Duration,
+    jitter: Duration,
+    /// Bits a second, where the path has a rate.
+    bits: Option<u64>,
+    /// One datagram in so many lost, where the path loses.
+    loss: Option<u64>,
+}
+
 pub struct Relay {
     front: SocketAddr,
     stop: Arc<AtomicBool>,
-    /// The bytes carried toward the node behind, and toward its clients.
-    carried: Arc<[AtomicU64; 4]>,
+    /// The bytes carried toward the node behind, and toward its clients;
+    /// the datagrams dropped at a full queue each way; the datagrams lost
+    /// each way.
+    carried: Arc<[AtomicU64; 6]>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Relay {
     /// A relay in front of `back`, each datagram each way delayed by `delay`
     /// and up to `jitter` more: a round trip of twice the delay.
     pub fn new(back: SocketAddr, delay: Duration, jitter: Duration) -> Self {
-        Self::shaped(back, delay, jitter, None)
+        Self::build(
+            back,
+            Shape {
+                delay,
+                jitter,
+                bits: None,
+                loss: None,
+            },
+        )
     }
     /// The same, carrying `bits` a second each way where given.
     pub fn shaped(back: SocketAddr, delay: Duration, jitter: Duration, bits: Option<u64>) -> Self {
+        Self::build(
+            back,
+            Shape {
+                delay,
+                jitter,
+                bits,
+                loss: None,
+            },
+        )
+    }
+    /// The same, losing one datagram in `loss` each way: the sender's loss
+    /// detection sends it again, a round trip and more later, and what it
+    /// sent behind it arrives first.
+    pub fn lossy(back: SocketAddr, delay: Duration, jitter: Duration, loss: u64) -> Self {
+        Self::build(
+            back,
+            Shape {
+                delay,
+                jitter,
+                bits: None,
+                loss: Some(loss.max(1)),
+            },
+        )
+    }
+    fn build(back: SocketAddr, shape: Shape) -> Self {
         let front_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let front = front_socket.local_addr().unwrap();
         front_socket.set_read_timeout(Some(POLL)).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
-        let carried: Arc<[AtomicU64; 4]> = Arc::new([
+        let carried: Arc<[AtomicU64; 6]> = Arc::new([
+            AtomicU64::new(0),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -81,17 +130,7 @@ impl Relay {
         let counting = carried.clone();
         let thread = std::thread::Builder::new()
             .name("focal-test-relay".into())
-            .spawn(move || {
-                run(
-                    front_socket,
-                    back,
-                    delay,
-                    jitter,
-                    bits,
-                    &stopping,
-                    &counting,
-                )
-            })
+            .spawn(move || run(front_socket, back, shape, &stopping, &counting))
             .unwrap();
         Self {
             front,
@@ -120,6 +159,13 @@ impl Relay {
             self.carried[3].load(Ordering::Acquire),
         )
     }
+    /// The datagrams the path lost toward the node, and toward its clients.
+    pub fn lost(&self) -> (u64, u64) {
+        (
+            self.carried[4].load(Ordering::Acquire),
+            self.carried[5].load(Ordering::Acquire),
+        )
+    }
 }
 impl Drop for Relay {
     fn drop(&mut self) {
@@ -141,12 +187,16 @@ const QUEUE: usize = 32;
 fn run(
     front: UdpSocket,
     back: SocketAddr,
-    delay: Duration,
-    jitter: Duration,
-    bits: Option<u64>,
+    shape: Shape,
     stop: &AtomicBool,
-    carried: &[AtomicU64; 4],
+    carried: &[AtomicU64; 6],
 ) {
+    let Shape {
+        delay,
+        jitter,
+        bits,
+        loss,
+    } = shape;
     let mut clients: Vec<(SocketAddr, Client)> = Vec::new();
     let mut travelling = BinaryHeap::new();
     let mut serial = 0u64;
@@ -208,8 +258,17 @@ fn run(
             }
         }
         while let Some((to, via, bytes)) = taken.pop_front() {
-            let extra = Duration::from_nanos(draw() % (jitter.as_nanos() as u64).saturating_add(1));
             let way = usize::from(via >= usize::MAX - CLIENTS);
+            // A path that loses loses one datagram in so many, each way.
+            if let Some(loss) = loss
+                && draw() % loss == 0
+            {
+                if let Some(lost) = carried.get(4 + way) {
+                    lost.fetch_add(1, Ordering::AcqRel);
+                }
+                continue;
+            }
+            let extra = Duration::from_nanos(draw() % (jitter.as_nanos() as u64).saturating_add(1));
             let now = Instant::now();
             // At the bottleneck: behind those before it, at the rate; one
             // that finds the queue full is dropped.

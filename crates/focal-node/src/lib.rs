@@ -65,6 +65,7 @@ pub mod range_balancer;
 mod reads;
 mod reconciliation;
 pub mod replication;
+pub mod resequence;
 pub mod route_cache_host;
 #[cfg(test)]
 mod route_cache_tests;

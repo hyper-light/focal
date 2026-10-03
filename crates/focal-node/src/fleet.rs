@@ -151,19 +151,24 @@ pub struct ReplicationFrame {
     /// streaming to it. Bounded by the members a configuration names.
     lost: Option<mpsc::SyncSender<u64>>,
     /// What a group cannot do without — a heartbeat, a vote, an answer:
-    /// everything but entries and snapshots. The driver sends it before the
-    /// entries that wait for the same peer, and gives it up last
+    /// everything but appends and snapshots. The driver sends it before the
+    /// appends that wait for the same peer, and gives it up last
     /// (`replication::drive`).
     pub(crate) urgent: bool,
     _charge: Allocation,
 }
-/// Whether a message is what a group cannot do without: anything but
-/// entries on their way to a member and a snapshot.
+/// Whether a message is what a group cannot do without: anything but an
+/// append on its way to a member and a snapshot. An append names a place
+/// in the log — the entry before what it carries — whether it carries
+/// entries or only the commit that followed them; the member judges it by
+/// what it holds, so it goes in the order of the appends before it
+/// (27 §12). Sent ahead of them as a heartbeat is, an empty append named
+/// an entry the member had yet to receive and was refused for it (the
+/// jittered fleet: every refusal with the order kept was one, 2026-10-02).
 pub(crate) fn urgent(message: &focal_consensus::Message) -> bool {
-    let entries = message.msg_type == focal_consensus::MessageType::MsgAppend as i32
-        && !message.entries.is_empty();
+    let append = message.msg_type == focal_consensus::MessageType::MsgAppend as i32;
     let snapshot = message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32;
-    !entries && !snapshot
+    !append && !snapshot
 }
 /// The peers an owner may have lost exchanges with between two of its
 /// periods: at most every member once (`focal_raft::MAX_MEMBERS`); a peer
@@ -224,6 +229,18 @@ pub struct ReplicaProgress {
     /// Exchanges the driver could not make at all, told to the core so it
     /// probes the peer instead of streaming to it (27 §3.3).
     pub peers_unreachable: u64,
+    /// Appends this replica refused for not holding the entry before them
+    /// (27 §12): what a frame that overtook another cost before the order
+    /// was kept, and what a lost frame costs still.
+    pub appends_rejected: u64,
+    /// Frames held for the one they overtook (27 §12), and frames let go
+    /// past their patience or their lane without it: the first is what
+    /// the path reordered, the second what it lost.
+    pub frames_held: u64,
+    pub frames_let_go: u64,
+    /// Frames behind what was already stepped from their source (27 §12):
+    /// stepped as they came, the core judging them.
+    pub frames_stale: u64,
     /// Reports of a peer the owner already held for the core, and reports
     /// beyond the bound on peers held: the feedback is a hint about a
     /// peer, coalesced and never grown.
@@ -650,6 +667,26 @@ enum WaitingFor {
     },
     Stream(PendingStream),
 }
+/// A peer's frame held for the one it overtook (27 §12): stepped when that
+/// one comes, or when its patience passes, and answered as every peer frame
+/// is, at the Ready fence.
+struct HeldFrame {
+    source: u64,
+    message: Vec<u8>,
+    pending: Pending,
+}
+/// How a peer's frame was admitted (`admit_replication`).
+enum Replication {
+    /// Stepped; answered at the Ready fence by the owner's period given.
+    Stepped(u64),
+    /// Held for the frame it overtook, until the owner's period `until`.
+    Held {
+        source: u64,
+        sequence: u64,
+        until: u64,
+        deadline: u64,
+    },
+}
 struct Pending {
     header: ResponseEnvelope,
     response: oneshot::Sender<OwnedResponse>,
@@ -711,6 +748,19 @@ struct Owner {
     /// aligned with another replica's, never repeats a context (F63).
     incarnation: u64,
     nonce: u64,
+    /// The order this owner's bulk frames to each peer leave in (27 §12):
+    /// the next sequence for the peer within this owner's incarnation,
+    /// pruned to the configuration's members each pass.
+    ordered: std::collections::BTreeMap<u64, u64>,
+    /// A peer's bulk frames held for the ones they overtook, stepped in
+    /// their order (`crate::resequence`).
+    resequencer: crate::resequence::Resequencer<HeldFrame>,
+    /// `ReplicaProgress::appends_rejected`.
+    appends_rejected: u64,
+    /// `ReplicaProgress::frames_held`, `frames_let_go` and `frames_stale`.
+    frames_held: u64,
+    frames_let_go: u64,
+    frames_stale: u64,
     support_cursor: u64,
     dropped: u64,
     unreachable: u64,
@@ -833,6 +883,10 @@ impl ReplicaHost {
                 sequence: session.sequence(),
                 dropped_replication: 0,
                 peers_unreachable: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
+                appends_rejected: 0,
                 peer_reports_coalesced: 0,
                 peer_reports_dropped: 0,
                 waits_asked: 0,
@@ -868,6 +922,7 @@ impl ReplicaHost {
         let mut incarnation = [0u8; 8];
         getrandom::fill(&mut incarnation).map_err(|_| LedgerError::Capacity)?;
         let incarnation = u64::from_le_bytes(incarnation);
+        let lane = session.inflight_window();
         let owner = Owner {
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
             pace: pace.clone(),
@@ -897,6 +952,12 @@ impl ReplicaHost {
             progress,
             incarnation,
             nonce: 0,
+            ordered: std::collections::BTreeMap::new(),
+            resequencer: crate::resequence::Resequencer::new(lane, LOST_PEERS),
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
             support_cursor: 0,
             dropped: 0,
             unreachable: 0,
@@ -1344,6 +1405,9 @@ impl RequestHandler for ReplicaHost {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
     fn handle<'a>(
         &'a self,
         request: &'a VerifiedRequest,
@@ -1406,7 +1470,10 @@ impl ReplicaHost {
         let closed = request
             .request()
             .reply(Response::Error(AccessError::Unavailable));
-        let replication = matches!(request.request().operation, Operation::Raft { .. });
+        let replication = matches!(
+            request.request().operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        );
         let response_bytes = match &request.request().operation {
             Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
             Operation::Summary => {
@@ -2395,6 +2462,10 @@ impl Owner {
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 peers_unreachable: self.unreachable,
+                frames_held: self.frames_held,
+                frames_let_go: self.frames_let_go,
+                frames_stale: self.frames_stale,
+                appends_rejected: self.appends_rejected,
                 peer_reports_coalesced: self.lost_coalesced,
                 peer_reports_dropped: self.lost_dropped,
                 waits_asked: self.waits_asked,
@@ -2428,6 +2499,7 @@ impl Owner {
             .iter()
             .filter(|pending| matches!(pending.waiting, WaitingFor::PeerPersistence))
             .count()
+            .saturating_add(self.resequencer.held())
     }
     /// Pending participant requests: the queue less the peers'.
     fn pending_participants(&self) -> usize {
@@ -2450,6 +2522,116 @@ impl Owner {
             .max(1);
         members.saturating_mul(self.session.inflight_window())
     }
+    /// The owner's period past which a held frame is stepped without the
+    /// one it overtook: the probe timeout of the path it came by, as this
+    /// node measures it (RFC 9002 §6.2: what is not here by then was lost),
+    /// in this owner's periods, and one more for the period under way,
+    /// whose phase is unknown.
+    fn patience_until(&self, round_trip: std::time::Duration) -> u64 {
+        self.pace
+            .periods()
+            .saturating_add(focal_timing::ProgressDeadline::periods(
+                focal_wire::probe_timeout(round_trip),
+                self.config.tick,
+            ))
+            .saturating_add(1)
+    }
+    /// Step the frames the resequencer let go, in their order.
+    fn step_due(&mut self) {
+        while let Some(held) = self.resequencer.take_due() {
+            self.frames_let_go = self.frames_let_go.saturating_add(1);
+            self.step_held(held);
+        }
+    }
+    /// Step what was held behind the frame from `source` just stepped.
+    fn step_ready(&mut self, source: u64) {
+        while let Some(held) = self.resequencer.step_ready(source) {
+            self.step_held(held);
+        }
+    }
+    /// Admit a peer's frame: authorized, within the peers' reserve, and
+    /// stepped — now, with what was held behind it, or held itself for
+    /// the frame it overtook (27 §12).
+    fn admit_replication(
+        &mut self,
+        verified: &VerifiedRequest,
+        group: [u8; 16],
+        order: Option<(u64, u64)>,
+    ) -> Result<Replication, AccessError> {
+        let request = verified.request();
+        let deadline = self.request_deadline().ok_or(AccessError::Unavailable)?;
+        if request.ledger != self.session.ledger() {
+            return Err(AccessError::Unauthorized);
+        }
+        let PeerRole::Node { node_id } = verified.peer().role() else {
+            return Err(AccessError::Unauthorized);
+        };
+        let status = self.session.status();
+        if group != self.session.group_id()
+            || (!status.voters.contains(&node_id)
+                && !status.learners.contains(&node_id)
+                && self.admitted.binary_search(&node_id).is_err())
+        {
+            return Err(AccessError::Unauthorized);
+        }
+        // Raft traffic is admitted beside the participants (F56): a full
+        // participant queue never refuses the acknowledgments its own
+        // completion waits on.
+        if self.pending_peers() >= self.peer_reserve() {
+            return Err(AccessError::Capacity);
+        }
+        let message = match &request.operation {
+            Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. } => message,
+            _ => return Err(AccessError::InvalidRequest),
+        };
+        // A bulk frame is stepped in the order it left its sender: one
+        // that overtook the frame before it is held for it, for its
+        // patience at most.
+        if let Some((epoch, sequence)) = order {
+            match self.resequencer.admit(node_id, epoch, sequence) {
+                Err(crate::resequence::Capacity) => return Err(AccessError::Capacity),
+                Ok(crate::resequence::Admission::Hold) => {
+                    self.frames_held = self.frames_held.saturating_add(1);
+                    return Ok(Replication::Held {
+                        source: node_id,
+                        sequence,
+                        until: self.patience_until(verified.path_round_trip()),
+                        deadline,
+                    });
+                }
+                Ok(crate::resequence::Admission::Stale) => {
+                    self.frames_stale = self.frames_stale.saturating_add(1);
+                }
+                Ok(crate::resequence::Admission::Step) => {}
+            }
+            self.step_due();
+        }
+        self.session
+            .step_authenticated(node_id, message)
+            .map_err(access)?;
+        if order.is_some() {
+            self.step_ready(node_id);
+        }
+        // The ingress acknowledgment and the generated Raft messages remain
+        // behind the exact Ready fence, including async writes.
+        Ok(Replication::Stepped(deadline))
+    }
+    /// Step a held frame: answered at the Ready fence as every peer frame
+    /// is, or refused as its step was.
+    fn step_held(&mut self, held: HeldFrame) {
+        let HeldFrame {
+            source,
+            message,
+            mut pending,
+        } = held;
+        match self.session.step_authenticated(source, &message) {
+            Ok(()) => {
+                pending.waiting = WaitingFor::PeerPersistence;
+                self.pending.push_back(pending);
+            }
+            Err(error) => pending.finish(Response::Error(access(error))),
+        }
+    }
     fn request(
         &mut self,
         verified: VerifiedRequest,
@@ -2461,6 +2643,69 @@ impl Owner {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
+        // A peer's frame has a path of its own: stepped now, or held for
+        // the frame it overtook (27 §12), and answered at the Ready fence
+        // either way.
+        let replication = match &verified.request().operation {
+            Operation::Raft { group, .. } => Some((*group, None)),
+            Operation::RaftOrdered {
+                group,
+                epoch,
+                sequence,
+                ..
+            } => Some((*group, Some((*epoch, *sequence)))),
+            _ => None,
+        };
+        if let Some((group, order)) = replication {
+            match self.admit_replication(&verified, group, order) {
+                Ok(Replication::Stepped(deadline)) => self.pending.push_back(Pending {
+                    header,
+                    response,
+                    waiting: WaitingFor::PeerPersistence,
+                    term: self.session.status().term,
+                    deadline,
+                    _charge: charge,
+                }),
+                Ok(Replication::Held {
+                    source,
+                    sequence,
+                    until,
+                    deadline,
+                }) => {
+                    let (_, request) = verified.into_parts();
+                    let Operation::RaftOrdered { message, .. } = request.operation else {
+                        let mut header = header;
+                        header.result = Response::Error(AccessError::Unavailable);
+                        let _ = response.send(finish_response(header, charge));
+                        return;
+                    };
+                    let frame = HeldFrame {
+                        source,
+                        message,
+                        pending: Pending {
+                            header,
+                            response,
+                            waiting: WaitingFor::PeerPersistence,
+                            term: self.session.status().term,
+                            deadline,
+                            _charge: charge,
+                        },
+                    };
+                    if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
+                        frame.pending.finish(Response::Error(AccessError::Capacity));
+                    }
+                    // A lane that was full let what it held go, this frame
+                    // with it.
+                    self.step_due();
+                }
+                Err(error) => {
+                    let mut header = header;
+                    header.result = Response::Error(error);
+                    let _ = response.send(finish_response(header, charge));
+                }
+            }
+            return;
+        }
         let mut waiting = None;
         let result = (|| -> Result<Response, AccessError> {
             let request = verified.request();
@@ -2468,32 +2713,6 @@ impl Owner {
             let deadline = self.request_deadline().ok_or(AccessError::Unavailable)?;
             if request.ledger != self.session.ledger() {
                 return Err(AccessError::Unauthorized);
-            }
-            if let Operation::Raft { group, message } = &request.operation {
-                let PeerRole::Node { node_id } = peer.role() else {
-                    return Err(AccessError::Unauthorized);
-                };
-                let status = self.session.status();
-                if *group != self.session.group_id()
-                    || (!status.voters.contains(&node_id)
-                        && !status.learners.contains(&node_id)
-                        && self.admitted.binary_search(&node_id).is_err())
-                {
-                    return Err(AccessError::Unauthorized);
-                }
-                // Raft traffic is admitted beside the participants (F56):
-                // a full participant queue never refuses the acknowledgments
-                // its own completion waits on.
-                if self.pending_peers() >= self.peer_reserve() {
-                    return Err(AccessError::Capacity);
-                }
-                self.session
-                    .step_authenticated(node_id, message)
-                    .map_err(access)?;
-                // This ingress acknowledgment and the generated Raft messages
-                // remain behind the exact Ready fence, including async writes.
-                waiting = Some((WaitingFor::PeerPersistence, deadline));
-                return Ok(Response::Error(AccessError::Unavailable));
             }
             if let Operation::ManagedSupport { group } = &request.operation {
                 let PeerRole::Node { node_id } = peer.role() else {
@@ -3342,6 +3561,11 @@ impl Owner {
     /// its way that is not.
     fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
         for message in messages {
+            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32
+                && message.reject
+            {
+                self.appends_rejected = self.appends_rejected.saturating_add(1);
+            }
             let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
@@ -3391,22 +3615,53 @@ impl Owner {
             self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
             let id = ((u128::from(self.session.status().node_id) << 64) | u128::from(self.nonce))
                 .to_be_bytes();
+            let group = self.session.group_id();
+            let urgent = urgent(message);
+            // A bulk frame carries the order it leaves in (27 §12): the
+            // next sequence to its peer within this owner's incarnation,
+            // for as many peers as a configuration names; the driver
+            // finishes it for the peer's profile.
+            let sequence = if urgent {
+                None
+            } else {
+                match self.ordered.get(&message.to) {
+                    Some(last) => last.checked_add(1),
+                    None if self.ordered.len() < LOST_PEERS => Some(1),
+                    None => None,
+                }
+            };
+            let operation = match sequence {
+                Some(sequence) => {
+                    self.ordered.insert(message.to, sequence);
+                    Operation::RaftOrdered {
+                        group,
+                        epoch: self.incarnation,
+                        sequence,
+                        message: message_bytes,
+                    }
+                }
+                None => Operation::Raft {
+                    group,
+                    message: message_bytes,
+                },
+            };
             let frame = ReplicationFrame {
                 target: message.to,
                 snapshot,
                 lost: Some(self.lost_sender.clone()),
-                urgent: urgent(message),
+                urgent,
                 _charge: charge.commit(),
                 request: RequestEnvelope {
-                    protocol: PROTOCOL_VERSION,
+                    protocol: if matches!(operation, Operation::RaftOrdered { .. }) {
+                        focal_wire::ORDERED_PROTOCOL_VERSION
+                    } else {
+                        PROTOCOL_VERSION
+                    },
                     ledger: self.session.ledger(),
                     route_epoch: self.config.route_epoch,
                     request_epoch: RequestEpoch(1),
                     request_id: RequestId(id),
-                    operation: Operation::Raft {
-                        group: self.session.group_id(),
-                        message: message_bytes,
-                    },
+                    operation,
                 },
             };
             if self.outbound.try_send(frame).is_err() {
@@ -3855,6 +4110,27 @@ impl Owner {
     fn expire_pending(&mut self) {
         self.expire_placement();
         let now = self.pace.periods();
+        // Frames held past their patience go, in their order; the lanes of
+        // members that left are closed and what they held refused; the
+        // order kept for departed peers is forgotten (27 §12).
+        if self.resequencer.expire(now).is_ok() {
+            self.step_due();
+        }
+        let status = self.session.status();
+        let admitted = &self.admitted;
+        let member = |source: u64| {
+            status.voters.contains(&source)
+                || status.learners.contains(&source)
+                || admitted.binary_search(&source).is_ok()
+        };
+        let mut gone = Vec::new();
+        if self.resequencer.prune(&member, &mut gone).is_ok() {
+            for held in gone {
+                held.pending
+                    .finish(Response::Error(AccessError::Unauthorized));
+            }
+        }
+        self.ordered.retain(|peer, _| member(*peer));
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(pending) = self.memberships.pop_front() else {

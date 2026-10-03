@@ -84,6 +84,16 @@ pub struct ControlProgress {
     /// §3.3); reports coalesced into a peer already held, and reports
     /// beyond the bound on peers held.
     pub peers_unreachable: u64,
+    /// Appends this replica refused for not holding the entry before them
+    /// (27 §12): what a frame that overtook another cost before the order
+    /// was kept, and what a lost frame costs still.
+    pub appends_rejected: u64,
+    /// Frames held for the one they overtook, frames let go past their
+    /// patience or their lane without it, and frames behind what was
+    /// already stepped from their source (27 §12).
+    pub frames_held: u64,
+    pub frames_let_go: u64,
+    pub frames_stale: u64,
     pub peer_reports_coalesced: u64,
     pub peer_reports_dropped: u64,
     pub stopped: bool,
@@ -305,6 +315,15 @@ enum Turn {
     Submit(Box<ControlRequest>),
     Transfer(ControlTransfer),
 }
+/// A peer's frame held for the one it overtook (27 §12), answered once it
+/// is stepped and the drain that follows has run.
+struct HeldControlFrame {
+    source: u64,
+    message: Vec<u8>,
+    header: ResponseEnvelope,
+    response: oneshot::Sender<Completed>,
+    charge: Allocation,
+}
 struct Pending {
     header: ResponseEnvelope,
     response: oneshot::Sender<Completed>,
@@ -345,6 +364,23 @@ struct Owner<V> {
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
+    /// This owner's incarnation, the epoch of the order its bulk frames
+    /// leave in (27 §12); drawn when it started.
+    epoch: u64,
+    /// The next sequence of a bulk frame to each peer, pruned to the
+    /// members the replica accepts.
+    ordered: std::collections::BTreeMap<u64, u64>,
+    /// A peer's bulk frames held for the ones they overtook, stepped in
+    /// their order (`crate::resequence`).
+    resequencer: crate::resequence::Resequencer<HeldControlFrame>,
+    /// Held frames stepped since the last drain, answered once it has run.
+    stepped: Vec<(ResponseEnvelope, oneshot::Sender<Completed>, Allocation)>,
+    /// `ControlProgress::appends_rejected`, `frames_held`, `frames_let_go`
+    /// and `frames_stale`.
+    appends_rejected: u64,
+    frames_held: u64,
+    frames_let_go: u64,
+    frames_stale: u64,
     /// Whether a request took its turn for the proposal in the drain under
     /// way: the next drain proposes it.
     took_turn: bool,
@@ -631,6 +667,10 @@ impl ControlHost {
                 revisions: replica.revisions(),
                 dropped_replication: 0,
                 peers_unreachable: 0,
+                appends_rejected: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
                 peer_reports_coalesced: 0,
                 peer_reports_dropped: 0,
                 stopped: false,
@@ -641,6 +681,9 @@ impl ControlHost {
             _allocation: None,
         });
         let (lost_sender, lost) = mpsc::sync_channel(crate::fleet::LOST_PEERS);
+        let mut epoch = [0u8; 8];
+        getrandom::fill(&mut epoch).map_err(|_| ControlError::Capacity)?;
+        let epoch = u64::from_le_bytes(epoch);
         let owner = Owner {
             replica,
             initial,
@@ -662,6 +705,17 @@ impl ControlHost {
             progress,
             nonce: 0,
             dropped: 0,
+            epoch,
+            ordered: std::collections::BTreeMap::new(),
+            resequencer: crate::resequence::Resequencer::new(
+                focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+                crate::fleet::LOST_PEERS,
+            ),
+            stepped: Vec::new(),
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
             took_turn: false,
             unreachable: 0,
             failure: None,
@@ -855,7 +909,10 @@ impl RequestHandler for ControlHost {
             let capacity = request
                 .request()
                 .reply(Response::Error(AccessError::Capacity));
-            let peer = matches!(request.request().operation, Operation::Raft { .. });
+            let peer = matches!(
+                request.request().operation,
+                Operation::Raft { .. } | Operation::RaftOrdered { .. }
+            );
             let Some(bytes) = postcard::experimental::serialized_size(request.request())
                 .ok()
                 .and_then(|n| n.checked_mul(if peer { 2 } else { 32 }))
@@ -1298,6 +1355,75 @@ impl<V: AuthorityVerifier> Owner<V> {
             _state: state,
         })
     }
+    /// The owner's period past which a held frame is stepped without the
+    /// one it overtook: the probe timeout of the path it came by, as this
+    /// node measures it (RFC 9002 §6.2: what is not here by then was lost),
+    /// in this owner's periods, and one more for the period under way,
+    /// whose phase is unknown.
+    fn patience_until(&self, round_trip: std::time::Duration) -> u64 {
+        self.pace
+            .periods()
+            .saturating_add(focal_timing::ProgressDeadline::periods(
+                focal_wire::probe_timeout(round_trip),
+                self.config.tick,
+            ))
+            .saturating_add(1)
+    }
+    /// Step the frames the resequencer let go, in their order.
+    fn step_due(&mut self) {
+        while let Some(held) = self.resequencer.take_due() {
+            self.frames_let_go = self.frames_let_go.saturating_add(1);
+            self.step_held(held);
+        }
+    }
+    /// Step what was held behind the frame from `source` just stepped.
+    fn step_ready(&mut self, source: u64) {
+        while let Some(held) = self.resequencer.step_ready(source) {
+            self.step_held(held);
+        }
+    }
+    /// Step a held frame; it is answered once the drain that follows has
+    /// run (`answer_stepped`), or refused now as its step was.
+    fn step_held(&mut self, held: HeldControlFrame) {
+        let HeldControlFrame {
+            source,
+            message,
+            mut header,
+            response,
+            charge,
+        } = held;
+        let stepped = self.replica.step_authenticated(source, &message);
+        if stepped.is_ok() && self.stepped.try_reserve(1).is_ok() {
+            self.stepped.push((header, response, charge));
+            return;
+        }
+        header.result = Response::Error(if stepped.is_ok() {
+            AccessError::Capacity
+        } else {
+            AccessError::Unavailable
+        });
+        let _ = response.send(Completed {
+            response: header,
+            _input: charge,
+            _output: None,
+        });
+    }
+    /// Answer the held frames stepped since the last drain: accepted once
+    /// the drain ran, unavailable if it failed.
+    fn answer_stepped(&mut self, drained: bool) {
+        for (mut header, response, charge) in self.stepped.drain(..) {
+            header.result = if drained {
+                Response::PeerAccepted
+            } else {
+                Response::Error(AccessError::Unavailable)
+            };
+            let _ = response.send(Completed {
+                response: header,
+                _input: charge,
+                _output: None,
+            });
+        }
+    }
     fn request(
         &mut self,
         verified: VerifiedRequest,
@@ -1313,11 +1439,16 @@ impl<V: AuthorityVerifier> Owner<V> {
             Operation::EnrollmentControl { .. }
         );
         let mut peer_accepted = false;
-        let peer_rpc = matches!(verified.request().operation, Operation::Raft { .. });
+        let mut held: Option<(u64, u64, u64)> = None;
+        let peer_rpc = matches!(
+            verified.request().operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        );
         let root_peer = if self.replica.identity().scope == ControlScope::Root
             && matches!(
                 verified.request().operation,
                 Operation::Raft { .. }
+                    | Operation::RaftOrdered { .. }
                     | Operation::PeerControl { .. }
                     | Operation::EnrollmentControl { .. }
             ) {
@@ -1349,16 +1480,51 @@ impl<V: AuthorityVerifier> Owner<V> {
                 self.drain().map_err(ControlFailure::from)?;
                 self.authorize_root_peer(peer)?;
             }
-            if let Operation::Raft { group, message } = &request.operation {
+            let replication = match &request.operation {
+                Operation::Raft { group, message } => Some((*group, None, message)),
+                Operation::RaftOrdered {
+                    group,
+                    epoch,
+                    sequence,
+                    message,
+                } => Some((*group, Some((*epoch, *sequence)), message)),
+                _ => None,
+            };
+            if let Some((group, order, message)) = replication {
                 let PeerRole::Node { node_id } = verified.peer().role() else {
                     return Err(ControlFailure::Unauthorized);
                 };
-                if *group != self.replica.identity().group || !self.replica.accepts_peer(node_id) {
+                if group != self.replica.identity().group || !self.replica.accepts_peer(node_id) {
                     return Err(ControlFailure::Unauthorized);
+                }
+                // A bulk frame is stepped in the order it left its sender
+                // (27 §12): one that overtook the frame before it is held
+                // for it, for its patience at most.
+                if let Some((epoch, sequence)) = order {
+                    match self.resequencer.admit(node_id, epoch, sequence) {
+                        Err(crate::resequence::Capacity) => return Err(ControlFailure::Capacity),
+                        Ok(crate::resequence::Admission::Hold) => {
+                            self.frames_held = self.frames_held.saturating_add(1);
+                            held = Some((
+                                node_id,
+                                sequence,
+                                self.patience_until(verified.path_round_trip()),
+                            ));
+                            return Err(ControlFailure::Invalid);
+                        }
+                        Ok(crate::resequence::Admission::Stale) => {
+                            self.frames_stale = self.frames_stale.saturating_add(1);
+                        }
+                        Ok(crate::resequence::Admission::Step) => {}
+                    }
+                    self.step_due();
                 }
                 self.replica
                     .step_authenticated(node_id, message)
                     .map_err(ControlFailure::from)?;
+                if order.is_some() {
+                    self.step_ready(node_id);
+                }
                 self.drain().map_err(ControlFailure::from)?;
                 peer_accepted = true;
                 return Err(ControlFailure::Invalid);
@@ -1575,6 +1741,43 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
             }
         })();
+        if let Some((source, sequence, until)) = held {
+            // Held for the frame it overtook: answered once it is stepped
+            // and the drain that follows has run.
+            let (_, request) = verified.into_parts();
+            let Operation::RaftOrdered { message, .. } = request.operation else {
+                let mut header = header;
+                header.result = Response::Error(AccessError::Unavailable);
+                let _ = response.send(Completed {
+                    response: header,
+                    _input: charge,
+                    _output: None,
+                });
+                return;
+            };
+            let frame = HeldControlFrame {
+                source,
+                message,
+                header,
+                response,
+                charge,
+            };
+            if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
+                let mut header = frame.header;
+                header.result = Response::Error(AccessError::Capacity);
+                let _ = frame.response.send(Completed {
+                    response: header,
+                    _input: frame.charge,
+                    _output: None,
+                });
+            }
+            // A lane that was full let what it held go, this frame with it.
+            self.step_due();
+            if self.drain().is_err() {
+                self.answer_stepped(false);
+            }
+            return;
+        }
         if peer_accepted {
             let mut header = header;
             header.result = Response::PeerAccepted;
@@ -1644,6 +1847,35 @@ impl<V: AuthorityVerifier> Owner<V> {
             )
     }
     fn drain(&mut self) -> Result<(), ControlError> {
+        // Frames held past their patience go first, in their order; the
+        // lanes of members the replica no longer accepts are closed and
+        // what they held refused (27 §12).
+        if self.resequencer.expire(self.pace.periods()).is_ok() {
+            self.step_due();
+        }
+        let mut gone = Vec::new();
+        if self
+            .resequencer
+            .prune(|source| self.replica.accepts_peer(source), &mut gone)
+            .is_ok()
+        {
+            for frame in gone {
+                let mut header = frame.header;
+                header.result = Response::Error(AccessError::Unauthorized);
+                let _ = frame.response.send(Completed {
+                    response: header,
+                    _input: frame.charge,
+                    _output: None,
+                });
+            }
+        }
+        self.ordered
+            .retain(|peer, _| self.replica.accepts_peer(*peer));
+        let drained = self.drain_turns();
+        self.answer_stepped(drained.is_ok());
+        drained
+    }
+    fn drain_turns(&mut self) -> Result<(), ControlError> {
         // What took its turn in a drain is proposed by the next: one more
         // drain for each request that waits, at most, and none when none
         // took a turn.
@@ -1950,6 +2182,11 @@ impl<V: AuthorityVerifier> Owner<V> {
         node: u64,
     ) -> Result<(), ControlError> {
         for message in messages {
+            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32
+                && message.reject
+            {
+                self.appends_rejected = self.appends_rejected.saturating_add(1);
+            }
             // Register the exact current flight before any local operation can
             // drop it. Replacing a prior receiver fences late transport results.
             let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
@@ -1996,16 +2233,46 @@ impl<V: AuthorityVerifier> Owner<V> {
             self.nonce = self.nonce.checked_add(1).ok_or(ControlError::Capacity)?;
             let urgent = crate::fleet::urgent(&message);
             let target = message.to;
+            let group = self.replica.identity().group;
+            // A bulk frame carries the order it leaves in (27 §12): the
+            // next sequence to its peer within this owner's epoch, for as
+            // many peers as a configuration names; the driver finishes it
+            // for the peer's profile.
+            let sequence = if urgent {
+                None
+            } else {
+                match self.ordered.get(&target) {
+                    Some(last) => last.checked_add(1),
+                    None if self.ordered.len() < crate::fleet::LOST_PEERS => Some(1),
+                    None => None,
+                }
+            };
+            let operation = match sequence {
+                Some(sequence) => {
+                    self.ordered.insert(target, sequence);
+                    Operation::RaftOrdered {
+                        group,
+                        epoch: self.epoch,
+                        sequence,
+                        message: encoded,
+                    }
+                }
+                None => Operation::Raft {
+                    group,
+                    message: encoded,
+                },
+            };
             let request = RequestEnvelope {
-                protocol: PROTOCOL_VERSION,
+                protocol: if matches!(operation, Operation::RaftOrdered { .. }) {
+                    focal_wire::ORDERED_PROTOCOL_VERSION
+                } else {
+                    PROTOCOL_VERSION
+                },
                 ledger: self.config.namespace,
                 route_epoch: self.config.route_epoch,
                 request_epoch: RequestEpoch(1),
                 request_id: RequestId::from_u128((u128::from(node) << 64) | u128::from(self.nonce)),
-                operation: Operation::Raft {
-                    group: self.replica.identity().group,
-                    message: encoded,
-                },
+                operation,
             };
             if self
                 .outbound
@@ -2196,6 +2463,10 @@ impl<V: AuthorityVerifier> Owner<V> {
                 revisions: self.replica.revisions(),
                 dropped_replication: self.dropped,
                 peers_unreachable: self.unreachable,
+                appends_rejected: self.appends_rejected,
+                frames_held: self.frames_held,
+                frames_let_go: self.frames_let_go,
+                frames_stale: self.frames_stale,
                 peer_reports_coalesced: self.lost_coalesced,
                 peer_reports_dropped: self.lost_dropped,
                 stopped,

@@ -364,7 +364,9 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
         leader.tick().unwrap();
         settle(&mut leader);
         while let Ok(frame) = outgoing.try_recv() {
-            let Operation::Raft { message, .. } = &frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                &frame.request.operation
+            else {
                 panic!("raft")
             };
             let mut decoded = focal_consensus::Message::default();
@@ -386,7 +388,9 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
             }
         }
         while let Ok(frame) = replies.try_recv() {
-            let Operation::Raft { message, .. } = &frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                &frame.request.operation
+            else {
                 panic!("raft")
             };
             let mut decoded = focal_consensus::Message::default();
@@ -437,7 +441,9 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
 }
 fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission: bool) -> bool {
     settle(owner);
-    let Operation::Raft { message, .. } = &frame.request.operation else {
+    let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+        &frame.request.operation
+    else {
         panic!("raft")
     };
     let mut decoded = focal_consensus::Message::default();

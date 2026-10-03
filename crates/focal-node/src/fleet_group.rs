@@ -137,7 +137,7 @@ fn class(work: &Work) -> WorkClass {
         Work::Probe(request, ..) if completion_request(request) => WorkClass::Completion,
         Work::Probe(..) => WorkClass::Query,
         Work::Request(request, ..) => match request.verified.request().operation {
-            Operation::Raft { .. } => WorkClass::Apply,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. } => WorkClass::Apply,
             Operation::Read(_)
             | Operation::Stream(_)
             | Operation::Reconcile(_)

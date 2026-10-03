@@ -178,6 +178,14 @@ pub fn wire_coverage(operation: &Operation) -> Coverage {
             "Authenticated current assignment and membership.",
             "PeerAccepted is not commit",
         ),
+        Operation::RaftOrdered { .. } => coverage(
+            "peer.raft_ordered",
+            Capability::Node,
+            Exposure::InternalOnly,
+            false,
+            "Authenticated current assignment and membership; stepped in the sender's order.",
+            "PeerAccepted is not commit",
+        ),
         Operation::OpenEpoch { .. } => coverage(
             "request.open_epoch",
             Capability::Actor,

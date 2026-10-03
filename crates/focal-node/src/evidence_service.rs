@@ -2234,6 +2234,9 @@ impl RequestHandler for FleetService {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
     fn handle<'a>(
         &'a self,
         request: &'a VerifiedRequest,

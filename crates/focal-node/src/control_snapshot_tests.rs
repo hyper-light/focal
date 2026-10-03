@@ -96,6 +96,10 @@ impl Fixture {
                 revisions: replica.revisions(),
                 dropped_replication: 0,
                 peers_unreachable: 0,
+                appends_rejected: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
                 peer_reports_coalesced: 0,
                 peer_reports_dropped: 0,
                 stopped: false,
@@ -125,6 +129,17 @@ impl Fixture {
             progress,
             nonce: 0,
             dropped: 0,
+            epoch: 0,
+            ordered: std::collections::BTreeMap::new(),
+            resequencer: crate::resequence::Resequencer::new(
+                focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+                crate::fleet::LOST_PEERS,
+            ),
+            stepped: Vec::new(),
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
             took_turn: false,
             unreachable: 0,
             lost_sender: lost.0,
@@ -145,7 +160,9 @@ impl Fixture {
         }
     }
     fn deliver(&mut self, mut frame: ControlReplicationFrame) {
-        let Operation::Raft { message, .. } = &frame.request.operation else {
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            &frame.request.operation
+        else {
             panic!("not Raft")
         };
         self.follower.step_authenticated(1, message).unwrap();
@@ -160,7 +177,9 @@ impl Fixture {
             self.owner.replica.tick().unwrap();
             self.owner.drain().unwrap();
             while let Ok(frame) = self.outgoing.try_recv() {
-                let Operation::Raft { message, .. } = &frame.request.operation else {
+                let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                    &frame.request.operation
+                else {
                     panic!("not Raft")
                 };
                 if focal_consensus::decode_message(message).unwrap().msg_type
@@ -279,7 +298,9 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
         fixture.owner.replica.tick().unwrap();
         fixture.owner.drain().unwrap();
         while let Ok(frame) = fixture.outgoing.try_recv() {
-            let Operation::Raft { message, .. } = &frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                &frame.request.operation
+            else {
                 panic!("not Raft")
             };
             assert_ne!(

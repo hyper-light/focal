@@ -2200,14 +2200,15 @@ fn a_bodys_arrival_is_charged_with_what_arrives_against_what_is_owed() {
         Err(WireError::Timeout)
     ));
     // The judgement stretches with the path: a period that the longest
-    // round trip's probe timeout exceeds is that probe timeout.
+    // round trip's probe timeout exceeds is that probe timeout — three
+    // round trips and the acknowledgement delay the peer may take.
     assert_eq!(
         crate::frame::judgement(PERIOD, Duration::from_millis(10)),
         PERIOD
     );
     assert_eq!(
         crate::frame::judgement(PERIOD, Duration::from_millis(50)),
-        Duration::from_millis(150)
+        Duration::from_millis(175)
     );
 }
 
@@ -5345,6 +5346,153 @@ fn webpki_crosses_a_zero_length_anchor_through_an_endorsement() {
     assert!(with_endorsement.is_ok(), "{with_endorsement:?}");
     assert!(without.is_err(), "{without:?}");
 }
+
+/// The ordered profile tops the ladder (27 §12): offered by a handler that
+/// steps a peer's frames in their order and asked for by every connector,
+/// it is negotiated where both sides have it and the native profile where
+/// one does not; a connection that negotiated it admits every request
+/// below it, and one that did not admits no ordered frame. A connector made
+/// to offer an older binary's profiles never reaches it.
+#[tokio::test]
+async fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
+    let limits = WireLimits::default();
+    let hello = |versions: &[u16]| Hello {
+        versions: versions.to_vec(),
+        max_frame_bytes: limits.max_frame_bytes,
+        max_items: limits.max_items,
+    };
+    let all = hello(&OFFERED_PROTOCOLS);
+    assert_eq!(
+        limits
+            .negotiate_ordered(&all, true, true, true, true)
+            .unwrap()
+            .protocol,
+        ORDERED_PROTOCOL_VERSION
+    );
+    // A handler that does not step frames in order, or a connector that
+    // does not ask for it, stays at the native profile.
+    assert_eq!(
+        limits
+            .negotiate_ordered(&all, true, true, true, false)
+            .unwrap()
+            .protocol,
+        NATIVE_PROTOCOL_VERSION
+    );
+    let older = hello(&[
+        NATIVE_PROTOCOL_VERSION,
+        PEER_PROTOCOL_VERSION,
+        MANAGED_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
+    ]);
+    assert_eq!(
+        limits
+            .negotiate_ordered(&older, true, true, true, true)
+            .unwrap()
+            .protocol,
+        NATIVE_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        limits
+            .negotiate_native(&all, true, true, true)
+            .unwrap()
+            .protocol,
+        NATIVE_PROTOCOL_VERSION
+    );
+    let ordered = Negotiated {
+        protocol: ORDERED_PROTOCOL_VERSION,
+        max_frame_bytes: 1024,
+        max_items: 1,
+    };
+    for requested in OFFERED_PROTOCOLS {
+        assert!(ordered.accepts_protocol(requested), "{requested}");
+    }
+    assert!(!ordered.accepts_protocol(6));
+    let native = Negotiated {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ..ordered
+    };
+    assert!(!native.accepts_protocol(ORDERED_PROTOCOL_VERSION));
+    // The ordered frame: a registered tag of its own, carried as control.
+    let frame = Operation::RaftOrdered {
+        group: [3; 16],
+        epoch: 9,
+        sequence: 4,
+        message: vec![1, 2, 3],
+    };
+    assert_eq!(frame.registered_tag(), 33);
+    assert_eq!(frame.class(), TrafficClass::Control);
+    let bytes = postcard::to_allocvec(&frame).unwrap();
+    assert_eq!(postcard::from_bytes::<Operation>(&bytes).unwrap(), frame);
+    // A connector offers what it is told, within what this binary speaks
+    // and always with the base profile.
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let connector = || {
+        QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_tls(
+                TlsIdentity::from_pkcs8(vec![certificate.clone()], key.clone()),
+                vec![pki.ca.der().to_vec()],
+                &limits,
+            )
+            .unwrap(),
+            limits.clone(),
+        )
+        .unwrap()
+    };
+    assert!(connector().offering(&[PROTOCOL_VERSION]).is_ok());
+    assert!(
+        connector()
+            .offering(&[PEER_PROTOCOL_VERSION, PROTOCOL_VERSION])
+            .is_ok()
+    );
+    assert!(connector().offering(&[]).is_err());
+    assert!(connector().offering(&[MANAGED_PROTOCOL_VERSION]).is_err());
+    assert!(connector().offering(&[PROTOCOL_VERSION, 6]).is_err());
+    // A receiver holds an ordered frame to the ordered profile, and a
+    // plain frame to the base one; a node sends either.
+    let node = || {
+        AuthenticatedPeer::local(PeerGrant {
+            principal: ParticipantId::from_u128(2),
+            tenants: BTreeSet::from([TenantId::from_u128(1)]),
+            role: PeerRole::Node { node_id: 2 },
+        })
+        .unwrap()
+    };
+    let envelope = |protocol: u16, operation: Operation| RequestEnvelope {
+        protocol,
+        ledger: LedgerId {
+            tenant: TenantId::from_u128(1),
+            session: SessionId::from_u128(2),
+        },
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(77),
+        operation,
+    };
+    let plain = || Operation::Raft {
+        group: [3; 16],
+        message: vec![1],
+    };
+    assert!(
+        verify_request(
+            node(),
+            envelope(ORDERED_PROTOCOL_VERSION, frame.clone()),
+            &limits
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        verify_request(node(), envelope(PROTOCOL_VERSION, frame.clone()), &limits),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    assert!(verify_request(node(), envelope(PROTOCOL_VERSION, plain()), &limits).is_ok());
+    assert!(matches!(
+        verify_request(node(), envelope(ORDERED_PROTOCOL_VERSION, plain()), &limits),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+}
+
 /// A part of a chunk is what the path delivered in an exchange's time
 /// (`part_for`, the audit's F49): one window's worth before the peer
 /// answered any bulk exchange — not the cold window over the cold round

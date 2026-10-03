@@ -40,7 +40,9 @@ fn rounds(fixture: &mut Fixture) -> Vec<(u64, Vec<u8>)> {
         frames.push(frame);
     }
     for frame in frames {
-        let Operation::Raft { message, .. } = &frame.request.operation else {
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            &frame.request.operation
+        else {
             panic!("Raft expected")
         };
         let decoded = focal_consensus::decode_message(message).unwrap();

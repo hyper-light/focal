@@ -245,9 +245,8 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
             }),
         },
     );
-    let cursor_reply = exchange(&fleet, leader, &cursor).await;
-    let Response::Managed(cursor_receipt) = cursor_reply else {
-        panic!("cursor: {cursor_reply:?}")
+    let Response::Managed(cursor_receipt) = exchange(&fleet, leader, &cursor).await else {
+        panic!("cursor")
     };
     assert!(cursor_receipt.stream.is_some());
     assert_eq!(cursor_receipt.receipt.sequence, domain.receipt.sequence);

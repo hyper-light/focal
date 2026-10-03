@@ -261,6 +261,9 @@ impl RequestHandler for DataService {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -272,7 +275,8 @@ impl RequestHandler for DataService {
                 | Operation::PlacementControl { group, .. }
                 | Operation::NodeContact { group, .. }
                 | Operation::EnrollmentControl { group, .. }
-                | Operation::Raft { group, .. } => Some(*group),
+                | Operation::Raft { group, .. }
+                | Operation::RaftOrdered { group, .. } => Some(*group),
                 _ => None,
             };
             if group == Some(self.root_group) {

@@ -119,13 +119,40 @@ struct Replica {
     pool: Arc<PeerConnectionPool>,
     driver: Option<JoinHandle<Result<ReplicationReport, ReplicationDriverError>>>,
     actor: QuicRemote,
+    /// The frames the replica's driver holds at most.
+    inflight: usize,
 }
 struct Fleet {
     replicas: Vec<Replica>,
     actor_connector: QuicConnector,
     routes: BTreeMap<u64, PeerEndpoint>,
     revision: u64,
+    /// The relays the replicas reach each other through, where the fleet
+    /// is shaped; kept until the fleet is dropped.
+    _relays: Vec<relay::Relay>,
 }
+/// A path between the replicas slower than the loopback and out of order:
+/// every datagram between them crosses a relay that delays it `delay` and
+/// up to `jitter` more, and where `loss` is given loses one datagram in so
+/// many, so the streams of frames sent together complete in any order; and
+/// the connectors of the nodes in `old` offer what a binary before the
+/// ordered profile offered, so their frames go plain.
+#[derive(Clone, Copy)]
+struct Shaped<'a> {
+    delay: Duration,
+    jitter: Duration,
+    loss: Option<u64>,
+    old: &'a [u64],
+}
+/// The fleet's tick: its owners' period.
+const TICK: Duration = Duration::from_millis(20);
+/// What a binary before the ordered profile offered in its Hello.
+const OLDER_PROFILES: [u16; 4] = [
+    NATIVE_PROTOCOL_VERSION,
+    PEER_PROTOCOL_VERSION,
+    MANAGED_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+];
 enum Outgoing {
     Single(tokio::sync::mpsc::Receiver<focal_node::fleet::ReplicationFrame>),
     Grouped(FleetReplication),
@@ -262,7 +289,17 @@ impl Fleet {
     /// with native hosting (its own content store and seed store), so the
     /// group can activate native history.
     async fn open_with(path: &Path, grouped: bool, members: u64, native: bool) -> Self {
+        Self::open_shaped(path, grouped, members, native, None).await
+    }
+    async fn open_shaped(
+        path: &Path,
+        grouped: bool,
+        members: u64,
+        native: bool,
+        shaped: Option<Shaped<'_>>,
+    ) -> Self {
         let pki = Pki::new();
+        let mut relays = Vec::new();
         let identities: Vec<_> = (1..=members)
             .map(|node| pki.issue(format!("node-{node}.focal.test"), true))
             .collect();
@@ -280,7 +317,7 @@ impl Fleet {
                 NodeConfig::joining(id, [7; 16], [8; 16], vec![1, 2, 3], vec![])
             };
             let mut service = ReplicaConfig::new(RootCommandId::from_u128(3));
-            service.tick = Duration::from_millis(20);
+            service.tick = TICK;
             service.request_timeout = Duration::from_millis(500);
             let (host, owner, channel) = if grouped {
                 let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
@@ -398,13 +435,28 @@ impl Fleet {
             let serving = server.clone();
             let handler = host.clone();
             let server_task = tokio::spawn(async move { serving.serve(handler).await });
+            let connector = match shaped {
+                Some(shaped) if shaped.old.contains(&id) => {
+                    pki.connector(identity).offering(&OLDER_PROFILES).unwrap()
+                }
+                _ => pki.connector(identity),
+            };
+            // A shaped fleet carries a burst as the product does: a lane of
+            // the consensus window to each peer and a driver that holds
+            // every lane; the loopback fleets keep their eight, which the
+            // tests of a full driver are written to.
+            let lane = shaped.map_or(2, |_| focal_consensus::DEFAULT_INFLIGHT_WINDOW);
+            let inflight = shaped.map_or(8, |_| {
+                focal_consensus::DEFAULT_INFLIGHT_WINDOW * usize::try_from(members).unwrap()
+            });
             let pool = Arc::new(
                 PeerConnectionPool::new(
-                    pki.connector(identity),
+                    connector,
                     PeerPoolLimits {
                         max_routes: usize::try_from(members).unwrap(),
                         max_connections: usize::try_from(members).unwrap(),
-                        max_inflight: 8,
+                        max_inflight: inflight,
+                        per_peer_inflight: lane,
                         attempts: 1,
                         timeout: Duration::from_millis(500),
                         retry_backoff: Duration::ZERO,
@@ -418,18 +470,48 @@ impl Fleet {
                 server_name: identity.name.clone(),
                 name: None,
             };
-            routes.insert(id, endpoint.clone());
-            pending.push((host, owner, channel, server, server_task, pool, endpoint));
+            // The replicas reach this one through its relay, where there is
+            // one; its actor reaches it directly.
+            let reached = match shaped {
+                Some(shaped) => {
+                    let relay = match shaped.loss {
+                        Some(loss) => {
+                            relay::Relay::lossy(endpoint.address, shaped.delay, shaped.jitter, loss)
+                        }
+                        None => relay::Relay::new(endpoint.address, shaped.delay, shaped.jitter),
+                    };
+                    let front = relay.front();
+                    relays.push(relay);
+                    PeerEndpoint {
+                        address: front,
+                        ..endpoint.clone()
+                    }
+                }
+                None => endpoint.clone(),
+            };
+            routes.insert(id, reached);
+            pending.push((
+                host,
+                owner,
+                channel,
+                server,
+                server_task,
+                pool,
+                endpoint,
+                inflight,
+            ));
         }
         let mut replicas = Vec::new();
-        for (host, owner, channel, server, serving, pool, endpoint) in pending {
+        for (host, owner, channel, server, serving, pool, endpoint, inflight) in pending {
             pool.replace_routes(1, routes.clone()).unwrap();
             let sending = pool.clone();
             let driver = tokio::spawn(async move {
                 match channel {
-                    Outgoing::Single(channel) => drive_replication(channel, &sending, 8).await,
+                    Outgoing::Single(channel) => {
+                        drive_replication(channel, &sending, inflight).await
+                    }
                     Outgoing::Grouped(channel) => {
-                        drive_fleet_replication(channel, &sending, 8).await
+                        drive_fleet_replication(channel, &sending, inflight).await
                     }
                 }
             });
@@ -445,6 +527,7 @@ impl Fleet {
                 pool,
                 driver: Some(driver),
                 actor: remote,
+                inflight,
             });
         }
         Self {
@@ -452,6 +535,7 @@ impl Fleet {
             actor_connector: actor,
             routes,
             revision: 1,
+            _relays: relays,
         }
     }
     async fn leader(&self, excluding: Option<usize>) -> usize {
@@ -536,7 +620,7 @@ impl Fleet {
         replica.actor.close();
         replica.owner.take().unwrap().join().unwrap();
         let report = replica.driver.take().unwrap().await.unwrap().unwrap();
-        assert!(report.peak_inflight <= 8);
+        assert!(report.peak_inflight <= replica.inflight, "{report:?}");
         // Every frame attempted was handed to a send or given up for the
         // room (refused), and every frame sent was accepted, lost or
         // refused at the pool's bound — none dropped in silence.
@@ -668,6 +752,169 @@ async fn quorum_retry_and_recovery(grouped: bool) {
 
 #[path = "fleet_quic/managed.rs"]
 mod managed;
+#[path = "support/relay.rs"]
+mod relay;
+
+/// A peer's appends are stepped in the order they left it (27 §12, the
+/// audit's F42). Each frame to a peer goes on its own stream, and a path
+/// that loses completes the streams in any order — a datagram lost is
+/// sent again a round trip and an acknowledgement delay later, the frame
+/// behind it arriving first: an append that overtook the one before it
+/// was refused by the core and the member probed. With every connector
+/// offering what a binary before the ordered profile offered, the
+/// followers refuse appends across the lossy path; with the ordered
+/// profile a frame that overtook another is held for it and stepped in
+/// its order, and a refusal is left only for a frame let go past its
+/// patience — the one before it lost twice, or its exchange given up —
+/// which the core judges as it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peers_appends_are_stepped_in_their_order_across_a_lossy_path() {
+    let plain = appends_refused_across_a_lossy_path(&[1, 2, 3]).await;
+    let ordered = appends_refused_across_a_lossy_path(&[]).await;
+    println!(
+        "lossy path: {} appends refused with plain frames; {} with ordered ones, {} held, {} let go past their patience",
+        plain.refused, ordered.refused, ordered.held, ordered.let_go
+    );
+    assert!(
+        plain.refused > 0,
+        "the path reordered nothing: the test has no teeth"
+    );
+    assert!(
+        ordered.refused <= ordered.let_go,
+        "an ordered frame was refused for overtaking within its patience: {} refused, {} let go",
+        ordered.refused,
+        ordered.let_go
+    );
+    assert!(
+        ordered.refused < plain.refused,
+        "the order kept spared the group nothing: {} refused against {}",
+        ordered.refused,
+        plain.refused
+    );
+}
+/// What the followers did with a burst's appends across a path (the
+/// leader excluded).
+struct Refusals {
+    /// Appends refused for not holding the entry before them.
+    refused: u64,
+    /// Frames held for the one they overtook.
+    held: u64,
+    /// Frames let go past their patience or their lane.
+    let_go: u64,
+}
+/// The appends the followers refused while a burst of entries crossed a
+/// path of 5 ms each way that loses one datagram in fifty, the connectors
+/// of the nodes in `old` offering the older profiles. A frame whose
+/// datagram the path lost arrives a loss detection later — the
+/// acknowledgement of what was sent behind it, a round trip and the delay
+/// the peer may hold it — after the frame sent behind it, which is how one
+/// QUIC stream overtakes another on a real path; a datagram lost twice
+/// (one in twenty-five hundred) arrives a probe timeout later still. Two
+/// entries are proposed a tick, so an append is on the path as the next
+/// leaves; the burst is long enough for a thousand appends — the entries
+/// and the commits after them — to cross to the followers, a fiftieth of
+/// them overtaken.
+async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
+    const BURST: u128 = 512;
+    let directory = tempfile::tempdir().unwrap();
+    let fleet = Fleet::open_shaped(
+        directory.path(),
+        true,
+        3,
+        false,
+        Some(Shaped {
+            delay: Duration::from_millis(5),
+            jitter: Duration::from_millis(2),
+            loss: Some(50),
+            old,
+        }),
+    )
+    .await;
+    let leader = fleet.leader(None).await;
+    // A burst of entries, each a millisecond after the one before, from
+    // eight connections at once: the leader's window to each follower
+    // holds many appends in flight, each on its own stream, so the
+    // jittered path completes them in any order. Each request is asked
+    // again, exactly, until its commit is answered: an owner that the path
+    // keeps waiting past its request time answers that it cannot know yet,
+    // and the exact retry finds the receipt (27 §3.1).
+    const CONNECTIONS: u128 = 8;
+    let endpoint = fleet.routes[&(leader as u64 + 1)].clone();
+    let mut actors = Vec::new();
+    for _ in 0..CONNECTIONS {
+        actors.push(
+            fleet
+                .actor_connector
+                .connect(
+                    fleet.replicas[leader].server.local_addr().unwrap(),
+                    &endpoint.server_name,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let asked: Vec<_> = (1..=BURST)
+        .map(|epoch| {
+            let actor = actors[usize::try_from(epoch % CONNECTIONS).unwrap()].clone();
+            async move {
+                tokio::time::sleep((TICK / 2).saturating_mul(u32::try_from(epoch).unwrap())).await;
+                // Each request opens the principal's epoch under its own
+                // identity: one committed entry per request, as the quorum
+                // test's exact retry commits a second.
+                let envelope = request(
+                    epoch,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                );
+                let bound = tokio::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    let answer = match actor.request(&envelope).await {
+                        Ok(answer) => answer.result,
+                        Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
+                        Err(error) => panic!("entry {epoch}: {error:?}"),
+                    };
+                    match answer {
+                        Response::Submitted(MutationReply::Committed(receipt)) => return receipt,
+                        Response::Error(
+                            AccessError::OutcomeUnknown
+                            | AccessError::Unavailable
+                            | AccessError::Capacity,
+                        ) if tokio::time::Instant::now() < bound => {}
+                        other => panic!("entry {epoch}: {other:?}"),
+                    }
+                }
+            }
+        })
+        .collect();
+    let receipts = futures_util::future::join_all(asked).await;
+    assert_eq!(receipts.len(), usize::try_from(BURST).unwrap());
+    fleet
+        .all_at(SessionSeq(u64::try_from(BURST).unwrap()))
+        .await;
+    let mut refusals = Refusals {
+        refused: 0,
+        held: 0,
+        let_go: 0,
+    };
+    let mut lost = 0;
+    for (index, replica) in fleet.replicas.iter().enumerate() {
+        let progress = replica.host.progress();
+        lost += progress.peers_unreachable + progress.dropped_replication;
+        if index == leader {
+            continue;
+        }
+        refusals.refused += progress.appends_rejected;
+        refusals.held += progress.frames_held;
+        refusals.let_go += progress.frames_let_go;
+    }
+    println!(
+        "lossy path, older offers {old:?}: {} appends refused, {} frames held, {} let go, {lost} exchanges lost",
+        refusals.refused, refusals.held, refusals.let_go
+    );
+    fleet.stop().await;
+    refusals
+}
 
 /// The leader of the moment and its membership view: a fresh group may
 /// still be handing leadership on, and replicas sharing a machine with

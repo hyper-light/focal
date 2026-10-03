@@ -12934,3 +12934,7 @@ that moved and never for a re-fence under the plan, asked as a dry run before
 any side effect ([08](08-stepped-complexity-and-deployment.md) §9); and a hosted
 partition's egress whose end was reported without its owner's failure, which
 it now names.
+
+### 2026-10-03 — a peer's appends are stepped in the order they left it
+
+The audit's F42 residual ([27](27-consensus-roadmap-and-slates-port.md) §12): a group's appends to a peer carry a sequence within the sender's incarnation (`Operation::RaftOrdered`, the ordered profile), the receiver holds a frame that overtook the one before it — for the path's probe timeout at most, within the source's lane and the configuration's members — and steps the frames in their order, so an append never overtakes another and is never refused for it; frames a group cannot do without stay unordered. Over a path that loses one datagram in fifty, 512 entries had 27 appends refused with the older offer and none (61 held, none let go) with the profile (`ReplicaProgress::appends_rejected`, `fleet_quic`). Found on the way: the probe timeout counted no acknowledgement delay (`frame::MAX_ACK_DELAY`), and empty appends went unordered.

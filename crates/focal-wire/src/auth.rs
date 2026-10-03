@@ -395,6 +395,7 @@ pub fn capability(operation: &Operation) -> Capability {
     match operation {
         Operation::ManagedSupport { .. }
         | Operation::Raft { .. }
+        | Operation::RaftOrdered { .. }
         | Operation::EnrollmentControl { .. }
         | Operation::Custody(_)
         | Operation::PeerControl { .. }
@@ -443,10 +444,25 @@ pub fn capability(operation: &Operation) -> Capability {
 pub struct VerifiedRequest {
     peer: AuthenticatedPeer,
     request: RequestEnvelope,
+    /// The round trip of the connection the request came on, as this side
+    /// measures it when the request is read; zero for a request made
+    /// locally. What a receiver holds a frame that overtook another for
+    /// (27 §12): the probe timeout of the path.
+    path: std::time::Duration,
 }
 impl VerifiedRequest {
     pub fn peer(&self) -> &AuthenticatedPeer {
         &self.peer
+    }
+    /// The round trip of the path the request came by; zero where there is
+    /// no path (a local request).
+    pub fn path_round_trip(&self) -> std::time::Duration {
+        self.path
+    }
+    /// The request as it came by a path of `round_trip`.
+    pub fn with_path(mut self, round_trip: std::time::Duration) -> Self {
+        self.path = round_trip;
+        self
     }
     pub fn request(&self) -> &RequestEnvelope {
         &self.request
@@ -626,7 +642,16 @@ pub fn verify_request(
     );
     let participant = is_peer_request(&request);
     let native = request.protocol == crate::NATIVE_PROTOCOL_VERSION;
-    if native {
+    // An ordered frame is of the ordered profile and nothing else is
+    // (27 §12): a sender names the profile its frame needs, and a receiver
+    // holds it to it.
+    let ordered = matches!(request.operation, Operation::RaftOrdered { .. });
+    if ordered != (request.protocol == crate::ORDERED_PROTOCOL_VERSION) {
+        return Err(AccessError::UnsupportedProtocol);
+    }
+    if ordered {
+        // Admitted by its capability below, as `Raft` is.
+    } else if native {
         if !crate::native_profile_operation(&request.operation) {
             return Err(AccessError::UnsupportedProtocol);
         }
@@ -700,7 +725,11 @@ pub fn verify_request(
         }
     }
     request_shape(&request, limits, Some(&peer))?;
-    Ok(VerifiedRequest { peer, request })
+    Ok(VerifiedRequest {
+        peer,
+        request,
+        path: std::time::Duration::ZERO,
+    })
 }
 
 /// Local syntax and resource validation only. This neither authenticates a
@@ -724,6 +753,7 @@ pub fn check_request_shape(
             | Operation::NodeContact { .. }
             | Operation::EnrollmentControl { .. }
             | Operation::Raft { .. }
+            | Operation::RaftOrdered { .. }
             | Operation::Custody(_)
             | Operation::Managed { .. }
             | Operation::RequestStreamControl { .. }

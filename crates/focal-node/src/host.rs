@@ -701,6 +701,7 @@ fn dispatch(
                 .map(Response::Stream),
             Operation::Subscribe(_)
             | Operation::Raft { .. }
+            | Operation::RaftOrdered { .. }
             | Operation::Control { .. }
             | Operation::PeerControl { .. }
             | Operation::NodeContact { .. }

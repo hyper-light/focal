@@ -196,12 +196,25 @@ pub async fn read_frame_payload_into<'a, R: AsyncRead + Unpin>(
 /// What one datagram of the least size a path of QUIC carries holds.
 pub const LEAST_PROGRESS: usize = 1_200;
 
+/// The longest a peer may hold an acknowledgement before sending it, as
+/// every connection of this crate advertises it: the transport parameter's
+/// default (RFC 9000 §18.2, `max_ack_delay`; quinn-proto 0.11, which this
+/// crate leaves at it). A sender's probe timer counts it (RFC 9002
+/// §6.2.1): what a peer may wait before acknowledging is time the sender
+/// cannot tell a loss in.
+pub const MAX_ACK_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// The probe timeout of a path whose round trip is `rtt`: the round trip
-/// and four times its variance (RFC 9002 §6.2.1), three round trips with
-/// the variance a first sample is given (§5.3), which is all that one who
-/// knows the round trip alone has of it.
+/// and four times its variance, and the acknowledgement delay the peer may
+/// take (RFC 9002 §6.2.1) — three round trips with the variance a first
+/// sample is given (§5.3), which is all that one who knows the round trip
+/// alone has of it, and [`MAX_ACK_DELAY`]. On a path of a millisecond a
+/// loss is recovered no sooner than the acknowledgement delay allows: a
+/// probe timeout of three milliseconds was a time no sender could meet
+/// (the jittered fleet of 27 §12, which refused what a lost datagram's
+/// recovery brought a moment after its patience, 2026-10-02).
 pub fn probe_timeout(rtt: std::time::Duration) -> std::time::Duration {
-    rtt.saturating_mul(3)
+    rtt.saturating_mul(3).saturating_add(MAX_ACK_DELAY)
 }
 
 /// How long `bytes` may take to arrive over a path whose round trip is

@@ -619,11 +619,12 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             .map_err(|_| WireError::Connection)?;
         let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await?;
         require_end(&mut recv).await?;
-        let negotiated = match limits.negotiate_native(
+        let negotiated = match limits.negotiate_ordered(
             &hello,
             handler.supports_managed_requests(),
             handler.supports_participant_requests(),
             handler.supports_native_requests(),
+            handler.supports_ordered_replication(),
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -706,7 +707,14 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                         let peer=registry.authenticate(fingerprint)?;
                         send.set_priority(request.operation.class().priority()).map_err(|_|WireError::Connection)?;
                         let response = if negotiated.accepts_protocol(request.protocol) {
-                            dispatch_accounted(&handler,peer,request,&limits).await
+                            dispatch_accounted_by(
+                                &handler,
+                                peer,
+                                request,
+                                &limits,
+                                carrying.rtt(),
+                            )
+                            .await
                         } else {
                             OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
                         };
@@ -779,7 +787,19 @@ pub struct QuicConnector {
     /// The identity presented on every connection opened from now on; a
     /// renewal replaces it without rebinding the endpoint.
     tls: std::sync::RwLock<quinn::ClientConfig>,
+    /// The profiles offered in every Hello, the newest first: all this
+    /// binary speaks, unless [`Self::offering`] made it an older one.
+    offers: Vec<u16>,
 }
+/// Every profile this binary speaks, the newest first: what a connector
+/// offers in its Hello.
+pub const OFFERED_PROTOCOLS: [u16; 5] = [
+    crate::ORDERED_PROTOCOL_VERSION,
+    crate::NATIVE_PROTOCOL_VERSION,
+    PEER_PROTOCOL_VERSION,
+    MANAGED_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+];
 impl QuicConnector {
     pub fn limits(&self) -> &WireLimits {
         &self.limits
@@ -795,7 +815,24 @@ impl QuicConnector {
             endpoint,
             limits,
             tls: std::sync::RwLock::new(tls),
+            offers: OFFERED_PROTOCOLS.to_vec(),
         })
+    }
+    /// A connector that offers only `versions` in its Hello: what a
+    /// connector of an older binary offers, for a fleet's tests of a mixed
+    /// window (27 §12). The base profile is always among them.
+    pub fn offering(mut self, versions: &[u16]) -> Result<Self, WireError> {
+        if versions.is_empty()
+            || versions.len() > OFFERED_PROTOCOLS.len()
+            || !versions.contains(&PROTOCOL_VERSION)
+            || versions
+                .iter()
+                .any(|version| !OFFERED_PROTOCOLS.contains(version))
+        {
+            return Err(WireError::Limit);
+        }
+        self.offers = versions.to_vec();
+        Ok(self)
     }
     /// Present another client identity on every connection opened from now
     /// on; connections already open keep the identity they were opened with.
@@ -811,6 +848,7 @@ impl QuicConnector {
             endpoint: self.endpoint.clone(),
             limits: self.limits.clone(),
             tls: self.tls.read().map_err(|_| WireError::Connection)?.clone(),
+            offers: self.offers.clone(),
         })
     }
     pub async fn connect(
@@ -823,6 +861,7 @@ impl QuicConnector {
             &self.endpoint,
             tls,
             &self.limits,
+            &self.offers,
             address,
             server_name,
         ))
@@ -837,6 +876,7 @@ pub struct QuicDialer {
     endpoint: Endpoint,
     limits: WireLimits,
     tls: quinn::ClientConfig,
+    offers: Vec<u16>,
 }
 impl QuicDialer {
     pub async fn connect(
@@ -848,6 +888,7 @@ impl QuicDialer {
             &self.endpoint,
             self.tls.clone(),
             &self.limits,
+            &self.offers,
             address,
             server_name,
         ))
@@ -1105,6 +1146,7 @@ async fn open_remote(
     endpoint: &Endpoint,
     tls: quinn::ClientConfig,
     limits: &WireLimits,
+    offers: &[u16],
     address: SocketAddr,
     server_name: &str,
 ) -> Result<QuicRemote, WireError> {
@@ -1121,12 +1163,7 @@ async fn open_remote(
             .await
             .map_err(|_| WireError::Connection)?;
         let hello = Hello {
-            versions: vec![
-                crate::NATIVE_PROTOCOL_VERSION,
-                PEER_PROTOCOL_VERSION,
-                MANAGED_PROTOCOL_VERSION,
-                PROTOCOL_VERSION,
-            ],
+            versions: offers.to_vec(),
             max_frame_bytes: limits.max_frame_bytes,
             max_items: limits.max_items,
         };
@@ -1148,6 +1185,7 @@ async fn open_remote(
             | MANAGED_PROTOCOL_VERSION
             | PEER_PROTOCOL_VERSION
             | crate::NATIVE_PROTOCOL_VERSION
+            | crate::ORDERED_PROTOCOL_VERSION
     ) || negotiated.max_frame_bytes > limits.max_frame_bytes
         || negotiated.max_items > limits.max_items
     {
@@ -1236,7 +1274,10 @@ impl QuicRemote {
         if !self.negotiated.accepts_protocol(request.protocol) {
             return Err(WireError::Access(AccessError::UnsupportedProtocol));
         }
-        let lane = if matches!(request.operation, Operation::Raft { .. }) {
+        let lane = if matches!(
+            request.operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        ) {
             &self.capacity.control
         } else {
             &self.capacity.data

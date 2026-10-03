@@ -83,7 +83,9 @@ fn a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on() {
     let heartbeats = sent(&mut fixture, 0);
     assert!(!heartbeats.is_empty(), "the barrier asks the followers");
     for (target, request) in heartbeats {
-        let Operation::Raft { message, .. } = &request.operation else {
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            &request.operation
+        else {
             panic!("Raft expected")
         };
         fixture.owners[target as usize - 1]

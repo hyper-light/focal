@@ -25,6 +25,11 @@ pub struct PeerEndpoint {
     /// the same for every candidate.
     pub name: Option<String>,
 }
+/// The ordered profile (27 §12): a connection that negotiated it carries a
+/// group's bulk frames with the order they left their sender in
+/// ([`Operation::RaftOrdered`]), and the receiver steps them in it. It
+/// implies every earlier profile.
+pub const ORDERED_PROTOCOL_VERSION: u16 = 5;
 #[derive(Debug, Clone)]
 pub struct PeerPoolLimits {
     pub max_routes: usize,
@@ -512,6 +517,22 @@ impl PeerConnectionPool {
         let connection = slot.connection.lock().ok()?;
         connection.as_ref().map(|open| open.remote.window())
     }
+    /// The profile the open connection to `target` negotiated; `None`
+    /// while there is none. What a sender reads before it stamps a frame
+    /// with an order ([`Operation::RaftOrdered`]): a peer whose connection
+    /// does not admit the ordered profile — an older binary, a first
+    /// contact not yet dialled — is sent plain `Raft`.
+    pub fn peer_protocol(&self, target: u64) -> Option<u16> {
+        let slot = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.cached.get(&target).map(|entry| entry.slot.clone()))?;
+        let cached = slot.connection.lock().ok()?;
+        cached
+            .as_ref()
+            .map(|entry| entry.remote.negotiated().protocol)
+    }
     /// The round trip of the connection to `target`, as it measures it;
     /// `None` while there is none.
     pub fn round_trip(&self, target: u64) -> Option<Duration> {
@@ -634,7 +655,10 @@ impl PeerConnectionPool {
     /// work immediately; the FleetHost owns its separate bounded egress queue.
     /// Ok means ingress accepted this packet, never a quorum/durability signal.
     pub async fn send(&self, target: u64, request: &RequestEnvelope) -> Result<(), PeerSendError> {
-        if !matches!(request.operation, Operation::Raft { .. }) {
+        if !matches!(
+            request.operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        ) {
             return Err(PeerSendError::InvalidRequest);
         }
         match self.exchange(target, request).await? {
@@ -837,6 +861,9 @@ impl PeerConnectionPool {
     ) -> Result<Response, PeerSendError> {
         let valid_operation = match &request.operation {
             Operation::Raft { group, message } => *group != [0; 16] && !message.is_empty(),
+            Operation::RaftOrdered { group, message, .. } => {
+                *group != [0; 16] && !message.is_empty()
+            }
             Operation::Custody(_) => true,
             Operation::ManagedSupport { group } => *group != [0; 16],
             Operation::PeerControl { group, request } => {
@@ -881,10 +908,10 @@ impl PeerConnectionPool {
         if target == 0
             || !valid_operation
             || request.protocol
-                != if matches!(request.operation, Operation::ManagedSupport { .. }) {
-                    MANAGED_PROTOCOL_VERSION
-                } else {
-                    PROTOCOL_VERSION
+                != match request.operation {
+                    Operation::ManagedSupport { .. } => MANAGED_PROTOCOL_VERSION,
+                    Operation::RaftOrdered { .. } => ORDERED_PROTOCOL_VERSION,
+                    _ => PROTOCOL_VERSION,
                 }
             || request.request_epoch.0 == 0
             || request.request_id.is_zero()
@@ -903,7 +930,11 @@ impl PeerConnectionPool {
         let mut asked = Asked {
             pool: self,
             target,
-            measured: !probe && !matches!(request.operation, Operation::Raft { .. }),
+            measured: !probe
+                && !matches!(
+                    request.operation,
+                    Operation::Raft { .. } | Operation::RaftOrdered { .. }
+                ),
             answered: false,
             bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
             bulk,
@@ -974,7 +1005,37 @@ impl PeerConnectionPool {
                 };
                 let sent = std::time::Instant::now();
                 let before = slot.answered.load(Ordering::Acquire);
-                let answered = remote.request_within(request, self.limits.timeout).await;
+                // An ordered frame goes as it is on a connection that admits
+                // the ordered profile, and as a plain frame on one that does
+                // not — a peer of an older binary (27 §12). The plain copy
+                // is the one copy a mixed window costs, within the frame's
+                // charge; a connection admitting the profile copies nothing.
+                let plain = match &request.operation {
+                    Operation::RaftOrdered { group, message, .. }
+                        if remote.negotiated().protocol < ORDERED_PROTOCOL_VERSION =>
+                    {
+                        let mut plain = Vec::new();
+                        plain
+                            .try_reserve_exact(message.len())
+                            .map_err(|_| PeerSendError::Busy)?;
+                        plain.extend_from_slice(message);
+                        Some(RequestEnvelope {
+                            protocol: PROTOCOL_VERSION,
+                            ledger: request.ledger,
+                            route_epoch: request.route_epoch,
+                            request_epoch: request.request_epoch,
+                            request_id: request.request_id,
+                            operation: Operation::Raft {
+                                group: *group,
+                                message: plain,
+                            },
+                        })
+                    }
+                    _ => None,
+                };
+                let answered = remote
+                    .request_within(plain.as_ref().unwrap_or(request), self.limits.timeout)
+                    .await;
                 // What kept this exchange from an answer, when the
                 // connection itself is to be judged for it.
                 let failure = match answered {
