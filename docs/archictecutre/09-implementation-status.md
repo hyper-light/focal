@@ -12891,3 +12891,18 @@ verifiers of the succession's first landing, which carried a crossing rule of
 their own, were never reached; they are gone and every verifier is webpki over
 the committed root set.
 
+### 2026-10-02 — the day's CI runs: five tests, five causes
+
+The four CI runs of batches 6 to 9 failed on five tests that pass on a laptop,
+each a defect at its cause ([the record](../audit/2026-09-29_remediation.md),
+"Found by CI (2026-10-02)"): a wire test that held a withheld body's give-up to
+the clock where the rule gives it up by the connection's quiet (now sampled as
+the rule reads it, `QuicRemote::received`); a debug build's poll frames — 1.8 MB
+to start a service under the renewal journey, the futures themselves small —
+which a Windows test thread's 2 MiB did not hold (the service's open and the
+harness's start boxed by plain functions, the journey in phases; 1.2 MB now,
+the open's own frames recorded as open); a plan's refusal decoded as an
+inconsistent response; a stood-down leader answering a read `OutcomeUnknown`
+where it took nothing (`host::barrier_refused`); and a shaped-path fleet dialling
+under the loopback's half second (`Slow::dial`).
+

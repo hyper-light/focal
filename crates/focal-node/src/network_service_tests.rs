@@ -35,10 +35,22 @@ pub(crate) struct Running {
     ended: tokio::sync::watch::Receiver<Option<String>>,
 }
 impl Running {
-    pub(crate) async fn start(settings: &TestSettings) -> Self {
+    /// Boxed by a plain function, as `NetworkService::open_with_socket` is:
+    /// a test body's poll frame holds a pointer to the start, not its
+    /// state, in a debug build (the renewal journey's body held 628 KiB of
+    /// such temporaries, and a Windows test thread of 2 MiB overflowed).
+    pub(crate) fn start(
+        settings: &TestSettings,
+    ) -> std::pin::Pin<Box<impl Future<Output = Self> + '_>> {
+        Box::pin(Self::start_inner(settings))
+    }
+    async fn start_inner(settings: &TestSettings) -> Self {
         Self::from_service(settings.open().await.unwrap()).await
     }
-    async fn from_service(service: NetworkService) -> Self {
+    fn from_service(service: NetworkService) -> std::pin::Pin<Box<impl Future<Output = Self>>> {
+        Box::pin(Self::from_service_inner(service))
+    }
+    async fn from_service_inner(service: NetworkService) -> Self {
         let handles = service.handles();
         let data = service.data.clone();
         let (stop, receive) = oneshot::channel();
@@ -212,8 +224,10 @@ impl std::ops::Deref for TestSettings {
     }
 }
 impl TestSettings {
-    pub(crate) async fn open(&self) -> Result<NetworkService, ServiceError> {
-        NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap())).await
+    pub(crate) fn open(
+        &self,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<NetworkService, ServiceError>> + '_>> {
+        NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap()))
     }
 }
 pub(crate) fn settings(root: &Path) -> TestSettings {

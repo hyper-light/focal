@@ -758,8 +758,17 @@ async fn the_controller_completes_a_plan_on_one_host_with_signed_readiness_and_f
     founder.stop().await;
 }
 
-/// Join a second host to a running founder and return its service.
-pub(crate) async fn join_peer(
+/// Join a second host to a running founder and return its service. Boxed
+/// by a plain function, as `Running::start` is and for the same frame.
+pub(crate) fn join_peer<'a>(
+    founder: &'a Running,
+    founder_dir: &'a Path,
+    name: &'a str,
+    peer_settings: &'a crate::network_service::tests::TestSettings,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = (Running, u64)> + 'a>> {
+    Box::pin(join_peer_inner(founder, founder_dir, name, peer_settings))
+}
+async fn join_peer_inner(
     founder: &Running,
     founder_dir: &Path,
     name: &str,

@@ -483,8 +483,12 @@ struct Prepared {
     directory: NodeDirectory,
 }
 impl Prepared {
-    async fn open(settings: &Settings) -> Result<Self, ServiceError> {
-        Box::pin(Self::open_inner(settings)).await
+    /// Boxed by a plain function, as [`NetworkService::open_with_socket`]
+    /// is and for the same frame.
+    fn open(
+        settings: &Settings,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<Self, ServiceError>> + '_>> {
+        Box::pin(Self::open_inner(settings))
     }
     async fn open_inner(settings: &Settings) -> Result<Self, ServiceError> {
         settings.validate().map_err(NodeError::from)?;
@@ -602,11 +606,19 @@ impl NetworkService {
     /// The startup state machine (every recovered owner, registry and handle
     /// across its awaits) lives on the heap, so a caller's stack carries one
     /// frame however many services it opens.
-    async fn open_with_socket(
+    /// The open, boxed by a plain function. An `async fn` that awaits a
+    /// boxed inner still holds the inner's whole state as a temporary of
+    /// its own poll frame in a debug build, where no two temporaries share
+    /// a slot: this wrapper's frame was 110 KiB on macOS as an `async fn`,
+    /// the inner's is 483 KiB, and under a test body's frame a Windows test
+    /// thread of 2 MiB overflowed. A function that returns the boxed future
+    /// leaves its caller a pointer, and its own frame is gone before the
+    /// future is polled.
+    fn open_with_socket(
         settings: &Settings,
         socket: Option<std::net::UdpSocket>,
-    ) -> Result<Self, ServiceError> {
-        Box::pin(Self::open_with_socket_inner(settings, socket)).await
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<Self, ServiceError>> + '_>> {
+        Box::pin(Self::open_with_socket_inner(settings, socket))
     }
     async fn open_with_socket_inner(
         settings: &Settings,

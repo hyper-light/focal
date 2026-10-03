@@ -2867,6 +2867,89 @@ not sent is now, and its report says so (`sent`, beside `attempted`, `accepted`,
 `lost`, `saturated` and `refused`; the QUIC harness asserts both halves of the
 identity at every stop).
 
+## Found by CI (2026-10-02)
+
+The four CI runs of 4387a31 (batches 6 to 9) failed on five tests — two on Windows, two
+on macOS, one on ubuntu — none of which fails on this machine. Each is a defect, at its
+cause.
+
+**A withheld body judged by the clock** (Windows, focal-wire
+`a_body_the_peer_withholds_while_it_sends_others_is_given_up`). The test's lower bound
+held the give-up to the last of the other replies within a judgement (`at +
+request_timeout >= last_other`), which assumes the peer paced its pieces continuously.
+The body is given up by the connection's quiet alone (`Arriving::judge`: a judgement that
+brought less than `LEAST_PROGRESS`), never by the `had` rule in this scenario — the
+withheld body's own bytes are part of what is owed, so what is charged never reaches
+it. A runner that ran the pacing at six times its interval (the wire suite at 370 s where
+this machine takes 28) paused longer than a judgement; the rule gave the body up half a
+second before the last of the others, and was right to. *Fix.* `QuicRemote::received`
+tells a measurer what the connection received, as the rule reads it; the test samples it
+at a sixteenth of a judgement and holds the give-up to a quiet span before it — a
+judgement less two samples, carrying under the least progress — never to the clock, and
+to three judgements of the path's own (`frame::judgement` of the longest round trip)
+after the last of the others. Two runs of the suite oversubscribed and five alone, green.
+
+**A debug build's frames** (Windows, focal-node
+`credential_renewal::tests::a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_late_joiner`,
+`STATUS_STACK_OVERFLOW` on the 2 MiB test thread). The futures are small — the test body's
+65 KiB, a service start's 40 KiB (`size_of_val`); the frames are not: a debug build gives
+a generator's poll a slot for every temporary of every state, none shared, and an `async
+fn` that awaits another holds the callee's whole future as a temporary of its own frame.
+Measured from the prologues (macOS arm64, opt-level 0): the test body 628 KiB,
+`Running::start` 164 KiB, `NetworkService::open_with_socket` — an `async fn` that awaited
+a boxed inner — 110 KiB, `open_with_socket_inner` 483 KiB, `Prepared::open_inner` 172 KiB,
+tokio's `block_on` 220 KiB: about 1.8 MB of stack to start the first service, which the
+test thread's 2 MiB holds on macOS and not on Windows (the split of the body into
+phases alone made it worse — 348 KiB for thirty lines, each phase's future a temporary —
+and overflowed macOS too, in the join phase). *Fix.* The large asynchronous entries are
+boxed by plain functions that return the future (`open_with_socket`, `Prepared::open`;
+the harness's `TestSettings::open`, `Running::start`, `Running::from_service`,
+`join_peer`): a caller's frame holds a pointer, and the function's own frame is gone
+before the future is polled; the journey is told in four phases. The body's frame is 119
+KiB now, `Running::start`'s 82, `join_peer`'s 41, the start's chain about 1.2 MB; the suite
+passes with the thread's 2 MiB and overflows a 1 MiB thread still. *Open.* The frames that
+remain are the service's: `open_with_socket_inner` 483 KiB and `Prepared::open_inner` 172
+KiB, under `block_on` on the main thread of `focal start`, which Windows gives 1 MiB.
+`clippy::large_stack_frames` estimates six functions above a quarter of that stack:
+`NetworkService::open_with_socket_inner` (607 KB), `PlacementAgent::tick` (521 KB), the
+evidence suite's `evidence_scenario` (486 KB), `PlacementAgent::run` (397 KB),
+`NetworkService::run_tasks` (307 KB), the CLI's `cluster::run` (265 KB). The lint at a
+threshold derived from the smallest stack and the deepest poll chain, and these functions
+told in phases, are a batch of their own.
+
+**A plan's refusal read as an inconsistent response** (macOS, cli_nodes
+`a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capacity_is_refused`).
+Batch 8 answered a plan the partition refused by name — state 3, no operation, no voters —
+and the admin client checked for the state after a decoder that had already refused every
+reply without an operation, without voters or beyond state 2: the operator was told
+`invalid_input` where `compare_failed` was owed, and the journey's replanning loop
+asserted on it (the local runs never met a refusal). *Fix.* `planned_reply` holds a reply
+to one of two shapes, a plan's or a refusal's — a refusal that names voters and a plan
+that names none are inconsistent still — `planned_result` names the refusal, and the
+deployment dry run says it too. A unit test decodes both shapes and five inconsistent ones.
+
+**An isolated leader's read answered `OutcomeUnknown`** (macOS, fleet_quic
+`managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery`). Once an
+isolated leader stands down (check-quorum) it leads no one and knows no leader, and a
+read's barrier cannot begin: `read_index_inner` refuses `NotLeader`, which the ledger
+error map (`host::access`) rendered `OutcomeUnknown` — a mutation's word, for a read that
+took nothing. *Fix.* `host::barrier_refused`: a barrier that could not be begun is
+`Unavailable` (capacity and the client's standing keep their names), at every barrier
+site — the fleet owner's reads, the summary, monitor, managed and reconciliation reads,
+the client reads; the test waits for the stood-down node and asks it again.
+
+**A shaped path dialled under the loopback's clock** (ubuntu, evidence_quic
+`a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second`: the leader was node 2).
+The harness gave every dial and exchange half a second, on the loopback and behind the
+128 kbit/s relays alike, and followers two seconds of patience. A handshake across the
+relay takes about 400 ms of transmission; on a slow runner node 1's dials were given up,
+node 2 waited its two seconds for a heartbeat that never came and took the group, and the
+crossing's premise — the leader beside the copy's relay — failed. *Fix.* The dial is
+derived from the path (`Slow::dial`: two round trips of a flight under the Hello's 4 KiB
+bound, each crossing the relay's delay, jitter and rate — 1.07 s at 128 kbit/s, 2.1 s at
+64, 16 s at 8) and a follower's patience is twice it (`Slow::election_ticks`); the
+loopback keeps its half second.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms
