@@ -15,6 +15,8 @@ struct Fixture {
     outgoing: async_mpsc::Receiver<ControlReplicationFrame>,
     follower: ControlReplica,
     budget: MemoryBudget,
+    /// The follower's own budget: a test fills it to refuse a delivery.
+    follower_budget: MemoryBudget,
     _directory: tempfile::TempDir,
 }
 impl Fixture {
@@ -79,7 +81,7 @@ impl Fixture {
         let mut follower = ControlReplica::open(
             options(2),
             bootstrap,
-            follower_budget,
+            follower_budget.clone(),
             directory.path().join("follower"),
         )
         .unwrap();
@@ -156,6 +158,7 @@ impl Fixture {
             outgoing,
             follower,
             budget,
+            follower_budget,
             _directory: directory,
         }
     }
@@ -455,4 +458,72 @@ fn the_root_owner_holds_lost_peers_each_once_and_tells_the_core() {
         ),
         (1000, 2, 0)
     );
+}
+
+/// A delivery a memory refusal stops is retained and continued by the next
+/// drain, nothing applied twice, and the replica is not failed by it: a
+/// member brought up by snapshot on a loaded runner met a refusal in its
+/// snapshot's decode and ended (ubuntu CI, 2026-10-03). The follower's
+/// budget is filled so the snapshot's decode has no room; the drain is
+/// refused for memory and the replica says nothing failed; the room given
+/// back, the next drain installs the snapshot. (Every delivery runs the
+/// same cursors; a refusal between two entries has no deterministic lever in
+/// this fixture, whose commands are all of a size.)
+#[test]
+fn a_delivery_a_memory_refusal_stops_is_continued_by_the_next_drain() {
+    let mut fixture = Fixture::new();
+    let frame = fixture.snapshot();
+    let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+        &frame.request.operation
+    else {
+        panic!("a raft frame")
+    };
+    fixture.follower.step_authenticated(1, message).unwrap();
+    let leader_index = fixture.owner.replica.applied_index();
+    // The room left: enough for the node to hand its events over (their
+    // bytes, once), not for the delivery's decode (thirty-two times the
+    // snapshot's): the refusal is the delivery's, not the node's.
+    let stats = fixture.follower_budget.stats();
+    let room = message.len() * 4 + 64 * 1024;
+    let hog = fixture
+        .follower_budget
+        .reserve(
+            BudgetKind::Recovery,
+            BudgetLane::Completion,
+            stats.limit.saturating_sub(stats.used).saturating_sub(room),
+        )
+        .unwrap()
+        .commit();
+    // The drain waits for the disk, as the owner's does when it has nothing
+    // to send meanwhile; the node hands its events over, and the delivery
+    // is refused the room for the snapshot's decode.
+    let refused = fixture.follower.drain(&NoDirectoryAuthority);
+    assert!(
+        matches!(refused, Err(ControlError::Memory(_))),
+        "{refused:?}"
+    );
+    assert_eq!(fixture.follower.failure(), None);
+    assert!(fixture.follower.applied_index() < leader_index);
+    // Refused again while the room is held: still retained, still not failed.
+    assert!(matches!(
+        fixture.follower.drain(&NoDirectoryAuthority),
+        Err(ControlError::Memory(_))
+    ));
+    assert_eq!(fixture.follower.failure(), None);
+    drop(hog);
+    // The room given back, the delivery continues and the snapshot is
+    // installed.
+    fixture.follower.drain(&NoDirectoryAuthority).unwrap();
+    assert_eq!(fixture.follower.applied_index(), leader_index);
+    assert_eq!(
+        fixture.follower.revisions(),
+        fixture.owner.replica.revisions()
+    );
+    // Nothing is delivered twice: a drain after it applies nothing more,
+    // whatever messages the node has to send after its snapshot.
+    if let Some(events) = fixture.follower.try_drain(&NoDirectoryAuthority).unwrap() {
+        assert!(events.completed.is_none());
+        assert_eq!(events.applied_index, leader_index);
+    }
+    assert_eq!(fixture.follower.applied_index(), leader_index);
 }

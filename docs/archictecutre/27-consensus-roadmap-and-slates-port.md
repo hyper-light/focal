@@ -1140,3 +1140,27 @@ the group took it to be on its way.
 
 Measured on three in-process replicas over real QUIC behind relays of 5 ms each way that lose one datagram in fifty (`fleet_quic`, `a_peers_appends_are_stepped_in_their_order_across_a_lossy_path`; `support/relay.rs`, `Relay::lossy`): a burst of 512 entries had the followers refuse 27 appends with every connector offering what a binary before the profile offered, and none with the ordered profile — 61 frames held for the one they overtook, none let go past its patience (`ReplicaProgress::appends_rejected`; `frames_held`, `frames_let_go` and `frames_stale` say what the order did). Found by the measurement: the probe timeout of a path counted three round trips and not the acknowledgement delay a peer may take (RFC 9000 §18.2's 25 ms, which every connection here advertises) — on a path of ten milliseconds a loss is recovered no sooner than it, and a patience derived from it was shorter than the recovery (`frame::MAX_ACK_DELAY`); and an empty append, which carries the commit after the entries it follows, went unordered as a heartbeat does and was refused for naming an entry its member had yet to receive — every refusal left with the order kept was one. Open: a frame lost on the path still costs the probe it did; a held frame's patience is one probe timeout, which a frame lost twice exceeds.
 
+## 13. A delivery a refusal stops is continued, not failed (2026-10-03)
+
+A control replica (`ControlReplica`, the shell of the root and of every directory
+partition) took what its node handed over — a snapshot, the entries after it — and
+applied it in one pass; any error of the pass marked the replica failed, and every call
+after answered `Failed`. The node had handed the events over once, so a replica could
+not ask for them again: a refusal that changed nothing of the node — memory for an
+entry's decode, for a snapshot's restore — ended the replica as a corrupt entry would,
+and its owner, which treats such a refusal as a checkpoint's (the pace refused, the
+poll after resumes), resumed into a replica that had already failed. A member brought
+up by snapshot on a loaded runner ended that way (ubuntu CI, 2026-10-03), reporting its
+egress's end and then, once the owner named it, the generic failure.
+
+| Rule | Why | Where |
+|---|---|---|
+| A delivery is continued from where it stands, never taken twice | The events the node handed over are kept with the output built so far and two cursors — the entries and the configuration changes applied — and a snapshot's installation is marked done once its state is swapped in; the next drain continues at the entry a refusal stopped, nothing applied twice, no new drain while one is held (one at most; its memory is the node's allocation for the events) | `RetainedDelivery`, `ControlReplica::continue_delivery`, `drive` |
+| Only a refusal that changed nothing of the node is retained | Memory refused for a decode or a restore leaves the node and the replica as they were; the drain answers the refusal and the owner polls again. Any other error — a corrupt entry, a wrong owner, a node that failed — fails the replica by its name, kept as its first failure | `drive`, `ControlReplica::{fail, failure}`, the owner's `checkpoint_retryable` |
+
+Measured on the owner's fixture: a follower whose budget is filled before its snapshot's
+decode answers the drain `Memory`, says nothing failed, and installs the snapshot once
+the room is given back (`a_delivery_a_memory_refusal_stops_is_continued_by_the_next_
+drain`); every delivery runs the same cursors, and a refusal between two entries has no
+deterministic lever in the fixture, whose commands are all of a size.
+

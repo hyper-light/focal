@@ -102,6 +102,40 @@ struct CheckpointV8<S = ControlBootstrap> {
 }
 const CHECKPOINT_SCHEMA: u16 = 8;
 const COMMAND_SCHEMA: u16 = 2;
+/// A delivery the node handed over, continued from where it stands: the
+/// events, the output built so far, and the cursors past what is applied.
+/// A refusal that changed nothing of the node — memory for an entry's
+/// decode, a snapshot's restore — leaves it here for the next drain; the
+/// replica held one such delivery per poll and failed on it before
+/// (a member brought up by snapshot on a loaded runner, ubuntu CI,
+/// 2026-10-03). One at most: the node is not asked for more while one is held.
+struct RetainedDelivery {
+    events: focal_consensus::NodeEvents,
+    output: ControlEvents,
+    entry: usize,
+    configuration: usize,
+    snapshot_done: bool,
+}
+impl RetainedDelivery {
+    fn new(mut events: focal_consensus::NodeEvents) -> Self {
+        Self {
+            output: ControlEvents {
+                allocation: events.take_allocation(),
+                ..Default::default()
+            },
+            events,
+            entry: 0,
+            configuration: 0,
+            snapshot_done: false,
+        }
+    }
+}
+/// One entry of a delivery as it is applied: read in place.
+struct DeliveredEntry<'a> {
+    index: u64,
+    term: u64,
+    data: &'a [u8],
+}
 struct Pending {
     request: ControlRequestId,
     request_hash: [u8; 32],
@@ -160,6 +194,8 @@ pub struct ControlReplica {
     /// member brought up by snapshot reported the egress's end alone,
     /// macOS and ubuntu CI, 2026-10-02 and 2026-10-03).
     failure: Option<String>,
+    /// A delivery a refusal stopped, continued by the next drain.
+    retained: Option<RetainedDelivery>,
     /// Founded here on a sealed image (`ControlBootstrap::is_image`).
     founded_from_image: bool,
 }
@@ -194,6 +230,7 @@ impl ControlReplica {
             drained: false,
             failed: false,
             failure: None,
+            retained: None,
             founded_from_image,
         })
     }
@@ -225,6 +262,7 @@ impl ControlReplica {
             drained: false,
             failed: false,
             failure: None,
+            retained: None,
             founded_from_image,
         })
     }
@@ -868,6 +906,9 @@ impl ControlReplica {
         verifier: &impl AuthorityVerifier,
     ) -> Result<ControlEvents, ControlError> {
         self.check()?;
+        if let Some(delivery) = self.retained.take() {
+            return self.drive(delivery, verifier);
+        }
         let events = match self.node.drain() {
             Ok(events) => events,
             Err(error) if !self.node.failed() => return Err(error.into()),
@@ -876,11 +917,30 @@ impl ControlReplica {
                 return Err(error.into());
             }
         };
-        let result = self.drain_inner(events, verifier);
-        if let Err(error) = &result {
-            self.fail(error);
+        self.drive(RetainedDelivery::new(events), verifier)
+    }
+    /// Deliver, or retain what a refusal that changed nothing of the node
+    /// stopped — memory for an entry's decode or a snapshot's restore — for
+    /// the next drain, which continues at the same entry; anything else
+    /// fails the replica by its name. The owner treats the refusal as it
+    /// treats a checkpoint's (`checkpoint_retryable`): the pace refused, the
+    /// poll after resumes.
+    fn drive(
+        &mut self,
+        mut delivery: RetainedDelivery,
+        verifier: &impl AuthorityVerifier,
+    ) -> Result<ControlEvents, ControlError> {
+        match self.continue_delivery(&mut delivery, verifier) {
+            Ok(()) => Ok(delivery.output),
+            Err(error @ ControlError::Memory(_)) => {
+                self.retained = Some(delivery);
+                Err(error)
+            }
+            Err(error) => {
+                self.fail(&error);
+                Err(error)
+            }
         }
-        result
     }
     /// The replica stops at `error`: what it delivered is not whole, and a
     /// reopen recovers it. The first cause is kept by name.
@@ -904,6 +964,9 @@ impl ControlReplica {
         verifier: &impl AuthorityVerifier,
     ) -> Result<Option<ControlEvents>, ControlError> {
         self.check()?;
+        if let Some(delivery) = self.retained.take() {
+            return self.drive(delivery, verifier).map(Some);
+        }
         let events = match self.node.try_drain() {
             Ok(Some(events)) => events,
             Ok(None) => return Ok(None),
@@ -913,11 +976,8 @@ impl ControlReplica {
                 return Err(error.into());
             }
         };
-        let result = self.drain_inner(events, verifier);
-        if let Err(error) = &result {
-            self.fail(error);
-        }
-        result.map(Some)
+        self.drive(RetainedDelivery::new(events), verifier)
+            .map(Some)
     }
     /// The Raft messages that may be sent while the node's write is in
     /// flight (`DurableNode::sendable`): a leader's, which its members
@@ -932,16 +992,17 @@ impl ControlReplica {
         self.check()?;
         Ok(self.node.wait_persisted()?)
     }
-    fn drain_inner(
+    /// Deliver what the node handed over, from where the delivery stands:
+    /// a delivery a refusal stopped is retained and continued at the same
+    /// entry by the next drain, nothing applied twice (`RetainedDelivery`).
+    fn continue_delivery(
         &mut self,
-        mut events: focal_consensus::NodeEvents,
+        delivery: &mut RetainedDelivery,
         verifier: &impl AuthorityVerifier,
-    ) -> Result<ControlEvents, ControlError> {
-        let mut output = ControlEvents {
-            allocation: events.take_allocation(),
-            ..Default::default()
-        };
-        if let Some(snapshot) = events.snapshot {
+    ) -> Result<(), ControlError> {
+        if !delivery.snapshot_done
+            && let Some(snapshot) = &delivery.events.snapshot
+        {
             let _decode = self.budget.reserve(
                 BudgetKind::Recovery,
                 BudgetLane::Completion,
@@ -1134,11 +1195,12 @@ impl ControlReplica {
             }
             self.membership = membership;
             if let Some(pending) = self.pending.take() {
-                output.uncertain = Some(pending.request);
+                delivery.output.uncertain = Some(pending.request);
             }
             self.machine = machine;
             self.retries = retries;
             self.applied_index = checkpoint.applied_index;
+            delivery.snapshot_done = true;
         }
         // A member of a group founded on an image it does not hold applies
         // no entry before a snapshot: the founder compacted at founding, so
@@ -1147,11 +1209,13 @@ impl ControlReplica {
         // the group's at the first command).
         if self.options.founded_elsewhere.is_some()
             && self.applied_index == 0
-            && (events
+            && (delivery
+                .events
                 .committed
                 .first()
                 .is_some_and(|entry| entry.index == 1)
-                || events
+                || delivery
+                    .events
                     .membership
                     .first()
                     .is_some_and(|change| change.index == 1))
@@ -1160,174 +1224,211 @@ impl ControlReplica {
                 "a member founded elsewhere applies no entry before a snapshot",
             ));
         }
-        let mut ordinary = events.committed.into_iter().peekable();
-        let mut configurations = events.membership.into_iter().peekable();
-        while ordinary.peek().is_some() || configurations.peek().is_some() {
-            let configuration_first = match (ordinary.peek(), configurations.peek()) {
-                (Some(entry), Some(change)) => change.index < entry.index,
+        // The entries and the configuration changes, merged by index, from
+        // the delivery's cursors: an entry is read in place and its cursor
+        // moved past it once it is applied, so a delivery continued after a
+        // refusal begins at the entry the refusal stopped.
+        loop {
+            let next_entry = delivery
+                .events
+                .committed
+                .get(delivery.entry)
+                .map(|entry| entry.index);
+            let next_change = delivery
+                .events
+                .membership
+                .get(delivery.configuration)
+                .map(|change| change.index);
+            let configuration_first = match (next_entry, next_change) {
+                (Some(entry), Some(change)) => change < entry,
                 (None, Some(_)) => true,
-                _ => false,
+                (Some(_), None) => false,
+                (None, None) => break,
             };
             let (entry, membership) = if configuration_first {
-                let mut change = configurations
-                    .next()
+                let change = delivery
+                    .events
+                    .membership
+                    .get(delivery.configuration)
                     .ok_or(ControlError::Corrupt("configuration vanished"))?;
-                let entry = focal_consensus::CommittedEntry {
-                    index: change.index,
-                    term: change.term,
-                    data: std::mem::take(&mut change.context),
-                };
-                (entry, Some(change))
-            } else {
                 (
-                    ordinary
-                        .next()
-                        .ok_or(ControlError::Corrupt("command vanished"))?,
+                    DeliveredEntry {
+                        index: change.index,
+                        term: change.term,
+                        data: &change.context,
+                    },
+                    Some(change),
+                )
+            } else {
+                let entry = delivery
+                    .events
+                    .committed
+                    .get(delivery.entry)
+                    .ok_or(ControlError::Corrupt("command vanished"))?;
+                (
+                    DeliveredEntry {
+                        index: entry.index,
+                        term: entry.term,
+                        data: &entry.data,
+                    },
                     None,
                 )
             };
-            if entry.index <= self.applied_index {
-                return Err(ControlError::Corrupt("application index regression"));
-            }
-            let prior_configuration = self.configuration_index;
-            if let Some(applied) = &membership {
-                self.configuration_index = entry.index;
-                if entry.data.is_empty() {
-                    self.membership = Some(ControlMembershipRecord::of_entry(
+            'entry: {
+                if entry.index <= self.applied_index {
+                    return Err(ControlError::Corrupt("application index regression"));
+                }
+                let prior_configuration = self.configuration_index;
+                if let Some(applied) = &membership {
+                    self.configuration_index = entry.index;
+                    if entry.data.is_empty() {
+                        self.membership = Some(ControlMembershipRecord::of_entry(
+                            entry.index,
+                            entry.term,
+                            applied.after.clone(),
+                        )?);
+                        self.applied_index = entry.index;
+                        break 'entry;
+                    }
+                }
+                let encoded_hash = blake3::derive_key("focal.control.envelope.v1", entry.data);
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.envelope_hash == encoded_hash)
+                {
+                    // Exact locally admitted bytes already own their complete next
+                    // state and receipt. Publication needs no decode or reservation.
+                    let pending = self
+                        .pending
+                        .take()
+                        .ok_or(ControlError::Corrupt("pending vanished"))?;
+                    if pending.term != entry.term {
+                        return Err(ControlError::WrongOwner);
+                    }
+                    match (&pending.membership, &membership) {
+                        (None, None) => {}
+                        (Some(expected), Some(applied))
+                            if expected.index == prior_configuration
+                                && expected.before == applied.before
+                                && expected.after == applied.after => {}
+                        _ => return Err(ControlError::Corrupt("prepared membership result")),
+                    }
+                    self.machine.publish(pending.machine, entry.index)?;
+                    let mut retries = pending.retries;
+                    let receipt = retries.complete(
+                        pending.request,
                         entry.index,
                         entry.term,
-                        applied.after.clone(),
-                    )?);
+                        self.machine.revisions(),
+                    )?;
+                    self.retries = retries;
+                    if let Some(applied) = &membership {
+                        self.membership = Some(ControlMembershipRecord {
+                            index: entry.index,
+                            term: entry.term,
+                            request_hash: pending.request_hash,
+                            configuration: applied.after.clone(),
+                        });
+                    }
                     self.applied_index = entry.index;
-                    continue;
+                    delivery.output.completed = Some(receipt);
+                    break 'entry;
                 }
-            }
-            let encoded_hash = blake3::derive_key("focal.control.envelope.v1", &entry.data);
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.envelope_hash == encoded_hash)
-            {
-                // Exact locally admitted bytes already own their complete next
-                // state and receipt. Publication needs no decode or reservation.
-                let pending = self
-                    .pending
-                    .take()
-                    .ok_or(ControlError::Corrupt("pending vanished"))?;
-                if pending.term != entry.term {
+                let _decode = self.budget.reserve(
+                    BudgetKind::Recovery,
+                    BudgetLane::Completion,
+                    charge(entry.data.len().saturating_add(8192), 32)?,
+                )?;
+                let envelope: CommandEnvelope =
+                    decode(entry.data, self.options.limits.max_command_bytes)?;
+                // Schema 1 entries predate disk load reports and plan observations;
+                // their layout is otherwise identical and decodes above.
+                if !(1..=COMMAND_SCHEMA).contains(&envelope.schema)
+                    || envelope.identity != self.identity
+                    || envelope.owner_node == 0
+                    || envelope.owner_term != entry.term
+                {
                     return Err(ControlError::WrongOwner);
                 }
-                match (&pending.membership, &membership) {
-                    (None, None) => {}
-                    (Some(expected), Some(applied))
-                        if expected.index == prior_configuration
-                            && expected.before == applied.before
-                            && expected.after == applied.after => {}
-                    _ => return Err(ControlError::Corrupt("prepared membership result")),
+                match (&envelope.request.command, membership.as_ref()) {
+                    (ControlCommand::Membership(command), Some(applied)) => {
+                        if command.expected_configuration_index != prior_configuration
+                            || command.expected != applied.before
+                            || command.change.apply_to(&applied.before)? != applied.after
+                        {
+                            return Err(ControlError::Corrupt("committed membership precondition"));
+                        }
+                    }
+                    (ControlCommand::Membership(_), None) | (_, Some(_)) => {
+                        return Err(ControlError::Corrupt("command entry type"));
+                    }
+                    _ => {}
                 }
-                self.machine.publish(pending.machine, entry.index)?;
-                let mut retries = pending.retries;
-                let receipt = retries.complete(
-                    pending.request,
-                    entry.index,
-                    entry.term,
-                    self.machine.revisions(),
-                )?;
-                self.retries = retries;
+                let request_hash = envelope.request.digest()?;
                 if let Some(applied) = &membership {
                     self.membership = Some(ControlMembershipRecord {
                         index: entry.index,
                         term: entry.term,
-                        request_hash: pending.request_hash,
+                        request_hash,
                         configuration: applied.after.clone(),
                     });
                 }
-                self.applied_index = entry.index;
-                output.completed = Some(receipt);
-                continue;
-            }
-            let _decode = self.budget.reserve(
-                BudgetKind::Recovery,
-                BudgetLane::Completion,
-                charge(entry.data.len().saturating_add(8192), 32)?,
-            )?;
-            let envelope: CommandEnvelope =
-                decode(&entry.data, self.options.limits.max_command_bytes)?;
-            // Schema 1 entries predate disk load reports and plan observations;
-            // their layout is otherwise identical and decodes above.
-            if !(1..=COMMAND_SCHEMA).contains(&envelope.schema)
-                || envelope.identity != self.identity
-                || envelope.owner_node == 0
-                || envelope.owner_term != entry.term
-            {
-                return Err(ControlError::WrongOwner);
-            }
-            match (&envelope.request.command, membership.as_ref()) {
-                (ControlCommand::Membership(command), Some(applied)) => {
-                    if command.expected_configuration_index != prior_configuration
-                        || command.expected != applied.before
-                        || command.change.apply_to(&applied.before)? != applied.after
+                if let Some(existing) = self.retries.existing(&envelope.request, request_hash)? {
+                    if self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.request == existing.request)
                     {
-                        return Err(ControlError::Corrupt("committed membership precondition"));
+                        self.pending = None;
+                        delivery.output.completed = Some(existing);
                     }
+                    self.applied_index = entry.index;
+                    break 'entry;
                 }
-                (ControlCommand::Membership(_), None) | (_, Some(_)) => {
-                    return Err(ControlError::Corrupt("command entry type"));
+                if let Some(pending) = self.pending.take() {
+                    delivery.output.uncertain = Some(pending.request);
                 }
-                _ => {}
-            }
-            let request_hash = envelope.request.digest()?;
-            if let Some(applied) = &membership {
-                self.membership = Some(ControlMembershipRecord {
-                    index: entry.index,
-                    term: entry.term,
+                let mut prepared_retries = self.retries.prepare(
+                    &envelope.request,
                     request_hash,
-                    configuration: applied.after.clone(),
-                });
-            }
-            if let Some(existing) = self.retries.existing(&envelope.request, request_hash)? {
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.request == existing.request)
-                {
-                    self.pending = None;
-                    output.completed = Some(existing);
-                }
+                    &self.options.limits,
+                    &self.budget,
+                )?;
+                let prepared_machine = self.machine.prepare(
+                    &envelope.request.command,
+                    entry.data.len(),
+                    &self.budget,
+                    verifier,
+                    self.identity,
+                    &self.options,
+                )?;
+                self.machine.publish(prepared_machine, entry.index)?;
+                prepared_retries.complete(
+                    envelope.request.id,
+                    entry.index,
+                    entry.term,
+                    self.machine.revisions(),
+                )?;
+                self.retries = prepared_retries;
                 self.applied_index = entry.index;
-                continue;
             }
-            if let Some(pending) = self.pending.take() {
-                output.uncertain = Some(pending.request);
+            if configuration_first {
+                delivery.configuration = delivery
+                    .configuration
+                    .checked_add(1)
+                    .ok_or(ControlError::Capacity)?;
+            } else {
+                delivery.entry = delivery
+                    .entry
+                    .checked_add(1)
+                    .ok_or(ControlError::Capacity)?;
             }
-            let mut prepared_retries = self.retries.prepare(
-                &envelope.request,
-                request_hash,
-                &self.options.limits,
-                &self.budget,
-            )?;
-            let prepared_machine = self.machine.prepare(
-                &envelope.request.command,
-                entry.data.len(),
-                &self.budget,
-                verifier,
-                self.identity,
-                &self.options,
-            )?;
-            self.machine.publish(prepared_machine, entry.index)?;
-            prepared_retries.complete(
-                envelope.request.id,
-                entry.index,
-                entry.term,
-                self.machine.revisions(),
-            )?;
-            self.retries = prepared_retries;
-            self.applied_index = entry.index;
         }
-        if events.applied_index < self.applied_index {
+        if delivery.events.applied_index < self.applied_index {
             return Err(ControlError::Corrupt("Raft prefix regression"));
         }
-        self.applied_index = events.applied_index;
+        self.applied_index = delivery.events.applied_index;
         let status = self.node.status();
         if self
             .pending
@@ -1335,20 +1436,21 @@ impl ControlReplica {
             .is_some_and(|pending| pending.term != status.term || status.role != StateRole::Leader)
             && let Some(pending) = self.pending.take()
         {
-            output.uncertain = Some(pending.request);
+            delivery.output.uncertain = Some(pending.request);
         }
-        if events
+        if delivery
+            .events
             .read_states
             .iter()
             .any(|read| read.index > self.applied_index)
         {
             return Err(ControlError::Corrupt("read barrier ahead of publication"));
         }
-        output.messages = events.messages;
-        output.read_states = events.read_states;
-        output.applied_index = self.applied_index;
+        delivery.output.messages = std::mem::take(&mut delivery.events.messages);
+        delivery.output.read_states = std::mem::take(&mut delivery.events.read_states);
+        delivery.output.applied_index = self.applied_index;
         self.drained = true;
-        Ok(output)
+        Ok(())
     }
     pub fn checkpoint(&mut self) -> Result<(), ControlError> {
         self.check()?;

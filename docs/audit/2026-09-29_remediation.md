@@ -3044,13 +3044,18 @@ first error was one the owner treats as retryable (`checkpoint_retryable`: memor
 capacity, a node not ready, persistence pending), since any other would have ended the
 loop by its own name. *Fix, this batch.* The replica keeps its first failure by name
 (`ControlReplica::failure`) and the owner reports it beside `Failed`
-(`ControlProgress::failure`), so the next occurrence names the refusal. *Open.* A
-delivery the replica took from its node and could not finish for a refusal that changed
-nothing of the node — memory for a snapshot's decode, a machine's restore — ends the
-replica, where a session retains such a delivery and resumes it (`Session::retained`,
-`PendingDelivery`): the control replica needs the same retained delivery, bounded to one,
-so a transient refusal under a runner's load never ends a member; a batch of its own once
-the cause is named.
+(`ControlProgress::failure`), so the next occurrence names the refusal. *Fixed in the
+batch after.* A delivery the replica took from its node and could not finish for a
+refusal that changed nothing of the node — memory for a snapshot's decode, a machine's
+restore — ended the replica, where a session retains such a delivery and resumes it
+(`Session::retained`, `PendingDelivery`). The control replica retains it now (27 §13:
+`RetainedDelivery`, the events with the output built so far and the cursors past what
+is applied; `continue_delivery` reads each entry in place and moves its cursor once it is
+applied; `drive` keeps a delivery a memory refusal stopped for the next drain and fails
+the replica on anything else, by name), bounded to one: no new drain while one is held.
+`a_delivery_a_memory_refusal_stops_is_continued_by_the_next_drain` fills a follower's
+budget before its snapshot's decode, has the drain refused and nothing failed, and the
+snapshot installed once the room is given back.
 
 **A host's level that never came** (ubuntu, the second run, cli_upgrade
 `the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_refuses_to_serve`:

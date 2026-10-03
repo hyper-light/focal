@@ -12965,3 +12965,13 @@ first failure now, and the retained delivery it lacks is recorded as a batch of 
 A fourth, open: a host's level that never reached the upgrade view after the rollout's
 restart on one ubuntu run; the journey reports the node's health and placement beside
 the view when that happens again.
+
+### 2026-10-03 — a control replica's delivery is continued, not failed
+
+A control replica marked itself failed on any error of a delivery, a memory refusal
+for a snapshot's decode among them, though the refusal changed nothing of the node and
+the owner would have polled again: a member brought up by snapshot on a loaded runner
+ended ([27](27-consensus-roadmap-and-slates-port.md) §13). The delivery is retained now —
+the events, the output so far, the cursors past what is applied — and continued by the
+next drain at the entry the refusal stopped; only a memory refusal is retained, anything
+else fails the replica by its first failure's name.
