@@ -13062,3 +13062,12 @@ the group files' crash cuts cut the one adapter, and focal-ledger's test adapter
 backup keeps its names (`BackupMedium` is the medium) and calls a path with no parent a corrupt
 backup path, as before. `install` states the constraint its temporary name sets: two names of one
 directory that differ only in their extension share it.
+
+### 2026-10-03 — an unreadable record is not an absent one
+
+The medium answered `exists` as `Path::exists` does: any failure to read a path's metadata, a
+permission or an I/O error among them, read as no file there. For 27 §15's rule that a group's log
+without its records is corruption and never a fresh group, an unreadable record must not read as
+a missing one. `Medium::exists` now returns the error (`Path::try_exists`), focal-sim's disk
+answers absent only for a name it does not hold, and the backup's refusal to write over an
+existing manifest passes an error on instead of writing.

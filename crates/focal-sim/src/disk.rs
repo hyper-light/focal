@@ -184,8 +184,12 @@ impl focal_platform::fs::Medium for Disk {
     fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
         Disk::rename(self, from, to).map_err(io)
     }
-    fn exists(&self, path: &Path) -> bool {
-        Disk::read(self, path).is_ok()
+    fn exists(&self, path: &Path) -> std::io::Result<bool> {
+        match Disk::read(self, path) {
+            Ok(_) => Ok(true),
+            Err(DiskError::Missing) => Ok(false),
+            Err(error) => Err(io(error)),
+        }
     }
     fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
         let bytes = Disk::read(self, path).map_err(io)?;
