@@ -478,3 +478,117 @@ mod tests {
         assert!(private_dir_owner(&path).unwrap().is_none());
     }
 }
+
+/// Where files go and how they become durable. The real filesystem
+/// ([`FileMedium`]) and focal-sim's simulated disk both implement it, so the
+/// install sequence ([`install`]) is written once over it and a
+/// qualification's crash cuts cut the sequence the node runs.
+///
+/// Durability: [`FileMedium`]'s `sync_file` is `File::sync_all`, which is
+/// `fcntl(F_FULLFSYNC)` on Apple platforms (std's `sys/fs/unix.rs`) and
+/// `fsync` on other Unixes; its `sync_dir` on Unix is an `fsync` of the
+/// directory. Windows has no directory flush: there a name is made durable by
+/// [`atomic_replace`]'s write-through `MoveFileExW` (doc 20 §3).
+pub trait Medium {
+    fn create_dir(&mut self, path: &Path) -> io::Result<()>;
+    fn create(&mut self, path: &Path) -> io::Result<()>;
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+    fn sync_file(&mut self, path: &Path) -> io::Result<()>;
+    fn sync_dir(&mut self, path: &Path) -> io::Result<()>;
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
+    fn exists(&self, path: &Path) -> bool;
+    fn read(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>>;
+}
+/// The real filesystem.
+#[derive(Debug, Default)]
+pub struct FileMedium;
+impl Medium for FileMedium {
+    fn create_dir(&mut self, path: &Path) -> io::Result<()> {
+        if path.is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            self.create_dir(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(path)?;
+        crate::sync_dir(path)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            crate::sync_dir(parent)?;
+        }
+        Ok(())
+    }
+    fn create(&mut self, path: &Path) -> io::Result<()> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .map(drop)
+    }
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(bytes)
+    }
+    fn sync_file(&mut self, path: &Path) -> io::Result<()> {
+        // Open with write access: FlushFileBuffers rejects a read-only handle
+        // on Windows. write(true) without truncate reopens the existing file
+        // in place; fsync/FlushFileBuffers then makes its bytes durable.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()
+    }
+    fn sync_dir(&mut self, path: &Path) -> io::Result<()> {
+        crate::sync_dir(path)
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        atomic_replace(from, to)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+    fn read(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut file = File::open(path)?;
+        let length = usize::try_from(file.metadata()?.len())
+            .map_err(|_| io::Error::other("file too large"))?;
+        if length > limit {
+            return Err(io::Error::other("file exceeds the bound"));
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| io::Error::other("allocation"))?;
+        bytes.resize(length, 0);
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+/// Install one file durably: a temporary name, the bytes, a file sync, the
+/// rename, and the directory sync that makes the name durable. The temporary
+/// is `path` with the extension `part`: two files of one directory whose
+/// names differ only in their extension share it and must not be installed
+/// at once, and a `path` that ends in `.part` is its own temporary and must
+/// not be installed this way. Refused (`InvalidInput`) for a path with no
+/// parent directory.
+pub fn install<M: Medium>(medium: &mut M, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a path with no parent"))?;
+    let temporary = path.with_extension("part");
+    medium.create(&temporary)?;
+    medium.write(&temporary, bytes)?;
+    medium.sync_file(&temporary)?;
+    medium.rename(&temporary, path)?;
+    medium.sync_dir(parent)?;
+    Ok(())
+}

@@ -13186,3 +13186,16 @@ across files. The old WAL directory is never removed: `CURRENT` at fence version
 conversion's commit point, and the binary before it fails closed on it. The conversion runs at
 start once the upgrade fence opens at `STORAGE_LEVEL`, or by `focal storage convert`, on one code
 path. The shared shell gains a tick mode and a held refusal first, in hyper-raft. No code yet.
+
+### 2026-10-03 — one medium for every durable install
+
+The install sequence (a temporary name, the bytes, a file flush, the rename, the directory flush)
+was written once over `BackupMedium` in focal-ledger, with the real filesystem and a test adapter
+of focal-sim's disk under it. The group files of [27](27-consensus-roadmap-and-slates-port.md)
+§15 need the same sequence, and focal-consensus cannot depend on focal-ledger. The trait, the
+filesystem's medium and the sequence move unchanged to focal-platform (`fs::Medium`,
+`fs::FileMedium`, `fs::install`). focal-sim's disk is now a medium itself, so the backup suites and
+the group files' crash cuts cut the one adapter, and focal-ledger's test adapter is gone. The
+backup keeps its names (`BackupMedium` is the medium) and calls a path with no parent a corrupt
+backup path, as before. `install` states the constraint its temporary name sets: two names of one
+directory that differ only in their extension share it.

@@ -2413,46 +2413,6 @@ fn a_hosted_authority_retires_under_the_outcome_bound_and_is_refused_at_it() {
     assert_eq!(cluster.status(1, 1), Some(ClaimStatus::Cancelled));
 }
 
-/// The simulated disk as a backup medium: every install step is one
-/// operation the qualification can cut.
-struct SimMedium(focal_sim::disk::Disk);
-impl SimMedium {
-    fn io(error: focal_sim::disk::DiskError) -> std::io::Error {
-        std::io::Error::other(error.to_string())
-    }
-}
-impl backup::BackupMedium for SimMedium {
-    fn create_dir(&mut self, _: &Path) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn create(&mut self, path: &Path) -> std::io::Result<()> {
-        self.0.create(path).map_err(Self::io)
-    }
-    fn write(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        let offset = self.0.read(path).map_err(Self::io)?.len();
-        self.0.write(path, offset, bytes).map_err(Self::io)
-    }
-    fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
-        self.0.sync_file(path).map_err(Self::io)
-    }
-    fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
-        self.0.sync_dir(path).map_err(Self::io)
-    }
-    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-        self.0.rename(from, to).map_err(Self::io)
-    }
-    fn exists(&self, path: &Path) -> bool {
-        self.0.read(path).is_ok()
-    }
-    fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
-        let bytes = self.0.read(path).map_err(Self::io)?;
-        if bytes.len() > limit {
-            return Err(std::io::Error::other("bound"));
-        }
-        Ok(bytes.to_vec())
-    }
-}
-
 /// A hosted session with a work artifact whose payload the node sealed,
 /// and the image of its committed prefix.
 fn backed_up_cluster() -> (Cluster, backup::BackupImage) {
@@ -2531,7 +2491,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     let decoder = backup::decoder_pair();
     let root = Path::new("/backup");
     // The complete write.
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     let report = backup::write(
         &mut medium,
         root,
@@ -2579,17 +2539,17 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     // Every durable cut before the manifest leaves no backup; the survivors
     // are whole files or absent.
     let operations = {
-        let mut probe = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+        let mut probe = focal_sim::disk::Disk::new(64 * 1024 * 1024);
         backup::write(
             &mut probe, root, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
         )
         .unwrap();
-        probe.0.operations()
+        probe.operations()
     };
     assert!(operations > 5);
     for cut in 1..=operations {
-        let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
-        medium.0.fail_before(Some(cut));
+        let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
+        medium.fail_before(Some(cut));
         let result = backup::write(
             &mut medium,
             root,
@@ -2601,7 +2561,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
             &budget,
             1_000,
         );
-        medium.0.crash();
+        medium.crash();
         match result {
             Ok(_) => {
                 assert_eq!(cut, operations + 1, "a cut inside the write cannot succeed");
@@ -2616,7 +2576,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         }
     }
     // A tampered chunk and a tampered envelope are named.
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     backup::write(
         &mut medium,
         root,
@@ -2631,7 +2591,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     .unwrap();
     let chunk = report.manifest.content[0].chunks[0].hash;
     let path = root.join("content").join(format!("{chunk}.chunk"));
-    medium.0.write(&path, 0, &[0xff]).unwrap();
+    medium.write(&path, 0, &[0xff]).unwrap();
     let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
     assert!(!tampered.complete());
     assert!(
@@ -2642,7 +2602,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         "{:?}",
         tampered.problems
     );
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     backup::write(
         &mut medium,
         root,
@@ -2655,7 +2615,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         1_000,
     )
     .unwrap();
-    medium.0.write(root.join("checkpoint"), 3, &[0xff]).unwrap();
+    medium.write(root.join("checkpoint"), 3, &[0xff]).unwrap();
     let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
     assert!(!tampered.checkpoint_verified && !tampered.inventory_matches);
     // The real filesystem medium writes the same backup.
@@ -2683,7 +2643,7 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
     let decoder = backup::decoder_pair();
     let root = Path::new("/backup");
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     let report = backup::write(
         &mut medium,
         root,
@@ -2700,7 +2660,6 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     for chunk in &report.manifest.seeds {
         assert!(
             medium
-                .0
                 .read(root.join("seeds").join(format!("{}.seed", chunk.hash)))
                 .is_ok()
         );
@@ -2711,7 +2670,7 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     // A missing seed chunk is named and the envelope cannot be rebuilt.
     let first = report.manifest.seeds[0].hash;
     let path = root.join("seeds").join(format!("{first}.seed"));
-    medium.0.rename(&path, root.join("gone")).unwrap();
+    medium.rename(&path, root.join("gone")).unwrap();
     let broken = backup::verify(&medium, root, decoder.1, &budget).unwrap();
     assert!(!broken.complete());
     assert!(
