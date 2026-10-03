@@ -258,6 +258,25 @@ pub trait Delivery: Send + Sync {
     /// `bytes` of a declared body of `rank`'s class will not be read: the
     /// reader gave it up.
     fn released(&self, rank: u8, bytes: u64);
+    /// A reader gave a body up, for `reason`.
+    fn gave_up(&self, reason: GiveUp);
+}
+/// Why a body was given up (`Arriving::judge`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GiveUp {
+    /// A judgement brought less than the least progress of the connection.
+    Quiet,
+    /// The connection delivered everything the peer owed of the body's class
+    /// and the less urgent ones, and the body was not among it: the peer
+    /// withholds it.
+    Withheld,
+}
+/// The bodies a connection's readers gave up, by reason: what a measurer of
+/// the connection reads to tell a quiet connection from a withholding peer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GiveUps {
+    pub quiet: u64,
+    pub withheld: u64,
 }
 /// The delivery a reader keeps for itself where no connection does: what it
 /// read is all it knows was received or delivered, and all it is owed is
@@ -266,6 +285,13 @@ pub trait Delivery: Send + Sync {
 pub struct AloneDelivery {
     read: std::sync::atomic::AtomicU64,
     owed: std::sync::atomic::AtomicU64,
+    given_up: GiveUpCounts,
+}
+impl AloneDelivery {
+    /// The bodies this reader gave up, by reason.
+    pub fn given_up(&self) -> GiveUps {
+        self.given_up.read()
+    }
 }
 impl Delivery for AloneDelivery {
     fn received(&self) -> u64 {
@@ -289,13 +315,44 @@ impl Delivery for AloneDelivery {
     fn released(&self, _rank: u8, bytes: u64) {
         saturating_sub_atomic(&self.owed, bytes);
     }
+    fn gave_up(&self, reason: GiveUp) {
+        self.given_up.count(reason);
+    }
+}
+/// Bodies given up, by reason.
+#[derive(Debug, Default)]
+struct GiveUpCounts {
+    quiet: std::sync::atomic::AtomicU64,
+    withheld: std::sync::atomic::AtomicU64,
+}
+impl GiveUpCounts {
+    fn count(&self, reason: GiveUp) {
+        let count = match reason {
+            GiveUp::Quiet => &self.quiet,
+            GiveUp::Withheld => &self.withheld,
+        };
+        // A count that reached the most a u64 holds stays there.
+        let _ = count.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |value| value.checked_add(1),
+        );
+    }
+    fn read(&self) -> GiveUps {
+        GiveUps {
+            quiet: self.quiet.load(std::sync::atomic::Ordering::Acquire),
+            withheld: self.withheld.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
 }
 /// The delivery one connection keeps for all its readers: what each class
-/// declared and read, beside what the connection received.
+/// declared and read, beside what the connection received, and the bodies
+/// its readers gave up.
 #[derive(Debug, Default)]
 pub struct Counts {
     delivered: [std::sync::atomic::AtomicU64; crate::TrafficClass::RANKS],
     declared: [std::sync::atomic::AtomicU64; crate::TrafficClass::RANKS],
+    given_up: GiveUpCounts,
 }
 impl Counts {
     fn slot(
@@ -338,6 +395,13 @@ impl Counts {
         if let Some(count) = Self::slot(&self.declared, rank) {
             saturating_sub_atomic(count, bytes);
         }
+    }
+    pub fn gave_up(&self, reason: GiveUp) {
+        self.given_up.count(reason);
+    }
+    /// The bodies the connection's readers gave up, by reason.
+    pub fn given_up(&self) -> GiveUps {
+        self.given_up.read()
     }
 }
 fn saturating_sub_atomic(count: &std::sync::atomic::AtomicU64, bytes: u64) {
@@ -428,7 +492,7 @@ impl Arriving {
         moved: Moved,
         backlog: u64,
         period: std::time::Duration,
-    ) -> Result<(), WireError> {
+    ) -> Result<(), GiveUp> {
         if now < self.next {
             return Ok(());
         }
@@ -438,8 +502,11 @@ impl Arriving {
         let least = u64::try_from(LEAST_PROGRESS)
             .unwrap_or(u64::MAX)
             .min(self.remaining);
-        if self.had || received < least {
-            return Err(WireError::Timeout);
+        if self.had {
+            return Err(GiveUp::Withheld);
+        }
+        if received < least {
+            return Err(GiveUp::Quiet);
         }
         self.charged = self
             .charged
@@ -522,12 +589,17 @@ pub async fn read_payload_arriving<R: AsyncRead + Unpin, T: DeserializeOwned>(
     let mut filled = 0_usize;
     while filled < bytes.len() {
         longest = longest.max(round_trip());
-        arriving.judge(
-            tokio::time::Instant::now(),
-            moved(),
-            delivery.backlog(rank),
-            judgement(wait, longest),
-        )?;
+        arriving
+            .judge(
+                tokio::time::Instant::now(),
+                moved(),
+                delivery.backlog(rank),
+                judgement(wait, longest),
+            )
+            .map_err(|reason| {
+                delivery.gave_up(reason);
+                WireError::Timeout
+            })?;
         let rest = bytes.get_mut(filled..).ok_or(WireError::Limit)?;
         if let Ok(read) = tokio::time::timeout_at(arriving.due(), reader.read(rest)).await {
             let read = read?;

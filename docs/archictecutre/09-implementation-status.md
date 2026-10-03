@@ -13043,3 +13043,14 @@ same manager; beside Copa under CoDel, NewReno and CUBIC carry 1.008 to 1.539 of
 they carry beside their own kind. Open, the next batch: Copa competing without a manager
 takes more than that at long round trips, its test of the mode misjudges its own queue,
 and on a link without jitter it does not leave the competitive mode.
+
+### 2026-10-03 — a connection says why it gave a body up
+
+From 9e1e463's macOS run: the wire test of a body a peer withholds while it sends others
+held the give-up to the connection's quiet, taking the other rule — everything the peer
+owed of the class delivered, the body not among it — for unreachable; with the headers
+straggling, the others' bytes passed the most that was owed and the body rightly ended a
+judgement after the last of them. The judgement names its rule (`GiveUp::{Quiet,
+Withheld}`), the connection counts the bodies given up by each (`QuicRemote::given_up`),
+and the test takes either, a quiet one only where its samples, by their own spacing,
+cannot rule it out.

@@ -120,6 +120,9 @@ impl crate::frame::Delivery for ConnectionDelivery<'_> {
     fn released(&self, rank: u8, bytes: u64) {
         self.counts.released(rank, bytes);
     }
+    fn gave_up(&self, reason: crate::frame::GiveUp) {
+        self.counts.gave_up(reason);
+    }
 }
 /// What one exchange has to send, held until it ends.
 struct Sending<'a> {
@@ -1251,6 +1254,12 @@ impl QuicRemote {
     /// connection.
     pub fn received(&self) -> u64 {
         self.connection.stats().udp_rx.bytes
+    }
+    /// The bodies this connection's readers gave up, by reason
+    /// (`frame::GiveUp`): a quiet connection, or a peer withholding a body
+    /// while it delivers others.
+    pub fn given_up(&self) -> crate::frame::GiveUps {
+        self.capacity.counts.given_up()
     }
     pub async fn request(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, WireError> {
         self.request_within(request, self.limits.request_timeout)

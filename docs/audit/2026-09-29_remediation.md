@@ -3170,6 +3170,25 @@ three at a time with and without the harness's capture: each took 11 s to 21 s, 
 span of the runs before it whose level waited no interval. *Test.*
 `a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_interval`.
 
+**A withheld body given up by the rule taken for unreachable** (macOS, 9e1e463's push run,
+focal-wire `a_body_the_peer_withholds_while_it_sends_others_is_given_up`: given up 111 ms
+after the last of the other replies, with no quiet span before it). `Arriving::judge`
+gives a body up by two rules: a judgement that brought less than the least progress, or
+the connection having delivered everything the peer owed of the body's class with the body
+not among it (the share). The test held the give-up to the first alone — its fix of
+2026-10-02 took the second for unreachable here, the withheld body's own bytes being part
+of what is owed. That holds only while every reply's header is outstanding at once: the
+most the peer owed is read at each judgement, the others' delivery is counted since the
+body began, and where their headers came after the first judgements (a slow runner) the
+others' bytes pass the most that was owed and the body ends a judgement later — rightly,
+the peer having sent the replies after it. *Fix.* The judgement says which rule ended a
+body (`GiveUp::{Quiet, Withheld}`), the reader records it on the connection's counts
+(`Delivery::gave_up`), and a measurer reads them (`QuicRemote::given_up`); the test takes
+the give-up by either rule, and holds a quiet one to what the sampled received bytes
+cannot rule out — a judgement before it, the samples' own gaps counted rather than a
+punctual sampler assumed. The judgement's unit test names each rule's reason. Twelve
+runs, four at a time: all pass.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

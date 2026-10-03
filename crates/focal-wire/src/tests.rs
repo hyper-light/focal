@@ -2172,10 +2172,10 @@ fn a_bodys_arrival_is_charged_with_what_arrives_against_what_is_owed() {
     let mut body = Arriving::begin(start, moved(0, 0), 24_000, 24_000, PERIOD);
     body.judge(start + PERIOD / 2, moved(0, 0), 24_000, PERIOD)
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         body.judge(start + PERIOD, moved(100, 100), 24_000, PERIOD),
-        Err(WireError::Timeout)
-    ));
+        Err(crate::frame::GiveUp::Quiet)
+    );
     // A body of fewer bytes than a datagram needs only itself.
     let mut tail = Arriving::begin(start, moved(0, 0), 300, 300, PERIOD);
     tail.arrived(300);
@@ -2195,10 +2195,10 @@ fn a_bodys_arrival_is_charged_with_what_arrives_against_what_is_owed() {
     withheld
         .judge(start + PERIOD * 3, moved(1_060_000, 60_000), 10_000, PERIOD)
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         withheld.judge(start + PERIOD * 4, moved(2_000_000, 60_000), 10_000, PERIOD),
-        Err(WireError::Timeout)
-    ));
+        Err(crate::frame::GiveUp::Withheld)
+    );
     // The judgement stretches with the path: a period that the longest
     // round trip's probe timeout exceeds is that probe timeout — three
     // round trips and the acknowledgement delay the peer may take.
@@ -4961,17 +4961,21 @@ async fn a_reply_queued_behind_the_peers_others_is_not_refused_while_they_arrive
 
 /// A peer that answers with a header, declares a body and never sends it,
 /// while it keeps the connection busy with the replies to the requests that
-/// follow, is still given up, and the others arrive. A body is given up by
-/// the connection's quiet alone (`Arriving::judge`: a judgement that
-/// brought less than `LEAST_PROGRESS`, though every judgement of a quiet
-/// connection brings a datagram or two), so the withheld body lasts while
-/// the others arrive and goes within a judgement or two of the last of
-/// them — or of a pause of the peer's own that long, on a machine that
-/// starves it (a CI runner that ran the pacing at six times its interval
-/// gave the body up half a second before the last of the others, and was
-/// right to). The connection's received bytes are sampled as the rule
-/// reads them, and the give-up is held to a quiet span before it, never to
-/// the clock.
+/// follow, is still given up, and the others arrive. `Arriving::judge`
+/// gives a body up by either of two rules, and the connection says which
+/// (`QuicRemote::given_up`): a judgement that brought less than
+/// `LEAST_PROGRESS` of the connection (a pause of the peer's own on a
+/// machine that starves it — a CI runner that ran the pacing at six times
+/// its interval gave the body up half a second before the last of the
+/// others, and was right to), or the connection delivering everything the
+/// peer owed of the body's class with the body not among it — which the
+/// headers' order decides: where the others' headers came after the first
+/// judgements, the most the peer owed at any judgement is less than the
+/// others' bytes, and their delivery ends the withheld body a judgement
+/// after (a macOS runner, 2026-10-03; the rule was taken for unreachable
+/// here). A quiet give-up is held to what the connection's received bytes,
+/// sampled as the rule reads them, cannot rule out — a judgement before
+/// it, the samples' own gaps included — never to the clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
     const OTHERS: u128 = 12;
@@ -5044,28 +5048,28 @@ async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
     }
     let pieces = u32::try_from(OTHERS).unwrap() * OTHER_BYTES.div_ceil(PACED_PIECE as u32);
     assert!(last_other >= PACED_EVERY * pieces, "{last_other:?}");
-    // The withheld body is given up by the connection's quiet and by
-    // nothing else: a span of a judgement — less the two samples that
-    // bracket it — in which the connection carried less than the least
-    // progress, ending by the give-up; after the last of the others, or
-    // during a pause of the peer's own. And it goes within three
-    // judgements of the last of the others.
+    // The withheld body is given up, by one of the two rules and once; a
+    // quiet give-up only where the samples cannot rule out a judgement's
+    // quiet before it. And it goes within three judgements of the last of
+    // the others.
     let (withheld, at) = &answers[0];
     assert!(
         matches!(withheld, Err(WireError::Timeout)),
         "{withheld:?} at {at:?}"
     );
-    let quiet = quiet_before(
-        &samples,
-        wire.request_timeout.saturating_sub(sample_every * 2),
-        *at,
-    );
-    assert!(
-        quiet.is_some(),
-        "given up at {at:?} while the connection carried on (the others' last at {last_other:?}; {} samples)",
-        samples.len()
-    );
     let judgement = crate::frame::judgement(wire.request_timeout, remote.longest_round_trip());
+    let given_up = remote.given_up();
+    assert_eq!(given_up.quiet + given_up.withheld, 1, "{given_up:?}");
+    if given_up.quiet == 1 {
+        assert!(
+            quiet_before(&samples, judgement, *at),
+            "given up at {at:?} while the connection carried on (the others' last at {last_other:?}): {:?}",
+            samples
+                .iter()
+                .filter(|(when, _)| *when + judgement * 2 >= *at && *when <= *at + judgement)
+                .collect::<Vec<_>>()
+        );
+    }
     assert!(
         *at <= last_other + judgement * 3,
         "{at:?} long after the others' {last_other:?} (a judgement of {judgement:?})"
@@ -5081,23 +5085,33 @@ const RECEIVED_SAMPLES: usize = 16_384;
 /// that gives a body up (`Arriving::judge`), as a sampler sees it — a
 /// judgement's window has a sample within one interval of either end, so
 /// a window of a judgement less two intervals is asked of the samples.
-fn quiet_before(
-    samples: &[(Duration, u64)],
-    window: Duration,
-    until: Duration,
-) -> Option<(Duration, Duration)> {
+/// Whether the connection's received bytes, sampled at `samples`, leave room
+/// for a window of `judgement` ending by `until` in which the connection
+/// received less than the least progress: two samples between which it did,
+/// whose span, with the gaps to the samples beside them — where the bytes
+/// counted at the far sample may have come at its end — reaches a
+/// judgement. The samples' own spacing is what they say, however a loaded
+/// machine spaced them.
+fn quiet_before(samples: &[(Duration, u64)], judgement: Duration, until: Duration) -> bool {
     let least = u64::try_from(crate::frame::LEAST_PROGRESS).unwrap();
-    for (index, (from, received_from)) in samples.iter().enumerate() {
-        for (to, received_to) in samples.iter().skip(index + 1) {
+    for (first, (from, received_from)) in samples.iter().enumerate() {
+        let opens = first
+            .checked_sub(1)
+            .and_then(|before| samples.get(before))
+            .map_or(Duration::ZERO, |(when, _)| *when);
+        for (last, (to, received_to)) in samples.iter().enumerate().skip(first) {
             if *to > until || received_to - received_from >= least {
                 break;
             }
-            if *to - *from >= window {
-                return Some((*from, *to));
+            let closes = samples
+                .get(last + 1)
+                .map_or(until, |(when, _)| (*when).min(until));
+            if closes.saturating_sub(opens) >= judgement && *to >= *from {
+                return true;
             }
         }
     }
-    None
+    false
 }
 
 /// A peer whose issuer succeeded one the verifier knows is admitted through
