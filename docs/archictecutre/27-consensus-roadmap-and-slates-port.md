@@ -592,6 +592,19 @@ written through the leader, read through each host). Reads therefore scale acros
 the voters of a log, and a copy's read is exactly as fresh as the leader's commit
 index at the moment it asked.
 
+A control replica — the root's, a directory partition's — serves its followers'
+reads the same way since 2026-10-02 (`ControlReplica::read_index`, a follower's
+read through its leader), and parks the same way since 2026-10-03: a barrier
+answered above what it has applied is held until the entries it names are applied
+(`ControlReplica::{park_ahead, release_parked}`), its bytes charged while held and
+handed to the delivery that lets it go, no more than the reads the core holds in
+flight; a replica at that bound refuses a new read as `Capacity`, and one dropped
+there is counted (`reads_dropped`). Before, the control replica took such a barrier
+for corruption: a member brought up by snapshot that read before it caught up
+failed, and with it the hosted partition it served (the split-and-merge test's
+failures on ubuntu CI, 2026-10-02 and 2026-10-03, named once the replica kept the
+error that stopped it).
+
 ## 6. Order of work
 
 | Stage | Content | Exit evidence |

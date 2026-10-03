@@ -3079,6 +3079,24 @@ the replica on anything else, by name), bounded to one: no new drain while one i
 budget before its snapshot's decode, has the drain refused and nothing failed, and the
 snapshot installed once the room is given back.
 
+**The split test's cause, named (2026-10-03).** With the replica's first failure kept
+by name, a local run of `a_crowded_partition_splits_survives_a_restart_and_merges_back`
+said it: `corrupt committed metadata: read barrier ahead of publication`. A control
+replica serves its followers' reads through its leader since 2026-10-02 (27 §5), and
+the leader's answer names its commit, which a member brought up by snapshot has yet to
+apply; the replica's delivery took a barrier above its applied index for corruption and
+failed — the check predates follower reads. The hosted session had met the same and
+parks such a barrier (F55). *Fix.* The control replica parks the same way
+(`park_ahead`, `release_parked`): held until the entries the barrier names are applied,
+reserved before anything moves so a refusal for memory leaves the delivery to be
+continued, charged while held and handed with the barrier to the delivery that lets it
+go, bounded by the reads the core holds in flight — a replica at the bound refuses a new
+read as `Capacity` and counts a barrier dropped there. The control test rig withholds a
+follower's entries while the others commit (`Rig::withheld`); in
+`a_follower_read_answered_ahead_of_what_it_applied_waits_and_never_fails_it` the
+follower's read is answered above what it applied, waits, and is answered once its
+entries arrive — before the fix the follower failed with the error above.
+
 **A host's level that never came** (ubuntu, the second run, cli_upgrade
 `the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_refuses_to_serve`:
 after the rollout's restart the host stayed at the level before for 90 s, the founder at

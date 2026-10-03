@@ -12985,3 +12985,14 @@ frame after the gap and stopped applying. The owner asks at every period now, wh
 runs it; a test isolates a follower of single-owner replicas while entries commit, and it held
 40 frames and let none go before the fix. The fleet and evidence harnesses' waits for
 publication and for a leader are charged to the replicas' periods and name each replica's state.
+
+### 2026-10-03 — a control follower's read waits for what its leader committed
+
+The split-and-merge test's failures on ubuntu CI had one cause, named once the
+control replica kept the error that stopped it: a follower's read answered with its
+leader's commit, above what the follower had applied, was taken for corruption — a
+check older than the control replicas' follower reads (27 §5). The barrier is held
+until the entries it names are applied, bounded by the reads the core holds in flight
+and charged while held, as the hosted session has held one since F55; a control-rig
+test withholds a follower's entries while the others commit, and its read waits and
+is answered instead of failing the replica.

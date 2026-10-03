@@ -164,6 +164,8 @@ pub struct ControlEvents {
     pub uncertain: Option<ControlRequestId>,
     pub applied_index: u64,
     allocation: Option<Allocation>,
+    /// The charge of the held barriers this delivery let go.
+    parked: Option<Allocation>,
 }
 impl ControlEvents {
     /// Move with messages/read barriers transferred into the host transport.
@@ -196,6 +198,16 @@ pub struct ControlReplica {
     failure: Option<String>,
     /// A delivery a refusal stopped, continued by the next drain.
     retained: Option<RetainedDelivery>,
+    /// Read barriers answered above what this replica has applied — a
+    /// follower's read, answered with its leader's commit (27 §5) — held
+    /// until the entries they name are applied; no more than the reads the
+    /// core holds in flight, their bytes charged to `parked_charge` while
+    /// held.
+    parked_reads: Vec<ReadBarrier>,
+    parked_charge: Option<Allocation>,
+    /// Barriers held so, and barriers dropped at that bound, since open.
+    reads_parked: u64,
+    reads_dropped: u64,
     /// Founded here on a sealed image (`ControlBootstrap::is_image`).
     founded_from_image: bool,
 }
@@ -231,6 +243,10 @@ impl ControlReplica {
             failed: false,
             failure: None,
             retained: None,
+            parked_reads: Vec::new(),
+            parked_charge: None,
+            reads_parked: 0,
+            reads_dropped: 0,
             founded_from_image,
         })
     }
@@ -263,6 +279,10 @@ impl ControlReplica {
             failed: false,
             failure: None,
             retained: None,
+            parked_reads: Vec::new(),
+            parked_charge: None,
+            reads_parked: 0,
+            reads_dropped: 0,
             founded_from_image,
         })
     }
@@ -721,6 +741,12 @@ impl ControlReplica {
     /// the first root with three voters).
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), ControlError> {
         self.check()?;
+        // A replica whose held barriers are at their bound is too far
+        // behind to take another read: refused here, typed, rather than
+        // dropped when its answer comes.
+        if self.parked_reads.len() >= self.node.pending_reads() {
+            return Err(ControlError::Capacity);
+        }
         let status = self.node.status();
         if status.role == StateRole::Leader {
             self.check_ready()?;
@@ -1438,19 +1464,123 @@ impl ControlReplica {
         {
             delivery.output.uncertain = Some(pending.request);
         }
-        if delivery
-            .events
-            .read_states
-            .iter()
-            .any(|read| read.index > self.applied_index)
-        {
-            return Err(ControlError::Corrupt("read barrier ahead of publication"));
-        }
+        // A barrier answered above what this replica has applied is a
+        // follower's read answered with its leader's commit (27 §5, the
+        // session's rule since F55): held until the entries it names are
+        // applied, never corruption. It was taken for corruption, and a
+        // member brought up by snapshot that read before it caught up
+        // failed (`a_crowded_partition_splits_survives_a_restart_and_merges_back`,
+        // ubuntu CI and a local run, 2026-10-03). Those held before that this
+        // delivery reached go out with the rest.
+        self.park_ahead(&mut delivery.events.read_states)?;
+        let released = self.release_parked(&mut delivery.events.read_states)?;
         delivery.output.messages = std::mem::take(&mut delivery.events.messages);
         delivery.output.read_states = std::mem::take(&mut delivery.events.read_states);
+        delivery.output.parked = released;
         delivery.output.applied_index = self.applied_index;
         self.drained = true;
         Ok(())
+    }
+    /// Hold the barriers of `states` answered above the applied index. What
+    /// they take is reserved before any is moved, so a refusal for memory
+    /// leaves the delivery as it was, to be continued; beyond the bound —
+    /// the reads the core holds in flight — a barrier is dropped and
+    /// counted, and the replica refuses new reads until its held ones go
+    /// (`read_index`).
+    fn park_ahead(&mut self, states: &mut Vec<ReadBarrier>) -> Result<(), ControlError> {
+        let bound = self.node.pending_reads();
+        let room = bound.saturating_sub(self.parked_reads.len());
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for read in states
+            .iter()
+            .filter(|read| read.index > self.applied_index)
+            .take(room)
+        {
+            bytes = bytes
+                .checked_add(parked_bytes(read)?)
+                .ok_or(ControlError::Capacity)?;
+            count = count.checked_add(1).ok_or(ControlError::Capacity)?;
+        }
+        if count > 0 {
+            self.parked_reads
+                .try_reserve(count)
+                .map_err(|_| ControlError::Capacity)?;
+            let mut charge = self
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?
+                .commit();
+            match &mut self.parked_charge {
+                Some(held) => held
+                    .absorb(&mut charge)
+                    .map_err(|_| ControlError::Capacity)?,
+                None => self.parked_charge = Some(charge),
+            }
+        }
+        let mut index = 0;
+        while let Some(read) = states.get(index) {
+            if read.index <= self.applied_index {
+                index = index.checked_add(1).ok_or(ControlError::Capacity)?;
+                continue;
+            }
+            let barrier = states.remove(index);
+            if self.parked_reads.len() < bound {
+                self.parked_reads.push(barrier);
+                self.reads_parked = self.reads_parked.saturating_add(1);
+            } else {
+                self.reads_dropped = self.reads_dropped.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+    /// Move the held barriers the applied index has reached into `states`,
+    /// their charge with them.
+    fn release_parked(
+        &mut self,
+        states: &mut Vec<ReadBarrier>,
+    ) -> Result<Option<Allocation>, ControlError> {
+        let reached = self
+            .parked_reads
+            .iter()
+            .filter(|read| read.index <= self.applied_index)
+            .count();
+        if reached == 0 {
+            return Ok(None);
+        }
+        states
+            .try_reserve(reached)
+            .map_err(|_| ControlError::Capacity)?;
+        let mut released: Option<Allocation> = None;
+        let mut index = 0;
+        while let Some(read) = self.parked_reads.get(index) {
+            if read.index > self.applied_index {
+                index = index.checked_add(1).ok_or(ControlError::Capacity)?;
+                continue;
+            }
+            let bytes = parked_bytes(read)?;
+            let mut part = self
+                .parked_charge
+                .as_mut()
+                .ok_or(ControlError::Corrupt(
+                    "held read barrier without its charge",
+                ))?
+                .split_off(bytes)
+                .map_err(|_| ControlError::Corrupt("held read barrier without its charge"))?;
+            match &mut released {
+                Some(all) => all.absorb(&mut part).map_err(|_| ControlError::Capacity)?,
+                None => released = Some(part),
+            }
+            states.push(self.parked_reads.remove(index));
+        }
+        Ok(released)
+    }
+    /// Barriers held above the applied index, and dropped at the bound,
+    /// since open (27 §5).
+    pub fn reads_parked(&self) -> u64 {
+        self.reads_parked
+    }
+    pub fn reads_dropped(&self) -> u64 {
+        self.reads_dropped
     }
     pub fn checkpoint(&mut self) -> Result<(), ControlError> {
         self.check()?;
@@ -1570,4 +1700,11 @@ impl ControlReplica {
         }
         Ok(())
     }
+}
+
+/// What a held read barrier is charged: the barrier and its context.
+fn parked_bytes(read: &ReadBarrier) -> Result<usize, ControlError> {
+    size_of::<ReadBarrier>()
+        .checked_add(read.context.capacity())
+        .ok_or(ControlError::Capacity)
 }

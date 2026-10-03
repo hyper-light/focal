@@ -142,6 +142,10 @@ struct Rig {
     owners: Vec<ControlOwner>,
     routers: Vec<tokio::task::JoinHandle<()>>,
     isolated: Arc<AtomicU64>,
+    /// The node the routers send no entries to — appends and snapshots
+    /// dropped, everything else carried — so its log falls behind while it
+    /// still hears its leader. Zero withholds nothing.
+    withheld: Arc<AtomicU64>,
     /// The applied index at which the routers hold every frame, until a
     /// test lets the next one through: a commit at a time, at the test's
     /// pace. `u64::MAX` holds nothing.
@@ -172,6 +176,7 @@ impl Rig {
             owners: vec![],
             routers: vec![],
             isolated: Arc::new(AtomicU64::new(0)),
+            withheld: Arc::new(AtomicU64::new(0)),
             allowed: Arc::new(AtomicU64::new(u64::MAX)),
             election_tick,
             request_timeout,
@@ -208,6 +213,7 @@ impl Rig {
         for (from, mut channel) in channels {
             let hosts = self.hosts.clone();
             let isolated = self.isolated.clone();
+            let withheld = self.withheld.clone();
             let allowed = self.allowed.clone();
             self.routers.push(tokio::spawn(async move {
                 // What the machine takes to wake a task that asked for a
@@ -224,6 +230,19 @@ impl Rig {
                     let excluded = isolated.load(Ordering::SeqCst);
                     if excluded == from || excluded == frame.target {
                         continue;
+                    }
+                    if withheld.load(Ordering::SeqCst) == frame.target {
+                        let (Operation::Raft { message, .. }
+                        | Operation::RaftOrdered { message, .. }) = &frame.request.operation
+                        else {
+                            continue;
+                        };
+                        let kind = focal_consensus::decode_message(message).unwrap().msg_type;
+                        if kind == focal_consensus::MessageType::MsgAppend as i32
+                            || kind == focal_consensus::MessageType::MsgSnapshot as i32
+                        {
+                            continue;
+                        }
                     }
                     let Some(target) = hosts.get(frame.target.saturating_sub(1) as usize) else {
                         continue;
@@ -1636,6 +1655,91 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
         "{receipts:?}"
     );
     assert_eq!(transferred, Ok(()));
+    rig.stop().await;
+}
+
+/// A follower's read answered above what it has applied waits for the
+/// entries it names (27 §5), and never fails the replica. The follower is
+/// sent no entries while the other two commit, so the leader answers its
+/// read with a commit the follower has not applied; the barrier was taken
+/// for corruption, and a member brought up by snapshot that read before it
+/// caught up failed (`a_crowded_partition_splits_survives_a_restart_and_merges_back`,
+/// 2026-10-03). Its entries let through, the follower answers the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_read_answered_ahead_of_what_it_applied_waits_and_never_fails_it() {
+    let keys = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        keys.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    rig.hosts[0].campaign().await.unwrap();
+    let leader = rig.leader(0).await;
+    let follower = (leader + 1) % 3;
+    let follower_node = rig.hosts[follower].progress().node;
+    rig.withheld.store(follower_node, Ordering::SeqCst);
+    // The other two commit what the follower is not sent.
+    let mut index = leader;
+    for sequence in 1..=3 {
+        let revision = rig.hosts[leader].progress().revisions.root;
+        rig.definite(
+            &mut index,
+            PeerRole::Runtime,
+            &request(sequence, region(revision, u128::from(9_000 + sequence))),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        rig.hosts[follower].progress().applied_index < rig.hosts[leader].progress().applied_index
+    );
+    // The follower's read is answered by the leader with a commit it has
+    // not applied: the read waits, and the replica goes on.
+    let asked = rig.hosts[follower]
+        .read(
+            peer(PeerRole::Runtime),
+            RequestId::from_u128(9_100),
+            ControlRead::Membership,
+        )
+        .await;
+    assert!(asked.is_err(), "{asked:?}");
+    let progress = rig.hosts[follower].progress();
+    assert!(
+        progress.failure.is_none() && !progress.stopped,
+        "the follower failed on a read answered ahead of it: {:?}",
+        progress.failure
+    );
+    // Its entries let through, it catches up and answers.
+    rig.withheld.store(0, Ordering::SeqCst);
+    let mut wait = rig.deadline();
+    let mut asked = 9_100u128;
+    let answered = loop {
+        asked += 1;
+        match rig.hosts[follower]
+            .read(
+                peer(PeerRole::Runtime),
+                RequestId::from_u128(asked),
+                ControlRead::Membership,
+            )
+            .await
+        {
+            Ok(ControlReadResult::Membership(membership)) => break membership,
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => {
+                if let Err(spent) = wait.check(&rig.periods()) {
+                    panic!("the follower never answered: {spent}; last {error:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(answered.node, follower_node);
+    let progress = rig.hosts[follower].progress();
+    assert!(progress.failure.is_none() && !progress.stopped);
     rig.stop().await;
 }
 
