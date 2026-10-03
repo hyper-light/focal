@@ -5025,8 +5025,9 @@ async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
 /// A peer whose issuer succeeded one the verifier knows is admitted through
 /// the predecessor's endorsement (24 §11): a CA certificate for the
 /// successor's key under the predecessor's signature, presented beside the
-/// successor's own. Without it, or endorsed by a stranger, the chain is
-/// refused — in both directions.
+/// successor's own — an ordinary intermediate to path building. Without
+/// it, or endorsed by a stranger, the chain is refused — in both
+/// directions.
 #[tokio::test]
 async fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_endorsement() {
     fn issuer_params(name: &str) -> CertificateParams {
@@ -5221,4 +5222,59 @@ async fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predeces
         server.close();
         task.await.unwrap().unwrap();
     }
+}
+
+/// What path building does with a trust anchor's own length constraint:
+/// an endorsement of a successor's key, signed by an anchor issued with a
+/// path length of zero, is an ordinary intermediate to a verifier that
+/// holds the anchor — the anchor's constraints are not applied (RFC 5280
+/// §6.1.1 leaves them to policy; webpki applies none).
+#[test]
+fn webpki_crosses_a_zero_length_anchor_through_an_endorsement() {
+    use rustls::client::danger::ServerCertVerifier;
+    fn issuer_params(name: &str) -> CertificateParams {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params
+    }
+    let genesis_key = KeyPair::generate().unwrap();
+    let genesis = issuer_params("genesis").self_signed(&genesis_key).unwrap();
+    let successor_key = KeyPair::generate().unwrap();
+    let successor = issuer_params("successor")
+        .self_signed(&successor_key)
+        .unwrap();
+    let endorsement = issuer_params("successor")
+        .signed_by(&successor_key, &genesis, &genesis_key)
+        .unwrap();
+    let mut leaf_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &successor, &successor_key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(genesis.der().clone()).unwrap();
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+    )
+    .build()
+    .unwrap();
+    let now = rustls::pki_types::UnixTime::now();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let with_endorsement = verifier.verify_server_cert(
+        leaf.der(),
+        &[successor.der().clone(), endorsement.der().clone()],
+        &name,
+        &[],
+        now,
+    );
+    let without =
+        verifier.verify_server_cert(leaf.der(), &[successor.der().clone()], &name, &[], now);
+    assert!(with_endorsement.is_ok(), "{with_endorsement:?}");
+    assert!(without.is_err(), "{without:?}");
 }

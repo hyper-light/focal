@@ -1919,13 +1919,21 @@ or by hash everywhere a chain is verified (the registry's `ca_certificate` and
 `verify_issued`, every `ServerTrust`, the listener's and the pool's roots, the saved
 network state, the anchor's `enrollment_ca`), and nothing could replace it: a cluster
 that outlived its issuer, or whose issuer's key was exposed, had no move but a
-re-founding. The facts the design rests on, read 2026-09-30: the root has a path length
-of zero, so a successor cannot be cross-certified *as an intermediate* under it; and the
-verifiers a succession must reach include ones that have not seen it — a node behind the
-commit, a client holding the trust its invitation carried — which, refused by every peer
-issued under the successor, could never catch up (the hole stage 2 closed for renewals
-with the enrolled-key rule, reopened one level up). *Fix.* Identity by genesis, trust by
-the committed set, bridged by endorsement. The genesis issuer stays the cluster's
+re-founding. The facts the design rests on, read 2026-09-30 and corrected 2026-10-02:
+the verifiers a succession must reach include ones that have not seen it — a node behind
+the commit, a client holding the trust its invitation carried — which, refused by every
+peer issued under the successor, could never catch up (the hole stage 2 closed for
+renewals with the enrolled-key rule, reopened one level up); and a trust anchor's own
+path-length constraint is not applied in path building (RFC 5280 §6.1.1 leaves it to
+policy; webpki applies none), so a successor cross-certified by its predecessor is an
+ordinary intermediate to every verifier holding the predecessor, the genesis root's
+zero notwithstanding. The design first read that zero as a block and carried verifiers
+of its own for the crossing (`EndorsingServerVerifier`/`EndorsingClientVerifier`); the
+client's adoption, built on them, never fired, which showed they were never reached —
+webpki had built the path itself. They are gone; every verifier is webpki over
+`TrustRoots`, and the dependency's behaviour is held by
+`webpki_crosses_a_zero_length_anchor_through_an_endorsement`. *Fix.* Identity by
+genesis, trust by the committed set, crossed by endorsement. The genesis issuer stays the cluster's
 identity (`ca_certificate`, the anchor, `same_sponsor`, every equality that was an
 identity check); the trust is the registry's `IssuerSuccession { current, successor,
 retiring }` (schema 6; `IssuerRecord` with certificate, endorsement and validity;
@@ -1979,11 +1987,20 @@ settings bounds and derivation; the committed-policy refusal; the CLI journey's
 tools, manifest v20). *Measurements.* under the forty-five-second test lifetime the
 succession activates within a second of the staging and the genesis issuer retires
 within two lifetimes; a chain grows from two certificates to three (about 1.6 KiB).
+A client context adopts the successor it verified through the endorsement
+(2026-10-02): recorded beside its join journal once a request succeeded over the
+connection (`trust-adopted.bin`, atomically replaced, the newest adoptions within the
+roots a verifier holds), read into its roots at the next start, so a later succession —
+endorsed by that successor — still verifies; the wire's verifier verifies as any does and
+tells its holder of an issuer the verified chain carried that the roots do not hold,
+endorsed by one they do (`AdoptingServerVerifier`, `client_tls_adopting`). Tests: the
+CLI journey's participant, enrolled under the genesis issuer, reads after the founder
+renewed under the successor and holds the adoption; the unit test adopts once per issuer,
+keeps the newest within the bound and refuses a damaged record.
 *Residual.* Recovery of a lost `authority.bin` (the issuer's key is custody, never
 replicated: a verified backup of the private directory, or a re-founding with
 re-enrollment). A founder whose credential expired outright cannot sign a renewal
-request: the runbook's escalation stands. A client context adopts a successor it verified
-by endorsement only at its next enrollment or renewal (recorded for the client batch).
+request: the runbook's escalation stands.
 
 ## F22
 

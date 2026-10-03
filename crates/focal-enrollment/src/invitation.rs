@@ -184,21 +184,18 @@ impl ServerTrust {
         Ok(hash("focal.enrollment.server-trust.v1", &encode(self)?))
     }
     /// The verifier of a bootstrap connection's chain: the issuers this
-    /// trust holds, bridged by an endorsement when the chain's issuer
-    /// succeeded one of them since (24 §11).
+    /// trust holds; a successor issuer's endorsement by one of them is an
+    /// ordinary intermediate to it (24 §11).
     fn verifier(
         &self,
         provider: Arc<rustls::crypto::CryptoProvider>,
-    ) -> Result<Arc<focal_wire::EndorsingServerVerifier>, EnrollmentError> {
-        let roots = focal_wire::TrustRoots::new(
-            self.issuers
-                .iter()
-                .map(|issuer| issuer.certificate.clone())
-                .collect(),
+    ) -> Result<Arc<rustls::client::WebPkiServerVerifier>, EnrollmentError> {
+        rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(self.roots()?),
+            provider,
         )
-        .map_err(|_| EnrollmentError::Invalid)?;
-        focal_wire::EndorsingServerVerifier::new(roots, provider)
-            .map_err(|_| EnrollmentError::Crypto)
+        .build()
+        .map_err(|_| EnrollmentError::Crypto)
     }
     /// Ordinary TLS 1.3 chain/name verification against the pinned CA, for
     /// an enrollment connection made by a node that already holds a

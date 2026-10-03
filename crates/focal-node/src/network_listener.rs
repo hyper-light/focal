@@ -82,15 +82,17 @@ fn server_config(
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    // A client's chain is verified against the issuers this node trusts,
-    // and through a predecessor's endorsement when the client's issuer
-    // succeeded one of them since (24 §11); the enrollment protocol
-    // authenticates a joiner without a certificate.
-    let verifier = focal_wire::EndorsingClientVerifier::new(
-        focal_wire::TrustRoots::new(roots.to_vec())?,
+    // A client's chain is verified against the issuers this node trusts; a
+    // successor issuer's endorsement by one of them is an ordinary
+    // intermediate to it (24 §11). The enrollment protocol authenticates
+    // a joiner without a certificate.
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(focal_wire::TrustRoots::new(roots.to_vec())?.store()?),
         provider.clone(),
-        true,
-    )?;
+    )
+    .allow_unauthenticated()
+    .build()
+    .map_err(|_| WireError::Authentication)?;
     let identity = TlsIdentity::from_pkcs8(
         node.certificate_chain().to_vec(),
         node.private_key_der().to_vec(),

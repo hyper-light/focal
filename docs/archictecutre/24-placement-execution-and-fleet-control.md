@@ -719,13 +719,18 @@ name under the predecessor's signature (`BootstrapAuthority::stage_issuer`
 issues both; `endorses` checks the pair), committed beside the self-signed
 one and presented in every chain (`[leaf, issuer, endorsement]`,
 `JoinKey::complete`/`renew`/`rotate_into`, the bootstrap server's
-`server_identity`). The genesis issuer has a path length of zero, so X.509
-path building cannot cross it; the bridge is the verifier's own explicit
-rule (`focal_wire::trust`, `EndorsingServerVerifier`/`EndorsingClientVerifier`
-in both TLS directions and the enrollment trust's `verify_chain`): a chain
-whose issuer is unknown is accepted when a presented CA certificate, valid
-now, verifies under a known root's key, and the leaf is then verified under
-it as under any anchor; at most four presented certificates, four roots.
+`server_identity`). To a verifier that holds the predecessor the endorsement
+is an ordinary intermediate: the leaf chains through it to the anchor by
+path building alone (webpki, in both TLS directions and in the enrollment
+trust's `verify_chain`). The genesis issuer's path length of zero does not
+stand in the way: a trust anchor's own constraints are not applied in path
+building (RFC 5280 §6.1.1 leaves them to policy; webpki applies none),
+which the wire's tests hold the dependency to
+(`webpki_crosses_a_zero_length_anchor_through_an_endorsement`; the design
+first read the zero as a block and carried verifiers of its own for the
+crossing, which were never reached and are gone). Every verifier is built
+from the same bounded root set (`focal_wire::TrustRoots`: at most four
+roots, each parseable).
 The founder's authority (bundle schema 3) keeps the staged successor's key
 and endorsement, the current issuer's endorsement, and the issuer it
 succeeded while the bootstrap server certificate it issued is still
@@ -750,6 +755,19 @@ cluster is never behind an operator step its own issuer's expiry would wait
 on. An expired
 receipt in a checkpoint may have been issued under an issuer retired since;
 `restore` holds it to its shape and verifies the signature of the live ones.
+A participant's context holds the issuers its invitation carried (its join
+journal is read beside other readers and never rewritten); its verifier
+(`focal_wire::AdoptingServerVerifier`, `client_tls_adopting`) verifies as
+any does and then reports an issuer the verified chain carried that the
+roots do not hold, endorsed by one they do (at most four presented
+certificates read), and the context adopts it beside the journal
+(`trust-adopted.bin`, replaced atomically, the newest adoptions within the
+roots a verifier holds; `network_join::adopt_issuer`, read by
+`PendingClientJoin::trust_roots` at the next start), so a later succession
+— endorsed by that successor, not by the issuer the invitation named —
+still verifies. The adoption is recorded once a request succeeded over the
+connection; a record that cannot be written is said on standard error
+(`trust_not_adopted`) and tried again at the next.
 
 **Closed records (2026-10-02; the audit's F22).** The registry kept every
 record it ever made — invitations expired unredeemed, consumed and long

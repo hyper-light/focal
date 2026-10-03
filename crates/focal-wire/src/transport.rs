@@ -339,14 +339,15 @@ pub fn server_tls(
 ) -> Result<quinn::ServerConfig, WireError> {
     limits.validate()?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    // A client's chain is verified against the roots this server knows,
-    // and through a predecessor's endorsement when the client's issuer
-    // succeeded one of them since (`trust`).
-    let verifier = crate::EndorsingClientVerifier::new(
-        crate::TrustRoots::new(client_roots)?,
+    // A client's chain is verified against the roots this server knows;
+    // a successor issuer's endorsement by one of them is an ordinary
+    // intermediate to it (`trust`).
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(crate::TrustRoots::new(client_roots)?.store()?),
         provider.clone(),
-        false,
-    )?;
+    )
+    .build()
+    .map_err(|_| WireError::Authentication)?;
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?
@@ -379,13 +380,42 @@ pub fn client_tls(
 ) -> Result<quinn::ClientConfig, WireError> {
     limits.validate()?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    // The server's chain is verified against the roots this client knows,
-    // and through a predecessor's endorsement when the server's issuer
-    // succeeded one of them since (`trust`).
-    let verifier = crate::EndorsingServerVerifier::new(
+    // The server's chain is verified against the roots this client knows;
+    // a successor issuer's endorsement by one of them is an ordinary
+    // intermediate to it (`trust`).
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(crate::TrustRoots::new(server_roots)?.store()?),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|_| WireError::Authentication)?;
+    client_tls_with(identity, verifier, provider, limits)
+}
+/// [`client_tls`] for a client that adopts an issuer a verified chain
+/// carried endorsed and it did not hold (24 §11): the configuration, and
+/// where the adoption is read.
+pub fn client_tls_adopting(
+    identity: TlsIdentity,
+    server_roots: Vec<Vec<u8>>,
+    limits: &WireLimits,
+) -> Result<(quinn::ClientConfig, crate::AdoptedRoots), WireError> {
+    limits.validate()?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let (verifier, adopted) = crate::AdoptingServerVerifier::new(
         crate::TrustRoots::new(server_roots)?,
         provider.clone(),
     )?;
+    Ok((
+        client_tls_with(identity, verifier, provider, limits)?,
+        adopted,
+    ))
+}
+fn client_tls_with(
+    identity: TlsIdentity,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    limits: &WireLimits,
+) -> Result<quinn::ClientConfig, WireError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?

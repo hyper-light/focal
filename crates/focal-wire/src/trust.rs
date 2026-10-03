@@ -1,4 +1,4 @@
-//! Trust roots that bridge an issuer's succession (24 §11, the audit's F13
+//! Trust roots across an issuer's succession (24 §11, the audit's F13
 //! stage 3). A cluster's credentials are issued by one root at a time; a
 //! successor root is committed in the enrollment registry before anything
 //! is issued under it, and every node adopts it from there. A verifier that
@@ -7,27 +7,27 @@
 //! successor and could never catch up through the peers it refuses. So a
 //! successor is *endorsed* by its predecessor: a CA certificate for the
 //! successor's key and name, signed by the predecessor's key, is committed
-//! beside the self-signed one and presented in every chain. A verifier
-//! that knows only the predecessor accepts the chain through the
-//! endorsement — the predecessor's signature over the successor's key —
-//! and verifies the leaf under it as under any anchor; one that knows the
-//! successor needs no bridge. The genesis root is issued with a path length
-//! of zero, so X.509 path building cannot cross it; the bridge is this
-//! module's own, explicit rule: an endorsement is a presented CA
-//! certificate, valid now, whose signature verifies under a known root.
+//! beside the self-signed one and presented in every chain. To a verifier
+//! that holds the predecessor the endorsement is an ordinary intermediate:
+//! the leaf chains to it and it to the anchor. The genesis root is issued
+//! with a path length of zero, and that does not stand in the way — a trust
+//! anchor's own constraints are not applied in path building (RFC 5280
+//! §6.1.1 leaves them to policy; webpki applies none), which
+//! `tests::webpki_crosses_a_zero_length_anchor_through_an_endorsement`
+//! holds the dependency to. What this module adds is the bounded root set
+//! every verifier is built from, and, for a client that holds an older
+//! trust, the word that a chain carried an issuer it does not hold —
+//! endorsed by one it does — so the client adopts it before the succession
+//! after that one, endorsed by the issuer it never held, would cut it off.
 use crate::WireError;
 use rustls::{
-    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme,
+    DigitallySignedStruct, Error as TlsError, SignatureScheme,
     client::{
         WebPkiServerVerifier,
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     },
     crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
-    server::{
-        WebPkiClientVerifier,
-        danger::{ClientCertVerified, ClientCertVerifier},
-    },
 };
 use std::sync::Arc;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -45,7 +45,7 @@ const MAX_CERTIFICATE_BYTES: usize = 4096;
 
 /// The DER roots a verifier knows, bounded and each parseable. A root is
 /// trusted as configured, whatever its own constraints say — as any trust
-/// anchor is; what must be a CA certificate is an endorsement.
+/// anchor is.
 #[derive(Clone)]
 pub struct TrustRoots {
     roots: Vec<Vec<u8>>,
@@ -74,17 +74,26 @@ impl TrustRoots {
         }
         Ok(Self { roots })
     }
-    fn store(&self) -> Result<rustls::RootCertStore, WireError> {
-        store_of(
-            self.roots
-                .iter()
-                .map(|root| CertificateDer::from(root.as_slice())),
-        )
+    /// The roots as a store a verifier is built from.
+    pub fn store(&self) -> Result<rustls::RootCertStore, WireError> {
+        let mut store = rustls::RootCertStore::empty();
+        for root in &self.roots {
+            store
+                .add(CertificateDer::from(root.as_slice()).into_owned())
+                .map_err(|_| WireError::Authentication)?;
+        }
+        if store.is_empty() {
+            return Err(WireError::Authentication);
+        }
+        Ok(store)
     }
-    /// The presented certificate, if any, that a known root endorses: a CA
-    /// certificate valid at `now` whose signature verifies under a known
-    /// root's key. It anchors the leaf as the successor root would.
-    fn endorsed_anchor<'a>(
+    /// The presented certificate, if any, that endorses an issuer this
+    /// verifier does not hold: a CA certificate valid at `now`, for a key
+    /// that is no root's, whose signature verifies under a known root's
+    /// key. A verifier that holds the predecessor alone verified the chain
+    /// through it; the successor it certifies is what such a verifier
+    /// adopts.
+    fn endorsed_issuer<'a>(
         &self,
         presented: &[CertificateDer<'a>],
         now: UnixTime,
@@ -107,15 +116,19 @@ impl TrustRoots {
             {
                 continue;
             }
+            // A root endorses no certificate of its own key: that is the
+            // root itself, which is held.
+            let held = self.roots.iter().any(|root| {
+                X509Certificate::from_der(root)
+                    .is_ok_and(|(_, root)| root.public_key().raw == endorsement.public_key().raw)
+            });
+            if held {
+                continue;
+            }
             for root in &self.roots {
                 let Ok((_, root)) = X509Certificate::from_der(root) else {
                     continue;
                 };
-                // A root endorses no certificate of its own key: that is
-                // the root itself, known or not.
-                if root.public_key().raw == endorsement.public_key().raw {
-                    continue;
-                }
                 if endorsement
                     .verify_signature(Some(root.public_key()))
                     .is_ok()
@@ -126,69 +139,76 @@ impl TrustRoots {
         }
         Ok(None)
     }
-}
-fn store_of<'a>(
-    certificates: impl Iterator<Item = CertificateDer<'a>>,
-) -> Result<rustls::RootCertStore, WireError> {
-    let mut store = rustls::RootCertStore::empty();
-    for certificate in certificates {
-        store
-            .add(certificate.into_owned())
-            .map_err(|_| WireError::Authentication)?;
+    /// The presented self-signed certificate of the key `endorsement`
+    /// certifies, if the chain carried it: the issuer itself.
+    fn self_signed_of<'a>(
+        presented: &[CertificateDer<'a>],
+        endorsement: &CertificateDer<'_>,
+    ) -> Option<CertificateDer<'a>> {
+        let (_, endorsement) = X509Certificate::from_der(endorsement).ok()?;
+        presented.iter().find_map(|candidate| {
+            let (rest, certificate) = X509Certificate::from_der(candidate).ok()?;
+            (rest.is_empty()
+                && certificate.public_key().raw == endorsement.public_key().raw
+                && certificate.issuer().as_raw() == certificate.subject().as_raw())
+            .then(|| candidate.clone())
+        })
     }
-    if store.is_empty() {
-        return Err(WireError::Authentication);
-    }
-    Ok(store)
-}
-/// Whether a refusal may be one the bridge answers: any fault in the
-/// chain's path — an issuer unknown, or a path the genesis root's length
-/// constraint forbids. The bridged verifier verifies the leaf in full
-/// again, so a fault that was the leaf's own is refused the same way.
-fn bridgeable(error: &TlsError) -> bool {
-    matches!(error, TlsError::InvalidCertificate(_))
-}
-fn tls_error() -> TlsError {
-    TlsError::InvalidCertificate(CertificateError::UnknownIssuer)
 }
 
-/// Verifies a server's chain against the known roots, and through an
-/// endorsement a known root signed when the chain's issuer is unknown.
+/// An issuer a verifier accepted through its predecessor's endorsement: the
+/// endorsement, verified under a root the verifier holds (`anchor`), and
+/// the issuer's own self-signed certificate when the chain presented it.
+/// What a verifier holding an older trust adopts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adopted {
+    pub anchor: Vec<u8>,
+    pub issuer: Option<Vec<u8>>,
+}
+/// The latest issuer a client's verifier found endorsed and not held (24
+/// §11): read once a request succeeded, recorded by the client that holds
+/// the trust.
 #[derive(Debug)]
-pub struct EndorsingServerVerifier {
+pub struct AdoptedRoots(tokio::sync::watch::Receiver<Option<Adopted>>);
+impl AdoptedRoots {
+    /// The adoption not yet taken, if any.
+    pub fn take(&mut self) -> Option<Adopted> {
+        if !self.0.has_changed().unwrap_or(false) {
+            return None;
+        }
+        self.0.borrow_and_update().clone()
+    }
+}
+
+/// Verifies a server's chain against the known roots as webpki does, and
+/// tells its holder when a verified chain carried an issuer the roots do
+/// not hold, endorsed by one they do — so the holder adopts it.
+#[derive(Debug)]
+pub struct AdoptingServerVerifier {
     roots: TrustRoots,
-    provider: Arc<CryptoProvider>,
     known: Arc<WebPkiServerVerifier>,
+    adoption: tokio::sync::watch::Sender<Option<Adopted>>,
 }
-impl EndorsingServerVerifier {
-    pub fn new(roots: TrustRoots, provider: Arc<CryptoProvider>) -> Result<Arc<Self>, WireError> {
-        let known =
-            WebPkiServerVerifier::builder_with_provider(Arc::new(roots.store()?), provider.clone())
-                .build()
-                .map_err(|_| WireError::Authentication)?;
-        Ok(Arc::new(Self {
-            roots,
-            provider,
-            known,
-        }))
-    }
-    fn bridged(
-        &self,
-        intermediates: &[CertificateDer<'_>],
-        now: UnixTime,
-    ) -> Result<Arc<WebPkiServerVerifier>, TlsError> {
-        let anchor = self
-            .roots
-            .endorsed_anchor(intermediates, now)
-            .map_err(|_| tls_error())?
-            .ok_or_else(tls_error)?;
-        let store = store_of(std::iter::once(anchor)).map_err(|_| tls_error())?;
-        WebPkiServerVerifier::builder_with_provider(Arc::new(store), self.provider.clone())
+impl AdoptingServerVerifier {
+    pub fn new(
+        roots: TrustRoots,
+        provider: Arc<CryptoProvider>,
+    ) -> Result<(Arc<Self>, AdoptedRoots), WireError> {
+        let known = WebPkiServerVerifier::builder_with_provider(Arc::new(roots.store()?), provider)
             .build()
-            .map_err(|_| tls_error())
+            .map_err(|_| WireError::Authentication)?;
+        let (adoption, receive) = tokio::sync::watch::channel(None);
+        Ok((
+            Arc::new(Self {
+                roots,
+                known,
+                adoption,
+            }),
+            AdoptedRoots(receive),
+        ))
     }
 }
-impl ServerCertVerifier for EndorsingServerVerifier {
+impl ServerCertVerifier for AdoptingServerVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -197,120 +217,25 @@ impl ServerCertVerifier for EndorsingServerVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        match self.known.verify_server_cert(
+        let verified = self.known.verify_server_cert(
             end_entity,
             intermediates,
             server_name,
             ocsp_response,
             now,
-        ) {
-            Err(error) if bridgeable(&error) => self
-                .bridged(intermediates, now)?
-                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now),
-            verified => verified,
+        )?;
+        // Verified; a chain that carried an issuer the roots do not hold,
+        // endorsed by one they do, is told to the holder. A chain the
+        // bound refuses to read is still the verified chain it was.
+        if let Ok(Some(endorsement)) = self.roots.endorsed_issuer(intermediates, now) {
+            let issuer = TrustRoots::self_signed_of(intermediates, &endorsement)
+                .map(|certificate| certificate.to_vec());
+            self.adoption.send_replace(Some(Adopted {
+                anchor: endorsement.to_vec(),
+                issuer,
+            }));
         }
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        self.known.verify_tls12_signature(message, cert, dss)
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        self.known.verify_tls13_signature(message, cert, dss)
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.known.supported_verify_schemes()
-    }
-}
-
-/// Verifies a client's chain against the known roots, and through an
-/// endorsement a known root signed when the chain's issuer is unknown.
-#[derive(Debug)]
-pub struct EndorsingClientVerifier {
-    roots: TrustRoots,
-    provider: Arc<CryptoProvider>,
-    allow_unauthenticated: bool,
-    known: Arc<dyn ClientCertVerifier>,
-}
-impl EndorsingClientVerifier {
-    /// `allow_unauthenticated` admits a handshake without a client
-    /// certificate, for an endpoint whose enrollment protocol authenticates
-    /// by other means; a certificate presented is always verified.
-    pub fn new(
-        roots: TrustRoots,
-        provider: Arc<CryptoProvider>,
-        allow_unauthenticated: bool,
-    ) -> Result<Arc<Self>, WireError> {
-        let known = Self::verifier(&roots.store()?, &provider, allow_unauthenticated)
-            .map_err(|_| WireError::Authentication)?;
-        Ok(Arc::new(Self {
-            roots,
-            provider,
-            allow_unauthenticated,
-            known,
-        }))
-    }
-    fn verifier(
-        store: &rustls::RootCertStore,
-        provider: &Arc<CryptoProvider>,
-        allow_unauthenticated: bool,
-    ) -> Result<Arc<dyn ClientCertVerifier>, TlsError> {
-        let builder =
-            WebPkiClientVerifier::builder_with_provider(Arc::new(store.clone()), provider.clone());
-        let builder = if allow_unauthenticated {
-            builder.allow_unauthenticated()
-        } else {
-            builder
-        };
-        builder.build().map_err(|_| tls_error())
-    }
-    fn bridged(
-        &self,
-        intermediates: &[CertificateDer<'_>],
-        now: UnixTime,
-    ) -> Result<Arc<dyn ClientCertVerifier>, TlsError> {
-        let anchor = self
-            .roots
-            .endorsed_anchor(intermediates, now)
-            .map_err(|_| tls_error())?
-            .ok_or_else(tls_error)?;
-        let store = store_of(std::iter::once(anchor)).map_err(|_| tls_error())?;
-        Self::verifier(&store, &self.provider, self.allow_unauthenticated)
-    }
-}
-impl ClientCertVerifier for EndorsingClientVerifier {
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        self.known.root_hint_subjects()
-    }
-    fn offer_client_auth(&self) -> bool {
-        self.known.offer_client_auth()
-    }
-    fn client_auth_mandatory(&self) -> bool {
-        self.known.client_auth_mandatory()
-    }
-    fn verify_client_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        now: UnixTime,
-    ) -> Result<ClientCertVerified, TlsError> {
-        match self
-            .known
-            .verify_client_cert(end_entity, intermediates, now)
-        {
-            Err(error) if bridgeable(&error) => self
-                .bridged(intermediates, now)?
-                .verify_client_cert(end_entity, intermediates, now),
-            verified => verified,
-        }
+        Ok(verified)
     }
     fn verify_tls12_signature(
         &self,

@@ -460,3 +460,69 @@ fn a_join_carries_the_advertised_name_so_peers_can_re_resolve_a_moved_host() {
         "an address literal names nothing to re-resolve"
     );
 }
+
+/// A client adopts an endorsed issuer it did not hold (24 §11): recorded
+/// beside its journal, once per issuer, the newest within the bound a
+/// verifier holds, and read back only when the file is what it wrote.
+#[test]
+fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_refuses_a_damaged_record()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().join("enrollment-alice");
+    std::fs::create_dir_all(&directory).unwrap();
+    assert!(adopted_issuers(&directory).unwrap().is_empty());
+    let authority_at = |name: &str| {
+        focal_enrollment::BootstrapAuthority::open_or_create(
+            dir.path().join(name),
+            [9; 16],
+            vec!["localhost".into()],
+            1_783_000_000,
+        )
+        .unwrap()
+    };
+    let first = authority_at("first");
+    let adopted = focal_wire::Adopted {
+        anchor: first.ca_certificate().to_vec(),
+        issuer: None,
+    };
+    assert!(adopt_issuer(&directory, &adopted).unwrap());
+    assert!(!adopt_issuer(&directory, &adopted).unwrap());
+    let recorded = adopted_issuers(&directory).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0], first.issuer_record().unwrap());
+    // The bound: the oldest adoption leaves for the newest.
+    let mut fingerprints = vec![recorded[0].fingerprint];
+    for name in ["second", "third", "fourth", "fifth"] {
+        let authority = authority_at(name);
+        assert!(
+            adopt_issuer(
+                &directory,
+                &focal_wire::Adopted {
+                    anchor: authority.ca_certificate().to_vec(),
+                    issuer: None,
+                },
+            )
+            .unwrap()
+        );
+        fingerprints.push(authority.issuer_record().unwrap().fingerprint);
+    }
+    let recorded = adopted_issuers(&directory).unwrap();
+    assert_eq!(recorded.len(), focal_wire::MAX_TRUST_ROOTS);
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|issuer| issuer.fingerprint)
+            .collect::<Vec<_>>(),
+        fingerprints[1..].to_vec()
+    );
+    // A damaged record is refused, never trusted.
+    let path = directory.join("trust-adopted.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        adopted_issuers(&directory),
+        Err(JoinError::Invalid)
+    ));
+}

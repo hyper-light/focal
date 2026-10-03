@@ -12876,3 +12876,18 @@ certificate is unknown, which never admits ([24](24-placement-execution-and-flee
 §11). The bound holds the open and live population; the committed command
 stream is the history.
 
+### 2026-10-02 — a participant adopts the endorsed issuer it does not hold
+
+A participant's context holds the issuers its invitation carried; after an
+issuer's succession it verifies the nodes' chains through the predecessor's
+endorsement, and now adopts the successor beside its join journal once a
+request succeeded over the connection, so a succession after that — endorsed
+by the successor it adopted, not by the issuer its invitation named — still
+verifies ([24](24-placement-execution-and-fleet-control.md) §11). Found on
+the way: the endorsement is an ordinary intermediate to path building — a
+trust anchor's path-length constraint is not applied (RFC 5280 §6.1.1;
+webpki applies none), which a wire test now holds the dependency to — so the
+verifiers of the succession's first landing, which carried a crossing rule of
+their own, were never reached; they are gone and every verifier is webpki over
+the committed root set.
+

@@ -708,6 +708,46 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     // its level from genesis. The operator stages the successor: endorsed
     // by the genesis issuer, trusted everywhere from its staging, issuing
     // from the controller's next step; asked again, it is answered as it is.
+    // A participant enrolled under the genesis issuer, before it succeeds
+    // itself: its context holds that issuer alone.
+    let client_dir = private_dir("client");
+    let client = client_dir.path();
+    let invitation = founder.join("alice.invite");
+    success(
+        founder,
+        &[
+            "cluster",
+            "client",
+            "invite",
+            "--name",
+            "alice",
+            "--output",
+            invitation.to_str().unwrap(),
+        ],
+    );
+    success(
+        client,
+        &[
+            "context",
+            "enroll",
+            "alice",
+            "--invite-file",
+            invitation.to_str().unwrap(),
+        ],
+    );
+    let standing = success(client, &["--client-context", "alice", "status"]);
+    assert!(
+        standing["result"].is_object() || standing.is_object(),
+        "{standing}"
+    );
+    let adopted_file = client
+        .join("CLIENT.contexts")
+        .join("enrollment-alice")
+        .join("trust-adopted.bin");
+    assert!(
+        !adopted_file.exists(),
+        "nothing endorsed beyond the invitation's issuers, nothing adopted"
+    );
     let issuers = success(founder, &["cluster", "credentials", "issuers"])["result"].clone();
     assert!(issuers["successor"].is_null(), "{issuers}");
     assert!(issuers["retiring"].is_null(), "{issuers}");
@@ -733,6 +773,36 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
                 && again["retiring"]["fingerprint"] == genesis_issuer),
         "{again}"
     );
+    // Asked on, the succession is stepped to its activation: the successor
+    // issues, the genesis issuer retires while what it issued lives.
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    let activated = loop {
+        let view = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+        if view["current"]["fingerprint"] == staged["fingerprint"] {
+            break view;
+        }
+        assert!(deadline.open(), "the successor never issued: {view}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(
+        activated["retiring"]["fingerprint"], genesis_issuer,
+        "{activated}"
+    );
+    // The founder renews under the successor and presents the endorsed
+    // chain; the participant, holding the genesis issuer alone, verifies it
+    // through the endorsement and adopts the successor beside its journal
+    // (24 §11) — and serves on the adopted root from then on.
+    let renewed = success(founder, &["cluster", "credentials", "renew"])["result"].clone();
+    assert!(renewed["issued_at"].is_number(), "{renewed}");
+    let endorsed = success(client, &["--client-context", "alice", "status"]);
+    assert!(endorsed.is_object(), "{endorsed}");
+    assert!(
+        adopted_file.is_file(),
+        "the successor the participant was shown endorsed was not adopted at {}",
+        adopted_file.display()
+    );
+    let adopted_again = success(client, &["--client-context", "alice", "status"]);
+    assert!(adopted_again.is_object(), "{adopted_again}");
     drop(servers);
 }
 /// A plan refused as `compare_failed` was made on an observation that went
