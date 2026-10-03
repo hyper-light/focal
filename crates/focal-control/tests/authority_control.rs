@@ -7,7 +7,7 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
-use focal_consensus::{NodeConfig, PbMessageExt};
+use focal_consensus::NodeConfig;
 use focal_control::*;
 use focal_directory::*;
 use focal_enrollment::{BootstrapAuthority, EnrollmentLimits, FoundingEnrollmentDraft, JoinKey};
@@ -101,7 +101,10 @@ impl Group {
                 let to = usize::try_from(message.to - 1).unwrap();
                 if Some(to) != excluded {
                     self.replicas[to]
-                        .step_authenticated(from, &message.write_to_bytes().unwrap())
+                        .step_authenticated(
+                            from,
+                            &focal_consensus::encode_message(&message).unwrap(),
+                        )
                         .unwrap();
                 }
             }
@@ -157,7 +160,7 @@ impl Group {
                 let from = message.from;
                 let to = usize::try_from(message.to - 1).unwrap();
                 self.replicas[to]
-                    .step_authenticated(from, &message.write_to_bytes().unwrap())
+                    .step_authenticated(from, &focal_consensus::encode_message(&message).unwrap())
                     .unwrap();
             }
             if barrier {

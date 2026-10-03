@@ -1,7 +1,5 @@
 use super::*;
-use focal_consensus::{
-    ConfChangeSingle, ConfChangeType, ConfChangeV2, DurableNode, NodeConfig, PbMessageExt,
-};
+use focal_consensus::{ConfChangeSingle, ConfChangeType, ConfChangeV2, DurableNode, NodeConfig};
 use focal_enrollment::{
     BootstrapAuthority, CredentialMaterial, EnrollmentLimits, EnrollmentReceipt,
     EnrollmentRegistry, EnrollmentRole, Invitation, InviteOptions, JoinKey, JoinPreparation,
@@ -539,9 +537,12 @@ fn real_committed_configuration_needs_installed_quorum_and_exact_scoped_signatur
         node_id: 5,
         ..Default::default()
     };
-    add.set_change_type(ConfChangeType::AddLearnerNode);
+    add.change_type = ConfChangeType::AddLearnerNode;
     change.changes.push(add);
-    let record_hash = ContentHash(*blake3::hash(&change.write_to_bytes().unwrap()).as_bytes());
+    let record_hash = ContentHash(
+        *blake3::hash(&focal_consensus::envelope::encode_conf_change_v2(&change).unwrap())
+            .as_bytes(),
+    );
     nodes
         .get_mut(&2)
         .unwrap()

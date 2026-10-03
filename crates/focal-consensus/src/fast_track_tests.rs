@@ -2,11 +2,10 @@
 //! is on disk before it says so, outlives a restart and a checkpoint, and a
 //! group is opened with the track it was made with.
 use crate::{
-    ConsensusError, DurableNode, Entry, Message, MessageType, NodeConfig, PbMessageExt, StateRole,
-    tests::config,
+    ConsensusError, DurableNode, Entry, Message, MessageType, NodeConfig, StateRole, tests::config,
 };
 use focal_log::{LogicalLogId, RecordKind, SharedWal, WalIdentity, WalOptions};
-use focal_raft::fast::{FAST_PROPOSE, FAST_VOTE};
+use hyper_raft::fast::{FAST_PROPOSE, FAST_VOTE};
 
 fn fast(id: u64) -> NodeConfig {
     let mut config = config(id);
@@ -66,7 +65,7 @@ impl Group {
                 let to = message.to;
                 // As a peer sends it: encoded, and its sender the one the
                 // transport knows.
-                let encoded = message.write_to_bytes().unwrap();
+                let encoded = crate::encode_message(&message).unwrap();
                 self.nodes[(to - 1) as usize]
                     .step_authenticated(message.from, &encoded)
                     .unwrap();
@@ -118,7 +117,7 @@ fn a_followers_proposal_is_committed_by_the_fast_quorum_and_applied_by_all() {
         !group
             .net
             .iter()
-            .any(|message| message.msg_type == MessageType::MsgAppendResponse as i32),
+            .any(|message| message.msg_type == MessageType::MsgAppendResponse),
         "a member answered the leader before the index was committed"
     );
     assert_eq!(group.applied[0].last().unwrap(), b"fast");
@@ -325,7 +324,7 @@ fn what_may_not_go_by_the_fast_track_is_refused_before_the_core() {
     };
     let refused = [
         proposal(Entry {
-            entry_type: crate::EntryType::EntryConfChangeV2 as i32,
+            entry_type: crate::EntryType::EntryConfChangeV2,
             index: 2,
             data: vec![1],
             ..Entry::default()

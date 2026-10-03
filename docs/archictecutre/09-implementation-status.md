@@ -13071,3 +13071,17 @@ from the log's first entry, and the window beyond them, as for any member.
 `a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging` fails on 27b0531
 (the leader's step refused) and passes after. PR #4's core made the split test meet it under the
 whole focal-node suite's load: 4 of 7 failed without the fix, none of 6 with it.
+
+### 2026-10-03 — the core is hyper-raft's
+
+focal runs the shared repository's core ([27](27-consensus-roadmap-and-slates-port.md) §14):
+`hyper-raft` and `hyper-timing` vendored under `vendor/` (`SNAPSHOT`), `crates/focal-raft`
+removed, its suites and its differential against raft-rs in the shared repository. No byte focal
+writes changes: `focal-consensus`'s envelope (`src/envelope.rs`) writes the core's values exactly
+as raft-proto's prost codec did and reads what any protocol-buffer reader reads, translating a
+change of configuration's data between raft-rs's encoding and the core's record; no
+protocol-buffer runtime ships, and `raft-proto` is the test oracle (4,096 generated values of each
+type equal to its bytes, every prefix and one-byte mutation read alike). The accounting reads a
+committed change in place through `hyper_raft::wire::changes_stated`. Every crate's suite passes
+on it; the types are the core's (typed kinds), and the tests that sent a kind no message has now
+send it as raft-rs writes it, refused by the envelope.

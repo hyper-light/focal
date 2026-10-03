@@ -1,7 +1,7 @@
 use super::{ConsensusError, NodeConfig};
 use crate::memory::{entry_bytes, reserve, snapshot_bytes};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_raft::{
+use hyper_raft::{
     InitialState, Storage, StorageError,
     proto::{self, ConfState, Entry, HardState, Snapshot},
 };
@@ -446,7 +446,7 @@ impl RamLog {
 impl Storage for RamLog {
     fn initial_state(&self) -> Result<InitialState, StorageError> {
         Ok(InitialState {
-            hard_state: self.hard_state.clone(),
+            hard_state: self.hard_state,
             configuration: self.conf_state.clone(),
             proposals: self
                 .proposals
@@ -496,7 +496,6 @@ impl Storage for RamLog {
                 entry_type: entry.entry_type,
                 term: entry.term,
                 index: entry.index,
-                sync_log: entry.sync_log,
                 ..Entry::default()
             };
             copy.data
@@ -665,12 +664,14 @@ mod tests {
         assert_eq!(log.last_index().unwrap(), 7);
         agree(&log);
         // Compacted behind a checkpoint: the origin moves.
-        let mut snapshot = Snapshot::default();
-        snapshot.mut_metadata().index = 4;
-        snapshot.mut_metadata().term = 1;
-        snapshot
-            .mut_metadata()
-            .set_conf_state(log.conf_state.clone());
+        let snapshot = Snapshot {
+            metadata: Some(hyper_raft::proto::SnapshotMetadata {
+                conf_state: Some(log.conf_state.clone()),
+                index: 4,
+                term: 1,
+            }),
+            ..Snapshot::default()
+        };
         let prepared = log.prepare_snapshot(&snapshot).unwrap();
         log.compact_prepared(prepared).unwrap();
         assert_eq!(log.first_index().unwrap(), 5);
@@ -678,12 +679,14 @@ mod tests {
         log.append(&[entry(8, 1000), entry(9, 1)]).unwrap();
         agree(&log);
         // A snapshot installed: the log begins again.
-        let mut installed = Snapshot::default();
-        installed.mut_metadata().index = 20;
-        installed.mut_metadata().term = 1;
-        installed
-            .mut_metadata()
-            .set_conf_state(log.conf_state.clone());
+        let installed = Snapshot {
+            metadata: Some(hyper_raft::proto::SnapshotMetadata {
+                conf_state: Some(log.conf_state.clone()),
+                index: 20,
+                term: 1,
+            }),
+            ..Snapshot::default()
+        };
         log.install_snapshot(installed).unwrap();
         assert_eq!(
             log.bytes_between(1, 100, usize::MAX, usize::MAX).unwrap(),

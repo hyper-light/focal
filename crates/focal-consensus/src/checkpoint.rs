@@ -85,13 +85,14 @@ impl DurableNode {
         )?;
         let result = catch_unwind(AssertUnwindSafe(|| {
             let term = self.raw.store().term(index)?;
-            let mut snapshot = Snapshot::default();
-            snapshot.mut_metadata().index = index;
-            snapshot.mut_metadata().term = term;
-            snapshot
-                .mut_metadata()
-                .set_conf_state(self.raw.store().conf_state.clone());
-            snapshot.data = data;
+            let snapshot = Snapshot {
+                data,
+                metadata: Some(SnapshotMetadata {
+                    conf_state: Some(self.raw.store().conf_state.clone()),
+                    index,
+                    term,
+                }),
+            };
             let prepared = self.raw.store().prepare_snapshot(&snapshot)?;
             let mut records = Vec::new();
             let count = self

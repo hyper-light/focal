@@ -238,9 +238,11 @@ impl Rig {
                             continue;
                         };
                         let kind = focal_consensus::decode_message(message).unwrap().msg_type;
-                        if kind == focal_consensus::MessageType::MsgAppend as i32
-                            || kind == focal_consensus::MessageType::MsgSnapshot as i32
-                        {
+                        if matches!(
+                            kind,
+                            focal_consensus::MessageType::MsgAppend
+                                | focal_consensus::MessageType::MsgSnapshot
+                        ) {
                             continue;
                         }
                     }
@@ -854,8 +856,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         term: 1,
         ..Default::default()
     };
-    message.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-    use focal_consensus::PbMessageExt;
+    message.msg_type = focal_consensus::MessageType::MsgHeartbeat;
     let wire = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
         ledger: namespace(),
@@ -864,7 +865,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         request_id: RequestId::from_u128(56),
         operation: Operation::Raft {
             group,
-            message: message.write_to_bytes().unwrap(),
+            message: focal_consensus::encode_message(&message).unwrap(),
         },
     };
     let verified = verify_request(
@@ -1361,7 +1362,6 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
 
 #[tokio::test]
 async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_after_owner_stop() {
-    use focal_consensus::PbMessageExt;
     let data = tempfile::tempdir().unwrap();
     let authority = BootstrapAuthority::open_or_create(
         data.path().join("ca"),
@@ -1393,7 +1393,12 @@ async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_aft
     let mut expected: Vec<_> = initial
         .messages
         .iter()
-        .map(|message| (message.to, message.write_to_bytes().unwrap()))
+        .map(|message| {
+            (
+                message.to,
+                focal_consensus::encode_message(message).unwrap(),
+            )
+        })
         .collect();
     expected.sort();
     assert!(!expected.is_empty());
