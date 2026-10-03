@@ -250,106 +250,16 @@ pub mod backup {
         }
     }
 
-    /// Where a backup's files go and how they become durable. The real
-    /// filesystem and the simulated disk of the qualification suite both
-    /// implement it; the install sequence (temporary, sync, rename, sync the
-    /// directory) is written once over it.
-    pub trait BackupMedium {
-        fn create_dir(&mut self, path: &Path) -> std::io::Result<()>;
-        fn create(&mut self, path: &Path) -> std::io::Result<()>;
-        fn write(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()>;
-        fn sync_file(&mut self, path: &Path) -> std::io::Result<()>;
-        fn sync_dir(&mut self, path: &Path) -> std::io::Result<()>;
-        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
-        fn exists(&self, path: &Path) -> bool;
-        fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>>;
-    }
-    /// The real filesystem.
-    #[derive(Debug, Default)]
-    pub struct FileMedium;
-    impl BackupMedium for FileMedium {
-        fn create_dir(&mut self, path: &Path) -> std::io::Result<()> {
-            if path.is_dir() {
-                return Ok(());
-            }
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                self.create_dir(parent)?;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new().mode(0o700).create(path)?;
-            }
-            #[cfg(not(unix))]
-            std::fs::create_dir(path)?;
-            focal_platform::sync_dir(path)?;
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                focal_platform::sync_dir(parent)?;
-            }
-            Ok(())
-        }
-        fn create(&mut self, path: &Path) -> std::io::Result<()> {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(path)
-                .map(drop)
-        }
-        fn write(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-            file.write_all(bytes)
-        }
-        fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
-            // Open with write access: FlushFileBuffers rejects a read-only handle
-            // on Windows. write(true) without truncate reopens the existing file
-            // in place; fsync/FlushFileBuffers then makes its bytes durable.
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?
-                .sync_all()
-        }
-        fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
-            focal_platform::sync_dir(path)
-        }
-        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-            focal_platform::fs::atomic_replace(from, to)
-        }
-        fn exists(&self, path: &Path) -> bool {
-            path.exists()
-        }
-        fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
-            use std::io::Read as _;
-            let mut file = std::fs::File::open(path)?;
-            let length = usize::try_from(file.metadata()?.len())
-                .map_err(|_| std::io::Error::other("file too large"))?;
-            if length > limit {
-                return Err(std::io::Error::other("file exceeds the bound"));
-            }
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(length)
-                .map_err(|_| std::io::Error::other("allocation"))?;
-            bytes.resize(length, 0);
-            file.read_exact(&mut bytes)?;
-            Ok(bytes)
-        }
-    }
-    /// Install one file durably: a temporary name, the bytes, a file sync,
-    /// the rename, and the directory sync that makes the name durable.
+    /// Where a backup's files go and how they become durable: focal-platform's
+    /// medium, under the name the backup suites use.
+    pub use focal_platform::fs::{FileMedium, Medium as BackupMedium};
+    /// Install one file durably (`focal_platform::fs::install`); a path with no
+    /// parent directory is a corrupt backup path.
     fn install<M: BackupMedium>(medium: &mut M, path: &Path, bytes: &[u8]) -> Result<(), BackupError> {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .ok_or(BackupError::Corrupt("backup path"))?;
-        let temporary = path.with_extension("part");
-        medium.create(&temporary)?;
-        medium.write(&temporary, bytes)?;
-        medium.sync_file(&temporary)?;
-        medium.rename(&temporary, path)?;
-        medium.sync_dir(parent)?;
+        if path.parent().filter(|p| !p.as_os_str().is_empty()).is_none() {
+            return Err(BackupError::Corrupt("backup path"));
+        }
+        focal_platform::fs::install(medium, path, bytes)?;
         Ok(())
     }
 

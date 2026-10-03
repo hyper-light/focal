@@ -825,6 +825,7 @@ name = "focal-sim"
 version = "0.1.0"
 dependencies = [
  "focal-model",
+ "focal-platform",
  "thiserror",
 ]
 

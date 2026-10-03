@@ -160,6 +160,46 @@ impl Disk {
     }
 }
 
+/// The simulated disk as a medium: each step of an install is one operation a
+/// qualification can cut (`fail_before`). It keeps no directories, so making
+/// one does nothing; a write appends at the file's current length, which is
+/// what an install needs.
+impl focal_platform::fs::Medium for Disk {
+    fn create_dir(&mut self, _: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn create(&mut self, path: &Path) -> std::io::Result<()> {
+        Disk::create(self, path).map_err(io)
+    }
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let offset = Disk::read(self, path).map_err(io)?.len();
+        Disk::write(self, path, offset, bytes).map_err(io)
+    }
+    fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
+        Disk::sync_file(self, path).map_err(io)
+    }
+    fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
+        Disk::sync_dir(self, path).map_err(io)
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        Disk::rename(self, from, to).map_err(io)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        Disk::read(self, path).is_ok()
+    }
+    fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+        let bytes = Disk::read(self, path).map_err(io)?;
+        if bytes.len() > limit {
+            return Err(std::io::Error::other("bound"));
+        }
+        Ok(bytes.to_vec())
+    }
+}
+
+fn io(error: DiskError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
