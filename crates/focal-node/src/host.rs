@@ -376,6 +376,21 @@ pub(crate) fn known_receipt(
         ))
     }))
 }
+/// What a read barrier that could not be begun answers: nothing was taken,
+/// so the node is unavailable for the read — a replica that leads no one
+/// and knows no leader (an isolated leader once it stands down,
+/// `ConsensusError::NotLeader`), a session that stopped — never an unknown
+/// outcome, which is a mutation's word. Capacity and the client's standing
+/// keep their names.
+pub(crate) fn barrier_refused(error: LedgerError) -> AccessError {
+    match error {
+        LedgerError::Capacity
+        | LedgerError::Behind
+        | LedgerError::ResyncRequired
+        | LedgerError::Consensus(focal_consensus::ConsensusError::Capacity) => access(error),
+        _ => AccessError::Unavailable,
+    }
+}
 pub(crate) fn access(error: LedgerError) -> AccessError {
     match error {
         LedgerError::Managed(error) => match error {

@@ -3,7 +3,7 @@
 //! Directory/control code supplies the already authorized Session and route epoch.
 use crate::{custody::CustodyScope, evidence_service::EvidenceWitness};
 use crate::{
-    host::{access, finish_response, known_receipt},
+    host::{access, barrier_refused, finish_response, known_receipt},
     reads::{ListReadContext, ReadViews},
     streams::{PendingStream, Streams},
 };
@@ -2699,7 +2699,9 @@ impl Owner {
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((
                         WaitingFor::RequestStreamRead {
                             context,
@@ -2796,7 +2798,9 @@ impl Owner {
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((WaitingFor::Monitor { context, id: *id }, deadline));
                     Ok(Response::Error(AccessError::Unavailable))
                 }
@@ -2814,7 +2818,9 @@ impl Owner {
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((WaitingFor::Summary { context }, deadline));
                     Ok(Response::Error(AccessError::Unavailable))
                 }
@@ -2832,7 +2838,9 @@ impl Owner {
                     context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((
                         WaitingFor::Reconcile {
                             context,
@@ -2859,7 +2867,9 @@ impl Owner {
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::List {
                                 context,
@@ -2902,7 +2912,9 @@ impl Owner {
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Select {
                                 context,
@@ -2945,7 +2957,9 @@ impl Owner {
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Validators {
                                 context,
@@ -2988,7 +3002,9 @@ impl Owner {
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Traverse {
                                 context,
@@ -3027,7 +3043,9 @@ impl Owner {
                         context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Read {
                                 context,

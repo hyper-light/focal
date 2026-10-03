@@ -84,7 +84,7 @@ impl ReadViews {
             context.extend_from_slice(&request_id.0);
             session
                 .read_index(context.clone())
-                .map_err(super::host::access)?;
+                .map_err(super::host::barrier_refused)?;
             let mut complete = false;
             for _ in 0..4 {
                 let events = session.poll().map_err(super::host::access)?;

@@ -273,6 +273,27 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
         matches!(isolated, Response::Error(AccessError::Unavailable)),
         "the isolated leader answered {isolated:?}"
     );
+    // Once it stands down — an election timeout without its quorum — it
+    // leads no one and knows no leader, and a read's barrier cannot begin
+    // (`ConsensusError::NotLeader`): the read is unavailable, never an
+    // unknown outcome, which is a mutation's word (the macOS run that met
+    // the stood-down node answered `OutcomeUnknown`).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let progress = fleet.replicas[leader].host.progress();
+            if progress.leader != progress.node {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the isolated leader stood down");
+    let stood_down = exchange(&fleet, leader, &lookup).await;
+    assert!(
+        matches!(stood_down, Response::Error(AccessError::Unavailable)),
+        "the stood-down leader answered {stood_down:?}"
+    );
     let next = current_leader(&fleet, Some(leader)).await;
     let Response::Managed(retried) = exchange(&fleet, next, &mutation).await else {
         panic!("retry")
