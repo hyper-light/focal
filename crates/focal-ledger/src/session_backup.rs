@@ -895,7 +895,7 @@ pub mod backup {
         {
             return Err(BackupError::Corrupt("image"));
         }
-        if medium.exists(&root.join(MANIFEST_FILE)) {
+        if medium.exists(&root.join(MANIFEST_FILE))? {
             return Err(BackupError::Exists);
         }
         let inventory = inventory(&image.checkpoint, seeds, source, limits, budget)?;
