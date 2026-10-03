@@ -369,9 +369,8 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
             else {
                 panic!("raft")
             };
-            let mut decoded = focal_consensus::Message::default();
-            decoded.merge_from_bytes(message).unwrap();
-            if decoded.msg_type == focal_consensus::MessageType::MsgSnapshot as i32 {
+            let decoded = focal_consensus::decode_message(message).unwrap();
+            if decoded.msg_type == focal_consensus::MessageType::MsgSnapshot {
                 snapshots += 1;
                 if !canceled {
                     canceled = true;
@@ -381,7 +380,7 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
                     continue;
                 }
             }
-            let was_snapshot = decoded.msg_type == focal_consensus::MessageType::MsgSnapshot as i32;
+            let was_snapshot = decoded.msg_type == focal_consensus::MessageType::MsgSnapshot;
             let accepted = deliver_frame(&mut learner, frame, false);
             if was_snapshot && !accepted {
                 floor_rejected = true;
@@ -393,11 +392,9 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
             else {
                 panic!("raft")
             };
-            let mut decoded = focal_consensus::Message::default();
-            decoded.merge_from_bytes(message).unwrap();
-            let retry_hint = decoded.msg_type
-                == focal_consensus::MessageType::MsgHeartbeatResponse as i32
-                || decoded.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32
+            let decoded = focal_consensus::decode_message(message).unwrap();
+            let retry_hint = decoded.msg_type == focal_consensus::MessageType::MsgHeartbeatResponse
+                || decoded.msg_type == focal_consensus::MessageType::MsgAppendResponse
                     && decoded.reject;
             let force_admission = retry_hint && !admission_failed;
             let dropped = leader.dropped_snapshots;
@@ -446,8 +443,7 @@ fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission
     else {
         panic!("raft")
     };
-    let mut decoded = focal_consensus::Message::default();
-    decoded.merge_from_bytes(message).unwrap();
+    let decoded = focal_consensus::decode_message(message).unwrap();
     let peer = AuthenticatedPeer::local(PeerGrant {
         principal: ParticipantId::from_u128(u128::from(decoded.from) + 1000),
         tenants: [ledger().tenant].into_iter().collect(),

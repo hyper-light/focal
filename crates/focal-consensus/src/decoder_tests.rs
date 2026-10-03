@@ -60,7 +60,7 @@ fn decoder_floor_requires_actual_application_confirmation_before_any_raft_partic
         term: 99,
         ..Default::default()
     };
-    vote.set_msg_type(MessageType::MsgRequestVote);
+    vote.msg_type = MessageType::MsgRequestVote;
     let term = reopened.status().term;
     assert!(matches!(
         reopened.step(vote),

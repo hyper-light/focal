@@ -185,7 +185,7 @@ impl Fixture {
                     panic!("not Raft")
                 };
                 if focal_consensus::decode_message(message).unwrap().msg_type
-                    == MessageType::MsgSnapshot as i32
+                    == MessageType::MsgSnapshot
                 {
                     return frame;
                 }
@@ -261,7 +261,7 @@ fn control_snapshot_local_queue_and_frame_limit_rejection_release_flow_control()
                 term: fixture.owner.replica.status().term,
                 ..Default::default()
             };
-            heartbeat.set_msg_type(MessageType::MsgHeartbeatResponse);
+            heartbeat.msg_type = MessageType::MsgHeartbeatResponse;
             fixture.owner.replica.step(heartbeat).unwrap();
             fixture.owner.drain().unwrap();
         }
@@ -287,7 +287,7 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
         term: fixture.owner.replica.status().term + 1,
         ..Default::default()
     };
-    heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+    heartbeat.msg_type = MessageType::MsgHeartbeat;
     fixture.owner.replica.step(heartbeat).unwrap();
     fixture.owner.drain().unwrap();
     fixture.owner.replica.campaign().unwrap();
@@ -307,7 +307,7 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
             };
             assert_ne!(
                 focal_consensus::decode_message(message).unwrap().msg_type,
-                MessageType::MsgSnapshot as i32
+                MessageType::MsgSnapshot
             );
             fixture.deliver(frame);
         }

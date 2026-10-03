@@ -524,11 +524,13 @@ fn cursor_metadata_needs_quorum_and_lost_leadership_drops_reservations() {
     let baseline = s.memory_stats().used;
     s.submit_cursor(&acknowledgment).unwrap();
     assert!(s.memory_stats().used > baseline);
-    let mut heartbeat = Message::default();
-    heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-    heartbeat.from = 2;
-    heartbeat.to = 1;
-    heartbeat.term = s.status().term + 1;
+    let heartbeat = Message {
+        msg_type: focal_consensus::MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: s.status().term + 1,
+        ..Message::default()
+    };
     s.step(heartbeat).unwrap();
     drop(s.poll().unwrap());
     assert_eq!(s.pending_count(), 0);

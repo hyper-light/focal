@@ -7,7 +7,7 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
-use focal_consensus::{MessageType, NodeConfig, PbMessageExt, SnapshotStatus, StateRole};
+use focal_consensus::{MessageType, NodeConfig, SnapshotStatus, StateRole};
 use focal_control::*;
 use focal_directory::*;
 use focal_enrollment::{BootstrapAuthority, EnrollmentLimits, EnrollmentRegistry};
@@ -119,9 +119,9 @@ impl Cluster {
                 if !self.nodes[(to - 1) as usize].accepts_peer(from) {
                     continue;
                 }
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 self.nodes[(to - 1) as usize]
-                    .step_authenticated(from, &message.write_to_bytes().unwrap())
+                    .step_authenticated(from, &focal_consensus::encode_message(&message).unwrap())
                     .unwrap();
                 if snapshot {
                     self.nodes[(from - 1) as usize]
@@ -198,7 +198,7 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
         let to = message.to;
         if to != 4 {
             cluster.nodes[(to - 1) as usize]
-                .step_authenticated(from, &message.write_to_bytes().unwrap())
+                .step_authenticated(from, &focal_consensus::encode_message(&message).unwrap())
                 .unwrap();
         }
     }

@@ -141,13 +141,12 @@ fn an_append_given_up_before_it_leaves_keeps_its_place_in_the_order() {
     let mut fixture = Fixture::open(root.path());
     let owner = &mut fixture.owners[0];
     let term = owner.session.scalars().term;
-    let append = |term: u64| {
-        let mut message = focal_consensus::Message::default();
-        message.set_msg_type(focal_consensus::MessageType::MsgAppend);
-        message.from = 1;
-        message.to = 2;
-        message.term = term;
-        message
+    let append = |term: u64| focal_consensus::Message {
+        msg_type: focal_consensus::MessageType::MsgAppend,
+        from: 1,
+        to: 2,
+        term,
+        ..focal_consensus::Message::default()
     };
     owner.send(&[append(term)]).unwrap();
     let first = owner.ordered.get(&2).copied().unwrap();

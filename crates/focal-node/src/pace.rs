@@ -118,7 +118,7 @@ impl TickPeriod {
     /// The ticks the stall is covered by: what the longest stall the owner
     /// remembers took, and a tail of the paths after it, in periods of the
     /// pace in force. The replica waits as many beyond its election
-    /// timeout before it campaigns (`focal_raft::Raft::set_patience`): a
+    /// timeout before it campaigns (`hyper_raft::Raft::set_patience`): a
     /// node that stalls cannot tell a leader that stalls as it does from
     /// one that died, and a leader's heartbeat leaves its tick, so the one
     /// after a stall takes a tail to arrive. In ticks and not in the

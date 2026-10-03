@@ -46,7 +46,7 @@ fn rounds(fixture: &mut Fixture) -> Vec<(u64, Vec<u8>)> {
             panic!("Raft expected")
         };
         let decoded = focal_consensus::decode_message(message).unwrap();
-        if decoded.msg_type == MessageType::MsgHeartbeat as i32 && !decoded.context.is_empty() {
+        if decoded.msg_type == MessageType::MsgHeartbeat && !decoded.context.is_empty() {
             rounds.push((decoded.to, decoded.context.clone()));
         }
         fixture.owners[frame.target as usize - 1]

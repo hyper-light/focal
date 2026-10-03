@@ -7,7 +7,6 @@ use crate::{
     reads::{ListReadContext, ReadViews},
     streams::{PendingStream, Streams},
 };
-use focal_consensus::PbMessageExt as _;
 use focal_consensus::StateRole;
 #[path = "fleet_diagnostics.rs"]
 mod diagnostics;
@@ -166,12 +165,12 @@ pub struct ReplicationFrame {
 /// an entry the member had yet to receive and was refused for it (the
 /// jittered fleet: every refusal with the order kept was one, 2026-10-02).
 pub(crate) fn urgent(message: &focal_consensus::Message) -> bool {
-    let append = message.msg_type == focal_consensus::MessageType::MsgAppend as i32;
-    let snapshot = message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32;
+    let append = message.msg_type == focal_consensus::MessageType::MsgAppend;
+    let snapshot = message.msg_type == focal_consensus::MessageType::MsgSnapshot;
     !append && !snapshot
 }
 /// The peers an owner may have lost exchanges with between two of its
-/// periods: at most every member once (`focal_raft::MAX_MEMBERS`); a peer
+/// periods: at most every member once (`hyper_raft::MAX_MEMBERS`); a peer
 /// lost more often within a period is reported once.
 pub(crate) const LOST_PEERS: usize = 1024;
 impl ReplicationFrame {
@@ -3707,7 +3706,7 @@ impl Owner {
     /// its way that is not.
     fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
         for message in messages {
-            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32 {
+            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse {
                 self.judge_append_answer(message);
             }
             // A bulk frame carries the order it leaves in (27 §12): the
@@ -3742,14 +3741,22 @@ impl Owner {
                     self.session.report_snapshot_at(
                         message.to,
                         message.term,
-                        message.get_snapshot().get_metadata().index,
+                        message
+                            .snapshot
+                            .as_deref()
+                            .map_or(0, focal_consensus::snapshot_index),
                         focal_consensus::SnapshotStatus::Failure,
                     )?;
                     self.dropped = self.dropped.saturating_add(1);
                     continue;
                 }
             };
-            let size = message.compute_size() as usize;
+            let Ok(size) = focal_consensus::envelope::message_len(message) else {
+                drop(snapshot);
+                self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
+                continue;
+            };
             // Oversized snapshots require the chunked snapshot transport. They
             // cannot be silently treated as installed or acknowledged.
             if size
@@ -3775,7 +3782,7 @@ impl Owner {
                 let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
-            let Ok(message_bytes) = message.write_to_bytes() else {
+            let Ok(message_bytes) = focal_consensus::encode_message(message) else {
                 drop(snapshot);
                 self.dropped = self.dropped.saturating_add(1);
                 let _ = self.lost_sender.try_send(message.to);
