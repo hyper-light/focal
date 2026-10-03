@@ -1270,8 +1270,9 @@ of its own (F43, F41, F42, and the fast track's election fix of `7ea6f63` with a
 change of configuration; hyper-raft `crates/hyper-raft/ORIGIN.md`). focal now runs that crate:
 a snapshot of it and of `hyper-timing`, which it depends on, under `vendor/` (`SNAPSHOT` names the
 revision), and `crates/focal-raft` is gone. The order the owner set for the rest (2026-10-03): the
-core; then the WAL onto hyper-log (F-1); then the durable shell onto hyper-durable (D-2); then
-timing and liveness; then the transport.
+core; then the WAL onto hyper-log (F-1) and the durable shell onto hyper-durable (D-2), together
+(§15); then timing and liveness; then the transport. Tracked here until it goes: the shared
+shell's tick mode, which focal's shell runs on until its timing and liveness step (§15.7).
 
 **No byte changes.** hyper-raft speaks its own types and format (its R-2). focal's WAL records and
 peer messages keep raft-rs 0.7's protocol-buffer encoding (18 §1: no serialized type changes in
@@ -1302,9 +1303,295 @@ fast track's second rule. focal's suites run unchanged on it but for the types: 
 typed (a kind is an enum, not a number to check), and a value raft-rs's numbers could carry and
 the core does not name is refused by the envelope before the core is given it.
 
-**The format switch comes later, by layer**, with F-1: on the wire, a new protocol profile
-negotiated per connection, as the ordered profile is (§12), the old encoding sent to a peer that
-did not negotiate it; on disk, the new encoding under new `RecordKind` ordinals, which an older
-binary refuses, written only once the cluster's upgrade fence opens a named capability level
-(24 §21), the old kinds read for old histories. 18 §5's activation is for what entry data means,
-which this does not change.
+**The format switch comes later, by layer.** On disk it is §15's conversion to hyper-log,
+behind the cluster's upgrade fence at a named capability level (24 §21), the old records read for
+old histories. On the wire it comes with the transport step (§15.9), a protocol version negotiated
+per connection; until then the envelope's encoding is frozen. 18 §5's activation is for what entry
+data means, which neither changes.
+
+## 15. The log onto hyper-log, the shell onto hyper-durable (F-1, D-2) (2026-10-03)
+
+The next step of §14's order, designed before any code and reviewed by focal's session on
+2026-10-03. hyper-raft's `docs/durable.md` (§8, §11 "focal (D-2)") and `docs/raft.md` (§4, F-1)
+state the shared crates' half.
+
+### 15.1 Shape
+
+F-1 (focal-log to hyper-log) and D-2 (`DurableNode` to hyper-durable's `Replica`) land together, as
+one PR of ordered commits, each compiling and passing its tests. Porting `persistence.rs` to
+hyper-log only to replace it with the shell would build it twice.
+
+Two changes to the shared shell come first, made in hyper-raft and gated by its suites:
+- its tick mode (§15.7);
+- its held refusal (O2, §15.5).
+
+The commits in focal, in order:
+
+1. **Vendor** hyper-log, hyper-block and hyper-durable beside hyper-raft (`vendor/`, `SNAPSHOT`), as
+   for the core.
+2. **The group files** (§15.4): their format, the write discipline and the read that verifies
+   them. Tests cut the power at every write and flush (focal-sim `Disk::fail_before`).
+3. **The state machines** (§15.6): the Session's and the control groups', as
+   `hyper_durable::StateMachine`.
+4. **The shell on hyper-log** (§15.7), opened by a constructor that only the simulations and tests
+   use at first. focal-consensus's simulation and election suites run on it.
+5. **The conversion** (§15.8): one code path, run by `focal storage convert` and at start, with
+   every ordering edge cut.
+6. **The level**: `STORAGE_LEVEL`, the switch at start, and the old binary's refusal qualified.
+7. **Measurements and documents** (§15.10).
+
+### 15.2 What goes where
+
+| focal-log record | New home | Encoding |
+|---|---|---|
+| `Entry` | hyper-log, the group's entries | hyper-durable's `GroupStore`: the entry's kind, its context's length, its context, its data. No protocol buffers. |
+| `HardState` | hyper-log, the group's hard state | hyper-log's |
+| `Snapshot`: its point and configuration | hyper-log's start `(index, term)`, and the image file's header | — |
+| `Snapshot`: its data, the application's image | `groups/<id>/image` | the state machine's bytes, as now |
+| `Proposal` | hyper-log, the group's proposals | hyper-log's |
+| `Identity`, `FastTrack`, `DecoderFloor`, `DecoderTransition` | `groups/<id>/meta` | §15.4 |
+| `Floor`, `Moved` | nothing: the conversion reads through them with focal-log's replay | — |
+| `Configuration`, `Checkpoint` | written by nothing in this tree; the conversion refuses them as replay does (`unexpected session Raft record`) | — |
+
+hyper-log's group id is focal's `group_id`, 16 bytes, read as a little-endian `u128`.
+
+### 15.3 Layout
+
+```
+<data dir>/
+  wal/              focal-log's directory, never removed: LOCK, INITIALIZED, and CURRENT
+                    (FENCE_VERSION 3 once converted, §15.8)
+  wal-converted/    the old segments, moved there after the commit point (§15.8)
+  raft/
+    log             hyper-log's file: every group of this data directory, on its device
+    groups/<group id, 32 hex digits>/
+      meta          the group's identity, fast track, decoder floor and transition
+      image         the state machine's image, with its point and configuration
+```
+
+There is one hyper-log per data directory, as there was one WAL, so one flush still commits every
+group's writes (hyper-log's group commit). Its `Config` comes from the device and the node:
+- `segment_bytes` comes from the device's geometry (hyper-block's probe).
+- `max_segments` comes from the node's disk budget for `DiskKind::Wal`.
+- `max_groups` is the node's admission bound, the most groups it may be placed. It is never the
+  current placement, since groups arrive at runtime. Reaching it is a typed `Capacity` at
+  placement.
+- `group_entries` and `group_bytes` are derived as mantle derives them (`docs/design/raft-log.md`
+  §4–§5) for `max_groups` groups.
+- `queue_submissions` is `max_groups × GROUP_SUBMISSIONS`. This is exact by construction, so no
+  measurement is needed: each group's handle keeps at most `GROUP_SUBMISSIONS` (two) writes in the
+  log, and its next waits in the handle (hyper-raft `docs/durable.md` §15).
+
+focal's `WalOptions` (a 64 MiB segment, a 16 MiB record, a 64 MiB batch) go with focal-log's writer.
+
+### 15.4 The group files
+
+**Format.** Each file holds a magic number, a version, the payload's length, the payload
+(postcard), and a CRC32C of everything before it. The checksum is verified on every read, and a
+mismatch is `ConsensusError::Corruption` naming the file. A version this binary does not know is
+refused.
+
+**Writes.** A file is written whole:
+1. Write a temporary file in the group's directory.
+2. Flush it fully: `F_FULLFSYNC` on macOS, `fdatasync` on Linux, `FlushFileBuffers` on Windows.
+3. Rename it over the old one.
+4. Flush the directory.
+
+A new group's directory is created, then `groups/` is flushed. This is focal's `atomic_replace`
+with the directory sync. etcd keeps its snapshots the same way: one file per snapshot in `snap/`,
+written and synced before its WAL records the snapshot, so no WAL record names a file that is not
+there.
+
+**meta** is written when the group is made, then only when its decoder floor or its transition is
+set: at most three writes in a group's life. Kept apart from the image, the irreversible decoder
+write never rewrites an image, and no image rewrite touches the floor.
+
+**image** is written at every checkpoint and every install.
+
+### 15.5 Ordering, with no write across files
+
+No rule needs two files changed at once. Each needs one write durable before another begins.
+
+- **O1, meta before the log.** The identity and the fast track are durable in `meta` before the
+  group's first write to hyper-log. At open, a group in hyper-log without `meta` is `Corruption`,
+  never a fresh group.
+- **O2, the decoder floor (18 §4–§5).** `meta` stating the floor, or the transition, is durable:
+  - before any recovery output, campaign, step or vote of the group;
+  - before the log persists the first entry or snapshot that needs the successor decoder.
+
+  Two places enforce the rule:
+  - **Entries.** focal's `LogStore` wraps `GroupStore`, and every path to durable entry bytes
+    crosses it: leader and follower appends, a learner's catch-up, the member's own proposals, and
+    the conversion. A write holding the first entry that needs the successor is refused while
+    `meta` does not state the floor durable. The refusal is the shell's held kind (hyper-raft
+    `docs/durable.md` §2.4), never room. It carries the floor it needs, changes nothing, stalls
+    the replica as room does, and is counted. The owner writes `meta` and resumes the replica,
+    which submits the write again.
+  - **Images.** `StateMachine::install` checks the image it is given before writing it, since the
+    wrapper never sees image writes.
+
+  Every path is tested, with a crash cut between the `meta` write and the resubmission.
+- **O3, the image before the start (hyper-durable's I8).** `StateMachine::install` returns once
+  the image is durable, and the shell moves the log's start only after. A crash between them
+  leaves an image at `(I, T)` and a log not reset. The shell's open (`repair_at_open`, hyper-raft
+  `docs/durable.md` §4.3) runs Raft's decision again:
+  - if the log holds `(I, T)`, it keeps the suffix and raises the commit to `I`;
+  - otherwise it resets the log to start at `(I, T)`.
+
+  The image file names its own point, so no marker is needed.
+- **O4, compaction.** The log's start never passes the image's point (hyper-durable's `compact`).
+- **O5, backups (26 §6).** `checkpoint_evidence` opens the image once and reads it whole. The
+  prefix through the evidence's index is read from hyper-log in the same owner turn.
+  - On POSIX, a rename that replaces the file leaves the open file's bytes.
+  - On Windows, Rust's standard library opens a file sharing read, write and delete
+    (`OpenOptionsExt::share_mode`'s default), so the replace succeeds and the reader keeps its
+    version. Every open of an image keeps that sharing.
+- **O6, the disk budget.** An image is charged to `DiskKind::Checkpoint` before its temporary file
+  is written. The image it replaces is released once the rename and the directory flush are
+  durable.
+
+### 15.6 The state machines
+
+- **The Session** (focal-ledger) as a `StateMachine`:
+  - `apply` is its apply;
+  - `durable` is the point of its last durable image;
+  - `image` and `install` are its checkpoint and its restore;
+  - `persist` writes an image at the applied point.
+
+  `acts_at_start` is false for its entries, as `DurableNode` applies them now.
+- **Control groups** (focal-control): `acts_at_start` is true for every entry. This is
+  `apply_on_written_commit` as the shell states it (hyper-raft `docs/durable.md` §4.1, F17). Their
+  registry checkpoint is their image.
+- **The group's records** (`meta`) are not the machine's state. The owner writes them through the
+  group files, under O1 and O2.
+
+### 15.7 The shell
+
+| `DurableNode` | hyper-durable |
+|---|---|
+| `try_drain`, `drain`, `sendable`, `wait_persisted` | `Replica::drive` and the owner's waker (durable.md §9) |
+| `PersistencePending`, and the owners' ingress queues for it | gone: readies are taken ahead of persistence (R-4) |
+| `apply_on_written_commit` | `StateMachine::acts_at_start` (§15.6) |
+| the quiet commit write (`settle_commit`, `commit_waiting`) | the shell's quiet write; `Settings::quiet` is the owner's period |
+| `begin_checkpoint`, `finish_checkpoint` | `StateMachine::persist`, then `Replica::compact` |
+| focal-memory's reservations | the shell's `Budget`, implemented over them |
+| `step_authenticated` | the sender bound before `Replica::step`, as now |
+| `propose*`, `read_index`, `propose_conf_change`, `transfer_leader`, `set_priority`, `set_inflight_bytes`, `report_*`, `campaign` | the `Replica`'s calls of the same meaning |
+| `tick`, `heartbeat_tick`, `election_tick` | the shell's tick mode, below |
+
+**The tick mode.** hyper-durable's shell elects by suspicion (durable.md §8). focal elects on ticks
+until its timing and liveness step, which comes after D-2. The shell therefore takes the core's
+tick path as an owner's setting, under these conditions:
+- It is fixed per owner at open and never switched while running.
+- The tick path takes no suspicion input: no mixed mode.
+- It keeps focal's election semantics exactly: pre-vote, check-quorum, and the randomized timeout
+  from the pace the owner supplies each period (focal-timing). focal-consensus's election suites
+  on the shell and the raft-rs differential on ticks prove it.
+- It goes once the last consumer elects by suspicion. durable.md states that condition, and §14
+  tracks it.
+
+mantle's D-1 has the same need where its owner cannot yet carry the datagram plane.
+
+### 15.8 The conversion
+
+**Never remove the old WAL directory.** An old binary that opens a directory with no `CURRENT` and
+no `INITIALIZED` makes a fresh, empty WAL: a voter that forgot what it acknowledged.
+
+**One code path**, run by `focal storage convert` and at start. It holds `wal/LOCK` throughout.
+
+1. **Charge the disk budget.** The new store is written beside the old WAL, so its bytes are
+   checked first. A store that does not fit is refused, typed, naming the bytes it needs and the
+   bytes free.
+2. **Start clean.** A `raft/` left by an earlier attempt is removed whole: `CURRENT` is still
+   version 2, so nothing in it was ever acknowledged.
+3. **Read and write, group by group.** Read the old WAL through focal-log's replay, every record
+   decoded by the envelope, which reads the old kinds forever. Hold one group in memory at a time,
+   under the node's `MemoryBudget`, and record the peak. For each group, write:
+   - its `meta` (O1);
+   - its `image`, where it has one;
+   - its log in hyper-log: the start, the entries, the hard state and the proposals.
+4. **Make it durable.** hyper-log's writes are durable, and `raft/`, `raft/groups/` and each
+   group's directory are flushed.
+5. **Verify.** Open hyper-log and the files as a restart would, and compare every group with the
+   old replay, value for value: hard state, start, every entry's index, term, kind, data and
+   context, the proposals, the image's bytes, and `meta`'s fields. The comparison runs in
+   hyper-raft's types: the old side decoded by the envelope, the new side read through
+   `GroupStore`.
+6. **Commit.** Write `CURRENT` with `FENCE_VERSION` 3, by `atomic_replace` and the directory flush.
+   This is the conversion's commit point. The new fence keeps what focal-log's `read_fence` needs to
+   read it:
+   - `FENCE_MAGIC`;
+   - version 2's fields first (`version`, `identity`, `position`, `base`), then hyper-log's log id;
+   - the CRC32 (crc32fast) over the payload;
+   - a total within `MAX_FENCE_BYTES` (1,024).
+
+   The binary before this one then reads version 3 and fails closed at open with
+   `LogError::Identity`, before any replica opens. The qualification pins the error that the
+   preserved binary actually answers.
+7. **Move the old segments** to `wal-converted/`, then flush both directories.
+   - `wal-converted/` stays charged to the disk budget until it is removed.
+   - It is removed by `focal storage remove-converted`, never by a bare `rm`. The command
+     refuses unless `CURRENT` is version 3 and hyper-log opens and verifies.
+
+**After a crash.**
+- Before step 6, `CURRENT` is version 2: the new binary discards the partial `raft/` and converts
+  again. A disk that fills halfway leaves it so too.
+- After step 6, `CURRENT` is version 3 and hyper-log is authoritative. An open finishes step 7
+  where it stopped.
+
+The new binary refuses a `raft/` whose `CURRENT` is not version 3, and a version 3 `CURRENT`
+without `raft/`.
+
+**When it runs.**
+- Both the command and the start read the fence as this node can know it:
+  - its applied registry, where it holds a root copy;
+  - otherwise, a root quorum read through the root's leader over the node's own credentials (the
+    `read_registry` path).
+
+  When no root member answers within a deadline charged to progress, it refuses, typed, and never
+  assumes.
+- A node converts at its first start after the fence opens at `STORAGE_LEVEL` (24 §21; 08: stepped
+  complexity), or at a later start if the read cannot answer. A rollout costs each node one restart.
+- `focal storage convert` runs offline under the lock and refuses unless the fence is open. It is
+  for rehearsals and staged rollouts, like `cluster replicas activate-native`.
+- A start below the fence never converts: the binary runs `DurableNode` on focal-log, unchanged.
+- A cluster founded at `STORAGE_LEVEL` starts on hyper-log.
+- The release after this one requires the fence at `STORAGE_LEVEL`. It removes `DurableNode` and
+  focal-log's writer, and keeps focal-log's reader and the envelope for conversion and old
+  histories.
+
+### 15.9 The wire
+
+The wire keeps raft-rs's encoding through the envelope, frozen, until the transport step, where
+hyper-transport carries the core's own encoding under a negotiated version. Switching focal-wire's
+profile now, only for hyper-transport to replace focal-wire after, would build the switch twice.
+§14's wire profile moves to the transport step.
+
+### 15.10 Evidence (the gate)
+
+- A crash cut at every new ordering edge:
+  - in process, focal-sim's `Disk::fail_before` at every write and flush of the group files and of
+    hyper-log;
+  - on real processes, new `FaultSite`s for the R11 crash matrix: `ConvertWritten`,
+    `ConvertVerified`, `ConvertCommitted`, `ConvertMoved`, `MetaDurable`, `FloorDurable`,
+    `ImageDurable`.
+- The disk-full refusal before step 2, and a disk that fills during step 3, which leaves version 2.
+- Recorded data directories converted and read back equal: `durable-session-v1`, the
+  decoder-transition fixture's directories, and directories recorded from the current binary (the
+  round trip that qualified step 1).
+- The preserved old binary refuses a converted directory with the error the qualification pins,
+  and every file's hash is unchanged after it tried.
+- focal's `cli_upgrade` journey, or a sibling, extended through `STORAGE_LEVEL`: converted at
+  start, the old binary refused, the new one serving. It records one restart per node per rollout.
+- Conversion time and peak memory, at a recorded WAL of gigabytes.
+- focal's restart and restore runbooks on real processes.
+- focal-consensus's simulation and election suites on the shell, and F17's two cases on focal's
+  shape.
+- `cargo bench -p focal-consensus --bench commits` against `DurableNode` at its last commit,
+  loaded, with the load recorded. The shell replaces focal's only where it is at least as fast and
+  allocates no more (hyper-raft `docs/durable.md` §13).
+- The group files at scale: thousands of groups a node, each checkpointing, and a checkpoint storm
+  in which every group checkpoints together after a restart. The shared WAL paid one flush a batch
+  across groups; a checkpoint here pays a file flush and a directory flush. The measurement records
+  the cost of a checkpoint and the node's flushes a second. If the files do not hold, the
+  alternative is a per-device image store, measured against them.

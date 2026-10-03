@@ -13363,3 +13363,13 @@ read 1.5 s past its instant, where nothing reports a timer fired: F26's metrics 
 both belong); and production waits with no stated derivation that the sweep found: the
 MCP adapter's 3 s shutdown bound and its 20 ms poll, the transfer backend's 30 s,
 `network_state`'s 5 s DNS lookups, the controller's 250 ms pass.
+### 2026-10-03 — the log and the shell move together, designed first
+
+F-1 and D-2 are one step, designed before code and reviewed by focal's session
+([27](27-consensus-roadmap-and-slates-port.md) §15). Each group's Raft state goes to hyper-log,
+one log per data directory. Its image and its records (identity, fast track, decoder floor and
+transition) go to files of its own under `raft/groups/`. Ordering rules stand in for a write
+across files. The old WAL directory is never removed: `CURRENT` at fence version 3 is the
+conversion's commit point, and the binary before it fails closed on it. The conversion runs at
+start once the upgrade fence opens at `STORAGE_LEVEL`, or by `focal storage convert`, on one code
+path. The shared shell gains a tick mode and a held refusal first, in hyper-raft. No code yet.
