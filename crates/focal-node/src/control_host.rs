@@ -1070,7 +1070,12 @@ impl<V: AuthorityVerifier> Owner<V> {
         }));
         self.failure = match result {
             Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.to_string()),
+            // The replica's own cause, where it failed first: the loop's
+            // last error is `Failed`, every call's answer after that.
+            Ok(Err(error)) => Some(match self.replica.failure() {
+                Some(cause) => format!("{error} ({cause})"),
+                None => error.to_string(),
+            }),
             Err(_) => Some("control owner unwound".to_owned()),
         };
         self.stop_waiters();

@@ -753,7 +753,11 @@ root observed up to the receipt's revision first (`NetworkController::
 trust_for`, bounded by the revisions as they come and by the root's reply
 time; a credential request is served after the refresh that follows it,
 never between a commit and the read of it), and one the registry at that
-revision names no issuer of is refused as uninstallable. The
+revision names no issuer of is refused as uninstallable. A renewal
+decided within the second the current certificate was issued would not
+extend it and is answered with the current certificate, as a retry of a
+committed renewal is (`prepare_renew`): a holder's own renewal and an
+operator's asked in one second are one renewal. The
 succession is the first behaviour gated on the upgrade fence (§21,
 `upgrade::ISSUER_SUCCESSION_LEVEL`, 2): a binary below it cannot verify an
 endorsed chain, so staging is refused (`Fenced`, by name) until the fence
@@ -1580,9 +1584,9 @@ every artifact with content, in artifact order from `after` and at most
 (`CustodyRequest::Verify`, the manifest and every chunk) and counts it
 verified; an object it lacks or that fails its hash is pulled from another
 required copy — the content copies first, then the voters, each once — with
-the copy's manifest, chunk by verified chunk, resuming at the first chunk
-this node lacks or holds corrupt (a transfer opened over a chunk that fails
-its hash now installs verified bytes over it), and counts as repaired; an
+the copy's manifest, chunk by verified chunk, pulling every chunk this node
+lacks or holds corrupt and none it holds (a transfer opened over a chunk that
+fails its hash installs verified bytes over it), and counts as repaired; an
 object no copy answers with is unrecoverable, listed (bounded to 64,
 counted exactly) and turns `restore_required` on. This node then records
 its own receipt when it is a required copy, and asks every other required

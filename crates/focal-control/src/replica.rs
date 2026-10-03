@@ -154,6 +154,12 @@ pub struct ControlReplica {
     membership: Option<ControlMembershipRecord>,
     drained: bool,
     failed: bool,
+    /// Why the replica failed, where it did: the first error that stopped
+    /// it, named by its text. A replica that failed answers every call
+    /// `Failed`; without this the cause was gone with the first answer (a
+    /// member brought up by snapshot reported the egress's end alone,
+    /// macOS and ubuntu CI, 2026-10-02 and 2026-10-03).
+    failure: Option<String>,
     /// Founded here on a sealed image (`ControlBootstrap::is_image`).
     founded_from_image: bool,
 }
@@ -187,6 +193,7 @@ impl ControlReplica {
             membership: None,
             drained: false,
             failed: false,
+            failure: None,
             founded_from_image,
         })
     }
@@ -217,6 +224,7 @@ impl ControlReplica {
             membership: None,
             drained: false,
             failed: false,
+            failure: None,
             founded_from_image,
         })
     }
@@ -864,17 +872,28 @@ impl ControlReplica {
             Ok(events) => events,
             Err(error) if !self.node.failed() => return Err(error.into()),
             Err(error) => {
-                self.failed = true;
-                self.pending = None;
+                self.fail(&error);
                 return Err(error.into());
             }
         };
         let result = self.drain_inner(events, verifier);
-        if result.is_err() {
-            self.failed = true;
-            self.pending = None;
+        if let Err(error) = &result {
+            self.fail(error);
         }
         result
+    }
+    /// The replica stops at `error`: what it delivered is not whole, and a
+    /// reopen recovers it. The first cause is kept by name.
+    fn fail(&mut self, error: &dyn std::fmt::Display) {
+        self.failed = true;
+        self.pending = None;
+        if self.failure.is_none() {
+            self.failure = Some(error.to_string());
+        }
+    }
+    /// Why the replica failed, where it has.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
     /// The drain without the wait for the disk: none while the node still
     /// persists what it took, when an owner sends what may be sent
@@ -890,15 +909,13 @@ impl ControlReplica {
             Ok(None) => return Ok(None),
             Err(error) if !self.node.failed() => return Err(error.into()),
             Err(error) => {
-                self.failed = true;
-                self.pending = None;
+                self.fail(&error);
                 return Err(error.into());
             }
         };
         let result = self.drain_inner(events, verifier);
-        if result.is_err() {
-            self.failed = true;
-            self.pending = None;
+        if let Err(error) = &result {
+            self.fail(error);
         }
         result.map(Some)
     }
@@ -1384,8 +1401,10 @@ impl ControlReplica {
             // that changed nothing (Raft has work outstanding, persistence is
             // in flight, memory or log pressure) is retried by the caller;
             // treating it as fatal ended the root leader under ordinary load.
-            if self.node.failed() {
-                self.failed = true;
+            if self.node.failed()
+                && let Err(error) = &result
+            {
+                self.fail(error);
             }
         }
         result.map_err(ControlError::from)

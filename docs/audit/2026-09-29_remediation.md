@@ -3004,6 +3004,65 @@ failure, which the owner records as it stops (`ControlProgress::failure`). *Fix.
 The owner's failure on that runner is not known: the test passed on the same commit's
 first macOS run and on every run before; the next occurrence names it.
 
+## Found by CI (2026-10-03)
+
+The runs of b318e80 (the CI fixes above and the F42 residual) failed on three tests.
+
+**A stalled stream's bound on a loopback is the acknowledgement delay's** (Windows ×2,
+focal-wire `a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries`:
+`27.06 s of 51 s at 1.75 ms`). The F42 residual made the probe timeout count the 25 ms a
+peer may hold an acknowledgement (RFC 9002 §6.2.1; `frame::MAX_ACK_DELAY`), and the
+residency law — two datagrams of the least size a probe timeout — follows it: two
+megabytes withheld on a 1.75 ms loopback are given 27 s where three round trips alone
+gave 4.6 s (24.7 s here at 857 µs). The test's claim that the law's bound is under half
+the old wait (51 s) held only while the timeout counted the round trips alone; the law is
+right — a sender that loses every flight on a LAN sends two datagrams a probe timeout,
+and the timeout waits the peer's acknowledgement delay — and the claim is restated as
+less than the old wait, with the bound's derivation beside it. The suite takes the 24 s
+the law states on every platform now.
+
+**A renewal asked within the second of the last was a conflict** (macOS ×2,
+`credential_renewal::tests::a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it`:
+the host's renewal `Rejected(Conflict)`). The registry refused a renewal that would not
+extend the credential — one decided within the second the current certificate was issued
+(`prepare_renew`) — as a conflict. With a short lifetime the holder's own renewal ahead of
+expiry ran in the controller pass before the operator's request was served, and the
+operator's, a second later at most, met the refusal; an operator asking `credentials
+renew` the second after the holder renewed meets it the same way. *Fix.* Such a renewal is
+answered with the current certificate, as a retry of a committed renewal is: the holder
+holds a credential as fresh as the sponsor issues (24 §11). The registry's idempotency
+test pins it; the controller test takes the renewals it finds.
+
+**A control replica named the symptom, not its cause** (ubuntu,
+`placement_agent::split::tests::a_crowded_partition_splits_survives_a_restart_and_merges_back`:
+`ControlOwner("metadata replica failed during durable delivery; reopen for recovery")`
+for the member brought up by snapshot — the owner's failure, now surfaced, is itself a
+generic one). `ControlReplica::drain`/`try_drain` mark the replica failed on any error of
+the delivery and keep nothing of the error; every call after answers `Failed`, and the
+owner's loop ends on that answer, the first error — the cause — gone. On this run the
+first error was one the owner treats as retryable (`checkpoint_retryable`: memory, a
+capacity, a node not ready, persistence pending), since any other would have ended the
+loop by its own name. *Fix, this batch.* The replica keeps its first failure by name
+(`ControlReplica::failure`) and the owner reports it beside `Failed`
+(`ControlProgress::failure`), so the next occurrence names the refusal. *Open.* A
+delivery the replica took from its node and could not finish for a refusal that changed
+nothing of the node — memory for a snapshot's decode, a machine's restore — ends the
+replica, where a session retains such a delivery and resumes it (`Session::retained`,
+`PendingDelivery`): the control replica needs the same retained delivery, bounded to one,
+so a transient refusal under a runner's load never ends a member; a batch of its own once
+the cause is named.
+
+**A host's level that never came** (ubuntu, the second run, cli_upgrade
+`the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_refuses_to_serve`:
+after the rollout's restart the host stayed at the level before for 90 s, the founder at
+the binary's). A node's level rides the placement agent's load report
+(`PartitionOperation::ReportLoad`, `NodeLoad::capability`), due at a restarted agent's
+first tick; the host's never reached the directory, so its agent did not tick to a
+report or the report was refused — which the view cannot tell. The first run of the same
+commit passed it on ubuntu. *Open.* The journey prints the node's health and placement
+beside the view it waited on when a level never comes, so the next occurrence names
+what held the report.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms
@@ -3125,4 +3184,3 @@ in an exchange time. Under a six-process CPU load, with the cold rule, the cross
 twice (74–79 s, 1.13 MB crossed): the failure needs the first part's exchange to be given
 up, which the suite's load did and the hogs alone did not; the amplifier is gone either
 way.
-

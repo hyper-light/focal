@@ -12938,3 +12938,17 @@ it now names.
 ### 2026-10-03 — a peer's appends are stepped in the order they left it
 
 The audit's F42 residual ([27](27-consensus-roadmap-and-slates-port.md) §12): a group's appends to a peer carry a sequence within the sender's incarnation (`Operation::RaftOrdered`, the ordered profile), the receiver holds a frame that overtook the one before it — for the path's probe timeout at most, within the source's lane and the configuration's members — and steps the frames in their order, so an append never overtakes another and is never refused for it; frames a group cannot do without stay unordered. Over a path that loses one datagram in fifty, 512 entries had 27 appends refused with the older offer and none (61 held, none let go) with the profile (`ReplicaProgress::appends_rejected`, `fleet_quic`). Found on the way: the probe timeout counted no acknowledgement delay (`frame::MAX_ACK_DELAY`), and empty appends went unordered.
+
+### 2026-10-03 — the gate commit's CI: three causes
+
+The runs of b318e80 failed on three tests ([the record](../audit/2026-09-29_remediation.md),
+"Found by CI (2026-10-03)"): the F38 test's claim that a stalled stream's bound is under
+half the old wait, which the probe timeout's acknowledgement delay made 27 s of 51 on a
+Windows loopback (the law is right; the claim is restated as less than the old wait); a
+renewal asked within the second of the holder's own, refused as a conflict and now
+answered with the current certificate ([24](24-placement-execution-and-fleet-control.md)
+§11); and a control replica that kept nothing of the error that stopped it — it names its
+first failure now, and the retained delivery it lacks is recorded as a batch of its own.
+A fourth, open: a host's level that never reached the upgrade view after the rollout's
+restart on one ubuntu run; the journey reports the node's health and placement beside
+the view when that happens again.

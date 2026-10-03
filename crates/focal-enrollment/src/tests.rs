@@ -1011,6 +1011,13 @@ fn a_renewal_keeps_the_key_and_identity_retires_the_old_certificate_after_grace_
     key.renew(&renewed, authority.issuers().unwrap().trusted(), at)
         .unwrap();
     let again = material.renewal_request(&key, &renewed).unwrap();
+    // A renewal asked within the second the renewed certificate was issued
+    // would not extend it, and is answered with it: a holder's own renewal
+    // and an operator's in one second are one renewal, never a conflict.
+    assert!(matches!(
+        registry.prepare_renew(&authority, &again, at, 30).unwrap(),
+        RenewPreparation::Existing(receipt) if receipt == renewed
+    ));
     let RenewPreparation::Commit(second) = registry
         .prepare_renew(&authority, &again, at + 40, 30)
         .unwrap()
@@ -1157,15 +1164,17 @@ fn renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment() {
     let mut registry = registry(&authority);
     let (key, receipt, material) = enroll_node(&dir, &mut registry, &authority, "node");
     // A renewal decided within the second the certificate was issued cannot
-    // extend it and is refused rather than committed for nothing.
+    // extend it, and is answered with the certificate held rather than
+    // committed for nothing or refused: the holder holds a credential as
+    // fresh as the sponsor issues (it was a conflict, which an operator's
+    // renewal the second after the holder's own met).
     let same_second = material.renewal_request(&key, &receipt).unwrap();
-    let refused = registry
-        .prepare_renew(&authority, &same_second, receipt.issued_at, 30)
-        .err();
-    assert!(
-        matches!(refused, Some(EnrollmentError::Conflict)),
-        "{refused:?}"
-    );
+    assert!(matches!(
+        registry
+            .prepare_renew(&authority, &same_second, receipt.issued_at, 30)
+            .unwrap(),
+        RenewPreparation::Existing(current) if current == receipt
+    ));
     let (other_key, other_receipt, other_material) =
         enroll_node(&dir, &mut registry, &authority, "other");
     // A request signed by another enrolled node, or naming another node's

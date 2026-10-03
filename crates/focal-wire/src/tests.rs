@@ -4139,16 +4139,26 @@ async fn a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carri
         unread.after,
         unread.longest
     );
-    // And far less than the others would have kept it under the old wait:
-    // what they send in a period, and the periods it would have taken them
-    // to send what the stalled exchange had to.
+    // And less than the others would have kept it under the old wait: what
+    // they send in a period, and the periods it would have taken them to
+    // send what the stalled exchange had to. On a loopback the law's bound
+    // is the acknowledgement delay's — a probe timeout is three round
+    // trips and the 25 ms a peer may hold an acknowledgement (RFC 9002
+    // §6.2.1), two datagrams of the least size each — 27 s here for two
+    // megabytes on a Windows runner's 1.75 ms loopback, where the old wait
+    // was 51 s and the claim of under half of it held only while the
+    // probe timeout counted the round trips alone (Windows CI, 2026-10-03).
     let moved = UNREAD_OTHER as u32 * (UNREAD_PERIOD.as_millis() / UNREAD_EVERY.as_millis()) as u32;
     let kept = UNREAD_PERIOD * (STALLED as u32 / moved);
     assert!(kept >= UNREAD_PERIOD * 100);
     assert!(
-        given < kept / 2,
+        given < kept,
         "{given:?} of {kept:?} at {:?}",
         unread.longest
+    );
+    println!(
+        "a stalled stream of {STALLED} bytes ended after {:?}, given {given:?} at a longest round trip of {:?}; the old wait kept it {kept:?}",
+        unread.after, unread.longest
     );
     assert!(unread.answered >= 1, "{}", unread.answered);
 }

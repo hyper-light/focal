@@ -1599,10 +1599,15 @@ impl EnrollmentRegistry {
         let lifetime =
             i64::try_from(self.limits.credential_lifetime).map_err(|_| EnrollmentError::Invalid)?;
         let expires_at = now.checked_add(lifetime).ok_or(EnrollmentError::Invalid)?;
-        // A renewal must extend the credential; one decided within the
-        // second the current certificate was issued would not.
+        // A renewal extends the credential; one decided within the second
+        // the current certificate was issued would not, and is answered
+        // with the current certificate, as a retry of a committed renewal
+        // is: the holder holds a credential as fresh as the sponsor issues.
+        // It was refused as a conflict, which an operator's renewal asked
+        // the second after the holder's own renewal met (macOS CI,
+        // 2026-10-03).
         if !rotation && expires_at <= current.expires_at {
-            return Err(EnrollmentError::Conflict);
+            return Ok(RenewPreparation::Existing(current.clone()));
         }
         let retire_previous_at = now
             .checked_add(i64::try_from(grace_seconds).map_err(|_| EnrollmentError::Invalid)?)

@@ -1094,7 +1094,10 @@ async fn a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it()
         )
         .await;
         assert_eq!(renewed.node, listed, "{who}");
-        assert_eq!(renewed.renewals, 1, "{who}");
+        // The holder's own renewal ahead of expiry may have come first on a
+        // slow runner (the lifetime is short here); the ask is answered
+        // with what it holds then, and counts as the renewal it is.
+        assert!(renewed.renewals >= 1, "{who}: {}", renewed.renewals);
         let registry = root_registry(&founder, founder_dir.path()).await;
         let under = registry
             .enrollments()

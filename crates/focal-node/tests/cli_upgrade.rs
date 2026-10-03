@@ -176,7 +176,16 @@ fn wait_for_upgrade(root: &Path, what: &str, condition: impl Fn(&Value) -> bool)
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    panic!("{what} did not happen; last: {last:#?}");
+    // What the node knows of itself and the fleet when the level it waited
+    // for never came: a level rides the placement agent's load report (an
+    // ubuntu run showed the host at the level before for 90 s, 2026-10-03).
+    let health = run(root, &["cluster", "node", "health"]);
+    let placement = run(root, &["cluster", "placement"]);
+    panic!(
+        "{what} did not happen; last: {last:#?}\nhealth: {}\nplacement: {}",
+        String::from_utf8_lossy(&health.stdout),
+        String::from_utf8_lossy(&placement.stdout)
+    );
 }
 fn capability(view: &Value, node: u64) -> u64 {
     view["nodes"]
