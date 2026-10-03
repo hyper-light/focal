@@ -496,7 +496,10 @@ pub trait Medium {
     fn sync_file(&mut self, path: &Path) -> io::Result<()>;
     fn sync_dir(&mut self, path: &Path) -> io::Result<()>;
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
-    fn exists(&self, path: &Path) -> bool;
+    /// Whether `path` names a file. A failure to find out (a permission, an
+    /// I/O error) is an error, never an absent file: a caller that reads a
+    /// missing record as a fresh start must not read an unreadable one so.
+    fn exists(&self, path: &Path) -> io::Result<bool>;
     fn read(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>>;
 }
 /// The real filesystem.
@@ -552,8 +555,8 @@ impl Medium for FileMedium {
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
         atomic_replace(from, to)
     }
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        path.try_exists()
     }
     fn read(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         use std::io::Read as _;
