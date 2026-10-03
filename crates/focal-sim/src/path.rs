@@ -1,6 +1,7 @@
 //! A modelled network path between nodes (27 §3.1 P7): propagation delay
-//! with jitter, a loss process, a bottleneck link with a drop-tail queue, a
-//! path MTU and a NAT whose mapping expires. A [`Fabric`] decides each
+//! with jitter, a loss process, a bottleneck link with a drop-tail queue and
+//! an active queue manager that marks what is ECN-capable, a path MTU and a
+//! NAT whose mapping expires. A [`Fabric`] decides each
 //! message's fate from its path and a seed, and schedules what survives on a
 //! [`Network`]; a scenario replays exactly from its seed.
 //!
@@ -79,6 +80,115 @@ pub struct Link {
     /// A message arriving when the backlog plus itself exceeds this is
     /// dropped.
     pub queue_bytes: u64,
+    /// What the queue's manager does below that capacity.
+    pub marking: Marking,
+}
+impl Link {
+    /// A link whose queue only drops what overflows it.
+    pub const fn drop_tail(rate_bits_per_second: u64, queue_bytes: u64) -> Self {
+        Self {
+            rate_bits_per_second,
+            queue_bytes,
+            marking: Marking::Off,
+        }
+    }
+}
+/// What a link's queue manager does with a message that finds the queue long,
+/// below the capacity that drops it (RFC 7567): one that is ECN-capable is
+/// marked Congestion Experienced and goes on, one that is not is dropped
+/// where it would be marked (RFC 3168 §5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Marking {
+    /// Drop-tail alone.
+    #[default]
+    Off,
+    /// A step at a threshold of the queue, as DCTCP's switches mark (RFC
+    /// 8257 §3.1): a message that finds more than `threshold_bytes` ahead
+    /// of it.
+    Step { threshold_bytes: u64 },
+    /// CoDel (RFC 8289) marking where it would drop: once the messages'
+    /// sojourn has stayed above `target_ns` for an `interval_ns`, one is
+    /// marked, and the next at `interval/√count` apart while it stays above.
+    CoDel { target_ns: u64, interval_ns: u64 },
+}
+/// CoDel's state on one link (RFC 8289 §5). A FIFO link's messages leave in
+/// the order they came and each one's start of transmission is known when it
+/// is queued, so the state advances at each message's dequeue time, in
+/// order, as the queue is entered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CoDel {
+    first_above: Option<u64>,
+    marking: bool,
+    next: u64,
+    count: u64,
+    last_count: u64,
+}
+impl CoDel {
+    /// Whether the message that leaves the queue at `dequeue`, having waited
+    /// `sojourn` behind `ahead` bytes, is marked; `bytes` is its own size,
+    /// the one message a queue may hold without being long (RFC 8289 §5.2's
+    /// "queue holds more than one MTU").
+    fn judge(
+        &mut self,
+        dequeue: u64,
+        sojourn: u64,
+        ahead: u64,
+        bytes: u64,
+        target_ns: u64,
+        interval_ns: u64,
+    ) -> bool {
+        let above = if sojourn < target_ns || ahead <= bytes {
+            self.first_above = None;
+            false
+        } else {
+            match self.first_above {
+                None => {
+                    self.first_above = Some(dequeue.saturating_add(interval_ns));
+                    false
+                }
+                Some(first) => dequeue >= first,
+            }
+        };
+        if self.marking {
+            if !above {
+                self.marking = false;
+                return false;
+            }
+            if dequeue < self.next {
+                return false;
+            }
+            self.count = self.count.saturating_add(1);
+            self.next = control_law(self.next, self.count, interval_ns);
+            return true;
+        }
+        if !above {
+            return false;
+        }
+        self.marking = true;
+        // RFC 8289 §5.5: a state left recently resumes near its rate.
+        let delta = self.count.saturating_sub(self.last_count);
+        self.count =
+            if delta > 1 && dequeue.saturating_sub(self.next) < interval_ns.saturating_mul(16) {
+                delta
+            } else {
+                1
+            };
+        self.next = control_law(dequeue, self.count, interval_ns);
+        self.last_count = self.count;
+        true
+    }
+}
+/// `t + interval/√count` (RFC 8289 §5.3), the root in 16 fractional bits:
+/// `√(count·2³²) = √count·2¹⁶`.
+fn control_law(at: u64, count: u64, interval_ns: u64) -> u64 {
+    let step = u128::from(count.max(1))
+        .checked_shl(32)
+        .map(u128::isqrt)
+        .zip(u128::from(interval_ns).checked_shl(16))
+        .and_then(|(root, scaled)| scaled.checked_div(root))
+        .and_then(|step| u64::try_from(step).ok())
+        .unwrap_or(interval_ns);
+    at.saturating_add(step)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LinkId(usize);
@@ -96,6 +206,7 @@ struct LinkState {
     /// What the transmitter has accepted and not finished sending, in
     /// order. Each keeps the timing of the rate it was accepted at.
     queued: VecDeque<Queued>,
+    codel: CoDel,
 }
 impl LinkState {
     /// Rounded up, so a message always takes time on a finite link.
@@ -237,6 +348,8 @@ pub struct FabricStats {
     pub dropped_capacity: u64,
     pub dropped_nat: u64,
     pub peak_queue_bytes: u64,
+    /// ECN-capable messages a queue manager marked Congestion Experienced.
+    pub marked: u64,
 }
 
 /// How many directed flows, links and NATs a fabric models. A scenario that
@@ -322,6 +435,7 @@ impl<M> Fabric<M> {
             link,
             busy_until: 0,
             queued: VecDeque::new(),
+            codel: CoDel::default(),
         });
         Ok(id)
     }
@@ -406,7 +520,31 @@ impl<M> Fabric<M> {
         };
         chance(&mut self.random, ppm)
     }
+    /// Send a message that is not ECN-capable: a queue manager drops it
+    /// where it would mark it.
     pub fn send(&mut self, from: u64, to: u64, message: M, bytes: usize) -> Fate {
+        self.send_with(from, to, message, bytes, None::<fn(&mut M)>)
+    }
+    /// Send an ECN-capable message (RFC 3168 §5): where a queue manager on
+    /// its link marks it, `mark` is applied to it and it goes on.
+    pub fn send_ecn(
+        &mut self,
+        from: u64,
+        to: u64,
+        message: M,
+        bytes: usize,
+        mark: impl FnOnce(&mut M),
+    ) -> Fate {
+        self.send_with(from, to, message, bytes, Some(mark))
+    }
+    fn send_with<F: FnOnce(&mut M)>(
+        &mut self,
+        from: u64,
+        to: u64,
+        mut message: M,
+        bytes: usize,
+        mark: Option<F>,
+    ) -> Fate {
         let now = self.network.now();
         bump(&mut self.stats.sent);
         if let Some((_, last)) = self.nats.get_mut(&from) {
@@ -431,8 +569,35 @@ impl<M> Fabric<M> {
                 bump(&mut self.stats.dropped_queue);
                 return Fate::Dropped(Dropped::Queue);
             }
-            self.stats.peak_queue_bytes = self.stats.peak_queue_bytes.max(backlog);
             let starts = link.busy_until.max(now);
+            let congested = match link.link.marking {
+                Marking::Off => false,
+                Marking::Step { threshold_bytes } => backlog > threshold_bytes,
+                Marking::CoDel {
+                    target_ns,
+                    interval_ns,
+                } => link.codel.judge(
+                    starts,
+                    starts.saturating_sub(now),
+                    backlog,
+                    size,
+                    target_ns,
+                    interval_ns,
+                ),
+            };
+            if congested {
+                match mark {
+                    Some(mark) => {
+                        mark(&mut message);
+                        bump(&mut self.stats.marked);
+                    }
+                    None => {
+                        bump(&mut self.stats.dropped_queue);
+                        return Fate::Dropped(Dropped::Queue);
+                    }
+                }
+            }
+            self.stats.peak_queue_bytes = self.stats.peak_queue_bytes.max(backlog);
             departure = starts.saturating_add(link.serialization_ns(bytes));
             link.busy_until = departure;
             link.queued.push_back(Queued {
@@ -598,12 +763,7 @@ mod tests {
         let mut fabric = fabric();
         // 8,000 bits a second is 1,000 bytes a second; the queue holds two
         // messages of 500 bytes behind the one being sent.
-        let link = fabric
-            .add_link(Link {
-                rate_bits_per_second: 8_000,
-                queue_bytes: 1_500,
-            })
-            .unwrap();
+        let link = fabric.add_link(Link::drop_tail(8_000, 1_500)).unwrap();
         fabric.set_path(Path::NONE.through(link));
         let half = 500_000_000;
         assert_eq!(fabric.send(1, 2, 1, 500), Fate::Arrives { at: half });
@@ -634,24 +794,13 @@ mod tests {
     #[test]
     fn a_link_whose_capacity_changes_is_followed() {
         let mut fabric = fabric();
-        let link = fabric
-            .add_link(Link {
-                rate_bits_per_second: 8_000,
-                queue_bytes: 10_000,
-            })
-            .unwrap();
+        let link = fabric.add_link(Link::drop_tail(8_000, 10_000)).unwrap();
         fabric.set_path(Path::NONE.through(link));
         assert_eq!(
             fabric.send(1, 2, 1, 1_000),
             Fate::Arrives { at: 1_000_000_000 }
         );
-        fabric.set_link(
-            link,
-            Link {
-                rate_bits_per_second: 80_000,
-                queue_bytes: 10_000,
-            },
-        );
+        fabric.set_link(link, Link::drop_tail(80_000, 10_000));
         assert_eq!(
             fabric.send(1, 2, 2, 1_000),
             Fate::Arrives { at: 1_100_000_000 }
@@ -726,12 +875,7 @@ mod tests {
     #[test]
     fn every_message_is_accounted_for() {
         let mut fabric = fabric();
-        let link = fabric
-            .add_link(Link {
-                rate_bits_per_second: 1_000_000,
-                queue_bytes: 20_000,
-            })
-            .unwrap();
+        let link = fabric.add_link(Link::drop_tail(1_000_000, 20_000)).unwrap();
         fabric.set_path(
             Path::REGIONAL
                 .with_loss(Loss::random(30_000))
@@ -767,17 +911,9 @@ mod tests {
             link_messages: 3,
         };
         let mut fabric: Fabric<u64> = Fabric::with_limits(1, 1 << 20, 1 << 30, limits);
-        let link = fabric
-            .add_link(Link {
-                rate_bits_per_second: 8,
-                queue_bytes: u64::MAX,
-            })
-            .unwrap();
+        let link = fabric.add_link(Link::drop_tail(8, u64::MAX)).unwrap();
         assert_eq!(
-            fabric.add_link(Link {
-                rate_bits_per_second: 8,
-                queue_bytes: 1
-            }),
+            fabric.add_link(Link::drop_tail(8, 1)),
             Err(NetworkError::Capacity)
         );
         fabric.set_nat(1, Nat { idle_timeout_ns: 1 }).unwrap();
@@ -807,5 +943,140 @@ mod tests {
         assert!(fabric.pair_paths.is_empty());
         fabric.set_pair_path(1, 3, Path::NONE).unwrap();
         assert!(matches!(fabric.send(1, 3, 6, 1), Fate::Arrives { .. }));
+    }
+
+    /// Every delivery of an ECN-capable fabric in order: its time, its
+    /// message and whether it was marked.
+    fn drain_marked(fabric: &mut Fabric<(u64, bool)>) -> Vec<(u64, u64, bool)> {
+        let mut delivered = vec![];
+        while let Some(at) = fabric.next_arrival() {
+            fabric.advance_to(at.max(fabric.now())).unwrap();
+            while let Some(delivery) = fabric.receive() {
+                let (message, marked) = delivery.message;
+                delivered.push((fabric.now(), message, marked));
+            }
+        }
+        delivered
+    }
+    #[test]
+    fn a_step_marks_what_finds_more_than_its_threshold_and_drops_what_cannot_be_marked() {
+        let mut fabric: Fabric<(u64, bool)> = Fabric::new(7, 1 << 20, 1 << 30);
+        // 8 kbit/s: a message of 1,000 bytes takes a second to leave.
+        let link = fabric
+            .add_link(Link {
+                rate_bits_per_second: 8_000,
+                queue_bytes: 10_000,
+                marking: Marking::Step {
+                    threshold_bytes: 2_500,
+                },
+            })
+            .unwrap();
+        fabric.set_path(Path::NONE.through(link));
+        // Five at once find 0, 1,000, 2,000, 3,000 and 4,000 bytes ahead.
+        for message in 0..5 {
+            let fate = fabric.send_ecn(1, 2, (message, false), 1_000, |sent| sent.1 = true);
+            assert!(matches!(fate, Fate::Arrives { .. }), "{fate:?}");
+        }
+        // One that is not ECN-capable finds 5,000: dropped where it would be
+        // marked, though the queue has room for it.
+        assert_eq!(
+            fabric.send(1, 2, (5, false), 1_000),
+            Fate::Dropped(Dropped::Queue)
+        );
+        let delivered = drain_marked(&mut fabric);
+        let marked: Vec<u64> = delivered
+            .iter()
+            .filter(|(_, _, marked)| *marked)
+            .map(|(_, message, _)| *message)
+            .collect();
+        assert_eq!(marked, vec![3, 4]);
+        assert_eq!(delivered.len(), 5);
+        let stats = fabric.stats();
+        assert_eq!(stats.marked, 2);
+        assert_eq!(stats.dropped_queue, 1);
+        // Below the threshold again, nothing is marked.
+        fabric.send_ecn(1, 2, (6, false), 1_000, |sent| sent.1 = true);
+        assert!(
+            !drain_marked(&mut fabric)
+                .iter()
+                .any(|(_, _, marked)| *marked)
+        );
+    }
+    #[test]
+    fn codel_marks_a_standing_queue_after_an_interval_and_ever_sooner_until_it_drains() {
+        let mut fabric: Fabric<(u64, bool)> = Fabric::new(7, 1 << 20, 1 << 30);
+        // 1 Mbit/s: a message of 1,250 bytes takes 10 ms to leave. CoDel's
+        // defaults (RFC 8289 §4.3): a target of 5 ms over 100 ms.
+        let link = fabric
+            .add_link(Link {
+                rate_bits_per_second: 1_000_000,
+                queue_bytes: 1_000_000,
+                marking: Marking::CoDel {
+                    target_ns: 5 * MILLISECOND,
+                    interval_ns: 100 * MILLISECOND,
+                },
+            })
+            .unwrap();
+        fabric.set_path(Path::NONE.through(link));
+        // When each message arrives, by its number: the fabric is drained
+        // after the last send, so the delivery's own clock says nothing of
+        // when a message left.
+        let mut arrivals: Vec<u64> = Vec::new();
+        let mut send = |fabric: &mut Fabric<(u64, bool)>| {
+            let message = arrivals.len() as u64;
+            match fabric.send_ecn(1, 2, (message, false), 1_250, |sent| sent.1 = true) {
+                Fate::Arrives { at } => arrivals.push(at),
+                fate => panic!("{fate:?}"),
+            }
+        };
+        // A standing queue of three messages, then one at the link's rate
+        // for a second: each waits 30 ms, six times the target.
+        for _ in 0..3 {
+            send(&mut fabric);
+        }
+        for step in 0..100_u64 {
+            fabric.advance_to(step * 10 * MILLISECOND).unwrap();
+            send(&mut fabric);
+        }
+        // Then one every 20 ms for a second: the queue drains and stays
+        // below the target.
+        for step in 0..50_u64 {
+            fabric
+                .advance_to(1_000 * MILLISECOND + step * 20 * MILLISECOND)
+                .unwrap();
+            send(&mut fabric);
+        }
+        let delivered = drain_marked(&mut fabric);
+        assert_eq!(delivered.len(), 153);
+        // A message leaves the queue 10 ms before it arrives: its own time
+        // on the link, and no propagation.
+        let marks: Vec<u64> = delivered
+            .iter()
+            .filter(|(_, _, marked)| *marked)
+            .map(|(_, message, _)| arrivals[*message as usize] - 10 * MILLISECOND)
+            .collect();
+        assert_eq!(fabric.stats().marked, marks.len() as u64);
+        assert!(marks.len() >= 5, "{marks:?}");
+        // Nothing before the sojourn has stood above the target for an
+        // interval.
+        assert!(marks[0] >= 100 * MILLISECOND, "{marks:?}");
+        // The gaps shrink as interval/√count: the first is the interval, none
+        // is longer than it and a message's time (marks fall where messages
+        // leave, every 10 ms), and the later half of the standing queue
+        // holds more marks than the earlier.
+        let gaps: Vec<u64> = marks.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(gaps[0], 100 * MILLISECOND, "{gaps:?}");
+        assert!(gaps.iter().all(|gap| *gap <= 110 * MILLISECOND), "{gaps:?}");
+        assert!(gaps[gaps.len() - 1] < gaps[0], "{gaps:?}");
+        let middle = (marks[0] + 1_000 * MILLISECOND) / 2;
+        let earlier = marks.iter().filter(|at| **at < middle).count();
+        let later = marks
+            .iter()
+            .filter(|at| **at >= middle && **at < 1_000 * MILLISECOND)
+            .count();
+        assert!(later > earlier, "{marks:?}");
+        // Once the queue drained, nothing more is marked.
+        let drained = 1_200 * MILLISECOND;
+        assert!(marks.iter().all(|at| *at < drained), "{marks:?}");
     }
 }

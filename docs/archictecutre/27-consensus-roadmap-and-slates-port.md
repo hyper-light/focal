@@ -927,6 +927,88 @@ parts of its own transport; quinn has delayed acknowledgements, MTU discovery,
 segmentation offload, key update and migration, which slates lacks. Its consensus core
 has not changed since what focal took from it.
 
+**A queue manager's mark (the audit's F39, 2026-10-03).** quinn sends its datagrams
+ECT(0) where the path keeps the field and tells the law of a mark as a congestion event
+with no bytes lost (`Connection::process_ecn`); Copa took it for a loss, which in its
+default mode is no signal, so a mark changed nothing. A mark is never noise — a queue
+manager judged its queue too long — and a sender of ECT(0) answers it as congestion (RFC
+3168 §5, RFC 9002 §7.1). Copa now does (`Copa::on_mark`): once a round trip (RFC 9002
+§7.3.2) slow start ends, `1/δ` halves while Copa competes, and the window halves
+(`DEFAULT_MARK_BACKOFF`, RFC 9002 §B.2's `kLossReductionFactor`). For ten seconds after a
+mark past slow start the window grows as a classic sender's, a datagram a round trip, in
+either mode: a queue manager keeps the queue short for every sender, so Copa does not see
+the classic senders that fill it to the manager's target — their marks are what it sees
+of them — and Copa's own step after each mark took back the share they regrow a datagram
+a round trip. While it grows so, competing raises `1/δ` only after a round trip in which
+the target held the window back: beside a target raised a packet a round trip, a window
+growing a datagram a round trip never reaches it, never falls, and never empties the
+queue Copa alone keeps, and Copa alone, misjudging itself competing, filled CoDel's queue
+to its target. Marks round trip after round trip halve the window each round trip to the
+least: the response to persistent marking.
+
+The harness carries the ECN field on the paths that say so (`Scenario::ecn`; the grid
+above is of paths that bleach it, and its numbers are unchanged — the flows refactor runs
+one flow exactly as before), its bottleneck marks by a step at one datagram (DCTCP's
+threshold, RFC 8257 §3.1) or by CoDel's defaults (RFC 8289: 5 ms over 100 ms;
+`focal_sim::path::Marking`, CoDel evaluated at each datagram's dequeue time), and it runs
+flows side by side through one bottleneck (`compete`). Copa alone, 30 s, against itself
+without a manager and NewReno under the same manager:
+
+| Path | Manager | Copa queue p99, ms (without manager) | Copa carried | NewReno carried |
+|---|---|---|---|---|
+| 1 Mbit/s, 20 ms | step | 19.20 (27.71) | 57.5% | 50.4% |
+| 1 Mbit/s, 20 ms | CoDel | 27.71 (27.71) | 91.5% | 90.4% |
+| 1 Mbit/s, 100 ms | step | 19.20 (80.47) | 16.5% | 16.1% |
+| 1 Mbit/s, 100 ms | CoDel | 34.11 (80.47) | 80.4% | 76.6% |
+| 10 Mbit/s, 20 ms | step | 1.92 (12.61) | 11.5% | 8.9% |
+| 10 Mbit/s, 20 ms | CoDel | 12.61 (12.61) | 96.0% | 89.8% |
+| 10 Mbit/s, 100 ms | step | 1.92 (11.33) | 2.1% | 1.8% |
+| 10 Mbit/s, 100 ms | CoDel | 7.49 (11.33) | 82.0% | 77.6% |
+| 100 Mbit/s, 20 ms | step | 0.19 (0.73) | 1.2% | 1.0% |
+| 100 Mbit/s, 20 ms | CoDel | 0.73 (0.73) | 97.1% | 87.2% |
+| 100 Mbit/s, 100 ms | step | 0.19 (7.30) | 0.2% | 0.2% |
+| 100 Mbit/s, 100 ms | CoDel | 7.30 (7.30) | 73.4% | 73.5% |
+
+In no scenario is the managed queue longer than Copa keeps without a manager; by
+geometric mean it is 0.377 of it, and Copa carries 1.108 times what NewReno carries under
+the same manager. (Under the one-datagram step, the threshold of DCTCP's senders of
+ECT(1), every classic sender starves, NewReno with it.) Beside NewReno and CUBIC under
+CoDel, the incumbent's share over its bar — what it carries beside its own kind or CUBIC,
+the worse-off of each pair (Ware, Mukerjee, Seshan and Sherry, HotNets 2019) — by
+geometric mean over eight seeds, each seed's bar its own:
+
+| Path | NewReno beside Copa (bar) | of its bar | CUBIC beside Copa (bar) | of its bar |
+|---|---|---|---|---|
+| 1 Mbit/s, 100 ms | 37.3% (37.0%) | 1.008 | 40.8% (40.3%) | 1.014 |
+| 10 Mbit/s, 20 ms | 60.9% (45.0%) | 1.354 | 57.2% (47.5%) | 1.203 |
+| 10 Mbit/s, 100 ms | 44.8% (36.2%) | 1.233 | 52.7% (39.8%) | 1.325 |
+| 100 Mbit/s, 20 ms | 63.5% (44.0%) | 1.445 | 65.3% (42.4%) | 1.539 |
+
+By geometric mean NewReno carries 1.249 of its bar beside Copa and CUBIC 1.256. The
+backoff, over the four paths (alone: geometric means over both managers):
+
+| Backoff | Alone: queue of unmanaged | Alone: carried of NewReno | Least of the bar under CoDel, NewReno / CUBIC |
+|---|---|---|---|
+| 1/2 (RFC 3168, RFC 9002) | 0.382 | 1.130 | 1.008 / 1.014 |
+| 7/10 (RFC 9438) | 0.401 | 1.558 | 0.842 / 0.880 |
+| 4/5 (RFC 8511) | 0.375 | 1.934 | 0.812 / 0.794 |
+
+The gentler backoffs carry more alone and take it from NewReno and CUBIC at 1 Mbit/s,
+100 ms; only 1/2 leaves each nine tenths of its bar. How the answer was found — two first
+answers that failed, ten seconds of classic growth chosen over the mode's four round
+trips, a growth cap that changed the paths without a manager, the competing raise that
+let Copa alone fill CoDel's queue, and the harness's own rules, which judged one run's
+and then one seed's noise — is in the record's F39.
+
+Open, the next batch (the record's F39): without a manager, Copa competing takes more
+than the bar at long round trips (NewReno 33.8% against 43.3% at 1 Mbit/s, 100 ms; CUBIC
+35.6% against 40.1% at 100 Mbit/s, 20 ms), answering a loss by `1/δ` alone; Copa's test
+of the mode takes the least of four smoothed round trips where the paper's detector asks
+for five, and Copa alone judged itself competing in 13.5% of samples at 100 Mbit/s,
+20 ms; on a link without jitter Copa does not leave the competitive mode once a
+competitor has left; and at 100 Mbit/s, 20 ms under CoDel Copa yields, carrying about 32%
+beside either.
+
 ## 8. Where the plan stands, and slates examined again (2026-09-28)
 
 ### 8.1 What was planned, and the evidence for each

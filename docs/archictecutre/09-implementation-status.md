@@ -13024,3 +13024,22 @@ the native engine and the fleet owner read those on their paths, and the readine
 marker is read in place. With focal-load's allocation bench (1,000 claims, macOS arm64, exact
 counts): a linearizable read takes 20 allocations and no reallocation, 26 and one at
 916afbf; a committed claim 336.79 allocations, 340.89 before.
+
+### 2026-10-03 — Copa answers a queue manager's mark
+
+The audit's F39: quinn tells a law of a mark (ECN-CE) as a congestion event with no bytes
+lost, and Copa took it for a loss, no signal in its default mode. A mark is congestion:
+once a round trip Copa ends slow start, halves `1/δ` while competing, and halves its
+window (RFC 9002 §B.2; 7/10 and 4/5 were measured to take from NewReno and CUBIC); for
+ten seconds after a mark past slow start its window grows as a classic sender's, a
+datagram a round trip, and competing it raises `1/δ` only after a round trip in which
+the target held the window back — raised beside it a packet a round trip, Copa alone,
+misjudging itself competing, filled CoDel's queue to its target. The congestion harness
+carries ECN where a path does, marks by a one-datagram step or by CoDel
+(`focal_sim::path::Marking`), runs flows side by side, and judges a newcomer's harm over
+eight seeds. Alone, Copa's managed queue is in no scenario longer than its unmanaged one,
+0.377 of it by geometric mean, and it carries 1.108 times what NewReno carries under the
+same manager; beside Copa under CoDel, NewReno and CUBIC carry 1.008 to 1.539 of what
+they carry beside their own kind. Open, the next batch: Copa competing without a manager
+takes more than that at long round trips, its test of the mode misjudges its own queue,
+and on a link without jitter it does not leave the competitive mode.

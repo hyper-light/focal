@@ -51,7 +51,7 @@ ruling before work starts).
 | F36 | P1 | in tree | 9 | [F36](#f38-and-f36) |
 | F37 | P1 | in tree | 8 | [F37](#f37) |
 | F38 | P2 | in tree | 8 | [F38](#f38-and-f36) |
-| F39 | P2 | open | 12 | — |
+| F39 | P2 | in tree (Copa's competing mode open) | 12 | [F39](#f39) |
 | F40 | P2 | open | 10 | — |
 | F41 | P2 | in tree | 10 | [F41](#f41) |
 | F42 | P1 | in tree | 9 | [F42](#f42) |
@@ -3387,3 +3387,137 @@ group's one voter (the 16-byte class: 6,000 allocations per thousand reads befor
 after), and the readiness marker built for the comparison (the 64-byte class: 5,000 to
 4,000), whose growth was the read's one reallocation (19 bytes moved per read, none
 after). Bytes requested per read: 11,236.9 before, 11,139.9 after.
+
+## F39
+
+**Cause.** quinn raises a queue manager's mark (ECN-CE) as a congestion event with no
+bytes lost (`Connection::process_ecn`, once for each acknowledgement whose count of marks
+grew), and leaves the round trip's single answer to the law. Copa's adapter took every
+event for a loss, and a loss in Copa's default mode is no signal (Copa §2.2: it may be
+noise), so a mark changed nothing — the audit's probe: five marks, the window 12,000
+bytes, slow start still on. A mark is never noise.
+
+**Fix.** `Copa::on_mark`, once a round trip (a mark of what was sent before the last one
+answered belongs to that round trip, RFC 9002 §7.3.2): slow start ends (§7.3.1); while
+Copa competes, `1/δ` halves, its own answer to congestion there; a direction Up turns
+Down at velocity one; and the window is multiplied by `DEFAULT_MARK_BACKOFF`, 1/2 — a
+classic sender's answer to congestion (RFC 3168 §5; RFC 9002 §B.2's
+`kLossReductionFactor`) — never below the least window, the next round trip's direction
+judged from the window the mark left. After a mark past slow start, for ten seconds (the
+window Copa keeps its least round trip over, §2.1), the window grows as a classic
+sender's, a datagram a round trip (RFC 9002 §B.5), in either mode: a queue manager keeps
+the queue short for every sender, so Copa does not see the senders filling it to the
+manager's target, and their marks are what it sees of them. While it grows so, competing
+raises `1/δ` only after a round trip in which the target held the window back. Losses are
+answered as before. The adapter takes an event without lost bytes and without
+persistence for a mark.
+
+**How the answer was found.** Each answer was measured against rules stated before its
+run; these failed, in order.
+- *Copa's own Down step for a round trip* (`v·(1/δ)` datagrams): under a step at one
+  datagram Copa's queue grew (99th percentile 4.93 ms to 6.85 ms), beside NewReno Copa
+  took 92.2% and NewReno 3.4%, and under CoDel at 10 Mbit/s, 100 ms its median queue grew
+  from 3.65 ms to 17.89 ms — the velocity reset each mark kept Copa's oscillation too
+  small to empty the queue, and the least round trip it measured grew with the queue.
+- *A multiplicative backoff alone* (4/5 in the default mode; the window and `1/δ` halved
+  while competing — this finding's first commit): beside NewReno and CUBIC under CoDel on
+  100 ms paths the incumbent carried less than the bar of a newcomer's harm, what it
+  carries beside its own kind or CUBIC (Ware, Mukerjee, Seshan and Sherry, HotNets 2019):
+  NewReno 24.7% against 37.1% at 1 Mbit/s, 26.6% against 38.5% at 10 Mbit/s. After every
+  mark Copa regrew by its own step, `v/δ` datagrams a round trip, where NewReno regrows one.
+- *Classic growth for the mode's window* (four round trips) let Copa grow by its own step
+  between the marks of a long path and take from NewReno more than CUBIC does.
+- *Classic growth whenever competing, and a loss halving the window while competing*
+  changed what Copa does on paths without a manager: the stride the harness chooses moved
+  from 2 to 8, and the laws grid's carried from 0.998 to 0.968. Withdrawn: a loss is no
+  mark, and Copa's loss rule is its paper's.
+- *Classic growth after any mark, `1/δ` raised as before*: Copa alone at 100 Mbit/s,
+  20 ms under CoDel kept a queue of 5.34 ms at its 99th percentile where it keeps 0.73 ms
+  without a manager, and carried 91.0% where it carries 97.1%. Traced at 10 ms of the
+  law's state: the paper's test of the mode misjudges Copa's own queue now and then
+  (below, open); competing, `1/δ` grows a packet a round trip, and beside a window
+  growing a datagram a round trip the target was never reached, the window never fell,
+  the queue never emptied, and the mode never ended — `1/δ` rose to 58 and the queue to
+  CoDel's target, whose mark began ten more seconds of classic growth: a mark every 3 to
+  6 s. Marks in slow start begin no classic growth (a doubling past the manager's target
+  is Copa's own, which ending slow start answers); this changed nothing there, Copa's
+  slow start having ended by delay before the first mark.
+- *Classic growth in the default mode only*: alone, the queue was back at 0.73 ms; but
+  competing, Copa's own step after its marks left NewReno and CUBIC under CoDel at
+  1 Mbit/s, 100 ms 0.893 and 0.880 of their bars over eight seeds.
+- *The raise gated on one acknowledgement over the target*: an acknowledgement's noise
+  counted, and `1/δ` still rose about once a round trip (six marks, 5.24 ms). A round trip
+  judged Down by Copa's own direction rule is what holds the window back; the mark's own
+  back-off is no such round trip, so the direction is judged afresh from the window the
+  mark left.
+- *The rules themselves*. Judging each scenario alone fell to one run's noise (4/5's
+  queue 12.29 ms against 11.33 ms without a manager at one path): the alone rules are
+  stated over the grid by geometric mean, as the harness judges its other choices, with a
+  bound for each scenario — the queue under the manager ten ninths at most of the queue
+  without it — which the geometric mean alone had let 5.34 ms pass. The stall rule beside
+  NewReno under the one-datagram step measured NewReno's own collapse there (NewReno alone
+  carries 1.8% to 26% under it — DCTCP's threshold, for senders of ECT(1), RFC 8257,
+  RFC 9330), so coexistence is judged under CoDel, the manager ECT(0) meets, and reported
+  under the step; CoDel marks only a sojourn above its target for an interval, so whether
+  it must mark is judged by the median queue. And a scenario's harm judged by one seed
+  judged the seed: over eight seeds at 1 Mbit/s, 100 ms the incumbent's share over its
+  bar spread with a standard deviation of 0.096 beside CUBIC and 0.064 beside NewReno,
+  the bar itself from 35.5% to 42.6%, and the one seed's 0.863 sat 1.5 deviations under
+  the eight seeds' 1.009. Each scenario's harm is now the geometric mean over eight seeds
+  (`HARM_SEEDS`), judged where the seeds resolve it from the floor — 2.5 of their mean's
+  deviations, the eight pairs a grid judges taken together at 5% (`FLOOR_DEVIATIONS`).
+
+**Tests.** `focal-wire` (`congestion.rs`): a mark ends slow start and halves the window
+once a round trip, to the least window; competing, a mark halves `1/δ` and the window;
+marks round trip after round trip halve the window each round trip to the least; after a
+mark past slow start the window grows a datagram a round trip for ten seconds, and after
+one in slow start by Copa's own step
+(`after_a_mark_past_slow_start_the_window_grows_a_datagram_a_round_trip_for_ten_seconds`);
+competing as a classic sender, `1/δ` holds while the window grows and rises once a round
+trip goes down
+(`competing_as_a_classic_sender_copa_raises_its_target_only_after_a_round_trip_held_back`,
+which fails at its first round trip without the gate); the controller takes an event
+without lost bytes for a mark. `focal-sim` (`path.rs`): a step marks what finds more than
+its threshold ahead and drops what cannot be marked; CoDel leaves a standing queue
+unmarked for an interval, then marks it ever sooner until it drains. The harness
+(`tests/congestion.rs`), ECN carried where `Scenario::ecn` says and flows side by side
+(`compete`; one flow runs exactly as before, its every field equal):
+`copa_takes_a_mark_for_a_queue_longer_than_its_manager_wants`,
+`copa_shares_a_bottleneck_with_newreno_and_cubic`,
+`the_mark_backoff_of_the_law_is_the_one_that_was_measured` (`FOCAL_CONGESTION_FULL=1`
+runs the grids).
+
+**Measured** (the grids, macOS arm64; the tables in 27 §7). Alone, over twelve scenarios
+(1, 10, 100 Mbit/s; 20, 100 ms; a step at one datagram and CoDel): in no scenario is
+Copa's queue under the manager longer than without it; by geometric mean it is 0.377 of
+it, and Copa carries 1.108 times what NewReno carries under the same manager; at
+100 Mbit/s, 20 ms under CoDel, 0.73 ms and 97.1%, as without a manager. Beside NewReno and
+CUBIC under CoDel, over eight seeds each: the incumbent carries 1.008 to 1.539 of its bar,
+1.249 (NewReno) and 1.256 (CUBIC) by geometric mean. The backoff, of 1/2, 7/10 and 4/5:
+only 1/2 leaves every incumbent nine tenths of its bar — at 1 Mbit/s, 100 ms 7/10 leaves
+NewReno 0.842 and CUBIC 0.880, 4/5 leaves them 0.812 and 0.794 — and 1/2 is the law's.
+With no mark the law is the one measured before: the laws grid chooses Copa and the
+stride grid half, as recorded.
+
+**Found by this measurement, open** (the next batch: Copa's competing mode).
+- *Copa competing without a manager takes more than the bar at long round trips*:
+  NewReno 33.8% against 43.3% and CUBIC 27.2% against 41.6% at 1 Mbit/s, 100 ms; CUBIC
+  35.6% against 40.1% at 100 Mbit/s, 20 ms. No mark is there: Copa's competing mode
+  answers a loss by `1/δ` alone (§2.2: a loss may be noise), and it needs a way to tell a
+  congestive loss from a random one.
+- *Copa's test of the mode misjudges its own queue.* The authors' implementation
+  (genericCC, `rtt-window.cc`), slates and focal take the least round trip of four
+  smoothed round trips, where the paper's detector asks for a nearly empty queue "in the
+  last 5 RTTs" — the period of Copa's own oscillation (§2.2, §3). Alone without a manager
+  at 100 Mbit/s, 20 ms, Copa judged itself competing in 13.5% of samples, `1/δ` reaching 5.
+- *On a link without jitter Copa does not leave the competitive mode.* In a model of one
+  queue served in order, acknowledged a round trip after service, Copa's comparison of
+  its current window with a target taken from its lagged standing round trip dithers at
+  the target, an acknowledgement's step either side; with `1/δ` large the window never
+  overshoots, the queue never empties, and after a competitor leaves Copa competes on,
+  `1/δ` rising to 125 in eight seconds — the law's own growth while competing, F39's
+  classic growth or not. The paper's analysis (§3) takes the rate as `cwnd/RTT`, moving
+  with the round trip; the harness's paths, with pacing and acknowledgements' timing,
+  oscillate and empty.
+- *At 100 Mbit/s, 20 ms under CoDel Copa yields*: about 32% beside NewReno or CUBIC,
+  which carry 1.45 and 1.54 of their bars.
