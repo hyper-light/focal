@@ -66,6 +66,43 @@ struct Slow {
     delay: Duration,
     chunk_bytes: usize,
 }
+/// The replicas' tick, and what a dial and an exchange between them are
+/// given on the loopback.
+const TICK: Duration = Duration::from_millis(20);
+const DIAL: Duration = Duration::from_millis(500);
+/// The most a handshake's flight carries: a Hello is read under this bound
+/// (`read_frame(.., 4096)`), and the TLS flights with the test PKI's chain
+/// are smaller.
+const HANDSHAKE_FLIGHT_BYTES: u64 = 4096;
+impl Slow {
+    /// How long the relay takes to carry `bytes` one way: its delay, the
+    /// jitter it adds (a tenth), and the bytes at its rate.
+    fn crossing(&self, bytes: u64) -> Duration {
+        let nanos = bytes
+            .checked_mul(8)
+            .and_then(|bits| bits.checked_mul(1_000_000_000))
+            .map(|bit_nanos| bit_nanos / self.bits)
+            .unwrap();
+        self.delay + self.delay / 10 + Duration::from_nanos(nanos)
+    }
+    /// What a dial across the path is given: two round trips of a flight
+    /// each way — QUIC's Initial and Handshake, then focal's Hello and its
+    /// reply — each under the flight bound. On the loopback the pool's half
+    /// second says a peer is gone; across a shaped path, that time would
+    /// say so of a peer whose handshake the path is still carrying (the
+    /// ubuntu run of the 128 kbit/s crossing: node 1's dials were given up
+    /// at 500 ms, and node 2, which waited its two seconds for a heartbeat
+    /// that never came, took the group).
+    fn dial(&self) -> Duration {
+        self.crossing(HANDSHAKE_FLIGHT_BYTES) * 4
+    }
+    /// A follower's patience with its leader, in ticks: twice the dial, so
+    /// a heartbeat that waited the dial's whole time still comes before
+    /// the follower campaigns.
+    fn election_ticks(&self, tick: Duration) -> usize {
+        usize::try_from((self.dial() * 2).as_nanos().div_ceil(tick.as_nanos())).unwrap()
+    }
+}
 fn store_limits_with(chunk_bytes: usize) -> StoreLimits {
     let limits = store_limits();
     let chunk = u64::try_from(chunk_bytes).unwrap();
@@ -294,9 +331,11 @@ impl Fleet {
             config.voters = plan.voters.clone();
             // Campaign node1 before starting clients. Slower follower elections
             // stabilize setup; the later transfer uses Raft's explicit protocol.
+            // Across a shaped path a follower waits at least the path's dial,
+            // twice, before it campaigns (`Slow::election_ticks`).
             config.election_tick = match id {
                 1 => 10,
-                _ => 100,
+                _ => slow.map_or(100, |slow| slow.election_ticks(TICK).max(100)),
             };
             let mut resources = None;
             let mut session = if managed {
@@ -332,7 +371,7 @@ impl Fleet {
                 session.campaign().unwrap();
             }
             let mut config = ReplicaConfig::new(ROOT);
-            config.tick = Duration::from_millis(20);
+            config.tick = TICK;
             config.request_timeout = Duration::from_secs(1);
             let (host, owner, channel, manager) = if let Some((budget, tenant, wal)) = resources {
                 let (manager, owner, channel) = ReplicaFleet::spawn_managed(
@@ -459,7 +498,10 @@ impl Fleet {
                         max_connections: 3,
                         max_inflight: 8,
                         attempts: 1,
-                        timeout: Duration::from_millis(500),
+                        // A dial and an exchange are given the loopback's
+                        // half second, or the shaped path's dial
+                        // (`Slow::dial`), whichever is longer.
+                        timeout: slow.map_or(DIAL, |slow| slow.dial().max(DIAL)),
                         retry_backoff: Duration::ZERO,
                         ..PeerPoolLimits::default()
                     },
