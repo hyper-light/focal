@@ -1208,6 +1208,12 @@ impl QuicRemote {
     pub fn longest_round_trip(&self) -> std::time::Duration {
         self.capacity.held.longest().max(self.connection.rtt())
     }
+    /// Bytes the connection has received so far, of anything: what a body's
+    /// arrival is judged by (`Arriving::judge`), for a measurer of the
+    /// connection.
+    pub fn received(&self) -> u64 {
+        self.connection.stats().udp_rx.bytes
+    }
     pub async fn request(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, WireError> {
         self.request_within(request, self.limits.request_timeout)
             .await

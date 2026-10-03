@@ -4950,10 +4950,17 @@ async fn a_reply_queued_behind_the_peers_others_is_not_refused_while_they_arrive
 
 /// A peer that answers with a header, declares a body and never sends it,
 /// while it keeps the connection busy with the replies to the requests that
-/// follow, is still given up: once the connection has delivered everything
-/// the peer owed, the withheld body has a judgement more and no longer,
-/// though every judgement brings more than a datagram; and the others
-/// arrive.
+/// follow, is still given up, and the others arrive. A body is given up by
+/// the connection's quiet alone (`Arriving::judge`: a judgement that
+/// brought less than `LEAST_PROGRESS`, though every judgement of a quiet
+/// connection brings a datagram or two), so the withheld body lasts while
+/// the others arrive and goes within a judgement or two of the last of
+/// them — or of a pause of the peer's own that long, on a machine that
+/// starves it (a CI runner that ran the pacing at six times its interval
+/// gave the body up half a second before the last of the others, and was
+/// right to). The connection's received bytes are sampled as the rule
+/// reads them, and the give-up is held to a quiet span before it, never to
+/// the clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
     const OTHERS: u128 = 12;
@@ -4984,7 +4991,31 @@ async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
             }
         })
         .collect();
+    // What the connection received, sampled at a sixteenth of a judgement
+    // while the exchanges run: how a give-up is told from the connection's
+    // quiet (`quiet_before`).
+    let sample_every = wire.request_timeout / 16;
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let sampler = tokio::spawn({
+        let remote = remote.clone();
+        async move {
+            let mut samples = Vec::new();
+            loop {
+                samples.push((began.elapsed(), remote.received()));
+                if samples.len() >= RECEIVED_SAMPLES {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    () = tokio::time::sleep(sample_every) => {}
+                }
+            }
+            samples
+        }
+    });
     let answers = futures_util::future::join_all(asked).await;
+    let _ = stop.send(());
+    let samples = sampler.await.unwrap();
     // The others arrive, one after another.
     let mut last_other = Duration::ZERO;
     for (id, (answer, at)) in answers.iter().enumerate().skip(1) {
@@ -5002,24 +5033,60 @@ async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
     }
     let pieces = u32::try_from(OTHERS).unwrap() * OTHER_BYTES.div_ceil(PACED_PIECE as u32);
     assert!(last_other >= PACED_EVERY * pieces, "{last_other:?}");
-    // The withheld body is given up once everything else owed had
-    // arrived: not before the last of the others by more than a
-    // judgement, and within three judgements after it.
+    // The withheld body is given up by the connection's quiet and by
+    // nothing else: a span of a judgement — less the two samples that
+    // bracket it — in which the connection carried less than the least
+    // progress, ending by the give-up; after the last of the others, or
+    // during a pause of the peer's own. And it goes within three
+    // judgements of the last of the others.
     let (withheld, at) = &answers[0];
     assert!(
         matches!(withheld, Err(WireError::Timeout)),
         "{withheld:?} at {at:?}"
     );
-    assert!(
-        *at + wire.request_timeout >= last_other,
-        "{at:?} long before the others' {last_other:?}"
+    let quiet = quiet_before(
+        &samples,
+        wire.request_timeout.saturating_sub(sample_every * 2),
+        *at,
     );
     assert!(
-        *at <= last_other + wire.request_timeout * 3,
-        "{at:?} long after the others' {last_other:?}"
+        quiet.is_some(),
+        "given up at {at:?} while the connection carried on (the others' last at {last_other:?}; {} samples)",
+        samples.len()
+    );
+    let judgement = crate::frame::judgement(wire.request_timeout, remote.longest_round_trip());
+    assert!(
+        *at <= last_other + judgement * 3,
+        "{at:?} long after the others' {last_other:?} (a judgement of {judgement:?})"
     );
     drop(remote);
     peer.abort();
+}
+/// The sampler's bound: at a sixteenth of a judgement, five minutes of a
+/// run whose exchanges end sooner by their own give-ups.
+const RECEIVED_SAMPLES: usize = 16_384;
+/// The first span of `window` at least, ending by `until`, in which the
+/// sampled connection received less than `LEAST_PROGRESS` bytes: the quiet
+/// that gives a body up (`Arriving::judge`), as a sampler sees it — a
+/// judgement's window has a sample within one interval of either end, so
+/// a window of a judgement less two intervals is asked of the samples.
+fn quiet_before(
+    samples: &[(Duration, u64)],
+    window: Duration,
+    until: Duration,
+) -> Option<(Duration, Duration)> {
+    let least = u64::try_from(crate::frame::LEAST_PROGRESS).unwrap();
+    for (index, (from, received_from)) in samples.iter().enumerate() {
+        for (to, received_to) in samples.iter().skip(index + 1) {
+            if *to > until || received_to - received_from >= least {
+                break;
+            }
+            if *to - *from >= window {
+                return Some((*from, *to));
+            }
+        }
+    }
+    None
 }
 
 /// A peer whose issuer succeeded one the verifier knows is admitted through
