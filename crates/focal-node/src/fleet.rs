@@ -1794,6 +1794,7 @@ impl Owner {
     fn tick(&mut self) -> Result<(), LedgerError> {
         self.pace
             .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+        self.expire_held();
         // What the owner has seen of its own stalls is the replica's
         // patience before it campaigns (`ControlHost`).
         self.session.set_patience(
@@ -2052,6 +2053,7 @@ impl Owner {
                 self.pace
                     .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
                 self.pace.refuse();
+                self.expire_held();
             } else {
                 self.tick()?;
             }
@@ -2535,6 +2537,34 @@ impl Owner {
                 self.config.tick,
             ))
             .saturating_add(1)
+    }
+    /// Frames held past their patience go, in their order; the lanes of
+    /// members that left are closed and what they held refused; the order
+    /// kept for departed peers is forgotten (27 §12). At every period the
+    /// owner runs, since a frame's patience is counted in periods: a
+    /// replica's own owner let held frames go only beside a group's
+    /// progress, which it never makes, so a follower that lost one ordered
+    /// frame held every one after it for ever (the evidence scenario's copy,
+    /// 2026-10-03).
+    fn expire_held(&mut self) {
+        if self.resequencer.expire(self.pace.periods()).is_ok() {
+            self.step_due();
+        }
+        let status = self.session.status();
+        let admitted = &self.admitted;
+        let member = |source: u64| {
+            status.voters.contains(&source)
+                || status.learners.contains(&source)
+                || admitted.binary_search(&source).is_ok()
+        };
+        let mut gone = Vec::new();
+        if self.resequencer.prune(&member, &mut gone).is_ok() {
+            for held in gone {
+                held.pending
+                    .finish(Response::Error(AccessError::Unauthorized));
+            }
+        }
+        self.ordered.retain(|peer, _| member(*peer));
     }
     /// Step the frames the resequencer let go, in their order.
     fn step_due(&mut self) {
@@ -4109,28 +4139,8 @@ impl Owner {
     }
     fn expire_pending(&mut self) {
         self.expire_placement();
+        self.expire_held();
         let now = self.pace.periods();
-        // Frames held past their patience go, in their order; the lanes of
-        // members that left are closed and what they held refused; the
-        // order kept for departed peers is forgotten (27 §12).
-        if self.resequencer.expire(now).is_ok() {
-            self.step_due();
-        }
-        let status = self.session.status();
-        let admitted = &self.admitted;
-        let member = |source: u64| {
-            status.voters.contains(&source)
-                || status.learners.contains(&source)
-                || admitted.binary_search(&source).is_ok()
-        };
-        let mut gone = Vec::new();
-        if self.resequencer.prune(&member, &mut gone).is_ok() {
-            for held in gone {
-                held.pending
-                    .finish(Response::Error(AccessError::Unauthorized));
-            }
-        }
-        self.ordered.retain(|peer, _| member(*peer));
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(pending) = self.memberships.pop_front() else {

@@ -2497,6 +2497,28 @@ gone with its term. It proposes again to the leader that followed.
 
 **The residual, closed (2026-10-03).** A peer's frames went each on its own stream and arrived in any order — a datagram lost is sent again a round trip and an acknowledgement delay later, the frame behind it arriving first — and an append that overtook the one before it was refused by the core and the member probed: a round trip lost, for nothing lost. 27 §12 has the rules: a sender counts its appends to each peer within its incarnation (`Operation::RaftOrdered { group, epoch, sequence, message }`, tag 33, on the ordered profile that tops the ladder, 5), empty appends — the commit after the entries — with the rest, since each names the entry before what it carries; the receiver steps them in that order (`resequence::Resequencer`, one per owner, keyed by source: admit, hold, step the held successors); and what is held is bounded by the frame's patience (the path's probe timeout as the receiver's connection measures it, stamped on the request by the transport), the source's lane (the inflight window) and the configuration's members; past any bound the held frames are stepped in order and the core judges them as it did. Heartbeats, votes and answers stay unordered. Nothing of the owners' admission changed for a plain `Raft` frame, which is what an older binary sends and receives: the pool sends an ordered frame plain on a connection that did not negotiate the profile. *Tests.* The resequencer's five (1, 3, 2; a full lane; a passed patience; a newer epoch; departed sources), the wire's ladder, tag and `verify_request`, and the lossy fleet: 27 appends refused with the older offer, none (61 held, none let go) with the profile, the relays losing one datagram in fifty. *Found on the way.* The server side's `open_remote` held a connection to a fixed list of profiles and refused the new one as an invalid frame — every connection to a node failed until the list knew it; `verify_request` held every non-managed node request to the base profile, and would have refused an ordered frame as unsupported; the probe timeout counted no acknowledgement delay (`frame::MAX_ACK_DELAY`, RFC 9002 §6.2.1: a patience of three round trips on a ten-millisecond path was shorter than the loss it waited for); and empty appends went unordered — with the order kept, every refusal left was one, until they too carried the sequence (`fleet::urgent`). *Measured first under a path that jittered every datagram up to 100 ms* — 273 refusals against 96 — which is not a path: QUIC's loss detection took the reordering for loss, its window collapsed and exchanges timed out; a path that loses is how streams reorder, and is what the test shapes.
 
+**A replica's own owner let held frames go (2026-10-03).** The gate of F50 failed
+`evidence_quic`'s `placed_copies_artifact_attachment_and_cold_leader_pull_use_real_quic`,
+and every local run after it: the copy, node 2, stayed at its first entry holding 22
+ordered frames and letting none go, while the others applied seven. The resequencer lets
+a held frame go past its patience when its owner asks (`Resequencer::expire`), and the
+fleet's owner asked only in `expire_pending`, which runs beside a group's progress
+(`progress_group`) and in a non-blocking owner's idle drain — never on a replica's own
+owner's ticks. The scenario loses the appends sent to the copy while it cuts the copy's
+route, and every frame after the gap waited for sequences that never came. The F42
+residual's fleet test drives grouped owners alone, which ask at every pass, and passed.
+*Fix.* The held frames are let go at every period the owner runs, whichever owner runs
+it (`Owner::expire_held`, at `tick` and in a group's period refused for a pending write).
+`a_follower_that_lost_ordered_appends_lets_the_held_ones_go_under_its_own_owner` isolates
+a follower of three replicas, each under its own owner, while three entries commit, then
+reconnects it and has it publish the fifth: before the fix it held 40 frames and let none
+go. The harnesses' waits for every replica to publish and for a leader were held to the
+clock — five and ten seconds — and reported the stall as a timeout; they are charged to
+the replicas' own periods now (`focal_timing::ProgressDeadline`) and name each replica's
+sequence and held frames when a wait is spent. *Open.* 48 more waits in focal-node's tests
+are bounded by the clock rather than by the progress of what they wait on; moving them is
+a batch of its own.
+
 ### The fast track's election, mended (2026-10-01)
 
 **Cause.** A member votes for an entry in a leader's round and for a candidate by its

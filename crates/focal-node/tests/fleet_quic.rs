@@ -146,6 +146,9 @@ struct Shaped<'a> {
 }
 /// The fleet's tick: its owners' period.
 const TICK: Duration = Duration::from_millis(20);
+/// How long a replica's owner may run no period before a wait calls it
+/// wedged: the waits are charged to the owners' periods, not to the clock.
+const FROZEN: Duration = Duration::from_secs(60);
 /// What a binary before the ordered profile offered in its Hello.
 const OLDER_PROFILES: [u16; 4] = [
     NATIVE_PROTOCOL_VERSION,
@@ -573,16 +576,53 @@ impl Fleet {
         .await;
         result.unwrap_or_else(|error| panic!("no quorum leader excluding {excluding:?}: {error}; last probe={last_probe}; replicas={:?}",self.diagnostics()))
     }
+    /// A wait for every running replica to publish `sequence`, charged to
+    /// the running owners' own periods (27 §3.1 P8): what ten seconds hold
+    /// at their tick, however long that takes on the machine the test runs
+    /// on; the report names each replica's state when the wait is spent.
     async fn all_at(&self, sequence: SessionSeq) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self.replicas.iter().any(|replica| {
-                !replica.host.progress().stopped && replica.host.progress().sequence < sequence
-            }) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let live: Vec<usize> = self
+            .replicas
+            .iter()
+            .enumerate()
+            .filter(|(_, replica)| !replica.host.progress().stopped)
+            .map(|(index, _)| index)
+            .collect();
+        let periods = |live: &[usize]| -> Vec<u64> {
+            live.iter()
+                .map(|index| self.replicas[*index].host.periods())
+                .collect()
+        };
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &periods(&live),
+            focal_timing::ProgressDeadline::periods(Duration::from_secs(10), TICK),
+            FROZEN,
+        );
+        while self.replicas.iter().any(|replica| {
+            let progress = replica.host.progress();
+            !progress.stopped && progress.sequence < sequence
+        }) {
+            if let Err(spent) = wait.check(&periods(&live)) {
+                let replicas: Vec<_> = self
+                    .replicas
+                    .iter()
+                    .map(|replica| {
+                        let progress = replica.host.progress();
+                        (
+                            progress.node,
+                            progress.stopped,
+                            progress.sequence,
+                            progress.frames_held,
+                            progress.frames_let_go,
+                        )
+                    })
+                    .collect();
+                panic!(
+                    "QUIC replicas did not publish {sequence:?}: {spent}; (node, stopped, sequence, frames held, let go): {replicas:?}"
+                );
             }
-        })
-        .await
-        .expect("QUIC replicas did not publish the committed prefix");
+            tokio::time::sleep(TICK).await;
+        }
     }
     fn isolate(&mut self, index: usize) {
         self.revision += 1;
@@ -914,6 +954,58 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
     );
     fleet.stop().await;
     refusals
+}
+
+/// A follower that lost ordered appends lets the ones held behind them go
+/// once their patience has passed, under a replica's own owner as under a
+/// group's (27 §12). The frames the leader sent while the follower could
+/// not be reached never come, and those sent after were held for them; a
+/// replica's own owner let held frames go only beside a group's progress,
+/// which it never makes, and the follower held every frame after the gap
+/// for ever (the evidence scenario's copy, 2026-10-03).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_lost_ordered_appends_lets_the_held_ones_go_under_its_own_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut fleet = Fleet::open(directory.path(), false).await;
+    let leader = fleet.leader(None).await;
+    let follower = (0..fleet.replicas.len())
+        .find(|index| *index != leader)
+        .unwrap();
+    let actor = fleet.replicas[leader].actor.clone();
+    let first = committed(&actor, 1).await;
+    fleet.all_at(first).await;
+    // The follower cannot be reached: the appends sent to it are lost, the
+    // order's sequences spent on them, while the other two commit.
+    fleet.isolate(follower);
+    for id in 2..=4 {
+        committed(&actor, id).await;
+    }
+    fleet.reconnect();
+    let last = committed(&actor, 5).await;
+    fleet.all_at(last).await;
+    let progress = fleet.replicas[follower].host.progress();
+    assert!(
+        progress.frames_let_go > 0 || progress.frames_held == 0,
+        "the follower held {} frames and let none go",
+        progress.frames_held
+    );
+    fleet.stop().await;
+}
+/// One entry committed through `actor` under request `id`.
+async fn committed(actor: &QuicRemote, id: u128) -> SessionSeq {
+    let answer = actor
+        .request(&request(
+            id,
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        ))
+        .await
+        .unwrap();
+    let Response::Submitted(MutationReply::Committed(receipt)) = answer.result else {
+        panic!("entry {id}: {answer:?}")
+    };
+    receipt.sequence
 }
 
 /// The leader of the moment and its membership view: a fresh group may

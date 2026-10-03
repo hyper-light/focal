@@ -80,6 +80,9 @@ const OLDER_PROFILES: [u16; 4] = [
 /// given on the loopback.
 const TICK: Duration = Duration::from_millis(20);
 const DIAL: Duration = Duration::from_millis(500);
+/// How long a replica's owner may run no period before a wait calls it
+/// wedged: the waits are charged to the owners' periods, not to the clock.
+const FROZEN: Duration = Duration::from_secs(60);
 /// The most a handshake's flight carries: a Hello is read under this bound
 /// (`read_frame(.., 4096)`), and the TLS flights with the test PKI's chain
 /// are smaller.
@@ -648,50 +651,98 @@ impl Fleet {
     async fn leader(&self) -> usize {
         self.leader_at(None).await
     }
+    /// The replicas whose owners run, and a wait charged to their own
+    /// periods (27 §3.1 P8): what `allowance` holds at their tick, however
+    /// long that takes on the machine the test runs on. The waits here were
+    /// held to the clock — five seconds for every replica to apply a
+    /// committed entry — and a machine loaded with sixteen busy loops ran
+    /// the owners too slowly for it (a gate run, 2026-10-03).
+    fn wait(&self, allowance: Duration) -> (Vec<usize>, focal_timing::ProgressDeadline) {
+        let live: Vec<usize> = self
+            .replicas
+            .iter()
+            .enumerate()
+            .filter(|(_, replica)| !replica.host.progress().stopped)
+            .map(|(index, _)| index)
+            .collect();
+        let deadline = focal_timing::ProgressDeadline::begin(
+            &self.periods(&live),
+            focal_timing::ProgressDeadline::periods(allowance, TICK),
+            FROZEN,
+        );
+        (live, deadline)
+    }
+    fn periods(&self, live: &[usize]) -> Vec<u64> {
+        live.iter()
+            .map(|index| self.replicas[*index].host.periods())
+            .collect()
+    }
+    /// What each replica says of itself, for a wait's report.
+    fn report(&self) -> Vec<(u64, bool, u64, SessionSeq, u64)> {
+        self.replicas
+            .iter()
+            .map(|replica| {
+                let progress = replica.host.progress();
+                (
+                    progress.node,
+                    progress.stopped,
+                    progress.leader,
+                    progress.sequence,
+                    progress.term,
+                )
+            })
+            .collect()
+    }
     async fn leader_at(&self, target: Option<u64>) -> usize {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                for (index, replica) in self.replicas.iter().enumerate() {
-                    let progress = replica.host.progress();
-                    if !progress.stopped
-                        && progress.leader == progress.node
-                        && target.is_none_or(|target| progress.node == target)
-                    {
-                        let response = replica
-                            .actor
-                            .request(&request(
-                                9000,
-                                Operation::Read(ReadRequest {
-                                    consistency: ReadConsistency::Linearizable,
-                                    query: ReadQuery::Objects(vec![]),
-                                    max_items: 1,
-                                }),
-                            ))
-                            .await
-                            .unwrap();
-                        if matches!(response.result, Response::Read(_)) {
-                            return index;
-                        }
+        let (live, mut wait) = self.wait(Duration::from_secs(10));
+        loop {
+            for (index, replica) in self.replicas.iter().enumerate() {
+                let progress = replica.host.progress();
+                if !progress.stopped
+                    && progress.leader == progress.node
+                    && target.is_none_or(|target| progress.node == target)
+                {
+                    let response = replica
+                        .actor
+                        .request(&request(
+                            9000,
+                            Operation::Read(ReadRequest {
+                                consistency: ReadConsistency::Linearizable,
+                                query: ReadQuery::Objects(vec![]),
+                                max_items: 1,
+                            }),
+                        ))
+                        .await
+                        .unwrap();
+                    if matches!(response.result, Response::Read(_)) {
+                        return index;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        })
-        .await
-        .expect("no quorum-authoritative evidence leader")
+            if let Err(spent) = wait.check(&self.periods(&live)) {
+                panic!(
+                    "no quorum-authoritative evidence leader{}: {spent}; (node, stopped, leader, sequence, term): {:?}",
+                    target.map_or(String::new(), |target| format!(" at node {target}")),
+                    self.report()
+                );
+            }
+            tokio::time::sleep(TICK).await;
+        }
     }
     async fn all_at(&self, sequence: SessionSeq) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while self
-                .replicas
-                .iter()
-                .any(|r| !r.host.progress().stopped && r.host.progress().sequence < sequence)
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let (live, mut wait) = self.wait(Duration::from_secs(5));
+        while self.replicas.iter().any(|replica| {
+            let progress = replica.host.progress();
+            !progress.stopped && progress.sequence < sequence
+        }) {
+            if let Err(spent) = wait.check(&self.periods(&live)) {
+                panic!(
+                    "the replicas did not all publish {sequence:?}: {spent}; (node, stopped, leader, sequence, term): {:?}",
+                    self.report()
+                );
             }
-        })
-        .await
-        .unwrap();
+            tokio::time::sleep(TICK).await;
+        }
     }
     fn omit_route(&mut self, source: usize, target: u64) {
         self.omit_routes(source, &[target]);

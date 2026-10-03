@@ -12975,3 +12975,13 @@ ended ([27](27-consensus-roadmap-and-slates-port.md) §13). The delivery is reta
 the events, the output so far, the cursors past what is applied — and continued by the
 next drain at the entry the refusal stopped; only a memory refusal is retained, anything
 else fails the replica by its first failure's name.
+
+### 2026-10-03 — a replica's own owner lets held frames go
+
+The gate of F50 found the F42 residual's defect ([27](27-consensus-roadmap-and-slates-port.md)
+§12): a replica's own owner never asked its resequencer to let held frames go past their
+patience — only a group's progress did — so a follower that lost ordered appends held every
+frame after the gap and stopped applying. The owner asks at every period now, whichever owner
+runs it; a test isolates a follower of single-owner replicas while entries commit, and it held
+40 frames and let none go before the fix. The fleet and evidence harnesses' waits for
+publication and for a leader are charged to the replicas' periods and name each replica's state.
