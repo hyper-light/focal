@@ -976,11 +976,13 @@ fn owner_term_change_discards_old_worker_result_before_a_new_dispatch() {
     drive_until(&mut runtime, &mut session, |r, _| r.active_count() == 1);
     gate.wait_started();
     let term = session.status().term;
-    let mut heartbeat = focal_consensus::Message::default();
-    heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-    heartbeat.from = 2;
-    heartbeat.to = 1;
-    heartbeat.term = term + 1;
+    let heartbeat = focal_consensus::Message {
+        msg_type: focal_consensus::MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: term + 1,
+        ..focal_consensus::Message::default()
+    };
     session.step(heartbeat).unwrap();
     session.poll().unwrap();
     assert!(!session.is_authoritative());

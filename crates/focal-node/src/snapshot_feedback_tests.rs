@@ -1,11 +1,18 @@
 use super::*;
 fn message(index: u64) -> Message {
-    let mut message = Message::default();
-    message.set_msg_type(MessageType::MsgSnapshot);
-    message.to = 2;
-    message.term = 3;
-    message.mut_snapshot().mut_metadata().index = index;
-    message
+    Message {
+        msg_type: MessageType::MsgSnapshot,
+        to: 2,
+        term: 3,
+        snapshot: Some(Box::new(focal_consensus::Snapshot {
+            metadata: Some(focal_consensus::SnapshotMetadata {
+                index,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+        ..Message::default()
+    }
 }
 #[test]
 fn snapshot_feedback_drop_replacement_and_retry_hold_exact_flight_and_charge() {

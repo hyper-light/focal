@@ -51,7 +51,7 @@ impl Session {
             entry.data.starts_with(MANAGED_DOMAIN_MAGIC)
                 || entry.data.starts_with(MANAGED_CURSOR_MAGIC)
                 || entry.data.starts_with(REQUEST_STREAM_MAGIC)
-        }) || message.get_snapshot().data.starts_with(SNAPSHOT_V5_MAGIC);
+        }) || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V5_MAGIC));
         if managed {
             // Existing learners need not have participated in the initial voter
             // support barrier. Fence their first managed packet before Raft can

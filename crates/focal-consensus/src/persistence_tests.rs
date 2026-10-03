@@ -316,8 +316,8 @@ fn an_outstanding_ready_keeps_reserved_group_memory_through_publication() {
 #[test]
 fn a_leaders_appends_leave_while_it_flushes_and_a_followers_answer_after() {
     use super::tests::Cluster;
-    let append = MessageType::MsgAppend as i32;
-    let answer = MessageType::MsgAppendResponse as i32;
+    let append = MessageType::MsgAppend;
+    let answer = MessageType::MsgAppendResponse;
     let mut cluster = Cluster::new();
     cluster.nodes[0].campaign().unwrap();
     cluster.pump(None);
@@ -432,7 +432,7 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
         to: 1,
         term,
         index,
-        msg_type: MessageType::MsgAppendResponse as i32,
+        msg_type: MessageType::MsgAppendResponse,
         ..Message::default()
     })
     .unwrap();
@@ -447,7 +447,7 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
         from: 2,
         to: 1,
         term,
-        msg_type: MessageType::MsgHeartbeatResponse as i32,
+        msg_type: MessageType::MsgHeartbeatResponse,
         ..Message::default()
     })
     .unwrap();
@@ -461,7 +461,7 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
         early
             .messages
             .iter()
-            .all(|message| message.msg_type != MessageType::MsgSnapshot as i32)
+            .all(|message| message.msg_type != MessageType::MsgSnapshot)
     );
     // The charge moved with the messages: nothing was reserved anew.
     assert_eq!(budget.stats().used, used);
@@ -473,7 +473,7 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
     assert_eq!(
         rest.messages
             .iter()
-            .filter(|message| message.msg_type == MessageType::MsgSnapshot as i32)
+            .filter(|message| message.msg_type == MessageType::MsgSnapshot)
             .count(),
         1
     );
@@ -551,7 +551,7 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
         node_id: 2,
         ..Default::default()
     };
-    member.set_change_type(ConfChangeType::RemoveNode);
+    member.change_type = ConfChangeType::RemoveNode;
     remove.changes.push(member);
     nodes[0].propose_conf_change(remove).unwrap();
     let appends = nodes[0].drain().unwrap().messages;

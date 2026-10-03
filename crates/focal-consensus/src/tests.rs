@@ -1,7 +1,8 @@
 use super::*;
 
 // These fixed bytes were verified against the original protobuf-codec encoder.
-// They remain disk/wire fixtures when the production decoder uses prost-codec.
+// They remain disk/wire fixtures: the envelope reads them, and writes them again
+// byte for byte.
 const PROTOBUF_ENTRY: &[u8] = &[0x10, 3, 0x18, 8, 0x22, 5, b'h', b'e', b'l', b'l', b'o'];
 const PROTOBUF_HARD_STATE: &[u8] = &[0x08, 3, 0x10, 1, 0x18, 8];
 const PROTOBUF_SNAPSHOT: &[u8] = &[
@@ -14,39 +15,34 @@ const PROTOBUF_MESSAGE: &[u8] = &[
 ];
 
 #[test]
-fn original_protobuf_bytes_decode_and_reencode_through_prost() {
-    let entry = decode_proto::<Entry>(PROTOBUF_ENTRY).unwrap();
+fn original_protobuf_bytes_decode_and_reencode_exactly() {
+    let entry = envelope::decode_entry(PROTOBUF_ENTRY).unwrap();
     assert_eq!(entry.term, 3);
     assert_eq!(entry.index, 8);
     assert_eq!(entry.data, b"hello");
-    assert_eq!(
-        decode_proto::<Entry>(&entry.write_to_bytes().unwrap()).unwrap(),
-        entry
-    );
-    let hard_state = decode_proto::<HardState>(PROTOBUF_HARD_STATE).unwrap();
+    assert_eq!(envelope::encode_entry(&entry).unwrap(), PROTOBUF_ENTRY);
+    let hard_state = envelope::decode_hard_state(PROTOBUF_HARD_STATE).unwrap();
     assert_eq!(hard_state.term, 3);
     assert_eq!(hard_state.vote, 1);
     assert_eq!(hard_state.commit, 8);
-    let snapshot = decode_proto::<Snapshot>(PROTOBUF_SNAPSHOT).unwrap();
+    assert_eq!(
+        envelope::encode_hard_state(&hard_state).unwrap(),
+        PROTOBUF_HARD_STATE
+    );
+    let snapshot = envelope::decode_snapshot(PROTOBUF_SNAPSHOT).unwrap();
     assert_eq!(snapshot.data, b"state");
-    assert_eq!(snapshot.get_metadata().index, 8);
-    assert_eq!(
-        snapshot.get_metadata().get_conf_state().voters,
-        vec![1, 2, 3]
-    );
-    assert_eq!(
-        decode_proto::<Snapshot>(&snapshot.write_to_bytes().unwrap()).unwrap(),
-        snapshot
-    );
+    assert_eq!(metadata_of(&snapshot).index, 8);
+    assert_eq!(conf_of(metadata_of(&snapshot)).voters, vec![1, 2, 3]);
+    // Its voters were written unpacked; the envelope writes them packed, as
+    // prost does, and reads either.
+    let rewritten = envelope::encode_snapshot(&snapshot).unwrap();
+    assert_eq!(envelope::decode_snapshot(&rewritten).unwrap(), snapshot);
     let message = decode_message(PROTOBUF_MESSAGE).unwrap();
     assert_eq!(message.to, 2);
     assert_eq!(message.from, 1);
-    assert_eq!(message.msg_type, MessageType::MsgAppend as i32);
+    assert_eq!(message.msg_type, MessageType::MsgAppend);
     assert_eq!(message.entries, vec![entry]);
-    assert_eq!(
-        decode_message(&message.write_to_bytes().unwrap()).unwrap(),
-        message
-    );
+    assert_eq!(encode_message(&message).unwrap(), PROTOBUF_MESSAGE);
 }
 
 #[test]
@@ -96,7 +92,7 @@ fn deeply_nested_unknown_protobuf_groups_fail_without_stack_overflow() {
     }
     assert!(decode_message(&malicious).is_err());
     // Also exercise nested configuration data independently of the peer envelope.
-    assert!(decode_proto::<ConfChangeV2>(&malicious).is_err());
+    assert!(envelope::decode_conf_change_v2(&malicious).is_err());
 }
 pub(crate) fn config(id: u64) -> NodeConfig {
     NodeConfig::single(id, [1; 16], [2; 16])
@@ -215,7 +211,7 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
         from: 2,
         to: 1,
         term,
-        msg_type: MessageType::MsgHeartbeatResponse as i32,
+        msg_type: MessageType::MsgHeartbeatResponse,
         ..Message::default()
     })
     .unwrap();
@@ -223,9 +219,12 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
     let snapshot = events
         .messages
         .iter()
-        .find(|m| m.msg_type == MessageType::MsgSnapshot as i32)
+        .find(|m| m.msg_type == MessageType::MsgSnapshot)
         .unwrap();
-    assert_eq!(snapshot.get_snapshot().get_metadata().index, index);
+    assert_eq!(
+        metadata_of(snapshot.snapshot.as_deref().unwrap()).index,
+        index
+    );
     assert_eq!(
         node.raw.raft.tracker().get(2).unwrap().pending_snapshot,
         index
@@ -248,7 +247,7 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
     assert_eq!(node.raw.raft.tracker().get(2).unwrap().pending_snapshot, 0);
     assert_eq!(
         node.raw.raft.tracker().get(2).unwrap().state,
-        focal_raft::progress::ProgressState::Probe
+        hyper_raft::progress::ProgressState::Probe
     );
 }
 pub(crate) struct Cluster {
@@ -297,7 +296,7 @@ impl Cluster {
             }
             for message in messages {
                 if isolated != Some(message.from) && isolated != Some(message.to) {
-                    let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                    let snapshot = message.msg_type == MessageType::MsgSnapshot;
                     let from = message.from;
                     let to = message.to;
                     self.nodes[(to - 1) as usize].step(message).unwrap();
@@ -555,7 +554,7 @@ fn committed_membership_is_rebuilt_before_restart_can_campaign() {
         node_id: 2,
         ..Default::default()
     };
-    learner.set_change_type(ConfChangeType::AddLearnerNode);
+    learner.change_type = ConfChangeType::AddLearnerNode;
     change.changes.push(learner);
     node.propose_conf_change(change).unwrap();
     node.drain().unwrap();
@@ -571,7 +570,7 @@ fn member_change(id: u64, kind: ConfChangeType) -> ConfChangeV2 {
         node_id: id,
         ..Default::default()
     };
-    member.set_change_type(kind);
+    member.change_type = kind;
     change.changes.push(member);
     change
 }
@@ -741,8 +740,8 @@ fn reads_asked_together_are_confirmed_by_one_round_of_heartbeats() {
     let mut cluster = Cluster::new();
     cluster.nodes[0].campaign().unwrap();
     cluster.pump(None);
-    let heartbeat = MessageType::MsgHeartbeat as i32;
-    let answer = MessageType::MsgHeartbeatResponse as i32;
+    let heartbeat = MessageType::MsgHeartbeat;
+    let answer = MessageType::MsgHeartbeatResponse;
     let mut asked = 0u32;
     for together in [1usize, 32, 128] {
         let contexts: Vec<Vec<u8>> = (0..together)
@@ -909,7 +908,7 @@ fn a_failure_of_the_core_stops_only_this_replica_until_disk_recovery() {
         } else {
             assert!(matches!(
                 result,
-                Err(ConsensusError::Raft(focal_raft::Error::Invariant(_)))
+                Err(ConsensusError::Raft(hyper_raft::Error::Invariant(_)))
             ));
         }
         assert!(node.failed());
@@ -957,15 +956,13 @@ fn pathological_configuration_and_peer_shapes_return_errors_without_poisoning() 
         Err(ConsensusError::Configuration(_))
     ));
     let mut node = DurableNode::open(config(1), dir.path()).unwrap();
-    let mut message = Message {
-        from: 2,
-        to: 1,
-        term: 1,
-        ..Default::default()
-    };
-    message.msg_type = i32::MAX;
+    // A kind no message has (the largest `int32`), to 1 from 2 in term 1: the
+    // envelope refuses it before the core can be given it.
+    let unknown_kind = [
+        0x08, 0xff, 0xff, 0xff, 0xff, 0x07, 0x10, 1, 0x18, 2, 0x20, 1,
+    ];
     assert!(matches!(
-        node.step(message),
+        node.step_authenticated(2, &unknown_kind),
         Err(ConsensusError::MalformedMessage(_))
     ));
     let mut message = Message {
@@ -975,7 +972,7 @@ fn pathological_configuration_and_peer_shapes_return_errors_without_poisoning() 
         index: 1,
         ..Default::default()
     };
-    message.set_msg_type(MessageType::MsgAppend);
+    message.msg_type = MessageType::MsgAppend;
     message.entries.push(Entry {
         index: 3,
         term: 1,
@@ -1083,13 +1080,14 @@ fn retained_log_prepare_is_atomic_under_quota_and_compaction_releases_payloads()
     assert_eq!(log.entries.front(), Some(&first));
     drop(pressure);
     assert_eq!(budget.stats().used, baseline);
-    let mut snapshot = Snapshot::default();
-    snapshot.mut_metadata().index = 1;
-    snapshot.mut_metadata().term = 1;
-    snapshot
-        .mut_metadata()
-        .set_conf_state(log.conf_state.clone());
-    snapshot.data = vec![3; 1024];
+    let snapshot = Snapshot {
+        data: vec![3; 1024],
+        metadata: Some(SnapshotMetadata {
+            conf_state: Some(log.conf_state.clone()),
+            index: 1,
+            term: 1,
+        }),
+    };
     let prepared = log.prepare_snapshot(&snapshot).unwrap();
     log.compact_prepared(prepared).unwrap();
     assert!(budget.stats().used < baseline);
@@ -1147,22 +1145,29 @@ fn protobuf_preflight_accounts_repeated_structs_without_bulk_payload_multiplier(
         entries: vec![Entry::default(); 4096],
         ..Default::default()
     };
-    let encoded = message.write_to_bytes().unwrap();
+    let encoded = crate::encode_message(&message).unwrap();
     let scratch = decode_message_charge(&encoded).unwrap();
     assert_eq!(scratch, memory::message_scratch(&encoded).unwrap());
     assert!(scratch > encoded.len() * 32);
     assert!(scratch >= memory::message_bytes(&message).unwrap());
     let mut snapshot = Snapshot {
         data: vec![5; 8 * 1024 * 1024],
-        ..Default::default()
+        metadata: Some(SnapshotMetadata {
+            conf_state: Some(ConfState {
+                voters: vec![1],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
     };
-    snapshot.mut_metadata().set_conf_state(ConfState {
-        voters: vec![1],
-        ..Default::default()
-    });
     let record = proto_record([2; 16], RecordKind::Snapshot, 1, 1, &snapshot).unwrap();
     assert!(memory::replay_scratch(&record).unwrap() < 17 * 1024 * 1024);
-    snapshot.mut_metadata().mut_conf_state().voters = vec![1; 2049];
+    snapshot
+        .metadata
+        .as_mut()
+        .and_then(|metadata| metadata.conf_state.as_mut())
+        .unwrap()
+        .voters = vec![1; 2049];
     let oversized = proto_record([2; 16], RecordKind::Snapshot, 1, 1, &snapshot).unwrap();
     assert!(matches!(
         memory::replay_scratch(&oversized),

@@ -13024,3 +13024,17 @@ the native engine and the fleet owner read those on their paths, and the readine
 marker is read in place. With focal-load's allocation bench (1,000 claims, macOS arm64, exact
 counts): a linearizable read takes 20 allocations and no reallocation, 26 and one at
 916afbf; a committed claim 336.79 allocations, 340.89 before.
+
+### 2026-10-03 — the core is hyper-raft's
+
+focal runs the shared repository's core ([27](27-consensus-roadmap-and-slates-port.md) §14):
+`hyper-raft` and `hyper-timing` vendored under `vendor/` (`SNAPSHOT`), `crates/focal-raft`
+removed, its suites and its differential against raft-rs in the shared repository. No byte focal
+writes changes: `focal-consensus`'s envelope (`src/envelope.rs`) writes the core's values exactly
+as raft-proto's prost codec did and reads what any protocol-buffer reader reads, translating a
+change of configuration's data between raft-rs's encoding and the core's record; no
+protocol-buffer runtime ships, and `raft-proto` is the test oracle (4,096 generated values of each
+type equal to its bytes, every prefix and one-byte mutation read alike). The accounting reads a
+committed change in place through `hyper_raft::wire::changes_stated`. Every crate's suite passes
+on it; the types are the core's (typed kinds), and the tests that sent a kind no message has now
+send it as raft-rs writes it, refused by the envelope.

@@ -104,8 +104,7 @@ impl Sim {
             .applied
             .extend(events.committed.into_iter().map(|entry| entry.data));
         for message in events.messages {
-            use crate::PbMessageExt as _;
-            let bytes = message.compute_size() as usize;
+            let bytes = crate::envelope::message_len(&message).unwrap();
             let (from, to) = (message.from, message.to);
             let _: Fate = self.fabric.send(from, to, message, bytes);
         }

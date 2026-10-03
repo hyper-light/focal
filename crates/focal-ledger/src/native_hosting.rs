@@ -279,8 +279,8 @@ type RestoredNative = (
 fn carries_native_history(message: &Message) -> bool {
     message.entries.iter().any(|entry| {
         entry.data.starts_with(ACTIVATION_MAGIC) || engine::NativeEngine::<BuiltinNativeSchemas>::is_native_entry(&entry.data)
-    }) || message.get_snapshot().data.starts_with(SNAPSHOT_V6_MAGIC)
-        || message.get_snapshot().data.starts_with(SNAPSHOT_V7_MAGIC)
+    }) || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V6_MAGIC))
+        || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V7_MAGIC))
 }
 
 impl Session {

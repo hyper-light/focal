@@ -21,8 +21,9 @@ entries not yet durable, the held proposals, the committed page, each lagging pe
 page or snapshot and the window of pages for the one that answers are named from
 counters the core keeps as it changes and running totals the storage keeps beside its
 entries, and a heartbeat over a long history asks for what a heartbeat copies. Until 2026-09-28 the core was tikv raft-rs 0.7
-`RawNode`; since then it is `focal-raft` (section 4.5), which keeps raft-rs's log and
-speaks its messages. The table states what raft-rs gave and what focal ran when this
+`RawNode`; from then it was `focal-raft` (section 4.5), and since 2026-10-03 it is that
+core moved to the shared repository, hyper-raft (section 14), whose log and messages
+focal keeps in raft-rs's encoding. The table states what raft-rs gave and what focal ran when this
 plan was made.
 
 | Planned feature | raft-rs 0.7 | focal today |
@@ -1177,3 +1178,49 @@ the room is given back (`a_delivery_a_memory_refusal_stops_is_continued_by_the_n
 drain`); every delivery runs the same cursors, and a refusal between two entries has no
 deterministic lever in the fixture, whose commands are all of a size.
 
+## 14. The core is hyper-raft's (2026-10-03)
+
+focal's core moved to the shared repository on 2026-10-01 as hyper-raft (R-1: `focal-raft` at
+`a8e95f7`, with its history), and every core change focal made since was ported there in a commit
+of its own (F43, F41, F42, and the fast track's election fix of `7ea6f63` with a second rule for a
+change of configuration; hyper-raft `crates/hyper-raft/ORIGIN.md`). focal now runs that crate:
+a snapshot of it and of `hyper-timing`, which it depends on, under `vendor/` (`SNAPSHOT` names the
+revision), and `crates/focal-raft` is gone. The order the owner set for the rest (2026-10-03): the
+core; then the WAL onto hyper-log (F-1); then the durable shell onto hyper-durable (D-2); then
+timing and liveness; then the transport.
+
+**No byte changes.** hyper-raft speaks its own types and format (its R-2). focal's WAL records and
+peer messages keep raft-rs 0.7's protocol-buffer encoding (18 §1: no serialized type changes in
+place), through focal's own codec, `focal-consensus/src/envelope.rs`:
+
+| Way | Rule | Why |
+|---|---|---|
+| Written | Exactly as raft-proto's prost codec writes it: fields in the order of their numbers, defaults and empty fields left out, repeated numbers packed, a message field whenever it is present; a vote request's positive priority in raft-rs's older field too, as focal's core sent it | An older binary, and a peer of one, reads every byte as before; a node can go back to the binary before this one |
+| Read | As any protocol-buffer reader reads it: fields in any order, the last of a scalar winning, a message field met twice merged, repeated numbers packed or not, unknown fields skipped by wire type; refused: a field number outside 1 to 2^29 − 1, a known field of another wire type, a varint past ten bytes, a group, bytes that end inside a field, a kind the core does not name | What raft-rs reads, focal reads; what no raft-rs message holds is no message |
+| A change of configuration | Its data is raft-rs's `ConfChange`/`ConfChangeV2` in the log and the core's own record in the core: translated with the entry; the empty change is no bytes in both | The core decodes a change's data where it applies it |
+| What the core has and the encoding has not | Refused, never dropped: a member's mark (`Message::lost`), which focal's log never sets | — |
+
+No protocol-buffer runtime ships: `raft-proto` is a test dependency, the oracle. `envelope_tests`
+holds the codec to it — 4,096 generated values of each type written to raft-proto's own bytes
+exactly and read back (messages with changes of configuration among their entries, snapshots,
+both priority fields), every prefix and one-byte mutation of generated messages read as raft-proto
+reads them — and the fixed original encoder fixtures are written again byte for byte. Peer bytes
+that do not read are `MalformedMessage`. The memory accounting that priced a committed change from
+raft-rs's bytes reads the core's record in place (`hyper_raft::wire::changes_stated`, added to the
+shared crate for it).
+
+**What the core brings beyond `focal-raft`**, by the shared repository's steps
+(hyper-raft `docs/raft.md` §3): pages chosen and entries moved without copying, a `Ready` in place
+(the law of measurement); readies taken ahead of their persistence (R-4), off at focal's depth of
+one; answers that state no commit beyond the durable one (R-6); a marked member's repair and
+election (R-5, R-7), off without hyper-log's marks; elections by suspicion (L-2), off on ticks; the
+fast track's second rule. focal's suites run unchanged on it but for the types: the core's are
+typed (a kind is an enum, not a number to check), and a value raft-rs's numbers could carry and
+the core does not name is refused by the envelope before the core is given it.
+
+**The format switch comes later, by layer**, with F-1: on the wire, a new protocol profile
+negotiated per connection, as the ordered profile is (§12), the old encoding sent to a peer that
+did not negotiate it; on disk, the new encoding under new `RecordKind` ordinals, which an older
+binary refuses, written only once the cluster's upgrade fence opens a named capability level
+(24 §21), the old kinds read for old histories. 18 §5's activation is for what entry data means,
+which this does not change.

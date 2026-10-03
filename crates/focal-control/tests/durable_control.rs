@@ -588,7 +588,7 @@ impl Cluster {
                 if isolated == Some(message.from) || isolated == Some(message.to) {
                     continue;
                 }
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 let from = message.from;
                 let to = message.to;
                 self.nodes[(to - 1) as usize].step(message).unwrap();

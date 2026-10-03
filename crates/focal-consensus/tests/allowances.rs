@@ -19,13 +19,15 @@
 #[path = "../../focal-memory/benches/support/alloc_count.rs"]
 mod alloc_count;
 
-use focal_consensus::{ConfState, DurableNode, Entry, Message, NodeConfig, PbMessageExt, Snapshot};
+use focal_consensus::{
+    ConfState, DurableNode, Entry, Message, NodeConfig, Snapshot, SnapshotMetadata,
+};
 use focal_log::{SharedWal, WalIdentity, WalOptions};
 
 /// The crates whose allocations a consensus allowance funds; the WAL's are
 /// the node-wide log budget's, the standard library's are attributed to
 /// whichever of these asked.
-const GROUPS: &[&[&str]] = &[&["focal_consensus", "focal_raft"], &["focal_log"]];
+const GROUPS: &[&[&str]] = &[&["focal_consensus", "hyper_raft"], &["focal_log"]];
 
 fn peak(operation: impl FnOnce()) -> usize {
     let baseline = alloc_count::reset_peak();
@@ -73,21 +75,23 @@ fn a_message_decodes_within_its_charge_whatever_its_shape() {
         }],
         ..Default::default()
     };
-    let mut snapshot = Snapshot {
+    let snapshot = Snapshot {
         data: vec![5; 4 << 20],
-        ..Default::default()
+        metadata: Some(SnapshotMetadata {
+            conf_state: Some(ConfState {
+                voters: (1..=1024).collect(),
+                learners: (2000..=3023).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
     };
-    snapshot.mut_metadata().set_conf_state(ConfState {
-        voters: (1..=1024).collect(),
-        learners: (2000..=3023).collect(),
-        ..Default::default()
-    });
     let carrying = Message {
-        snapshot: Some(snapshot),
+        snapshot: Some(Box::new(snapshot)),
         ..Default::default()
     };
     for (name, message) in [("many", many), ("big", big), ("snapshot", carrying)] {
-        let bytes = message.write_to_bytes().unwrap();
+        let bytes = focal_consensus::encode_message(&message).unwrap();
         let charge = focal_consensus::decode_message_charge(&bytes).unwrap();
         let measured = peak(|| {
             let decoded = focal_consensus::decode_message(&bytes).unwrap();
