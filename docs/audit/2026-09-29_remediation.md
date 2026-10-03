@@ -3189,6 +3189,32 @@ cannot rule out — a judgement before it, the samples' own gaps counted rather 
 punctual sampler assumed. The judgement's unit test names each rule's reason. Twelve
 runs, four at a time: all pass.
 
+**A host's renewal took the sponsor's new certificate for its own inconsistency** (a peer
+session's loaded runs of the focal-node suite on 9e1e463, 1 of 4, and all four on another
+tree; macOS CI at b318e80, run 37105157895; focal-node
+`credential_renewal::tests::a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it`:
+"the host's renewal under the successor: the node's own credential material is
+inconsistent"). A holder dials its sponsor with the pins of the bootstrap server
+certificate its last refresh read from its own root replica. The test asks the host to
+renew the moment the founder's registry names the successor; a host whose root replica
+had not applied the staging yet held the old pin alone while the founder presented the
+successor's certificate, the enrollment client refused it at the pin, and the controller
+read every enrollment error as `RenewalError::Identity`. Traced, the test alone three
+copies at a time: in each the pin refused — the certificate presented not the one held,
+no successor pinned — and nothing else did. 24 §11 has a node that slept through a
+succession learn it "from the registry before it dials the sponsor"; the renewal never
+did. *Fix.* The client tells a refusal by the pin from one by the chain
+(`EnrollmentError::Unpinned`). On it the controller learns the pins at a control read
+that begins after the refusal — confirmed by the root's leader and answered once the
+node's replica applied what it names, so it holds the commit the founder presented after
+— and dials again (`NetworkController::ask_sponsor`, `learn_pins`); a certificate the
+registry does not name even then is not the sponsor's, and the renewal waits as for a
+sponsor not reached (`Unavailable`), never as the node's own inconsistency. *Measured.*
+The test alone, three copies at once beside a peer's focal-node loops: 3 of 3 failed
+before, 0 of 30 after (ten rounds). The enrollment tests that present a wrong leaf under
+the right chain now say `Unpinned`; those whose chain does not verify still say
+`Unauthorized`.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

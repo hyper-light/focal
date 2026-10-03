@@ -515,9 +515,10 @@ fn tls_ca_and_name_verification_does_not_replace_the_exact_invited_leaf_pin() {
     let dir = tempfile::tempdir().unwrap();
     let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
     let wrong = handshake(&invitation, config(other_leaf.der().to_vec(), &other_key)).unwrap();
+    // The chain is the CA's; the leaf is not the one pinned.
     assert!(matches!(
         invitation.request_after_tls(&wrong, &key, now()),
-        Err(EnrollmentError::Unauthorized)
+        Err(EnrollmentError::Unpinned)
     ));
     let valid = handshake(
         &invitation,
@@ -702,9 +703,7 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
         client
             .redeem(server.local_addr().unwrap(), &bad_pin, &key, now())
             .await,
-        Err(JoinTransportError::Enrollment(
-            EnrollmentError::Unauthorized
-        ))
+        Err(JoinTransportError::Enrollment(EnrollmentError::Unpinned))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     // Even a correctly authenticated server connection cannot force an oversized
@@ -1327,9 +1326,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
         client
             .renew(server.local_addr().unwrap(), &bad, request, now())
             .await,
-        Err(JoinTransportError::Enrollment(
-            EnrollmentError::Unauthorized
-        ))
+        Err(JoinTransportError::Enrollment(EnrollmentError::Unpinned))
     ));
     client.close();
     server.close();
@@ -1916,7 +1913,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
         older
             .trust()
             .verify_chain(&[successor.clone().into()], now()),
-        Err(EnrollmentError::Unauthorized)
+        Err(EnrollmentError::Unpinned)
     ));
     // The newer invitation was issued after the staging: it is not awaited.
     assert_eq!(
@@ -2382,9 +2379,11 @@ fn an_older_trust_verifies_an_endorsed_chain_and_refuses_an_unendorsed_or_forged
         ..older.trust().clone()
     };
     pinned.verify_chain(&chain, at).unwrap();
+    // The chain verifies; the pin alone refuses, and says so: a holder
+    // answers it by learning the pins the registry names (24 §11).
     assert!(matches!(
         older.trust().verify_chain(&chain, at),
-        Err(EnrollmentError::Unauthorized)
+        Err(EnrollmentError::Unpinned)
     ));
     // Without the endorsement: refused.
     assert!(matches!(

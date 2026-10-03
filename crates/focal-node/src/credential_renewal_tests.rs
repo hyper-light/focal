@@ -1042,7 +1042,11 @@ async fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_gene
 /// (24 §11). Before, a holder chained a receipt against the issuers it had
 /// read, and one under an issuer it had not was refused as uninstallable
 /// (the drain journey's renewal after two issuer rotations, ubuntu CI,
-/// 2026-10-02).
+/// 2026-10-02). And the host's pins may not name the certificate the
+/// founder presents by then: it learns them at a read after the refusal and
+/// dials again (24 §11). Before, the refusal was reported as the host's own
+/// credential material being inconsistent — in three of three copies run
+/// together, and on macOS CI at b318e80 (2026-10-03).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it() {
     let founder_dir = tempfile::tempdir().unwrap();

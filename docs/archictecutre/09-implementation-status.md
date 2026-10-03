@@ -13054,3 +13054,14 @@ judgement after the last of them. The judgement names its rule (`GiveUp::{Quiet,
 Withheld}`), the connection counts the bodies given up by each (`QuicRemote::given_up`),
 and the test takes either, a quiet one only where its samples, by their own spacing,
 cannot rule it out.
+
+### 2026-10-03 — a host learns its sponsor's pins when the sponsor has moved on
+
+From a peer session's loaded runs and macOS CI at b318e80: a host asked to renew the
+moment the founder's issuer succession activated dialed the founder with the pins its own
+root replica had applied, refused the successor certificate the founder presented, and
+reported its own credential material inconsistent. The enrollment client now tells a
+refusal by the pin (`EnrollmentError::Unpinned`) from one by the chain; on it the
+controller learns the pins at a control read that begins after the refusal — answered
+once its replica applied what the root's leader confirmed — and dials again (24 §11). The
+test alone, three copies at once under load: 3 of 3 failed before, 0 of 30 after.

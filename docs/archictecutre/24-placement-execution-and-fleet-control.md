@@ -654,8 +654,18 @@ accepts either on the connection (`accepts`); an invitation issued while a
 successor is staged carries both, so it redeems whichever the founder
 presents when it arrives; a joined node adopts the pins the committed
 registry names on every refresh (`NetworkState::write`), so a succession it
-observed reaches its next renewal and one it slept through is learned from
-the registry — over the node transport — before it dials the sponsor. The
+observed reaches its next renewal. One it has not observed yet — its root
+replica behind the activation — is learned when the sponsor's endpoint
+presents a certificate it does not pin (`EnrollmentError::Unpinned`, told
+from a chain that does not verify): the founder presents a certificate only
+after the root committed it, so a control read that begins after the
+refusal — confirmed by the root's leader, answered once this node's replica
+applied what it names — holds the commit, the node adopts the pins it reads
+and dials again (`NetworkController::ask_sponsor`); a certificate the
+registry does not name even then is not the sponsor's, and the renewal
+waits as for a sponsor not reached. Before, the refusal was reported as the
+node's own credential material being inconsistent, and a host asked to
+renew the moment the successor issued failed so (2026-10-03). The
 pins are facts, not identity: `same_identity` compares the sponsor's
 endpoint, name and CA (`ServerTrust::same_sponsor`). An invitation's record
 binds the trust as the invitation's schema encoded it

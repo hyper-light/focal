@@ -1001,6 +1001,9 @@ pub struct NetworkController {
     /// from the root: what its trust (`state.sponsor.issuers`) is current
     /// to.
     observed_revision: u64,
+    /// The reads the sponsor's pins were learned at (`learn_pins`): what
+    /// makes each read's request id its own.
+    pin_reads: u64,
     /// The local socket's grant and the tenants it was bound with: every
     /// tenant the committed registry admits joins them on each refresh.
     local_grant: Option<(tokio::sync::watch::Sender<PeerGrant>, BTreeSet<TenantId>)>,
@@ -1117,6 +1120,7 @@ impl NetworkController {
             last_renewal_error: None,
             registry_ahead: false,
             observed_revision: 0,
+            pin_reads: 0,
             local_grant: None,
             topology: crate::config::Topology::default(),
             budget,
@@ -1491,7 +1495,7 @@ impl NetworkController {
             .credentials
             .rotation_request(&key, &next, &self.receipt)
             .map_err(|_| RenewalError::Identity)?;
-        let receipt = self.ask_sponsor(request, now).await?;
+        let receipt = self.ask_sponsor(request, pool, host, registry, now).await?;
         self.trust_for(&receipt, pool, host, registry).await?;
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
@@ -1519,7 +1523,7 @@ impl NetworkController {
             .credentials
             .rotation_request(&key, &next, &self.receipt)
             .map_err(|_| RenewalError::Identity)?;
-        let receipt = self.ask_sponsor(request, now).await?;
+        let receipt = self.ask_sponsor(request, pool, host, registry, now).await?;
         self.trust_for(&receipt, pool, host, registry).await?;
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
@@ -1531,21 +1535,85 @@ impl NetworkController {
         self.rotations = self.rotations.saturating_add(1);
         Ok(())
     }
-    /// One renewal or rotation exchange with the sponsor: the enrollment
+    /// One renewal or rotation exchange with the sponsor. Its endpoint
+    /// presents a certificate only once the root committed it (24 §11), so
+    /// one this node does not pin was committed before the endpoint refused
+    /// the pins it holds: the node learns the pins the registry names from a
+    /// read that begins after the refusal, and dials again. A certificate
+    /// the registry does not name even then is not the sponsor's, and the
+    /// sponsor is not reached.
+    async fn ask_sponsor(
+        &mut self,
+        request: focal_enrollment::RenewRequest,
+        pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
+        now: i64,
+    ) -> Result<EnrollmentReceipt, RenewalError> {
+        match self.exchange(request.clone(), now).await {
+            Err(Exchange::Unpinned) => {}
+            answered => return answered.map_err(Exchange::refused),
+        }
+        self.learn_pins(pool, host, registry).await?;
+        let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
+        self.exchange(request, now).await.map_err(Exchange::refused)
+    }
+    /// The pins the registry names at a read that begins now: a control
+    /// read is confirmed by the root's leader and answered once this
+    /// replica applied what it names, so the observation after it holds
+    /// every commit before the read began.
+    async fn learn_pins(
+        &mut self,
+        pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
+    ) -> Result<(), RenewalError> {
+        let peer = AuthenticatedPeer::local(PeerGrant {
+            principal: controller_principal(self.state.genesis.founder.cluster),
+            tenants: BTreeSet::from([self.state.genesis.root_namespace.tenant]),
+            role: PeerRole::Runtime,
+        })
+        .map_err(|_| RenewalError::Identity)?;
+        self.pin_reads = self
+            .pin_reads
+            .checked_add(1)
+            .ok_or(RenewalError::Unavailable)?;
+        let id = pin_read_id(self.receipt.request, self.pin_reads);
+        let read = match host.read(peer, id, ControlRead::Configuration).await {
+            Ok(ControlReadResult::Configuration(read)) => read,
+            _ => return Err(RenewalError::Unavailable),
+        };
+        let Some(next) = observe_projection(host, registry)
+            .await
+            .map_err(|_| RenewalError::Unavailable)?
+        else {
+            return Err(RenewalError::Unavailable);
+        };
+        if next.snapshot().applied_index < read.applied_index {
+            return Err(RenewalError::Unavailable);
+        }
+        let now = unix_time().map_err(|_| RenewalError::Identity)?;
+        self.refresh(&next, pool, registry, now)
+            .map_err(|_| RenewalError::Install)?;
+        Ok(())
+    }
+    /// One exchange with the sponsor under the trust held: the enrollment
     /// host this node runs itself (the founder's), else the founder over
     /// the enrollment transport.
-    async fn ask_sponsor(
+    async fn exchange(
         &self,
         request: focal_enrollment::RenewRequest,
         now: i64,
-    ) -> Result<EnrollmentReceipt, RenewalError> {
+    ) -> Result<EnrollmentReceipt, Exchange> {
         if let Some(sponsor) = &self.local_sponsor {
             // The grant for the renewed certificate is this controller's own
             // next refresh to publish, so the host is asked directly rather
             // than through the registered handler that waits for it.
             return match JoinHandler::renew(sponsor, request).await {
                 JoinResponse::Enrolled(receipt) => Ok(receipt),
-                JoinResponse::Rejected(failure) => Err(RenewalError::Rejected(failure)),
+                JoinResponse::Rejected(failure) => {
+                    Err(Exchange::Refused(RenewalError::Rejected(failure)))
+                }
             };
         }
         let address: std::net::SocketAddr = self
@@ -1553,24 +1621,29 @@ impl NetworkController {
             .sponsor
             .endpoint
             .parse()
-            .map_err(|_| RenewalError::Identity)?;
+            .map_err(|_| Exchange::Refused(RenewalError::Identity))?;
         let bind: std::net::SocketAddr = if address.is_ipv4() {
             "0.0.0.0:0"
         } else {
             "[::]:0"
         }
         .parse()
-        .map_err(|_| RenewalError::Identity)?;
+        .map_err(|_| Exchange::Refused(RenewalError::Identity))?;
         let client = EnrollmentClient::bind(bind, TransportLimits::default())
-            .map_err(|_| RenewalError::Unavailable)?;
+            .map_err(|_| Exchange::Refused(RenewalError::Unavailable))?;
         let answered = client
             .renew(address, &self.state.sponsor, request, now)
             .await;
         client.close();
         answered.map_err(|error| match error {
-            JoinTransportError::Rejected(failure) => RenewalError::Rejected(failure),
-            JoinTransportError::Enrollment(_) => RenewalError::Identity,
-            _ => RenewalError::Unavailable,
+            JoinTransportError::Rejected(failure) => {
+                Exchange::Refused(RenewalError::Rejected(failure))
+            }
+            JoinTransportError::Enrollment(focal_enrollment::EnrollmentError::Unpinned) => {
+                Exchange::Unpinned
+            }
+            JoinTransportError::Enrollment(_) => Exchange::Refused(RenewalError::Identity),
+            _ => Exchange::Refused(RenewalError::Unavailable),
         })
     }
     /// One renewal: ask the sponsor under the credential held, install the
@@ -1591,7 +1664,7 @@ impl NetworkController {
             .credentials
             .renewal_request(&key, &self.receipt)
             .map_err(|_| RenewalError::Identity)?;
-        let receipt = self.ask_sponsor(request, now).await?;
+        let receipt = self.ask_sponsor(request, pool, host, registry, now).await?;
         self.trust_for(&receipt, pool, host, registry).await?;
         // The receipt is issued at the sponsor's clock after the exchange.
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
@@ -2184,6 +2257,33 @@ enum ContactOutcome {
     Retry,
     /// The root holds a generation this announcement did not expect.
     Stale,
+}
+/// How one exchange with the sponsor ended short of a receipt.
+enum Exchange {
+    Refused(RenewalError),
+    /// The sponsor's endpoint presented a certificate the trust held does
+    /// not pin.
+    Unpinned,
+}
+impl Exchange {
+    /// A certificate the registry did not name at a read after the endpoint
+    /// presented it is not the sponsor's: the sponsor is not reached.
+    fn refused(self) -> RenewalError {
+        match self {
+            Self::Refused(error) => error,
+            Self::Unpinned => RenewalError::Unavailable,
+        }
+    }
+}
+/// The request id of one read the pins are learned at: distinct per read.
+fn pin_read_id(request: [u8; 16], read: u64) -> RequestId {
+    let mut input = [0; 24];
+    input[..16].copy_from_slice(&request);
+    input[16..].copy_from_slice(&read.to_be_bytes());
+    let digest = blake3::derive_key("focal.renewal.pin-read.v1", &input);
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    RequestId(id)
 }
 /// The wire request id of one contact announcement: distinct per sequence
 /// so a renewed announcement is never read as a retry of the first.

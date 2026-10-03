@@ -214,7 +214,9 @@ impl ServerTrust {
         config.enable_early_data = false;
         Ok(config)
     }
-    /// Verify an established enrollment connection carries the pinned leaf.
+    /// Verify an established enrollment connection carries the pinned leaf:
+    /// one that chains to a held issuer and is not pinned is
+    /// [`EnrollmentError::Unpinned`], the rest `Unauthorized`.
     pub fn verify_quic(
         &self,
         connection: &quinn::Connection,
@@ -271,7 +273,7 @@ impl ServerTrust {
             )
             .map_err(|_| EnrollmentError::Unauthorized)?;
         if !self.accepts(server_fingerprint(first.as_ref())) {
-            return Err(EnrollmentError::Unauthorized);
+            return Err(EnrollmentError::Unpinned);
         }
         Ok(())
     }

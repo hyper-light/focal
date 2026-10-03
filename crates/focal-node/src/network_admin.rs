@@ -2314,6 +2314,7 @@ fn enrollment_error(error: QuorumEnrollmentError) -> AccessError {
             EnrollmentError::Invalid
             | EnrollmentError::WrongCluster
             | EnrollmentError::Unauthorized
+            | EnrollmentError::Unpinned
             | EnrollmentError::Expired
             | EnrollmentError::Revoked
             | EnrollmentError::Used,
