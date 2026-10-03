@@ -13224,3 +13224,17 @@ The first piece of [27](27-consensus-roadmap-and-slates-port.md) §15 in code:
   reads as before or as after, never between, and as after once its install returned. Every
   flipped byte, a short tail, another file's magic, a later version and an unreadable path are
   each refused. Nothing uses the files yet.
+
+### 2026-10-03 — the durable shell's crates beside the core
+
+The first commit of [27](27-consensus-roadmap-and-slates-port.md) §15.1. `vendor/` takes
+`hyper-durable` from the shared repository with what it builds on:
+- `hyper-log`, the log a data directory's groups share;
+- `hyper-block`, its block I/O;
+- `hyper-liveness`, the node-pair stream.
+
+They come at one revision (`418851a`, its CI green on all six targets), with `hyper-raft` and
+`hyper-timing` taken again at the same revision; their sources had not changed. That revision
+carries the shell's tick mode and its held refusal, which §15.5 and §15.7 need. focal-consensus
+depends on the shell, which nothing uses yet, so every commit after this one builds it. No
+third-party crate is new to the tree; the release roster and `cargo deny` agree.

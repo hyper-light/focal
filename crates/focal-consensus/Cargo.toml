@@ -12,6 +12,7 @@ focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 getrandom.workspace = true
+hyper-durable.workspace = true
 hyper-raft.workspace = true
 postcard.workspace = true
 serde.workspace = true
