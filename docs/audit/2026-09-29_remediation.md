@@ -54,7 +54,7 @@ ruling before work starts).
 | F39 | P2 | open | 12 | — |
 | F40 | P2 | open | 10 | — |
 | F41 | P2 | in tree | 10 | [F41](#f41) |
-| F42 | P1 | in tree (a peer's frames in order open) | 9 | [F42](#f42) |
+| F42 | P1 | in tree | 9 | [F42](#f42) |
 | F43 | P2 | in tree (the leader's read bound open) | 10 | [F43](#f43) |
 | F44 | P2 | open | 10 | — |
 | F45 | P2 | in tree | 10 | [F45](#f45) |
@@ -62,7 +62,7 @@ ruling before work starts).
 | F47 | P2 | open | 11 | — |
 | F48 | P1 | in tree | 9 | [F48](#f48) |
 | F49 | P1 | in tree | 9 | [F49](#f49) |
-| F50 | P2 | open | 11 | — |
+| F50 | P2 | in tree | 11 | [F50](#f50) |
 | F51 | P2 | open | 11 | — |
 | F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
 | F53 | P2 | open | 10 | — |
