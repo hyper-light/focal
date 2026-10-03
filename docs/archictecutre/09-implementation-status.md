@@ -13175,3 +13175,14 @@ type equal to its bytes, every prefix and one-byte mutation read alike). The acc
 committed change in place through `hyper_raft::wire::changes_stated`. Every crate's suite passes
 on it; the types are the core's (typed kinds), and the tests that sent a kind no message has now
 send it as raft-rs writes it, refused by the envelope.
+
+### 2026-10-03 — the log and the shell move together, designed first
+
+F-1 and D-2 are one step, designed before code and reviewed by focal's session
+([27](27-consensus-roadmap-and-slates-port.md) §15). Each group's Raft state goes to hyper-log,
+one log per data directory. Its image and its records (identity, fast track, decoder floor and
+transition) go to files of its own under `raft/groups/`. Ordering rules stand in for a write
+across files. The old WAL directory is never removed: `CURRENT` at fence version 3 is the
+conversion's commit point, and the binary before it fails closed on it. The conversion runs at
+start once the upgrade fence opens at `STORAGE_LEVEL`, or by `focal storage convert`, on one code
+path. The shared shell gains a tick mode and a held refusal first, in hyper-raft. No code yet.
