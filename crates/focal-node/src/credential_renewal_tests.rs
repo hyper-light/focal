@@ -1033,3 +1033,80 @@ async fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_gene
     after.stop().await;
     founder.stop().await;
 }
+
+/// A renewal asked the moment the successor issues is installed under it:
+/// the founder's, whose controller serves the request after it has read
+/// the activation its own sponsor committed, and a host's, whose root
+/// replica may not have applied it yet — the receipt names a revision, and
+/// the holder observes the root up to it before chaining the receipt
+/// (24 §11). Before, a holder chained a receipt against the issuers it had
+/// read, and one under an issuer it had not was refused as uninstallable
+/// (the drain journey's renewal after two issuer rotations, ubuntu CI,
+/// 2026-10-02).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it() {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let mut founder_settings = settings(founder_dir.path());
+    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+    let peer_settings = settings(peer_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let founder_id = founder_node(founder_dir.path());
+    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+    let enrollment = founder.handles.enrollment.clone().unwrap();
+    let staged = enrollment
+        .rotate_issuer(unix_time().unwrap())
+        .await
+        .unwrap();
+    let successor = staged.successor.clone().unwrap().record;
+    enrollment
+        .rotate_issuer(unix_time().unwrap())
+        .await
+        .unwrap();
+    // The root commits the activation; the holders' controllers read it at
+    // their own pace, and are asked before they have.
+    until(
+        "the successor issues",
+        &[&founder, &peer],
+        Duration::from_secs(SHORT_LIFETIME),
+        async || {
+            let registry = root_registry(&founder, founder_dir.path()).await;
+            (registry.issuers().current == successor).then_some(())
+        },
+    )
+    .await;
+    for (who, handles, listed) in [
+        ("founder", &founder.handles, founder_id),
+        ("host", &peer.handles, node),
+    ] {
+        let renewed = until(
+            "the credential renews under the successor when asked",
+            &[&founder, &peer],
+            Duration::from_secs(SHORT_LIFETIME),
+            async || match handles.credentials.renew().await {
+                Ok(renewed) => Some(renewed),
+                // The sponsor's endpoint between the two certificates it
+                // presents (24 §11) is asked again; a receipt that could not
+                // be installed is the defect.
+                Err(crate::credential_renewal::RenewalError::Unavailable) => None,
+                Err(error) => panic!("the {who}'s renewal under the successor: {error}"),
+            },
+        )
+        .await;
+        assert_eq!(renewed.node, listed, "{who}");
+        assert_eq!(renewed.renewals, 1, "{who}");
+        let registry = root_registry(&founder, founder_dir.path()).await;
+        let under = registry
+            .enrollments()
+            .find(|receipt| receipt.identity.node_id == Some(listed))
+            .is_some_and(|receipt| {
+                focal_wire::issued_by(&receipt.certificate, &successor.certificate).unwrap_or(false)
+            });
+        assert!(
+            under,
+            "the {who}'s renewed credential is issued by the successor"
+        );
+    }
+    peer.stop().await;
+    founder.stop().await;
+}

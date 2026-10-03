@@ -194,6 +194,7 @@ pub fn preflight(
                 "membership_epoch" => "membership_epoch",
                 "placement_epoch" => "placement_epoch",
                 "operation" => "operation",
+                "voters" => "voters",
                 "members" => "members",
                 _ => "presence",
             },
@@ -603,15 +604,53 @@ pub async fn apply(
                 session,
                 durability,
                 operation,
+                voters,
                 expected,
                 ..
             } => {
+                // The placement epoch the request's effect is measured
+                // past: the one the session has as the request is made,
+                // where it re-fenced under the plan, else the one the plan
+                // observed (a resumed apply measures from the latter).
+                let mut base = expected.placement;
                 if journal
                     .phase(index)
                     .is_none_or(|phase| phase < Phase::Committed)
                 {
                     journal.record(index, Phase::Prepared, None, now_ms()?)?;
                     write_journal(&dir, &journal)?;
+                    // The seats the directory would plan now, journaling
+                    // nothing: the plan's, or the plan is stale before any
+                    // side effect. A session that re-fenced under the plan
+                    // with the seats it was planned from — the fleet moved
+                    // its leader while the root and the partition were
+                    // seated (the VM journey, macOS CI, 2026-10-02) — is
+                    // the plan's request under its new authority, named by
+                    // the operation the directory gives it now (08 §9); one
+                    // whose seats moved is what the operator did not review.
+                    let preview = admin
+                        .plan_session_reply(
+                            *tenant,
+                            *session,
+                            survive_code(durability.survive),
+                            durability.max_failures,
+                            true,
+                        )
+                        .await?;
+                    if preview.voters != *voters {
+                        let name = session_name(tenant, session);
+                        journal.outcome = Outcome::Stale {
+                            step: index,
+                            subject: name.clone(),
+                            field: "voters".into(),
+                        };
+                        write_journal(&dir, &journal)?;
+                        return Err(stale(name, "voters"));
+                    }
+                    current = Current::of(&observe(admin, network).await?);
+                    if let Some(observed) = current.sessions.get(&(*tenant, *session)) {
+                        base = base.max(observed.epochs.placement);
+                    }
                     let reply = admin
                         .plan_session_reply(
                             *tenant,
@@ -621,25 +660,26 @@ pub async fn apply(
                             false,
                         )
                         .await?;
-                    if reply.operation != *operation {
+                    if reply.voters != *voters {
                         let name = session_name(tenant, session);
                         journal.outcome = Outcome::Stale {
                             step: index,
                             subject: name.clone(),
-                            field: "operation".into(),
+                            field: "voters".into(),
                         };
                         write_journal(&dir, &journal)?;
-                        return Err(stale(name, "operation"));
+                        return Err(stale(name, "voters"));
                     }
-                    journal.record(index, Phase::Committed, Some(*operation), now_ms()?)?;
+                    journal.record(index, Phase::Committed, Some(reply.operation), now_ms()?)?;
                     write_journal(&dir, &journal)?;
                 }
+                let committed = journal.operation(index).unwrap_or(*operation);
                 loop {
                     let progress = session_progress(
                         current.sessions.get(&(*tenant, *session)),
-                        *operation,
+                        committed,
                         *durability,
-                        expected.placement,
+                        base,
                     );
                     let recorded = journal.phase(index).unwrap_or(Phase::Committed);
                     if progress > recorded {

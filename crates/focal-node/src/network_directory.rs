@@ -473,7 +473,7 @@ async fn drive_hosted(
                 if ending.load(std::sync::atomic::Ordering::Acquire) {
                     seat.await
                 } else {
-                    result.map_err(ServiceError::from).and(Err(ServiceError::Owner("hosted partition egress ended")))
+                    result.map_err(ServiceError::from).and(Err(egress_ended(&host)))
                 }
             }
             result = &mut refresh => {
@@ -501,8 +501,19 @@ async fn drive_hosted(
         return result;
     }
     tokio::select! {
-        result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("hosted partition egress ended"))),
+        result = &mut replication => result.map_err(ServiceError::from).and(Err(egress_ended(&host))),
         result = &mut refresh => result,
+    }
+}
+/// Why a hosted partition's egress ended while its seat held: its owner
+/// ended, and says why where it failed — the egress hands the owner's
+/// frames on and ends with the owner, so the owner's failure is the cause
+/// and the egress's end its symptom (a member brought up by snapshot on a
+/// starved runner reported only the symptom, macOS CI, 2026-10-02).
+fn egress_ended(host: &ControlHost) -> ServiceError {
+    match host.progress().failure {
+        Some(failure) => ServiceError::ControlOwner(failure),
+        None => ServiceError::Owner("hosted partition egress ended"),
     }
 }
 /// Run a member's replica while the root's committed grant seats its host

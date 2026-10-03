@@ -12917,3 +12917,20 @@ exchange the peer answered delivered, over an exchange time, bounded by the
 law; before any, one window's worth (`PeerConnectionPool::part_bytes`,
 `part_for`; the record's F49).
 
+
+### 2026-10-03 — the gate run's CI: three more causes
+
+The two CI runs of the gate commit failed on three tests that pass on a laptop
+([the record](../audit/2026-09-29_remediation.md), "Found by CI (2026-10-02)",
+the second part): a credential request served at the foot of the controller's
+loop on the trust read at its head — a renewal asked the moment the operator's
+rotation activated the successor could not be chained — now served after the
+refresh that follows it, and a receipt whose issuer the holder has not read
+chained once the root is observed up to the receipt's revision
+(`NetworkController::trust_for`, [24](24-placement-execution-and-fleet-control.md)
+§11); a deployment plan's session step stale for a leader the fleet moved while
+the apply's own steps seated the root and the partition — now stale for seats
+that moved and never for a re-fence under the plan, asked as a dry run before
+any side effect ([08](08-stepped-complexity-and-deployment.md) §9); and a hosted
+partition's egress whose end was reported without its owner's failure, which
+it now names.

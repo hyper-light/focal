@@ -2950,6 +2950,58 @@ bound, each crossing the relay's delay, jitter and rate — 1.07 s at 128 kbit/s
 64, 16 s at 8) and a follower's patience is twice it (`Slow::election_ticks`); the
 loopback keeps its half second.
 
+The two CI runs of ceb2adb (the gate run of the day's batches) failed on three more, two
+on the same journey tests the runs above had passed, one on a unit test; none fails here.
+
+**A renewal served between a commit and the read of it** (ubuntu, cli_nodes
+`a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capacity_is_refused`:
+`cluster credentials renew` after two `rotate-issuer`, `the renewed credential could not
+be installed or presented`). The controller served a credential request where it took
+it, at the foot of its loop, on the trust it had read at the head: the operator's second
+rotation activated the successor, the founder's sponsor answered the renewal under it a
+moment later, and the holder — the founder itself — chained the receipt against the
+issuers it had read before the activation and found none that issued it. A joined host
+has the same window and a wider one: its root replica applies the activation after the
+sponsor committed it. *Fix.* A request taken from the channel is served at the head of
+the next pass, after the refresh that reads what the root committed since; and a receipt
+whose issuer the holder has not read has the root observed up to the receipt's revision
+before it is chained (`NetworkController::trust_for`, charged to the registry's
+revisions as they come and bounded by the root's reply time where none comes), each
+observation adopting what the registry names; a receipt the registry at its own revision
+names no issuer of is refused as it was.
+`a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it` asks the founder
+and a host the moment the root shows the successor issuing, and refuses an installation
+failure where it tolerates the sponsor's endpoint between two certificates (24 §11).
+
+**A plan stale for a leader the fleet moved** (macOS, deployment_fleet
+`the_vm_stage_adds_addresses_invitations_and_a_durability_intent`: `deployment apply` of
+the node-1 plan, `plan is stale: session … changed its operation`). The session step's
+request named the operation the plan was made under — the hash of the session's
+authority record, among other facts — and the apply refused a reply naming another. The
+apply's own earlier steps seat the root and the partition group on the hosts (F24),
+which takes long on a starved runner; the fleet's leader balancer, seeing three groups
+led by the founder, moved the session's leader meanwhile — a placement cycle that
+re-fences the session and gives it a new authority record — and the session step found
+another operation for the same seats. At scale a fleet is never still: a plan whose
+session step is stale for every re-fence under it could not be applied. *Fix.* The
+session step asks the directory as a dry run first, journaling nothing: a reply naming
+other seats than the plan's marks the plan stale before any side effect (`voters`, exit
+5); one naming the plan's seats under another operation is the plan's request for a
+session that re-fenced under it, journaled under the operation the directory names, and
+its effect is measured past the placement epoch the session has as the request is made,
+never past the one the plan observed (08 §9). The preflight keeps its rule for the plan's
+observation as a whole: a plan is applied to the deployment it observed.
+
+**An egress's end told without its cause** (macOS,
+`placement_agent::split::tests::a_crowded_partition_splits_survives_a_restart_and_merges_back`:
+`service ended Err(Owner("hosted partition egress ended"))` for a member brought up by
+snapshot, and nothing else). A hosted partition's egress ends with its owner — it hands
+the owner's frames on — and the service reported the egress's end, never the owner's
+failure, which the owner records as it stops (`ControlProgress::failure`). *Fix.*
+`network_directory::egress_ended` reports the owner's failure where there is one. *Open.*
+The owner's failure on that runner is not known: the test passed on the same commit's
+first macOS run and on every run before; the next occurrence names it.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

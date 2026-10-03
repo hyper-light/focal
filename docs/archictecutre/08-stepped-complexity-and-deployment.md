@@ -470,9 +470,14 @@ leaves the contract intact), a tampered plan, and — before any side effect and
 journaling — a stale plan whose observed policy revision or session epochs moved. It
 then journals each change under `cluster/apply/<plan>/` (`FCLAPLY1`, the plan kept
 beside it) through `Prepared → Committed → Verified → Complete`: the policy is committed
-as the next revision and read back; the placement request is sent (a reply naming
-another operation marks the plan stale), then observed under way (`pending` names the
-operation) and complete (no plan pending and the achieved guarantee covers the request);
+as the next revision and read back; the placement request is asked as a dry run first
+and then sent (a reply naming other seats than the plan's marks the plan stale, the dry
+run before any side effect; one naming the plan's seats under another operation is the
+plan's request for a session that re-fenced under the plan — the fleet moved its leader
+while the root and the partition were seated — journaled under the operation the
+directory names), then observed under way (`pending` names the operation) and complete
+(no plan pending and the achieved guarantee covers the request; a re-fence before the
+request is not the request's effect);
 `--wait` bounds how long apply watches; a `plan_root` step promotes each planned voter
 through the root once it is held as a learner, one exact request each, asked again as
 the root moves while a learner is behind or a request is still deciding, and is complete

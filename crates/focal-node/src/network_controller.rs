@@ -206,14 +206,20 @@ async fn wait_registered_grant(
     .map_err(|_| JoinFailure::OutcomeUnknown)?
 }
 
+/// How long the root is given to answer an observation of it: the deadline
+/// also covers a stalled physical metadata owner, so no permanently
+/// suspended read can pin old grants.
+const ROOT_OBSERVATION: Duration = Duration::from_secs(5);
+/// How long the controller waits before observing again a root that
+/// answered nothing, or not yet what is waited for.
+const OBSERVATION_RETRY: Duration = Duration::from_millis(100);
 /// Keep recovery routes, but never keep ingress grants when the committed
-/// authorization prefix cannot be observed. The deadline also covers a stalled
-/// physical metadata owner; no permanently suspended read can pin old grants.
+/// authorization prefix cannot be observed.
 async fn observe_projection(
     host: &ControlHost,
     registry: &PeerRegistry,
 ) -> Result<Option<RootObservation>, ControllerError> {
-    let failure = match tokio::time::timeout(Duration::from_secs(5), host.observe_root()).await {
+    let failure = match tokio::time::timeout(ROOT_OBSERVATION, host.observe_root()).await {
         Ok(Ok(observation)) => return Ok(Some(observation)),
         Ok(Err(failure)) => Some(failure),
         Err(_) => None,
@@ -991,6 +997,10 @@ pub struct NetworkController {
     /// The committed registry holds a newer receipt of this node than the one
     /// it presents: a renewal committed that this node has not installed.
     registry_ahead: bool,
+    /// The enrollment registry's revision as this controller last read it
+    /// from the root: what its trust (`state.sponsor.issuers`) is current
+    /// to.
+    observed_revision: u64,
     /// The local socket's grant and the tenants it was bound with: every
     /// tenant the committed registry admits joins them on each refresh.
     local_grant: Option<(tokio::sync::watch::Sender<PeerGrant>, BTreeSet<TenantId>)>,
@@ -1106,6 +1116,7 @@ impl NetworkController {
             last_renewal_attempt: 0,
             last_renewal_error: None,
             registry_ahead: false,
+            observed_revision: 0,
             local_grant: None,
             topology: crate::config::Topology::default(),
             budget,
@@ -1148,6 +1159,7 @@ impl NetworkController {
         let mut next_transition = i64::MAX;
         let mut previous_time = None;
         let mut last_bootstrap_announce: Option<std::time::Instant> = None;
+        let mut asked: Option<CredentialRequest> = None;
         loop {
             let progress = host.progress();
             if progress.stopped {
@@ -1184,7 +1196,7 @@ impl NetworkController {
                                 result?;
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(OBSERVATION_RETRY).await;
                         continue;
                     }
                 };
@@ -1218,17 +1230,29 @@ impl NetworkController {
                         .await?;
                 }
             }
-            self.maintain_credential(pool, &swap, now).await;
+            self.maintain_credential(pool, host, registry, &swap, now)
+                .await;
             self.maintain_bootstrap_server(&swap, now).await;
             self.maintain_issuer(now).await;
             self.present_trust(pool, &swap)?;
+            // A credential request is served on the root as it is applied
+            // now: one taken below is served at the top of the next pass,
+            // after the refresh that reads what the root committed since.
+            // Served where it was taken, a renewal asked the moment the
+            // operator rotated the issuer was built on the issuers read
+            // before the rotation, and the receipt the sponsor answered
+            // under the successor could not be chained (the drain journey,
+            // ubuntu CI, 2026-10-02).
+            if let Some(request) = asked.take() {
+                let now = unix_time()?;
+                self.serve_credential(request, pool, host, registry, &swap, now)
+                    .await;
+                continue;
+            }
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_millis(250)) => {}
                 request = swap.requests.recv() => {
-                    if let Some(request) = request {
-                        let now = unix_time()?;
-                        self.serve_credential(request, pool, &swap, now).await;
-                    }
+                    asked = request;
                 }
             }
         }
@@ -1249,18 +1273,20 @@ impl NetworkController {
         &mut self,
         request: CredentialRequest,
         pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
         swap: &CredentialSwap,
         now: i64,
     ) {
         match request {
             CredentialRequest::Renew(reply) => {
-                let result = self.renew(pool, swap, now).await;
+                let result = self.renew(pool, host, registry, swap, now).await;
                 self.last_renewal_attempt = now;
                 self.last_renewal_error = result.as_ref().err().cloned();
                 let _ = reply.send(result.map(|()| self.summary()));
             }
             CredentialRequest::Rotate(reply) => {
-                let result = self.rotate(pool, swap, now).await;
+                let result = self.rotate(pool, host, registry, swap, now).await;
                 self.last_renewal_attempt = now;
                 self.last_renewal_error = result.as_ref().err().cloned();
                 let _ = reply.send(result.map(|()| self.summary()));
@@ -1276,6 +1302,8 @@ impl NetworkController {
     async fn maintain_credential(
         &mut self,
         pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
         swap: &CredentialSwap,
         now: i64,
     ) {
@@ -1287,14 +1315,17 @@ impl NetworkController {
         // crash between the two) is adopted from the staged key first.
         if self.rotation_ahead {
             self.last_renewal_attempt = now;
-            self.last_renewal_error = self.adopt_rotation(pool, swap, now).await.err();
+            self.last_renewal_error = self
+                .adopt_rotation(pool, host, registry, swap, now)
+                .await
+                .err();
             return;
         }
         if !self.registry_ahead && now < self.receipt.expires_at.saturating_sub(window) {
             return;
         }
         self.last_renewal_attempt = now;
-        self.last_renewal_error = self.renew(pool, swap, now).await.err();
+        self.last_renewal_error = self.renew(pool, host, registry, swap, now).await.err();
     }
     /// One step of the bootstrap server certificate's succession on the
     /// founder (24 §11), at the cadence of a credential's retries; when the
@@ -1449,6 +1480,8 @@ impl NetworkController {
     async fn rotate(
         &mut self,
         pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
         swap: &CredentialSwap,
         now: i64,
     ) -> Result<(), RenewalError> {
@@ -1459,6 +1492,7 @@ impl NetworkController {
             .rotation_request(&key, &next, &self.receipt)
             .map_err(|_| RenewalError::Identity)?;
         let receipt = self.ask_sponsor(request, now).await?;
+        self.trust_for(&receipt, pool, host, registry).await?;
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
             .rotate_into(&next, &receipt, self.state.sponsor.issuers.iter(), now)
@@ -1473,6 +1507,8 @@ impl NetworkController {
     async fn adopt_rotation(
         &mut self,
         pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
         swap: &CredentialSwap,
         now: i64,
     ) -> Result<(), RenewalError> {
@@ -1484,6 +1520,7 @@ impl NetworkController {
             .rotation_request(&key, &next, &self.receipt)
             .map_err(|_| RenewalError::Identity)?;
         let receipt = self.ask_sponsor(request, now).await?;
+        self.trust_for(&receipt, pool, host, registry).await?;
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
             .rotate_into(&next, &receipt, self.state.sponsor.issuers.iter(), now)
@@ -1544,6 +1581,8 @@ impl NetworkController {
     async fn renew(
         &mut self,
         pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
         swap: &CredentialSwap,
         now: i64,
     ) -> Result<(), RenewalError> {
@@ -1553,6 +1592,7 @@ impl NetworkController {
             .renewal_request(&key, &self.receipt)
             .map_err(|_| RenewalError::Identity)?;
         let receipt = self.ask_sponsor(request, now).await?;
+        self.trust_for(&receipt, pool, host, registry).await?;
         // The receipt is issued at the sponsor's clock after the exchange.
         let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
         let material = key
@@ -1562,6 +1602,61 @@ impl NetworkController {
         self.present(pool, swap, material, receipt)?;
         self.renewals = self.renewals.saturating_add(1);
         Ok(())
+    }
+    /// Hold the trust a receipt is issued under before installing it. A
+    /// receipt issued under an issuer this node holds is installed on what
+    /// it holds. One issued under an issuer it has not read yet — the
+    /// sponsor committed the issuer's succession and answered before this
+    /// node's root replica applied it (24 §11: a successor is trusted from
+    /// its staging, the sponsor issues under it from its activation) — has
+    /// the root observed until the registry read reaches the receipt's
+    /// revision, each observation adopting what it names, charged to the
+    /// revisions as they come and bounded by the root's reply time where
+    /// none comes. A receipt the registry at its own revision names no
+    /// issuer of is refused.
+    async fn trust_for(
+        &mut self,
+        receipt: &EnrollmentReceipt,
+        pool: &PeerConnectionPool,
+        host: &ControlHost,
+        registry: &PeerRegistry,
+    ) -> Result<(), RenewalError> {
+        let issued_by_held = |issuers: &[focal_enrollment::IssuerRecord]| {
+            issuers.iter().any(|issuer| {
+                focal_wire::issued_by(&receipt.certificate, &issuer.certificate).unwrap_or(false)
+            })
+        };
+        if issued_by_held(&self.state.sponsor.issuers) {
+            return Ok(());
+        }
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &[self.observed_revision],
+            receipt
+                .revision
+                .saturating_sub(self.observed_revision)
+                .saturating_add(1),
+            ROOT_OBSERVATION,
+        );
+        loop {
+            if self.observed_revision >= receipt.revision {
+                return Err(RenewalError::Install);
+            }
+            wait.check(&[self.observed_revision])
+                .map_err(|_| RenewalError::Unavailable)?;
+            let Some(next) = observe_projection(host, registry)
+                .await
+                .map_err(|_| RenewalError::Unavailable)?
+            else {
+                return Err(RenewalError::Unavailable);
+            };
+            let now = unix_time().map_err(|_| RenewalError::Identity)?;
+            self.refresh(&next, pool, registry, now)
+                .map_err(|_| RenewalError::Install)?;
+            if issued_by_held(&self.state.sponsor.issuers) {
+                return Ok(());
+            }
+            tokio::time::sleep(OBSERVATION_RETRY).await;
+        }
     }
     fn refresh(
         &mut self,
@@ -1589,6 +1684,7 @@ impl NetworkController {
         if enrollment.ca_certificate() != self.state.sponsor.ca_certificate {
             return Err(ControllerError::Identity);
         }
+        self.observed_revision = enrollment.revision();
         // A binary behind the committed fence stops serving at once (24 §21).
         let announced = crate::upgrade::announced_level();
         if !crate::upgrade::admits(enrollment.fence(), announced) {

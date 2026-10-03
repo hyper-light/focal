@@ -744,7 +744,16 @@ step, and the predecessor retired once nothing live was issued under it —
 no receipt in the registry, current or retired, that is unexpired, and not
 the bootstrap server certificate, which is staged under the new issuer as
 soon as it is not under the one issuing and succeeds itself as §11 says —
-a fact, reached within a credential lifetime of the activation. The
+a fact, reached within a credential lifetime of the activation. A holder
+chains a renewed receipt on the issuers its controller has read from the
+root; a receipt the sponsor issued under an issuer the holder has not read
+yet — the activation committed and the renewal answered before the holder's
+root replica applied it, or before its controller's next refresh — has the
+root observed up to the receipt's revision first (`NetworkController::
+trust_for`, bounded by the revisions as they come and by the root's reply
+time; a credential request is served after the refresh that follows it,
+never between a commit and the read of it), and one the registry at that
+revision names no issuer of is refused as uninstallable. The
 succession is the first behaviour gated on the upgrade fence (§21,
 `upgrade::ISSUER_SUCCESSION_LEVEL`, 2): a binary below it cannot verify an
 endorsed chain, so staging is refused (`Fenced`, by name) until the fence
