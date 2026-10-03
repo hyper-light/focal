@@ -66,8 +66,9 @@ pub enum IntentOutcome {
     /// Refused before admission (a stale compare); the sequence stays free.
     /// The failure names why, for the agent's diagnostics.
     Refused(ControlFailure),
-    /// No decision yet: not leader, not ready, capacity or an unknown outcome.
-    Retry,
+    /// No decision yet: not leader, not ready, capacity or an unknown
+    /// outcome, named for the agent's diagnostics; asked again next pass.
+    Retry(ControlFailure),
 }
 
 pub(crate) struct IntentJournal {
@@ -238,12 +239,12 @@ impl IntentJournal {
                 Ok(IntentOutcome::Refused(failure))
             }
             Err(
-                ControlFailure::NotLeader { .. }
+                failure @ (ControlFailure::NotLeader { .. }
                 | ControlFailure::NotReady
                 | ControlFailure::Capacity
                 | ControlFailure::Unavailable
-                | ControlFailure::OutcomeUnknown,
-            ) => Ok(IntentOutcome::Retry),
+                | ControlFailure::OutcomeUnknown),
+            ) => Ok(IntentOutcome::Retry(failure)),
             Err(error) => Err(error.into()),
         }
     }

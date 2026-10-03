@@ -176,14 +176,24 @@ fn wait_for_upgrade(root: &Path, what: &str, condition: impl Fn(&Value) -> bool)
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    // What the node knows of itself and the fleet when the level it waited
-    // for never came: a level rides the placement agent's load report (an
-    // ubuntu run showed the host at the level before for 90 s, 2026-10-03).
-    let health = run(root, &["cluster", "node", "health"]);
+    // What every node knows of itself, and the fleet as the asked node sees
+    // it, when the level it waited for never came: a level rides the
+    // placement agent's load report, and the node whose report never landed
+    // says why in its own health (ubuntu runs showed the host at the level
+    // before for 90 s with the founder's health alone, 2026-10-03).
+    let mut health = String::new();
+    for observed in deadline::observed() {
+        let output = run(&observed, &["cluster", "node", "health"]);
+        health.push_str(&format!(
+            "\n{}: {}{}",
+            observed.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let placement = run(root, &["cluster", "placement"]);
     panic!(
-        "{what} did not happen; last: {last:#?}\nhealth: {}\nplacement: {}",
-        String::from_utf8_lossy(&health.stdout),
+        "{what} did not happen; last: {last:#?}\nhealth:{health}\nplacement: {}",
         String::from_utf8_lossy(&placement.stdout)
     );
 }

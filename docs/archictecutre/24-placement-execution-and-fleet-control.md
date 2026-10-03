@@ -210,8 +210,13 @@ does at most one thing:
    creates the session descriptor. Once the directory holds the session the
    agent never captures the plan again, so a session whose log has moved past
    its creation fence is not a registration conflict.
-3. **Report load.** Whenever the node has no load row, its enrollment
-   generation changed, or 30 s passed: `NodeLoad { available_memory }` from the
+3. **Report load.** Whenever the node has no load row, the row holds
+   another enrollment generation or another capability level than the
+   node's own (§21), or 30 s passed since its last committed report — a
+   report the partition refuses on a stale compare (its evidence names an
+   authority the owner has since replaced, as it does whenever the root
+   commits) is planned again at the next pass from a fresh observation,
+   never held for the interval: `NodeLoad { available_memory }` from the
    node's whole memory allowance, `active_weight` from the installed replica
    count, `disk_available` as the data volume's free bytes that no queued
    durable write has been promised (§10), and a report epoch above both the
@@ -1667,7 +1672,10 @@ behind a committed fence ([08](08-stepped-complexity-and-deployment.md)
 the operator sets through `FOCAL_CAPABILITY_LEVEL` for a staged rollout or
 a rehearsal; the variable never raises it — in every load report
 (`NodeLoad::capability`; the frozen V1 row codec restores it as zero,
-unknown). The fence itself is a fact of the enrollment registry
+unknown), and reports it at the first pass whose report commits while the
+directory holds another level (§7 step 3): a restarted binary's level never
+waits for the load interval, even behind a report its previous process
+journaled with the level that process announced. The fence itself is a fact of the enrollment registry
 (`UpgradeFence { level, activated_at, revision }`, registry schema 4; a
 schema-3 checkpoint restores with no fence), raised only by the founder
 authority through `Change::ActivateFence { level }`: a fence only rises

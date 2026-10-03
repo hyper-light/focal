@@ -1612,5 +1612,120 @@ fn a_plan_is_answered_by_its_commit_or_its_refusal_and_not_before() {
             focal_control::ControlFailure::CompareFailed
         )))
     ));
-    assert!(plan_answer(&planned, &IntentOutcome::Retry).is_none());
+    assert!(
+        plan_answer(
+            &planned,
+            &IntentOutcome::Retry(focal_control::ControlFailure::OutcomeUnknown)
+        )
+        .is_none()
+    );
+}
+
+/// A load report the partition refuses on a stale compare — its evidence
+/// names an authority revision the owner has since replaced, as it does
+/// whenever the root commits after a restart — is planned again at the next
+/// pass, never held for the load interval; a committed one starts the
+/// interval; and the level the upgrade fence waits for (24 §21) is due until
+/// the directory holds this binary's, even when a report the previous
+/// process journaled commits after the restart with its own.
+#[test]
+fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_interval() {
+    use crate::placement_journal::IntentOutcome;
+    let partition = PartitionId([3; 16]);
+    let load = |generation, capability, report| NodeLoad {
+        node: 7,
+        generation,
+        report,
+        available_memory: 1,
+        active_weight: 0,
+        disk_available: 1,
+        capability,
+    };
+    let receipt = focal_control::ControlReceipt {
+        request: ControlRequestId {
+            client: [1; 16],
+            sequence: 1,
+        },
+        request_hash: [2; 32],
+        committed_index: 10,
+        committed_term: 1,
+        revisions: focal_control::ControlRevisions::default(),
+    };
+    let mut last = BTreeMap::new();
+    // A restarted agent reports at its first pass.
+    assert!(load_due(None, Some(load(1, 1, 10)), 1, 2, 100));
+    // Refused on a stale compare: due again at the next pass.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Refused(ControlFailure::CompareFailed),
+        100,
+    );
+    assert!(load_due(
+        last.get(&partition).copied(),
+        Some(load(1, 1, 10)),
+        1,
+        2,
+        100
+    ));
+    // Undecided: asked again by the journal, nothing noted.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Retry(ControlFailure::OutcomeUnknown),
+        100,
+    );
+    assert_eq!(last.get(&partition), None);
+    // Committed with this binary's level: the interval runs from the commit.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Committed(receipt),
+        101,
+    );
+    assert_eq!(last.get(&partition), Some(&(101, 1)));
+    let committed = Some(load(1, 2, 102));
+    assert!(!load_due(
+        last.get(&partition).copied(),
+        committed,
+        1,
+        2,
+        101 + LOAD_INTERVAL - 1
+    ));
+    assert!(load_due(
+        last.get(&partition).copied(),
+        committed,
+        1,
+        2,
+        101 + LOAD_INTERVAL
+    ));
+    // The previous process's report committed with the level it announced:
+    // this binary's level is due at once.
+    assert!(load_due(
+        last.get(&partition).copied(),
+        Some(load(1, 1, 102)),
+        1,
+        2,
+        102
+    ));
+    // A new generation is due at once.
+    assert!(load_due(
+        last.get(&partition).copied(),
+        committed,
+        2,
+        2,
+        102
+    ));
+    // Another intent's outcome leaves the interval where it stands.
+    note_load(
+        &mut last,
+        partition,
+        None,
+        &IntentOutcome::Refused(ControlFailure::CompareFailed),
+        102,
+    );
+    assert_eq!(last.get(&partition), Some(&(101, 1)));
 }

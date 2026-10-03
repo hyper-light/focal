@@ -412,6 +412,12 @@ pub struct PlacementAgent {
     /// The kind of intent `last_refusal` is about: a commit of another kind
     /// does not clear it.
     last_refusal_kind: Option<&'static str>,
+    /// The pending intent the owner has not decided yet, asked again each
+    /// pass: which journal, its kind and sequence, how many times it was
+    /// asked and the last answer. A pass that resolves it clears it; an
+    /// intent asked without end otherwise leaves no trace, its passes
+    /// succeeding.
+    retrying: Option<Retrying>,
     /// Where each session's log was last found to lead, from a leader's
     /// redirect, for sessions this node drives without leading (24 §9).
     session_leaders: BTreeMap<LedgerId, u64>,
@@ -542,6 +548,7 @@ impl PlacementAgent {
             last_error: None,
             last_refusal: None,
             last_refusal_kind: None,
+            retrying: None,
             session_leaders: BTreeMap::new(),
             ticks: 0,
             last_observed: Vec::new(),
@@ -803,6 +810,7 @@ impl PlacementAgent {
             let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
             if let Some(pending) = journals.root.pending() {
                 let kind = intent_kind(&pending.command);
+                let sequence = pending.id.sequence;
                 let control = &handles.control;
                 // A root intent is submitted where the root leads: here, or
                 // through the leader's placement-control ingress, which admits
@@ -821,7 +829,7 @@ impl PlacementAgent {
                     submit_partition(&access, pool, root_namespace, root_peer.clone(), request)
                 };
                 let outcome = journals.root.advance(control, submit).await?;
-                self.note_intent(kind, &outcome);
+                self.note_intent(IntentJournalKind::Root, kind, sequence, &outcome);
                 return Ok(AgentStep::Advanced);
             }
         }
@@ -880,13 +888,22 @@ impl PlacementAgent {
                 .ok_or(AgentError::Identity)?;
             if let Some(pending) = journal.pending() {
                 let kind = intent_kind(&pending.command);
+                let sequence = pending.id.sequence;
                 let planned = planned_session_of(&pending.command);
+                let reported = reported_load(&pending.command);
                 let submit = |request: ControlRequest| {
                     submit_partition(&access, pool, namespace, partition_peer.clone(), request)
                 };
                 let outcome = journal.advance(&handles.control, submit).await?;
-                self.note_intent(kind, &outcome);
+                self.note_intent(IntentJournalKind::Partition, kind, sequence, &outcome);
                 self.answer_plan_outcome(planned, &outcome);
+                note_load(
+                    &mut self.last_load,
+                    delegation.partition,
+                    reported,
+                    &outcome,
+                    now,
+                );
                 return Ok(AgentStep::Advanced);
             }
             if let Some((snapshot, installed)) = self
@@ -2789,16 +2806,14 @@ impl PlacementAgent {
         };
         let generation = record.enrollment.generation;
         let partition = self.current_partition.ok_or(AgentError::Identity)?;
-        let due = match (self.last_load.get(&partition).copied(), record.load) {
-            (_, None) => true,
-            (None, Some(_)) => true,
-            (Some((at, reported)), Some(load)) => {
-                reported != generation
-                    || load.generation != generation
-                    || now.saturating_sub(at) >= LOAD_INTERVAL
-            }
-        };
-        if !due {
+        let capability = crate::upgrade::announced_level();
+        if !load_due(
+            self.last_load.get(&partition).copied(),
+            record.load,
+            generation,
+            capability,
+            now,
+        ) {
             return Ok(None);
         }
         let stats = self.node_budget.stats();
@@ -2818,7 +2833,7 @@ impl PlacementAgent {
             // Free bytes of the data volume that no queued durable write has
             // been promised, as the disk envelope estimates them.
             disk_available: self.wal.available_bytes().unwrap_or(0),
-            capability: crate::upgrade::announced_level(),
+            capability,
         };
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
             command: PartitionCommand {
@@ -2836,7 +2851,9 @@ impl PlacementAgent {
         if snapshot.revisions.partition != directory.revision {
             return Err(AgentError::Identity);
         }
-        self.last_load.insert(partition, (now, generation));
+        // Counted as reported once it commits (`note_load`): a report the
+        // owner refuses on a stale compare is planned again at the next
+        // pass from a fresh observation, never held for an interval.
         self.intend_partition(handles, command).await.map(Some)
     }
     /// Install the copy a plan assigns to this node and report `Installed`.
@@ -3223,26 +3240,57 @@ impl PlacementAgent {
                 .unwrap_or_default(),
             last_error: self.last_error.as_ref().map(|error| error.to_string()),
             last_refusal: self.last_refusal.clone(),
+            retrying: self.retrying.as_ref().map(Retrying::describe),
         }
     }
-    /// Keep the last refused intent visible; a committed one clears it.
+    /// Keep the last refused intent visible, a committed one clearing it,
+    /// and the intent still undecided with how often it was asked.
     fn note_intent(
         &mut self,
+        journal: IntentJournalKind,
         kind: &'static str,
+        sequence: u64,
         outcome: &crate::placement_journal::IntentOutcome,
     ) {
         use crate::placement_journal::IntentOutcome;
+        match outcome {
+            IntentOutcome::Committed(_) | IntentOutcome::Refused(_) => {
+                if self
+                    .retrying
+                    .as_ref()
+                    .is_some_and(|retrying| retrying.journal == journal)
+                {
+                    self.retrying = None;
+                }
+            }
+            IntentOutcome::Retry(failure) => {
+                let asked = match &self.retrying {
+                    Some(retrying)
+                        if retrying.journal == journal && retrying.sequence == sequence =>
+                    {
+                        retrying.asked.saturating_add(1)
+                    }
+                    _ => 1,
+                };
+                self.retrying = Some(Retrying {
+                    journal,
+                    kind,
+                    sequence,
+                    asked,
+                    last: *failure,
+                });
+            }
+        }
         match outcome {
             IntentOutcome::Committed(_) if self.last_refusal_kind == Some(kind) => {
                 self.last_refusal = None;
                 self.last_refusal_kind = None;
             }
-            IntentOutcome::Committed(_) => {}
+            IntentOutcome::Committed(_) | IntentOutcome::Retry(_) => {}
             IntentOutcome::Refused(failure) => {
                 self.last_refusal = Some(format!("{kind}: {failure}"));
                 self.last_refusal_kind = Some(kind);
             }
-            IntentOutcome::Retry => {}
         }
     }
     /// Answer the operators waiting on a session plan by the intent's
@@ -3389,7 +3437,7 @@ fn plan_answer(
             state: PlanState::Planned,
         })),
         IntentOutcome::Refused(failure) => Some(Err(AgentError::Control(*failure))),
-        IntentOutcome::Retry => None,
+        IntentOutcome::Retry(_) => None,
     }
 }
 /// The session plan a journaled intent carries, if it is one: whose
@@ -3415,6 +3463,96 @@ fn planned_session_of(
         *operation,
         desired.placement.voters.keys().copied().collect(),
     ))
+}
+/// Whether this node's load report to a partition is due: `last` is the
+/// time and generation of its last committed report there, `committed` the
+/// load the directory holds. The facts the cluster gates on — the
+/// generation, the level the upgrade fence waits for (24 §21) — are due
+/// until the directory holds this node's own; the rest refresh once an
+/// interval. A report the previous process journaled may commit after a
+/// restart with the level that process announced, and is followed at once.
+fn load_due(
+    last: Option<(i64, u64)>,
+    committed: Option<NodeLoad>,
+    generation: u64,
+    capability: u32,
+    now: i64,
+) -> bool {
+    match (last, committed) {
+        (_, None) | (None, Some(_)) => true,
+        (Some((at, reported)), Some(load)) => {
+            reported != generation
+                || load.generation != generation
+                || load.capability != capability
+                || now.saturating_sub(at) >= LOAD_INTERVAL
+        }
+    }
+}
+/// What a load report's intent established (`reported`: its generation, when
+/// the intent was one): a committed report starts the interval; a refused
+/// one — a compare gone stale — leaves the report due at the next pass; an
+/// undecided one is asked again and changes nothing.
+fn note_load(
+    last_load: &mut BTreeMap<PartitionId, (i64, u64)>,
+    partition: PartitionId,
+    reported: Option<u64>,
+    outcome: &crate::placement_journal::IntentOutcome,
+    now: i64,
+) {
+    use crate::placement_journal::IntentOutcome;
+    let Some(generation) = reported else {
+        return;
+    };
+    match outcome {
+        IntentOutcome::Committed(_) => {
+            last_load.insert(partition, (now, generation));
+        }
+        IntentOutcome::Refused(_) => {
+            last_load.remove(&partition);
+        }
+        IntentOutcome::Retry(_) => {}
+    }
+}
+/// The generation a pending load report reports at, when the intent is one.
+fn reported_load(command: &ControlCommand) -> Option<u64> {
+    match command {
+        ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
+            command:
+                PartitionCommand {
+                    operation: PartitionOperation::ReportLoad { load },
+                    ..
+                },
+            ..
+        }) => Some(load.generation),
+        _ => None,
+    }
+}
+/// Which of the agent's journals an intent waits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentJournalKind {
+    Root,
+    Partition,
+}
+/// An intent its owner has not decided yet (24 §7).
+#[derive(Debug, Clone, Copy)]
+struct Retrying {
+    journal: IntentJournalKind,
+    kind: &'static str,
+    sequence: u64,
+    asked: u64,
+    last: ControlFailure,
+}
+impl Retrying {
+    fn describe(&self) -> String {
+        let journal = match self.journal {
+            IntentJournalKind::Root => "root",
+            IntentJournalKind::Partition => "partition",
+        };
+        format!(
+            "{journal} intent {} ({}): asked {} times, last answer: {}",
+            self.sequence, self.kind, self.asked, self.last
+        )
+    }
 }
 fn intent_kind(command: &ControlCommand) -> &'static str {
     match command {

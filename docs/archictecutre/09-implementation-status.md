@@ -12996,3 +12996,20 @@ until the entries it names are applied, bounded by the reads the core holds in f
 and charged while held, as the hosted session has held one since F55; a control-rig
 test withholds a follower's entries while the others commit, and its read waits and
 is answered instead of failing the replica.
+
+### 2026-10-03 — a refused load report is asked again at the next pass
+
+The upgrade journey's failure on ubuntu CI, a restarted host whose level never reached
+the directory in 90 s, was a level that waited: a load report refused on a stale compare
+— another node's write landed between its observation and its submission — was counted
+as made and asked again only after the 30 s load interval, and after a restart two
+nodes' intervals run from the same moment, so their reports raced again every interval
+and the host lost each race. A load report now counts as made once it commits and is
+planned again at the next pass when refused (`note_load`); the level is due while the
+directory holds another than the binary's (`load_due`, 24 §21); and an intent its owner
+keeps undecided is named in the agent's health (`retrying`). Fifteen local runs of the
+journey before the fix: one failed so and nine waited one to three intervals; thirty-six
+after: none. The lossy-path fleet test's retries are charged to the replicas' periods
+and paced a period apart, the upgrade journey prints every node's health when a level
+never comes, and the collector journey judges its second restore across a window no
+pass entered (a pass between the two requests takes the orphan again, rightly).

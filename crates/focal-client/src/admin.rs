@@ -153,6 +153,11 @@ pub struct AdminPlacementAgent {
     /// by kind and failure; cleared by the next intent that commits.
     #[serde(default)]
     pub last_refusal: Option<String>,
+    /// The intent its owner has not decided yet, asked again each pass:
+    /// its journal, sequence and kind, how often it was asked and the
+    /// last answer; cleared once it is decided.
+    #[serde(default)]
+    pub retrying: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

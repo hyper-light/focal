@@ -3097,6 +3097,32 @@ follower's entries while the others commit (`Rig::withheld`); in
 follower's read is answered above what it applied, waits, and is answered once its
 entries arrive — before the fix the follower failed with the error above.
 
+**A test's retries held to the clock** (macOS, 916afbf's push run, fleet_quic
+`a_peers_appends_are_stepped_in_their_order_across_a_lossy_path`: `entry 76:
+Error(Capacity)`). The F42 residual's lossy-path test asked each of its 512 requests again
+until committed, bounded by sixty seconds of the clock, and asked again at once when the
+leader answered that it had no room — a loop that kept the leader busy refusing while the
+burst waited behind it, on a runner slow enough to spend the minute. *Fix.* The retries
+are charged to the replicas' own periods (what a minute holds at their tick,
+`focal_timing::ProgressDeadline`); a leader without the room, or one that cannot be
+reached, is asked again a period later, and a wait that is spent names every replica's
+sequence, held frames and refusals.
+
+**A second restore judged across a pass** (macOS, PR #4's CI on 916afbf, cli_gc
+`unreferenced_objects_leave_through_quarantine_while_proof_stays`: the second restore
+answered `true`). The journey restores the quarantined orphan twice and expects the second
+request to find it back; the collector passes every 300 ms and the orphan's bytes are
+old, so a pass between the two requests takes it again and the second truly restores it.
+The store's restore moves the manifest out of quarantine and answers `false` only when no
+round holds it, which is right. *Fix.* The pair is judged across a window no pass
+entered — the collector's count unchanged and nothing collecting at either end (a pass
+quarantines only once it shows itself collecting, and its completion clears that and
+counts it in one publication); a window a pass entered is asked again once a pass has
+taken the orphan back, within a deadline charged to the node's periods, and the later
+pass the journey waits for to take the orphan again is counted from that window (the
+gate's first run of this fix waited from a count read before it, and found the orphan
+back).
+
 **A host's level that never came** (ubuntu, the second run, cli_upgrade
 `the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_refuses_to_serve`:
 after the rollout's restart the host stayed at the level before for 90 s, the founder at
@@ -3106,7 +3132,43 @@ first tick; the host's never reached the directory, so its agent did not tick to
 report or the report was refused — which the view cannot tell. The first run of the same
 commit passed it on ubuntu. *Open.* The journey prints the node's health and placement
 beside the view it waited on when a level never comes, so the next occurrence names
-what held the report.
+what held the report. It came again on 916afbf's push run (ubuntu): the founder's health
+and placement showed the host's record at the level before, alive, its node enrolled,
+and no partition membership of its own — the report was never committed — and the
+founder's health says nothing of the host's agent; the wait now prints every observed
+node's health.
+
+*Cause, found (2026-10-03).* The level did not fail to come; it waited. A partition
+command compares the partition's revision and the installed authority's
+(`expected_revision`, `ControlEvidence::{authority_revision, enrollment_revision}`), at
+submit and again at apply, so that a command admitted is a command applied; a report
+built a pass before another node's write lands is refused as a stale compare
+(`CompareFailed`), and the journal's answer to that is to plan again from a fresh
+observation (24 §7). The agent's load report did not: it counted the load as reported
+when it journaled the intent (`last_load` set before `intend_partition`), so a refused
+report was asked again only after the load interval, 30 s. After the rollout's restart
+both nodes report at their first pass; the founder, submitting to the partition it
+leads, commits first and the host's report is refused; both intervals then run from the
+same moment, the two reports race again every 30 s, and the host loses each race to the
+founder's local submission. Run three at a time on macOS with a per-second sample of
+every agent's health, the journey showed it: the host's `partition load: metadata
+comparison failed` at +2 s, +31 s, +61 s and +90 s of the wait, each time as the
+founder's own report committed (its intents 5, 6, 7), and the wait spent at 90 s —
+ubuntu's failure. Of fifteen such runs one failed so and nine waited one to three
+intervals for the level (30.1 s to 90.9 s, against 0.7 s to 1.0 s for the five whose
+report was not refused). *Fix.* A load report counts as made once it commits
+(`note_load`): refused, it is due at the next pass, from a fresh observation; undecided,
+the journal asks it again and nothing is noted. The level the upgrade fence waits for is
+due while the directory holds another than this binary's (`load_due`, 24 §21): a report
+the previous process journaled before the restart may commit after it with the level
+that process announced, and is followed at once. And an intent its owner keeps
+undecided — answered not leader, not ready, without room or unknown, and asked every
+pass — is named in the agent's health (`AdminPlacementAgent::retrying`: its journal,
+sequence and kind, how often it was asked, the last answer), where before its passes
+succeeded and left no trace. *Measured.* Thirty-six runs of the journey after the fix,
+three at a time with and without the harness's capture: each took 11 s to 21 s, the
+span of the runs before it whose level waited no interval. *Test.*
+`a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_interval`.
 
 ## F48
 

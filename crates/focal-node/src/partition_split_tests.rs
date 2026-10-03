@@ -115,6 +115,7 @@ async fn wait_delegations(
                 status.map(|status| (
                     status.last_error,
                     status.last_refusal,
+                    status.retrying,
                     status.root_intents,
                     status.partition_intents
                 )),
@@ -152,6 +153,8 @@ async fn wait_partition(
                 running.ended(),
                 status.map(|status| (
                     status.last_error,
+                    status.last_refusal,
+                    status.retrying,
                     status.root_intents,
                     status.partition_intents
                 )),

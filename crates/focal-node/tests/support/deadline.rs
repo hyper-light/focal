@@ -34,6 +34,10 @@ pub fn observe(root: &Path) {
         }
     });
 }
+/// The data directories this test observes, for a wait's report.
+pub fn observed() -> Vec<PathBuf> {
+    OBSERVED.with(|observed| observed.borrow().clone())
+}
 /// The periods the root owner of the process on `root` has run; none while
 /// it does not answer.
 pub fn periods(root: &Path) -> Option<u64> {

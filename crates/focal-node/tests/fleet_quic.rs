@@ -893,6 +893,7 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                 .unwrap(),
         );
     }
+    let replicas = &fleet.replicas;
     let asked: Vec<_> = (1..=BURST)
         .map(|epoch| {
             let actor = actors[usize::try_from(epoch % CONNECTIONS).unwrap()].clone();
@@ -907,7 +908,20 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                         epoch: RequestEpoch(1),
                     },
                 );
-                let bound = tokio::time::Instant::now() + Duration::from_secs(60);
+                // Asked again until committed, charged to the replicas'
+                // own periods: what a minute holds at their tick, however
+                // long a loaded runner takes (a macOS run spent sixty
+                // seconds of the clock on one entry, 2026-10-03). A leader
+                // without the room is asked again a period later, never in
+                // a loop that keeps it busy refusing.
+                let periods = || -> Vec<u64> {
+                    replicas.iter().map(|replica| replica.host.periods()).collect()
+                };
+                let mut wait = focal_timing::ProgressDeadline::begin(
+                    &periods(),
+                    focal_timing::ProgressDeadline::periods(Duration::from_secs(60), TICK),
+                    FROZEN,
+                );
                 loop {
                     let answer = match actor.request(&envelope).await {
                         Ok(answer) => answer.result,
@@ -917,10 +931,34 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                     match answer {
                         Response::Submitted(MutationReply::Committed(receipt)) => return receipt,
                         Response::Error(
-                            AccessError::OutcomeUnknown
+                            refused @ (AccessError::OutcomeUnknown
                             | AccessError::Unavailable
-                            | AccessError::Capacity,
-                        ) if tokio::time::Instant::now() < bound => {}
+                            | AccessError::Capacity),
+                        ) => {
+                            if let Err(spent) = wait.check(&periods()) {
+                                let state: Vec<_> = replicas
+                                    .iter()
+                                    .map(|replica| {
+                                        let progress = replica.host.progress();
+                                        (
+                                            progress.node,
+                                            progress.leader,
+                                            progress.sequence,
+                                            progress.frames_held,
+                                            progress.frames_let_go,
+                                            progress.appends_rejected,
+                                            progress.peers_unreachable,
+                                        )
+                                    })
+                                    .collect();
+                                panic!(
+                                    "entry {epoch}: {refused:?} after {spent}; (node, leader, sequence, held, let go, rejected, unreachable): {state:?}"
+                                );
+                            }
+                            if !matches!(refused, AccessError::OutcomeUnknown) {
+                                tokio::time::sleep(TICK).await;
+                            }
+                        }
                         other => panic!("entry {epoch}: {other:?}"),
                     }
                 }

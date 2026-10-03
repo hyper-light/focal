@@ -224,6 +224,9 @@ pub struct AgentStatus {
     pub last_error: Option<String>,
     /// The last intent the owner refused before admission (24 §7).
     pub last_refusal: Option<String>,
+    /// The intent the owner has not decided yet, asked again each pass,
+    /// with how often it was asked and the last answer.
+    pub retrying: Option<String>,
     /// The tenants this node hosts, their queues, and the node's memory and
     /// volume envelopes.
     pub admission: crate::admission::AdmissionReport,

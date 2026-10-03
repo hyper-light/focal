@@ -160,6 +160,7 @@ impl LocalNetworkAdmin {
                                 .collect(),
                             last_error: status.last_error,
                             last_refusal: status.last_refusal,
+                            retrying: status.retrying,
                         }
                     }),
                     None => None,
