@@ -26,6 +26,7 @@ pub use membership::*;
 mod checkpoint;
 mod decoder;
 pub mod envelope;
+pub mod group_files;
 mod persistence;
 mod storage;
 /// A group's timing, derived from the round trips it measures (27 §3.1 P2).

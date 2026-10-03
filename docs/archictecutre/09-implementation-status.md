@@ -13208,3 +13208,19 @@ without its records is corruption and never a fresh group, an unreadable record 
 a missing one. `Medium::exists` now returns the error (`Path::try_exists`), focal-sim's disk
 answers absent only for a name it does not hold, and the backup's refusal to write over an
 existing manifest passes an error on instead of writing.
+
+### 2026-10-03 — a group's records and image are files of its own
+
+The first piece of [27](27-consensus-roadmap-and-slates-port.md) §15 in code:
+`focal-consensus::group_files`.
+- A group's records (`meta`: identity, fast track, decoder floor and transition) and its image
+  (`image`: the state at a point, with its configuration) live in `raft/groups/<id>/`.
+- Each is written whole by the shared install and read whole or refused, naming the file: a
+  checksum over every byte, a magic number, a version and a length. A file that does not read
+  whole is never read as no file, nor as an earlier one.
+- The records' bound derives from the largest configuration; the image's is the state machine's
+  own.
+- Tests on focal-sim's disk cut the power at each of the ten operations of a rewrite: each file
+  reads as before or as after, never between, and as after once its install returned. Every
+  flipped byte, a short tail, another file's magic, a later version and an unreadable path are
+  each refused. Nothing uses the files yet.
