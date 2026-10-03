@@ -206,3 +206,71 @@ async fn reconciliation_proves_supersession_and_recovers_lost_receipt_without_re
     control.stop().await.unwrap();
     owner.join().unwrap();
 }
+
+/// A plan the partition refused is answered by name (24 §16): its reply
+/// names no operation and no voters, and is `compare_failed` to the
+/// operator — not an inconsistent response, which the macOS drain journey
+/// was told when the decoder held the refusal to a plan's shape. A refusal
+/// that names voters, and a plan that names none, are inconsistent still.
+#[test]
+fn a_refused_plan_is_compare_failed_and_a_planned_one_names_its_voters() {
+    use crate::network_admin::{SESSION_PLANNED_REPLY_SCHEMA, SessionPlannedReply};
+    let tenant = [1; 16];
+    let session = [2; 16];
+    let reply = |state: u8, operation: [u8; 16], voters: Vec<u64>| SessionPlannedReply {
+        schema: SESSION_PLANNED_REPLY_SCHEMA,
+        tenant,
+        session,
+        operation,
+        voters,
+        state,
+        dry_run: false,
+    };
+    let encode = |reply: &SessionPlannedReply| postcard::to_allocvec(reply).unwrap();
+    let refused = planned_reply(
+        &encode(&reply(3, [0; 16], Vec::new())),
+        tenant,
+        session,
+        false,
+    )
+    .unwrap();
+    assert_eq!(refused.state, 3);
+    assert!(matches!(
+        planned_result(refused, "node", 1),
+        Err(ClusterAdminError::Control(ControlFailure::CompareFailed))
+    ));
+    let planned = planned_reply(
+        &encode(&reply(0, [3; 16], vec![1, 2, 3])),
+        tenant,
+        session,
+        false,
+    )
+    .unwrap();
+    match planned_result(planned, "zone", 1).unwrap() {
+        AdminResult::SessionPlanned { voters, state, .. } => {
+            assert_eq!(voters, vec![1, 2, 3]);
+            assert_eq!(state, "planned");
+        }
+        other => panic!("{other:?}"),
+    }
+    for inconsistent in [
+        reply(3, [3; 16], Vec::new()),
+        reply(3, [0; 16], vec![1]),
+        reply(0, [0; 16], vec![1, 2, 3]),
+        reply(1, [3; 16], Vec::new()),
+        reply(4, [3; 16], vec![1]),
+    ] {
+        assert!(
+            matches!(
+                planned_reply(&encode(&inconsistent), tenant, session, false),
+                Err(ClusterAdminError::Invalid)
+            ),
+            "{inconsistent:?}"
+        );
+    }
+    // The reply answers the request it was made for.
+    assert!(matches!(
+        planned_reply(&encode(&reply(0, [3; 16], vec![1])), tenant, session, true),
+        Err(ClusterAdminError::Invalid)
+    ));
+}

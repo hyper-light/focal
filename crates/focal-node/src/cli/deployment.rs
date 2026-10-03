@@ -461,6 +461,11 @@ fn plan(
                         operation: reply.operation,
                         voters: reply.voters,
                     },
+                    // The partition refused the plan: its observation went
+                    // stale between the planning and the commit (24 §16).
+                    3 => deployment::plan::Proposal::Refused(
+                        "the partition's observation went stale while the plan was made; plan again".into(),
+                    ),
                     _ => deployment::plan::Proposal::Satisfied,
                 },
                 Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {

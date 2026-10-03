@@ -1883,26 +1883,7 @@ impl ClusterAdmin {
         let reply = self
             .plan_session_reply(tenant, session, survive_code, max_failures, dry_run)
             .await?;
-        // The partition refused the plan: its observation went stale between
-        // the planning and the commit. The operator plans again (24 §16).
-        if reply.state == 3 {
-            return Err(ClusterAdminError::Control(ControlFailure::CompareFailed));
-        }
-        Ok(AdminResult::SessionPlanned {
-            tenant: focal_model::TenantId(reply.tenant).to_string(),
-            session: focal_model::SessionId(reply.session).to_string(),
-            operation: hex(&reply.operation),
-            voters: reply.voters,
-            survive: survive.into(),
-            max_failures,
-            state: match reply.state {
-                0 => "planned",
-                1 => "pending",
-                _ => "satisfied",
-            }
-            .into(),
-            dry_run,
-        })
+        planned_result(reply, survive, max_failures)
     }
     /// The root voters a durability needs (F24; survive code 0 node, 1
     /// zone, 2 region): reported, never journaled.
@@ -1962,21 +1943,7 @@ impl ClusterAdmin {
                 dry_run,
             })
             .await?;
-        let (reply, tail): (crate::network_admin::SessionPlannedReply, _) =
-            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
-        if !tail.is_empty()
-            || reply.schema != crate::network_admin::SESSION_PLANNED_REPLY_SCHEMA
-            || reply.tenant != tenant
-            || reply.session != session
-            || reply.operation == [0; 16]
-            || reply.voters.is_empty()
-            || reply.voters.len() > 64
-            || reply.state > 2
-            || reply.dry_run != dry_run
-        {
-            return Err(ClusterAdminError::Invalid);
-        }
-        Ok(reply)
+        planned_reply(&bytes, tenant, session, dry_run)
     }
     async fn exchange(&self, command: AdminCommand) -> Result<ControlReply> {
         match ControlReply::decode(
@@ -2273,4 +2240,60 @@ fn issuers_result(bytes: &[u8]) -> Result<AdminResult> {
         }),
         IssuerReply::Fenced { level, needed } => Err(ClusterAdminError::Fenced { level, needed }),
     }
+}
+
+/// A plan's reply, held to its shape: a planned session names its
+/// operation and voters, and a plan the partition refused (state 3, 24
+/// §16) names neither — a refusal with voters, or a plan without, is an
+/// inconsistent response.
+fn planned_reply(
+    bytes: &[u8],
+    tenant: [u8; 16],
+    session: [u8; 16],
+    dry_run: bool,
+) -> Result<crate::network_admin::SessionPlannedReply> {
+    let (reply, tail): (crate::network_admin::SessionPlannedReply, _) =
+        postcard::take_from_bytes(bytes).map_err(|_| ClusterAdminError::Invalid)?;
+    let refused = reply.state == 3 && reply.operation == [0; 16] && reply.voters.is_empty();
+    let planned = reply.state <= 2
+        && reply.operation != [0; 16]
+        && !reply.voters.is_empty()
+        && reply.voters.len() <= 64;
+    if !tail.is_empty()
+        || reply.schema != crate::network_admin::SESSION_PLANNED_REPLY_SCHEMA
+        || reply.tenant != tenant
+        || reply.session != session
+        || reply.dry_run != dry_run
+        || !(refused || planned)
+    {
+        return Err(ClusterAdminError::Invalid);
+    }
+    Ok(reply)
+}
+/// What a plan's reply is to the operator: the plan, or the refusal by
+/// name — the partition's observation went stale between the planning and
+/// the commit, and the operator plans again (24 §16).
+fn planned_result(
+    reply: crate::network_admin::SessionPlannedReply,
+    survive: &str,
+    max_failures: u16,
+) -> Result<AdminResult> {
+    if reply.state == 3 {
+        return Err(ClusterAdminError::Control(ControlFailure::CompareFailed));
+    }
+    Ok(AdminResult::SessionPlanned {
+        tenant: focal_model::TenantId(reply.tenant).to_string(),
+        session: focal_model::SessionId(reply.session).to_string(),
+        operation: hex(&reply.operation),
+        voters: reply.voters,
+        survive: survive.into(),
+        max_failures,
+        state: match reply.state {
+            0 => "planned",
+            1 => "pending",
+            _ => "satisfied",
+        }
+        .into(),
+        dry_run: reply.dry_run,
+    })
 }
