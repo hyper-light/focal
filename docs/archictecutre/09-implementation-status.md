@@ -12939,6 +12939,19 @@ it now names.
 
 The audit's F42 residual ([27](27-consensus-roadmap-and-slates-port.md) §12): a group's appends to a peer carry a sequence within the sender's incarnation (`Operation::RaftOrdered`, the ordered profile), the receiver holds a frame that overtook the one before it — for the path's probe timeout at most, within the source's lane and the configuration's members — and steps the frames in their order, so an append never overtakes another and is never refused for it; frames a group cannot do without stay unordered. Over a path that loses one datagram in fifty, 512 entries had 27 appends refused with the older offer and none (61 held, none let go) with the profile (`ReplicaProgress::appends_rejected`, `fleet_quic`). Found on the way: the probe timeout counted no acknowledgement delay (`frame::MAX_ACK_DELAY`), and empty appends went unordered.
 
+### 2026-10-03 — a copy tells what it holds, and is sent what it lacks
+
+The audit's F50 ([24](24-placement-execution-and-fleet-control.md) §20): a
+transfer opened on a copy took an inventory of the prefix before the first
+chunk lacked and forgot every chunk past it — sent again by the next
+transfer, and a seal over an object made whole by the gap's chunk refused.
+The inventory is the whole object now, every chunk verified by its hash; a
+sender whose connection admits the ordered profile asks what the copy holds
+(`CustodyRequest::OpenHeld`, a bit for each chunk) and sends only what it
+lacks, and one of an older binary is sent from the first lacked as it was. A
+second object sharing three of four chunks with one the copy holds crossed
+the path with 69,559 bytes where the older ask sent 203,932 (`evidence_quic`).
+
 ### 2026-10-03 — the gate commit's CI: three causes
 
 The runs of b318e80 failed on three tests ([the record](../audit/2026-09-29_remediation.md),

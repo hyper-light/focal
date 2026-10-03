@@ -45,10 +45,16 @@ fn request(
     id: u128,
     operation: Operation,
 ) -> VerifiedRequest {
+    // An ask of what a copy holds rides the ordered profile (the audit's
+    // F50); every other request here is of the base.
+    let protocol = match &operation {
+        Operation::Custody(CustodyRequest::OpenHeld { .. }) => ORDERED_PROTOCOL_VERSION,
+        _ => PROTOCOL_VERSION,
+    };
     verify_request(
         peer(node),
         RequestEnvelope {
-            protocol: PROTOCOL_VERSION,
+            protocol,
             ledger,
             route_epoch: RouteEpoch(epoch),
             request_epoch: RequestEpoch(1),
@@ -915,6 +921,90 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
     ));
 }
 
+/// An ask of what a copy holds is admitted where an open is (the audit's
+/// F50): from the installed placement's peers, and from an announced
+/// pending placement's peers at its route, since a copy being prepared
+/// opens the transfers it pulls through before its placement activates;
+/// from no other node. Held to the installed placement alone, a copy's pull
+/// of an object it lacked was refused and the delivery that needed the
+/// object waited on it for ever.
+#[test]
+fn an_ask_of_what_a_copy_holds_is_admitted_where_an_open_is() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let bytes: Vec<u8> = (1..=16).collect();
+    let content = stored(&mut sender, 1, 1, &bytes);
+    let manifest = sender.export_manifest(&content).unwrap();
+    let mut store = CustodyStore::new(
+        ContentStore::open(target.path(), limits()).unwrap(),
+        CustodyConfig::new(1),
+        memory(),
+    )
+    .unwrap();
+    let ledger = ledger(1, 10);
+    store.install_policy(policy(ledger)).unwrap();
+    let pending = CustodyScope {
+        ledger,
+        route_epoch: RouteEpoch(2),
+        policy_revision: 2,
+    };
+    store
+        .announce_pending(ledger, Some((pending, BTreeSet::from([1, 2, 3]))))
+        .unwrap();
+    let ask = |node: u64, route: u64, revision: u64, id: u128, held: bool| {
+        let transfer = [u8::try_from(id).unwrap(); 16];
+        let operation = if held {
+            CustodyRequest::OpenHeld {
+                transfer,
+                policy_revision: revision,
+                content: content.clone(),
+                manifest: manifest.encoded().to_vec(),
+            }
+        } else {
+            CustodyRequest::Open {
+                transfer,
+                policy_revision: revision,
+                content: content.clone(),
+                manifest: manifest.encoded().to_vec(),
+            }
+        };
+        request(ledger, route, Some(node), id, Operation::Custody(operation))
+    };
+    // An installed peer at the installed route, either way.
+    assert!(matches!(
+        store.request(&ask(2, 1, 1, 1, true)).unwrap().value(),
+        CustodyReply::OpenedHeld { chunks: 4, held } if held == &vec![0]
+    ));
+    assert!(matches!(
+        store.request(&ask(2, 1, 1, 2, false)).unwrap().value(),
+        CustodyReply::Opened {
+            chunks: 4,
+            next_missing: 0
+        }
+    ));
+    // A pending peer at the pending route, either way.
+    assert!(matches!(
+        store.request(&ask(3, 2, 2, 3, true)).unwrap().value(),
+        CustodyReply::OpenedHeld { chunks: 4, .. }
+    ));
+    assert!(matches!(
+        store.request(&ask(3, 2, 2, 4, false)).unwrap().value(),
+        CustodyReply::Opened { chunks: 4, .. }
+    ));
+    // A pending peer at the installed route, and a node of neither.
+    for held in [true, false] {
+        assert!(matches!(
+            store.request(&ask(3, 1, 1, 5, held)),
+            Err(AccessError::Unauthorized)
+        ));
+        assert!(matches!(
+            store.request(&ask(4, 2, 2, 6, held)),
+            Err(AccessError::Unauthorized)
+        ));
+    }
+}
+
 /// A transfer goes by several streams and its chunks arrive in no order:
 /// a copy takes any chunk of the manifest, the last before the first,
 /// counts what it lacks first, and seals what it has whole.
@@ -1017,6 +1107,171 @@ fn the_chunks_of_a_manifest_are_taken_in_any_order() {
             policy_revision: 1,
             content: content.clone()
         }
+    );
+}
+
+/// A copy's inventory of an object is every chunk it holds verified, not
+/// the prefix before the first it lacks (the audit's F50): chunks 0, 2 and
+/// 3 of four taken under one transfer are held under the next, which says
+/// so to a sender that asks (`OpenHeld`), and names 1 as the first lacked
+/// to one that asks as an older binary does (`Open`); chunk 1 then makes
+/// the object whole and the seal is given — it was refused, the chunks
+/// past the gap forgotten. A chunk whose file holds other bytes is lacked,
+/// and the chunk sent again installs over it.
+#[test]
+fn a_copy_tells_what_it_holds_and_a_gap_filled_seals_the_object() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    // Four chunks of four bytes.
+    let bytes: Vec<u8> = (1..=16).collect();
+    let content = stored(&mut sender, 1, 1, &bytes);
+    let manifest = sender.export_manifest(&content).unwrap();
+    let mut receiver = CustodyStore::new(
+        ContentStore::open(target.path(), limits()).unwrap(),
+        CustodyConfig::new(1),
+        memory(),
+    )
+    .unwrap();
+    let ledger = ledger(1, 10);
+    receiver.install_policy(policy(ledger)).unwrap();
+    let part = |index: usize| bytes.chunks(4).nth(index).unwrap();
+    let open = |receiver: &mut CustodyStore, transfer: [u8; 16]| {
+        let opened = receiver
+            .request(&custody(
+                ledger,
+                1,
+                CustodyRequest::Open {
+                    transfer,
+                    policy_revision: 1,
+                    content: content.clone(),
+                    manifest: manifest.encoded().to_vec(),
+                },
+            ))
+            .unwrap();
+        let CustodyReply::Opened {
+            chunks,
+            next_missing,
+        } = opened.value()
+        else {
+            panic!("opened")
+        };
+        (*chunks, *next_missing)
+    };
+    let open_held = |receiver: &mut CustodyStore, transfer: [u8; 16]| {
+        let opened = receiver
+            .request(&custody(
+                ledger,
+                1,
+                CustodyRequest::OpenHeld {
+                    transfer,
+                    policy_revision: 1,
+                    content: content.clone(),
+                    manifest: manifest.encoded().to_vec(),
+                },
+            ))
+            .unwrap();
+        let CustodyReply::OpenedHeld { chunks, held } = opened.value() else {
+            panic!("opened held")
+        };
+        (*chunks, held.clone())
+    };
+    let chunk = |receiver: &mut CustodyStore, transfer: [u8; 16], index: usize| {
+        receiver
+            .request(&custody(
+                ledger,
+                2,
+                CustodyRequest::Chunk {
+                    transfer,
+                    index: index as u32,
+                    bytes: part(index).to_vec(),
+                },
+            ))
+            .map(|reply| reply.value().clone())
+    };
+    let seal = |receiver: &mut CustodyStore, transfer: [u8; 16]| {
+        receiver
+            .request(&custody(ledger, 3, CustodyRequest::Seal { transfer }))
+            .map(|reply| reply.value().clone())
+    };
+    // The first transfer takes chunks 0, 2 and 3 and is cancelled.
+    let first = [1; 16];
+    assert_eq!(open(&mut receiver, first), (4, 0));
+    for index in [0, 2, 3] {
+        assert_eq!(
+            chunk(&mut receiver, first, index),
+            Ok(CustodyReply::ChunkStored {
+                index: index as u32
+            })
+        );
+    }
+    receiver
+        .request(&custody(
+            ledger,
+            4,
+            CustodyRequest::Cancel { transfer: first },
+        ))
+        .unwrap();
+    // The next transfer finds them held: told whole to a sender that
+    // asks, and as the first lacked to one that asks the old way.
+    let second = [2; 16];
+    assert_eq!(open_held(&mut receiver, second), (4, vec![0b1101]));
+    receiver
+        .request(&custody(
+            ledger,
+            4,
+            CustodyRequest::Cancel { transfer: second },
+        ))
+        .unwrap();
+    let third = [3; 16];
+    assert_eq!(open(&mut receiver, third), (4, 1));
+    assert!(matches!(
+        seal(&mut receiver, third),
+        Err(AccessError::InvalidRequest)
+    ));
+    // The gap filled makes the object whole: the seal is given.
+    assert_eq!(
+        chunk(&mut receiver, third, 1),
+        Ok(CustodyReply::ChunkStored { index: 1 })
+    );
+    assert_eq!(open(&mut receiver, third), (4, 4));
+    assert_eq!(
+        seal(&mut receiver, third),
+        Ok(CustodyReply::Durable {
+            policy_revision: 1,
+            content: content.clone()
+        })
+    );
+    // A chunk file that holds other bytes under chunk 2's name is lacked;
+    // the chunk sent again installs over it and the object seals.
+    let objects = target.path().join("objects");
+    let mut corrupted = 0;
+    for domain in std::fs::read_dir(&objects).unwrap() {
+        for entry in std::fs::read_dir(domain.unwrap().path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "chunk")
+                && std::fs::read(&path).unwrap() == part(2)
+            {
+                std::fs::write(&path, part(0)).unwrap();
+                corrupted += 1;
+            }
+        }
+    }
+    assert_eq!(corrupted, 1);
+    let fourth = [4; 16];
+    assert_eq!(open_held(&mut receiver, fourth), (4, vec![0b1011]));
+    assert_eq!(
+        chunk(&mut receiver, fourth, 2),
+        Ok(CustodyReply::ChunkStored { index: 2 })
+    );
+    assert_eq!(
+        seal(&mut receiver, fourth),
+        Ok(CustodyReply::Durable {
+            policy_revision: 1,
+            content: content.clone()
+        })
     );
 }
 

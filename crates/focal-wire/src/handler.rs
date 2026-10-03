@@ -751,6 +751,11 @@ pub fn validate_response(
                         next_missing,
                     },
                 ) => next_missing <= chunks,
+                // The inventory: a word for every sixty-four chunks.
+                (CustodyRequest::OpenHeld { .. }, CustodyReply::OpenedHeld { chunks, held }) => {
+                    usize::try_from(*chunks)
+                        .is_ok_and(|chunks| held.len() == chunks.div_ceil(u64::BITS as usize))
+                }
                 (
                     CustodyRequest::Chunk { index, .. },
                     CustodyReply::ChunkStored { index: stored },

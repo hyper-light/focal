@@ -399,6 +399,7 @@ pub const fn custody_coverage(custody: &CustodyRequest) -> Coverage {
         CustodyRequest::SeedChunk { .. } => ("custody.seed_chunk", false),
         CustodyRequest::ChunkPart { .. } => ("custody.chunk_part", true),
         CustodyRequest::ReadChunkPart { .. } => ("custody.read_chunk_part", false),
+        CustodyRequest::OpenHeld { .. } => ("custody.open_held", true),
     };
     coverage(
         name,

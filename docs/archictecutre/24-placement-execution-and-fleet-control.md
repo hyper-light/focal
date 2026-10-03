@@ -1629,7 +1629,7 @@ object no peer supplies leaves the delivery retained and the copy short of
 readiness, which the placement view reports. Only an activated native
 engine projects rows into the evidence export; a replica that can host one
 but still serves legacy history exports the graph's projection. Custody reads — a seed, an object's manifest, the transfer
-that describes it, its chunks, a verification and a cancel — are admitted
+that describes it (an open, or an ask of what the copy holds), its chunks, a verification and a cancel — are admitted
 from the nodes of the installed placement *and* of an announced pending
 placement at that placement's route (`authorize_read`, `check_read_scope`),
 since a copy being prepared reads before the placement activates; writes
@@ -1638,6 +1638,25 @@ chunk a transfer receives over a file that holds other bytes under the same
 content-addressed name replaces it (`install_transferred_chunk`): the file
 was corrupt and the bytes are verified; every other install path still
 refuses a differing existing file.
+
+**What a copy holds is what it says (2026-10-03; the audit's F50).** A
+transfer opened on a copy takes an inventory of the whole object, not of the
+prefix before the first chunk lacked: every chunk the manifest names that the
+store holds verified — read and hashed, never taken on its name — is noted
+as taken, and the first chunk lacked is the first the copy lacks
+(`CustodyStore::open_transfer`). Before, the chunks past a gap were
+forgotten by the next transfer, which sent them all again, and a seal over an
+object made whole by the gap's chunk alone was refused. A sender whose
+connection to the copy admits the ordered profile asks what the copy holds
+(`CustodyRequest::OpenHeld`, answered `OpenedHeld { chunks, held }`: a bit for
+each chunk, a word for every sixty-four the manifest names, held to the
+manifest at the sender) and sends only the chunks the copy lacks
+(`striped` over the lacked); a copy of an older binary is asked `Open` and
+sent from the first chunk it lacks, as it was (`PeerConnectionPool::
+negotiated_with` reads the connection's profile, dialling it where there is
+none). A pull takes this node's own inventory the same way. Chunk files are
+content-addressed per domain, so a second object that shares chunks with one
+the copy holds crosses the path only where it differs: over relays of 2 ms at 100 Mbit/s, a second object sharing three of four 64 KiB chunks crossed toward the copy with 69,559 bytes — the chunk it lacked, the manifest and the exchanges — where a holder offering an older binary's profiles sent 203,932 (`evidence_quic`, `a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds`).
 
 ## 21. The upgrade fence
 

@@ -533,6 +533,18 @@ impl PeerConnectionPool {
             .as_ref()
             .map(|entry| entry.remote.negotiated().protocol)
     }
+    /// The profile the connection to `target` negotiated, the connection
+    /// dialled where there is none, within the pool's deadline: what a
+    /// sender reads before it asks a copy what it holds (the audit's F50),
+    /// an ask of the ordered profile a copy of an older binary cannot
+    /// answer.
+    pub async fn negotiated_with(&self, target: u64) -> Result<u16, PeerSendError> {
+        let slot = self.slot(target)?;
+        let (_, remote) = tokio::time::timeout(self.limits.timeout, self.connection(&slot))
+            .await
+            .map_err(|_| PeerSendError::Lost)??;
+        Ok(remote.negotiated().protocol)
+    }
     /// The round trip of the connection to `target`, as it measures it;
     /// `None` while there is none.
     pub fn round_trip(&self, target: u64) -> Option<Duration> {
@@ -910,7 +922,10 @@ impl PeerConnectionPool {
             || request.protocol
                 != match request.operation {
                     Operation::ManagedSupport { .. } => MANAGED_PROTOCOL_VERSION,
-                    Operation::RaftOrdered { .. } => ORDERED_PROTOCOL_VERSION,
+                    Operation::RaftOrdered { .. }
+                    | Operation::Custody(CustodyRequest::OpenHeld { .. }) => {
+                        ORDERED_PROTOCOL_VERSION
+                    }
                     _ => PROTOCOL_VERSION,
                 }
             || request.request_epoch.0 == 0

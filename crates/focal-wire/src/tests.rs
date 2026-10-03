@@ -5501,6 +5501,85 @@ async fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it
         verify_request(node(), envelope(ORDERED_PROTOCOL_VERSION, plain()), &limits),
         Err(AccessError::UnsupportedProtocol)
     ));
+    // An ask of what a copy holds is of the ordered profile and nothing
+    // else (the audit's F50); the old ask stays with the base. Both new
+    // variants take the tags after the last of their enums.
+    // The content's domain is the request's tenant, as every custody
+    // request's must be.
+    let content = ContentRef {
+        domain: ContentDomainId::from_u128(1),
+        class: ContentClass::Evidence,
+        root: ContentHash([5; 32]),
+        length: 16,
+    };
+    let held = Operation::Custody(CustodyRequest::OpenHeld {
+        transfer: [6; 16],
+        policy_revision: 1,
+        content: content.clone(),
+        manifest: vec![7; 8],
+    });
+    let open = Operation::Custody(CustodyRequest::Open {
+        transfer: [6; 16],
+        policy_revision: 1,
+        content,
+        manifest: vec![7; 8],
+    });
+    assert!(ordered_profile_operation(&held));
+    assert!(!ordered_profile_operation(&open));
+    assert!(
+        verify_request(
+            node(),
+            envelope(ORDERED_PROTOCOL_VERSION, held.clone()),
+            &limits
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        verify_request(node(), envelope(PROTOCOL_VERSION, held.clone()), &limits),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    assert!(verify_request(node(), envelope(PROTOCOL_VERSION, open.clone()), &limits).is_ok());
+    assert!(matches!(
+        verify_request(
+            node(),
+            envelope(ORDERED_PROTOCOL_VERSION, open.clone()),
+            &limits
+        ),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    let bytes = postcard::to_allocvec(&held).unwrap();
+    assert_eq!(postcard::from_bytes::<Operation>(&bytes).unwrap(), held);
+    let reply = CustodyReply::OpenedHeld {
+        chunks: 70,
+        held: vec![u64::MAX, 0b11_1111],
+    };
+    let bytes = postcard::to_allocvec(&reply).unwrap();
+    assert_eq!(postcard::from_bytes::<CustodyReply>(&bytes).unwrap(), reply);
+    // The tags: the variants come after every one before them.
+    let tag = |bytes: &[u8]| bytes.first().copied().unwrap();
+    assert_eq!(
+        tag(&postcard::to_allocvec(&CustodyRequest::OpenHeld {
+            transfer: [0; 16],
+            policy_revision: 0,
+            content: ContentRef {
+                domain: ContentDomainId::from_u128(0),
+                class: ContentClass::Evidence,
+                root: ContentHash([0; 32]),
+                length: 0,
+            },
+            manifest: Vec::new(),
+        })
+        .unwrap()),
+        10
+    );
+    assert_eq!(
+        tag(&postcard::to_allocvec(&CustodyReply::OpenedHeld {
+            chunks: 0,
+            held: Vec::new(),
+        })
+        .unwrap()),
+        9
+    );
 }
 
 /// A part of a chunk is what the path delivered in an exchange's time

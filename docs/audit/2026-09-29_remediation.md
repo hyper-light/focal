@@ -3184,3 +3184,56 @@ in an exchange time. Under a six-process CPU load, with the cold rule, the cross
 twice (74–79 s, 1.13 MB crossed): the failure needs the first part's exchange to be given
 up, which the suite's load did and the hogs alone did not; the amplifier is gone either
 way.
+
+## F50
+
+**Cause.** A transfer opened on a copy scanned its chunk files from the first and stopped
+at the first missing or corrupt one (`custody.rs`, `Open`): `next_missing` was that index
+and the receipt bitmap was zeroed, so every chunk the copy held past the gap was
+forgotten, and the senders (`push`, `pull`) sent or pulled every chunk from the gap to
+the end. The audit's probe: chunks 0, 2 and 3 of four taken, a new transfer said the
+first lacked was 1, and after chunk 1 was stored the next said 2 and the seal was refused
+with all four present — a correctness fault, not only bandwidth. The store already took
+a verified duplicate for nothing (F59), but the bytes had crossed the path.
+
+**Fix.** The inventory is the whole object (24 §20): `open_transfer` reads and hashes
+every chunk the manifest names and notes each the store holds verified (`note`), then
+finds the first lacked past everything held (`advance`); a corrupt chunk stays lacked
+and the import installs verified bytes over it. `Opened { chunks, next_missing }` keeps
+its meaning for an older sender, and a seal over an object made whole is given. A sender
+asks what the copy holds where its connection admits the ordered profile
+(`CustodyRequest::OpenHeld` → `CustodyReply::OpenedHeld { chunks, held }`, the bitmap
+bounded by the manifest — a word for every sixty-four chunks, at most 512 words — charged
+to the reply beside the request, held to the manifest at the sender: a word for each
+sixty-four and no bit for a chunk the manifest does not name) and `striped` skips what is
+held; where the connection is of an older binary (`PeerConnectionPool::negotiated_with`,
+which dials the connection where there is none) it asks `Open` and sends from the first
+lacked, as it was. A pull takes this node's own inventory the same way; the holder's
+transfer is opened as before, since it serves reads on any profile. `OpenHeld` rides the
+ordered profile and nothing else (`ordered_profile_operation`: `verify_request`,
+`send_bounded`, the custody `envelope`). Nothing is written for the inventory: a chunk
+file under its hash name is the proof the bytes verified when installed, and the scan
+re-verifies by hash.
+
+**Tests.** `a_copy_tells_what_it_holds_and_a_gap_filled_seals_the_object` (the probe:
+0, 2, 3 taken under one transfer; the next says `[0b1101]` to `OpenHeld` and 1 to `Open`;
+chunk 1 seals the object; a chunk file holding other bytes is lacked, `[0b1011]`, and the
+chunk sent again installs over it); the two-hundred-chunk test keeps its assertions;
+the wire holds `OpenHeld` to the ordered profile and round-trips both variants;
+`evidence_quic`: a second object sharing three of four 64 KiB chunks with one the copy
+holds crosses the relay toward the copy with 69,559 bytes (one chunk, the manifest and the
+exchanges) where a holder offering an older binary's profiles sends 203,932 (three
+chunks); every refusal, lease and part rule of F49 unchanged.
+
+**Found while diagnosing its gate.** The custody store admits the requests that open
+and read a transfer — `Open` among them — from an announced pending placement's peers as
+well as the installed one's (24 §20: a copy being prepared pulls before its placement
+activates), and `OpenHeld` was left out of that class: held to the installed placement
+and its route, a pending copy's pull through its own `OpenHeld` would be refused. *Fix.*
+`OpenHeld` is admitted where `Open` is;
+`an_ask_of_what_a_copy_holds_is_admitted_where_an_open_is` holds the two to the same
+peers and routes, and refused the pending peer's `OpenHeld` before. The gate's failure
+itself (`evidence_quic`, a copy stalled at its first entry) was not this but the F42
+residual's (the F42 section, "A replica's own owner let held frames go").
+
+**Measured.** Over relays of 2 ms at 100 Mbit/s, three replicas, the copy on node 2: a first object of four 64 KiB chunks is sealed with all four on the copy; a second, differing in its second chunk alone, crossed toward the copy with 69,559 bytes under the inventory (one chunk of 65,536, the manifest, the open, the seal and the cancel) and 203,932 under the older ask (three chunks); the first run of the test measured 204,246 under the inventory too, because the harness's handler wrapper kept the trait's default offers and the connection negotiated the native profile — the wrapper forwards its service's offers now, and a mixed window is what `Slow::old` makes on purpose. Tags: `OpenHeld` is the 11th variant of its enum and `OpenedHeld` the 10th (postcard indices 10 and 9), both appended, so an older binary's tags keep their meaning.

@@ -634,6 +634,26 @@ pub enum CustodyRequest {
         offset: u32,
         max_bytes: u32,
     },
+    /// `Open`, answered with what the copy holds of the object
+    /// (`OpenedHeld`), so a sender sends what the copy lacks and nothing it
+    /// holds (the audit's F50). Of the ordered profile and nothing else: a
+    /// copy of an older binary is asked `Open`.
+    OpenHeld {
+        transfer: [u8; 16],
+        policy_revision: u64,
+        content: ContentRef,
+        #[serde(with = "focal_memory::serde_bytes")]
+        manifest: Vec<u8>,
+    },
+}
+/// Whether an operation is of the ordered profile and nothing else
+/// (27 §12): a sender names the profile its request needs, and a receiver
+/// holds it to it.
+pub const fn ordered_profile_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::RaftOrdered { .. } | Operation::Custody(CustodyRequest::OpenHeld { .. })
+    )
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustodyReply {
@@ -677,6 +697,14 @@ pub enum CustodyReply {
         length: u32,
         #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
+    },
+    /// What the copy holds of the object `OpenHeld` named, verified: a bit
+    /// for each of the manifest's `chunks`, bit `i % 64` of word `i / 64`
+    /// set where chunk `i` is held. Bounded by the manifest: a word for
+    /// every sixty-four chunks it names.
+    OpenedHeld {
+        chunks: u32,
+        held: Vec<u64>,
     },
 }
 

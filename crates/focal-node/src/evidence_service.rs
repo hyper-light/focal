@@ -1247,6 +1247,7 @@ async fn holds(
 async fn striped<F>(
     width: impl Fn() -> usize,
     lacked: std::ops::Range<u32>,
+    held: impl Fn(u32) -> bool,
     moved: impl Fn(u32) -> F,
 ) -> Result<(), AccessError>
 where
@@ -1279,9 +1280,14 @@ where
             if let Some(index) = again.pop_first() {
                 flying.push(attempt(index));
             } else if next < lacked.end {
-                open = open.saturating_add(1);
-                flying.push(attempt(next));
+                let index = next;
                 next = next.checked_add(1).ok_or(AccessError::Capacity)?;
+                // A chunk the copy holds is not moved (the audit's F50).
+                if held(index) {
+                    continue;
+                }
+                open = open.saturating_add(1);
+                flying.push(attempt(index));
             } else {
                 break;
             }
@@ -1332,11 +1338,12 @@ async fn send_chunks(
     scope: CustodyScope,
     transfer: [u8; 16],
     reference: &ContentRef,
-    lacked: std::ops::Range<u32>,
+    lacked: &Lacked,
 ) -> Result<(), AccessError> {
     striped(
         || pool.bulk_width(peer),
-        lacked,
+        lacked.range.clone(),
+        |index| lacked.held.holds(index),
         async |index: u32| {
             let bytes = content
                 .read_transfer_chunk(
@@ -1421,39 +1428,67 @@ async fn push(
     reference: &ContentRef,
 ) -> Result<(), AccessError> {
     let manifest = content.export_manifest(scope, reference.clone()).await?;
-    let opened = remote(
-        pool,
-        peer,
-        scope,
-        transfer,
-        CustodyRequest::Open {
+    // What the copy holds is asked for where its connection admits the
+    // ordered profile, and only what it lacks is sent (the audit's F50); a
+    // copy of an older binary says the first chunk it lacks and is sent
+    // from there, as it was.
+    let profile = pool.negotiated_with(peer).await.map_err(send_error)?;
+    let encoded = manifest.value().encoded().to_vec();
+    let named = manifest.value().chunks();
+    let lacked = if profile >= ORDERED_PROTOCOL_VERSION {
+        let opened = remote(
+            pool,
+            peer,
+            scope,
             transfer,
-            policy_revision: scope.policy_revision,
-            content: reference.clone(),
-            manifest: manifest.value().encoded().to_vec(),
-        },
-    )
-    .await?;
-    let CustodyReply::Opened {
-        chunks,
-        next_missing,
-    } = opened
-    else {
-        return Err(AccessError::InvalidRequest);
+            CustodyRequest::OpenHeld {
+                transfer,
+                policy_revision: scope.policy_revision,
+                content: reference.clone(),
+                manifest: encoded,
+            },
+        )
+        .await?;
+        let CustodyReply::OpenedHeld { chunks, held } = opened else {
+            return Err(AccessError::InvalidRequest);
+        };
+        if chunks as usize != named {
+            return Err(AccessError::InvalidRequest);
+        }
+        Lacked {
+            range: 0..chunks,
+            held: Held::verified(chunks, held)?,
+        }
+    } else {
+        let opened = remote(
+            pool,
+            peer,
+            scope,
+            transfer,
+            CustodyRequest::Open {
+                transfer,
+                policy_revision: scope.policy_revision,
+                content: reference.clone(),
+                manifest: encoded,
+            },
+        )
+        .await?;
+        let CustodyReply::Opened {
+            chunks,
+            next_missing,
+        } = opened
+        else {
+            return Err(AccessError::InvalidRequest);
+        };
+        if chunks as usize != named || next_missing > chunks {
+            return Err(AccessError::InvalidRequest);
+        }
+        Lacked {
+            range: next_missing..chunks,
+            held: Held::none(),
+        }
     };
-    if chunks as usize != manifest.value().chunks() || next_missing > chunks {
-        return Err(AccessError::InvalidRequest);
-    }
-    send_chunks(
-        content,
-        pool,
-        peer,
-        scope,
-        transfer,
-        reference,
-        next_missing..chunks,
-    )
-    .await?;
+    send_chunks(content, pool, peer, scope, transfer, reference, &lacked).await?;
     let reply = remote(
         pool,
         peer,
@@ -1831,7 +1866,12 @@ pub(crate) async fn pull_object(
 }
 fn envelope(scope: CustodyScope, id: [u8; 16], operation: CustodyRequest) -> RequestEnvelope {
     RequestEnvelope {
-        protocol: PROTOCOL_VERSION,
+        // An ask of what a copy holds is of the ordered profile (the
+        // audit's F50); every other custody request is of the base.
+        protocol: match operation {
+            CustodyRequest::OpenHeld { .. } => ORDERED_PROTOCOL_VERSION,
+            _ => PROTOCOL_VERSION,
+        },
         ledger: scope.ledger,
         route_epoch: scope.route_epoch,
         request_epoch: RequestEpoch(1),
@@ -1848,11 +1888,57 @@ async fn remote(
 ) -> Result<CustodyReply, AccessError> {
     pool.send_custody(peer, &envelope(scope, transfer, operation))
         .await
-        .map_err(|error| match error {
-            PeerSendError::Busy => AccessError::Capacity,
-            PeerSendError::Rejected(error) => error,
-            _ => AccessError::OutcomeUnknown,
-        })
+        .map_err(send_error)
+}
+/// What a send that failed means to the transfer: a lane with no room is
+/// the copy's capacity, a refusal is the copy's word, anything else left
+/// the outcome unknown.
+fn send_error(error: PeerSendError) -> AccessError {
+    match error {
+        PeerSendError::Busy => AccessError::Capacity,
+        PeerSendError::Rejected(error) => error,
+        _ => AccessError::OutcomeUnknown,
+    }
+}
+/// What a copy holds of an object, as it told it (`CustodyReply::OpenedHeld`,
+/// the audit's F50): a bit for each chunk. Empty where nothing is known to
+/// be held.
+struct Held(Vec<u64>);
+/// The chunks a copy lacks: a range of the manifest's chunks, less what the
+/// copy said it holds.
+struct Lacked {
+    range: std::ops::Range<u32>,
+    held: Held,
+}
+impl Held {
+    fn none() -> Self {
+        Self(Vec::new())
+    }
+    /// The copy's word, held to the manifest: a word for every sixty-four
+    /// chunks and no bit for a chunk the manifest does not name.
+    fn verified(chunks: u32, held: Vec<u64>) -> Result<Self, AccessError> {
+        let words = usize::try_from(chunks)
+            .map_err(|_| AccessError::Capacity)?
+            .div_ceil(u64::BITS as usize);
+        if held.len() != words {
+            return Err(AccessError::InvalidRequest);
+        }
+        let spare = u32::try_from(words.saturating_mul(u64::BITS as usize))
+            .map_err(|_| AccessError::Capacity)?
+            .saturating_sub(chunks);
+        if spare > 0 && held.last().is_some_and(|last| last.leading_zeros() < spare) {
+            return Err(AccessError::InvalidRequest);
+        }
+        Ok(Self(held))
+    }
+    fn holds(&self, index: u32) -> bool {
+        let word = usize::try_from(index.checked_div(u64::BITS).unwrap_or(0)).unwrap_or(usize::MAX);
+        let bit = index
+            .checked_rem(u64::BITS)
+            .and_then(|bit| 1_u64.checked_shl(bit))
+            .unwrap_or(0);
+        self.0.get(word).is_some_and(|held| held & bit != 0)
+    }
 }
 async fn local(
     content: &ContentHost,
@@ -2007,26 +2093,39 @@ async fn pull(
     if described != *reference {
         return Err(AccessError::InvalidRequest);
     }
+    // This node's own inventory of the object (the audit's F50): what it
+    // holds verified is not pulled again. The holder's transfer is opened
+    // as it was; it serves reads on any profile.
     let open = CustodyRequest::Open {
         transfer,
         policy_revision: scope.policy_revision,
         content: reference.clone(),
-        manifest,
+        manifest: manifest.clone(),
     };
-    let opened = local(content, node, scope, transfer, open.clone()).await?;
+    let opened = local(
+        content,
+        node,
+        scope,
+        transfer,
+        CustodyRequest::OpenHeld {
+            transfer,
+            policy_revision: scope.policy_revision,
+            content: reference.clone(),
+            manifest,
+        },
+    )
+    .await?;
     remote(pool, peer, scope, transfer, open).await?;
-    let CustodyReply::Opened {
-        chunks,
-        next_missing,
-    } = opened
-    else {
+    let CustodyReply::OpenedHeld { chunks, held } = opened else {
         return Err(AccessError::InvalidRequest);
     };
+    let held = Held::verified(chunks, held)?;
     let max_bytes = u32::try_from(focal_evidence::MAX_TRANSFER_CHUNK_BYTES)
         .map_err(|_| AccessError::Capacity)?;
     striped(
         || pool.bulk_width(peer),
-        next_missing..chunks,
+        0..chunks,
+        |index| held.holds(index),
         async |index: u32| {
             // A chunk the path carries within an exchange's time is asked
             // for whole; one it does not is asked for in parts, each of

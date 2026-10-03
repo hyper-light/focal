@@ -642,10 +642,10 @@ pub fn verify_request(
     );
     let participant = is_peer_request(&request);
     let native = request.protocol == crate::NATIVE_PROTOCOL_VERSION;
-    // An ordered frame is of the ordered profile and nothing else is
-    // (27 §12): a sender names the profile its frame needs, and a receiver
-    // holds it to it.
-    let ordered = matches!(request.operation, Operation::RaftOrdered { .. });
+    // An ordered frame, or an ask of what a copy holds, is of the ordered
+    // profile and nothing else is (27 §12): a sender names the profile its
+    // request needs, and a receiver holds it to it.
+    let ordered = crate::ordered_profile_operation(&request.operation);
     if ordered != (request.protocol == crate::ORDERED_PROTOCOL_VERSION) {
         return Err(AccessError::UnsupportedProtocol);
     }
@@ -1201,6 +1201,12 @@ fn request_shape(
         Operation::Custody(custody) => {
             match custody {
                 CustodyRequest::Open {
+                    transfer,
+                    policy_revision,
+                    content,
+                    manifest,
+                }
+                | CustodyRequest::OpenHeld {
                     transfer,
                     policy_revision,
                     content,

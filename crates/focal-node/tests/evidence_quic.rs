@@ -65,7 +65,17 @@ struct Slow {
     bits: u64,
     delay: Duration,
     chunk_bytes: usize,
+    /// The nodes whose connectors offer what a binary before the ordered
+    /// profile offered, so their exchanges go as that binary's went.
+    old: &'static [u64],
 }
+/// What a binary before the ordered profile offered in its Hello.
+const OLDER_PROFILES: [u16; 4] = [
+    focal_wire::NATIVE_PROTOCOL_VERSION,
+    focal_wire::PEER_PROTOCOL_VERSION,
+    focal_wire::MANAGED_PROTOCOL_VERSION,
+    focal_wire::PROTOCOL_VERSION,
+];
 /// The replicas' tick, and what a dial and an exchange between them are
 /// given on the loopback.
 const TICK: Duration = Duration::from_millis(20);
@@ -229,6 +239,34 @@ enum TestService {
     Managed(ManagedService),
 }
 impl RequestHandler for TestService {
+    // What the service offers in its Hello is the service's: a wrapper that
+    // kept the defaults negotiated the base profiles alone, and a holder
+    // asked a copy `Open` where the copy answers `OpenHeld` (the audit's
+    // F50's crossing measured three chunks where one was lacked).
+    fn supports_managed_requests(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_managed_requests(),
+            Self::Managed(service) => service.supports_managed_requests(),
+        }
+    }
+    fn supports_participant_requests(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_participant_requests(),
+            Self::Managed(service) => service.supports_participant_requests(),
+        }
+    }
+    fn supports_native_requests(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_native_requests(),
+            Self::Managed(service) => service.supports_native_requests(),
+        }
+    }
+    fn supports_ordered_replication(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_ordered_replication(),
+            Self::Managed(service) => service.supports_ordered_replication(),
+        }
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -490,9 +528,15 @@ impl Fleet {
             );
             let serving_server = server.clone();
             let serving = tokio::spawn(async move { serving_server.serve(service).await });
+            let connector = match slow {
+                Some(slow) if slow.old.contains(&id) => {
+                    pki.connector(identity).offering(&OLDER_PROFILES).unwrap()
+                }
+                _ => pki.connector(identity),
+            };
             let pool = Arc::new(
                 PeerConnectionPool::new(
-                    pki.connector(identity),
+                    connector,
                     PeerPoolLimits {
                         max_routes: 3,
                         max_connections: 3,
@@ -1182,6 +1226,7 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
         bits,
         delay: Duration::from_millis(10),
         chunk_bytes: 1024 * 1024,
+        old: &[],
     };
     let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
     let leader = fleet.leader().await;
@@ -1289,4 +1334,89 @@ async fn a_megabyte_chunk_reaches_its_copy_across_64_kbit_per_second() {
 #[ignore = "a measurement of a quarter of an hour; run by name"]
 async fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
     a_chunk_reaches_its_copy_across(8_000).await;
+}
+
+/// A copy is sent the chunks it lacks and none it holds (24 §20, the
+/// audit's F50). Chunk files are content-addressed, so a second object that
+/// shares three of its four chunks with one the copy holds is held in three
+/// parts before it is pushed: a holder whose connection admits the ordered
+/// profile asks the copy what it holds and sends the one chunk it lacks; a
+/// holder offering what a binary before the profile offered is told the
+/// first chunk lacked and sends three, as every holder did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds() {
+    let ordered = bytes_crossed_for_a_second_object(&[]).await;
+    let older = bytes_crossed_for_a_second_object(&[1]).await;
+    println!(
+        "a second object sharing three chunks of four: {ordered} bytes crossed toward the copy with its inventory asked, {older} with the first chunk lacked"
+    );
+    assert!(
+        ordered < 2 * SHARED_CHUNK as u64,
+        "{ordered} bytes crossed toward the copy for one chunk of {SHARED_CHUNK} it lacked"
+    );
+    assert!(
+        older >= 3 * SHARED_CHUNK as u64,
+        "{older} bytes crossed where the older ask sends three chunks of {SHARED_CHUNK}"
+    );
+}
+const SHARED_CHUNK: usize = 64 * 1024;
+/// The bytes that crossed toward the copy while a second object, differing
+/// from the first in its second chunk alone, was uploaded and sealed.
+async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
+    let data = tempfile::tempdir().unwrap();
+    let slow = Slow {
+        bits: 100_000_000,
+        delay: Duration::from_millis(2),
+        chunk_bytes: SHARED_CHUNK,
+        old,
+    };
+    let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
+    let leader = fleet.leader().await;
+    assert_eq!(leader, 0);
+    let mut first = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    first.resize_with(4 * SHARED_CHUNK, || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+    });
+    let mut second = first.clone();
+    for byte in &mut second[SHARED_CHUNK..2 * SHARED_CHUNK] {
+        *byte = if *byte == b' ' { b'\t' } else { b' ' };
+    }
+    sealed(&fleet, leader, &slow, 1, &first).await;
+    let before = fleet.relays[1].carried_toward_back();
+    let reference = sealed(&fleet, leader, &slow, 2, &second).await;
+    let crossed = fleet.relays[1].carried_toward_back() - before;
+    assert_bytes(
+        download(&fleet.replicas[1].actor, &reference).await,
+        &second,
+    );
+    fleet.stop().await;
+    crossed
+}
+/// Upload `bytes` to the leader and seal, asking the seal again, exactly,
+/// while the copy is being made: for as long as four exchanges across the
+/// path take at the least.
+async fn sealed(fleet: &Fleet, leader: usize, slow: &Slow, id: u8, bytes: &[u8]) -> ContentRef {
+    let began = std::time::Instant::now();
+    let seal = upload(&fleet.replicas[leader].actor, id, bytes).await;
+    let budget = slow.dial().max(DIAL) * 4;
+    loop {
+        let response = fleet.replicas[leader].actor.request(&seal).await.unwrap();
+        match response.result {
+            Response::Upload(UploadReply::Sealed(reference)) => return reference,
+            Response::Error(
+                AccessError::OutcomeUnknown | AccessError::Unavailable | AccessError::Capacity,
+            ) => {
+                assert!(
+                    began.elapsed() < budget,
+                    "the seal of object {id} did not complete in {budget:?}"
+                );
+                tokio::time::sleep(TICK).await;
+            }
+            other => panic!("the seal of object {id}: {other:?}"),
+        }
+    }
 }
