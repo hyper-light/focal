@@ -1270,7 +1270,12 @@ a snapshot of it and of `hyper-timing`, which it depends on, under `vendor/` (`S
 revision), and `crates/focal-raft` is gone. The order the owner set for the rest (2026-10-03): the
 core; then the WAL onto hyper-log (F-1) and the durable shell onto hyper-durable (D-2), together
 (§15); then timing and liveness; then the transport. Tracked here until it goes: the shared
-shell's tick mode, which focal's shell runs on until its timing and liveness step (§15.7).
+shell's tick mode, which focal's shell runs on until its timing and liveness step (§15.7); the
+step that removes `DurableNode`'s old backend and inverts the ownership (§15.7); and, by that same
+release, the fast track. The shell does not yet report a proposal another entry displaced, so its
+backend refuses a fast group and the conversion refuses a data directory holding one (§15.8). By
+then the shell reports displaced proposals or focal drops the fast track, and the choice is
+recorded here.
 
 **No byte changes.** hyper-raft speaks its own types and format (its R-2). focal's WAL records and
 peer messages keep raft-rs 0.7's protocol-buffer encoding (18 §1: no serialized type changes in
@@ -1492,6 +1497,42 @@ tick path as an owner's setting, under these conditions:
   tracks it.
 
 mantle's D-1 has the same need where its owner cannot yet carry the datagram plane.
+
+**DurableNode over two backends (decided with focal's session, 2026-10-03).** Through the fence's
+transition every owner runs over both backends: focal-log below `STORAGE_LEVEL` and the shell
+above it. So `DurableNode` stays focal's owner-facing API, with the backend chosen at open. The
+shell's backend is never constructed below the fence (§15.8).
+
+Over the shell, a hand-over state machine gives each committed entry to the owner's next drain
+as `NodeEvents`, and the owner applies it as today. The owner owns the replica and the replica owns
+the machine, so a drain is the machine's queue taken on the owner's thread, with nothing shared.
+The difference between the backends sits in one place. The whole existing suite becomes a
+differential test of the shell under an unchanged API: the consensus simulations, the ledger's
+cluster tests, the node and CLI journeys. Inverting the ownership (the replica owning the
+session's state as its machine) is the step that removes the old backend, which §14 tracks.
+
+The shell's backend must hold each `NodeEvents` contract exactly, each a named test run on both
+backends:
+- (a) committed entries handed out in index order, exactly once, across a restart (replay above
+  the image's point) and an install;
+- (b) read states timed as today relative to applied entries: a barrier answered ahead of what
+  was applied is parked (F55, and the control replica since `7acd910`), never failed or answered
+  twice;
+- (c) a leader's appends may leave before its own write; no acknowledgement, vote or message that
+  depends on the hard state leaves before that state is durable;
+- (d) `apply_on_written_commit`, as `acts_at_start` for every entry of a control group;
+- (e) a checkpoint and a restore keep their observable results through the group files: the
+  applied index, the entries retained, the decoder floor;
+- (f) the floor's held refusal surfaces as today's typed error, never as corruption;
+- (g) the hand-over queue is bounded by what the shell already bounds (uncommitted and inflight
+  bytes), charged to the owner's `MemoryBudget` as `NodeEvents` are, and refused with `Capacity`.
+
+The evidence for "nothing changes for the owners" is the differential run the strong way: the
+consensus simulations feed one input stream to both backends and require the same `NodeEvents`
+sequences (entries, read states, messages outside the set allowed to leave early) and the same
+state after a restart. `PersistencePending` never arises on the shell's backend; the owners keep
+handling it, for it stays live on the old one. A contract that `drive` and its output cannot
+reproduce exactly stops the work and reopens the question for that owner alone.
 
 ### 15.8 The conversion
 

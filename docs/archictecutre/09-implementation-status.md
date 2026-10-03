@@ -13238,3 +13238,19 @@ They come at one revision (`418851a`, its CI green on all six targets), with `hy
 carries the shell's tick mode and its held refusal, which §15.5 and §15.7 need. focal-consensus
 depends on the shell, which nothing uses yet, so every commit after this one builds it. No
 third-party crate is new to the tree; the release roster and `cargo deny` agree.
+
+### 2026-10-03 — DurableNode over two backends, decided before its code
+
+[27](27-consensus-roadmap-and-slates-port.md) §15.7 records how D-2 meets the owners, decided with
+focal's session. `DurableNode` stays the owners' API, over focal-log below the upgrade fence and the
+shell above it. A hand-over state machine gives committed entries to the owner's next drain, and
+the owner applies them as today.
+
+Seven `NodeEvents` contracts are named, each to be a test on both backends. A differential runs the
+consensus simulations' input against both.
+
+Two gaps the shell had are settled:
+- its state machine now sees the change it applies (hyper-raft, for the membership report's
+  context);
+- the fast track's displaced proposals are not reported on the shell, so its backend and the
+  conversion refuse a fast group until a deadline §14 records.
