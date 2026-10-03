@@ -1,7 +1,14 @@
 [workspace]
 members = ["crates/*", "tools/*"]
 # The shared crates vendored from hyper-raft are roots of their own (SNAPSHOT in each).
-exclude = ["vendor/hyper-raft", "vendor/hyper-timing"]
+exclude = [
+    "vendor/hyper-block",
+    "vendor/hyper-durable",
+    "vendor/hyper-liveness",
+    "vendor/hyper-log",
+    "vendor/hyper-raft",
+    "vendor/hyper-timing",
+]
 resolver = "3"
 
 [workspace.package]
@@ -17,6 +24,9 @@ clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.5"
 getrandom = "0.3"
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
+# The durable shell around the core, vendored from hyper-raft with the log and
+# block layers and the liveness stream it builds on (vendor/*/SNAPSHOT; 27 §15).
+hyper-durable = { version = "0.1.0", path = "vendor/hyper-durable" }
 # The consensus core, vendored from hyper-raft (vendor/hyper-raft/SNAPSHOT;
 # 27 §4.2): focal's core moved there and is shared with mantle and slates.
 hyper-raft = { version = "0.1.0", path = "vendor/hyper-raft" }
