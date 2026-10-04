@@ -3623,10 +3623,20 @@ a defect of batching** (2026-10-04).
   same way. etcd holds such reads (`pendingReadIndexMessages`) and releases them at the
   first commit. Reported to the peer integrating hyper-raft, who takes the deferral into
   the core; reads the core holds die with the term.
-- **Open, in focal.** The owner gives up a waiting read at once when the term changes,
-  but not when its leader steps down within the term (check-quorum). The role guard
-  keeps such a read from being answered, and it waits for its deadline. The next batch
-  gives up the waits a leader answers at the role change too.
+- **And a leader that steps down within its term answers its waiting reads at once**
+  (2026-10-04, the batch after).
+  - *Cause.* The owner gave up a waiting read when the term changed, not when its leader
+    stepped down within the term (check-quorum). The role guard kept such a read from
+    being answered, so it waited out its deadline.
+  - *Fix.* The waits only a leader answers (`WaitingFor::answered_by_leader`: reads,
+    lists, selections, validators, traversals, summaries, monitors, reconciliations
+    and the request-stream reads and controls) are given up at the role change too.
+    A follower's native reads are not among them. The core's deferred reads die with
+    the leadership, and the owner answers for them.
+  - *Test.* `fleet::list_tests::read_round_tests::a_leader_that_steps_down_within_its_term_answers_its_waiting_reads_at_once`
+    asks a summary, isolates the leader until check-quorum makes it a follower in the
+    same term, and requires `Unavailable` at once. With the role change ignored, the
+    read is still waiting there.
 
 ## F48
 

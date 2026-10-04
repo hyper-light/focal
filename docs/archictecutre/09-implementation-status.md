@@ -13275,3 +13275,14 @@ request asked while a 256 MiB upload sealed at 1 MiB chunks:
   run at load 5.4–6.7).
 
 The seal took 7.2–8.5 s before and 7.1–8.5 s after.
+
+### 2026-10-04 — a leader that steps down within its term answers its waiting reads at once
+
+The owner gave up a waiting read when the term changed, but not when its leader stepped
+down within its term (check-quorum). The read, which only a leader answers, waited out
+its deadline. The waits only a leader answers (`WaitingFor::answered_by_leader`) are now
+given up at the role change as well.
+`fleet::list_tests::read_round_tests::a_leader_that_steps_down_within_its_term_answers_its_waiting_reads_at_once`
+isolates a leader until check-quorum steps it down in its term, and requires the summary
+it was asked to be answered `Unavailable` at once. With the role change ignored, the
+test fails.

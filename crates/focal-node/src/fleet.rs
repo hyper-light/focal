@@ -605,6 +605,29 @@ impl ReplicaOwner {
         self.0.join().map_err(|_| "replica owner panicked")
     }
 }
+impl WaitingFor {
+    /// Whether only this replica as leader answers the wait: a read its
+    /// own barrier confirms, or a request that waits for one. A leader that
+    /// steps down within its term (check-quorum) answers none of them, and
+    /// the barrier it waits for dies with its leadership: the wait is given
+    /// up at once, not at its deadline. A term that changes gives up every
+    /// wait of the term before it.
+    fn answered_by_leader(&self) -> bool {
+        matches!(
+            self,
+            WaitingFor::Read { .. }
+                | WaitingFor::List { .. }
+                | WaitingFor::Select { .. }
+                | WaitingFor::Validators { .. }
+                | WaitingFor::Traverse { .. }
+                | WaitingFor::Summary { .. }
+                | WaitingFor::Monitor { .. }
+                | WaitingFor::Reconcile { .. }
+                | WaitingFor::RequestStreamRead { .. }
+                | WaitingFor::RequestStreamControl { .. }
+        )
+    }
+}
 // Pending admission already reserves 4096 bytes of per-request owner metadata;
 // keeping stream fences inline avoids another separately allocated wrapper.
 #[allow(clippy::large_enum_variant)]
@@ -4267,7 +4290,10 @@ impl Owner {
             };
             if let Some(result) = result {
                 pending.finish(result);
-            } else if self.pace.periods() >= pending.deadline || status.term != pending.term {
+            } else if self.pace.periods() >= pending.deadline
+                || status.term != pending.term
+                || (status.role != StateRole::Leader && pending.waiting.answered_by_leader())
+            {
                 let result = self.given_up(&mut pending);
                 pending.finish(result);
             } else {

@@ -173,6 +173,46 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
     ));
 }
 
+/// A leader that steps down within its term (check-quorum: it heard from no
+/// quorum for an election timeout) answers the reads that wait for its
+/// barrier at once: the barrier died with its leadership. Before, only a
+/// change of term gave them up, and such a read waited out its deadline
+/// (the hyper-raft read deferral, 2026-10-04: reads the core holds die with
+/// the leadership, and the owner answers for them).
+#[test]
+fn a_leader_that_steps_down_within_its_term_answers_its_waiting_reads_at_once() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::open(root.path());
+    for _ in 0..10 {
+        fixture.pump();
+    }
+    let (work, mut answer) = summary(&fixture.owners[0], 6_000);
+    assert!(!fixture.owners[0].accept(work).unwrap());
+    fixture.owners[0].drain().unwrap();
+    assert!(answer.try_recv().is_err(), "the read waits for its round");
+    // Nothing more reaches the followers, nor comes back: the leader hears
+    // from no quorum and steps down, in its term.
+    let term = fixture.owners[0].session.scalars().term;
+    for _ in 0..1_000 {
+        if fixture.owners[0].session.scalars().role != StateRole::Leader {
+            break;
+        }
+        fixture.owners[0].session.tick().unwrap();
+        fixture.owners[0].drain().unwrap();
+        while fixture.outgoing[0].try_recv().is_ok() {}
+    }
+    let status = fixture.owners[0].session.scalars();
+    assert_eq!(status.role, StateRole::Follower);
+    assert_eq!(status.term, term, "within its term");
+    assert!(
+        matches!(
+            answer.try_recv().unwrap().envelope().result,
+            Response::Error(AccessError::Unavailable)
+        ),
+        "answered at the step-down, not at its deadline"
+    );
+}
+
 /// The bytes a leader sends a peer ahead of its answers follow what the
 /// path to it holds in flight and its round trip: twice the window; a page
 /// at least where the path carries a page within a beat; never a page on a
