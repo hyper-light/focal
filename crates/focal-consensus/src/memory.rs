@@ -214,6 +214,39 @@ pub(super) fn events_bytes(events: &NodeEvents) -> Result<usize, ConsensusError>
     }
     Ok(bytes)
 }
+/// What one drive of the shell may hand to the owner at most ([27] §15.7, contract (g)): the
+/// messages and reads the replica holds (`held`, what its budget holds for it), which leave its
+/// count for the events'; and the entries it applies, which the shell bounds by its page, one
+/// page or one larger entry (`max_committed_size_per_ready`), counted as the core counts an
+/// entry, its fixed bytes beside its data and context. They are no more than the `unapplied`
+/// entries above what it applied, nor more than the page holds at the fewest bytes an entry
+/// takes, each with its structure and its data's bookkeeping. What a change's configurations
+/// take is counted when the events are (`events_bytes`).
+///
+/// [27]: ../../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
+pub(super) fn drive_bytes(
+    config: &NodeConfig,
+    held: usize,
+    unapplied: u64,
+) -> Result<usize, ConsensusError> {
+    let fixed = hyper_raft::wire::ENTRY_FIXED_BYTES;
+    let page = usize::try_from(crate::COMMITTED_PAGE_BYTES)
+        .unwrap_or(usize::MAX)
+        .max(add(config.max_entry_bytes, fixed)?);
+    let fit = page
+        .checked_div(fixed)
+        .ok_or(ConsensusError::Capacity)
+        .and_then(|fit| add(fit, 1))?;
+    let count = usize::try_from(unapplied).unwrap_or(usize::MAX).min(fit);
+    let data = count
+        .checked_mul(add(config.max_entry_bytes, fixed)?)
+        .map_or(page, |all| all.min(page));
+    let each = add(
+        size_of::<crate::CommittedEntry>().max(size_of::<crate::AppliedMembership>()),
+        OVERHEAD,
+    )?;
+    add(add(add(held, data)?, mul(count, each)?)?, EVENTS_BYTES)
+}
 /// What opening a group allocates: the node and its queue, the identity
 /// record and its append, and for each member its validation, its identity
 /// bytes, its id in the log's configuration and its row in the tracker

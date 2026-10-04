@@ -5,6 +5,27 @@
 use super::*;
 
 impl DurableNode {
+    /// A member over hyper-durable's shell ([27] §15.7): its log one group of the node's
+    /// hyper-log log `log`, its records and image under the data directory `root`, its memory
+    /// charged within `parent_budget` and its disk within `disk`. `needs` names the decoder an
+    /// entry of the owner's needs, where it needs one the group's baseline does not give: a write
+    /// holding such an entry waits until the group's records state that decoder durable
+    /// (27 §15.5, O2). The conversion and the tests open members so; a start below the upgrade
+    /// fence never does (27 §15.8).
+    pub fn open_on_shell(
+        config: NodeConfig,
+        root: &Path,
+        log: &hyper_log::Log<hyper_block::file::DeviceFile>,
+        parent_budget: &MemoryBudget,
+        disk: DiskBudget,
+        needs: fn(&[u8]) -> Option<[u8; 32]>,
+    ) -> Result<Self, ConsensusError> {
+        shell_node::ShellNode::open(config, root, log, parent_budget, disk, needs).map(|node| {
+            Self {
+                backend: Backend::Shell(node),
+            }
+        })
+    }
     pub fn group_id(&self) -> [u8; 16] {
         dispatch!(inner = &self.backend => inner.group_id())
     }
@@ -377,7 +398,7 @@ impl DurableNode {
     pub fn has_committed_current_term(&self) -> bool {
         dispatch!(inner = &self.backend => inner.has_committed_current_term())
     }
-    pub fn inject_fault_once(&mut self, point: FaultPoint) {
+    pub fn inject_fault_once(&mut self, point: FaultPoint) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.inject_fault_once(point))
     }
     /// Whether this node stopped on a dependency or persistence failure and
@@ -485,7 +506,7 @@ impl DurableNode {
     ) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.propose_membership(expected, change, context))
     }
-    pub fn shared_wal(&self) -> SharedWal {
+    pub fn shared_wal(&self) -> Result<SharedWal, ConsensusError> {
         dispatch!(inner = &self.backend => inner.shared_wal())
     }
     /// True from Ready acquisition until its full output prefix is released.

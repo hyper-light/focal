@@ -447,7 +447,9 @@ async fn interrupted_activation_recovers_the_logged_request_before_selecting_a_s
     replica
         .submit(request.clone(), &crate::cluster::NoDirectoryAuthority)
         .unwrap();
-    replica.inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall);
+    replica
+        .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall)
+        .unwrap();
     assert!(
         replica
             .drain(&crate::cluster::NoDirectoryAuthority)

@@ -58,7 +58,7 @@ fn alone() {
     let mut node = DurableNode::open(config(1, &[1]), dir.path()).unwrap();
     node.campaign().unwrap();
     drop(node.drain().unwrap());
-    let wal = node.shared_wal();
+    let wal = node.shared_wal().unwrap();
     let before = wal.stats().unwrap().group_commits;
     let mut latencies = Vec::with_capacity(ALONE);
     for round in 0..ALONE {
@@ -93,7 +93,7 @@ fn member(
             }
         }
     };
-    let wal = node.shared_wal();
+    let wal = node.shared_wal().unwrap();
     let before = wal.stats().unwrap().group_commits;
     'serve: loop {
         // Everything that waits is taken before the next drain: what came

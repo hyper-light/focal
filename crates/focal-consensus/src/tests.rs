@@ -162,7 +162,7 @@ fn io_failure_never_releases_commit_and_node_fail_stops() {
     node.campaign().unwrap();
     node.drain().unwrap();
     node.propose(b"uncertain".to_vec()).unwrap();
-    node.inject_fault_once(FaultPoint::AfterDataSync);
+    node.inject_fault_once(FaultPoint::AfterDataSync).unwrap();
     assert!(node.drain().is_err());
     assert!(matches!(
         node.propose(b"later".to_vec()),
@@ -300,7 +300,7 @@ impl Cluster {
     fn flushes(&self) -> Vec<u64> {
         self.nodes
             .iter()
-            .map(|node| node.shared_wal().stats().unwrap().group_commits)
+            .map(|node| node.shared_wal().unwrap().stats().unwrap().group_commits)
             .collect()
     }
     pub(crate) fn pump(&mut self, isolated: Option<u64>) {
@@ -418,7 +418,11 @@ fn a_commit_is_waited_for_by_no_write_and_is_written_behind_what_it_released() {
         }
         cluster.pump(None);
     }
-    let wals: Vec<SharedWal> = cluster.nodes.iter().map(DurableNode::shared_wal).collect();
+    let wals: Vec<SharedWal> = cluster
+        .nodes
+        .iter()
+        .map(|node| node.shared_wal().unwrap())
+        .collect();
     // Each member's entry is durable, by one flush each, before any disk is
     // held.
     cluster.nodes[0].propose(b"released".to_vec()).unwrap();
@@ -753,7 +757,9 @@ fn follower_io_failure_cannot_supply_a_quorum_acknowledgment() {
     {
         cluster.nodes[1].step(message).unwrap();
     }
-    cluster.nodes[1].inject_fault_once(FaultPoint::AfterDataSync);
+    cluster.nodes[1]
+        .inject_fault_once(FaultPoint::AfterDataSync)
+        .unwrap();
     assert!(cluster.nodes[1].drain().is_err());
     assert!(cluster.nodes[0].drain().unwrap().committed.is_empty());
     let failed = cluster.nodes.remove(1);

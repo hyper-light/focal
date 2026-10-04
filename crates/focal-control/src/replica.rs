@@ -763,8 +763,8 @@ impl ControlReplica {
         self.node.read_index(context)?;
         Ok(())
     }
-    pub fn inject_fault_once(&mut self, fault: FaultPoint) {
-        self.node.inject_fault_once(fault);
+    pub fn inject_fault_once(&mut self, fault: FaultPoint) -> Result<(), ControlError> {
+        Ok(self.node.inject_fault_once(fault)?)
     }
     pub fn report_snapshot(
         &mut self,

@@ -739,8 +739,8 @@ impl Session {
         self.consensus.persistence_pending()
     }
     /// Node ownership retains the physical writer across logical-session removal.
-    pub fn shared_wal(&self) -> focal_consensus::SharedWal {
-        self.consensus.shared_wal()
+    pub fn shared_wal(&self) -> Result<focal_consensus::SharedWal, LedgerError> {
+        Ok(self.consensus.shared_wal()?)
     }
     /// Includes unstarted Ready work, such as the internal leadership ReadIndex
     /// queued by the last publication. Idle owners need not poll their sessions.

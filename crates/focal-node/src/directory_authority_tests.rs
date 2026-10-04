@@ -421,7 +421,8 @@ async fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commi
     ));
     owner
         .replica
-        .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall);
+        .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall)
+        .unwrap();
     assert!(owner.drain().is_err());
     drop(owner);
     drop(network);

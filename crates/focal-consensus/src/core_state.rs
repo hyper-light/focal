@@ -96,7 +96,7 @@ pub(crate) fn check_message(config: &NodeConfig, message: &Message) -> Result<()
         || message
             .snapshot
             .as_deref()
-            .is_some_and(|snapshot| snapshot.data.len() > 8 * 1024 * 1024)
+            .is_some_and(|snapshot| snapshot.data.len() > IMAGE_BYTES)
     {
         return Err(ConsensusError::Capacity);
     }
@@ -326,6 +326,24 @@ pub(crate) fn committed_in_term<S: Storage>(raw: &RawNode<S>) -> bool {
     raw.store()
         .term(raw.raft.log().committed())
         .is_ok_and(|term| term == raw.raft.term())
+}
+
+/// Whether the configuration a snapshot states, `stated`, names every member of `current`, the
+/// one applied: Raft discards a snapshot that does not name its recipient.
+pub(crate) fn names_every_member(stated: &ConfState, current: &ConfState) -> bool {
+    let named = |node: &u64| {
+        stated.voters.contains(node)
+            || stated.learners.contains(node)
+            || stated.voters_outgoing.contains(node)
+            || stated.learners_next.contains(node)
+    };
+    current
+        .voters
+        .iter()
+        .chain(&current.learners)
+        .chain(&current.voters_outgoing)
+        .chain(&current.learners_next)
+        .all(named)
 }
 
 /// The status's scalars, copied: `applied` is what the owner was handed.

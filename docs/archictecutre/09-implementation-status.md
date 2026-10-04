@@ -13319,3 +13319,25 @@ shell. They change focal's elections and allocations, not its correctness:
 - a member keeps a spare message queue for each `Ready` whose write may be out.
 
 No manifest or locked dependency moved.
+
+### 2026-10-03 — DurableNode over the shell, its second backend
+
+[27](27-consensus-roadmap-and-slates-port.md) §15.7's backend in code. `DurableNode::open_on_shell`
+opens a member over hyper-durable's replica. Its log is one group of the node's hyper-log log, and
+its records and image are in the group's own files. The hand-over machine gives each committed
+entry to the owner's next drain, and focal-memory's budget sits under the replica's
+(`FocalBudget`). Every call the owners make answers, its checks the ones focal-log's backend makes
+(`core_state`, `DecoderGate`). Where §15.7 says the shell differs, it does:
+- no `PersistencePending`;
+- a leader's messages leave with the drive that made them;
+- a checkpoint and a decoder record are durable before their begin returns.
+
+`shared_wal` and `inject_fault_once` are focal-log's alone and are refused, typed, on the shell.
+They return a `Result` now, and their owners take it. A log whose frame cannot hold the group's
+largest entry is refused at open, since such an entry's write would fail and fence the member.
+
+The tests run over real files: contracts (a), (e), (f) and (g), a group of three electing,
+replicating and serving a follower's read, the owners' poll, wait and drain loop, and the wake
+signal. The backend takes calls hyper-durable gained for it: the core's priority and windows, the
+reads the replica holds, the budget's lane, and a wait on the group store. Only its tests construct
+it yet; the differential over the consensus simulations (§15.10) is next.
