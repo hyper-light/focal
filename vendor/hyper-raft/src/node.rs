@@ -484,13 +484,16 @@ impl<S: Storage> RawNode<S> {
         Ok(())
     }
     /// The owner is done with the messages a [`Ready`] or [`LightReady`]
-    /// gave: their vector, emptied, becomes the member's next queue of
-    /// messages, so its room is not grown again. Optional; a vector with no
-    /// more room than the member keeps already, or more than
+    /// gave: their vector, emptied, becomes the member's queue of messages
+    /// or a spare for a later one, so its room is not grown again. The
+    /// member keeps a spare for each `Ready` whose write may be out
+    /// ([`crate::Limits::readies_in_flight`]). Optional; a vector with no
+    /// more room than the spares the member keeps already, or more than
     /// [`crate::Limits::pending_messages`] slots, is dropped.
     pub fn recycle_messages(&mut self, emptied: Vec<Message>) {
-        let most = self.raft.config.limits.pending_messages;
-        self.raft.msgs.recycle(emptied, most);
+        let limits = &self.raft.config.limits;
+        let (most, keep) = (limits.pending_messages, limits.readies_in_flight);
+        self.raft.msgs.recycle(emptied, most, keep);
     }
     /// The owner holds what it was given to apply and takes no more until
     /// [`RawNode::resume_apply`] (core step R-6, an apply pause as etcd's

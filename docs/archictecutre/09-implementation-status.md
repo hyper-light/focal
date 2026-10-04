@@ -13487,3 +13487,22 @@ is due ([27](27-consensus-roadmap-and-slates-port.md) §15.7). `DecoderGate` hol
 moved from `LogNode`'s methods unchanged; `LogNode` stages and makes durable the write the gate asks
 for as before, and the shell's backend will write its group files for it. The decoder suites pass
 unchanged.
+
+### 2026-10-03 — the shared crates at the revision the shell's backend needs
+
+`vendor/` takes the six shared crates again at `1eae0dd`, its CI green on all six targets. The
+shell's backend ([27](27-consensus-roadmap-and-slates-port.md) §15.7) needs four calls hyper-durable
+gained there:
+- the owner's priority and a member's window, passed to the core through the replica;
+- the reads the replica holds for their apply, which an owner bounding reads counts beside the
+  core's;
+- the budget lent, so an owner whose budget charges by lane says which lane before a call;
+- a wait on the group store for the oldest write's answer, as `wait_persisted` waits.
+
+The same revision carries two changes to the core, found by mantle moving its range replica onto the
+shell. They change focal's elections and allocations, not its correctness:
+- a campaign drops the member's own vote requests that have not left, since the campaign asks every
+  voter again;
+- a member keeps a spare message queue for each `Ready` whose write may be out.
+
+No manifest or locked dependency moved.

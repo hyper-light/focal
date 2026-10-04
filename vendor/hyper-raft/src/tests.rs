@@ -1535,6 +1535,45 @@ fn one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has() {
     }
 }
 
+/// A campaign supersedes the vote requests of the member's earlier campaigns that are still
+/// waiting to be taken: each asked every voter, and the campaign after it asks each again, so
+/// an answer to one the member gave up can win it nothing. A member whose writes stay out for
+/// many election timeouts while its owner ticks it, a device stalled, then sends one
+/// campaign's requests when a `Ready` takes them again, not one campaign's for every timeout:
+/// mantle's range replica on the durable shell sent 234 at once, two for each of 117
+/// campaigns, after a hundred of the longest timeouts with three writes out (mantle
+/// `docs/design/replica.md` §3).
+#[test]
+fn a_campaign_supersedes_the_requests_of_those_before_it_still_waiting() {
+    let mut node = follower();
+    let timeout = node.raft.randomized_election_timeout();
+    // No `Ready` is taken through a hundred of the longest timeouts the core draws.
+    for _ in 0..100 * 2 * timeout {
+        node.tick().unwrap();
+    }
+    let asked: Vec<(MessageType, u64)> = node
+        .raft
+        .messages()
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.msg_type,
+                MessageType::MsgRequestPreVote | MessageType::MsgRequestVote
+            )
+        })
+        .map(|m| (m.msg_type, m.to))
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            (MessageType::MsgRequestPreVote, 1),
+            (MessageType::MsgRequestPreVote, 3)
+        ]
+    );
+    // What waits still adds up to its counter.
+    node.raft.msgs.check().unwrap();
+}
+
 /// A follower given patience campaigns only once its patience has passed
 /// beyond its election timeout; given none, at its timeout.
 #[test]

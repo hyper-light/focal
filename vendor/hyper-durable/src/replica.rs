@@ -971,6 +971,29 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.node.raft.set_patience(ticks);
     }
 
+    /// The member's election priority (`hyper_raft::RawNode::set_priority`): policy its owner
+    /// sets, never part of what is durable.
+    pub fn set_priority(&mut self, priority: i64) {
+        self.node.set_priority(priority);
+    }
+
+    /// While the member leads, `member` is sent no more than `bytes` of entries ahead of its
+    /// answers (`hyper_raft::RawNode::set_inflight_bytes`): what its owner learned the path to
+    /// it carries. False for a member the configuration does not name.
+    pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
+        self.node.set_inflight_bytes(member, bytes)
+    }
+
+    /// The owner's budget, for the owner to say what its next reservations are charged to.
+    pub fn budget_mut(&mut self) -> &mut B {
+        &mut self.budget
+    }
+
+    /// Reads a quorum confirmed that wait for the replica to apply through their index.
+    pub fn reads_held(&self) -> usize {
+        self.reads.len()
+    }
+
     /// Hands the lead to `to`.
     pub fn transfer(&mut self, to: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {

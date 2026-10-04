@@ -119,6 +119,35 @@ impl<F: BlockFile + 'static> GroupStore<F> {
         &self.group
     }
 
+    /// Waits until the oldest write out is answered whole: every part of it the log took, and
+    /// the parts behind them sent as answers free room. False when no part of it is with the
+    /// log, so no answer is coming to wait for; its answer is then taken by the next poll. The
+    /// wait is the log's own (`GroupLog::wait`), once for each part, and a part's refusal
+    /// answers the write.
+    pub fn wait(&mut self) -> bool {
+        loop {
+            self.send_queued();
+            let Some(front) = self.writes.front_mut() else {
+                return false;
+            };
+            if front.answered >= front.total {
+                return true;
+            }
+            if front.answered >= front.sent {
+                return false;
+            }
+            let Some(answer) = self.group.wait() else {
+                return false;
+            };
+            let answer = answer.map_err(|e| fault(&e));
+            let refused = answer.is_err();
+            front.answer(answer);
+            if refused {
+                self.drop_queued();
+            }
+        }
+    }
+
     fn fetch(&self, low: u64, high: u64, max_bytes: u64) -> Result<Fetched, StorageError> {
         let into = self.fetched.take().unwrap_or_default();
         self.group

@@ -500,9 +500,12 @@ pub struct Raft<S> {
 pub struct Outgoing {
     msgs: Vec<Message>,
     payload: usize,
-    /// An emptied queue an owner gave back ([`Outgoing::recycle`]), which
-    /// the next [`Outgoing::take`] leaves in place of the one it gives.
-    spare: Vec<Message>,
+    /// Emptied queues owners gave back ([`Outgoing::recycle`]), the least
+    /// room first: each [`Outgoing::take`] leaves the one with the most in
+    /// place of the queue it gives. At most one for each `Ready` whose
+    /// write may be out ([`Limits::readies_in_flight`]), since each such
+    /// write holds a queue the member gave until the owner gives it back.
+    spares: Vec<Vec<Message>>,
 }
 impl Outgoing {
     /// The fewest slots a queue is given: what a tick of a three-member
@@ -529,13 +532,21 @@ impl Outgoing {
     pub fn payload(&self) -> usize {
         self.payload
     }
-    /// The bytes held, by capacity: the slots, the spare queue's, and what
+    /// The bytes held, by capacity: the slots, the spare queues', and what
     /// the messages hold.
     pub fn resident_bytes(&self) -> usize {
+        let spare_slots = self.spares.iter().fold(0usize, |slots, spare| {
+            slots.saturating_add(spare.capacity())
+        });
         self.msgs
             .capacity()
-            .saturating_add(self.spare.capacity())
+            .saturating_add(spare_slots)
             .saturating_mul(std::mem::size_of::<Message>())
+            .saturating_add(
+                self.spares
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<Message>>()),
+            )
             .saturating_add(self.payload)
     }
     /// The most bytes the slots may grow by when `count` messages are
@@ -561,31 +572,74 @@ impl Outgoing {
         self.msgs.push(message);
         Ok(())
     }
+    /// Drops the vote requests of `id`'s own that wait, which a campaign it
+    /// begins supersedes: each asked every voter, and the campaign asks each
+    /// again, so an answer to one it gave up can win it nothing. A member
+    /// whose writes stay out through many election timeouts, its owner
+    /// ticking it, would otherwise send one campaign's requests for every
+    /// timeout once a `Ready` takes them again. Their bytes leave the
+    /// counter; the queue keeps its room.
+    fn supersede_requests(&mut self, id: NodeId) {
+        let mut dropped = 0usize;
+        self.msgs.retain(|message| {
+            let superseded = message.from == id
+                && matches!(
+                    message.msg_type,
+                    MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+                );
+            if superseded {
+                dropped = dropped.saturating_add(proto::message_bytes(message));
+            }
+            !superseded
+        });
+        self.payload = self.payload.saturating_sub(dropped);
+    }
     /// Everything queued, given up: the queue that remains holds nothing,
-    /// with the room of the spare an owner gave back, if any.
+    /// with the room of the largest spare an owner gave back, if any.
     pub fn take(&mut self) -> Vec<Message> {
         self.payload = 0;
-        let spare = std::mem::take(&mut self.spare);
+        let spare = self.spares.pop().unwrap_or_default();
         std::mem::replace(&mut self.msgs, spare)
     }
     /// An owner gives back a queue it has emptied, so the room a burst grew
     /// stays with the member rather than being grown again from
-    /// [`Outgoing::SMALLEST`]: it is the queue now if nothing waits, else the
-    /// next [`Outgoing::take`]'s. It is kept only where it has more room than
-    /// what it would replace, and no more than `most` slots, the most that
-    /// may wait ([`Limits::pending_messages`]); otherwise it is dropped.
-    pub(crate) fn recycle(&mut self, mut emptied: Vec<Message>, most: usize) {
+    /// [`Outgoing::SMALLEST`]: it is the queue now if nothing waits and it
+    /// has more room than the queue, else a spare for a later
+    /// [`Outgoing::take`]. Spares are kept up to `keep`, one for each
+    /// `Ready` whose write may be out ([`Limits::readies_in_flight`]): an
+    /// owner that takes `Ready`s ahead of their writes gives back each
+    /// write's queue only once it is durable, and with fewer spares than
+    /// writes out a `take` would start a queue from nothing and grow it
+    /// again. Past `keep`, a queue with more room replaces the spare with
+    /// the least. A queue of more than `most` slots, the most that may
+    /// wait ([`Limits::pending_messages`]), or of none, is dropped.
+    pub(crate) fn recycle(&mut self, mut emptied: Vec<Message>, most: usize, keep: usize) {
         emptied.clear();
-        let room = emptied.capacity();
-        if room > most {
+        if emptied.capacity() > most {
             return;
         }
-        if self.msgs.is_empty() {
-            if room > self.msgs.capacity() {
-                self.msgs = emptied;
+        if self.msgs.is_empty() && emptied.capacity() > self.msgs.capacity() {
+            emptied = std::mem::replace(&mut self.msgs, emptied);
+        }
+        let room = emptied.capacity();
+        if room == 0 {
+            return;
+        }
+        if self.spares.len() < keep {
+            if self.spares.capacity() == 0 && self.spares.try_reserve_exact(keep).is_err() {
+                return;
             }
-        } else if room > self.spare.capacity() {
-            self.spare = emptied;
+            let at = self.spares.partition_point(|spare| spare.capacity() < room);
+            self.spares.insert(at, emptied);
+        } else if self
+            .spares
+            .first()
+            .is_some_and(|least| least.capacity() < room)
+        {
+            let at = self.spares.partition_point(|spare| spare.capacity() < room);
+            // The spare with the least room leaves; `emptied` takes its place in order.
+            self.spares.remove(0);
+            self.spares.insert(at.saturating_sub(1), emptied);
         }
     }
     /// Whether the counter says what a walk of the messages says.
@@ -2174,6 +2228,9 @@ impl<S: Storage> Raft<S> {
         let (index, log_term) = (self.log.last_index()?, self.log.last_term()?);
         let (id, own_term, priority) = (self.id, self.term, self.priority_in_force);
         let Self { tracker, msgs, .. } = self;
+        // This campaign asks every voter: what an earlier one asked and has
+        // not yet left is superseded.
+        msgs.supersede_requests(id);
         let configuration = tracker.configuration();
         // Every voter of either half, once.
         for voter in configuration
@@ -3297,4 +3354,72 @@ pub(crate) fn held<S: Storage>(raft: &Raft<S>) -> Vec<(u64, u64)> {
         .iter()
         .map(|entry| (entry.index, entry.term))
         .collect()
+}
+
+#[cfg(test)]
+mod outgoing {
+    use super::{Outgoing, queue};
+    use crate::proto::Message;
+
+    fn filled(out: &mut Outgoing, count: usize) {
+        for _ in 0..count {
+            queue(out, Message::default(), None).unwrap();
+        }
+    }
+
+    /// An owner that takes `Ready`s ahead of their writes gives back each write's queue only once
+    /// the write is durable. The member keeps a spare for each `Ready` that may be out, so each
+    /// queue taken while writes are out starts with the room a burst grew rather than from
+    /// nothing: with one spare, as before, the second and third take after the queues came back
+    /// started from nothing (mantle's range group on hyper-durable, three writes out, grew its
+    /// followers' queues from four slots 155 times in 6,000 entries).
+    #[test]
+    fn a_member_keeps_a_spare_queue_for_each_ready_in_flight() {
+        for (keep, roomy) in [(1, 1), (3, 3)] {
+            let mut out = Outgoing::default();
+            let mut away = Vec::new();
+            for _ in 0..3 {
+                filled(&mut out, 8);
+                away.push(out.take());
+            }
+            filled(&mut out, 1);
+            for emptied in away {
+                out.recycle(emptied, 1 << 16, keep);
+            }
+            assert_eq!(out.spares.len(), keep);
+            let mut started_roomy = 0;
+            for _ in 0..3 {
+                drop(out.take());
+                if out.msgs.capacity() >= 8 {
+                    started_roomy += 1;
+                }
+                filled(&mut out, 1);
+            }
+            assert_eq!(started_roomy, roomy, "keeping {keep}");
+            out.check().unwrap();
+        }
+    }
+
+    /// Past what it keeps, a queue with more room replaces the spare with the least, the spares
+    /// stay ordered by room, and a queue of more than the most that may wait is dropped.
+    #[test]
+    fn spares_past_the_bound_keep_the_most_room() {
+        let mut out = Outgoing::default();
+        filled(&mut out, 1);
+        for room in [8usize, 4, 16, 32] {
+            out.recycle(Vec::with_capacity(room), 1 << 16, 2);
+        }
+        let rooms: Vec<usize> = out.spares.iter().map(Vec::capacity).collect();
+        assert_eq!(rooms, [16, 32]);
+        out.recycle(Vec::with_capacity(1 << 17), 1 << 16, 2);
+        let rooms: Vec<usize> = out.spares.iter().map(Vec::capacity).collect();
+        assert_eq!(rooms, [16, 32]);
+        // An empty queue takes the most room given back; what it had becomes a spare.
+        drop(out.take());
+        assert_eq!(out.msgs.capacity(), 32);
+        out.recycle(Vec::with_capacity(64), 1 << 16, 2);
+        assert_eq!(out.msgs.capacity(), 64);
+        let rooms: Vec<usize> = out.spares.iter().map(Vec::capacity).collect();
+        assert_eq!(rooms, [16, 32]);
+    }
 }
