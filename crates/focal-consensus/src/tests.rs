@@ -669,6 +669,52 @@ fn learner_requires_durable_catchup_and_installs_snapshot_before_promotion() {
     assert_eq!(events.committed[0].data, b"after-promotion");
 }
 
+/// A member behind the log's start is sent the snapshot, and its answer
+/// that it holds it is sent the entries after it in the same transition.
+/// The leader stages the larger of the two: priced as the snapshot alone, a
+/// small snapshot with larger entries behind it outgrew the reservation the
+/// answer was stepped under, and the leader stopped itself (`Capacity`, then
+/// failed), a member seated after a split never caught up (focal PR #4's
+/// split test on macOS and Windows CI).
+#[test]
+fn a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0]
+        .propose_conf_change(member_change(4, ConfChangeType::AddLearnerNode))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(4);
+    cfg.voters = vec![1, 2, 3];
+    cfg.learners = vec![4];
+    cluster
+        .nodes
+        .push(DurableNode::open(cfg, dir.path()).unwrap());
+    cluster.dirs.push(dir);
+    cluster.applied.push(Vec::new());
+    cluster.snapshots.push(Vec::new());
+    cluster.pump(Some(4));
+    // A snapshot of one byte, and pages of entries after it far larger.
+    let index = cluster.nodes[0].status().applied_index;
+    cluster.nodes[0].checkpoint(index, b"s".to_vec()).unwrap();
+    let entries: Vec<Vec<u8>> = (0..8u8).map(|byte| vec![byte; 16 * 1024]).collect();
+    for entry in &entries {
+        cluster.nodes[0].propose(entry.clone()).unwrap();
+    }
+    cluster.pump(Some(4));
+    for _ in 0..8 {
+        for node in &mut cluster.nodes {
+            node.tick().unwrap();
+        }
+        cluster.pump(None);
+    }
+    assert!(!cluster.nodes[0].failed(), "the leader stopped itself");
+    assert_eq!(cluster.snapshots[3].len(), 1);
+    assert_eq!(cluster.snapshots[3][0].data, b"s");
+    assert_eq!(cluster.applied[3], entries);
+}
+
 #[test]
 fn follower_io_failure_cannot_supply_a_quorum_acknowledgment() {
     let mut cluster = Cluster::new();

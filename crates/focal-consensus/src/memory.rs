@@ -234,6 +234,9 @@ pub(super) fn initial_bytes(config: &NodeConfig) -> Result<usize, ConsensusError
 /// may be, as many pages as its window admits: its places, and no more
 /// pages than hold the bytes it is bounded by and one page beyond them
 /// (`Inflights::full`: what is sent passes the bound by one entry at most).
+/// A member behind the log is sent the snapshot, or, once its answer says
+/// it holds the snapshot, the pages from the log's first entry: the larger
+/// of the two, and the window beyond the first page as for any member.
 /// Pages are read from the running totals the storage keeps beside its
 /// entries; the entries not yet durable are counted whole when a page
 /// reaches them. Nothing is walked but the members.
@@ -282,13 +285,12 @@ fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
         }
         // A member's answer may reject what was sent and move its next
         // index back to what it is known to hold: the page is priced from
-        // its matched index, the lowest an answer can reset it to; below
-        // the log, the snapshot.
+        // its matched index, the lowest an answer can reset it to. Below
+        // the log, the snapshot; and the answer that it holds the snapshot
+        // moves it to the log's first entry, whose pages may be larger.
         let from = progress.matched.saturating_add(1).min(progress.next_index);
-        if progress.pending_request_snapshot != 0 || from < first {
-            pages = add(pages, snapshot)?;
-            continue;
-        }
+        let behind = progress.pending_request_snapshot != 0 || from < first;
+        let from = if behind { first } else { from };
         // An answer may make the member one that is sent ahead of its
         // answers, with an empty window: priced by the bound, not by what
         // is left of it.
@@ -301,7 +303,7 @@ fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
         let admitted = window.min(usize::try_from(bounded).unwrap_or(usize::MAX));
         let one = pages_from(from, 1)?;
         let all = pages_from(from, admitted)?;
-        pages = add(pages, one)?;
+        pages = add(pages, if behind { one.max(snapshot) } else { one })?;
         window_more = window_more.max(all.saturating_sub(one));
     }
     add(pages, window_more)

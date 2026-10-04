@@ -13054,3 +13054,20 @@ judgement after the last of them. The judgement names its rule (`GiveUp::{Quiet,
 Withheld}`), the connection counts the bodies given up by each (`QuicRemote::given_up`),
 and the test takes either, a quiet one only where its samples, by their own spacing,
 cannot rule it out.
+
+
+### 2026-10-03 — a member past a small snapshot is staged for what follows it
+
+Found from PR #4's CI, where on macOS and Windows the split test's member seated after the
+split never caught up, and present on this core too. The destination's founder sent the member
+the snapshot, and the member's answer that it held it was refused: the step's reservation could
+not hold what the transition left. The core had queued the entries after the snapshot for the
+member, and the leader stopped itself (`Capacity`, then failed until reopened). The staging
+(`memory::sends_bytes`) priced a member behind the log's start as the snapshot alone. The answer
+that says the member holds the snapshot moves it to the log's first entry, and its page, and
+the window beyond it, are sent in that transition. A one-byte snapshot with pages of entries
+behind it is enough. Now such a member is priced at the larger of the snapshot and the pages
+from the log's first entry, and the window beyond them, as for any member.
+`a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging` fails on 27b0531
+(the leader's step refused) and passes after. PR #4's core made the split test meet it under the
+whole focal-node suite's load: 4 of 7 failed without the fix, none of 6 with it.
