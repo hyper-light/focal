@@ -26,6 +26,17 @@ pub enum SessionFact {
         next: focal_directory::GroupAuthorityGrant,
         record: crate::placement_proof::MembershipRecord,
     },
+    /// A delegation fence a partition group's voter approves — the group
+    /// a split's or merge's source (`source`) or its destination — signed
+    /// by a node that hosts a replica of the group (24 §13). The root
+    /// verifies the fence against the sealed state it names; a voter's
+    /// signature is the group's approval, a majority of its installed
+    /// voters' the proof.
+    Delegation {
+        group: focal_directory::LogGroupId,
+        fence: focal_directory::DelegationFence,
+        source: bool,
+    },
 }
 /// The body of `Operation::SessionSign`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +58,7 @@ pub enum SessionSignReply {
 pub(crate) fn decode_placement_control(
     verified: &VerifiedRequest,
     bytes: &[u8],
+    cluster: [u8; 16],
 ) -> Result<ControlRpc, ControlFailure> {
     let PeerRole::Node { node_id } = verified.peer().role() else {
         return Err(ControlFailure::Unauthorized);
@@ -65,13 +77,31 @@ pub(crate) fn decode_placement_control(
             let ControlRpc::Submit(request) = &rpc else {
                 return Err(ControlFailure::Unauthorized);
             };
-            // The request client is the sender's enrolled principal, or the
+            // The request client is the sender's enrolled principal, the
             // client its root intents are named by (distinct from its
-            // partition intents, which share this owner's receipt space).
+            // partition intents, which share this owner's receipt space),
+            // or the local client its own agent is named by — bound to the
+            // node as the others are, and the name of a partition intent it
+            // journaled while it led the partition and now submits through
+            // the node that leads it (F24).
             let principal = verified.peer().principal().0;
-            if request.id.client != principal && request.id.client != root_intent_client(principal)
+            if request.id.client != principal
+                && request.id.client != root_intent_client(principal)
+                && request.id.client
+                    != crate::placement_agent::PlacementAgent::local_client(cluster, node_id)
             {
                 return Err(ControlFailure::Unauthorized);
+            }
+            // A group's membership change carries its own authority: the
+            // proof the group's installed voters signed, which the root
+            // verifies (24 §13). Whichever node leads the group intends it,
+            // the root's leader included (F24).
+            if let ControlCommand::Authority(focal_directory::AuthorityCommand {
+                operation: focal_directory::AuthorityOperation::ChangeGroup { .. },
+                ..
+            }) = &request.command
+            {
+                return Ok(rpc);
             }
             // A node bootstraps the group of a session it created alone: a
             // grant naming only itself (24 §16); every other root authority
@@ -194,6 +224,9 @@ pub struct AgentStatus {
     pub last_error: Option<String>,
     /// The last intent the owner refused before admission (24 §7).
     pub last_refusal: Option<String>,
+    /// The intent the owner has not decided yet, asked again each pass,
+    /// with how often it was asked and the last answer.
+    pub retrying: Option<String>,
     /// The tenants this node hosts, their queues, and the node's memory and
     /// volume envelopes.
     pub admission: crate::admission::AdmissionReport,
@@ -210,6 +243,9 @@ pub enum AgentJob {
     CreateSession(Box<CreateSessionJob>),
     /// Plan a session's placement under a requested durability.
     PlanSession(Box<PlanSessionJob>),
+    /// Plan the root group's voters under a requested durability (the
+    /// audit's F24).
+    PlanControl(Box<PlanControlJob>),
     /// Move one member of a session's range group to a node (25 §6).
     MoveRange(Box<MoveRangeJob>),
     /// Restore a session from a verified backup onto this node (26 §6).
@@ -239,10 +275,42 @@ pub struct PlanSessionJob {
     pub dry_run: bool,
     pub reply: oneshot::Sender<Result<PlannedSession, crate::placement_agent::AgentError>>,
 }
+/// One operator request for the root group's voters under a durability,
+/// answered from the partition as last observed and the root as observed
+/// now; nothing is journaled, promotion being the operator's own exact
+/// request through the root (F24).
+pub struct PlanControlJob {
+    pub durability: focal_directory::DurabilityIntent,
+    pub reply: oneshot::Sender<Result<PlannedControl, crate::placement_agent::AgentError>>,
+}
+/// The root voters a durability needs, at the root configuration they were
+/// planned against: `Satisfied` with the voters there are when those already
+/// tolerate the failures asked for, `Planned` with the solver's otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedControl {
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    pub state: PlanState,
+    /// The directory's partition groups, planned by the same rule (F24).
+    pub partitions: Vec<PlannedPartition>,
+}
+/// One partition group's voters under the requested durability, at the
+/// group's configuration they were planned against; `Refused` where no set
+/// of nodes seats it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPartition {
+    pub partition: [u8; 16],
+    pub group: [u8; 16],
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    pub state: PlanState,
+    pub refused: bool,
+}
 /// How a plan request was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanState {
-    /// A plan under the requested durability was journaled for the partition.
+    /// A plan under the requested durability committed: the directory pends
+    /// it, and the controller executes it from here.
     Planned,
     /// The session already has a pending plan; this is it.
     Pending,
@@ -392,6 +460,24 @@ impl PlacementHandle {
             .await
             .map_err(|_| crate::placement_agent::AgentError::Stopped)?
     }
+    /// The root group's voters under `durability` (F24).
+    pub async fn plan_control(
+        &self,
+        durability: focal_directory::DurabilityIntent,
+    ) -> Result<PlannedControl, crate::placement_agent::AgentError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::PlanControl(Box::new(PlanControlJob {
+            durability,
+            reply,
+        })))
+        .map_err(|error| match error {
+            PlacementProofError::Capacity => crate::placement_agent::AgentError::Capacity,
+            _ => crate::placement_agent::AgentError::Stopped,
+        })?;
+        receive
+            .await
+            .map_err(|_| crate::placement_agent::AgentError::Stopped)?
+    }
     /// Move one member of a session's range group to `node` (25 §6); the
     /// reply names the transfer the request denotes.
     pub async fn move_range(
@@ -461,23 +547,30 @@ impl PlacementHandle {
 pub async fn sign_session_fact(
     fleet: &FleetManager,
     control: &ControlHost,
+    directory: &crate::network_service::DirectoryHandle,
     signer: &PlacementHandle,
     ledger: focal_model::LedgerId,
     fact: SessionFact,
     window: ProofWindow,
 ) -> Result<AccountedAuthorityProof, PlacementProofError> {
-    let permit = prepare_session_fact(fleet, control, ledger, fact, window).await?;
+    let permit = prepare_session_fact(fleet, control, directory, ledger, fact, window).await?;
     signer.sign(permit).await
 }
 
-/// Witness `fact` locally and prepare the permit; the caller signs it.
+/// Witness `fact` locally and prepare the permit; the caller signs it. A
+/// fact under the directory's own namespace is a partition group's (F24):
+/// its membership is witnessed from this node's replica of that group.
 pub async fn prepare_session_fact(
     fleet: &FleetManager,
     control: &ControlHost,
+    directory: &crate::network_service::DirectoryHandle,
     ledger: focal_model::LedgerId,
     fact: SessionFact,
     window: ProofWindow,
 ) -> Result<crate::placement_proof::SessionProofPermit, PlacementProofError> {
+    if ledger == directory.namespace() {
+        return prepare_partition_fact(control, directory, fact, window).await;
+    }
     let host = fleet
         .current_host(ledger)
         .map_err(|_| PlacementProofError::Unauthorized)?;
@@ -533,5 +626,71 @@ pub async fn prepare_session_fact(
             }
             control.prepare_membership_proof(next, record, window).await
         }
+        // A delegation fence is a partition group's fact, under the
+        // directory's namespace.
+        SessionFact::Delegation { .. } => Err(PlacementProofError::Unauthorized),
     }
+}
+/// Witness a partition group's membership from this node's replica of it:
+/// the configuration it applied and the entry that changed it, the same on
+/// every member, so the root's grant follows the group's log (F24).
+async fn prepare_partition_fact(
+    control: &ControlHost,
+    directory: &crate::network_service::DirectoryHandle,
+    fact: SessionFact,
+    window: ProofWindow,
+) -> Result<crate::placement_proof::SessionProofPermit, PlacementProofError> {
+    let (next, record) = match fact {
+        SessionFact::Membership { next, record } => (next, record),
+        // A fence a voter of the group approves: signed where the node
+        // hosts a replica of the group — the control host checks that the
+        // node votes in it under the installed authority.
+        SessionFact::Delegation {
+            group,
+            fence,
+            source,
+        } => {
+            directory
+                .host_of_group(group.0)
+                .ok_or(PlacementProofError::Unauthorized)?;
+            return control
+                .prepare_delegation_proof(group, fence, source, window)
+                .await;
+        }
+        SessionFact::Placement(_) => return Err(PlacementProofError::Unauthorized),
+    };
+    let host = directory
+        .host_of_group(next.group.0)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let witness = host
+        .witness_membership()
+        .await
+        .map_err(|error| match error {
+            focal_control::ControlFailure::Capacity => PlacementProofError::Capacity,
+            focal_control::ControlFailure::Unavailable
+            | focal_control::ControlFailure::NotReady => PlacementProofError::Unavailable,
+            _ => PlacementProofError::Unauthorized,
+        })?;
+    let configuration = &witness.configuration.configuration;
+    let same = |applied: &[u64], granted: &std::collections::BTreeMap<u64, u64>| {
+        applied.iter().copied().eq(granted.keys().copied())
+    };
+    let latest = witness
+        .record
+        .as_ref()
+        .ok_or(PlacementProofError::Unauthorized)?;
+    if !same(&configuration.voters, &next.voters)
+        || !same(&configuration.voters_outgoing, &next.outgoing_voters)
+        || !same(&configuration.learners, &next.learners)
+        || !configuration.learners_next.is_empty()
+        || configuration.auto_leave
+        || latest.index != witness.configuration.configuration_index
+        || latest.index != record.index.0
+        || latest.term != record.term.0
+        || latest.request_hash != record.record_hash.0
+        || latest.configuration != *configuration
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    control.prepare_membership_proof(next, record, window).await
 }

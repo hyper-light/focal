@@ -27,10 +27,54 @@ pub struct AdminNodeHealth {
     /// a network service.
     #[serde(default)]
     pub placement: Option<AdminPlacementAgent>,
+    /// The directory partition groups this node hosts a replica of (24 §13;
+    /// the audit's F24), each with where it stands.
+    #[serde(default)]
+    pub partitions: Vec<AdminHostedPartition>,
+    /// The partitions this node was asked to host and has not opened yet,
+    /// with the permit refusals so far.
+    #[serde(default)]
+    pub partitions_pending: Vec<AdminPendingPartition>,
 }
-/// The node's readiness (doc 08 §9): the four probes a supervisor asks,
+/// A partition whose hosting is under way on this node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPendingPartition {
+    pub partition: String,
+    pub group: String,
+    pub host: u64,
+    pub attempts: u32,
+    pub last_refusal: Option<String>,
+}
+/// One hosted partition replica's progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminHostedPartition {
+    pub partition: String,
+    pub group: String,
+    /// The node this replica runs as: the founder, or a seated member.
+    pub host: u64,
+    pub leader: u64,
+    pub term: u64,
+    pub applied_index: u64,
+    pub stopped: bool,
+    /// The root index whose authority this replica's refresh last
+    /// installed, and the refusal of its last attempt where it did not
+    /// (a permit the root refused, or an install the group refused; none
+    /// while it follows the group's leader, which installs).
+    #[serde(default)]
+    pub authority_installed_index: u64,
+    #[serde(default)]
+    pub authority_refused: Option<String>,
+}
+/// The node's readiness (doc 08 §9): the five probes a supervisor asks,
 /// with the facts they are derived from. `alive` holds whenever the node
-/// answers; `catching_up` when every replica it hosts and its root replica
+/// answers; `serving` when its owners run — the root replica's and every
+/// installed session's, none stopped, on request or on a failure — which
+/// is what a supervisor's readiness asks: it never requires leadership or
+/// a quorum, since a readiness that failed for a missing quorum would take
+/// the pod from the endpoints its peers need to re-form one (the audit's
+/// F25); `catching_up` when every replica it hosts and its root replica
 /// follow a known leader with nothing pending but the node leads none of
 /// them; `authoritative` when it leads the root or a hosted session's log
 /// at a committed prefix; `policy_satisfied` when every session it hosts
@@ -41,9 +85,15 @@ pub struct AdminNodeHealth {
 pub struct AdminReadiness {
     pub node: u64,
     pub alive: bool,
+    #[serde(default)]
+    pub serving: bool,
     pub catching_up: bool,
     pub authoritative: bool,
     pub policy_satisfied: bool,
+    /// The root group's voters tolerate the failures the committed policy
+    /// promises (the audit's F24); part of `policy_satisfied`.
+    #[serde(default)]
+    pub control_satisfied: bool,
     pub root: AdminRootProgress,
     pub sessions: Vec<AdminSessionReadiness>,
     /// Sessions beyond the report bound were left out (and count as not
@@ -57,6 +107,17 @@ pub struct AdminRootProgress {
     pub term: u64,
     pub applied_index: u64,
     pub stopped: bool,
+    /// Where each other member's log stands as this node, when it leads,
+    /// knows it: what a promotion waits on (the audit's F24).
+    #[serde(default)]
+    pub peers: Vec<AdminPeerProgress>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPeerProgress {
+    pub node: u64,
+    pub matched: u64,
+    pub recent_active: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +153,11 @@ pub struct AdminPlacementAgent {
     /// by kind and failure; cleared by the next intent that commits.
     #[serde(default)]
     pub last_refusal: Option<String>,
+    /// The intent its owner has not decided yet, asked again each pass:
+    /// its journal, sequence and kind, how often it was asked and the
+    /// last answer; cleared once it is decided.
+    #[serde(default)]
+    pub retrying: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,6 +218,16 @@ pub struct AdminReplicaDiagnostics {
     /// Entries applied past the last snapshot: the log kept beyond the
     /// checkpoint (26 §3).
     pub log_entries_since_checkpoint: u64,
+    /// The decoder promises this replica holds and the configuration index
+    /// they were recorded at (24 §21): a learner is admitted to a native
+    /// group, and a voter promoted, only once its promise is held at the
+    /// current index — what a held admission waits on.
+    #[serde(default)]
+    pub promises_at: Option<u64>,
+    #[serde(default)]
+    pub managed_promises: Vec<u64>,
+    #[serde(default)]
+    pub native_promises: Vec<u64>,
     /// The retention floor of a native session and its inputs (26 §3):
     /// the published prefix, what registered consumers still need, what
     /// the archive reports holding, the least of them, and what holds the
@@ -305,6 +381,10 @@ pub struct AdminArchiveAgent {
     pub proposed: u64,
     /// Bundles sealed whose required copies have not all answered yet.
     pub waiting: u64,
+    /// Seal records proposed (F12), and seal bundles whose required copies
+    /// have not all answered yet.
+    pub seals_proposed: u64,
+    pub seals_waiting: u64,
     pub last_tick_ms: u64,
 }
 /// One hosted native session's retention as the storage view lists it.
@@ -573,6 +653,18 @@ pub struct AdminRangeView {
     pub pending: Option<AdminRangePending>,
     pub history: Vec<AdminRangeHistory>,
 }
+/// An issuer credentials chain to, as the admin reports it (24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminIssuerRecord {
+    pub fingerprint: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    /// Endorsed by the issuer it succeeded: presented beside it in every
+    /// chain, so a verifier holding the predecessor alone accepts it.
+    pub endorsed: bool,
+    /// When it was staged, for a successor not yet issuing.
+    pub staged_at: Option<i64>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminResult {
@@ -732,6 +824,10 @@ pub enum AdminResult {
     NodeRemoved {
         node: u64,
         membership_removed: bool,
+        /// The directory partition groups the node was seated in and taken
+        /// out of before it left the root (24 §13).
+        #[serde(default)]
+        partitions_vacated: u32,
         invitation: Option<String>,
         revoked: bool,
         /// Its committed contact record was retired (24 §19), freeing the
@@ -782,6 +878,17 @@ pub enum AdminResult {
         key_identity: String,
         renewals: u64,
         rotations: u64,
+    },
+    /// The issuers the cluster's credentials chain to, as committed (24
+    /// §11): the one issuing, one staged to succeed it, the one it
+    /// succeeded while a credential issued under it lives, and the upgrade
+    /// fence the succession is gated on.
+    Issuers {
+        current: AdminIssuerRecord,
+        successor: Option<AdminIssuerRecord>,
+        retiring: Option<AdminIssuerRecord>,
+        fence_level: u32,
+        succession_level: u32,
     },
     /// Every directory partition this node acts on, with each session's
     /// desired and achieved guarantee and what blocks it.
@@ -838,6 +945,50 @@ pub struct AdminPlacement {
     /// When the agent last observed these partitions (unix seconds).
     pub observed_at: i64,
     pub partitions: Vec<AdminPartition>,
+    /// The control plane's own survival (24 §15, the audit's F24): the root
+    /// group, every directory partition's group and the issuer, each
+    /// measured against the live nodes by the rule the sessions are. Absent
+    /// when the node could not observe its root.
+    #[serde(default)]
+    pub control: Option<AdminControlPlane>,
+}
+/// What the control plane survives: a session's data is only as available
+/// as the metadata that routes to it, places it and admits its members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminControlPlane {
+    pub root: AdminControlGroup,
+    /// The directory partitions' groups, in the root's delegation order.
+    pub partitions: Vec<AdminControlGroup>,
+    pub issuer: AdminIssuer,
+}
+/// One control group: its voters, what they tolerate of each failure class
+/// as a quorum, and what stands in the way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminControlGroup {
+    /// `root` or `partition`.
+    pub kind: String,
+    pub group: String,
+    /// The partition a partition group serves.
+    pub partition: Option<String>,
+    pub leader: u64,
+    pub configuration_index: u64,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    /// The failures of nodes, zones and regions the voters tolerate; absent
+    /// for a class a voter's domain is unknown in.
+    pub tolerates_node: Option<u16>,
+    pub tolerates_zone: Option<u16>,
+    pub tolerates_region: Option<u16>,
+    pub blocked_by: Vec<String>,
+}
+/// Who can sign credentials: the issuer's key is held by the nodes listed,
+/// and the signing service tolerates the loss of all but one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminIssuer {
+    pub holders: Vec<u64>,
+    pub tolerates_node: u16,
+    /// What limits the issuer's survival, in words an operator acts on.
+    pub note: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminPartition {

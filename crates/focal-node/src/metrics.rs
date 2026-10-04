@@ -17,6 +17,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Sessions a snapshot lists at most; more are counted as truncated.
 pub const MAX_SESSIONS: usize = 512;
+/// Scrapes the loopback endpoint serves at once: as many as the admin
+/// socket admits operators; a connection beyond them is closed unanswered,
+/// as the socket closes one.
+pub fn max_scrapes() -> usize {
+    crate::network_admin::admin_wire_limits().max_connections
+}
 /// The longest request the loopback endpoint reads.
 const MAX_REQUEST_BYTES: usize = 4096;
 
@@ -57,6 +63,12 @@ pub struct RootMetrics {
     /// Periods the root owner has run since it started: its progress, which
     /// a wait on this node is charged in (27 §3.1 P8).
     pub periods: u64,
+    /// Exchanges of the root replica the driver could not make at all, each
+    /// told to the core; reports coalesced into a peer already held, and
+    /// reports dropped beyond the bound (27 §3.3).
+    pub peers_unreachable: u64,
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerRtt {
@@ -86,6 +98,9 @@ pub struct CredentialMetrics {
 pub struct SessionMetrics {
     pub tenant: String,
     pub session: String,
+    /// Whether the session's owner answered this round; without it the
+    /// owner-side series are absent from the text, never zero.
+    pub observed: bool,
     pub leader: u64,
     pub term: u64,
     pub committed_index: u64,
@@ -112,9 +127,18 @@ pub struct SessionMetrics {
     /// measured tail it was derived from, in microseconds, and how many
     /// round trips fed it (27 §3.1 P2).
     pub tick_period_ms: u64,
+    /// Periods the session's owner has run: the unit its replica's election
+    /// timer counts, and what a wait on it is charged in (27 §3.1 P8).
+    pub periods: u64,
     /// Periods in which the owner's replica was not ticked: it was
     /// refused the room or still persisted.
     pub refused_periods: u64,
+    /// Exchanges of the session's replica the driver could not make at
+    /// all, each told to the core (27 §3.3); reports coalesced into a peer
+    /// already held for the core, and reports dropped beyond the bound.
+    pub peers_unreachable: u64,
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
     /// The longest a period of the owner took, in milliseconds
     /// (`RootMetrics::longest_period_ms`).
     pub longest_period_ms: u64,
@@ -154,9 +178,64 @@ pub struct MetricsSnapshot {
     pub credential: Option<CredentialMetrics>,
     pub sessions: Vec<SessionMetrics>,
     pub sessions_truncated: bool,
+    /// Sessions asked in this round whose owner had not answered when the
+    /// round closed — refused at its door, gone, or late (the audit's F65).
+    /// Their entries carry what the node knows without the owner, and say
+    /// so.
+    pub sessions_unobserved: u64,
+    /// How long the round took to observe what it could, in milliseconds;
+    /// a round closes at the sampling cadence.
+    pub collection_ms: u64,
     pub agent: Option<AgentMetrics>,
     pub fence_level: u32,
     pub announced_level: u32,
+}
+/// A published sample: the snapshot and its text, rendered once when it was
+/// sampled (the audit's F65). Every reader — the admin socket's and the
+/// loopback's — serves the text as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsPage {
+    pub snapshot: MetricsSnapshot,
+    pub text: String,
+}
+impl MetricsPage {
+    pub fn new(snapshot: MetricsSnapshot) -> Self {
+        let text = snapshot.render();
+        Self { snapshot, text }
+    }
+}
+/// Every session asked at once and each answer taken as it comes, the round
+/// closed at `deadline` (the audit's F65): an ask not answered by then is
+/// left unobserved and dropped with the set — never in the way of another,
+/// never passed over in silence, since the caller reads the gap. The asks
+/// are bounded by their number and each by the charge it made at its owner.
+pub async fn collect<T, F>(asks: Vec<F>, deadline: tokio::time::Instant) -> Vec<Option<T>>
+where
+    T: Send + 'static,
+    F: Future<Output = Option<T>> + Send + 'static,
+{
+    let mut answers: Vec<Option<T>> = Vec::new();
+    if answers.try_reserve_exact(asks.len()).is_err() {
+        return answers;
+    }
+    answers.resize_with(asks.len(), || None);
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, ask) in asks.into_iter().enumerate() {
+        tasks.spawn(async move { (index, ask.await) });
+    }
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(Ok((index, answer)))) => {
+                if let Some(slot) = answers.get_mut(index) {
+                    *slot = answer;
+                }
+            }
+            // A task that ended without an answer stays unobserved.
+            Ok(Some(Err(_))) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    answers
 }
 
 fn escape(value: &str, out: &mut String) {
@@ -232,6 +311,11 @@ impl MetricsSnapshot {
             "focal_metrics_sampled_milliseconds",
             "When this snapshot was sampled, milliseconds since the Unix epoch.",
             self.sampled_ms,
+        );
+        text.gauge(
+            "focal_metrics_collection_milliseconds",
+            "How long the sample took to observe its sessions; a round closes at the sampling cadence.",
+            self.collection_ms,
         );
         text.gauge(
             "focal_memory_limit_bytes",
@@ -318,6 +402,41 @@ impl MetricsSnapshot {
                 "Records the WAL index holds.",
                 wal.indexed_records,
             );
+            text.gauge(
+                "focal_wal_physical_bytes",
+                "Bytes of every frame the WAL holds from its base to its tail.",
+                wal.physical_bytes,
+            );
+            text.gauge(
+                "focal_wal_live_bytes",
+                "Bytes of the WAL's live frames.",
+                wal.live_bytes,
+            );
+            text.counter(
+                "focal_wal_checkpoint_bytes_total",
+                "Bytes group checkpoints wrote: their records and floors.",
+                wal.checkpoint_bytes,
+            );
+            text.counter(
+                "focal_wal_reclaimed_bytes_total",
+                "Bytes of the frames the WAL's base passed.",
+                wal.reclaimed_bytes,
+            );
+            text.counter(
+                "focal_wal_reclaimed_segments_total",
+                "Segments removed behind the WAL's base.",
+                wal.reclaimed_segments,
+            );
+            text.counter(
+                "focal_wal_relocated_records_total",
+                "Live frames the WAL's base met and wrote again at the tail.",
+                wal.relocated_records,
+            );
+            text.counter(
+                "focal_wal_relocated_bytes_total",
+                "Bytes of the frames written again at the tail.",
+                wal.relocated_bytes,
+            );
         }
         text.gauge(
             "focal_fleet_installed",
@@ -378,6 +497,21 @@ impl MetricsSnapshot {
             "focal_root_periods_refused_total",
             "Periods in which the root replica was not ticked: it was refused the room, or still persisted what the tick before had left.",
             self.root.refused_periods,
+        );
+        text.counter(
+            "focal_root_peers_unreachable_total",
+            "Exchanges of the root replica the driver could not make at all, each told to the core, which probes the peer instead of streaming to it.",
+            self.root.peers_unreachable,
+        );
+        text.counter(
+            "focal_root_peer_reports_coalesced_total",
+            "Reports of a lost exchange with a peer the root owner already held for the core: coalesced into the one it holds.",
+            self.root.peer_reports_coalesced,
+        );
+        text.counter(
+            "focal_root_peer_reports_dropped_total",
+            "Reports of a lost exchange dropped because the root owner held reports for as many peers as a configuration can name.",
+            self.root.peer_reports_dropped,
         );
         text.gauge(
             "focal_root_period_longest_ms",
@@ -524,9 +658,17 @@ impl MetricsSnapshot {
         for (bound, refused) in [
             ("handshakes", self.listener.refused_pending),
             ("identities", self.listener.refused_identities),
+            ("connections", self.listener.refused_connections),
+            ("bytes", self.listener.refused_bytes),
+            ("memory", self.listener.refused_memory),
         ] {
             text.labeled("focal_listener_refused_total", &[("bound", bound)], refused);
         }
+        text.gauge(
+            "focal_listener_ingress_bytes",
+            "Bytes of request bodies permitted to the listener's identities and not yet given back.",
+            self.listener.bytes,
+        );
         if !self.peer_rtts.is_empty() {
             text.header(
                 "focal_peer_rtt_ms",
@@ -696,11 +838,41 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 27] = [
+        text.gauge(
+            "focal_metrics_sessions_unobserved",
+            "Sessions asked whose owner had not answered when the round closed.",
+            self.sessions_unobserved,
+        );
+        let series: [(&str, &str, &str); 32] = [
+            (
+                "focal_session_observed",
+                "gauge",
+                "Whether the session's owner answered this round; without it the owner-side series are absent.",
+            ),
+            (
+                "focal_session_periods_total",
+                "counter",
+                "Periods the session's owner has run since it started: the unit its replica's election timer counts.",
+            ),
             (
                 "focal_session_periods_refused_total",
                 "counter",
                 "Periods in which the session's replica was not ticked: it was refused the room, or still persisted.",
+            ),
+            (
+                "focal_session_peers_unreachable_total",
+                "counter",
+                "Exchanges of the session's replica the driver could not make at all, each told to the core, which probes the peer instead of streaming to it.",
+            ),
+            (
+                "focal_session_peer_reports_coalesced_total",
+                "counter",
+                "Reports of a lost exchange with a peer the session's owner already held for the core: coalesced into the one it holds.",
+            ),
+            (
+                "focal_session_peer_reports_dropped_total",
+                "counter",
+                "Reports of a lost exchange dropped because the owner held reports for as many peers as a configuration can name; the peer's next lost exchange reports it.",
             ),
             (
                 "focal_session_period_longest_ms",
@@ -836,8 +1008,20 @@ impl MetricsSnapshot {
                     ("tenant", session.tenant.as_str()),
                     ("session", session.session.as_str()),
                 ];
+                if !session.observed && owner_side(name) {
+                    continue;
+                }
                 let value: Option<u64> = match name {
+                    "focal_session_observed" => Some(u64::from(session.observed)),
+                    "focal_session_periods_total" => Some(session.periods),
                     "focal_session_periods_refused_total" => Some(session.refused_periods),
+                    "focal_session_peers_unreachable_total" => Some(session.peers_unreachable),
+                    "focal_session_peer_reports_coalesced_total" => {
+                        Some(session.peer_reports_coalesced)
+                    }
+                    "focal_session_peer_reports_dropped_total" => {
+                        Some(session.peer_reports_dropped)
+                    }
                     "focal_session_period_longest_ms" => Some(session.longest_period_ms),
                     "focal_session_leader" => Some(session.leader),
                     "focal_session_preferred_leader" => session.preferred_leader,
@@ -892,54 +1076,94 @@ impl MetricsSnapshot {
     }
 }
 
-/// Serve the latest snapshot as `GET /metrics` over HTTP/1.0 on a loopback
-/// listener: one connection at a time, a bounded request, no other path.
+/// The series a session's owner alone can answer.
+fn owner_side(name: &str) -> bool {
+    matches!(
+        name,
+        "focal_session_committed_index"
+            | "focal_session_applied_index"
+            | "focal_session_apply_lag"
+            | "focal_session_sequence"
+            | "focal_session_pending"
+            | "focal_session_authoritative"
+            | "focal_session_preferred_leader"
+            | "focal_session_leader_returns_total"
+            | "focal_session_leader_returns_failed_total"
+            | "focal_session_log_entries_since_checkpoint"
+            | "focal_session_retention_published"
+            | "focal_session_retention_cursors"
+            | "focal_session_retention_floor"
+            | "focal_session_cursor_lag"
+            | "focal_session_seed_chunks_missing"
+            | "focal_session_custody_objects_missing"
+    )
+}
+
+/// Serve the latest page as `GET /metrics` over HTTP/1.0 on a loopback
+/// listener: the request is read and judged first, under its bound, and
+/// only then is the page's text — rendered once when it was sampled —
+/// written; as many connections at once as the admin socket admits
+/// operators, one beyond them closed unanswered; no other path.
 pub async fn serve_loopback(
     listener: tokio::net::TcpListener,
-    view: tokio::sync::watch::Receiver<Option<MetricsSnapshot>>,
+    view: tokio::sync::watch::Receiver<Option<MetricsPage>>,
 ) -> std::io::Result<()> {
+    let at_once = max_scrapes();
+    let mut serving = tokio::task::JoinSet::new();
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let body = view
-            .borrow()
-            .as_ref()
-            .map(MetricsSnapshot::render)
-            .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
-        let handled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 512];
-            loop {
-                let read = stream.read(&mut buffer).await?;
-                if read == 0 {
-                    break;
+        while serving.try_join_next().is_some() {}
+        if serving.len() >= at_once {
+            drop(stream);
+            continue;
+        }
+        let view = view.clone();
+        serving.spawn(async move {
+            let handled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 512];
+                loop {
+                    let read = stream.read(&mut buffer).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
+                    if request.len() > MAX_REQUEST_BYTES
+                        || request.windows(4).any(|w| w == b"\r\n\r\n")
+                    {
+                        break;
+                    }
                 }
-                request.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
-                if request.len() > MAX_REQUEST_BYTES || request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let line = request
-                .split(|byte| *byte == b'\n')
-                .next()
-                .unwrap_or(&[]);
-            let line = String::from_utf8_lossy(line);
-            let mut parts = line.split_whitespace();
-            let (status, payload) = match (parts.next(), parts.next()) {
-                (Some("GET"), Some("/metrics")) => ("200 OK", body.as_str()),
-                (Some("GET"), Some(_)) => ("404 Not Found", "not found\n"),
-                _ => ("405 Method Not Allowed", "GET /metrics only\n"),
-            };
-            let head = format!(
-                "HTTP/1.0 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                payload.len()
-            );
-            stream.write_all(head.as_bytes()).await?;
-            stream.write_all(payload.as_bytes()).await?;
-            stream.shutdown().await
-        })
-        .await;
-        // A slow or broken client costs this one connection, nothing else.
-        let _ = handled;
+                let line = request
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap_or(&[]);
+                let line = String::from_utf8_lossy(line);
+                let mut parts = line.split_whitespace();
+                let (status, payload) = match (parts.next(), parts.next()) {
+                    (Some("GET"), Some("/metrics")) => {
+                        let text = view
+                            .borrow()
+                            .as_ref()
+                            .map(|page| page.text.clone())
+                            .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
+                        ("200 OK", text)
+                    }
+                    (Some("GET"), Some(_)) => ("404 Not Found", "not found\n".to_owned()),
+                    _ => ("405 Method Not Allowed", "GET /metrics only\n".to_owned()),
+                };
+                let head = format!(
+                    "HTTP/1.0 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(payload.as_bytes()).await?;
+                stream.shutdown().await
+            })
+            .await;
+            // A slow or broken client costs this one connection, nothing else.
+            let _ = handled;
+        });
     }
 }
 
@@ -986,17 +1210,125 @@ mod tests {
             liveness: LivenessMetrics::default(),
             credential: None,
             sessions: vec![SessionMetrics {
+                periods: 0,
+                peers_unreachable: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 tenant: "t".into(),
                 session: "s".into(),
+                observed: true,
                 committed_index: 9,
                 applied_index: 7,
                 ..SessionMetrics::default()
             }],
             sessions_truncated: false,
+            sessions_unobserved: 0,
+            collection_ms: 3,
             agent: None,
             fence_level: 0,
             announced_level: 1,
         }
+    }
+    /// The audit's F65: a session whose owner did not answer says so and
+    /// carries no owner-side number — never a zero read as health.
+    #[test]
+    fn an_unobserved_session_says_so_and_carries_no_owner_side_numbers() {
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let mut sample = snapshot(budget.stats());
+        let mut silent = sample.sessions[0].clone();
+        silent.session = "u".into();
+        silent.observed = false;
+        silent.leader = 3;
+        sample.sessions.push(silent);
+        sample.sessions_unobserved = 1;
+        let text = sample.render();
+        let base = "node=\"7\",cluster=\"ab\\\"cd\"";
+        assert!(text.contains(&format!(
+            "focal_metrics_collection_milliseconds{{{base}}} 3\n"
+        )));
+        assert!(text.contains(&format!("focal_metrics_sessions_unobserved{{{base}}} 1\n")));
+        assert!(text.contains(&format!(
+            "focal_session_observed{{{base},tenant=\"t\",session=\"s\"}} 1\n"
+        )));
+        assert!(text.contains(&format!(
+            "focal_session_observed{{{base},tenant=\"t\",session=\"u\"}} 0\n"
+        )));
+        assert!(text.contains(&format!(
+            "focal_session_leader{{{base},tenant=\"t\",session=\"u\"}} 3\n"
+        )));
+        assert!(text.contains(&format!(
+            "focal_session_applied_index{{{base},tenant=\"t\",session=\"s\"}} 7\n"
+        )));
+        assert!(!text.contains(&format!(
+            "focal_session_applied_index{{{base},tenant=\"t\",session=\"u\"}}"
+        )));
+        assert!(!text.contains(&format!(
+            "focal_session_apply_lag{{{base},tenant=\"t\",session=\"u\"}}"
+        )));
+        assert_eq!(MetricsPage::new(sample.clone()).text, text);
+    }
+    /// A round takes every answer that comes and closes at its deadline:
+    /// the late and the failed stay unobserved, in their places.
+    #[tokio::test]
+    async fn a_round_closes_at_its_deadline_with_the_late_unobserved() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let asks: Vec<std::pin::Pin<Box<dyn Future<Output = Option<u8>> + Send>>> = vec![
+            Box::pin(async { Some(1) }),
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                Some(2)
+            }),
+            Box::pin(async { None }),
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Some(4)
+            }),
+        ];
+        let answers = collect(asks, deadline).await;
+        assert_eq!(answers, vec![Some(1), None, None, Some(4)]);
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert!(tokio::time::Instant::now() < deadline + std::time::Duration::from_secs(1));
+    }
+    /// The loopback serves the page's text as it was rendered, judges the
+    /// request before it writes, and a scrape that never speaks costs no
+    /// other scrape its answer.
+    #[tokio::test]
+    async fn a_silent_scrape_delays_no_other_and_the_text_is_the_page_s() {
+        use tokio::net::{TcpListener, TcpStream};
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let page = MetricsPage::new(snapshot(budget.stats()));
+        let (_publish, view) = tokio::sync::watch::channel(Some(page.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_loopback(listener, view));
+        let silent = TcpStream::connect(address).await.unwrap();
+        let started = std::time::Instant::now();
+        let exchange = |request: &'static str| async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).await.unwrap();
+            let reply = String::from_utf8(reply).unwrap();
+            let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+            (head.to_owned(), body.to_owned())
+        };
+        let (head, body) = exchange("GET /metrics HTTP/1.0\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.0 200 OK"), "{head}");
+        assert_eq!(body, page.text);
+        let (head, body) = exchange("GET /nothing HTTP/1.0\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.0 404"), "{head}");
+        assert_eq!(body, "not found\n");
+        let (head, _) = exchange("POST /metrics HTTP/1.0\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.0 405"), "{head}");
+        // Three answers while the silent scrape still holds its connection:
+        // served side by side, not behind its two-second bound.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(silent);
+        server.abort();
     }
     #[test]
     fn the_text_carries_fixed_labels_escapes_them_and_derives_lags() {
@@ -1014,9 +1346,10 @@ mod tests {
         assert!(used >= 3);
         let text = snapshot(memory).render();
         assert!(text.contains("# TYPE focal_node_info gauge"));
-        assert!(text.contains(
-            "focal_node_info{node=\"7\",cluster=\"ab\\\"cd\",role=\"founder\",region=\"eu-a\",zone=\"\",capability=\"1\"} 1"
-        ));
+        assert!(text.contains(&format!(
+            "focal_node_info{{node=\"7\",cluster=\"ab\\\"cd\",role=\"founder\",region=\"eu-a\",zone=\"\",capability=\"{}\"}} 1",
+            crate::upgrade::CAPABILITY_LEVEL
+        )));
         assert!(text.contains(&format!(
             "focal_memory_used_bytes{{node=\"7\",cluster=\"ab\\\"cd\"}} {used}"
         )));

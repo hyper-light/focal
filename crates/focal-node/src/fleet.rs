@@ -3,7 +3,7 @@
 //! Directory/control code supplies the already authorized Session and route epoch.
 use crate::{custody::CustodyScope, evidence_service::EvidenceWitness};
 use crate::{
-    host::{access, finish_response, known_receipt},
+    host::{access, barrier_refused, finish_response, known_receipt},
     reads::{ListReadContext, ReadViews},
     streams::{PendingStream, Streams},
 };
@@ -48,7 +48,7 @@ mod range_owner;
 use evidence_owner::{EvidenceCall, PendingEvidenceCall};
 pub use grouped::management::{
     FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
-    FleetRemoval, FleetReply, FleetStatus, ManagedFleetConfig,
+    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, ManagedFleetConfig,
 };
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
 pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};
@@ -56,6 +56,7 @@ use placement_owner::{PendingPlacementCall, PlacementCall};
 pub use range_owner::{
     ArchivedFamily, RANGE_CONTROL_SCHEMA, RangeControlReply, RangeControlRequest, RangeFact,
     RangeFactRequest, RangeHistoryView, RangeMemberView, RangePendingView, RangeView,
+    SealedOutcomes,
 };
 pub(crate) use range_owner::{verify_fact, verify_progress};
 
@@ -145,20 +146,125 @@ pub struct ReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
     snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
+    /// Where the driver says the peer could not be reached: the owner
+    /// reports it to the core, which probes the member instead of
+    /// streaming to it. Bounded by the members a configuration names.
+    lost: Option<mpsc::SyncSender<u64>>,
+    /// What a group cannot do without — a heartbeat, a vote, an answer:
+    /// everything but appends and snapshots. The driver sends it before the
+    /// appends that wait for the same peer, and gives it up last
+    /// (`replication::drive`).
+    pub(crate) urgent: bool,
     _charge: Allocation,
 }
+/// Whether a message is what a group cannot do without: anything but an
+/// append on its way to a member and a snapshot. An append names a place
+/// in the log — the entry before what it carries — whether it carries
+/// entries or only the commit that followed them; the member judges it by
+/// what it holds, so it goes in the order of the appends before it
+/// (27 §12). Sent ahead of them as a heartbeat is, an empty append named
+/// an entry the member had yet to receive and was refused for it (the
+/// jittered fleet: every refusal with the order kept was one, 2026-10-02).
+pub(crate) fn urgent(message: &focal_consensus::Message) -> bool {
+    let append = message.msg_type == focal_consensus::MessageType::MsgAppend as i32;
+    let snapshot = message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32;
+    !append && !snapshot
+}
+/// The peers an owner may have lost exchanges with between two of its
+/// periods: at most every member once (`focal_raft::MAX_MEMBERS`); a peer
+/// lost more often within a period is reported once.
+pub(crate) const LOST_PEERS: usize = 1024;
 impl ReplicationFrame {
+    /// The frame did not reach its peer: it could not be reached, it
+    /// refused, or the driver had no room for the frame.
+    pub(crate) fn lost(&mut self) {
+        if let Some(lost) = self.lost.take() {
+            let _ = lost.try_send(self.target);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        target: u64,
+        request: RequestEnvelope,
+        lost: mpsc::SyncSender<u64>,
+        budget: &MemoryBudget,
+    ) -> Result<Self, LedgerError> {
+        Ok(Self {
+            target,
+            request,
+            snapshot: None,
+            lost: Some(lost),
+            urgent: false,
+            _charge: budget
+                .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
+                .commit(),
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn urgent_for_test(mut self) -> Self {
+        self.urgent = true;
+        self
+    }
     pub(crate) fn report_snapshot(&mut self, accepted: bool) {
         crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
     }
+}
+/// A stopping leader's hand-off of its log (27 §5): the voter it asked to
+/// campaign, and whether the log led elsewhere before the replica stopped
+/// ticking. None while the replica did not lead when its stop began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopHandOff {
+    pub heir: u64,
+    pub completed: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ReplicaProgress {
     pub node: u64,
     pub leader: u64,
     pub term: u64,
+    /// The replica's role in its term: a member that names no leader is
+    /// told apart as following, asking for votes or holding them.
+    pub role: StateRole,
+    /// The hand-off a planned stop made, once the stop began.
+    pub stop_hand_off: Option<StopHandOff>,
     pub sequence: SessionSeq,
     pub dropped_replication: u64,
+    /// Exchanges the driver could not make at all, told to the core so it
+    /// probes the peer instead of streaming to it (27 §3.3).
+    pub peers_unreachable: u64,
+    /// Appends this replica refused for not holding the entry before them
+    /// (27 §12): what a frame that overtook another cost before the order
+    /// was kept, and what a lost frame costs still.
+    pub appends_rejected: u64,
+    /// Of those, the ones the order should have spared (27 §12): refused
+    /// for an entry past the last this log held when a frame of its leader
+    /// was last lost to it, in a term in which the leader sent its appends
+    /// ordered and one of them was taken. What a lost frame costs — the
+    /// frame let go past its patience, found stale or not stepped, and the
+    /// appends behind it until the leader sends again — and a term's first
+    /// exchange are not among them.
+    pub appends_rejected_in_order: u64,
+    /// Frames held for the one they overtook (27 §12), and frames let go
+    /// past their patience or their lane without it: the first is what
+    /// the path reordered, the second what it lost.
+    pub frames_held: u64,
+    pub frames_let_go: u64,
+    /// Frames behind what was already stepped from their source (27 §12):
+    /// stepped as they came, the core judging them.
+    pub frames_stale: u64,
+    /// Reports of a peer the owner already held for the core, and reports
+    /// beyond the bound on peers held: the feedback is a hint about a
+    /// peer, coalesced and never grown.
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
+    /// The times this replica's owner asked what the log had answered and
+    /// found its write still out. An owner the log wakes asks once as it
+    /// queues a write, and again only at its tick (27 §9).
+    pub waits_asked: u64,
+    /// The times the log's answer to this replica's write woke its owner
+    /// (`Session::notify_persisted`, on an owner that shares its thread
+    /// among sessions): the answer to `waits_asked` (27 §9).
+    pub waits_answered: u64,
     pub stopped: bool,
     /// The group's voters as this replica's committed configuration names
     /// them; the paths a pace is derived from (27 §3.1 P2).
@@ -284,6 +390,10 @@ enum Work {
         oneshot::Sender<Result<(), LedgerError>>,
         Allocation,
     ),
+    /// What the paths to the replica's peers hold in flight and their
+    /// round trips, by peer: `(peer, window bytes, round trip ns)`. The
+    /// bytes a leader sends each ahead of its answers follow (27 §11).
+    Windows(Vec<(u64, u64, u64)>, Allocation),
     /// Serve clients at an activated route: `(route, policy revision)`.
     Refence(
         RouteEpoch,
@@ -387,7 +497,7 @@ enum HostSender {
     Group {
         ledger: LedgerId,
         incarnation: u64,
-        sender: mpsc::SyncSender<grouped::FleetInput>,
+        sender: grouped::OwnerQueue,
         slots: MemoryBudget,
         _backing: std::sync::Arc<Allocation>,
     },
@@ -414,7 +524,7 @@ impl HostSender {
                         work,
                         _slot: slot.commit(),
                     }))
-                    .map_err(host_queue_error)
+                    .map_err(|error| host_queue_error(*error))
             }
         }
     }
@@ -422,6 +532,27 @@ impl HostSender {
 enum HostQueueError {
     Full,
     Disconnected,
+}
+/// The bytes of entries a leader sends a peer ahead of its answers, from
+/// what the path to it holds in flight (its transport's congestion window)
+/// and its round trip (27 §11).
+///
+/// Twice the window: a sender held to the window itself never fills it,
+/// and a window that is never filled is never found to be too small — the
+/// rule by which a sender's buffer is sized against its congestion window
+/// (Linux `tcp_sndbuf_expand`). And a page at least where the path carries
+/// a page within one beat of the leader: a path that fast is not kept to a
+/// window that only says nothing was sent on it yet, while a thin one is
+/// never given a page it would take many beats to carry.
+fn inflight_bytes(window: u64, round_trip_ns: u64, beat: Duration, page: u64) -> u64 {
+    let twice = window.saturating_mul(2);
+    let beat_ns = u64::try_from(beat.as_nanos()).unwrap_or(u64::MAX);
+    // What the path carries in one beat: its window, once a round trip.
+    let carried = u128::from(window)
+        .saturating_mul(u128::from(beat_ns))
+        .checked_div(u128::from(round_trip_ns))
+        .map_or(0, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
+    twice.max(page.min(carried))
 }
 fn host_queue_error<T>(error: mpsc::TrySendError<T>) -> HostQueueError {
     match error {
@@ -551,6 +682,43 @@ enum WaitingFor {
     },
     Stream(PendingStream),
 }
+/// A peer's frame held for the one it overtook (27 §12): stepped when that
+/// one comes, or when its patience passes, and answered as every peer frame
+/// is, at the Ready fence.
+struct HeldFrame {
+    source: u64,
+    message: Vec<u8>,
+    pending: Pending,
+}
+/// One leader's appends as this replica took them (`Owner::append_streams`).
+/// An answer is judged when the log is durable, after frames stepped since;
+/// so a loss is kept as the place it left in the log, not as a moment.
+#[derive(Clone, Copy, Debug, Default)]
+struct AppendStream {
+    /// The term and the first index this log lacked when a frame of the
+    /// leader was last lost to it — let go past its patience, found stale,
+    /// or not stepped: an append refused in that term for an entry before
+    /// it is the loss's, since every append past it waits for the entries
+    /// the lost frame carried.
+    lost_from: Option<(u64, u64)>,
+    /// The term an append of it was last taken in.
+    taken_in: Option<u64>,
+    /// The term it last sent an ordered frame in: a leader of an older
+    /// binary sends its appends plain, and the order spares them nothing.
+    ordered_in: Option<u64>,
+}
+/// How a peer's frame was admitted (`admit_replication`).
+enum Replication {
+    /// Stepped; answered at the Ready fence by the owner's period given.
+    Stepped(u64),
+    /// Held for the frame it overtook, until the owner's period `until`.
+    Held {
+        source: u64,
+        sequence: u64,
+        until: u64,
+        deadline: u64,
+    },
+}
 struct Pending {
     header: ResponseEnvelope,
     response: oneshot::Sender<OwnedResponse>,
@@ -594,14 +762,50 @@ struct Owner {
     placement: Option<PendingPlacementCall>,
     evidence: Option<PendingEvidenceCall>,
     outbound: async_mpsc::Sender<ReplicationFrame>,
+    /// Peers the driver could not reach, reported to the core each period.
+    lost_sender: mpsc::SyncSender<u64>,
+    lost: mpsc::Receiver<u64>,
+    /// Peers the driver reported lost, each once, kept until the core can
+    /// be told (bounded by the members a configuration names); reports of
+    /// a peer already held are coalesced, and reports beyond the bound are
+    /// dropped, both counted.
+    lost_peers: Vec<u64>,
+    lost_coalesced: u64,
+    lost_dropped: u64,
+    /// `ReplicaProgress::waits_asked`.
+    waits_asked: u64,
+    /// `ReplicaProgress::waits_answered`.
+    waits_answered: u64,
     progress: watch::Sender<ProgressState>,
+    /// Drawn when this owner started: with the node id it scopes every read
+    /// context the owner mints, so a nonce that restarts from zero, or one
+    /// aligned with another replica's, never repeats a context (F63).
     incarnation: u64,
     nonce: u64,
+    /// The order this owner's bulk frames to each peer leave in (27 §12):
+    /// the next sequence for the peer within this owner's incarnation,
+    /// pruned to the configuration's members each pass.
+    ordered: std::collections::BTreeMap<u64, u64>,
+    /// A peer's bulk frames held for the ones they overtook, stepped in
+    /// their order (`crate::resequence`).
+    resequencer: crate::resequence::Resequencer<HeldFrame>,
+    /// `ReplicaProgress::appends_rejected`.
+    appends_rejected: u64,
+    /// `ReplicaProgress::appends_rejected_in_order`.
+    appends_rejected_in_order: u64,
+    /// What became of each leader's appends here (`AppendStream`), for as
+    /// many peers as the order is kept for, pruned with the configuration.
+    append_streams: std::collections::BTreeMap<u64, AppendStream>,
+    /// `ReplicaProgress::frames_held`, `frames_let_go` and `frames_stale`.
+    frames_held: u64,
+    frames_let_go: u64,
+    frames_stale: u64,
     support_cursor: u64,
     dropped: u64,
-    /// A member was added after the log was compacted: the next checkpoint
-    /// is due so the snapshot that seeds it names it in its configuration.
-    checkpoint_due: bool,
+    unreachable: u64,
+    /// Whether the stored snapshot named every member, at the configuration
+    /// and snapshot indexes it was last asked at (`checkpoint_for_members`).
+    members_named: Option<((u64, u64), bool)>,
     #[cfg(test)]
     dropped_snapshots: u64,
     budget: MemoryBudget,
@@ -612,6 +816,11 @@ struct Owner {
     /// The reply to a stop, and the owner's period at which the stop is
     /// given up on.
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
+    /// While a stopping leader hands its log off: the owner's period at
+    /// which the hand-off is given up on.
+    handing_off: Option<u64>,
+    /// The hand-off this replica's stop made, reported in its progress.
+    stop_hand_off: Option<StopHandOff>,
     next_tick: Instant,
     /// When a leader whose period is stretched sends its next heartbeats.
     next_beat: Instant,
@@ -625,7 +834,9 @@ impl ReplicaHost {
         WireLimits {
             max_frame_bytes: 10 * 1024 * 1024,
             max_cost: 40 * 1024 * 1024,
-            ..WireLimits::default()
+            ..WireLimits::for_consensus(
+                u32::try_from(focal_consensus::DEFAULT_INFLIGHT_WINDOW).unwrap_or(u32::MAX),
+            )
         }
     }
     pub fn spawn(
@@ -701,13 +912,26 @@ impl ReplicaHost {
             return Err(LedgerError::PlacementConflict);
         }
         let status = session.status();
+        let (lost_sender, lost) = mpsc::sync_channel(LOST_PEERS);
         let (progress, changes) = watch::channel(ProgressState {
             value: ReplicaProgress {
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
+                role: status.role,
+                stop_hand_off: None,
                 sequence: session.sequence(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
+                appends_rejected: 0,
+                appends_rejected_in_order: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
+                waits_asked: 0,
+                waits_answered: 0,
                 stopped: false,
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
@@ -737,6 +961,10 @@ impl ReplicaHost {
         let tick_ceiling = config.tick_ceiling;
         let pace = crate::pace::TickPeriod::default();
         pace.announce(session.election_tick());
+        let mut incarnation = [0u8; 8];
+        getrandom::fill(&mut incarnation).map_err(|_| LedgerError::Capacity)?;
+        let incarnation = u64::from_le_bytes(incarnation);
+        let lane = session.inflight_window();
         let owner = Owner {
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
             pace: pace.clone(),
@@ -757,17 +985,35 @@ impl ReplicaHost {
             placement: None,
             evidence: None,
             outbound,
+            lost_sender,
+            lost,
+            lost_peers: Vec::new(),
+            lost_coalesced: 0,
+            lost_dropped: 0,
+            waits_asked: 0,
+            waits_answered: 0,
             progress,
-            incarnation: 0,
+            incarnation,
             nonce: 0,
+            ordered: std::collections::BTreeMap::new(),
+            resequencer: crate::resequence::Resequencer::new(lane, LOST_PEERS),
+            appends_rejected: 0,
+            appends_rejected_in_order: 0,
+            append_streams: std::collections::BTreeMap::new(),
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
             support_cursor: 0,
             dropped: 0,
-            checkpoint_due: false,
+            unreachable: 0,
+            members_named: None,
             #[cfg(test)]
             dropped_snapshots: 0,
             budget: budget.clone(),
             nonblocking: false,
             stopping: None,
+            handing_off: None,
+            stop_hand_off: None,
             next_tick: Instant::now(),
             next_beat: Instant::now(),
             wake_at: Instant::now(),
@@ -945,6 +1191,32 @@ impl ReplicaHost {
                 HostQueueError::Disconnected => LedgerError::Failed,
             })?;
         receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// What the paths to this replica's peers hold in flight — each peer's
+    /// transport window, in bytes — and their round trips, as the node
+    /// measures them: `(peer, window bytes, round trip ns)` (27 §11). While
+    /// the replica leads, a peer is sent no more of entries ahead of its
+    /// answers than follows from them (`inflight_bytes`). A hint,
+    /// said again every round of the node's pacer: one the owner has no
+    /// room for is dropped, and a peer never said keeps one page.
+    pub fn inflight_windows(&self, mut windows: Vec<(u64, u64, u64)>) {
+        windows.sort_unstable();
+        windows.dedup_by_key(|(peer, _, _)| *peer);
+        if windows.is_empty()
+            || windows.len() > MAX_ADMITTED
+            || windows.first().is_some_and(|(peer, _, _)| *peer == 0)
+        {
+            return;
+        }
+        let Ok(charge) =
+            self.budget
+                .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)
+        else {
+            return;
+        };
+        let _ = self
+            .sender
+            .try_send(Work::Windows(windows, charge.commit()));
     }
     /// Serve clients at the route a committed activation moved the session
     /// to ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §17):
@@ -1178,6 +1450,9 @@ impl RequestHandler for ReplicaHost {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
     fn handle<'a>(
         &'a self,
         request: &'a VerifiedRequest,
@@ -1240,7 +1515,10 @@ impl ReplicaHost {
         let closed = request
             .request()
             .reply(Response::Error(AccessError::Unavailable));
-        let replication = matches!(request.request().operation, Operation::Raft { .. });
+        let replication = matches!(
+            request.request().operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        );
         let response_bytes = match &request.request().operation {
             Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
             Operation::Summary => {
@@ -1388,7 +1666,7 @@ impl Owner {
     fn beats(&self) -> bool {
         self.pace
             .stretched(self.config.tick, self.config.tick_ceiling)
-            && self.session.status().role == StateRole::Leader
+            && self.session.scalars().role == StateRole::Leader
     }
     fn beat_if_due(&mut self) -> Result<(), LedgerError> {
         if !self.beats() || Instant::now() < self.next_beat {
@@ -1429,11 +1707,11 @@ impl Owner {
                 };
                 match receiver.recv_timeout(wake.saturating_duration_since(Instant::now())) {
                     Ok(work) => {
-                        if self.accept(work)? {
+                        if self.take(work, &receiver)? {
                             return Ok(());
                         }
                         self.progress_managed()?;
-                        self.checkpoint_if_due()?;
+                        self.checkpoint_for_members()?;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -1446,12 +1724,27 @@ impl Owner {
         }
         self.close();
     }
-    /// A member added after the log was compacted can only be seeded by a
-    /// snapshot whose configuration names it (Raft discards any other), so
-    /// the authority checkpoints once such a change has applied; a log that
-    /// is complete from its first entry needs no checkpoint. Retried while
-    /// proposals or persistence are pending; the checkpoint itself is the
-    /// synchronous one an operator's request takes.
+    /// Takes `work`, and while a read waits for its round, what is queued
+    /// behind it, before the drain that sends the round: the reads among it
+    /// share the round (27 §9). Counted by what the owner admits at once;
+    /// work that is no read drains for itself, which sends the round and
+    /// ends this. Whether the owner is to stop.
+    fn take(&mut self, work: Work, receiver: &mpsc::Receiver<Work>) -> Result<bool, LedgerError> {
+        if self.accept(work)? {
+            return Ok(true);
+        }
+        let mut taken = 1usize;
+        while self.session.reads_unasked() && taken < self.config.pending_clients {
+            let Ok(work) = receiver.try_recv() else {
+                break;
+            };
+            taken = taken.saturating_add(1);
+            if self.accept(work)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     /// Entries applied past the last snapshot: the log this replica keeps
     /// beyond its checkpoint (26 §3).
     pub(super) fn log_entries_since_checkpoint(&self) -> u64 {
@@ -1499,47 +1792,46 @@ impl Owner {
             Err(error) => Err(error),
         }
     }
-    fn checkpoint_if_due(&mut self) -> Result<(), LedgerError> {
-        if !self.checkpoint_due {
+    /// A member added after the log was compacted can only be seeded by a
+    /// snapshot whose configuration names it — Raft discards any other — so
+    /// a replica whose stored snapshot does not name every member of the
+    /// configuration it has applied checkpoints. Derived from what the
+    /// replica has applied: whichever replica leads when the member asks to
+    /// be seeded has refreshed its own snapshot, however leadership moved or
+    /// the owner restarted since the change. A flag kept by the owner that
+    /// resolved the change alone left a drained leader's replacement
+    /// unseeded for good: leadership moved off that owner before it
+    /// checkpointed, and the leader that followed sent the replacement a
+    /// snapshot that did not name it at every probe (macOS CI, 27b0531).
+    /// A change that only promotes or removes asks for nothing; what is
+    /// pending or persisting waits for a later period. The answer is kept
+    /// for the configuration and the snapshot it was found at, so a period
+    /// reads two indexes.
+    fn checkpoint_for_members(&mut self) -> Result<(), LedgerError> {
+        let at = (
+            self.session.configuration_index(),
+            self.session.snapshot_index(),
+        );
+        if at.1 >= at.0 {
             return Ok(());
         }
-        if self.session.snapshot_index() == 0 {
-            self.checkpoint_due = false;
-            return Ok(());
-        }
-        if self.session.pending_count() != 0
-            || self.session.persistence_pending()
-            || self.session.checkpoint_in_flight()
-            || self.stopping.is_some()
-        {
-            return Ok(());
-        }
-        match self.session.checkpoint() {
-            Ok(()) => {
-                self.checkpoint_due = false;
-                Ok(())
+        let named = match self.members_named {
+            Some((seen, named)) if seen == at => named,
+            _ => {
+                let named = self.session.snapshot_names_every_member();
+                self.members_named = Some((at, named));
+                named
             }
-            // Resource conditions and unpersisted state wait for a later tick.
-            Err(
-                LedgerError::Capacity
-                | LedgerError::NotReady { .. }
-                | LedgerError::Consensus(
-                    focal_consensus::ConsensusError::PersistencePending
-                    | focal_consensus::ConsensusError::Capacity
-                    | focal_consensus::ConsensusError::CheckpointIndex,
-                ),
-            ) => Ok(()),
-            Err(LedgerError::Native(error))
-                if error.class() == focal_ledger::FailureClass::Retryable =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error),
+        };
+        if named {
+            return Ok(());
         }
+        self.try_checkpoint().map(|_| ())
     }
     fn tick(&mut self) -> Result<(), LedgerError> {
         self.pace
             .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+        self.expire_held();
         // What the owner has seen of its own stalls is the replica's
         // patience before it campaigns (`ControlHost`).
         self.session.set_patience(
@@ -1551,7 +1843,7 @@ impl Owner {
         // current logs, so leadership returns to where placement put it and
         // a voter that merely timed out first does not take it. Policy from
         // committed state, applied by the owner; never from liveness.
-        let priority = self.rank(self.session.status().node_id);
+        let priority = self.rank(self.session.scalars().node_id);
         if self.session.priority() != priority {
             self.session.set_priority(priority)?;
         }
@@ -1570,7 +1862,7 @@ impl Owner {
             Err(error) => return Err(error),
         }
         self.return_leadership()?;
-        if self.session.status().role == StateRole::Leader {
+        if self.session.scalars().role == StateRole::Leader {
             let now = wall_ms()?.max(self.session.cursor_clock());
             match self.session.propose_cursor_clock(now) {
                 Ok(_) | Err(LedgerError::Capacity | LedgerError::NotReady { .. }) => {}
@@ -1588,6 +1880,9 @@ impl Owner {
             .map_err(|_| LedgerError::Failed)?;
         self.drain()?;
         self.checkpoint_by_cadence()?;
+        // At every period, not only beside work: a replica no request
+        // reaches still seeds the members its configuration added.
+        self.checkpoint_for_members()?;
         self.progress_managed()
     }
     /// The election priority of `node` by the session's committed
@@ -1613,20 +1908,27 @@ impl Owner {
     /// is counted and rested on; only a failure of the session itself is
     /// an error.
     fn return_leadership(&mut self) -> Result<(), LedgerError> {
-        let status = self.session.status();
+        let status = self.session.scalars();
+        let membership = self.session.members();
         let leads = self.session.is_authoritative();
         let own = self.rank(status.node_id);
         let votes = |node: u64| {
             node != status.node_id
-                && status.voters.contains(&node)
+                && membership.voters.contains(&node)
                 && self
                     .session
                     .active_placement()
                     .is_some_and(|spec| spec.placement.voters.contains_key(&node))
         };
+        // Fit to lead: caught up to what is committed and heard from, and
+        // not being sent a snapshot. Not the pipeline's state: a member the
+        // leader lost a message to is probed (27 §3.3) until its log moves,
+        // which a log with nothing proposed never does.
         let fit = |node: u64| {
             self.session.peer(node).is_some_and(|peer| {
-                peer.state == 1 && peer.matched >= status.committed_index && peer.recent_active
+                peer.state != focal_consensus::PEER_SNAPSHOT
+                    && peer.matched >= status.committed_index
+                    && peer.recent_active
             })
         };
         let preferred = self
@@ -1659,8 +1961,10 @@ impl Owner {
         let seen = crate::leader_return::Seen {
             leads,
             preferred: target,
-            current: peer
-                .is_some_and(|peer| peer.state == 1 && peer.matched >= status.committed_index),
+            current: peer.is_some_and(|peer| {
+                peer.state != focal_consensus::PEER_SNAPSHOT
+                    && peer.matched >= status.committed_index
+            }),
             heard: peer.is_some_and(|peer| peer.recent_active),
             transferring: self.session.transferring().is_some(),
             settled: self.stopping.is_none()
@@ -1686,7 +1990,51 @@ impl Owner {
     }
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
     /// remains inside Session until its WAL owner reports a completed fence.
+    /// What the driver could not reach since the last period, told to the
+    /// core: it probes those members instead of streaming to them. The
+    /// reports are gathered first, each peer once (a peer lost more often
+    /// is coalesced; more peers than the bound are dropped, both counted),
+    /// then told while the core can be told: one fenced by a write it still
+    /// persists, or short of the room, hears the rest next period, the
+    /// peers keeping their place. A report is a hint about a peer, never a
+    /// reason for the owner to end.
+    fn report_lost(&mut self) -> Result<(), LedgerError> {
+        for _ in 0..LOST_PEERS {
+            let Ok(peer) = self.lost.try_recv() else {
+                break;
+            };
+            match self.lost_peers.binary_search(&peer) {
+                Ok(_) => self.lost_coalesced = self.lost_coalesced.saturating_add(1),
+                Err(at)
+                    if self.lost_peers.len() < LOST_PEERS
+                        && self.lost_peers.try_reserve(1).is_ok() =>
+                {
+                    self.lost_peers.insert(at, peer);
+                }
+                Err(_) => self.lost_dropped = self.lost_dropped.saturating_add(1),
+            }
+        }
+        while let Some(&peer) = self.lost_peers.last() {
+            match self.session.report_unreachable(peer) {
+                Ok(()) => {
+                    self.lost_peers.pop();
+                    self.unreachable = self.unreachable.saturating_add(1);
+                }
+                Err(
+                    LedgerError::Consensus(
+                        focal_consensus::ConsensusError::PersistencePending
+                        | focal_consensus::ConsensusError::Capacity,
+                    )
+                    | LedgerError::Capacity
+                    | LedgerError::Memory(_),
+                ) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
     fn progress_group(&mut self) -> Result<bool, LedgerError> {
+        self.report_lost()?;
         self.views
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
@@ -1700,8 +2048,11 @@ impl Owner {
             self.poll_snapshot_feedback()?;
         }
         self.progress_managed()?;
-        self.checkpoint_if_due()?;
-        if let Some((_, deadline)) = self.stopping.as_ref() {
+        self.checkpoint_for_members()?;
+        let handing_off = self.handing_off();
+        if let Some((_, deadline)) = self.stopping.as_ref()
+            && !handing_off
+        {
             // A stop ticks the replica no more, but its time passes in the
             // owner's periods all the same: each is counted, refused.
             if Instant::now() >= self.next_tick {
@@ -1714,12 +2065,16 @@ impl Owner {
             }
             let expired = self.pace.periods() >= *deadline;
             if expired && self.session.has_ready() {
+                // What the stop made of its hand-off is published before
+                // the reply: the fleet reads it once the reply is in.
+                self.publish_progress(true);
                 if let Some((response, _)) = self.stopping.take() {
                     let _ = response.send(Err(LedgerError::OutcomeUnknown));
                 }
                 return Ok(true);
             }
             if !self.session.has_ready() {
+                self.publish_progress(true);
                 if let Some((response, _)) = self.stopping.take() {
                     // The shared WAL already owns the recoverable durable
                     // prefix. Avoid a synchronous whole-WAL checkpoint rewrite
@@ -1739,6 +2094,7 @@ impl Owner {
                 self.pace
                     .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
                 self.pace.refuse();
+                self.expire_held();
             } else {
                 self.tick()?;
             }
@@ -1752,11 +2108,20 @@ impl Owner {
         Ok(false)
     }
     fn group_deadline(&self) -> Result<Instant, LedgerError> {
-        if self.session.persistence_pending() || self.stopping.is_some() || self.evidence.is_some()
-        {
+        if self.stopping.is_some() || self.evidence.is_some() {
             return Instant::now()
                 .checked_add(Duration::from_millis(1))
                 .ok_or(LedgerError::Failed);
+        }
+        if self.session.persistence_pending() {
+            // The log tells this owner when what the replica waits for is
+            // answered (`Session::wakes_owner`, 27 §9), and the owner drains
+            // the session then: nothing is asked at intervals, and the tick
+            // is the bound on a signal that was lost. A write the log had no
+            // room for tells no one: it is asked again as the log answers
+            // the owner's other sessions, which is when room is made
+            // (`GroupOwner::signalled`), and at the tick.
+            return Ok(self.next_tick);
         }
         // A delivery waiting for seed chunks its host has not pulled yet
         // makes no progress on its own; it resumes when a chunk lands.
@@ -1788,6 +2153,7 @@ impl Owner {
                 let _ = response.send(self.registration_facts(charge));
             }
             Work::Request(request, response, charge) => {
+                let waiting = self.session.reads_waiting();
                 self.request(
                     request.verified,
                     response,
@@ -1795,7 +2161,16 @@ impl Owner {
                     request.witness,
                     request.native,
                 );
-                self.drain()?;
+                // A request that only asked a read is not drained for here:
+                // the owner's loop takes what else is queued first, and the
+                // round that leaves with its drain carries every read asked
+                // by then (27 §9). Reads queued together are confirmed by
+                // one round of heartbeats, and one asked alone leaves with
+                // the drain that follows at once. Anything else is drained
+                // for as it was.
+                if self.session.reads_waiting() <= waiting || !self.session.reads_unasked() {
+                    self.drain()?;
+                }
             }
             Work::Probe(request, response, charge) => {
                 let result = self.probe_receipt(&request).map(|known| ReceiptProbe {
@@ -1810,7 +2185,7 @@ impl Owner {
                     if let Some(fence) = &fence {
                         if !self.session.is_authoritative() {
                             return Err(LedgerError::NotReady {
-                                leader: self.session.status().leader_id,
+                                leader: self.session.scalars().leader_id,
                             });
                         }
                         if self.session.pending_count() != 0 {
@@ -1853,6 +2228,19 @@ impl Owner {
                 self.publish_progress(false);
                 drop(charge);
                 let _ = response.send(Ok(()));
+            }
+            Work::Windows(windows, charge) => {
+                let beat = self.beat_interval();
+                let page = self.session.page_bytes();
+                for (peer, window, round_trip_ns) in windows {
+                    // A peer the configuration does not name is told of
+                    // nothing; a replica that failed refuses, and stops.
+                    self.session.set_inflight_bytes(
+                        peer,
+                        inflight_bytes(window, round_trip_ns, beat, page),
+                    )?;
+                }
+                drop(charge);
             }
             Work::Refence(route, revision, response, charge) => {
                 let result = if route < self.config.route_epoch {
@@ -1963,7 +2351,11 @@ impl Owner {
                 // create the leader-readiness ReadIndex; the second consumes
                 // its local Ready output. Shutdown does not dispatch effects
                 // or wait for unavailable peers to commit pending proposals.
+                // A leader asks its heir to campaign first: the drain sends
+                // that, and the group is led again without an election
+                // timeout even though this owner does not stay for it.
                 let result = (|| {
+                    self.hand_off()?;
                     self.drain_with_runtime(false)?;
                     self.drain_with_runtime(false)?;
                     // A pending proposal remains recoverable in Raft's log;
@@ -1999,8 +2391,76 @@ impl Owner {
             return Ok(());
         }
         let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
+        self.hand_off()?;
         self.stopping = Some((response, deadline));
         Ok(())
+    }
+    /// A leader hands its log off before it goes (27 §5): the most
+    /// caught-up voter is asked to campaign now, and until the log leads
+    /// elsewhere — or the transfer's own bound, one election timeout, has
+    /// passed in this owner's periods — the replica ticks and beats as a
+    /// leader does, so the heir is caught up and asked. A leader that went
+    /// silent cost the survivors that whole timeout, for every log it led.
+    fn hand_off(&mut self) -> Result<(), LedgerError> {
+        // Once a stop: the owned status, which the heir is chosen from.
+        let status = self.session.status();
+        if status.role != StateRole::Leader {
+            return Ok(());
+        }
+        let peers: Vec<focal_consensus::PeerProgress> = status
+            .voters
+            .iter()
+            .filter_map(|voter| self.session.peer(*voter))
+            .collect();
+        // The placement's preferred leader takes it when it qualifies:
+        // leadership would return there anyway.
+        let preferred = self
+            .session
+            .active_placement()
+            .map(|spec| spec.placement.preferred_leader)
+            .filter(|node| {
+                peers
+                    .iter()
+                    .any(|peer| peer.node == *node && peer.state == 1 && peer.recent_active)
+                    && *node != status.node_id
+            });
+        let Some(heir) = preferred.or_else(|| focal_control::heir(&status, &peers)) else {
+            return Ok(());
+        };
+        match self.session.transfer_leader(heir) {
+            Ok(()) => {
+                let timeout = u64::try_from(self.session.election_tick()).unwrap_or(u64::MAX);
+                self.handing_off = self.pace.periods().checked_add(timeout);
+                self.stop_hand_off = Some(StopHandOff {
+                    heir,
+                    completed: false,
+                });
+                Ok(())
+            }
+            Err(
+                error @ (LedgerError::Failed
+                | LedgerError::Consensus(focal_consensus::ConsensusError::Failed)),
+            ) => Err(error),
+            // Refused (a transfer already under way, a member that is not a
+            // voter after all): the stop goes on as it did.
+            Err(_) => Ok(()),
+        }
+    }
+    /// Whether a stopping leader is still handing its log off; the hand-off
+    /// is complete once the log leads elsewhere before its bound.
+    fn handing_off(&mut self) -> bool {
+        let Some(bound) = self.handing_off else {
+            return false;
+        };
+        let leads = self.session.scalars().role == StateRole::Leader;
+        if leads && self.pace.periods() < bound {
+            return true;
+        }
+        if !leads && let Some(hand_off) = self.stop_hand_off.as_mut() {
+            hand_off.completed = true;
+        }
+        self.handing_off = None;
+        false
     }
     fn close(&mut self) {
         self.close_managed();
@@ -2043,14 +2503,26 @@ impl Owner {
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
+                role: status.role,
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
+                peers_unreachable: self.unreachable,
+                frames_held: self.frames_held,
+                frames_let_go: self.frames_let_go,
+                frames_stale: self.frames_stale,
+                appends_rejected: self.appends_rejected,
+                appends_rejected_in_order: self.appends_rejected_in_order,
+                peer_reports_coalesced: self.lost_coalesced,
+                peer_reports_dropped: self.lost_dropped,
+                waits_asked: self.waits_asked,
+                waits_answered: self.waits_answered,
                 stopped,
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),
                 priority: self.session.priority(),
                 near: self.near.clone(),
                 returns: self.leader_return.stats(),
+                stop_hand_off: self.stop_hand_off,
                 route_epoch: self.config.route_epoch,
                 import_pending: self.session.pending_import(),
                 seed_pending: self.session.pending_seed().map(|pending| SeedPending {
@@ -2067,6 +2539,181 @@ impl Owner {
             }
         });
     }
+    /// Pending Raft acknowledgments: each an authenticated peer's message
+    /// stepped, its reply behind the exact Ready fence.
+    fn pending_peers(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|pending| matches!(pending.waiting, WaitingFor::PeerPersistence))
+            .count()
+            .saturating_add(self.resequencer.held())
+    }
+    /// Pending participant requests: the queue less the peers'.
+    fn pending_participants(&self) -> usize {
+        self.pending.len().saturating_sub(self.pending_peers())
+    }
+    /// The Raft traffic admitted beside the participants' bound (F56): every
+    /// member the configuration names — voters, learners and the admitted —
+    /// may have its whole in-flight window outstanding at once, the window
+    /// the core itself allows a peer (`NodeConfig::max_inflight_messages`).
+    /// Participants never take these slots and peers never take theirs, so
+    /// admitted participant work cannot refuse the acknowledgments its own
+    /// completion waits on, and peers cannot crowd the participants out.
+    fn peer_reserve(&self) -> usize {
+        let members = self
+            .session
+            .members()
+            .len()
+            .saturating_add(self.admitted.len())
+            .max(1);
+        members.saturating_mul(self.session.inflight_window())
+    }
+    /// The owner's period past which a held frame is stepped without the
+    /// one it overtook: the probe timeout of the path it came by, as this
+    /// node measures it (RFC 9002 §6.2: what is not here by then was lost),
+    /// in this owner's periods, and one more for the period under way,
+    /// whose phase is unknown.
+    fn patience_until(&self, round_trip: std::time::Duration) -> u64 {
+        self.pace
+            .periods()
+            .saturating_add(focal_timing::ProgressDeadline::periods(
+                focal_wire::probe_timeout(round_trip),
+                self.config.tick,
+            ))
+            .saturating_add(1)
+    }
+    /// Frames held past their patience go, in their order; the lanes of
+    /// members that left are closed and what they held refused; the order
+    /// kept for departed peers is forgotten (27 §12). At every period the
+    /// owner runs, since a frame's patience is counted in periods: a
+    /// replica's own owner let held frames go only beside a group's
+    /// progress, which it never makes, so a follower that lost one ordered
+    /// frame held every one after it for ever (the evidence scenario's copy,
+    /// 2026-10-03).
+    fn expire_held(&mut self) {
+        if self.resequencer.expire(self.pace.periods()).is_ok() {
+            self.step_due();
+        }
+        let membership = self.session.members();
+        let admitted = &self.admitted;
+        let member =
+            |source: u64| membership.holds(source) || admitted.binary_search(&source).is_ok();
+        let mut gone = Vec::new();
+        if self.resequencer.prune(&member, &mut gone).is_ok() {
+            for held in gone {
+                held.pending
+                    .finish(Response::Error(AccessError::Unauthorized));
+            }
+        }
+        self.ordered.retain(|peer, _| member(*peer));
+        self.append_streams.retain(|peer, _| member(*peer));
+    }
+    /// Step the frames the resequencer let go, in their order.
+    fn step_due(&mut self) {
+        while let Some(held) = self.resequencer.take_due() {
+            self.frames_let_go = self.frames_let_go.saturating_add(1);
+            self.lost_to(held.source);
+            self.step_held(held);
+        }
+    }
+    /// Step what was held behind the frame from `source` just stepped.
+    fn step_ready(&mut self, source: u64) {
+        while let Some(held) = self.resequencer.step_ready(source) {
+            self.step_held(held);
+        }
+    }
+    /// Admit a peer's frame: authorized, within the peers' reserve, and
+    /// stepped — now, with what was held behind it, or held itself for
+    /// the frame it overtook (27 §12).
+    fn admit_replication(
+        &mut self,
+        verified: &VerifiedRequest,
+        group: [u8; 16],
+        order: Option<(u64, u64)>,
+    ) -> Result<Replication, AccessError> {
+        let request = verified.request();
+        let deadline = self.request_deadline().ok_or(AccessError::Unavailable)?;
+        if request.ledger != self.session.ledger() {
+            return Err(AccessError::Unauthorized);
+        }
+        let PeerRole::Node { node_id } = verified.peer().role() else {
+            return Err(AccessError::Unauthorized);
+        };
+        if group != self.session.group_id()
+            || (!self.session.members().holds(node_id)
+                && self.admitted.binary_search(&node_id).is_err())
+        {
+            return Err(AccessError::Unauthorized);
+        }
+        // Raft traffic is admitted beside the participants (F56): a full
+        // participant queue never refuses the acknowledgments its own
+        // completion waits on.
+        if self.pending_peers() >= self.peer_reserve() {
+            return Err(AccessError::Capacity);
+        }
+        let message = match &request.operation {
+            Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. } => message,
+            _ => return Err(AccessError::InvalidRequest),
+        };
+        // A bulk frame is stepped in the order it left its sender: one
+        // that overtook the frame before it is held for it, for its
+        // patience at most.
+        if let Some((epoch, sequence)) = order {
+            match self.resequencer.admit(node_id, epoch, sequence) {
+                Err(crate::resequence::Capacity) => return Err(AccessError::Capacity),
+                Ok(crate::resequence::Admission::Hold) => {
+                    self.frames_held = self.frames_held.saturating_add(1);
+                    self.sent_ordered(node_id);
+                    return Ok(Replication::Held {
+                        source: node_id,
+                        sequence,
+                        until: self.patience_until(verified.path_round_trip()),
+                        deadline,
+                    });
+                }
+                Ok(crate::resequence::Admission::Stale) => {
+                    self.frames_stale = self.frames_stale.saturating_add(1);
+                    self.lost_to(node_id);
+                }
+                Ok(crate::resequence::Admission::Step) => {}
+            }
+            self.sent_ordered(node_id);
+            self.step_due();
+        }
+        if let Err(error) = self.session.step_authenticated(node_id, message) {
+            // An ordered frame not stepped is lost to this log as much as
+            // one that never came: the appends behind it are refused.
+            if order.is_some() {
+                self.lost_to(node_id);
+            }
+            return Err(access(error));
+        }
+        if order.is_some() {
+            self.step_ready(node_id);
+        }
+        // The ingress acknowledgment and the generated Raft messages remain
+        // behind the exact Ready fence, including async writes.
+        Ok(Replication::Stepped(deadline))
+    }
+    /// Step a held frame: answered at the Ready fence as every peer frame
+    /// is, or refused as its step was.
+    fn step_held(&mut self, held: HeldFrame) {
+        let HeldFrame {
+            source,
+            message,
+            mut pending,
+        } = held;
+        match self.session.step_authenticated(source, &message) {
+            Ok(()) => {
+                pending.waiting = WaitingFor::PeerPersistence;
+                self.pending.push_back(pending);
+            }
+            Err(error) => {
+                self.lost_to(source);
+                pending.finish(Response::Error(access(error)));
+            }
+        }
+    }
     fn request(
         &mut self,
         verified: VerifiedRequest,
@@ -2078,6 +2725,69 @@ impl Owner {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
+        // A peer's frame has a path of its own: stepped now, or held for
+        // the frame it overtook (27 §12), and answered at the Ready fence
+        // either way.
+        let replication = match &verified.request().operation {
+            Operation::Raft { group, .. } => Some((*group, None)),
+            Operation::RaftOrdered {
+                group,
+                epoch,
+                sequence,
+                ..
+            } => Some((*group, Some((*epoch, *sequence)))),
+            _ => None,
+        };
+        if let Some((group, order)) = replication {
+            match self.admit_replication(&verified, group, order) {
+                Ok(Replication::Stepped(deadline)) => self.pending.push_back(Pending {
+                    header,
+                    response,
+                    waiting: WaitingFor::PeerPersistence,
+                    term: self.session.scalars().term,
+                    deadline,
+                    _charge: charge,
+                }),
+                Ok(Replication::Held {
+                    source,
+                    sequence,
+                    until,
+                    deadline,
+                }) => {
+                    let (_, request) = verified.into_parts();
+                    let Operation::RaftOrdered { message, .. } = request.operation else {
+                        let mut header = header;
+                        header.result = Response::Error(AccessError::Unavailable);
+                        let _ = response.send(finish_response(header, charge));
+                        return;
+                    };
+                    let frame = HeldFrame {
+                        source,
+                        message,
+                        pending: Pending {
+                            header,
+                            response,
+                            waiting: WaitingFor::PeerPersistence,
+                            term: self.session.scalars().term,
+                            deadline,
+                            _charge: charge,
+                        },
+                    };
+                    if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
+                        frame.pending.finish(Response::Error(AccessError::Capacity));
+                    }
+                    // A lane that was full let what it held go, this frame
+                    // with it.
+                    self.step_due();
+                }
+                Err(error) => {
+                    let mut header = header;
+                    header.result = Response::Error(error);
+                    let _ = response.send(finish_response(header, charge));
+                }
+            }
+            return;
+        }
         let mut waiting = None;
         let result = (|| -> Result<Response, AccessError> {
             let request = verified.request();
@@ -2086,36 +2796,11 @@ impl Owner {
             if request.ledger != self.session.ledger() {
                 return Err(AccessError::Unauthorized);
             }
-            if let Operation::Raft { group, message } = &request.operation {
-                let PeerRole::Node { node_id } = peer.role() else {
-                    return Err(AccessError::Unauthorized);
-                };
-                let status = self.session.status();
-                if *group != self.session.group_id()
-                    || (!status.voters.contains(&node_id)
-                        && !status.learners.contains(&node_id)
-                        && self.admitted.binary_search(&node_id).is_err())
-                {
-                    return Err(AccessError::Unauthorized);
-                }
-                if self.pending.len() == self.config.pending_clients {
-                    return Err(AccessError::Capacity);
-                }
-                self.session
-                    .step_authenticated(node_id, message)
-                    .map_err(access)?;
-                // This ingress acknowledgment and the generated Raft messages
-                // remain behind the exact Ready fence, including async writes.
-                waiting = Some((WaitingFor::PeerPersistence, deadline));
-                return Ok(Response::Error(AccessError::Unavailable));
-            }
             if let Operation::ManagedSupport { group } = &request.operation {
                 let PeerRole::Node { node_id } = peer.role() else {
                     return Err(AccessError::Unauthorized);
                 };
-                let status = self.session.status();
-                if (!status.voters.contains(&node_id)
-                    && !status.learners.contains(&node_id)
+                if (!self.session.members().holds(node_id)
                     && self.admitted.binary_search(&node_id).is_err())
                     || *group != self.session.group_id()
                     || request.route_epoch != self.config.route_epoch
@@ -2151,7 +2836,7 @@ impl Owner {
                     operation: ManagedOperation::Submit { .. },
                     ..
                 } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let (key, family, intent) = managed_request_identity(request)
@@ -2190,7 +2875,7 @@ impl Owner {
                                         route_epoch: self.config.route_epoch,
                                         policy_revision: self.config.policy_revision,
                                     },
-                                    &self.session.status().voters,
+                                    self.session.members().voters,
                                 )?,
                         ]
                     } else {
@@ -2241,7 +2926,7 @@ impl Owner {
                     operation: ManagedOperation::Cursor(stream),
                     ..
                 } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let (key, family, intent) = managed_request_identity(request)
@@ -2278,7 +2963,7 @@ impl Owner {
                     Ok(Response::Error(AccessError::OutcomeUnknown))
                 }
                 Operation::RequestStreamControl { .. } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let input = verified.into_request_stream_control()?;
@@ -2300,7 +2985,7 @@ impl Owner {
                     Ok(Response::Error(AccessError::OutcomeUnknown))
                 }
                 Operation::RequestStreamRead { cluster, query } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     if *cluster != self.session.cluster_id() {
@@ -2309,9 +2994,13 @@ impl Owner {
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.managed.read.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((
                         WaitingFor::RequestStreamRead {
                             context,
@@ -2324,7 +3013,7 @@ impl Owner {
                     Ok(Response::Error(AccessError::Unavailable))
                 }
                 Operation::Submit { .. } | Operation::OpenEpoch { .. } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let evidence = if matches!(
@@ -2344,7 +3033,7 @@ impl Owner {
                                 route_epoch: self.config.route_epoch,
                                 policy_revision: self.config.policy_revision,
                             },
-                            &self.session.status().voters,
+                            self.session.members().voters,
                         )?]
                     } else {
                         Vec::new()
@@ -2381,7 +3070,7 @@ impl Owner {
                     }
                 }
                 Operation::Stream(stream) => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let pending = self.streams.begin(
@@ -2398,15 +3087,19 @@ impl Owner {
                     if !self.session.is_authoritative() {
                         return Err(AccessError::Unavailable);
                     }
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.monitor.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((WaitingFor::Monitor { context, id: *id }, deadline));
                     Ok(Response::Error(AccessError::Unavailable))
                 }
@@ -2414,15 +3107,19 @@ impl Owner {
                     if !self.session.is_authoritative() {
                         return Err(AccessError::Unavailable);
                     }
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.summary.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((WaitingFor::Summary { context }, deadline));
                     Ok(Response::Error(AccessError::Unavailable))
                 }
@@ -2430,15 +3127,19 @@ impl Owner {
                     if !self.session.is_authoritative() {
                         return Err(AccessError::Unavailable);
                     }
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.reconcile.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
-                    self.session.read_index(context.clone()).map_err(access)?;
+                    self.session
+                        .read_index(context.clone())
+                        .map_err(barrier_refused)?;
                     waiting = Some((
                         WaitingFor::Reconcile {
                             context,
@@ -2455,15 +3156,19 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.list.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::List {
                                 context,
@@ -2496,15 +3201,19 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.selection.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Select {
                                 context,
@@ -2537,15 +3246,19 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.validators.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Validators {
                                 context,
@@ -2578,15 +3291,19 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.traversal.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Traverse {
                                 context,
@@ -2615,15 +3332,19 @@ impl Owner {
                 }
                 Operation::Read(read) => {
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.read.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.scalars().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
-                        self.session.read_index(context.clone()).map_err(access)?;
+                        self.session
+                            .read_index(context.clone())
+                            .map_err(barrier_refused)?;
                         waiting = Some((
                             WaitingFor::Read {
                                 context,
@@ -2646,7 +3367,7 @@ impl Owner {
                     }
                 }
                 Operation::Native { frame } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let header = native_frame_admissible(frame, peer, request)?;
@@ -2696,14 +3417,19 @@ impl Owner {
                         return Err(AccessError::Unavailable);
                     }
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
-                        if !self.session.is_authoritative() {
+                        // A follower serves it too: its barrier goes to the
+                        // leader, and the answer waits for this copy to have
+                        // applied the index it names (27 §5).
+                        if !self.session.serves_native_reads() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let correlation = crate::native_reads::correlation(
+                            self.session.scalars().node_id,
+                            self.incarnation,
                             peer.principal(),
                             request.request_id,
                             self.nonce,
@@ -2774,7 +3500,7 @@ impl Owner {
                 header,
                 response,
                 waiting,
-                term: self.session.status().term,
+                term: self.session.scalars().term,
                 deadline,
                 _charge: charge,
             });
@@ -2834,10 +3560,16 @@ impl Owner {
         // A retained delivery (a retryable native refusal, an import waiting
         // for sealed custody) resumes at the next poll; it never stops the
         // replica.
+        // What a leader sends leaves while its own write is in flight (27
+        // §3.4, the audit's F17): its members persist it for themselves, so
+        // the two writes overlap. The events of a poll are taken whole, once
+        // nothing of them is still to persist.
         let events = if self.nonblocking {
             match self.session.try_poll() {
                 Ok(Some(events)) => events,
                 Ok(None) => {
+                    self.waits_asked = self.waits_asked.saturating_add(1);
+                    self.send_early()?;
                     self.expire_pending();
                     self.publish_progress(false);
                     return Ok(());
@@ -2849,13 +3581,34 @@ impl Owner {
                 Err(error) => return Err(error),
             }
         } else {
-            match self.session.poll() {
-                Ok(events) => events,
-                Err(LedgerError::Retry) => {
-                    self.publish_progress(false);
-                    return Ok(());
+            loop {
+                match self.session.try_poll() {
+                    Ok(Some(events)) => break events,
+                    Ok(None) => {
+                        self.send_early()?;
+                        // This owner's thread has nothing else to do for
+                        // its replica: it waits for the write. Where there
+                        // is none to wait for — a checkpoint, a decoder
+                        // floor, a log with no room yet — the poll that
+                        // waits for those takes over.
+                        if self.session.wait_persisted()? {
+                            continue;
+                        }
+                        match self.session.poll() {
+                            Ok(events) => break events,
+                            Err(LedgerError::Retry) => {
+                                self.publish_progress(false);
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(LedgerError::Retry) => {
+                        self.publish_progress(false);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         };
         if drive_runtime && let Some(runtime) = &mut self.runtime {
@@ -2866,7 +3619,91 @@ impl Owner {
             }
         }
         self.resolve(&events)?;
-        for message in &events.messages {
+        self.send(&events.messages)?;
+        self.poll_snapshot_feedback()?;
+        self.publish_progress(false);
+        Ok(())
+    }
+    /// Send what may be sent while the replica's write is in flight
+    /// (`Session::sendable`). No snapshot is among it: a snapshot is sent
+    /// with the events of the poll, where what became of it can be told.
+    fn send_early(&mut self) -> Result<(), LedgerError> {
+        let Some(mut early) = self.session.sendable()? else {
+            return Ok(());
+        };
+        let _charge = early.take_allocation();
+        self.send(&early.messages)
+    }
+    /// The stream of `source`'s appends, kept for as many peers as the order
+    /// is (`LOST_PEERS`); none beyond them.
+    fn append_stream(&mut self, source: u64) -> Option<&mut AppendStream> {
+        if !self.append_streams.contains_key(&source) && self.append_streams.len() >= LOST_PEERS {
+            return None;
+        }
+        Some(self.append_streams.entry(source).or_default())
+    }
+    /// `source` sent an ordered frame in this replica's term.
+    fn sent_ordered(&mut self, source: u64) {
+        let term = self.session.scalars().term;
+        if let Some(stream) = self.append_stream(source) {
+            stream.ordered_in = Some(term);
+        }
+    }
+    /// A frame of `source` was lost to this log: what it refuses in this
+    /// term short of the first entry it lacks now is the loss's. Where the
+    /// log cannot say where it ends, every refusal of the term is.
+    fn lost_to(&mut self, source: u64) {
+        let term = self.session.scalars().term;
+        let from = self
+            .session
+            .last_log_index()
+            .map_or(u64::MAX, |last| last.saturating_add(1));
+        if let Some(stream) = self.append_stream(source) {
+            stream.lost_from = Some(match stream.lost_from {
+                Some((lost_in, before)) if lost_in == term => (term, before.max(from)),
+                _ => (term, from),
+            });
+        }
+    }
+    /// What this replica's answer to `leader`'s append says (27 §12). One
+    /// refused is counted; and counted as the order's to have spared when
+    /// the leader sent ordered and had an append taken in the answer's
+    /// term, and it was refused at or past where the log stood when a
+    /// frame of the leader was last lost to it — its hint, the last entry
+    /// this log could agree on, no earlier than that. A refusal that asks
+    /// for a snapshot is not one for an entry.
+    fn judge_append_answer(&mut self, answer: &focal_consensus::Message) {
+        if answer.reject {
+            self.appends_rejected = self.appends_rejected.saturating_add(1);
+        }
+        let Some(stream) = self.append_stream(answer.to) else {
+            return;
+        };
+        if !answer.reject {
+            stream.taken_in = Some(answer.term);
+            return;
+        }
+        let lost = stream
+            .lost_from
+            .is_some_and(|(term, from)| term == answer.term && answer.reject_hint < from);
+        if stream.ordered_in == Some(answer.term)
+            && stream.taken_in == Some(answer.term)
+            && answer.request_snapshot == 0
+            && !lost
+        {
+            self.appends_rejected_in_order = self.appends_rejected_in_order.saturating_add(1);
+        }
+    }
+    /// Hand the replica's messages to the driver that carries them. A
+    /// message that is not handed over — no room for it here, or in the
+    /// driver's queue — is told to the core as one the driver gave up is
+    /// (`report_lost`): the member is probed, and nothing is taken to be on
+    /// its way that is not.
+    fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
+        for message in messages {
+            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32 {
+                self.judge_append_answer(message);
+            }
             let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
@@ -2893,6 +3730,7 @@ impl Owner {
                     self.dropped_snapshots = self.dropped_snapshots.saturating_add(1);
                 }
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             }
             let Ok(charge) = self.budget.reserve(
@@ -2903,50 +3741,84 @@ impl Owner {
                     .ok_or(LedgerError::Capacity)?,
             ) else {
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
             let Ok(message_bytes) = message.write_to_bytes() else {
                 drop(snapshot);
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
             self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
-            let id = ((u128::from(self.session.status().node_id) << 64) | u128::from(self.nonce))
+            let id = ((u128::from(self.session.scalars().node_id) << 64) | u128::from(self.nonce))
                 .to_be_bytes();
+            let group = self.session.group_id();
+            let urgent = urgent(message);
+            // A bulk frame carries the order it leaves in (27 §12): the
+            // next sequence to its peer within this owner's incarnation,
+            // for as many peers as a configuration names; the driver
+            // finishes it for the peer's profile.
+            let sequence = if urgent {
+                None
+            } else {
+                match self.ordered.get(&message.to) {
+                    Some(last) => last.checked_add(1),
+                    None if self.ordered.len() < LOST_PEERS => Some(1),
+                    None => None,
+                }
+            };
+            let operation = match sequence {
+                Some(sequence) => {
+                    self.ordered.insert(message.to, sequence);
+                    Operation::RaftOrdered {
+                        group,
+                        epoch: self.incarnation,
+                        sequence,
+                        message: message_bytes,
+                    }
+                }
+                None => Operation::Raft {
+                    group,
+                    message: message_bytes,
+                },
+            };
             let frame = ReplicationFrame {
                 target: message.to,
                 snapshot,
+                lost: Some(self.lost_sender.clone()),
+                urgent,
                 _charge: charge.commit(),
                 request: RequestEnvelope {
-                    protocol: PROTOCOL_VERSION,
+                    protocol: if matches!(operation, Operation::RaftOrdered { .. }) {
+                        focal_wire::ORDERED_PROTOCOL_VERSION
+                    } else {
+                        PROTOCOL_VERSION
+                    },
                     ledger: self.session.ledger(),
                     route_epoch: self.config.route_epoch,
                     request_epoch: RequestEpoch(1),
                     request_id: RequestId(id),
-                    operation: Operation::Raft {
-                        group: self.session.group_id(),
-                        message: message_bytes,
-                    },
+                    operation,
                 },
             };
             if self.outbound.try_send(frame).is_err() {
                 self.dropped = self.dropped.saturating_add(1);
+                let _ = self.lost_sender.try_send(message.to);
             }
         }
-        self.poll_snapshot_feedback()?;
-        self.publish_progress(false);
         Ok(())
     }
     fn poll_snapshot_feedback(&mut self) -> Result<(), LedgerError> {
         self.snapshot_feedback
-            .poll(self.session.status().term, |peer, term, index, status| {
+            .poll(self.session.scalars().term, |peer, term, index, status| {
                 self.session.report_snapshot_at(peer, term, index, status)
             })
     }
     fn resolve(&mut self, events: &SessionEvents) -> Result<(), LedgerError> {
         self.resolve_memberships(events)?;
         self.resolve_placement(events)?;
-        let status = self.session.status();
+        let status = self.session.scalars();
         let count = self.pending.len();
         for _ in 0..count {
             let mut pending = self.pending.pop_front().ok_or(LedgerError::Corrupt)?;
@@ -3102,7 +3974,7 @@ impl Owner {
                     role,
                     profile,
                     read,
-                } if pending.term == status.term && self.session.is_authoritative() => events
+                } if pending.term == status.term && self.session.serves_native_reads() => events
                     .native_read_boundaries
                     .iter()
                     .find(|boundary| boundary.correlation == *correlation)
@@ -3324,21 +4196,34 @@ impl Owner {
             if let Some(result) = result {
                 pending.finish(result);
             } else if self.pace.periods() >= pending.deadline || status.term != pending.term {
-                let error = match &pending.waiting {
-                    WaitingFor::Mutation(_)
-                    | WaitingFor::ManagedMutation { .. }
-                    | WaitingFor::RequestStreamControl { .. } => AccessError::OutcomeUnknown,
-                    WaitingFor::Stream(stream) | WaitingFor::ManagedStream { stream, .. } => {
-                        stream.interrupted()
-                    }
-                    _ => AccessError::Unavailable,
-                };
-                pending.finish(Response::Error(error));
+                let result = self.given_up(&mut pending);
+                pending.finish(result);
             } else {
                 self.pending.push_back(pending);
             }
         }
         Ok(())
+    }
+    /// What a request the owner gives up is answered with: a read parked
+    /// with an empty page gets that page — its barrier was current when it
+    /// crossed it (the audit's F61) — and every other request the outcome
+    /// the owner can vouch for.
+    fn given_up(&self, pending: &mut Pending) -> Response {
+        match &mut pending.waiting {
+            WaitingFor::Stream(stream) => {
+                if let Some(reply) = stream.parked_reply() {
+                    return Response::Stream(reply);
+                }
+                Response::Error(stream.interrupted())
+            }
+            WaitingFor::ManagedStream { stream, .. } => Response::Error(stream.interrupted()),
+            WaitingFor::Mutation(_)
+            | WaitingFor::ManagedMutation { .. }
+            | WaitingFor::RequestStreamControl { .. } => {
+                Response::Error(AccessError::OutcomeUnknown)
+            }
+            _ => Response::Error(AccessError::Unavailable),
+        }
     }
     /// The owner's period at which a request taken now is given up: the
     /// request time in the periods it holds at the configured tick, counted
@@ -3362,6 +4247,7 @@ impl Owner {
     }
     fn expire_pending(&mut self) {
         self.expire_placement();
+        self.expire_held();
         let now = self.pace.periods();
         let count = self.memberships.len();
         for _ in 0..count {
@@ -3382,22 +4268,14 @@ impl Owner {
         // stalled disk retains both its Ready and client input reservations.
         let count = self.pending.len();
         for _ in 0..count {
-            let Some(pending) = self.pending.pop_front() else {
+            let Some(mut pending) = self.pending.pop_front() else {
                 break;
             };
             if pending.response.is_closed() {
                 drop(pending);
             } else if now >= pending.deadline {
-                let error = match &pending.waiting {
-                    WaitingFor::Mutation(_)
-                    | WaitingFor::ManagedMutation { .. }
-                    | WaitingFor::RequestStreamControl { .. } => AccessError::OutcomeUnknown,
-                    WaitingFor::Stream(stream) | WaitingFor::ManagedStream { stream, .. } => {
-                        stream.interrupted()
-                    }
-                    _ => AccessError::Unavailable,
-                };
-                pending.finish(Response::Error(error));
+                let result = self.given_up(&mut pending);
+                pending.finish(result);
             } else {
                 self.pending.push_back(pending);
             }
@@ -3447,7 +4325,7 @@ impl Owner {
                 }
             } else if !self.session.is_authoritative() {
                 return Err(LedgerError::NotReady {
-                    leader: self.session.status().leader_id,
+                    leader: self.session.scalars().leader_id,
                 });
             }
             Ok((deadline, proposed))
@@ -3457,7 +4335,7 @@ impl Owner {
                 call,
                 proposed,
                 context: None,
-                term: self.session.status().term,
+                term: self.session.scalars().term,
                 deadline,
                 charge,
             }),
@@ -3472,7 +4350,7 @@ impl Owner {
         }
     }
     fn resolve_memberships(&mut self, events: &SessionEvents) -> Result<(), LedgerError> {
-        let status = self.session.status();
+        let status = self.session.scalars();
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(mut pending) = self.memberships.pop_front() else {
@@ -3537,12 +4415,6 @@ impl Owner {
                     if !receipt_ready {
                         self.finish_membership(pending, Err(LedgerError::MembershipConflict));
                     } else {
-                        if matches!(
-                            pending.call.request.as_ref().map(|request| &request.change),
-                            Some(focal_consensus::MembershipChange::AddLearner { .. })
-                        ) {
-                            self.checkpoint_due = true;
-                        }
                         let view = self.session.membership();
                         self.finish_membership(pending, view);
                     }

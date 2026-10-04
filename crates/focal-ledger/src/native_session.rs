@@ -38,8 +38,11 @@ pub mod range;
 pub mod retention;
 #[path = "native_session_retirement.rs"]
 pub mod retirement;
+#[path = "native_session_seal.rs"]
+pub mod seal;
 pub use range::LayoutOperation;
 pub use retirement::RetirementRecord;
+pub use seal::SealRecord;
 #[path = "native_session_movement.rs"]
 pub mod movement;
 pub use movement::{LedgerRangeVerifier, MovementRecord};
@@ -126,6 +129,7 @@ impl NativeSessionLimits {
             attempts: 64,
             slot_bytes: 4096,
         };
+        let checkpoint = crate::native_checkpoint::Limits::default();
         Self {
             recovery: recovery::Limits {
                 // Bounded owner shapes: every completion-class admission funds
@@ -183,12 +187,15 @@ impl NativeSessionLimits {
                     construction_bytes: 4 * 1024 * 1024,
                 },
                 creation_objects: 4096,
-                work: recovery::Work {
-                    parsing: 1 << 30,
-                    source: 1 << 30,
-                    model: 1 << 30,
-                    lookup: 1 << 30,
-                },
+                // The work a restore of the largest checkpoint this
+                // configuration admits may spend, derived from the
+                // checkpoint's own bounds (the audit's F57): an admitted
+                // checkpoint always fits its recovery envelope.
+                work: recovery::Work::for_limits(
+                    checkpoint.visits,
+                    checkpoint.assembled_bytes,
+                    checkpoint.rows,
+                ),
             },
             encoding: record::EncodingLimits {
                 // One record: a preparation-sized body at the codec's fourfold
@@ -203,7 +210,7 @@ impl NativeSessionLimits {
                 rows: 100_000,
                 row_bytes: 6 << 20,
             },
-            checkpoint: crate::native_checkpoint::Limits::default(),
+            checkpoint,
             frame_bytes: 1 << 20,
             decode_work: input_codec::DecodeWork {
                 parse: 1 << 28,
@@ -257,8 +264,20 @@ pub enum NativeSessionError {
     Range(focal_ranges::RangeError),
     #[error("a committed retirement is in flight; propose again once it applies")]
     Retiring,
+    #[error("a committed seal is in flight; propose again once it applies")]
+    Sealing,
+    #[error("seal refused: {0:?}")]
+    Seal(focal_core::native::seal::SealRefusal),
     #[error("retirement refused: {0:?}")]
     Retirement(focal_core::native::retirement::RetirementRefusal),
+    /// A committed retirement the authority checked against an outcome
+    /// bound of `committed` makes a state this replica's bound of `local`
+    /// cannot hold: this replica is configured below the authority and
+    /// stops rather than diverge (26 §4).
+    #[error(
+        "a committed retirement was checked against an outcome bound of {committed}; this replica's bound of {local} cannot hold the state it makes"
+    )]
+    OutcomeBound { committed: u64, local: u64 },
 }
 impl From<focal_ranges::RangeError> for NativeSessionError {
     fn from(error: focal_ranges::RangeError) -> Self {
@@ -305,8 +324,9 @@ impl NativeSessionError {
             | Self::CustodyPending
             | Self::LayoutChanging
             | Self::Retiring
+            | Self::Sealing
             | Self::RangeMoving => Retryable,
-            Self::Retirement(_) => Request,
+            Self::Retirement(_) | Self::Seal(_) => Request,
             Self::Range(
                 focal_ranges::RangeError::Capacity | focal_ranges::RangeError::Memory(_),
             ) => Retryable,
@@ -326,7 +346,8 @@ impl NativeSessionError {
             | Self::Checkpoint(_)
             | Self::Corrupt
             | Self::Legacy
-            | Self::Failed => FailClosed,
+            | Self::Failed
+            | Self::OutcomeBound { .. } => FailClosed,
         }
     }
 }
@@ -640,7 +661,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         self.consensus.status()
     }
     pub fn is_authoritative(&self) -> bool {
-        self.engine.is_authoritative(&self.consensus.status())
+        self.engine.is_authoritative(&self.consensus.scalars())
     }
     pub fn genesis(&self) -> Option<ContentHash> {
         self.engine.genesis()
@@ -708,7 +729,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// family is derived from the committed state first, so an applicable
     /// record is what the log carries. Refused while candidates are
     /// pending, a layout change, movement step or another retirement is in
-    /// flight, or the family is ineligible.
+    /// flight, or the family is ineligible — the outcome the retirement
+    /// publishes past the core's bound (`OutcomeCapacity`) or promised to a
+    /// live report (`OutcomesReserved`) among the reasons; nothing is
+    /// proposed and nothing fenced on a refusal.
     pub fn propose_retirement(
         &mut self,
         root: focal_model::ClaimId,
@@ -723,10 +747,44 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn retirement_in_flight(&self) -> Option<RetirementRecord> {
         self.engine.retirement_in_flight()
     }
+    /// Propose one seal of closed outcomes as a session decision (F12): the
+    /// plan is derived from the committed state first, so an applicable
+    /// record is what the log carries. Refused under the retirement's
+    /// gates, while a seal or a retirement is in flight, or when the plan
+    /// does not name the committed prefix.
+    pub fn propose_seal(
+        &mut self,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), NativeSessionError> {
+        self.engine
+            .propose_seal(&mut self.consensus, plan, bundle, bytes, fold)
+    }
+    /// The seal this authority proposed and has not seen applied.
+    pub fn seal_in_flight(&self) -> Option<SealRecord> {
+        self.engine.seal_in_flight()
+    }
+    /// Seals applied through this replica's applied prefix.
+    pub fn seals_applied(&self) -> u64 {
+        self.engine.seals_applied()
+    }
+    /// Committed seal records this replica applied nothing for.
+    pub fn seals_inert(&self) -> u64 {
+        self.engine.seals_inert()
+    }
     /// Families retired through this replica's applied prefix (26 §4),
     /// counted from genesis or the checkpoint that seeded it.
     pub fn retired_families(&self) -> u64 {
         self.engine.retired_families()
+    }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4): the prefix they named had passed, a movement was
+    /// pending, or the committed state refused the family — a version-1
+    /// record beyond this replica's outcome bound among them.
+    pub fn retirements_inert(&self) -> u64 {
+        self.engine.retirements_inert()
     }
     /// Propose one movement step as a session decision (25 §6): checked
     /// against the committed coordinator state first, refused while
@@ -810,7 +868,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         boundary: NativeReadBoundary,
     ) -> Result<&Core<NativeState>, NativeSessionError> {
         self.engine
-            .read_at_least(boundary, &self.consensus.status())
+            .read_at_least(boundary, &self.consensus.scalars())
     }
     pub fn campaign(&mut self) -> Result<(), NativeSessionError> {
         self.engine.check()?;
@@ -954,6 +1012,15 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// namespace is internal and cannot be requested here.
     pub fn read_index(&mut self, correlation: ReadCorrelation) -> Result<(), NativeSessionError> {
         self.engine.read_index(&mut self.consensus, correlation)
+    }
+    /// Read barriers answered above this copy's applied index and held until
+    /// it caught up, since it opened (27 §5, follower reads).
+    pub fn reads_parked(&self) -> u64 {
+        self.engine.reads_parked
+    }
+    /// Read barriers dropped at the parked bound since this session opened.
+    pub fn reads_dropped(&self) -> u64 {
+        self.engine.reads_dropped
     }
     /// Encode the committed Core at the fully delivered prefix under a retained
     /// output permit and hand bytes and permit together to consensus. Completion

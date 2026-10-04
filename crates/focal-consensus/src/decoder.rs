@@ -28,6 +28,12 @@ pub(super) struct PendingDecoderFloor {
     receipt: Option<WalAppend>,
     _allocation: Allocation,
 }
+impl PendingDecoderFloor {
+    /// Whether the log took the floor's write.
+    pub(super) fn taken(&self) -> bool {
+        self.receipt.is_some()
+    }
+}
 impl DurableNode {
     /// Register the actual compiled application decoder before replay or Raft
     /// participation. This never persists or advertises a capability. A single
@@ -233,9 +239,11 @@ impl DurableNode {
             return Err(ConsensusError::PersistencePending);
         }
         if pending.receipt.is_none() {
-            match self.wal.append_async_in(
+            let persisted = self.persisted.as_ref().map(|signal| signal());
+            match self.wal.append_async_notified(
                 std::slice::from_ref(&pending.record),
                 BudgetLane::Completion,
+                persisted,
             ) {
                 Ok(receipt) => pending.receipt = Some(receipt),
                 Err(LogError::Capacity) => {

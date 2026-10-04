@@ -60,6 +60,52 @@ pub(super) enum FleetInput {
     Routed(Routed),
     Management(management::ManagementWork),
 }
+/// What the shared owner waits on: something was queued for it, or a write
+/// of one of its sessions was answered by the log. A signal says there is
+/// something to take, nothing more: one that finds the queue of signals
+/// full is dropped, since the owner is then about to take what the queued
+/// ones say and looks at its input and its sessions after each of them.
+pub(super) enum Signal {
+    Input,
+    Persisted(LedgerId),
+}
+/// The shared owner's queue as those that give it work hold it: the work
+/// is queued, then the owner is woken.
+#[derive(Clone)]
+pub(super) struct OwnerQueue {
+    input: mpsc::SyncSender<FleetInput>,
+    signal: mpsc::SyncSender<Signal>,
+}
+impl OwnerQueue {
+    /// The owner's input and signal queues, and this handle on them.
+    fn new() -> (Self, mpsc::Receiver<FleetInput>, mpsc::Receiver<Signal>) {
+        let (input, inputs) = mpsc::sync_channel(QUEUED);
+        let (signal, signals) = mpsc::sync_channel(QUEUED);
+        (Self { input, signal }, inputs, signals)
+    }
+    /// The refusal carries the work back, as the queue's own does; it is
+    /// boxed, the work being large and a refusal rare.
+    pub(super) fn try_send(
+        &self,
+        input: FleetInput,
+    ) -> Result<(), Box<mpsc::TrySendError<FleetInput>>> {
+        self.input.try_send(input).map_err(Box::new)?;
+        let _ = self.signal.try_send(Signal::Input);
+        Ok(())
+    }
+    /// What tells the owner that a write of `ledger`'s replica was
+    /// answered (`Session::notify_persisted`): the owner drains the session
+    /// then, instead of asking the log at intervals (27 §9).
+    pub(super) fn persisted(&self, ledger: LedgerId) -> focal_consensus::PersistedSignal {
+        let signal = self.signal.clone();
+        Box::new(move || {
+            let signal = signal.clone();
+            Box::new(move || {
+                let _ = signal.try_send(Signal::Persisted(ledger));
+            })
+        })
+    }
+}
 pub(super) fn lane(work: &Work) -> BudgetLane {
     match class(work) {
         WorkClass::Apply | WorkClass::Control | WorkClass::Completion => BudgetLane::Completion,
@@ -83,6 +129,7 @@ fn class(work: &Work) -> WorkClass {
         | Work::CustodyPulled(..)
         | Work::Refence(..)
         | Work::Admit(..)
+        | Work::Windows(..)
         | Work::Membership(..)
         | Work::Placement(..)
         | Work::Range(..)
@@ -90,7 +137,7 @@ fn class(work: &Work) -> WorkClass {
         Work::Probe(request, ..) if completion_request(request) => WorkClass::Completion,
         Work::Probe(..) => WorkClass::Query,
         Work::Request(request, ..) => match request.verified.request().operation {
-            Operation::Raft { .. } => WorkClass::Apply,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. } => WorkClass::Apply,
             Operation::Read(_)
             | Operation::Stream(_)
             | Operation::Reconcile(_)
@@ -130,6 +177,7 @@ impl ReplicaFleet {
             .commit();
         let shared_bytes = size_of::<FleetInput>()
             .checked_add(size_of::<ReplicationFrame>())
+            .and_then(|size| size.checked_add(size_of::<Signal>()))
             .and_then(|size| size.checked_add(128))
             .and_then(|size| QUEUED.checked_mul(size))
             .and_then(|bytes| {
@@ -186,7 +234,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, receiver) = mpsc::sync_channel(QUEUED);
+        let (sender, receiver, signals) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let mut sessions = BTreeMap::new();
         let mut wal_owners = Vec::new();
@@ -228,6 +276,7 @@ impl ReplicaFleet {
             }
             let ingress = tenant.child(64 * 1024 * 1024, 24 * 1024 * 1024)?;
             let slots = items.child(replica.config.queue_items, replica.config.queue_items / 4)?;
+            let wake = sender.clone();
             let sender = HostSender::Group {
                 ledger,
                 incarnation,
@@ -245,6 +294,7 @@ impl ReplicaFleet {
                 outbound.clone(),
             )?;
             owner.nonblocking = true;
+            owner.session.notify_persisted(Some(wake.persisted(ledger)));
             owner.incarnation = incarnation;
             owner.next_tick = now;
             owner.wake_at = now;
@@ -256,6 +306,8 @@ impl ReplicaFleet {
             sessions,
             deadlines,
             scheduler,
+            signals,
+            unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: None,
             _wal_owners: wal_owners,
@@ -281,6 +333,13 @@ struct GroupOwner {
     sessions: BTreeMap<LedgerId, Owner>,
     deadlines: BTreeMap<(Instant, LedgerId), ()>,
     scheduler: FairScheduler<Option<Routed>>,
+    /// What wakes this owner when it has nothing due (`Signal`).
+    signals: mpsc::Receiver<Signal>,
+    /// The sessions that wait to persist and that the log will not tell
+    /// this owner of: it had no room for their write. One is asked again
+    /// for each write of this owner's the log answers — a write answered is
+    /// its room given back — and each at its tick.
+    unwoken: std::collections::BTreeSet<LedgerId>,
     nonce: u128,
     management: Option<management::ManagementOwner>,
     // Physical writers outlive every logical-session removal. A final handle
@@ -321,6 +380,7 @@ impl GroupOwner {
     fn stop_session(&mut self, ledger: LedgerId) {
         if let Some(mut owner) = self.sessions.remove(&ledger) {
             self.deadlines.remove(&(owner.wake_at, ledger));
+            self.unwoken.remove(&ledger);
             owner.close();
         }
         if let Some(management) = &mut self.management {
@@ -333,8 +393,35 @@ impl GroupOwner {
             self.deadlines.remove(&(owner.wake_at, ledger));
             owner.wake_at = next;
             self.deadlines.insert((next, ledger), ());
+            if owner.session.persistence_pending() && !owner.session.wakes_owner() {
+                self.unwoken.insert(ledger);
+            } else {
+                self.unwoken.remove(&ledger);
+            }
         }
         Ok(())
+    }
+    /// The session is due now.
+    fn due(&mut self, ledger: LedgerId) {
+        if let Some(owner) = self.sessions.get_mut(&ledger) {
+            let now = Instant::now();
+            if owner.wake_at > now {
+                self.deadlines.remove(&(owner.wake_at, ledger));
+                owner.wake_at = now;
+                self.deadlines.insert((now, ledger), ());
+            }
+        }
+    }
+    /// Takes the signals that wait, without waiting for one: a session
+    /// whose write was answered while the owner had work is due on the
+    /// owner's next pass, not when the owner next has nothing to do.
+    fn take_signals(&mut self) {
+        for _ in 0..QUEUED {
+            match self.signals.try_recv() {
+                Ok(signal) => self.signalled(signal),
+                Err(_) => break,
+            }
+        }
     }
     fn enqueue(&mut self, routed: Routed) -> Result<(), LedgerError> {
         let Some(owner) = self.sessions.get_mut(&routed.ledger) else {
@@ -351,7 +438,10 @@ impl GroupOwner {
             self.reschedule(routed.ledger)?;
             return Ok(());
         }
-        if owner.stopping.is_some() {
+        // A stopping session takes no more work — except while its leader
+        // hands the log off (27 §5): its peers' messages are how the heir is
+        // caught up and asked, and how this replica's term ends.
+        if owner.stopping.is_some() && owner.handing_off.is_none() {
             return Ok(());
         }
         self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
@@ -406,6 +496,7 @@ impl GroupOwner {
             {
                 return Ok(());
             }
+            self.take_signals();
             for _ in 0..SLICE {
                 let Some((&(deadline, ledger), _)) = self.deadlines.first_key_value() else {
                     break;
@@ -442,8 +533,14 @@ impl GroupOwner {
                 match self
                     .scheduler
                     .schedule_when(|ledger| {
+                        // A stopping session takes no more work — except
+                        // while its leader hands the log off, which is
+                        // messages both ways: the heir's append responses
+                        // say when it is caught up, and its vote request
+                        // ends this replica's term.
                         sessions.get(&ledger).is_none_or(|owner| {
-                            !owner.session.persistence_pending() && owner.stopping.is_none()
+                            !owner.session.persistence_pending()
+                                && (owner.stopping.is_none() || owner.handing_off.is_some())
                         })
                     })
                     .map_err(|_| LedgerError::Failed)?
@@ -490,15 +587,32 @@ impl GroupOwner {
                 .map(|((when, _), _)| when.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::from_millis(100))
                 .min(Duration::from_millis(100));
-            match receiver.recv_timeout(wait) {
-                Ok(input) => {
-                    if self.input(input)? {
-                        return Ok(());
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            // Nothing is due and nothing runnable: the owner waits for a
+            // signal — work was queued, or the log answered a write — or
+            // for its next deadline. The input is taken, and found closed,
+            // at the top of the round.
+            if let Ok(signal) = self.signals.recv_timeout(wait) {
+                self.signalled(signal);
+                self.take_signals();
             }
+        }
+    }
+    /// A session whose write the log answered is due now: its drain takes
+    /// what the write released. A wake is no proof of anything: the drain
+    /// reads the write's own answer, and a signal for a session that was
+    /// stopped, or replaced since, costs one look. And the room the
+    /// answered write held is given back: one session the log had no room
+    /// for is due with it.
+    fn signalled(&mut self, signal: Signal) {
+        let Signal::Persisted(ledger) = signal else {
+            return;
+        };
+        if let Some(owner) = self.sessions.get_mut(&ledger) {
+            owner.waits_answered = owner.waits_answered.saturating_add(1);
+        }
+        self.due(ledger);
+        if let Some(waiting) = self.unwoken.pop_first() {
+            self.due(waiting);
         }
     }
 }

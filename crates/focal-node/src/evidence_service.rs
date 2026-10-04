@@ -11,7 +11,7 @@ use focal_model::*;
 use focal_wire::*;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     pin::Pin,
 };
@@ -293,6 +293,45 @@ struct Job {
     route: RouteEpoch,
     kind: JobKind,
     _allocation: Allocation,
+}
+/// What a participant job is: the ledger, the request exactly (a managed
+/// request by its key, as its transfer is named) and the kind of job.
+type JobIdentity = (LedgerId, [u8; 16], u8);
+impl Job {
+    /// A trusted node job has none: it runs as it comes.
+    fn identity(&self) -> Option<JobIdentity> {
+        let request = self.request.as_ref()?;
+        let kind = match self.kind {
+            JobKind::Seal(_) => 0,
+            JobKind::Attest(_) => 1,
+            JobKind::AttestNative(_) => 2,
+            JobKind::Obligation(..) => 3,
+            JobKind::Archive { .. } | JobKind::Repair { .. } => return None,
+        };
+        Some((self.ledger, custody_request_id(request).ok()?.0, kind))
+    }
+    fn refuse(self, error: AccessError) {
+        match self.kind {
+            JobKind::Seal(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Attest(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::AttestNative(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Obligation(_, reply) => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Archive { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            JobKind::Repair { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
 }
 struct PlacementRow {
     placement: EvidencePlacement,
@@ -713,7 +752,21 @@ impl EvidenceDriver {
     }
     async fn run_inner(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
         let content = self.content.clone();
+        let node = self.node;
         let mut tasks = FuturesUnordered::new();
+        // The participant jobs in flight, by what each is, and the jobs of
+        // the same identity that run after each: an exact retry that comes
+        // while its first is in flight (its client gave up the exchange
+        // before the copies took the object, as a client does across a
+        // slow path) runs once the first is done, and finds what it did —
+        // never beside it, sending every copy the same bytes again. At
+        // most as many wait behind one as run at once; the rest are
+        // refused the room.
+        let mut same: BTreeMap<JobIdentity, VecDeque<Job>> = BTreeMap::new();
+        let begin = |placement, identity, job| {
+            let content = &content;
+            async move { (identity, process(content, pool, node, placement, job).await) }
+        };
         let mut receiving = true;
         let mut updates = true;
         while receiving || updates || !tasks.is_empty() {
@@ -727,12 +780,37 @@ impl EvidenceDriver {
                 }
                 job = self.receiver.recv(), if receiving && tasks.len() < self.concurrency => {
                     if let Some(job) = job {
-                        let placement = self.snapshot(job.ledger, job.route);
-                        tasks.push(process(&content, pool, self.node, placement, job));
+                        let identity = job.identity();
+                        match identity.and_then(|identity| same.get_mut(&identity)) {
+                            Some(after) => {
+                                if after.len() < self.concurrency && after.try_reserve(1).is_ok() {
+                                    after.push_back(job);
+                                } else {
+                                    job.refuse(AccessError::Capacity);
+                                }
+                            }
+                            None => {
+                                if let Some(identity) = identity {
+                                    same.insert(identity, VecDeque::new());
+                                }
+                                let placement = self.snapshot(job.ledger, job.route);
+                                tasks.push(begin(placement, identity, job));
+                            }
+                        }
                     } else { receiving = false; }
                 }
                 done = tasks.next(), if !tasks.is_empty() => {
-                    if let Some(done) = done {done.send(&self.placements);}
+                    if let Some((identity, done)) = done {
+                        done.send(&self.placements);
+                        if let Some(identity) = identity
+                            && let Some(mut after) = same.remove(&identity)
+                            && let Some(job) = after.pop_front()
+                        {
+                            same.insert(identity, after);
+                            let placement = self.snapshot(job.ledger, job.route);
+                            tasks.push(begin(placement, Some(identity), job));
+                        }
+                    }
                 }
             }
         }
@@ -1169,6 +1247,7 @@ async fn holds(
 async fn striped<F>(
     width: impl Fn() -> usize,
     lacked: std::ops::Range<u32>,
+    held: impl Fn(u32) -> bool,
     moved: impl Fn(u32) -> F,
 ) -> Result<(), AccessError>
 where
@@ -1201,9 +1280,14 @@ where
             if let Some(index) = again.pop_first() {
                 flying.push(attempt(index));
             } else if next < lacked.end {
-                open = open.saturating_add(1);
-                flying.push(attempt(next));
+                let index = next;
                 next = next.checked_add(1).ok_or(AccessError::Capacity)?;
+                // A chunk the copy holds is not moved (the audit's F50).
+                if held(index) {
+                    continue;
+                }
+                open = open.saturating_add(1);
+                flying.push(attempt(index));
             } else {
                 break;
             }
@@ -1254,11 +1338,12 @@ async fn send_chunks(
     scope: CustodyScope,
     transfer: [u8; 16],
     reference: &ContentRef,
-    lacked: std::ops::Range<u32>,
+    lacked: &Lacked,
 ) -> Result<(), AccessError> {
     striped(
         || pool.bulk_width(peer),
-        lacked,
+        lacked.range.clone(),
+        |index| lacked.held.holds(index),
         async |index: u32| {
             let bytes = content
                 .read_transfer_chunk(
@@ -1267,19 +1352,66 @@ async fn send_chunks(
                     usize::try_from(index).map_err(|_| AccessError::Capacity)?,
                 )
                 .await?;
-            remote(
-                pool,
-                peer,
-                scope,
-                transfer,
-                CustodyRequest::Chunk {
+            let chunk = bytes.value();
+            // A chunk the path carries within an exchange's time goes
+            // whole; one it does not goes in parts, each of which renews
+            // the copy's lease on the transfer (the audit's F49), from
+            // wherever the copy says it holds the chunk to.
+            let mut offset = 0_usize;
+            while offset < chunk.len() {
+                let part = pool.part_bytes(peer, chunk.len());
+                if offset == 0 && part >= chunk.len() {
+                    remote(
+                        pool,
+                        peer,
+                        scope,
+                        transfer,
+                        CustodyRequest::Chunk {
+                            transfer,
+                            index,
+                            bytes: chunk.clone(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let end = offset.saturating_add(part).min(chunk.len());
+                let reply = remote(
+                    pool,
+                    peer,
+                    scope,
                     transfer,
-                    index,
-                    bytes: bytes.value().clone(),
-                },
-            )
-            .await
-            .map(|_| ())
+                    CustodyRequest::ChunkPart {
+                        transfer,
+                        index,
+                        offset: u32::try_from(offset).map_err(|_| AccessError::Capacity)?,
+                        bytes: chunk
+                            .get(offset..end)
+                            .ok_or(AccessError::Capacity)?
+                            .to_vec(),
+                    },
+                )
+                .await?;
+                match reply {
+                    CustodyReply::ChunkStored { index: stored } if stored == index => {
+                        return Ok(());
+                    }
+                    CustodyReply::PartStored {
+                        index: stored,
+                        staged,
+                    } if stored == index => {
+                        let staged = usize::try_from(staged).map_err(|_| AccessError::Capacity)?;
+                        // What the copy holds grows with every part, or
+                        // the copy and this sender disagree on the chunk.
+                        if staged <= offset {
+                            return Err(AccessError::InvalidRequest);
+                        }
+                        offset = staged;
+                    }
+                    _ => return Err(AccessError::InvalidRequest),
+                }
+            }
+            Ok(())
         },
     )
     .await
@@ -1296,39 +1428,67 @@ async fn push(
     reference: &ContentRef,
 ) -> Result<(), AccessError> {
     let manifest = content.export_manifest(scope, reference.clone()).await?;
-    let opened = remote(
-        pool,
-        peer,
-        scope,
-        transfer,
-        CustodyRequest::Open {
+    // What the copy holds is asked for where its connection admits the
+    // ordered profile, and only what it lacks is sent (the audit's F50); a
+    // copy of an older binary says the first chunk it lacks and is sent
+    // from there, as it was.
+    let profile = pool.negotiated_with(peer).await.map_err(send_error)?;
+    let encoded = manifest.value().encoded().to_vec();
+    let named = manifest.value().chunks();
+    let lacked = if profile >= ORDERED_PROTOCOL_VERSION {
+        let opened = remote(
+            pool,
+            peer,
+            scope,
             transfer,
-            policy_revision: scope.policy_revision,
-            content: reference.clone(),
-            manifest: manifest.value().encoded().to_vec(),
-        },
-    )
-    .await?;
-    let CustodyReply::Opened {
-        chunks,
-        next_missing,
-    } = opened
-    else {
-        return Err(AccessError::InvalidRequest);
+            CustodyRequest::OpenHeld {
+                transfer,
+                policy_revision: scope.policy_revision,
+                content: reference.clone(),
+                manifest: encoded,
+            },
+        )
+        .await?;
+        let CustodyReply::OpenedHeld { chunks, held } = opened else {
+            return Err(AccessError::InvalidRequest);
+        };
+        if chunks as usize != named {
+            return Err(AccessError::InvalidRequest);
+        }
+        Lacked {
+            range: 0..chunks,
+            held: Held::verified(chunks, held)?,
+        }
+    } else {
+        let opened = remote(
+            pool,
+            peer,
+            scope,
+            transfer,
+            CustodyRequest::Open {
+                transfer,
+                policy_revision: scope.policy_revision,
+                content: reference.clone(),
+                manifest: encoded,
+            },
+        )
+        .await?;
+        let CustodyReply::Opened {
+            chunks,
+            next_missing,
+        } = opened
+        else {
+            return Err(AccessError::InvalidRequest);
+        };
+        if chunks as usize != named || next_missing > chunks {
+            return Err(AccessError::InvalidRequest);
+        }
+        Lacked {
+            range: next_missing..chunks,
+            held: Held::none(),
+        }
     };
-    if chunks as usize != manifest.value().chunks() || next_missing > chunks {
-        return Err(AccessError::InvalidRequest);
-    }
-    send_chunks(
-        content,
-        pool,
-        peer,
-        scope,
-        transfer,
-        reference,
-        next_missing..chunks,
-    )
-    .await?;
+    send_chunks(content, pool, peer, scope, transfer, reference, &lacked).await?;
     let reply = remote(
         pool,
         peer,
@@ -1706,7 +1866,12 @@ pub(crate) async fn pull_object(
 }
 fn envelope(scope: CustodyScope, id: [u8; 16], operation: CustodyRequest) -> RequestEnvelope {
     RequestEnvelope {
-        protocol: PROTOCOL_VERSION,
+        // An ask of what a copy holds is of the ordered profile (the
+        // audit's F50); every other custody request is of the base.
+        protocol: match operation {
+            CustodyRequest::OpenHeld { .. } => ORDERED_PROTOCOL_VERSION,
+            _ => PROTOCOL_VERSION,
+        },
         ledger: scope.ledger,
         route_epoch: scope.route_epoch,
         request_epoch: RequestEpoch(1),
@@ -1723,11 +1888,57 @@ async fn remote(
 ) -> Result<CustodyReply, AccessError> {
     pool.send_custody(peer, &envelope(scope, transfer, operation))
         .await
-        .map_err(|error| match error {
-            PeerSendError::Busy => AccessError::Capacity,
-            PeerSendError::Rejected(error) => error,
-            _ => AccessError::OutcomeUnknown,
-        })
+        .map_err(send_error)
+}
+/// What a send that failed means to the transfer: a lane with no room is
+/// the copy's capacity, a refusal is the copy's word, anything else left
+/// the outcome unknown.
+fn send_error(error: PeerSendError) -> AccessError {
+    match error {
+        PeerSendError::Busy => AccessError::Capacity,
+        PeerSendError::Rejected(error) => error,
+        _ => AccessError::OutcomeUnknown,
+    }
+}
+/// What a copy holds of an object, as it told it (`CustodyReply::OpenedHeld`,
+/// the audit's F50): a bit for each chunk. Empty where nothing is known to
+/// be held.
+struct Held(Vec<u64>);
+/// The chunks a copy lacks: a range of the manifest's chunks, less what the
+/// copy said it holds.
+struct Lacked {
+    range: std::ops::Range<u32>,
+    held: Held,
+}
+impl Held {
+    fn none() -> Self {
+        Self(Vec::new())
+    }
+    /// The copy's word, held to the manifest: a word for every sixty-four
+    /// chunks and no bit for a chunk the manifest does not name.
+    fn verified(chunks: u32, held: Vec<u64>) -> Result<Self, AccessError> {
+        let words = usize::try_from(chunks)
+            .map_err(|_| AccessError::Capacity)?
+            .div_ceil(u64::BITS as usize);
+        if held.len() != words {
+            return Err(AccessError::InvalidRequest);
+        }
+        let spare = u32::try_from(words.saturating_mul(u64::BITS as usize))
+            .map_err(|_| AccessError::Capacity)?
+            .saturating_sub(chunks);
+        if spare > 0 && held.last().is_some_and(|last| last.leading_zeros() < spare) {
+            return Err(AccessError::InvalidRequest);
+        }
+        Ok(Self(held))
+    }
+    fn holds(&self, index: u32) -> bool {
+        let word = usize::try_from(index.checked_div(u64::BITS).unwrap_or(0)).unwrap_or(usize::MAX);
+        let bit = index
+            .checked_rem(u64::BITS)
+            .and_then(|bit| 1_u64.checked_shl(bit))
+            .unwrap_or(0);
+        self.0.get(word).is_some_and(|held| held & bit != 0)
+    }
 }
 async fn local(
     content: &ContentHost,
@@ -1882,62 +2093,140 @@ async fn pull(
     if described != *reference {
         return Err(AccessError::InvalidRequest);
     }
+    // This node's own inventory of the object (the audit's F50): what it
+    // holds verified is not pulled again. The holder's transfer is opened
+    // as it was; it serves reads on any profile.
     let open = CustodyRequest::Open {
         transfer,
         policy_revision: scope.policy_revision,
         content: reference.clone(),
-        manifest,
+        manifest: manifest.clone(),
     };
-    let opened = local(content, node, scope, transfer, open.clone()).await?;
+    let opened = local(
+        content,
+        node,
+        scope,
+        transfer,
+        CustodyRequest::OpenHeld {
+            transfer,
+            policy_revision: scope.policy_revision,
+            content: reference.clone(),
+            manifest,
+        },
+    )
+    .await?;
     remote(pool, peer, scope, transfer, open).await?;
-    let CustodyReply::Opened {
-        chunks,
-        next_missing,
-    } = opened
-    else {
+    let CustodyReply::OpenedHeld { chunks, held } = opened else {
         return Err(AccessError::InvalidRequest);
     };
+    let held = Held::verified(chunks, held)?;
     let max_bytes = u32::try_from(focal_evidence::MAX_TRANSFER_CHUNK_BYTES)
         .map_err(|_| AccessError::Capacity)?;
     striped(
         || pool.bulk_width(peer),
-        next_missing..chunks,
+        0..chunks,
+        |index| held.holds(index),
         async |index: u32| {
-            let reply = remote(
-                pool,
-                peer,
-                scope,
-                transfer,
-                CustodyRequest::ReadChunk {
+            // A chunk the path carries within an exchange's time is asked
+            // for whole; one it does not is asked for in parts, each of
+            // which renews both leases, the peer's and this node's (the
+            // audit's F49).
+            let mut offset = 0_usize;
+            loop {
+                let part = pool.part_bytes(peer, focal_evidence::MAX_TRANSFER_CHUNK_BYTES);
+                if offset == 0 && part >= focal_evidence::MAX_TRANSFER_CHUNK_BYTES {
+                    let reply = remote(
+                        pool,
+                        peer,
+                        scope,
+                        transfer,
+                        CustodyRequest::ReadChunk {
+                            transfer,
+                            index,
+                            max_bytes,
+                        },
+                    )
+                    .await?;
+                    let CustodyReply::Chunk {
+                        index: found,
+                        bytes,
+                    } = reply
+                    else {
+                        return Err(AccessError::InvalidRequest);
+                    };
+                    if index != found {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    local(
+                        content,
+                        node,
+                        scope,
+                        transfer,
+                        CustodyRequest::Chunk {
+                            transfer,
+                            index,
+                            bytes,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let reply = remote(
+                    pool,
+                    peer,
+                    scope,
                     transfer,
-                    index,
-                    max_bytes,
-                },
-            )
-            .await?;
-            let CustodyReply::Chunk {
-                index: found,
-                bytes,
-            } = reply
-            else {
-                return Err(AccessError::InvalidRequest);
-            };
-            if index != found {
-                return Err(AccessError::InvalidRequest);
-            }
-            local(
-                content,
-                node,
-                scope,
-                transfer,
-                CustodyRequest::Chunk {
-                    transfer,
-                    index,
+                    CustodyRequest::ReadChunkPart {
+                        transfer,
+                        index,
+                        offset: u32::try_from(offset).map_err(|_| AccessError::Capacity)?,
+                        max_bytes: u32::try_from(part).map_err(|_| AccessError::Capacity)?,
+                    },
+                )
+                .await?;
+                let CustodyReply::ChunkPart {
+                    index: found,
+                    offset: at,
+                    length: _,
                     bytes,
-                },
-            )
-            .await
-            .map(|_| ())
+                } = reply
+                else {
+                    return Err(AccessError::InvalidRequest);
+                };
+                if index != found
+                    || usize::try_from(at).map_err(|_| AccessError::Capacity)? != offset
+                    || bytes.is_empty()
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let stored = local(
+                    content,
+                    node,
+                    scope,
+                    transfer,
+                    CustodyRequest::ChunkPart {
+                        transfer,
+                        index,
+                        offset: at,
+                        bytes,
+                    },
+                )
+                .await?;
+                match stored {
+                    CustodyReply::ChunkStored { index: done } if done == index => return Ok(()),
+                    CustodyReply::PartStored {
+                        index: done,
+                        staged,
+                    } if done == index => {
+                        let staged = usize::try_from(staged).map_err(|_| AccessError::Capacity)?;
+                        if staged <= offset {
+                            return Err(AccessError::InvalidRequest);
+                        }
+                        offset = staged;
+                    }
+                    _ => return Err(AccessError::InvalidRequest),
+                }
+            }
         },
     )
     .await?;
@@ -2044,6 +2333,9 @@ impl RequestHandler for FleetService {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
     fn handle<'a>(
         &'a self,
         request: &'a VerifiedRequest,
@@ -2072,7 +2364,16 @@ impl RequestHandler for FleetService {
             } else if matches!(
                 request.request().operation,
                 Operation::Custody(_) | Operation::Upload(_) | Operation::Download { .. }
+            ) || matches!(
+                &request.request().operation,
+                Operation::NativeRead(read)
+                    if matches!(
+                        read.query,
+                        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_)
+                    )
             ) {
+                // Content, and an archived object read from a bundle this
+                // node holds (the audit's F11), are the content owner's.
                 self.content.handle_accounted(&request).await
             } else if let Operation::Native { frame } = &request.request().operation
                 && inspect_native_frame(frame)

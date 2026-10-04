@@ -98,8 +98,9 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     ..CompletionSlots::default()
                 }
             );
-            // Nine primary writes, the report's twenty-one index rows and the
-            // due timers of the reported and every sealed cohort evaluation.
+            // Ten primary writes (the principal's window among them, F12),
+            // the report's twenty-one index rows and the due timers of the
+            // reported and every sealed cohort evaluation.
             let report_index = crate::native::index_rows::report_rows(16).unwrap();
             let regular_timers =
                 crate::native::index_rows::timer_rows(0, 1 + cohort.evaluations(), 0).unwrap();
@@ -109,7 +110,7 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     .unwrap()
                     .limits()
                     .changed_keys,
-                9 + report_index + regular_timers
+                10 + report_index + regular_timers
             );
             let regular = envelope
                 .per_report_retained_bytes(CompletionUse::Regular)
@@ -120,15 +121,16 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     .report_storage(CompletionUse::Regular)
                     .unwrap()
                     .additional_retained_bytes()
-                    + crate::native::mutation::bytes(9 + report_index + regular_timers).unwrap(),
+                    + crate::native::mutation::bytes(10 + report_index + regular_timers).unwrap(),
                 "a report keeps its write set and an inline credit update"
             );
             let expected = if failure != 0 {
-                // Eleven primary rows, the cohort's rows, the report's index
-                // rows, a status move for the parent and every sealed cohort
-                // claim, and the due timers of every moved claim and every
-                // affected evaluation.
-                let failed = 11
+                // Twelve primary rows (the principal's window among them,
+                // F12), the cohort's rows, the report's index rows, a status
+                // move for the parent and every sealed cohort claim, and the
+                // due timers of every moved claim and every affected
+                // evaluation.
+                let failed = 12
                     + cohort.changed_keys()
                     + report_index
                     + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
@@ -1376,14 +1378,15 @@ pub(in crate::native) fn increment_fixture() -> (
 }
 
 #[test]
-fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_allowance() {
+fn required_increment_prices_ten_writes_per_attempt_without_a_claim_failure_allowance() {
     let (core, registry, state) = increment_fixture();
     let (claim, _, _) = parts(&core);
     let declaration = core.native_definition(key(4).validation).unwrap();
     let mut limits = core.limits;
-    // Nine primary writes, the report's twenty-one index rows and its
-    // evaluation's due timer (doc 22 §7).
-    limits.range.max_batch_entries = 31;
+    // Ten primary writes (the principal's window among them, F12), the
+    // report's twenty-one index rows and its evaluation's due timer (doc 22
+    // §7).
+    limits.range.max_batch_entries = 32;
     let before = core.state.budget.stats();
     let quote = CompletionEnvelope::derive(
         &core.state.rows,
@@ -1412,7 +1415,7 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
             .unwrap()
             .limits()
             .changed_keys,
-        9 + 21 + 1
+        10 + 21 + 1
     );
     assert_eq!(quote.slots().events, reports * 3);
     assert_eq!(quote.slots().new_rows, reports * 28);

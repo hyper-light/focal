@@ -14,7 +14,13 @@ transfer.
 
 focal's consensus is `focal-consensus::DurableNode`, a durable, memory-accounted shell
 around a core that owns elections and the log. The shell owns persistence, checkpoints,
-decoder fences and the unwind boundary. Until 2026-09-28 the core was tikv raft-rs 0.7
+decoder fences and the unwind boundary. Its guard reserves, before a transition runs,
+what the transition copies and nothing the size of the history (2026-09-29, the audit's
+F15/F16): a page of the log is chosen before it is copied and copied exactly, the
+entries not yet durable, the held proposals, the committed page, each lagging peer's
+page or snapshot and the window of pages for the one that answers are named from
+counters the core keeps as it changes and running totals the storage keeps beside its
+entries, and a heartbeat over a long history asks for what a heartbeat copies. Until 2026-09-28 the core was tikv raft-rs 0.7
 `RawNode`; since then it is `focal-raft` (section 4.5), which keeps raft-rs's log and
 speaks its messages. The table states what raft-rs gave and what focal ran when this
 plan was made.
@@ -53,11 +59,11 @@ are not driven in production.
 
 | # | From slates | Why focal needs it | Lands in |
 |---|---|---|---|
-| P1 | Progress-aware fan-out: `broadcast`, `DispatchWait`, `CommitBudget`, `Stragglers` | A round stops when every peer has reported or when no reply arrives within a stall window, and extends while a quorum is still filling. Late replies are folded into the operation they belong to. focal's drivers bound sends per peer but still decide by fixed deadlines. | `focal_timing::{RoundBudget, RoundWait}`, `focal_wire::gather`. Two differences from slates, both from what focal's transport is. The budget is derived from what exchanges with the round's peers were measured to take, the peer's work included, because a focal request waits on a commit at its peer and not on the path alone. And an exchange outstanding when its round ends is dropped, not kept to fold later: a Raft reply in focal is an inbound message of its own, and a signature past the majority has no use. The pool counts a dropped exchange as given up on and doubles what that peer is expected to take until it answers one (RFC 9002 §6.2), so an estimate that ended a round too early corrects itself |
+| P1 | Progress-aware fan-out: `broadcast`, `DispatchWait`, `CommitBudget`, `Stragglers` | A round stops when every peer has reported or when no reply arrives within a stall window, and extends while a quorum is still filling. Late replies are folded into the operation they belong to. focal's drivers bound sends per peer but still decide by fixed deadlines. | `focal_timing::{RoundBudget, RoundWait}`, `focal_wire::gather`. Two differences from slates, both from what focal's transport is. The budget is derived from what exchanges with the round's peers were measured to take, the peer's work included, because a focal request waits on a commit at its peer and not on the path alone. And an exchange outstanding when its round ends is dropped, not kept to fold later: a Raft reply in focal is an inbound message of its own, and a signature past the majority has no use. The pool counts a dropped exchange as given up on and doubles what that peer is expected to take until it answers one (RFC 9002 §6.2), so an estimate that ended a round too early corrects itself A round that has gathered nothing is given its whole deadline (2026-09-29): the deadline is derived from the tail of these peers' exchanges, so an answer inside it is the one the round opened for, and the judgement at three quarters of the deadline in force applies once something has arrived — the defect slates found in its `DispatchWait` on 2026-09-29 (a dispatch that had gathered nothing stopped at three quarters, and every pre-election whose one live voter answered in the last quarter failed), present in focal's port until then. |
 | P2 | Derived timing: `PathRtt` (RFC 9002 smoothing), `ElectionTiming::derive`, `round_budget` | focal's election and heartbeat ticks are constants. A WAN group whose round trip exceeds the fixed budget never elects. slates derives the election base from the slowest voter's tail. | `focal_timing::{PathRtt, TickPace}`; the pool measures each path by the liveness probes the peer answers, as the median of the latest sixteen and their median absolute deviation, so that an answer that came late does not set a group's election timeout; both owners tick at the derived period, and a leader beats at the configured cadence whatever its period. As in slates, what stretches is the election timeout and never the heartbeat. An owner's own stalls are covered too, and in ticks rather than in the period: the replica waits, beyond its election timeout, as many ticks as the longest stall the owner remembers took and a tail of the paths after it (`TickPeriod::patience`, `focal_raft::Raft::set_patience`), since a heartbeat leaves the leader's tick, a leader that stalls as this node does sends none for the stall, and a node that stalls cannot tell such a leader from one that died. A stall is remembered for the margin times its own length, ten seconds for a stall of one, and a longer one takes its place at once; it is the excess over the intended period that is measured, never the period itself, which the pace made and which would hold the pace wherever it was. Nothing else that is counted in periods grows with a stall except what the stall itself delayed: a request the owner holds is given the same ticks beyond its time, since a barrier the owner was late to run for a stall of its own is not given up for it; a wait's budget and the cadence of everything the owner does stay what the paths make them (`focal_root_period_longest_ms` is the longest a period took). A request an owner holds is given its time in the owner's periods and not the clock's (`ControlHost`, `ReplicaHost`, their directory, placement, managed and evidence sub-owners): a loaded machine slows the rounds and the request's time with them |
 | P3 | Period-counted timers | A starved node waits longer instead of campaigning. | The control and the replica owner tick once when their period has passed and begin the next from then: a period that was missed is not made up for, and the core counts ticks, so an owner that was starved for ten periods has waited eleven |
 | P4 | Voter reconciliation rules: retire only a death held continuously for one election window; sitting live voters keep their seats | focal's placement controller healed on the first verdict, and one ordering decided both who keeps a seat and who is nearest home. | `focal_directory::{heal_placement, home_move, deaths_held}` and the controller (section 5, seats) |
-| P5 | Admission by certificate: a pending-handshake reservation separate from authenticated slots, two slots per identity, replace on redial | focal bounds connections in total. One identity can take them. | `focal_wire::Admission`, in the node's listener. focal's identities are principals, and a participant may run several clients: a node holds 4 connections and any other identity 16. A connection past the bound replaces the one of that identity that was idle longest. Refusing the newcomer, which was the first rule here, made a participant whose clients exit without closing wait out the idle timeout of what they left behind |
+| P5 | Admission by certificate: a pending-handshake reservation separate from authenticated slots, two slots per identity, replace on redial | focal bounds connections in total. One identity can take them. | `focal_wire::Admission`, in the node's listener. focal's identities are principals, and a participant may run several clients: a node holds 4 connections and any other identity 16. A connection past the bound replaces the one of that identity that was idle longest. Refusing the newcomer, which was the first rule here, made a participant whose clients exit without closing wait out the idle timeout of what they left behind. The connections held in all are bounded after that rule, never by an outer count (the audit's F20); a body is permitted from the listener's budget, within its identity's share, before it is allocated (F03); the grant is current at dispatch and a revocation closes the certificate's connections (F35) |
 | P6 | Link validity inside a wait | A pending request should end when its peer's identity is replaced or retired, not at its deadline. | `focal-wire` pool: a retired route closes its connection under the lock a dial stores it under, so no order of the two leaves one open |
 | P7 | Simulated network: bottleneck with drop-tail queue, Gilbert-Elliott loss, MTU, NAT rebinding | focal-sim's network delivered at delays the test chose, with partitions and no path model. Election, fast-track and transfer claims need one. | `focal_sim::path` (`Fabric`, `Path`, `Loss`, `Link`, `Nat`), every table bounded (`FabricLimits`) |
 | P8 | Per-progress test deadlines (`poll_until` charged to the slowest node's progress counter) | focal's fleet tests use wall-clock deadlines and fail under load; this recurred four times in this work. | `focal_timing::ProgressDeadline`; owners count their periods (`periods()`, `focal_root_periods_total`) |
@@ -160,8 +166,9 @@ configuration so every member agrees on the quorum rule in force.
 - Configuration entries never take the fast track.
 
 These are checked three ways: a TLA+ model (`docs/models/FastTrack.tla`, checked by
-`scripts/check-model.sh` in CI, with the rule the core does not follow beside it, which
-the checker must refuse), tests over the sans-io core under seeded schedules
+`scripts/check-model.sh` in CI, every configuration within the states it states, with
+the rules the core does not follow beside it, which the checker must refuse;
+section 4.6), tests over the sans-io core under seeded schedules
 (`crates/focal-raft/tests/fast.rs`) and over durable nodes and P7's network model
 (`fast_track_tests`, `sim_fast_tests`), and the existing black-box history checker on
 real processes, for an owner that takes the fast track (section 4.6).
@@ -200,6 +207,7 @@ included.
 | A change refused for the size of what is uncommitted leaves the leader believing one is pending | It does not |
 | Election timeouts from the thread's generator | From a seed the owner gives: a run is reproducible |
 | Queues without a bound of their own | `Limits`: messages and reads that wait, entries not yet durable, entries in one message. A member takes of a message what it may hold and answers with the last entry taken |
+| A leader sends a round of heartbeats for each read as it is asked, and again each time the read is asked again: twenty reads taken together are forty heartbeats to two members, of which the answers to the last two confirm all twenty | One round when the member is next asked what there is to do, carrying the last read asked, for every read asked since the round before (`ReadRounds::Shared`, section 10). A read asked again while it waits asks for no round of its own; a round that was lost is asked again by the leader's clock, whose heartbeat carries the last read. The rule of raft-rs is kept (`ReadRounds::Each`) to compare the cores under one rule |
 
 **What is kept although it could be otherwise.** A member that a change removes and
 adds again is known anew, and a member added by a change is first probed one entry
@@ -244,7 +252,145 @@ members that elected it, more hold that entry by themselves than are outside R, 
 is the entry most held among them; and a member that holds it from the leader votes
 for no one whose log lacks it. An entry of an index no voter holds anything at was
 committed by no one, and one that is elected writes an entry there that states
-nothing.
+nothing. That argument takes the later leader's log to end below the index, and the
+members that elect it to count by the configuration the fast quorum was counted in.
+Neither held as first built; the two rules that follow make them hold.
+
+**A vote counts once the voter's log is of the leader's term (2026-10-01).** As first
+built an election could commit a second entry at an index that held a committed one.
+Forty thousand schedules of `a_group_with_the_fast_track_is_safe_and_settles` met it
+(seed 9843 from seed 3,000, on the commit before any change of that date; ninety-six
+and three thousand did not): the leader of term 3 committed index 32 by the fast
+quorum {1, 2, 4} of four voters, of whom 2 and 4 held the entry beside their logs and
+had told the leader nothing of their logs; member 3's log held an entry of an older
+term at 32; 2 and 4, whose logs were no more current than its own, elected it; one
+that is elected takes the entry most held only above its own log, so it kept its
+entry and committed it. The cause is that a fast quorum's members vote for the entry
+in the leader's round and for a candidate by their logs, and nothing an election
+reads recorded the first. Fast Paxos chooses a value in a round only by votes cast in
+that round, and its recovery reads each acceptor's round of its last vote, which the
+acceptor keeps durable (Lamport, "Fast Paxos", Distributed Computing 19(2), 2006,
+§3.3, condition O4); Raft counts replicas only for an entry of the leader's own term
+for the same reason (Ongaro's thesis, §3.6.2). Fast Raft's proof (Castiglia, Goldberg
+and Patterson, Lemma 2) shows that a follower never overwrites a chosen entry and
+that a new leader inserts the most-voted one, and says nothing of a leader elected
+with a leader-approved entry of an older term at the index: the paper's rule has the
+defect too.
+
+The rule: a member that holds the entry beside its log counts toward a fast quorum
+only once the leader knows its log holds an entry of the leader's term
+(`log.term(progress.matched) == term`, `Raft::fast_commit`). Every member of R then
+has a last term at or above the leader's and keeps it, because what it holds through
+the leader's first entry of the term a majority holds (R is one), so no later leader
+truncates below it. By the classic rule each refuses a candidate whose last term is
+older. A candidate whose last term is the leader's or later holds, through its last
+entry, the log of a leader that holds the committed entry: it holds the entry, or its
+log ends below the index and the argument above applies. The round is recorded where
+elections read it. It adds no message, no field and no durable state: the leader's
+first entry of its term reaches a member with its first append. Considered and not
+taken: a voter that refuses a candidate whose log is older than its own latest fast
+vote (the vote's term must be durable, and one term for the whole log does not
+protect an index: a candidate stale at the committed index can have voted later
+entries to the same leader); and holding the term with every entry beside the log
+and weighing it at every index above the candidate's commit (a durable write each
+time a held entry is voted to a new leader, a candidate that truncates its own log,
+and a term that is only a lower bound of the round the entry was accepted in).
+
+**A fast quorum is one of every configuration a member may count by (2026-10-01).**
+With the first rule in, forty thousand schedules from seed 43,000 and from 200,000
+each failed once (seeds 54104 and 203544). A leader had applied a change that made a
+voter a learner and committed an index by three of its four voters; one of the three
+had not heard the change committed and counted by the five voters before it (a
+member campaigns by the configuration it has applied); it was elected by itself and
+two of the five that held another entry, the most held among them. Majorities of two
+configurations one change apart meet, which is all the classic track needs; a fast
+quorum of the new one need not be a fast quorum of the old, and the guard below
+(applied, not joint, at the leader) says nothing of the members. A member that took
+an entry of the leader's term took the leader's commit with it, which covers the
+configuration the leader was elected under, and campaigns only once it has applied
+every change it committed (`Raft::hup`): it counts by that configuration or by one
+the leader applied since. One that took no entry of the term has an older last term
+than every member of R, which refuse it, and no majority of a configuration one
+change away is without them. So a leader notes the voters it was elected under and
+the one other set of voters a change in its term named (the two halves of a joint
+configuration are the two sets), and counts a fast quorum only where it is one of
+each (`Raft::note_term_configuration`, `note_term_change`,
+`fast_quorum_of_the_term`). A change that names a third set leaves it to the classic
+quorum until its term ends.
+
+This takes a member to write an entry and the commit it took with it in one write,
+and to apply a change only on a commit its log holds. focal's shell does both: the
+hard state follows the entries in the same batch (`persistence.rs`), and a change of
+the configuration waits for the write that states its commit (section 9).
+
+**What the rules cost.** A fast commit that counted a member whose log was not yet of
+the leader's term becomes a classic one, a round later: those at a new leader's first
+indexes, chiefly what it recovered at its election, which Fast Paxos also commits by
+a classic round. After a change, a fast quorum must also be one of the voters before
+it; after a second change in one term there is none until the next term.
+
+| Fast schedules | Fast commits before | With both rules |
+|---|---|---|
+| 96 from seed 0 (an ordinary run) | 418 | 188 |
+| 40,000 from seed 3,000 | fails at seed 9843 | 93,864 |
+
+The schedules change leaders and configurations far more often than a group in
+service does (five terms and many changes in 4,000 steps); a group with one leader
+and no change commits every proposal by the fast quorum as before.
+
+**Open before any owner takes it.** A leader that outlives two changes of its
+configuration has no fast track for the rest of its term, and terms in service are
+long. A set of voters can be dropped once no member can still count by it, which is
+when every member of it has applied the change after it; a leader knows what a member
+holds and not what it has applied, so that takes an answer that says so, and the
+model a configuration per member. It is not built. No owner sets `NodeConfig::fast`.
+
+**Evidence.** `an_election_never_commits_a_second_entry_at_a_committed_index` runs
+seed 9843's schedule under the rules it was found under and
+`a_member_that_counts_by_the_configuration_before_commits_no_second_entry` runs seed
+54104's; each fails without its rule. 160,000 schedules of 4,000 steps pass, 40,000
+from each of the seeds 3,000, 43,000, 100,000 and 200,000 (`FOCAL_RAFT_SEEDS=40000
+FOCAL_RAFT_SEED=<seed> cargo test -p focal-raft --release --test fast
+a_group_with_the_fast_track`), with 373,536 fast commits among 11,967,015 entries.
+The classic track is untouched: 3,000 schedules of the group and of the comparison
+with raft-rs pass as before.
+
+
+**The model.** `docs/models/FastTrack.tla` missed the run twice over. It had no step
+by which a leader that was deposed campaigns again with the log it led with, so no
+member whose log held what no other took was ever elected, at any bound; and its five
+voters ran two terms where the run takes three. It has the step and the rule now
+(`OfTheRound`). Without the rule the checker refuses it: four voters over three terms
+reach a leader that lacks what was committed (`FastTrackAnyRound.cfg`, in 190,662
+states); with it the same four voters hold every property in all 3,207,204 states
+(`FastTrackFour.cfg`). With the rule one index shows nothing of the fast quorum — a
+member whose log is of the leader's term holds the index from the leader — so three
+voters are checked over two indexes (`FastTrackRound.cfg`, 2,462,010 states), where
+the checker must also find an index committed by what members hold by themselves
+(`FastTrackReached.cfg`), or the configuration would check nothing of it. Four voters
+over two indexes, three voters over three terms and two indexes, and five voters are
+each more than twenty million states and are not visited (five voters at one index
+ran nightly, for hours, and with the rule that index shows nothing of the fast
+quorum); the schedules of the core are what cover them. The model has no change of configuration,
+so the second rule rests on its argument, its directed test and the schedules.
+
+**The checker is bounded like everything else.** As first changed, the model at two
+indexes did not end: 208 million states, and 26 GB of them on disk, in 87 minutes,
+under a JVM free to take half the machine's memory. Three things changed. An election
+is one step of the model, where it was four and more, each interleaved with every
+other step; a member says what it holds when it comes to hold it and with its vote,
+and the separate record of what it held when it voted is gone. Both keep every run, up
+to the order of steps that do not touch each other (the model's header says why).
+Three voters at three terms and one index were 1,219,562 states before the model had
+the step a deposed leader takes and are 560,563 with it, and the rule one that is
+elected does not follow is refused in 89,337 states where it took 26,212,234. A
+configuration states how many distinct states it has, and the checker stops at one
+more (`StateBudget`, `WithinBudget`); one that passes must have exactly that many, so
+a change that makes a model larger or smaller is refused until its states are counted
+and stated again. And `scripts/check-model.sh` gives the checker 256 MB of heap and as
+much again beside it, which is what the largest configuration was measured to need
+(404 MB resident, and no faster with four times that), one thread unless it is told
+of more, and removes a run's states however the run ends.
 
 **A member does not compare terms at or below its commit.** An entry committed by the
 fast quorum bears the term of the leader that took it; the leader after it, which
@@ -304,7 +450,23 @@ its own leaving all the same hands the group over and follows (section 4.5). The
 placement controller moves a session's leadership to a voter that stays (the
 preferred leader where it votes) before it removes a draining voter
 (`SessionCall::Transfer` reaches a leader on another node), and `cluster nodes remove`
-does the same for a root voter.
+does the same for a root voter. A planned stop hands off too (2026-09-29, from slates'
+4e38d3e): a replica that leads when its owner is told to stop — SIGTERM, a process
+manager's stop, an embedded node's — asks the most caught-up voter it hears from to
+campaign (`focal_control::heir`; a session prefers its placement's preferred leader
+when that one qualifies) and keeps ticking and beating until its log leads elsewhere,
+or for one election timeout in its own periods, before it stops as before; the control
+groups do the same (`ControlHost` waits on the hand-off in its loop). A leader that
+went silent cost the survivors their whole election timeout for every log it led:
+5.2 to 7.0 s on three loaded processes in `tests/stop_handoff.rs` before the change,
+84 ms after it, in one term, the stopping node reporting the hand-off in its last
+status line (`sessions_handed_off`), which the test requires. Four defects of the
+stop stood in the way and are fixed with it: the service dropped the drivers that
+carry its owners' messages, and the listener that receives their peers', before the
+owners stopped; the fleet's quiesce refused every routing lookup; the shared worker
+discarded every message routed to a stopping session; the peer pool closed before
+the owners. A stop now runs as a phase of the service: the owners stop while the
+listener and the egress drivers are still polled, and the pool closes after them.
 
 **Leadership returns.** Priority decides an election and starts none: after the
 preferred leader was away and came back, another voter leads, and would until it
@@ -406,6 +568,42 @@ in send order. A group's owner thread stays the only writer of its state.
 
 **Learners.** Present. Added with the new core: learners never count toward either
 quorum and never vote, tested as slates tests it.
+
+**Follower reads** (2026-09-29; the KIND campaign's D4). A linearizable native read
+asked of a replica that does not lead is served by that replica: its core forwards
+the read's barrier to the leader (`MsgReadIndex`, thesis §6.4), the answer names the
+leader's commit index, the engine parks the barrier until this copy has applied
+that index (bounded by the reads the core holds in flight, `DurableNode::pending_reads`),
+and the page is read from the copy's own committed core (`read_at_least`). The
+hosted `Session` parks the same way (2026-09-29, the audit's F55: the leader's
+answer may reach a follower before the append that carries its index — QUIC
+streams and separate exchanges owe no ordering between them — and that is
+replication lag, never corruption; before this the hosted session failed closed on
+it). The parked set is charged once for its bound; a copy at the bound refuses a
+new read as `Capacity` at the request and drops, counted (`reads_dropped`), a
+barrier it cannot hold rather than hold back the delivery that carries the very
+entries the parked reads wait for; a parked barrier leaves the set only once it is
+answered, so a retryable refusal loses none. A
+follower that knows no leader refuses the read as before (`NotReady`, and the
+client's bounded resends ride out the election). Before this a follower's operator
+socket refused every such read and the client resent it for its whole 30 s ceiling
+before reporting `unavailable` (`tests/follower_reads.rs`, three real processes:
+written through the leader, read through each host). Reads therefore scale across
+the voters of a log, and a copy's read is exactly as fresh as the leader's commit
+index at the moment it asked.
+
+A control replica — the root's, a directory partition's — serves its followers'
+reads the same way since 2026-10-02 (`ControlReplica::read_index`, a follower's
+read through its leader), and parks the same way since 2026-10-03: a barrier
+answered above what it has applied is held until the entries it names are applied
+(`ControlReplica::{park_ahead, release_parked}`), its bytes charged while held and
+handed to the delivery that lets it go, no more than the reads the core holds in
+flight; a replica at that bound refuses a new read as `Capacity`, and one dropped
+there is counted (`reads_dropped`). Before, the control replica took such a barrier
+for corruption: a member brought up by snapshot that read before it caught up
+failed, and with it the hosted partition it served (the split-and-merge test's
+failures on ubuntu CI, 2026-10-02 and 2026-10-03, named once the replica kept the
+error that stopped it).
 
 ## 6. Order of work
 
@@ -546,25 +744,166 @@ transfer all of whose chunks were refused, none answered between them, is refuse
 copy of a release that takes chunks in their order only refuses one that came ahead,
 and is sent them one after another from the first.
 
+**The lanes of a connection are derived (2026-09-29).** A connection had sixteen
+streams, two of them for what a group asks of the peer, and the pool let two exchanges
+to a peer be in flight for all the groups the two nodes share, while the core keeps a
+hundred and twenty-eight messages in flight to a follower (`NodeConfig::max_inflight_messages`,
+the pipeline of the thesis's §10.2.1): the pipeline on the wire was two, and a message
+that found the lane full was refused (`Busy`), counted by the driver and dropped, so the
+leader learned of the gap only from the follower's next answer. The streams are derived
+now (`WireLimits::for_consensus`, `PeerPoolLimits::for_consensus`): one for the probe,
+the consensus window for what groups ask of the peer (`DEFAULT_INFLIGHT_WINDOW`, 128;
+a window derived from the path will follow, section 8.5 C6), and for content what the
+reference path holds in flight a stream's window at a time and one (`content_streams`:
+1 Gbit/s at 100 ms is twelve megabytes, thirteen streams) — 142, and the pool's lanes
+follow: the window to each peer, and the window for every connection it may open in
+all. A message of a group that finds its lane full waits its turn as content does, for
+as long as its exchange has (`PeerPoolLimits::timeout`), and is refused past that,
+which the driver counts (`focal_peer_messages_busy_total`); one to a peer the pool
+could not reach at all is told to the frame's owner, which reports the peer to its
+core (`Session::report_unreachable`), so the leader probes the member instead of
+streaming to it, counted per session (`focal_session_peers_unreachable_total`).
+
 **How long an exchange waits.** An exchange was given a time: five seconds by the
 pool, thirty by a connection. A megabyte needs 1.7 Mbit/s for the first and 0.28 for
-the second, and a path that carries less carried no content at all. The parts of an
-exchange have waits of their own now, each charged to what it waits on
-(`transport::carried`, `frame::read_payload_arriving`):
+the second, and a path that carries less carried no content at all. Content was given
+waits of its own for its parts on 2026-09-28; what a group sends a peer kept the pool's
+five seconds for the whole of an exchange until the audit's F36, and the waits were
+charged to what the connection sent until its F38. Every exchange has these parts now,
+and each its own wait (`PeerConnectionPool::send_bounded`, `transport::Carriage`,
+`frame::read_payload_arriving`):
 
 | Part | Waits until | Given up when |
 |---|---|---|
-| What is sent, and the peer's answer to it | The answer begins | A period ends in which the connection sent less than a datagram; or a period ends that began when the connection had sent all that its exchanges had to send: the peer had the request, and a period to answer |
-| What arrives | Its last byte | A period brings neither its end nor a datagram more of it |
+| Its turn on the peer's lane, and its connection | It has them | The pool's time for each (`PeerPoolLimits::timeout`). The dial goes on without the caller, for the next: it is given what the connector gives a handshake (`request_timeout`, for the connection's and for the protocol's) |
+| What is sent | The peer has acknowledged the whole of its stream, or has answered | The residency of what the connection held to send beside it is spent; never before a period |
+| The peer's answer | It begins | A period after the peer had the request, and what the path is given to carry the first of it |
+| What arrives | Its last byte | It stopped arriving: a judgement (a period, or the probe timeout of the longest round trip seen) brought less than a datagram of the connection's bytes, or began with everything the peer owed of its class and the less urgent ones delivered and the body still not among it (`frame::Arriving`, 2026-10-02) |
 | The handler | It answers | The time of a request, as before |
 
-The period is the time the exchange was given before. What a connection sent is what
-it sent and has not found lost. So a megabyte crosses a path of 4 Mbit/s in both
-directions between endpoints that give a request one second
-(`narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given`, through a
-relay that carries that and drops what finds 32 datagrams waiting), and a peer that
-takes a request and does not answer is given up in one period or two on any path.
-Every period but the last moves a datagram of a bounded frame: the wait ends.
+The period is the pool's time. A group's exchange that ends by time is not asked again
+by the pool: its owner asks again by its own clock, and a second time would hold the
+peer's lane as long again.
+
+**What arrives is charged with what arrives (2026-10-02; found by hyper-raft's port of
+this law, ca8d44f).** A body was given its residency — its bytes at two datagrams of the
+least size a probe timeout of the longest round trip the path showed while it arrived,
+and a period at least. That is the pace of a sender limited by its path alone. A peer
+whose owner writes a body as it has it, whose exchanges share the connection under
+strict priority, or that is short of CPU, sends slower than its path, on a path whose
+round trip says nothing of when the body ends: at the 395 µs QUIC measures on loopback
+an 8 MiB body got one period, and the first judgement after it refused the body however
+much was arriving (under a CPU quota, 7 of 15 runs at half a core, 25 of 30 at a fifth;
+the rare refusals CI saw on ubuntu-24.04 and windows-11-arm). A body's arrival is now
+judged once a period — the peer's time, or the probe timeout of the longest round trip
+seen, whichever is longer, since a lost flight is sent again when the probe timer ends —
+and given up when a judgement brought less than a datagram of the connection's bytes
+(silence), or began with everything the peer owed delivered and the body still not among
+it: the wait is charged with the stream bytes the connection delivered of the body's
+class and the less urgent ones (`TrafficClass::rank`; a request's body, whose class is in
+it, counts as the most urgent) against what the peer declared of them and has still to
+deliver, this body included (`frame::Delivery`, one per connection on either role). A
+peer that withholds a body while it sends others is given up once it has sent everything
+it owed; one that sends nothing, within a judgement. What a slow body holds is bounded by
+the identity's share of the listener's ingress (F03), not by time.
+
+**What a sender knows of its own stream** is one thing: that the peer has acknowledged
+all of it, or stopped taking it (`SendStream::stopped`). What the connection sent is in
+flight, sent again, or another stream's. Charged with it, an exchange was given its
+peer's period to answer while its last window was still on the path: sixty-four
+kilobytes over eight kilobits a second were given up at sixty seconds, twelve periods
+to the second, five seconds before they had arrived. And a stream its peer had stopped
+reading was kept for as long as the other exchanges of its connection moved a datagram
+a period: two megabytes, twenty-five seconds, where it ends in half a second now. What
+a stream takes of what is written to it says little either: a window at once, and more
+only as the peer's reading lets it, an eighth of a window at a time, which on a narrow
+path is longer than any period (a megabyte over sixty-four kilobits was given up ten
+seconds in by that rule, tried and taken out). So between the last byte written and
+the acknowledgment the wait ends by a bound and not by a guess at delivery.
+
+**The bound is the residency** (`frame::residency`): what the bytes take at the least
+a live sender delivers, two datagrams of the least size in a probe timeout, at the
+longest round trip the path has shown. A sender whose window is as small as QUIC keeps
+it, and whose every flight must be asked for again, sends two datagrams when its probe
+timer ends (RFC 9002 §6.2.4, §7.2, §7.5), and the timer is three round trips with the
+variance a single sample is given (§5.3, §6.2.1) and the acknowledgement delay the peer
+may take (`frame::MAX_ACK_DELAY`, the transport parameter's 25 ms every connection here
+advertises: on a path of a millisecond a loss is recovered no sooner, which a timer of
+three milliseconds missed — found by the ordered fleet of §12, 2026-10-03). It was two
+datagrams a round trip,
+which is a path's best with that window and not its least: 256 kilobytes over eight
+kilobits a second took 262 seconds and were given 225. A receiver holds a payload to
+the same bound and to nothing else. It also gave a payload up when a period brought
+less than a datagram of it, which asked of every path a datagram a period and of every
+sender that it lose nothing: sixteen kilobytes arriving a datagram every 2.6 s were
+given up five seconds into the silence after a lost flight, with 175 s of their
+residency left. A sender that stops for good is given up when the residency is spent,
+one whose connection carries nothing when the connection ends, and a connection ends
+when its path is silent for ten seconds (`IDLE_TIMEOUT`).
+
+**What a path must carry**, then, is what a connection needs to live: a datagram of the
+least size returned within the idle timeout, 1,920 bits a second. Below that no
+connection is made, and every caller is told so in the pool's time; above it a message
+of any size the frame allows is carried in the time the path takes. Measured through a
+relay that carries so many bits a second each way with 50 ms of round trip, the pool
+as a node configures it sending a message of a group and then sending it again
+(`slow_paths_measured`, `adverse_paths_measured`, `narrow_lossy_paths_measured`):
+
+| Path | 64 B | 4 KiB | 64 KiB | 1 MiB |
+|---|---|---|---|---|
+| 100 bit/s, 1 kbit/s | `Lost`, `Lost` | `Lost`, `Lost` | `Lost`, `Lost` | `Lost`, `Lost` |
+| 8 kbit/s | `Lost`, then 5.0 s | `Lost`, 9.1 s | `Lost`, 75.0 s | 1,078 s on a connection that is open |
+| 64 kbit/s | 1.0 s, then 0.2 s | 1.6 s, 0.7 s | 9.8 s, 8.5 s | 136.7 s, 135.5 s |
+| 256 kbit/s | 0.4 s, then 0.1 s | 0.5 s, 0.2 s | 2.7 s, 2.2 s | 35.6 s, 35.4 s |
+
+The first send has no connection. Where the dial takes longer than the pool's five
+seconds (8.4 s at 8 kbit/s) it is told `Lost` at five, and the second has the
+connection when the dial is done. Before, nothing was delivered at 8 kbit/s (a dial was
+given the callers' five seconds and begun again from nothing by the next), and nothing
+that takes its path more than five seconds at any rate: 64 KiB at 64 kbit/s, a megabyte
+at 256. At 64 and 256 kbit/s, 4, 64 and 256 KiB are delivered with two and ten percent
+of datagrams lost, with 50 ms of jitter, with eight kilobits a second in either direction
+against the other, and across a path that carries nothing for three seconds or for
+eight; one that carries nothing for fifteen ends the connection, the message is `Lost`
+and the next is delivered over a new one. At 4, 8 and 16 kbit/s, sixteen and sixty-four
+kilobytes sent or asked for are answered at none, two and ten percent loss, thirty-six
+cases of which fourteen failed before the receiver's rule changed.
+
+**A chunk goes in parts where its path is slow (2026-10-02, the audit's F49).** A
+transfer's lease on a copy (`CustodyConfig::transfer_ttl`, 60 s) was renewed only when a
+request for it was executed, and a request's body is read before it is executed: a
+megabyte chunk, the unit of custody and what a manifest hashes, takes 131 s to cross
+64 kbit/s, so it arrived to a transfer that had expired. The sender sizes a part to what
+the path carries in the time the pool gives an exchange, at the rate the law holds in
+flight over the round trip (`PeerConnectionPool::part_bytes`; a datagram at least, the
+chunk at most, the whole chunk where the path is not yet measured), and sends a chunk in
+parts (`ChunkPart`; `ReadChunkPart` for a pull), each a request that crosses within an
+exchange's time and renews the lease as it is taken. The receiver stages a chunk's parts
+in order beside its objects, promised to the volume part by part, verifies the whole
+against the manifest's hash and installs it under the same name
+(`ContentStore::import_chunk_part`): a chunk made of parts is the chunk. A transfer
+that expires or is cancelled discards what it staged. The lease is thereby tied to
+admitted progress and covers twelve crossings; the sixty seconds themselves are set,
+not derived (section 8.4). A client that gives up its exchange before the copies hold
+the object asks again, exactly; the coordinator ran the exact retry's job beside the
+first, two pushes of one transfer each sending every part, and runs it after the first
+now, where it finds the copy holds the object. Measured in process over real QUIC, each
+replica behind a relay: at 128 kbit/s a megabyte and seven bytes is sealed on its copy
+75.9 s after the upload began (the path alone takes 65 s), 1,152,399 bytes crossing
+toward the copy in 87 parts; at 64 kbit/s, 152.9 s and 1,193,907 bytes (131 s); beside the first, the retry
+made it 1,970,721 bytes and 124 s.
+
+**Discovery of the native decoder's support has no clock of its own (2026-10-02, the
+audit's F48).** The exchange of durable promises that native activation and every
+promotion need gave each of its parts 250 ms — the replica's own fact, the peer's, the
+recording — so a healthy path further than that never contributed one. Each part is
+given what it takes: the replica's owner its periods, the peer its path; discoveries of
+different ledgers run at once, as many as one lane to a peer holds, bounded by their
+charges; a ledger is asked again a period of its owner after its last, and the loop
+waits for the fleet to change when none is due (`managed_support::support`). On real
+processes behind relays of 300, 600 and 1,200 ms round trip, activation, two promotions
+and a claim settle (`native_support_across_latency`); with the ceilings, the 1,200 ms
+fleet never settles.
 
 **Classes** (`focal_wire::TrafficClass`, `Operation::class`). A stream of a higher
 priority sends all it has before one of a lower sends anything. Consensus, probes and
@@ -587,6 +926,88 @@ Credit that rides acknowledgements, bounded probe copies and its path MTU search
 parts of its own transport; quinn has delayed acknowledgements, MTU discovery,
 segmentation offload, key update and migration, which slates lacks. Its consensus core
 has not changed since what focal took from it.
+
+**A queue manager's mark (the audit's F39, 2026-10-03).** quinn sends its datagrams
+ECT(0) where the path keeps the field and tells the law of a mark as a congestion event
+with no bytes lost (`Connection::process_ecn`); Copa took it for a loss, which in its
+default mode is no signal, so a mark changed nothing. A mark is never noise — a queue
+manager judged its queue too long — and a sender of ECT(0) answers it as congestion (RFC
+3168 §5, RFC 9002 §7.1). Copa now does (`Copa::on_mark`): once a round trip (RFC 9002
+§7.3.2) slow start ends, `1/δ` halves while Copa competes, and the window halves
+(`DEFAULT_MARK_BACKOFF`, RFC 9002 §B.2's `kLossReductionFactor`). For ten seconds after a
+mark past slow start the window grows as a classic sender's, a datagram a round trip, in
+either mode: a queue manager keeps the queue short for every sender, so Copa does not see
+the classic senders that fill it to the manager's target — their marks are what it sees
+of them — and Copa's own step after each mark took back the share they regrow a datagram
+a round trip. While it grows so, competing raises `1/δ` only after a round trip in which
+the target held the window back: beside a target raised a packet a round trip, a window
+growing a datagram a round trip never reaches it, never falls, and never empties the
+queue Copa alone keeps, and Copa alone, misjudging itself competing, filled CoDel's queue
+to its target. Marks round trip after round trip halve the window each round trip to the
+least: the response to persistent marking.
+
+The harness carries the ECN field on the paths that say so (`Scenario::ecn`; the grid
+above is of paths that bleach it, and its numbers are unchanged — the flows refactor runs
+one flow exactly as before), its bottleneck marks by a step at one datagram (DCTCP's
+threshold, RFC 8257 §3.1) or by CoDel's defaults (RFC 8289: 5 ms over 100 ms;
+`focal_sim::path::Marking`, CoDel evaluated at each datagram's dequeue time), and it runs
+flows side by side through one bottleneck (`compete`). Copa alone, 30 s, against itself
+without a manager and NewReno under the same manager:
+
+| Path | Manager | Copa queue p99, ms (without manager) | Copa carried | NewReno carried |
+|---|---|---|---|---|
+| 1 Mbit/s, 20 ms | step | 19.20 (27.71) | 57.5% | 50.4% |
+| 1 Mbit/s, 20 ms | CoDel | 27.71 (27.71) | 91.5% | 90.4% |
+| 1 Mbit/s, 100 ms | step | 19.20 (80.47) | 16.5% | 16.1% |
+| 1 Mbit/s, 100 ms | CoDel | 34.11 (80.47) | 80.4% | 76.6% |
+| 10 Mbit/s, 20 ms | step | 1.92 (12.61) | 11.5% | 8.9% |
+| 10 Mbit/s, 20 ms | CoDel | 12.61 (12.61) | 96.0% | 89.8% |
+| 10 Mbit/s, 100 ms | step | 1.92 (11.33) | 2.1% | 1.8% |
+| 10 Mbit/s, 100 ms | CoDel | 7.49 (11.33) | 82.0% | 77.6% |
+| 100 Mbit/s, 20 ms | step | 0.19 (0.73) | 1.2% | 1.0% |
+| 100 Mbit/s, 20 ms | CoDel | 0.73 (0.73) | 97.1% | 87.2% |
+| 100 Mbit/s, 100 ms | step | 0.19 (7.30) | 0.2% | 0.2% |
+| 100 Mbit/s, 100 ms | CoDel | 7.30 (7.30) | 73.4% | 73.5% |
+
+In no scenario is the managed queue longer than Copa keeps without a manager; by
+geometric mean it is 0.377 of it, and Copa carries 1.108 times what NewReno carries under
+the same manager. (Under the one-datagram step, the threshold of DCTCP's senders of
+ECT(1), every classic sender starves, NewReno with it.) Beside NewReno and CUBIC under
+CoDel, the incumbent's share over its bar — what it carries beside its own kind or CUBIC,
+the worse-off of each pair (Ware, Mukerjee, Seshan and Sherry, HotNets 2019) — by
+geometric mean over eight seeds, each seed's bar its own:
+
+| Path | NewReno beside Copa (bar) | of its bar | CUBIC beside Copa (bar) | of its bar |
+|---|---|---|---|---|
+| 1 Mbit/s, 100 ms | 37.3% (37.0%) | 1.008 | 40.8% (40.3%) | 1.014 |
+| 10 Mbit/s, 20 ms | 60.9% (45.0%) | 1.354 | 57.2% (47.5%) | 1.203 |
+| 10 Mbit/s, 100 ms | 44.8% (36.2%) | 1.233 | 52.7% (39.8%) | 1.325 |
+| 100 Mbit/s, 20 ms | 63.5% (44.0%) | 1.445 | 65.3% (42.4%) | 1.539 |
+
+By geometric mean NewReno carries 1.249 of its bar beside Copa and CUBIC 1.256. The
+backoff, over the four paths (alone: geometric means over both managers):
+
+| Backoff | Alone: queue of unmanaged | Alone: carried of NewReno | Least of the bar under CoDel, NewReno / CUBIC |
+|---|---|---|---|
+| 1/2 (RFC 3168, RFC 9002) | 0.382 | 1.130 | 1.008 / 1.014 |
+| 7/10 (RFC 9438) | 0.401 | 1.558 | 0.842 / 0.880 |
+| 4/5 (RFC 8511) | 0.375 | 1.934 | 0.812 / 0.794 |
+
+The gentler backoffs carry more alone and take it from NewReno and CUBIC at 1 Mbit/s,
+100 ms; only 1/2 leaves each nine tenths of its bar. How the answer was found — two first
+answers that failed, ten seconds of classic growth chosen over the mode's four round
+trips, a growth cap that changed the paths without a manager, the competing raise that
+let Copa alone fill CoDel's queue, and the harness's own rules, which judged one run's
+and then one seed's noise — is in the record's F39.
+
+Open, the next batch (the record's F39): without a manager, Copa competing takes more
+than the bar at long round trips (NewReno 33.8% against 43.3% at 1 Mbit/s, 100 ms; CUBIC
+35.6% against 40.1% at 100 Mbit/s, 20 ms), answering a loss by `1/δ` alone; Copa's test
+of the mode takes the least of four smoothed round trips where the paper's detector asks
+for five, and Copa alone judged itself competing in 13.5% of samples at 100 Mbit/s,
+20 ms; on a link without jitter Copa does not leave the competitive mode once a
+competitor has left; and at 100 Mbit/s, 20 ms under CoDel Copa yields, carrying about 32%
+beside either.
 
 ## 8. Where the plan stands, and slates examined again (2026-09-28)
 
@@ -634,16 +1055,207 @@ of it was changed.
 | An object is owned where it was created, until that host dies; then by a survivor chosen by hash | The only host | Every write from elsewhere crosses the long path; nothing moves an owner to its writers or spreads owners |
 | No migration, no path validation, no keep-alive, no key update | Nothing to see | A laptop that changes networks, or a NAT that forgets, ends the session |
 | Copa carries 0.795 of 100 Mbit/s at 100 ms and 0.496 at 300 ms | | focal measured the same law at 69% of 10 Mbit/s at 300 ms. With slow start judged by what was sent after a doubling and the stride bounded it carries 96.9% there (section 7); slates' law is as it was |
-| An exchange is given a time, whatever it carries | Nothing to see | A path that carries less than the object in that time carries none of it. focal had the same defect and waits on what the connection sent now (section 7) |
+| An exchange is given a time, whatever it carries | Nothing to see | A path that carries less than the object in that time carries none of it. focal had the same defect, for content until 2026-09-28 and for what groups send until 2026-10-01, and gives each part of an exchange what its own stream and its path take (section 7) |
 
 ### 8.4 What is open in focal
 
 | Open | Why it matters |
 |---|---|
-| The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | The lane of content is derived from them; they are set. 1 Gbit/s at 100 ms holds twelve megabytes in flight, which thirteen streams carry (section 7) |
-| The pool's deadline of five seconds for what is not content, the announcement's round of five and enrollment control's of four | Set, not derived. An exchange of a group with a peer further than that is not made; no path on this planet is, but a peer under load may be |
+| The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | Done (2026-09-29): derived from the consensus window and the reference path (`WireLimits::for_consensus`, section 7), and a group's message waits its turn on its lane, bounded by its exchange's time, instead of being refused; a peer the pool could not reach at all is told to the core, which probes it |
+| The pool's five seconds, the announcement's round of five and enrollment control's of four | Set, not derived. The pool's is no longer the time of an exchange (section 7, 2026-10-01): it is what a caller waits for its lane and for its connection, and what a peer is given to answer once it has the request. A peer under load that takes longer to answer is still given up |
+| The idle timeout of a connection, ten seconds | Set, not derived. It is what a path must return a datagram in (1,920 bit/s), and a path that carries nothing for longer loses its connections and what they carried |
+| A transfer's lease, sixty seconds | Set, not derived. It is the longest a copy holds an unfinished transfer without a part taken; a part is sized to cross in a twelfth of it at the rate the path showed (section 7), so a sender that stops is dropped after it and a live one renews it many times over |
 | The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Under eight and sixteen copies of the control suite at once this is what remains (five of eight runs, none of sixteen): a leader whose term entry the stalled followers do not acknowledge in time answers `NotReady` until leadership has moved again. The request time should follow the exchange tails of the voters (`PeerConnectionPool::exchange_tail`), which a stalled follower stretches and the leader's own stall does not |
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |
 | A voter that dies and returns within the hold, end to end | Done: `cluster plan` says for how many seconds a death still stands (`focal_directory::deaths_stand_for`), and a voter that returns within the hold keeps its seat on real processes while a spare waits; one that stays dead loses it to the spare without an operator (`runbook_node_loss_within_the_hold_moves_no_seat`) |
-| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision |
+| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision. Its election is mended (section 4.6, 2026-10-01). Before an owner takes it: a leader that outlives two changes of its configuration has no fast track until its term ends, and the model has no change of configuration |
+
+## 9. What a commit waits for (2026-09-30)
+
+The audit's F17, and what mantle's replica does with the same core (its
+`docs/design/replica.md` §3, read against this shell on 2026-09-30). The core says what a
+`Ready` needs: `Ready::messages` are a leader's and may be sent at once,
+`Ready::persisted_messages` answer for what the `Ready` persists, `Ready::must_sync` is
+false when nothing but the commit moved, and `LightReady::commit_index` "need not be
+durable to be acted on". Until this section the shell used none of it: every output of a
+`Ready` waited for its write, a leader's appends among them; a commit that moved once a
+write was durable was given a write and a flush of its own before anything it committed
+was released; and a `Ready` that moved nothing but the commit was written and waited for.
+A member that alone decides paid two flushes for every entry, a follower one for every
+commit it was told of, and a leader's followers began to persist only after it had.
+
+| Rule | Why it is safe | Where |
+|---|---|---|
+| A commit waits for no write of its own. A `Ready` that asks for no write is not waited for; a commit that moves once a write is durable is released at once | The commit index is volatile state (Ongaro's thesis, figure 3.1): what is durable is the term, the vote and the entries, and an entry is committed by where it is durable, not by a member's record of it. A member that restarts replays what its log says committed and is told the rest by its group; what it applied before it stopped it applies again from the same entries | `persistence.rs`, `finish_light` |
+| The commit is kept with the stored hard state and rides the group's next record; a checkpoint writes it too | The log's records of a group are in order, so a commit a record carries names entries the log holds by then (`replay_record` reads it back under the same check) | `commit_unwritten` |
+| A member that alone decides — it leads, it is the one voter, the configuration is not joint, the entries are of its term — writes `commit = last entry` in the append that holds the entries | No other member's answer is waited for: the commit is true exactly when that append is durable, which is when the record that states it is. Asked once the entries the `Ready` gave to apply are applied, so a change of membership among them is in force when the core counts; the core's commit is checked against it after the append and a difference stops the member | `sole_commit` |
+| A commit no record has carried for a whole period of the owner is written then, and when the member is let go; one such write in flight, no one waiting | A group that keeps writing never writes a commit for itself — a write made the moment the commit moved would hold the disk the next entry needs (measured: 64 ms a commit against 37 ms, three members on one disk). A quiet group's log says what it applied within a period, so a member that stops reads back what it applied but for what a cut inside the period took | `settle_commit`, `Drop` |
+| What a leader sends may leave while its write is in flight (`DurableNode::sendable`), and nothing else: the events of a drain are given whole, with nothing still to persist | Its members persist what it sends for themselves (Ongaro's thesis §10.2.1), and the core counts the leader's own copy only once `advance_append` says it is durable. A follower's acknowledgement and a vote stay behind the write they answer for. A snapshot stays with the drain, whose owner answers for what became of it | `sendable`, `wait_persisted`; the session owner and the control owner send before they wait |
+| A change of membership is applied only once a write has stated the commit that covers it, and that write is waited for | Whoever is told that a change committed may act on it where no log records it: stop the member it removed. A member that then restarted without the commit would count that member again and wait for it for good — two voters, one removed and stopped, leave one that cannot elect itself (`cli_network` met it: the founder removed its peer, both were stopped, and the founder did not come back). Changes are rare; the wait is one flush for each | `fenced`, `after_advance`, `commit_durable` |
+| A control group — the root, a directory partition — applies nothing, and says of nothing that it committed, before a write has stated the commit that covers it | What a control group applies its members act on when they next start, before the group has told them anything: who is enrolled and who was revoked, the fence below which a binary does not serve (24 §21), where a ledger is placed. A member that stopped within its owner's period would start again without what it had applied and act against it (`cli_upgrade` met it: a host that had honoured the fence, killed and started below it, published that it was ready before its group told it of the fence again). What a ledger applied is served only through its group — a read by a barrier, a write by a leader that committed in its term — so its members need no such rule. Under load the commit rides the group's next append, as before; a quiet group pays one flush for the commit; a control group of one voter pays nothing, its commit being in the append | `apply_on_written_commit`, `fenced`; `ControlReplica::open`, `open_on_wal` |
+| The entries a `Ready` gives to apply are applied before its write | They are committed and durable here already (`Ready::committed_entries`); a `Ready` with a snapshot gives none | `drain_progress` |
+| The owner that shares a thread among sessions is told when the log answers a write of one of them, drains that session then, and asks nothing meanwhile (the audit's F45) | It asked the log every millisecond for every session with a write out: the floor of a commit on a device that flushes faster than that, and a scan of every waiting session a thousand times a second on one that does not. The log's writer calls what the group gave it for the write — a `Ready`'s, a commit's, a checkpoint's, a decoder floor's — on its own thread; the call queues a signal the owner takes at the top of every pass and waits on when it has nothing due. A signal says there is something to take and nothing more: the drain reads the write's own answer, and a signal for a session that was stopped or replaced costs one look. One that is lost, or finds the queue of signals full, is made good at the session's tick, which is its only other deadline while it persists. A write the log had no room for tells no one; one such session is asked again for each write of the owner's that the log answers — a write answered is its room given back — and each at its tick | `DurableNode::{notify_persisted, wakes_owner}`, `focal_log::Persisted`, `fleet_group::{OwnerQueue, GroupOwner::signalled, take_signals}`, `Owner::group_deadline` |
+
+What a member opens with follows from the first rule, and one place did not allow for it:
+a member authorized the credential it holds against the registry its own replica
+recovered, and a replica can be behind the registry its credential was committed in — a
+follower always could be, and a leader now can for the last period before a cut. A member
+may present a credential issued at a revision its registry has not reached, for the
+identity the registry lists under the same enrollment
+(`EnrollmentRegistry::authorize_held`); the founder's enrollment control authenticates
+what the founder presents at each request and not when it is built.
+
+Measured on this host (`cargo bench -p focal-consensus --bench commits`; an APFS volume
+where a group commit is three `F_FULLFSYNC`; three members share the one disk, so their
+flushes queue behind each other and the overlap of a leader's write with its followers'
+shows as far less than it is on a disk each):
+
+| | before | after, an owner that waits before it sends | after |
+|---|---|---|---|
+| One voter, an entry at a time, median | 25.5 ms | 12.8 ms | 12.8 ms |
+| One voter, flushes a commit | 2.00 | 1.00 | 1.00 |
+| Three voters, an entry at a time, median | 70.1 ms | 38.5 ms | 36.2 ms |
+| Three voters, 4,000 entries as fast as the leader takes them | 18,092 /s | 24,213 /s | 28,880 /s |
+| Three voters, flushes by member for 4,201 entries | 405, 404, 404 | 203, 204, 203 | 202, 203, 203 |
+
+What mantle's replica does that this shell does not, and why:
+
+| mantle | focal |
+|---|---|
+| Holds the messages and ticks that come while a `Ready` is out and takes them after (its R19: refused, none of a loaded leader's proposals committed) | The owners queue what comes behind a pending write (`fleet_group`'s scheduler, a blocking owner's channel) and always did: nothing is refused. A tick that comes meanwhile is not held: the period has passed without it and the owner's stalls are the replica's patience (section 3.1 P3) — a member that replays held ticks after a stall campaigns for a leader that was only as slow as itself |
+| Confirms reads a round at a time: one round out, and a read asked meanwhile waits for the next | A round for every drain of the owner, carrying the reads asked since the last (section 10, the audit's F43). A read asked while a round is out does not wait for that round's answers before its own leaves: on a quorum a long path away, waiting costs up to a round trip more for every read that overlaps another |
+| Applies committed entries without the commit durable and repairs the log's commit from its engine at open | The same rule, without an engine: the state is the log's, replayed to the commit the log holds |
+| Marks a member whose last frame was lost and repairs it in place | A log damaged before its fence does not open; the member is replaced (24 §19). Open with the log's fence (below) |
+
+Open, and the audit's F17 still: a group commit is three device flushes here (the data,
+the fence file, the directory entry of its rename; `focal_log::install_fence`), where the
+fence could be made durable by one write in place.
+
+## 10. Reads that share a round (2026-10-01)
+
+The audit's F43. A linearizable read asks the leader at which index it may be served
+(`ReadIndex`, Ongaro's thesis §6.4): the leader notes its commit and asks a quorum whether
+it still leads; a round of heartbeats sent after the read was asked, and answered by a
+quorum, confirms it and every read asked before it. The core had the second half — one
+answer released every read asked before it — and not the first: it broadcast a round for
+each read as it was asked, so twenty reads taken together were forty heartbeats to two
+followers, of which the answers to the last two did all the work. And the owners drained
+after every request, so even a core that shared rounds would have been asked for one each.
+
+| Rule | Why it is safe, and what it costs | Where |
+|---|---|---|
+| A read asked is queued and nothing is sent. One round leaves when the member is next asked what there is to do, carrying the last read asked, for every read asked since the round before | The round is sent after each of those reads was asked, which is all a round must be to confirm a read. A read asked alone leaves with the `Ready` its owner takes next: nothing waits for a timer or for another read | `Raft::read_index`, `Raft::ask_reads`, `RawNode::ready`; `RawNode::has_ready` is true while a read is unasked |
+| A read asked after a round left is asked for by the next round, never confirmed by the one before | That round's heartbeats left before the read was asked and say nothing of who led when it was: a leader deposed between the two would answer the read at a commit the group had passed. `a_round_confirms_no_read_asked_after_it_left` holds a round's answers while another leader is elected and commits, asks the old leader a second read and delivers the answers: with the rule broken the read is answered at 2 when 4 was committed | `ReadOnly::asked`, `unasked`, `advance` |
+| A round that was lost is asked again by the leader's clock | The heartbeat a leader sends each beat carries the last read asked and is a round for every read that waits. A read asked again while it waits asks for no round of its own (raft-rs sent one) | `Raft::bcast_heartbeat` |
+| An owner takes what is queued behind a read before the drain that sends its round | The reads among it share the round. Counted by what the owner admits at once (`pending_clients`, `pending_requests`); a request that is no read is drained for as it was, which sends the round with it and ends the taking. An owner that shares its thread among sessions drains a session on its next pass, after the work it dispatched in this one | `Owner::take` and the `Work::Request` arm (`fleet.rs`), `ControlHost::run` and its `Work::Request` arm |
+
+A round for each drain, and not one round out at a time (what mantle's replica does): a
+read asked while a round is out would wait for that round's answers before its own left,
+up to a round trip more on every read that overlaps another — nothing on a quorum in one
+room, and half again of a read's latency on a quorum a long path away. The rounds an
+owner sends are bounded by its drains, and under load its drains carry what queued
+meanwhile, as a group commit carries what was written meanwhile.
+
+Measured by count, not by time: 1, 32 and 128 reads asked of a leader of three before it
+drains leave in two heartbeats and are all confirmed by one follower's answer
+(`reads_asked_together_are_confirmed_by_one_round_of_heartbeats`); a hundred requests
+queued for a session's owner leave in two heartbeats where a drain for each sent two
+hundred (`reads_queued_together_leave_in_one_round_and_all_are_answered`).
+
+Open: the reads a leader may hold are bounded by the window it lets a peer have in flight
+(`DurableNode::pending_reads`), a size that was right when each read was a round in
+flight. A read a follower forwards to a leader at that bound is refused there and found
+by its asker's deadline, not told to its asker at once.
+
+## 11. What a member is sent ahead of its answers (2026-10-01)
+
+The audit's F41. A leader sends a member entries ahead of its answers, and a window
+bounds how far (Ongaro's thesis §10.2.1). The window counted messages: 128 of them,
+each a page of up to an entry's bound and a kilobyte, so a member's window stood for
+forty bytes or for half a gigabyte, and the same number served a loopback, a 64 kbit/s
+path and a long fat one. Nothing bounded the bytes queued for a slow member but the
+memory that refused them.
+
+| Rule | Why, and what it costs | Where |
+|---|---|---|
+| A window holds messages and bytes, and is full by either. A message takes one place and what its entries encode to, by the measure a page is cut by | A page is cut to what the window has room for before any of it is copied, and holds one entry at least: what is out passes the bound by one entry at most. A window that holds nothing is never full for its bytes, so an entry larger than the bound is sent, alone, and the member is not left waiting for good | `Inflights::{full, room, add}`, `Progress::page_bytes`, `Outbox::append` |
+| An answer gives back what the messages it answers took | The bytes are kept with each message's last index; an answer out of date gives back nothing, one that repeats gives back once, one that skips ahead gives back all it covers. A change of the member's state empties the window and keeps its bound. The bytes counted are checked against the messages held wherever the core's accounting is (`check_accounting`, after every step of every schedule) | `Inflights::{free_to, reset, check}` |
+| The bound is the member's, and its owner says it | It is what the path to that member carries, which the core cannot know. Until it is said a member is sent one page: the least that always makes progress. A member the configuration makes anew begins there again | `Config::max_inflight_bytes`, `RawNode::set_inflight_bytes`, `DurableNode::set_inflight_bytes` |
+| The owner says: twice what the transport to the member holds in flight; and a page at least where the path carries a page within one beat of the leader | The transport's congestion window is the measure of what a path holds before it answers, and it is already kept for every peer (`focal_wire::congestion`). Twice it, as a sender's buffer is sized against its window (Linux `tcp_sndbuf_expand`: "Cubic needs 1.7 factor, rounded to 2 to include extra cushion (application might react slowly"): a sender held to the window itself never fills it, and a window never filled is never found too small. The page: a new connection's window says only that nothing was sent on it yet, and a path that carries a page in a beat is not kept to that; a thin path is never given a page it would take many beats to carry. A path with no round trip measured says nothing and the member keeps what it has | `fleet::inflight_bytes`, `Work::Windows`, `ReplicaHost::inflight_windows`, `PeerConnectionPool::window`; the node's pacer says it once a round |
+| Never more than the group's budget can stage | One transition stages a page for every member and the window of the one whose answer it may be. A window the budget's limit cannot hold beside those pages and what the group holds at rest would refuse every answer of the member it was made for; the bound is cut to what can be staged. The staging a transition reserves is priced by each member's bound, where it was priced by 128 pages | `DurableNode::set_inflight_bytes`, `memory::sends_bytes` |
+
+What a heartbeat's answer does (2026-10-01, with the audit's F42): raft-rs's rule freed a
+full window's first message at every heartbeat the member answered and sent the next,
+whatever became of the first, so the bytes out passed their bound by a message a beat. A
+member now says in its answer how far its log goes — its last index and that entry's term
+(`HeartbeatAnswers::Position`). Where the term is the leader's own, the leader made that
+entry and the member took it and all before it from the leader's appends: the answer is
+an append's answer for all of it, and is taken as one (not in a fast group, whose terms
+differ by member; there it gives the window back and nothing else). Answers that were
+lost are made good exactly; a member that holds nothing new is sent nothing more; one
+whose window is full and that has answered for none of it through a beat of the leader's
+ticks is probed, with one message cut to what its path carries; and a probe is sent again
+when its owner is told it was lost (`MsgUnreachable`), or once a beat of ticks has passed
+since it was sent — not at every heartbeat's answer, which on a path slower than the
+heartbeats sent the page again and again behind itself. The beat is counted in the
+leader's ticks because its owner stretches those by the path to the group's members
+(section 3.1 P2) while the heartbeats keep their configured cadence: a beat of ticks is,
+on whatever path, time enough for what was sent to have been answered. etcd's core sends an empty append to a full window instead; it was not taken,
+because this node sends a peer's frames each on its own stream, in no order, and an
+empty append overtakes what is still on a far path and is refused for the entry before
+it. raft-rs's rule is kept (`HeartbeatAnswers::Bare`) for the comparison alone.
+
+Control groups keep the page: their entries are small and their pacer says nothing of
+windows.
+
+## 12. What carries a group's messages to its peers (2026-10-01)
+
+The audit's F42. The owners hand their messages to a driver (`replication::drive`) that
+sends each as an exchange with the peer's node, answered once the peer has persisted
+what the message caused. The driver counted an exchange as under way before it had the
+peer's lane (`PeerConnectionPool`: as many exchanges with one peer at once as the
+consensus window), and held 1,024: a peer that stopped answering filled it with
+exchanges waiting for its lane, the driver stopped taking from the owners' channel, and
+the frames of every peer that did answer waited behind them. And a frame that was not
+delivered was told to its owner only when the peer could not be reached at all: a lane
+that was full, a peer that refused, a queue with no room dropped the frame untold, and
+the group took it to be on its way.
+
+| Rule | Why | Where |
+|---|---|---|
+| An exchange is begun only when its peer's lane has a place for it | A peer that stopped answering holds its own lane and nothing of another's | `replication::drive`, `Waiting::sending` |
+| What a peer's lane has no place for waits its turn in that peer's own queue, in the order it came, what a group cannot do without before its entries | A heartbeat, a vote or an answer behind a page of entries for a slow peer is the group's election timeout; entries and snapshots are what can wait | `Waiting::{urgent, bulk, next}`, `ReplicationFrame::urgent`, `fleet::urgent` |
+| The driver never stops receiving, and holds what the pool itself admits: every connection's lane at once | A frame left in its owner's channel holds back every frame behind it, whoever they are for. Sized by the pool, a burst from many groups to one peer waits in the driver and is carried, and the driver's own bound is met only when more peers are sent to than the pool has connections for | `PeerPoolLimits::for_consensus`, `NetworkService::run` |
+| When the driver holds all it may, the other peer that holds the most waiting gives up its newest frame for the frame that came, unless the frame's own peer holds more; then the frame that came is given up. On a tie the other's goes (2026-10-01): it is the older, and of a group's frames the newer carries the more | The room is shared by the peers that need it, and none takes another's by being slow. Nothing under way is given up. With the frame that came going on a tie, the driver's own test of a dead peer beside a live one hung in two runs of sixty: the live peer's fifth frame, arriving before any of its four was seen carried, found both peers holding two and went | `Waiting::newest` |
+| A frame that is not accepted — lost, refused by its peer, given up for the room, or dropped by its owner before it reached the driver — is told to its owner | The core then probes the member instead of sending ahead into a lane that is full or a void. Nothing is taken to be on its way that is not, which is what lets a full window wait for answers (section 11) | `Frame::give_up`, `ReplicationFrame::lost`, `Owner::send`, `ControlHost::carry`, `Owner::report_lost` |
+| A peer's appends carry the order they left in, and are stepped in it | Each frame goes on its own stream and the path completes the streams in any order — a datagram lost is sent again a round trip and an acknowledgement delay later, and the frame behind it arrives first: an append that overtook the one before it was refused by the core and the member probed, a round trip lost for nothing lost. The sender counts its appends to each peer (`Operation::RaftOrdered { group, epoch, sequence, message }`, tag 33, node-only: an epoch, the sender's incarnation; a sequence within it) — appends with entries and the empty appends that carry a commit alike, since each names the entry before what it carries — and the receiver keeps, per source, the sequence it expects next and the frames that came ahead of it, stepping each when its turn comes; what a group cannot do without — heartbeats, votes, answers — goes unordered, as `Raft`, since a monotone commit or match is the same in any order | `fleet::urgent`, `fleet::Owner::ordered`, `ControlHost` `Owner::ordered`, `resequence::Resequencer`, `admit_replication`, `HeldFrame`, `HeldControlFrame` |
+| A held frame is let go by three bounds: its patience, its source's lane, the configuration | It is held no longer than its patience — the probe timeout of the path it came by, as this node's connection measures the path (`frame::probe_timeout`: three round trips and the acknowledgement delay the sender's probe timer counts, RFC 9002 §6.2.1), in the owner's periods and one more for the period under way: a frame that waited longer did not overtake its predecessor, the predecessor was lost, and the leader that was told so is probing. No more are held for one source than the source may have in flight (the inflight window), and no more sources have a lane than a configuration may name (`LOST_PEERS`). Past any bound what is held is stepped in its order and the core judges it as it did; a newer epoch from a source resets its lane, the older's frames stepped first; a source that left the configuration has its frames refused. The owner asks at every period it runs, a replica's own owner as a group's: a replica's own owner never asked, and a follower that lost appends held every one after them (2026-10-03) | `Resequencer::{hold, expire, prune}`, `patience_until`, `Owner::expire_held`, `VerifiedRequest::path_round_trip` |
+| The order rides the ordered profile and nothing else | A connection that negotiated it (`ORDERED_PROTOCOL_VERSION`, 5, topping the ladder; offered by the node's replication handlers, `supports_ordered_replication`) carries `RaftOrdered`; to a peer whose connection does not admit it — an older binary — the pool sends the frame as a plain `Raft` at the connection, the one copy a mixed window costs, so the old peer loses nothing but the order. A receiver holds an ordered frame to the ordered profile and a plain one to the base (`verify_request`) | `PeerConnectionPool::peer_protocol`, `send_bounded`, `QuicConnector::offering` (what an older binary offers; the fleet's test of a mixed window) |
+
+Measured on three in-process replicas over real QUIC behind relays of 5 ms each way that lose one datagram in fifty (`fleet_quic`, `a_peers_appends_are_stepped_in_their_order_across_a_lossy_path`; `support/relay.rs`, `Relay::lossy`): a burst of 512 entries had the followers refuse 27 appends with every connector offering what a binary before the profile offered, and none with the ordered profile — 61 frames held for the one they overtook, none let go past its patience (`ReplicaProgress::appends_rejected`; `frames_held`, `frames_let_go` and `frames_stale` say what the order did). Found by the measurement: the probe timeout of a path counted three round trips and not the acknowledgement delay a peer may take (RFC 9000 §18.2's 25 ms, which every connection here advertises) — on a path of ten milliseconds a loss is recovered no sooner than it, and a patience derived from it was shorter than the recovery (`frame::MAX_ACK_DELAY`); and an empty append, which carries the commit after the entries it follows, went unordered as a heartbeat does and was refused for naming an entry its member had yet to receive — every refusal left with the order kept was one. Open: a frame lost on the path still costs the probe it did; a held frame's patience is one probe timeout, which a frame lost twice exceeds. Each follower also counts the refusals the order should have spared (`ReplicaProgress::appends_rejected_in_order`, 2026-10-03): a loss — a frame let go past its patience, found stale or not stepped — is kept as the first index the follower's log lacked then, and a refusal in that term whose hint, the last entry the log could agree on, falls before it is the loss's; a term's first exchange, the plain appends of a leader of an older binary and a request for a snapshot are not counted. How many appends a lossy path has refused is the load's as much as the path's (29 on the ubuntu CI, 14 on a laptop alone, none in three copies beside a suite), so the test asserts this count, never theirs.
+
+## 13. A delivery a refusal stops is continued, not failed (2026-10-03)
+
+A control replica (`ControlReplica`, the shell of the root and of every directory
+partition) took what its node handed over — a snapshot, the entries after it — and
+applied it in one pass; any error of the pass marked the replica failed, and every call
+after answered `Failed`. The node had handed the events over once, so a replica could
+not ask for them again: a refusal that changed nothing of the node — memory for an
+entry's decode, for a snapshot's restore — ended the replica as a corrupt entry would,
+and its owner, which treats such a refusal as a checkpoint's (the pace refused, the
+poll after resumes), resumed into a replica that had already failed. A member brought
+up by snapshot on a loaded runner ended that way (ubuntu CI, 2026-10-03), reporting its
+egress's end and then, once the owner named it, the generic failure.
+
+| Rule | Why | Where |
+|---|---|---|
+| A delivery is continued from where it stands, never taken twice | The events the node handed over are kept with the output built so far and two cursors — the entries and the configuration changes applied — and a snapshot's installation is marked done once its state is swapped in; the next drain continues at the entry a refusal stopped, nothing applied twice, no new drain while one is held (one at most; its memory is the node's allocation for the events) | `RetainedDelivery`, `ControlReplica::continue_delivery`, `drive` |
+| Only a refusal that changed nothing of the node is retained | Memory refused for a decode or a restore leaves the node and the replica as they were; the drain answers the refusal and the owner polls again. Any other error — a corrupt entry, a wrong owner, a node that failed — fails the replica by its name, kept as its first failure | `drive`, `ControlReplica::{fail, failure}`, the owner's `checkpoint_retryable` |
+
+Measured on the owner's fixture: a follower whose budget is filled before its snapshot's
+decode answers the drain `Memory`, says nothing failed, and installs the snapshot once
+the room is given back (`a_delivery_a_memory_refusal_stops_is_continued_by_the_next_
+drain`); every delivery runs the same cursors, and a refusal between two entries has no
+deterministic lever in the fixture, whose commands are all of a size.
+

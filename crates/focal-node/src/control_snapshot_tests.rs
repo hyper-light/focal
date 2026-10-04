@@ -15,6 +15,8 @@ struct Fixture {
     outgoing: async_mpsc::Receiver<ControlReplicationFrame>,
     follower: ControlReplica,
     budget: MemoryBudget,
+    /// The follower's own budget: a test fills it to refuse a delivery.
+    follower_budget: MemoryBudget,
     _directory: tempfile::TempDir,
 }
 impl Fixture {
@@ -79,7 +81,7 @@ impl Fixture {
         let mut follower = ControlReplica::open(
             options(2),
             bootstrap,
-            follower_budget,
+            follower_budget.clone(),
             directory.path().join("follower"),
         )
         .unwrap();
@@ -95,6 +97,13 @@ impl Fixture {
                 applied_index: replica.applied_index(),
                 revisions: replica.revisions(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
+                appends_rejected: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 stopped: false,
                 snapshot_index: 0,
                 peers: Vec::new(),
@@ -102,7 +111,9 @@ impl Fixture {
             },
             _allocation: None,
         });
+        let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
         let owner = Owner {
+            stopping: None,
             replica,
             initial: None,
             verifier: NoDirectoryAuthority,
@@ -120,6 +131,24 @@ impl Fixture {
             progress,
             nonce: 0,
             dropped: 0,
+            epoch: 0,
+            ordered: std::collections::BTreeMap::new(),
+            resequencer: crate::resequence::Resequencer::new(
+                focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+                crate::fleet::LOST_PEERS,
+            ),
+            stepped: Vec::new(),
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
+            took_turn: false,
+            unreachable: 0,
+            lost_sender: lost.0,
+            lost: lost.1,
+            lost_peers: Vec::new(),
+            lost_coalesced: 0,
+            lost_dropped: 0,
             failure: None,
             pace: Default::default(),
         };
@@ -129,11 +158,14 @@ impl Fixture {
             outgoing,
             follower,
             budget,
+            follower_budget,
             _directory: directory,
         }
     }
     fn deliver(&mut self, mut frame: ControlReplicationFrame) {
-        let Operation::Raft { message, .. } = &frame.request.operation else {
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            &frame.request.operation
+        else {
             panic!("not Raft")
         };
         self.follower.step_authenticated(1, message).unwrap();
@@ -148,7 +180,9 @@ impl Fixture {
             self.owner.replica.tick().unwrap();
             self.owner.drain().unwrap();
             while let Ok(frame) = self.outgoing.try_recv() {
-                let Operation::Raft { message, .. } = &frame.request.operation else {
+                let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                    &frame.request.operation
+                else {
                     panic!("not Raft")
                 };
                 if focal_consensus::decode_message(message).unwrap().msg_type
@@ -215,7 +249,13 @@ fn control_snapshot_local_queue_and_frame_limit_rejection_release_flow_control()
         }
         let dropped = fixture.owner.dropped;
         for _ in 0..8 {
-            // A heartbeat response makes the lagging learner recently active.
+            // A heartbeat response makes the lagging learner recently
+            // active; it comes a beat after the snapshot failed, which is
+            // when the learner is sent it again.
+            for _ in 0..fixture.owner.replica.heartbeat_tick() {
+                fixture.owner.replica.tick().unwrap();
+                fixture.owner.drain().unwrap();
+            }
             let mut heartbeat = Message {
                 from: 2,
                 to: 1,
@@ -261,7 +301,9 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
         fixture.owner.replica.tick().unwrap();
         fixture.owner.drain().unwrap();
         while let Ok(frame) = fixture.outgoing.try_recv() {
-            let Operation::Raft { message, .. } = &frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                &frame.request.operation
+            else {
                 panic!("not Raft")
             };
             assert_ne!(
@@ -374,4 +416,114 @@ fn the_tick_period_is_clamped_between_the_configured_period_and_its_ceiling() {
     assert!(bad.validate().is_err());
     bad.tick_ceiling = Duration::from_secs(11);
     assert!(bad.validate().is_err());
+}
+
+/// The root owner holds the driver's lost-peer reports for the core each
+/// peer once — a peer reported again in the same period is coalesced,
+/// counted — and tells the core every held peer once it can; a report is a
+/// hint about a peer, never a reason for the owner to end. (The bound on
+/// peers held, and a fenced core, are exercised on the session owner,
+/// whose harness pauses the WAL.)
+#[test]
+fn the_root_owner_holds_lost_peers_each_once_and_tells_the_core() {
+    let mut fixture = Fixture::new();
+    for peer in 1..=1000u64 {
+        fixture.owner.lost_sender.try_send(peer).unwrap();
+    }
+    fixture.owner.lost_sender.try_send(7).unwrap();
+    fixture.owner.lost_sender.try_send(7).unwrap();
+    fixture.owner.report_lost().unwrap();
+    assert!(
+        fixture.owner.lost_peers.is_empty(),
+        "every held peer was told"
+    );
+    assert_eq!(fixture.owner.unreachable, 1000, "each peer told once");
+    assert_eq!(
+        fixture.owner.lost_coalesced, 2,
+        "reported thrice: coalesced twice"
+    );
+    assert_eq!(fixture.owner.lost_dropped, 0);
+    assert_eq!(
+        fixture.owner.replica.status().leader_id,
+        1,
+        "the owner is live and leads"
+    );
+    fixture.owner.publish_progress(false);
+    let progress = fixture.owner.progress.borrow().value.clone();
+    assert_eq!(
+        (
+            progress.peers_unreachable,
+            progress.peer_reports_coalesced,
+            progress.peer_reports_dropped
+        ),
+        (1000, 2, 0)
+    );
+}
+
+/// A delivery a memory refusal stops is retained and continued by the next
+/// drain, nothing applied twice, and the replica is not failed by it: a
+/// member brought up by snapshot on a loaded runner met a refusal in its
+/// snapshot's decode and ended (ubuntu CI, 2026-10-03). The follower's
+/// budget is filled so the snapshot's decode has no room; the drain is
+/// refused for memory and the replica says nothing failed; the room given
+/// back, the next drain installs the snapshot. (Every delivery runs the
+/// same cursors; a refusal between two entries has no deterministic lever in
+/// this fixture, whose commands are all of a size.)
+#[test]
+fn a_delivery_a_memory_refusal_stops_is_continued_by_the_next_drain() {
+    let mut fixture = Fixture::new();
+    let frame = fixture.snapshot();
+    let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+        &frame.request.operation
+    else {
+        panic!("a raft frame")
+    };
+    fixture.follower.step_authenticated(1, message).unwrap();
+    let leader_index = fixture.owner.replica.applied_index();
+    // The room left: enough for the node to hand its events over (their
+    // bytes, once), not for the delivery's decode (thirty-two times the
+    // snapshot's): the refusal is the delivery's, not the node's.
+    let stats = fixture.follower_budget.stats();
+    let room = message.len() * 4 + 64 * 1024;
+    let hog = fixture
+        .follower_budget
+        .reserve(
+            BudgetKind::Recovery,
+            BudgetLane::Completion,
+            stats.limit.saturating_sub(stats.used).saturating_sub(room),
+        )
+        .unwrap()
+        .commit();
+    // The drain waits for the disk, as the owner's does when it has nothing
+    // to send meanwhile; the node hands its events over, and the delivery
+    // is refused the room for the snapshot's decode.
+    let refused = fixture.follower.drain(&NoDirectoryAuthority);
+    assert!(
+        matches!(refused, Err(ControlError::Memory(_))),
+        "{refused:?}"
+    );
+    assert_eq!(fixture.follower.failure(), None);
+    assert!(fixture.follower.applied_index() < leader_index);
+    // Refused again while the room is held: still retained, still not failed.
+    assert!(matches!(
+        fixture.follower.drain(&NoDirectoryAuthority),
+        Err(ControlError::Memory(_))
+    ));
+    assert_eq!(fixture.follower.failure(), None);
+    drop(hog);
+    // The room given back, the delivery continues and the snapshot is
+    // installed.
+    fixture.follower.drain(&NoDirectoryAuthority).unwrap();
+    assert_eq!(fixture.follower.applied_index(), leader_index);
+    assert_eq!(
+        fixture.follower.revisions(),
+        fixture.owner.replica.revisions()
+    );
+    // Nothing is delivered twice: a drain after it applies nothing more,
+    // whatever messages the node has to send after its snapshot.
+    if let Some(events) = fixture.follower.try_drain(&NoDirectoryAuthority).unwrap() {
+        assert!(events.completed.is_none());
+        assert_eq!(events.applied_index, leader_index);
+    }
+    assert_eq!(fixture.follower.applied_index(), leader_index);
 }

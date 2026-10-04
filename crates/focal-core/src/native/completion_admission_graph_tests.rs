@@ -57,16 +57,17 @@ fn isolated_required_parent_is_protected_and_failure_credit_is_still_one_time() 
     let failure = envelope
         .report_storage(CompletionUse::AdmissionFailure)
         .unwrap();
-    // Eleven primary rows, the cohort's rows, the report artifact's index
-    // rows and verdict, a status move for the parent and every sealed
-    // cohort claim, and the due timers the failure can retire: every
-    // deleted key beyond the status moves (doc 22 §7).
+    // Twelve primary rows (the principal's window among them, F12), the
+    // cohort's rows, the report artifact's index rows and verdict, a status
+    // move for the parent and every sealed cohort claim, and the due timers
+    // the failure can retire: every deleted key beyond the status moves
+    // (doc 22 §7).
     let cohort = envelope.cohort();
     let timers = failure.limits().deleted_keys - (1 + cohort.claims());
     assert!(timers > 1 + cohort.claims() + cohort.evaluations());
     assert_eq!(
         failure.limits().changed_keys,
-        11 + cohort.changed_keys()
+        12 + cohort.changed_keys()
             + crate::native::index_rows::report_rows(16).unwrap()
             + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
             + timers

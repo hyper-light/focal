@@ -356,7 +356,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
             .unwrap();
         assert_eq!(receipt.identity.node_id, Some(node));
         let material = key
-            .complete(&receipt, authority.ca_certificate(), now)
+            .complete(&receipt, authority.issuers().unwrap().trusted(), now)
             .unwrap();
         identities.push(Identity {
             certificate: receipt.certificate.clone(),
@@ -422,7 +422,14 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
         }
         let tls = server_tls(identity.tls(), roots.clone(), &limits()).unwrap();
         let server = Arc::new(
-            QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, peers, limits()).unwrap(),
+            QuicServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                peers,
+                limits(),
+                focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+            )
+            .unwrap(),
         );
         let serving_server = server.clone();
         let handler = host.clone();

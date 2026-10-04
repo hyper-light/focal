@@ -956,11 +956,26 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
         claims.push(hex_of(&created["id"]));
     }
     claims.sort_unstable();
-    let initial = ranges(founder).expect("ranges list");
+    // A process under load may refuse one exchange within its request
+    // deadline; the fact waited on is the map, not one answer.
+    let ranges_of = |root: &Path| -> Value {
+        let mut deadline = Deadline::after(Duration::from_secs(60));
+        loop {
+            if let Some(view) = ranges(root) {
+                return view;
+            }
+            assert!(
+                deadline.open(),
+                "the ranges list did not answer under {root:?}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    let initial = ranges_of(founder);
     assert_eq!(initial["epoch"], 1, "{initial}");
     assert!(initial["members"][0]["holder"].is_null(), "{initial}");
     let member_of = |root: &Path| -> String {
-        ranges(root).unwrap()["members"][0]["id"]
+        ranges_of(root)["members"][0]["id"]
             .as_str()
             .unwrap()
             .to_owned()

@@ -16,11 +16,11 @@
     },
     {
       "path": "references/admin-workflow.md",
-      "blake3": "5a57272861e188911edf45bb8127d521fb01708c93a7e5852709d631dc69bdd8"
+      "blake3": "9243a3fbc9108b5bc989083c0a2565432f319a31b7c351a73c7810f7485b5305"
     },
     {
       "path": "references/peer-workflows.md",
-      "blake3": "dd44a8d90b6f7c7e1ee1600feb7e97a11cb63bb922ee8e10985b41cef545e737"
+      "blake3": "cc114556dc3cfea5e54141b202eb11f4da37ff0a71e440b57f6d7b2acf95c662"
     }
   ],
   "skills": [
@@ -229,9 +229,9 @@
     },
     {
       "name": "focal-evidence",
-      "version": 8,
+      "version": 9,
       "path": "focal-evidence/SKILL.md",
-      "blake3": "c563f964cf1e602341cfa1bbd7c02626fb73920c18e6c44021111209422c35cc",
+      "blake3": "e1bcb388496179874974eb05d69987c27686463fc06260c9890e860d2a963f3b",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -385,6 +385,10 @@
       ],
       "required_admin_tools": [],
       "required_native_operations": [
+        {
+          "name": "archive.get",
+          "version": 2
+        },
         {
           "name": "artifact.diagnostic",
           "version": 2
@@ -612,9 +616,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 18,
+      "version": 20,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "ecb914bc9157e8ad301d82818637abdbebe55b16a398c66a28146200e9caa854",
+      "blake3": "593290f3cd58bf4b85a403f2200356f87dfae6bbbc3c2429c334f879cc6b2dce",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -649,6 +653,14 @@
         },
         {
           "name": "cluster.credentials.rotate",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.issuers",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.rotate_issuer",
           "version": 1
         },
         {
@@ -733,6 +745,26 @@
         },
         {
           "name": "cluster.nodes.undrain",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.add_learner",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.promote",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.remove",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.show",
+          "version": 1
+        },
+        {
+          "name": "cluster.partitions.transfer",
           "version": 1
         },
         {
@@ -856,9 +888,9 @@
     },
     {
       "name": "focal-peers",
-      "version": 1,
+      "version": 2,
       "path": "focal-peers/SKILL.md",
-      "blake3": "f4f315128cda921e828aa456672c38903eeddee936ed60f4a56709512ccb3e66",
+      "blake3": "71dc328c9aa266b88255087ef9e90994df3a854c09af94feec517d8eeb91e3e9",
       "references": [
         "references/workflow-contract.md",
         "references/peer-workflows.md"

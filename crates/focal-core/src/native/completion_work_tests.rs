@@ -108,13 +108,14 @@ fn received_target_prices_all_retry_versions_and_graph_consequences_before_entry
         }
     );
     let storage = envelope.report_storage(CompletionUse::Regular).unwrap();
-    // Sixteen primary changes, the cohort's rows, the report's index rows, a
-    // status move for the parent and every sealed cohort claim, and the due
-    // timers the report can retire: every deleted key beyond the status moves.
+    // Seventeen primary changes (the principal's window among them, F12),
+    // the cohort's rows, the report's index rows, a status move for the
+    // parent and every sealed cohort claim, and the due timers the report
+    // can retire: every deleted key beyond the status moves.
     let timers = storage.limits().deleted_keys - (1 + cohort.claims());
     assert!(timers > 1 + cohort.claims() + cohort.evaluations());
     let changed =
-        16 + cohort.changed_keys() + report_index + status * (1 + cohort.claims()) + timers;
+        17 + cohort.changed_keys() + report_index + status * (1 + cohort.claims()) + timers;
     assert_eq!(storage.limits().changed_keys, changed);
     let journal = crate::native::completion_book::journal_bytes(1 + cohort.evaluations()).unwrap();
     let writes = crate::native::mutation::bytes(changed).unwrap();
@@ -350,7 +351,7 @@ fn incoming_topology_growth_is_detected_even_when_original_parent_row_did_not_ch
     let timers = storage.limits().deleted_keys - (2 + cohort.claims());
     assert_eq!(
         storage.limits().changed_keys,
-        18 + cohort.changed_keys()
+        19 + cohort.changed_keys()
             + crate::native::index_rows::report_rows(16).unwrap()
             + crate::native::index_rows::STATUS_ROWS * (2 + cohort.claims())
             + timers

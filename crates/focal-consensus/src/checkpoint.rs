@@ -10,6 +10,12 @@ pub(super) struct PendingCheckpoint {
     // All pending payloads precede their staging permit in drop order.
     _allocation: Allocation,
 }
+impl PendingCheckpoint {
+    /// Whether the log took the checkpoint's write.
+    pub(super) fn taken(&self) -> bool {
+        self.receipt.is_some()
+    }
+}
 
 // The source buffer always dies before its funding, including validation
 // refusal. Consensus snapshot/WAL copies have their own staging allowance.
@@ -226,10 +232,12 @@ impl DurableNode {
     fn checkpoint_progress(&mut self, blocking: bool) -> Result<bool, ConsensusError> {
         let mut pending = self.checkpoint.take().ok_or(ConsensusError::Failed)?;
         if pending.receipt.is_none() {
-            match self
-                .wal
-                .rewrite_checkpoint_async_in(&pending.records, BudgetLane::Completion)
-            {
+            let persisted = self.persisted.as_ref().map(|signal| signal());
+            match self.wal.rewrite_checkpoint_async_notified(
+                &pending.records,
+                BudgetLane::Completion,
+                persisted,
+            ) {
                 Ok(receipt) => pending.receipt = Some(receipt),
                 Err(focal_log::LogError::Capacity) => {
                     // Completion-lane back-pressure is retryable in both modes;
@@ -262,6 +270,10 @@ impl DurableNode {
         drop(records);
         drop(receipt);
         self.raw.store_mut().compact_prepared(prepared)?;
+        // The checkpoint wrote the stored hard state, and no commit moved
+        // while it was written.
+        self.commit_unwritten = false;
+        self.commit_durable = self.commit_durable.max(self.raw.store().hard_state.commit);
         _allocation
             .shrink_to(memory::raw_bytes(&self.raw)?)
             .map_err(|_| ConsensusError::Capacity)?;

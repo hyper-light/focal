@@ -34,6 +34,7 @@ fn node_survival_renders_a_founder_and_a_host_set_and_names_what_is_missing() {
             "statefulset-focal-founder.yaml",
             "statefulset-focal-hosts.yaml",
             "pdb.yaml",
+            "namespace.yaml",
             "kustomization.yaml",
             "invitations.sh"
         ]
@@ -63,7 +64,24 @@ fn node_survival_renders_a_founder_and_a_host_set_and_names_what_is_missing() {
     assert!(founder.contains("\"$(POD_NAME).focal.$(POD_NAMESPACE).svc.cluster.local:7443\""));
     assert!(founder.contains("prepare-volume"));
     assert!(founder.contains("\"--check\", \"alive\""));
+    // Readiness asks whether the owners serve; startup and liveness whether
+    // the process answers.
+    assert!(founder.contains(
+        "readinessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"cluster\", \"node\", \"probe\", \"--check\", \"serving\"]"
+    ));
+    assert!(founder.contains(
+        "livenessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"cluster\", \"node\", \"probe\", \"--check\", \"alive\"]"
+    ));
     assert!(file(&assets, "pdb.yaml").contains("maxUnavailable: 1"));
+    // The namespace is an object of the kustomization, listed first, so a
+    // fresh cluster creates it before anything named in it.
+    assert!(
+        file(&assets, "namespace.yaml").contains("kind: Namespace\nmetadata:\n  name: focal\n")
+    );
+    assert!(
+        file(&assets, "kustomization.yaml")
+            .starts_with("namespace: focal\nresources:\n  - namespace.yaml\n")
+    );
     assert!(file(&assets, "service.yaml").contains("clusterIP: None"));
     assert!(file(&assets, "service.yaml").contains("protocol: UDP"));
     assert!(file(&assets, "invitations.sh").contains("--output - > \"$host.invite\""));
@@ -139,6 +157,7 @@ fn zone_survival_needs_its_zones_then_places_one_set_per_zone_with_affinity() {
             "statefulset-focal-b.yaml",
             "statefulset-focal-c.yaml",
             "pdb.yaml",
+            "namespace.yaml",
             "kustomization.yaml",
             "invitations.sh"
         ]

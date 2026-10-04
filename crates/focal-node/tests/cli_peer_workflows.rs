@@ -260,11 +260,22 @@ fn respond(root: &Path, client: &Path, holder: &str, claim: &str, payload: &str)
     ));
     artifact
 }
+/// The lineage's claims in order — the claim, its ancestors, its followers
+/// — of an observation that is complete at its one prefix.
 fn lineage_ids(root: &Path, claim: &str) -> Vec<String> {
     let page = cli(root, None, &["claim", "lineage", claim]);
     assert_eq!(page["condition"], "Lineage", "{page}");
-    objects(&page)
-        .iter()
+    lineage_claims(&page)
+}
+fn lineage_claims(page: &Value) -> Vec<String> {
+    assert_eq!(page["result"]["kind"], "native_lineage", "{page}");
+    let lineage = &page["result"]["lineage"];
+    assert!(lineage["ancestors_beyond"].is_null(), "{lineage}");
+    assert!(lineage["ancestors_missing"].is_null(), "{lineage}");
+    assert_eq!(lineage["followers_beyond"], json!([]), "{lineage}");
+    std::iter::once(&lineage["claim"])
+        .chain(lineage["ancestors"].as_array().unwrap())
+        .chain(lineage["followers"].as_array().unwrap())
         .map(|object| hex_hash(&object["Claim"]["binding"]["object"]))
         .collect()
 }

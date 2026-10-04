@@ -107,6 +107,23 @@ intent algorithm; these encoded bytes do not redefine it. ProjectionOnly refuses
 `CreateAuthored`; AuthoredV1 refuses `Create`. Other command tags share both
 profiles, with ordinary owner validation still required.
 
+The request epoch is the principal's **request generation** (the audit's F12,
+[22 §3](22-native-record-format.md)). The owner keeps one window per principal:
+a floor, and at most two generations open above it — the one a client fills and
+the one it drains while the last operations of it are acknowledged. A
+generation opens implicitly with its first request and only in order: a request
+in the generation after the open ones opens it; a request beyond it, or a third
+open generation, is refused `EpochNotAdmitted`; a request in a generation below
+the floor is refused `RequestHistoryExpired` — never executed, its committed
+outcome, if any, readable from the seal that holds it ([26 §4a](26-custody-archive-retention-and-restore.md)).
+The client's journal advances the floor itself with `AdvanceEpochFloor` (tag
+`28`): issued in the current generation once every operation of the generations
+below it is delivered, naming a minimum above the floor and at most the
+generation it is sent in (a request never closes its own generation). The owner
+forces a floor under pressure on its resident window, closing the least recently
+used open generations first; a client learns a forced floor by the refusal and
+continues in the generation the owner admits. Generation zero is no generation.
+
 Timer bodies are respectively `(EvaluationKey, Deadline)`, `(claim ID, Deadline)`
 and `(claim ID, monitor ID, Deadline)`. A Deadline is `(timer ID, generation u64,
 at u64)`. The authored `at` is included even though the timer invocation key
@@ -149,6 +166,7 @@ counted array; `?` means an explicitly tagged option.
 | 25 | RebindMonitor | expected Binding, ReceiptFence?, monitor ID, predecessor Binding, successor Binding |
 | 26 | CancelMonitor | expected Binding, ReceiptFence?, monitor ID |
 | 27 | CreateAuthored | `[(Claim, [Validation], max_responses u32, ScopeLimits, Owner?)]` |
+| 28 | AdvanceEpochFloor | minimum generation `u64` (the client protocol's floor advance, never an authored tool; F12) |
 
 Confidence uses Hint `0`, Tentative `1`, Committed `2`, Consensus `3`. Reported
 Outcome uses Complete `0`, Partial `1`, Refused `2`, Impossible `3`, Interrupted

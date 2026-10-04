@@ -107,6 +107,7 @@ fn settings_that_cannot_hold_are_refused() {
         (Box::new(|config| config.heartbeat_tick = 0), "heartbeat"),
         (Box::new(|config| config.election_tick = 2), "election"),
         (Box::new(|config| config.max_inflight_msgs = 0), "window"),
+        (Box::new(|config| config.max_inflight_bytes = 0), "bytes"),
         (
             Box::new(|config| config.max_uncommitted_size = 1),
             "uncommitted",
@@ -322,6 +323,426 @@ fn reads_that_wait_have_a_bound() {
     );
     node.advance(ready).unwrap();
     node.read_index(vec![7]).unwrap();
+}
+
+/// A leader of three that committed in its term: it answers reads.
+fn reading_leader() -> RawNode<Memory> {
+    committed_leader(config(1))
+}
+fn committed_leader(config: Config) -> RawNode<Memory> {
+    let mut node = leader_with(config);
+    let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    append.index = 1;
+    node.step(append).unwrap();
+    drain(&mut node);
+    node
+}
+fn rounds(messages: &[Message]) -> Vec<(u64, Vec<u8>)> {
+    messages
+        .iter()
+        .filter(|message| proto::message_type(message) == Some(MessageType::MsgHeartbeat))
+        .map(|message| (message.to, message.context.clone()))
+        .collect()
+}
+fn confirmed(node: &mut RawNode<Memory>) -> Vec<Vec<u8>> {
+    let mut ready = node.ready().unwrap();
+    let reads = ready
+        .take_read_states()
+        .into_iter()
+        .map(|read| read.request_ctx)
+        .collect();
+    node.advance(ready).unwrap();
+    reads
+}
+
+/// Twenty reads asked before the member is next asked what there is to do
+/// leave in one round — a heartbeat to each of the two other members, with
+/// the context of the last — and one member's answer to it confirms all
+/// twenty. A round for each was forty heartbeats, of which the answers to
+/// the last two did the same.
+#[test]
+fn reads_asked_together_leave_in_one_round_and_one_answer_confirms_them() {
+    let mut node = reading_leader();
+    for read in 0..20u8 {
+        node.read_index(vec![read]).unwrap();
+        // Nothing is sent as a read is asked.
+        assert!(node.raft.messages().is_empty());
+    }
+    assert!(node.has_ready());
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, vec![19]), (3, vec![19])]
+    );
+    // The round is out: there is nothing more to do for the reads.
+    assert!(!node.has_ready());
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = vec![19];
+    node.step(heartbeat).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 0);
+    assert_eq!(
+        confirmed(&mut node),
+        (0..20u8).map(|read| vec![read]).collect::<Vec<_>>()
+    );
+    // A read asked alone leaves with the next `Ready`, and no later.
+    node.read_index(b"alone".to_vec()).unwrap();
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, b"alone".to_vec()), (3, b"alone".to_vec())]
+    );
+}
+
+/// A read asked after a round was sent is not confirmed by that round: the
+/// heartbeats left before the read was asked, and say nothing of who led
+/// when it was. It is asked for by the next round, which leaves with the
+/// `Ready` that follows.
+#[test]
+fn a_read_asked_after_a_round_left_is_asked_for_by_the_next() {
+    let mut node = reading_leader();
+    node.read_index(b"first".to_vec()).unwrap();
+    assert_eq!(rounds(&drain(&mut node)).len(), 2);
+    node.read_index(b"second".to_vec()).unwrap();
+    node.read_index(b"third".to_vec()).unwrap();
+    // The answer to the first round arrives before the next round left.
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = b"first".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 2);
+    let mut ready = node.ready().unwrap();
+    assert_eq!(
+        ready
+            .take_read_states()
+            .into_iter()
+            .map(|read| read.request_ctx)
+            .collect::<Vec<_>>(),
+        vec![b"first".to_vec()]
+    );
+    // The same `Ready` carries one round for the two asked since.
+    assert_eq!(
+        rounds(&ready.take_messages()),
+        vec![(2, b"third".to_vec()), (3, b"third".to_vec())]
+    );
+    node.advance(ready).unwrap();
+    assert!(!node.has_ready());
+    // A late answer to the first round confirms nothing more.
+    let mut late = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    late.context = b"first".to_vec();
+    node.step(late).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 2);
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    heartbeat.context = b"third".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(
+        confirmed(&mut node),
+        vec![b"second".to_vec(), b"third".to_vec()]
+    );
+}
+
+/// A round that was lost is asked again by the leader's own clock: its
+/// heartbeat carries the last read asked, and is a round for every read
+/// that waits. A leader that is deposed lets its reads go, and has no
+/// round left to send.
+#[test]
+fn a_round_that_was_lost_is_asked_again_by_the_leaders_clock() {
+    let mut node = reading_leader();
+    node.read_index(b"lost".to_vec()).unwrap();
+    assert_eq!(rounds(&drain(&mut node)).len(), 2);
+    assert!(!node.has_ready());
+    let mut asked_again = Vec::new();
+    for _ in 0..2 {
+        node.tick().unwrap();
+        asked_again.extend(rounds(&drain(&mut node)));
+    }
+    assert_eq!(
+        asked_again,
+        vec![(2, b"lost".to_vec()), (3, b"lost".to_vec())]
+    );
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    heartbeat.context = b"lost".to_vec();
+    node.step(heartbeat).unwrap();
+    assert_eq!(confirmed(&mut node), vec![b"lost".to_vec()]);
+    // Deposed with a read asked and its round unsent.
+    node.read_index(b"unsent".to_vec()).unwrap();
+    assert!(node.has_ready());
+    node.step(answer(MessageType::MsgHeartbeat, 2, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.pending_read_count(), 0);
+    assert!(rounds(&drain(&mut node)).is_empty());
+}
+
+fn appends(messages: &[Message], to: u64) -> Vec<(u64, u64)> {
+    messages
+        .iter()
+        .filter(|message| {
+            message.to == to
+                && proto::message_type(message) == Some(MessageType::MsgAppend)
+                && !message.entries.is_empty()
+        })
+        .map(|message| {
+            (
+                message.entries.last().unwrap().index,
+                message.entries.iter().map(proto::encoded_bytes).sum(),
+            )
+        })
+        .collect()
+}
+fn window(node: &RawNode<Memory>, member: u64) -> (usize, u64) {
+    let progress = node.raft.tracker().get(member).unwrap();
+    (progress.inflights.count(), progress.inflights.bytes())
+}
+
+/// A member is sent no more bytes of entries ahead of its answers than the
+/// path to it carries, whatever their sizes; a member that answers nothing
+/// holds none of them back from a majority that does; an entry larger than
+/// the bound is sent, alone, and waited for without another being sent; an
+/// answer gives back what the messages it answers took, once, in whatever
+/// order answers come; and a bound that changes while messages are out is
+/// in force for the next.
+#[test]
+fn a_member_is_sent_no_more_bytes_ahead_of_its_answers_than_its_path_carries() {
+    let mut node = committed_leader(Config {
+        max_inflight_bytes: 1_000,
+        ..config(1)
+    });
+    // Member 2 answered and is sent ahead of its answers; member 3 has
+    // answered nothing and is probed: one message, and no more.
+    let sizes = [300usize, 20, 700, 40, 300, 300, 5, 300];
+    let mut sent = Vec::new();
+    for (round, size) in sizes.iter().enumerate() {
+        node.propose(vec![], vec![round as u8; *size]).unwrap();
+        let messages = drain(&mut node);
+        assert!(appends(&messages, 3).is_empty());
+        sent.extend(appends(&messages, 2));
+        node.check_accounting().unwrap();
+        let (_, bytes) = window(&node, 2);
+        // What is out passes the bound by one entry at most: the page that
+        // took the last of the room.
+        assert!(bytes < 1_000 + 710, "{bytes} bytes are out");
+    }
+    // The window filled by its bytes, with places to spare, and the
+    // entries behind it wait.
+    let (count, bytes) = window(&node, 2);
+    assert_eq!(bytes, sent.iter().map(|(_, bytes)| *bytes).sum::<u64>());
+    assert!(
+        bytes >= 1_000 && count < 8,
+        "{count} messages, {bytes} bytes"
+    );
+    let last = node.raft.log().last_index().unwrap();
+    assert!(sent.last().unwrap().0 < last);
+    // An answer out of date, and the same answer twice, give back nothing
+    // that was not taken.
+    let (first, first_bytes) = sent[0];
+    let answered = |index: u64| {
+        let mut answer = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+        answer.index = index;
+        answer
+    };
+    node.step(answered(1)).unwrap();
+    assert_eq!(window(&node, 2).1, bytes);
+    node.step(answered(first)).unwrap();
+    let more = drain(&mut node);
+    node.step(answered(first)).unwrap();
+    node.check_accounting().unwrap();
+    // What it gave back was sent again, as far as the bound allows.
+    let resent: u64 = appends(&more, 2).iter().map(|(_, bytes)| *bytes).sum();
+    assert_eq!(window(&node, 2).1, bytes - first_bytes + resent);
+    assert!(drain(&mut node).is_empty());
+    // The majority of members 1 and 2 commits everything, whatever member
+    // 3 does: answers skip ahead and come out of order.
+    let mut answers = vec![last];
+    for _ in 0..64 {
+        let Some(index) = answers.pop() else { break };
+        node.step(answered(index)).unwrap();
+        for (index, _) in appends(&drain(&mut node), 2) {
+            answers.insert(0, index);
+        }
+        node.check_accounting().unwrap();
+    }
+    for (index, _) in sent.iter().rev() {
+        node.step(answered(*index)).unwrap();
+    }
+    node.step(answered(last)).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.hard_state().commit, last);
+    assert_eq!(window(&node, 2), (0, 0));
+    assert_eq!(window(&node, 3), (0, 0));
+    // An entry larger than the bound goes alone, and the next waits for
+    // its answer: nothing spins, and nothing is sent in vain.
+    node.propose(vec![], vec![9; 5_000]).unwrap();
+    let large = appends(&drain(&mut node), 2);
+    assert_eq!(large.len(), 1);
+    assert!(large[0].1 > 5_000);
+    node.propose(vec![], b"behind".to_vec()).unwrap();
+    assert!(appends(&drain(&mut node), 2).is_empty());
+    assert!(!node.has_ready());
+    // The path is found to carry more: the bound rises, and the next
+    // answer or append sends what waited.
+    assert!(node.set_inflight_bytes(2, 1 << 20));
+    assert!(!node.set_inflight_bytes(9, 1 << 20));
+    node.propose(vec![], b"more".to_vec()).unwrap();
+    let after = appends(&drain(&mut node), 2);
+    assert_eq!(
+        after.last().unwrap().0,
+        node.raft.log().last_index().unwrap()
+    );
+    // And falls below what is out: nothing more until enough is answered.
+    assert!(node.set_inflight_bytes(2, 16));
+    node.propose(vec![], b"held".to_vec()).unwrap();
+    assert!(appends(&drain(&mut node), 2).is_empty());
+    node.step(answered(node.raft.log().last_index().unwrap() - 1))
+        .unwrap();
+    assert_eq!(appends(&drain(&mut node), 2).len(), 1);
+    node.check_accounting().unwrap();
+}
+
+/// A heartbeat's answer says how far the member's log goes. Where its last
+/// entry is of the leader's term the leader made that entry, and the member
+/// holds the leader's log through it: the answer is an append's answer for
+/// all of it, and the answers to three appends that were lost are made
+/// good, exactly. An answer from a member that holds nothing new gives
+/// nothing back and sends nothing — the bytes out never pass their bound
+/// for a member that answers heartbeats and no append (raft-rs freed the
+/// first message and sent the next at every such answer). A member whose
+/// window is full and that has answered for none of it through a beat of
+/// the leader's ticks is probed, with one message of what its path carries;
+/// and a probe is sent again when it is told lost, or once a beat has
+/// passed since it was sent, not at every heartbeat's answer.
+#[test]
+fn a_heartbeats_answer_gives_back_what_the_member_holds_and_nothing_more() {
+    let mut node = committed_leader(Config {
+        max_inflight_bytes: 1_000,
+        ..config(1)
+    });
+    let mut sent = Vec::new();
+    for round in 0..8u8 {
+        node.propose(vec![], vec![round; 300]).unwrap();
+        sent.extend(appends(&drain(&mut node), 2));
+    }
+    let (count, bytes) = window(&node, 2);
+    assert!(bytes >= 1_000 && count == sent.len());
+    let last = node.raft.log().last_index().unwrap();
+    let held = |index: u64, term: u64| {
+        let mut answer = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+        answer.index = index;
+        answer.log_term = term;
+        answer
+    };
+    let matched = |node: &RawNode<Memory>| node.raft.tracker().get(2).unwrap().matched;
+    let before = matched(&node);
+    // The member holds nothing of what is out: nothing is given back and
+    // nothing is sent.
+    for _ in 0..2 {
+        node.step(held(before, 1)).unwrap();
+        assert!(appends(&drain(&mut node), 2).is_empty());
+        assert_eq!(window(&node, 2), (count, bytes));
+    }
+    // Its last entry is of another term, or it says nothing of its log (a
+    // member of raft-rs): this leader did not make that entry, and it says
+    // nothing of what this leader sent.
+    node.step(held(last, 9)).unwrap();
+    node.step(held(0, 0)).unwrap();
+    assert!(appends(&drain(&mut node), 2).is_empty());
+    assert_eq!(window(&node, 2), (count, bytes));
+    assert_eq!(matched(&node), before);
+    // It holds through the second message, and the answers to both were
+    // lost: the heartbeat's answer is theirs. What the two took is given
+    // back, and what waited is sent as far as the bound allows.
+    node.step(held(sent[1].0, 1)).unwrap();
+    let more = appends(&drain(&mut node), 2);
+    assert!(!more.is_empty());
+    assert_eq!(matched(&node), sent[1].0);
+    let given_back = sent[0].1 + sent[1].1;
+    let resent: u64 = more.iter().map(|(_, bytes)| *bytes).sum();
+    assert_eq!(window(&node, 2).1, bytes - given_back + resent);
+    assert!(window(&node, 2).1 < 1_000 + 310);
+    node.check_accounting().unwrap();
+    // The member answers heartbeats and nothing of what is out. While no
+    // beat of the leader's ticks has passed since the window filled, that
+    // sends nothing; once one has, the member is probed, with one message,
+    // cut to what its path carries.
+    let fill = |node: &mut RawNode<Memory>| {
+        let mut sent = Vec::new();
+        for round in 0..8u8 {
+            node.propose(vec![], vec![round; 300]).unwrap();
+            sent.extend(appends(&drain(node), 2));
+        }
+        sent
+    };
+    fill(&mut node);
+    assert!(node.raft.tracker().get(2).unwrap().inflights.full());
+    for _ in 0..4 {
+        node.step(held(sent[1].0, 1)).unwrap();
+        assert!(appends(&drain(&mut node), 2).is_empty());
+    }
+    for _ in 0..2 {
+        node.tick().unwrap();
+        assert!(appends(&drain(&mut node), 2).is_empty());
+    }
+    node.step(held(sent[1].0, 1)).unwrap();
+    let probe = appends(&drain(&mut node), 2);
+    assert_eq!(probe.len(), 1);
+    assert!(probe[0].1 <= 1_000 + 310);
+    assert_eq!(
+        node.raft.tracker().get(2).unwrap().state,
+        crate::progress::ProgressState::Probe
+    );
+    assert_eq!(window(&node, 2), (0, 0));
+    // The probe is not sent again at every heartbeat the member answers:
+    // only once a beat has passed since it was sent.
+    for _ in 0..4 {
+        node.step(held(sent[1].0, 1)).unwrap();
+        assert!(appends(&drain(&mut node), 2).is_empty());
+    }
+    for _ in 0..2 {
+        node.tick().unwrap();
+        assert!(appends(&drain(&mut node), 2).is_empty());
+    }
+    node.step(held(sent[1].0, 1)).unwrap();
+    assert_eq!(appends(&drain(&mut node), 2), probe);
+    for _ in 0..4 {
+        node.step(held(sent[1].0, 1)).unwrap();
+        assert!(appends(&drain(&mut node), 2).is_empty());
+    }
+    // It is sent again when its owner is told it was lost.
+    node.report_unreachable(2).unwrap();
+    node.step(held(sent[1].0, 1)).unwrap();
+    assert_eq!(appends(&drain(&mut node), 2), probe);
+    // And once it arrives, the member is sent ahead of its answers again.
+    node.step(held(probe[0].0, 1)).unwrap();
+    assert!(!appends(&drain(&mut node), 2).is_empty());
+    assert_eq!(
+        node.raft.tracker().get(2).unwrap().state,
+        crate::progress::ProgressState::Replicate
+    );
+    assert_eq!(matched(&node), probe[0].0);
+    node.check_accounting().unwrap();
+    // A member that does not lead says how far its log goes.
+    let mut member = follower();
+    let mut heartbeat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    heartbeat.commit = 2;
+    member.step(heartbeat).unwrap();
+    let answers = drain(&mut member);
+    let said = answers
+        .iter()
+        .find(|message| proto::message_type(message) == Some(MessageType::MsgHeartbeatResponse))
+        .unwrap();
+    assert_eq!((said.index, said.log_term), (3, 1));
+    // Under the rule of raft-rs it says nothing, and a full window gives
+    // up its first message at every answer.
+    let mut bare = committed_leader(Config {
+        max_inflight_bytes: 1_000,
+        heartbeat_answers: crate::HeartbeatAnswers::Bare,
+        ..config(1)
+    });
+    for round in 0..8u8 {
+        bare.propose(vec![], vec![round; 300]).unwrap();
+        drain(&mut bare);
+    }
+    let (count, _) = window(&bare, 2);
+    bare.step(answer(MessageType::MsgHeartbeatResponse, 2, 1, 1))
+        .unwrap();
+    assert_eq!(appends(&drain(&mut bare), 2).len(), 1);
+    assert_eq!(window(&bare, 2).0, count);
 }
 
 #[test]
@@ -720,4 +1141,49 @@ fn a_follower_waits_its_patience_before_it_campaigns() {
     assert_eq!(prompt.raft.state(), StateRole::Follower);
     prompt.tick().unwrap();
     assert_ne!(prompt.raft.state(), StateRole::Follower);
+}
+
+#[test]
+fn a_read_asked_by_two_members_under_one_context_answers_both() {
+    let mut node = leader();
+    let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    append.index = 1;
+    node.step(append).unwrap();
+    drain(&mut node);
+    // Two followers forward a read under the same context: one read waits,
+    // with two askers.
+    for from in [2u64, 3] {
+        let mut asked = answer(MessageType::MsgReadIndex, from, 1, 1);
+        asked.entries = vec![Entry {
+            data: b"same".to_vec(),
+            ..Entry::default()
+        }];
+        node.step(asked).unwrap();
+    }
+    assert_eq!(node.raft.pending_read_count(), 1);
+    drain(&mut node);
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = b"same".to_vec();
+    node.step(heartbeat).unwrap();
+    // The quorum confirms the read once, and each asker is answered.
+    let answers: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
+        .into_iter()
+        .filter(|message| proto::message_type(message) == Some(MessageType::MsgReadIndexResp))
+        .map(|message| {
+            (
+                message.to,
+                message.index,
+                message
+                    .entries
+                    .first()
+                    .map(|entry| entry.data.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![(2, 1, b"same".to_vec()), (3, 1, b"same".to_vec())]
+    );
+    assert_eq!(node.raft.pending_read_count(), 0);
 }

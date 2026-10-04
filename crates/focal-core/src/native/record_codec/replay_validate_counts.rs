@@ -6,6 +6,7 @@ struct Counts {
     writes: Meta,
     meta: bool,
     outcome: bool,
+    epochs: bool,
 }
 fn row(meta: &mut Meta, value: &Row) -> Result<(), NativeError> {
     let count = match value {
@@ -22,6 +23,7 @@ fn row(meta: &mut Meta, value: &Row) -> Result<(), NativeError> {
         Row::CreationResult(_) => &mut meta.creation_results,
         Row::Outcome(_) => &mut meta.outcomes,
         Row::Event(_) => &mut meta.events,
+        Row::Epochs(_) => &mut meta.principals,
         _ => return Ok(()),
     };
     *count = add(*count, 1)?;
@@ -66,6 +68,7 @@ pub(super) fn immutable(key: Key) -> bool {
             | Key::ByEvaluator(..)
             | Key::ByVerdict(..)
             | Key::ByCreated(..)
+            | Key::Seal(_)
     )
 }
 
@@ -112,6 +115,34 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
         row(&mut counts.writes, value)?;
         match (key, value) {
             (Key::Meta, Row::Meta(_)) => counts.meta = true,
+            // A request writes its principal's window as admission left it
+            // (F12): the generation admitted, and the floor advanced when
+            // the request asked for it; a timer writes none.
+            (Key::Epochs(principal), Row::Epochs(after)) => {
+                let NativeInvocation::Request(request) = read.outcome.invocation else {
+                    return Err(invalid());
+                };
+                require(!counts.epochs && request.principal == principal)?;
+                counts.epochs = true;
+                let Row::Meta(next) = read.require(Key::Meta)? else {
+                    return Err(invalid());
+                };
+                let mut expected = match read.before(key)? {
+                    Some(Row::Epochs(before)) => before.copy()?,
+                    Some(_) => return Err(invalid()),
+                    None => EpochWindow::first(),
+                };
+                expected.admit(
+                    request.epoch,
+                    read.outcome.logical_time,
+                    crate::native::epochs::share(read.limits, next.principals),
+                )?;
+                if after.floor != expected.floor {
+                    require(read.outcome.operation == NativeOperation::AdvanceEpochFloor)?;
+                    expected.advance(after.floor)?;
+                }
+                require(*after == expected)?;
+            }
             (Key::Outcome(invocation), Row::Outcome(value)) => {
                 require(invocation == read.outcome.invocation && *value == read.outcome)?;
                 counts.outcome = true;
@@ -129,6 +160,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
         }
     }
     require(counts.meta && counts.outcome && counts.added.outcomes == 1)?;
+    require(counts.epochs == matches!(read.outcome.invocation, NativeInvocation::Request(_)))?;
     if read.profile == NativeContentProfile::AuthoredV1
         && read.outcome.operation == NativeOperation::Create
     {
@@ -218,6 +250,16 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
             next.creation_results,
             read.limits.outcomes,
         ),
+        (
+            previous.principals,
+            counts.added.principals,
+            next.principals,
+            read.limits.principals,
+        ),
+        // Seals are session decisions, never a record's (F12).
+        (previous.sealed, 0, next.sealed, usize::MAX),
+        (previous.sealed_events, 0, next.sealed_events, usize::MAX),
+        (previous.seals, 0, next.seals, usize::MAX),
     ];
     read.charge(add(pairs.len(), 1)?)?;
     for (old, added, actual, maximum) in pairs {

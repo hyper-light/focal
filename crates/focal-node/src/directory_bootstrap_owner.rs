@@ -70,12 +70,19 @@ impl ControlHost {
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity,
-                node: plan.founder_node(),
+                node: plan.host(),
                 leader: 0,
                 term: 0,
                 applied_index: 0,
                 revisions: ControlRevisions::default(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
+                appends_rejected: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 stopped: false,
                 snapshot_index: 0,
                 peers: Vec::new(),
@@ -95,17 +102,27 @@ impl ControlHost {
             pace,
         };
         let thread = std::thread::Builder::new()
-            .name(format!("focal-directory-{}", plan.founder_node()))
+            .name(format!("focal-directory-{}", plan.host()))
             .stack_size(DIRECTORY_STACK_BYTES)
             .spawn(move || {
                 let _outcome = catch_unwind(AssertUnwindSafe(
                     || -> Result<(), DirectoryBootstrapError> {
                         let opened = permit.open(wal, &budget, image)?;
+                        let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
+                        let mut epoch = [0u8; 8];
+                        getrandom::fill(&mut epoch)
+                            .map_err(|_| DirectoryBootstrapError::Unavailable)?;
                         let owner = Owner {
                             replica: opened.into_replica(),
                             initial: None,
                             verifier: crate::cluster::NoDirectoryAuthority,
                             config,
+                            stopping: None,
+                            lost_sender: lost.0,
+                            lost: lost.1,
+                            lost_peers: Vec::new(),
+                            lost_coalesced: 0,
+                            lost_dropped: 0,
                             limits,
                             budget,
                             pending: VecDeque::new(),
@@ -116,6 +133,19 @@ impl ControlHost {
                             progress: progress.clone(),
                             nonce: 0,
                             dropped: 0,
+                            epoch: u64::from_le_bytes(epoch),
+                            ordered: std::collections::BTreeMap::new(),
+                            resequencer: crate::resequence::Resequencer::new(
+                                focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+                                crate::fleet::LOST_PEERS,
+                            ),
+                            stepped: Vec::new(),
+                            appends_rejected: 0,
+                            frames_held: 0,
+                            frames_let_go: 0,
+                            frames_stale: 0,
+                            took_turn: false,
+                            unreachable: 0,
                             failure: None,
                             pace: owner_pace,
                         };

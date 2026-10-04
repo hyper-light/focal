@@ -41,6 +41,8 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinHandle;
+#[path = "support/relay.rs"]
+mod relay;
 const ACTOR: ParticipantId = ParticipantId::from_u128(909);
 const ROOT: RootCommandId = RootCommandId::from_u128(910);
 fn ledger() -> LedgerId {
@@ -53,6 +55,75 @@ fn wire_limits() -> WireLimits {
     WireLimits {
         request_timeout: Duration::from_secs(15),
         ..ReplicaHost::wire_limits()
+    }
+}
+/// A path between the replicas slower than the loopback: every datagram
+/// between them crosses a relay that carries `bits` a second each way, and
+/// the objects are chunked `chunk_bytes` at a time.
+#[derive(Clone, Copy)]
+struct Slow {
+    bits: u64,
+    delay: Duration,
+    chunk_bytes: usize,
+    /// The nodes whose connectors offer what a binary before the ordered
+    /// profile offered, so their exchanges go as that binary's went.
+    old: &'static [u64],
+}
+/// What a binary before the ordered profile offered in its Hello.
+const OLDER_PROFILES: [u16; 4] = [
+    focal_wire::NATIVE_PROTOCOL_VERSION,
+    focal_wire::PEER_PROTOCOL_VERSION,
+    focal_wire::MANAGED_PROTOCOL_VERSION,
+    focal_wire::PROTOCOL_VERSION,
+];
+/// The replicas' tick, and what a dial and an exchange between them are
+/// given on the loopback.
+const TICK: Duration = Duration::from_millis(20);
+const DIAL: Duration = Duration::from_millis(500);
+/// How long a replica's owner may run no period before a wait calls it
+/// wedged: the waits are charged to the owners' periods, not to the clock.
+const FROZEN: Duration = Duration::from_secs(60);
+/// The most a handshake's flight carries: a Hello is read under this bound
+/// (`read_frame(.., 4096)`), and the TLS flights with the test PKI's chain
+/// are smaller.
+const HANDSHAKE_FLIGHT_BYTES: u64 = 4096;
+impl Slow {
+    /// How long the relay takes to carry `bytes` one way: its delay, the
+    /// jitter it adds (a tenth), and the bytes at its rate.
+    fn crossing(&self, bytes: u64) -> Duration {
+        let nanos = bytes
+            .checked_mul(8)
+            .and_then(|bits| bits.checked_mul(1_000_000_000))
+            .map(|bit_nanos| bit_nanos / self.bits)
+            .unwrap();
+        self.delay + self.delay / 10 + Duration::from_nanos(nanos)
+    }
+    /// What a dial across the path is given: two round trips of a flight
+    /// each way — QUIC's Initial and Handshake, then focal's Hello and its
+    /// reply — each under the flight bound. On the loopback the pool's half
+    /// second says a peer is gone; across a shaped path, that time would
+    /// say so of a peer whose handshake the path is still carrying (the
+    /// ubuntu run of the 128 kbit/s crossing: node 1's dials were given up
+    /// at 500 ms, and node 2, which waited its two seconds for a heartbeat
+    /// that never came, took the group).
+    fn dial(&self) -> Duration {
+        self.crossing(HANDSHAKE_FLIGHT_BYTES) * 4
+    }
+    /// A follower's patience with its leader, in ticks: twice the dial, so
+    /// a heartbeat that waited the dial's whole time still comes before
+    /// the follower campaigns.
+    fn election_ticks(&self, tick: Duration) -> usize {
+        usize::try_from((self.dial() * 2).as_nanos().div_ceil(tick.as_nanos())).unwrap()
+    }
+}
+fn store_limits_with(chunk_bytes: usize) -> StoreLimits {
+    let limits = store_limits();
+    let chunk = u64::try_from(chunk_bytes).unwrap();
+    StoreLimits {
+        chunk_bytes,
+        max_content_bytes: limits.max_content_bytes.max(chunk * 2),
+        max_staging_bytes: limits.max_staging_bytes.max(chunk * 8),
+        ..limits
     }
 }
 fn store_limits() -> StoreLimits {
@@ -171,6 +242,34 @@ enum TestService {
     Managed(ManagedService),
 }
 impl RequestHandler for TestService {
+    // What the service offers in its Hello is the service's: a wrapper that
+    // kept the defaults negotiated the base profiles alone, and a holder
+    // asked a copy `Open` where the copy answers `OpenHeld` (the audit's
+    // F50's crossing measured three chunks where one was lacked).
+    fn supports_managed_requests(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_managed_requests(),
+            Self::Managed(service) => service.supports_managed_requests(),
+        }
+    }
+    fn supports_participant_requests(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_participant_requests(),
+            Self::Managed(service) => service.supports_participant_requests(),
+        }
+    }
+    fn supports_native_requests(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_native_requests(),
+            Self::Managed(service) => service.supports_native_requests(),
+        }
+    }
+    fn supports_ordered_replication(&self) -> bool {
+        match self {
+            Self::Single(service) => service.supports_ordered_replication(),
+            Self::Managed(service) => service.supports_ordered_replication(),
+        }
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -214,9 +313,15 @@ struct Fleet {
     replicas: Vec<Replica>,
     routes: BTreeMap<u64, PeerEndpoint>,
     revision: u64,
+    /// The relays the replicas reach each other through, where the path
+    /// between them is slow; one for each replica, in order.
+    relays: Vec<relay::Relay>,
 }
 impl Fleet {
     async fn open(path: &Path, managed: bool) -> Self {
+        Self::open_with(path, managed, None).await
+    }
+    async fn open_with(path: &Path, managed: bool, slow: Option<Slow>) -> Self {
         let pki = Pki::new();
         let identities: Vec<_> = (1..=3)
             .map(|id| pki.issue(format!("evidence-{id}.focal.test"), true))
@@ -260,15 +365,18 @@ impl Fleet {
             EvidencePlacement::verified(policy.scope(), &plan, &facts, &placement).unwrap();
         let mut pending = Vec::new();
         let mut routes = BTreeMap::new();
+        let mut relays = Vec::new();
         for (index, identity) in identities.iter().enumerate() {
             let id = index as u64 + 1;
             let mut config = NodeConfig::single(id, [91; 16], [92; 16]);
             config.voters = plan.voters.clone();
             // Campaign node1 before starting clients. Slower follower elections
             // stabilize setup; the later transfer uses Raft's explicit protocol.
+            // Across a shaped path a follower waits at least the path's dial,
+            // twice, before it campaigns (`Slow::election_ticks`).
             config.election_tick = match id {
                 1 => 10,
-                _ => 100,
+                _ => slow.map_or(100, |slow| slow.election_ticks(TICK).max(100)),
             };
             let mut resources = None;
             let mut session = if managed {
@@ -304,7 +412,7 @@ impl Fleet {
                 session.campaign().unwrap();
             }
             let mut config = ReplicaConfig::new(ROOT);
-            config.tick = Duration::from_millis(20);
+            config.tick = TICK;
             config.request_timeout = Duration::from_secs(1);
             let (host, owner, channel, manager) = if let Some((budget, tenant, wal)) = resources {
                 let (manager, owner, channel) = ReplicaFleet::spawn_managed(
@@ -343,9 +451,11 @@ impl Fleet {
                 (host, owner, TestReplication::Single(channel), None)
             };
             let allowance = MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
-            let store =
-                ContentStore::open(path.join(id.to_string()).join("content"), store_limits())
-                    .unwrap();
+            let store = ContentStore::open(
+                path.join(id.to_string()).join("content"),
+                store_limits_with(slow.map_or(store_limits().chunk_bytes, |slow| slow.chunk_bytes)),
+            )
+            .unwrap();
             let (content, content_owner) = ContentHost::spawn(
                 store,
                 CustodyConfig::new(id),
@@ -415,20 +525,30 @@ impl Fleet {
                     server_tls(identity.tls(), pki.roots(), &wire_limits()).unwrap(),
                     peers,
                     wire_limits(),
+                    focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
                 )
                 .unwrap(),
             );
             let serving_server = server.clone();
             let serving = tokio::spawn(async move { serving_server.serve(service).await });
+            let connector = match slow {
+                Some(slow) if slow.old.contains(&id) => {
+                    pki.connector(identity).offering(&OLDER_PROFILES).unwrap()
+                }
+                _ => pki.connector(identity),
+            };
             let pool = Arc::new(
                 PeerConnectionPool::new(
-                    pki.connector(identity),
+                    connector,
                     PeerPoolLimits {
                         max_routes: 3,
                         max_connections: 3,
                         max_inflight: 8,
                         attempts: 1,
-                        timeout: Duration::from_millis(500),
+                        // A dial and an exchange are given the loopback's
+                        // half second, or the shaped path's dial
+                        // (`Slow::dial`), whichever is longer.
+                        timeout: slow.map_or(DIAL, |slow| slow.dial().max(DIAL)),
                         retry_backoff: Duration::ZERO,
                         ..PeerPoolLimits::default()
                     },
@@ -440,7 +560,26 @@ impl Fleet {
                 server_name: identity.name.clone(),
                 name: None,
             };
-            routes.insert(id, endpoint.clone());
+            // The replicas reach this one through its relay, where there is
+            // one; its actors reach it directly.
+            let reached = match slow {
+                Some(slow) => {
+                    let relay = relay::Relay::shaped(
+                        endpoint.address,
+                        slow.delay,
+                        slow.delay.checked_div(10).unwrap(),
+                        Some(slow.bits),
+                    );
+                    let front = relay.front();
+                    relays.push(relay);
+                    PeerEndpoint {
+                        address: front,
+                        ..endpoint.clone()
+                    }
+                }
+                None => endpoint.clone(),
+            };
+            routes.insert(id, reached);
             pending.push((
                 host,
                 manager,
@@ -506,55 +645,104 @@ impl Fleet {
             replicas,
             routes,
             revision: 1,
+            relays,
         }
     }
     async fn leader(&self) -> usize {
         self.leader_at(None).await
     }
+    /// The replicas whose owners run, and a wait charged to their own
+    /// periods (27 §3.1 P8): what `allowance` holds at their tick, however
+    /// long that takes on the machine the test runs on. The waits here were
+    /// held to the clock — five seconds for every replica to apply a
+    /// committed entry — and a machine loaded with sixteen busy loops ran
+    /// the owners too slowly for it (a gate run, 2026-10-03).
+    fn wait(&self, allowance: Duration) -> (Vec<usize>, focal_timing::ProgressDeadline) {
+        let live: Vec<usize> = self
+            .replicas
+            .iter()
+            .enumerate()
+            .filter(|(_, replica)| !replica.host.progress().stopped)
+            .map(|(index, _)| index)
+            .collect();
+        let deadline = focal_timing::ProgressDeadline::begin(
+            &self.periods(&live),
+            focal_timing::ProgressDeadline::periods(allowance, TICK),
+            FROZEN,
+        );
+        (live, deadline)
+    }
+    fn periods(&self, live: &[usize]) -> Vec<u64> {
+        live.iter()
+            .map(|index| self.replicas[*index].host.periods())
+            .collect()
+    }
+    /// What each replica says of itself, for a wait's report.
+    fn report(&self) -> Vec<(u64, bool, u64, SessionSeq, u64)> {
+        self.replicas
+            .iter()
+            .map(|replica| {
+                let progress = replica.host.progress();
+                (
+                    progress.node,
+                    progress.stopped,
+                    progress.leader,
+                    progress.sequence,
+                    progress.term,
+                )
+            })
+            .collect()
+    }
     async fn leader_at(&self, target: Option<u64>) -> usize {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                for (index, replica) in self.replicas.iter().enumerate() {
-                    let progress = replica.host.progress();
-                    if !progress.stopped
-                        && progress.leader == progress.node
-                        && target.is_none_or(|target| progress.node == target)
-                    {
-                        let response = replica
-                            .actor
-                            .request(&request(
-                                9000,
-                                Operation::Read(ReadRequest {
-                                    consistency: ReadConsistency::Linearizable,
-                                    query: ReadQuery::Objects(vec![]),
-                                    max_items: 1,
-                                }),
-                            ))
-                            .await
-                            .unwrap();
-                        if matches!(response.result, Response::Read(_)) {
-                            return index;
-                        }
+        let (live, mut wait) = self.wait(Duration::from_secs(10));
+        loop {
+            for (index, replica) in self.replicas.iter().enumerate() {
+                let progress = replica.host.progress();
+                if !progress.stopped
+                    && progress.leader == progress.node
+                    && target.is_none_or(|target| progress.node == target)
+                {
+                    let response = replica
+                        .actor
+                        .request(&request(
+                            9000,
+                            Operation::Read(ReadRequest {
+                                consistency: ReadConsistency::Linearizable,
+                                query: ReadQuery::Objects(vec![]),
+                                max_items: 1,
+                            }),
+                        ))
+                        .await
+                        .unwrap();
+                    if matches!(response.result, Response::Read(_)) {
+                        return index;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        })
-        .await
-        .expect("no quorum-authoritative evidence leader")
+            if let Err(spent) = wait.check(&self.periods(&live)) {
+                panic!(
+                    "no quorum-authoritative evidence leader{}: {spent}; (node, stopped, leader, sequence, term): {:?}",
+                    target.map_or(String::new(), |target| format!(" at node {target}")),
+                    self.report()
+                );
+            }
+            tokio::time::sleep(TICK).await;
+        }
     }
     async fn all_at(&self, sequence: SessionSeq) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while self
-                .replicas
-                .iter()
-                .any(|r| !r.host.progress().stopped && r.host.progress().sequence < sequence)
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let (live, mut wait) = self.wait(Duration::from_secs(5));
+        while self.replicas.iter().any(|replica| {
+            let progress = replica.host.progress();
+            !progress.stopped && progress.sequence < sequence
+        }) {
+            if let Err(spent) = wait.check(&self.periods(&live)) {
+                panic!(
+                    "the replicas did not all publish {sequence:?}: {spent}; (node, stopped, leader, sequence, term): {:?}",
+                    self.report()
+                );
             }
-        })
-        .await
-        .unwrap();
+            tokio::time::sleep(TICK).await;
+        }
     }
     fn omit_route(&mut self, source: usize, target: u64) {
         self.omit_routes(source, &[target]);
@@ -1071,5 +1259,215 @@ async fn evidence_scenario(managed: bool) {
                 .unwrap(),
             second_bytes
         );
+    }
+}
+
+/// Custody of a chunk across a path that takes longer to carry it than a
+/// transfer's lease (the audit's F49). A transfer's lease held sixty
+/// seconds from the last request its receiver executed, and a request's
+/// body is read before it is executed: a megabyte chunk crosses 128 kbit/s
+/// in 66 s, so it arrived to a transfer that had expired, the copy was
+/// refused, and the seal that waits for its required copies never came. A
+/// chunk goes in parts now, each renewing the lease as it is taken, and the
+/// copy is made in the time the path takes.
+async fn a_chunk_reaches_its_copy_across(bits: u64) {
+    const BYTES: usize = 1024 * 1024 + 7;
+    let data = tempfile::tempdir().unwrap();
+    let slow = Slow {
+        bits,
+        delay: Duration::from_millis(10),
+        chunk_bytes: 1024 * 1024,
+        old: &[],
+    };
+    let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
+    let leader = fleet.leader().await;
+    assert_eq!(leader, 0);
+    // Before the copy has answered a bulk exchange, a part is one window's
+    // worth of the path, what it is known to accept in flight: the cold
+    // window over the cold round trip, stretched over an exchange time,
+    // made a first part of 307 KiB here, twenty seconds on the path and
+    // every byte of it sent again when its exchange failed under load.
+    let pool = &fleet.replicas[leader].pool;
+    let window = pool.window(2).expect("the leader's connection to the copy");
+    let first = pool.part_bytes(2, BYTES);
+    assert!(
+        first
+            <= usize::try_from(window)
+                .unwrap()
+                .max(focal_wire::LEAST_PROGRESS),
+        "a first part of {first} bytes for a window of {window}"
+    );
+    let mut bytes = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    bytes.resize_with(BYTES, || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+    });
+    // The upload comes to the leader over the loopback; the seal waits for
+    // the required copy on node 2, across its relay. The seal is asked
+    // again, exactly, for as long as four crossings take at the least.
+    let began = std::time::Instant::now();
+    let seal = upload(&fleet.replicas[leader].actor, 1, &bytes).await;
+    let least = Duration::from_secs(BYTES as u64 * 8 / bits);
+    let budget = least.saturating_mul(4);
+    let sealed = loop {
+        let response = fleet.replicas[leader].actor.request(&seal).await.unwrap();
+        if !matches!(
+            response.result,
+            Response::Error(
+                AccessError::OutcomeUnknown | AccessError::Unavailable | AccessError::Capacity
+            )
+        ) {
+            break response;
+        }
+        assert!(
+            began.elapsed() < budget,
+            "the seal did not complete in {budget:?} at {bits} bit/s: {response:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let took = began.elapsed();
+    let Response::Upload(UploadReply::Sealed(reference)) = &sealed.result else {
+        panic!("placed seal failed: {sealed:?}")
+    };
+    assert!(
+        took >= least,
+        "{took:?} for a chunk the path takes {least:?} to carry"
+    );
+    // The copy took the chunk once: what crossed toward node 2 is the
+    // chunk and the exchanges around it, not the chunk again. The client
+    // gives up its exchange before the copy has the chunk and asks the
+    // seal again, exactly; the exact retry ran beside the first seal
+    // before, and the two pushed the same transfer at once, each sending
+    // every byte: 1,970,721 crossed for this chunk, at 124 s. It runs
+    // after the first now, and finds the copy holds the object.
+    let crossed = fleet.relays[1].carried_toward_back();
+    println!(
+        "{bits} bit/s: the copy holds the megabyte and the seal came {took:?} after the upload began (the path alone takes {least:?}); {crossed} bytes crossed toward the copy, {} back, dropped {:?}",
+        fleet.relays[1].carried_toward_front(),
+        fleet.relays[1].dropped()
+    );
+    assert!(
+        crossed < (BYTES as u64) * 3 / 2,
+        "{crossed} bytes crossed toward the copy for a chunk of {BYTES}"
+    );
+    // A part is now what the path delivered in an exchange's time: at most
+    // twice what the path carries in it (the measurement may lag the path
+    // by one part).
+    let part = pool.part_bytes(2, BYTES);
+    let carries = usize::try_from(bits * slow.dial().as_millis() as u64 / 8 / 1000).unwrap();
+    assert!(
+        part <= carries * 2,
+        "a part of {part} bytes for a path that carries {carries} in an exchange time"
+    );
+    for index in [0, 1] {
+        assert_bytes(
+            download(&fleet.replicas[index].actor, reference).await,
+            &bytes,
+        );
+    }
+    fleet.stop().await;
+}
+
+/// 66 s for the chunk, past the lease of 60.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second() {
+    a_chunk_reaches_its_copy_across(128_000).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn a_megabyte_chunk_reaches_its_copy_across_64_kbit_per_second() {
+    a_chunk_reaches_its_copy_across(64_000).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of a quarter of an hour; run by name"]
+async fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
+    a_chunk_reaches_its_copy_across(8_000).await;
+}
+
+/// A copy is sent the chunks it lacks and none it holds (24 §20, the
+/// audit's F50). Chunk files are content-addressed, so a second object that
+/// shares three of its four chunks with one the copy holds is held in three
+/// parts before it is pushed: a holder whose connection admits the ordered
+/// profile asks the copy what it holds and sends the one chunk it lacks; a
+/// holder offering what a binary before the profile offered is told the
+/// first chunk lacked and sends three, as every holder did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds() {
+    let ordered = bytes_crossed_for_a_second_object(&[]).await;
+    let older = bytes_crossed_for_a_second_object(&[1]).await;
+    println!(
+        "a second object sharing three chunks of four: {ordered} bytes crossed toward the copy with its inventory asked, {older} with the first chunk lacked"
+    );
+    assert!(
+        ordered < 2 * SHARED_CHUNK as u64,
+        "{ordered} bytes crossed toward the copy for one chunk of {SHARED_CHUNK} it lacked"
+    );
+    assert!(
+        older >= 3 * SHARED_CHUNK as u64,
+        "{older} bytes crossed where the older ask sends three chunks of {SHARED_CHUNK}"
+    );
+}
+const SHARED_CHUNK: usize = 64 * 1024;
+/// The bytes that crossed toward the copy while a second object, differing
+/// from the first in its second chunk alone, was uploaded and sealed.
+async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
+    let data = tempfile::tempdir().unwrap();
+    let slow = Slow {
+        bits: 100_000_000,
+        delay: Duration::from_millis(2),
+        chunk_bytes: SHARED_CHUNK,
+        old,
+    };
+    let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
+    let leader = fleet.leader().await;
+    assert_eq!(leader, 0);
+    let mut first = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    first.resize_with(4 * SHARED_CHUNK, || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+    });
+    let mut second = first.clone();
+    for byte in &mut second[SHARED_CHUNK..2 * SHARED_CHUNK] {
+        *byte = if *byte == b' ' { b'\t' } else { b' ' };
+    }
+    sealed(&fleet, leader, &slow, 1, &first).await;
+    let before = fleet.relays[1].carried_toward_back();
+    let reference = sealed(&fleet, leader, &slow, 2, &second).await;
+    let crossed = fleet.relays[1].carried_toward_back() - before;
+    assert_bytes(
+        download(&fleet.replicas[1].actor, &reference).await,
+        &second,
+    );
+    fleet.stop().await;
+    crossed
+}
+/// Upload `bytes` to the leader and seal, asking the seal again, exactly,
+/// while the copy is being made: for as long as four exchanges across the
+/// path take at the least.
+async fn sealed(fleet: &Fleet, leader: usize, slow: &Slow, id: u8, bytes: &[u8]) -> ContentRef {
+    let began = std::time::Instant::now();
+    let seal = upload(&fleet.replicas[leader].actor, id, bytes).await;
+    let budget = slow.dial().max(DIAL) * 4;
+    loop {
+        let response = fleet.replicas[leader].actor.request(&seal).await.unwrap();
+        match response.result {
+            Response::Upload(UploadReply::Sealed(reference)) => return reference,
+            Response::Error(
+                AccessError::OutcomeUnknown | AccessError::Unavailable | AccessError::Capacity,
+            ) => {
+                assert!(
+                    began.elapsed() < budget,
+                    "the seal of object {id} did not complete in {budget:?}"
+                );
+                tokio::time::sleep(TICK).await;
+            }
+            other => panic!("the seal of object {id}: {other:?}"),
+        }
     }
 }

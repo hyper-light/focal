@@ -271,7 +271,7 @@ impl PlacementAgent {
     }
 }
 
-fn same_members(applied: &[u64], granted: &BTreeMap<u64, u64>) -> bool {
+pub(super) fn same_members(applied: &[u64], granted: &BTreeMap<u64, u64>) -> bool {
     applied.iter().copied().eq(granted.keys().copied())
 }
 
@@ -347,6 +347,8 @@ impl PlacementAgent {
                 voters,
                 outgoing_voters,
                 learners,
+                // The grant lasts as long as its members' grants do, which
+                // extend as their credentials are renewed (24 §11).
                 expires_at: configuration
                     .voters
                     .iter()
@@ -354,8 +356,7 @@ impl PlacementAgent {
                     .chain(&configuration.learners)
                     .filter_map(|id| authority.nodes.get(id).map(|grant| grant.expires_at))
                     .min()
-                    .unwrap_or(grant.expires_at)
-                    .min(grant.expires_at),
+                    .unwrap_or(grant.expires_at),
             };
             let record = MembershipRecord {
                 index: RaftIndex(receipt.index),
@@ -811,7 +812,10 @@ impl PlacementAgent {
             expires_at: now.checked_add(PROOF_WINDOW).ok_or(AgentError::Capacity)?,
         })
     }
-    fn root_enrollment_revision(&self, root: &RootObservation) -> Result<u64, AgentError> {
+    pub(super) fn root_enrollment_revision(
+        &self,
+        root: &RootObservation,
+    ) -> Result<u64, AgentError> {
         let ControlBootstrap::Root { enrollment, .. } = &root.snapshot().state else {
             return Err(AgentError::Identity);
         };

@@ -234,6 +234,11 @@ impl<S: Storage> RawNode<S> {
     pub fn set_priority(&mut self, priority: i64) {
         self.raft.set_priority(priority);
     }
+    /// What the path to `member` carries before it answers
+    /// ([`Raft::set_inflight_bytes`]).
+    pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
+        self.raft.set_inflight_bytes(member, bytes)
+    }
     pub fn tick(&mut self) -> Result<bool> {
         self.operate(Raft::tick)
     }
@@ -388,12 +393,18 @@ impl<S: Storage> RawNode<S> {
         Ok(LightReady {
             commit_index: None,
             committed_entries,
-            messages: std::mem::take(&mut self.raft.msgs),
+            messages: self.raft.msgs.take(),
         })
+    }
+    /// Whether every counter the member trusts for what it holds says what
+    /// a walk says ([`Raft::check_accounting`]).
+    pub fn check_accounting(&self) -> Result<()> {
+        self.raft.check_accounting()
     }
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         !raft.msgs.is_empty()
+            || raft.reads_unasked()
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
             || !raft.read_states.is_empty()
@@ -418,6 +429,10 @@ impl<S: Storage> RawNode<S> {
             .number
             .checked_add(1)
             .ok_or(Error::Capacity("readies"))?;
+        // One round for the reads asked since the last (`Raft::ask_reads`): it
+        // leaves with this `Ready`. A round refused is asked for again by
+        // the next `Ready`, and by the heartbeat the leader's clock sends.
+        self.raft.ask_reads()?;
         let mut ready = Ready {
             number,
             ..Ready::default()

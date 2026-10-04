@@ -152,24 +152,14 @@ fn main() {
 }
 fn execute(args: Args) -> Result<()> {
     let args = match args.command {
+        // Context-backed validation probes the ledger's engine, so it runs
+        // where a runtime exists, with the other manual commands.
         Commands::Schema {
             command:
                 cli::discovery::SchemaCommand::Validate {
-                    operation,
-                    input,
-                    shape_only: false,
+                    shape_only: false, ..
                 },
-        } => {
-            let settings =
-                load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-            return cli::schema_validate(
-                &settings,
-                args.client_context.as_deref(),
-                &operation,
-                input,
-            )
-            .map_err(Into::into);
-        }
+        } => args,
         Commands::Schema { command } => return cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => {
             return cli::discovery::completion(shell).map_err(Into::into);
@@ -334,6 +324,23 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             print_json(&report)
         }
         Commands::Identity => print_json(&decode_identity(&settings.data_dir()?.join("IDENTITY"))?),
+        Commands::Schema {
+            command:
+                cli::discovery::SchemaCommand::Validate {
+                    operation,
+                    input,
+                    shape_only: false,
+                    native,
+                },
+        } => cli::schema_validate(
+            runtime,
+            &settings,
+            args.client_context.as_deref(),
+            &operation,
+            input,
+            native,
+        )
+        .map_err(Into::into),
         Commands::Schema { command } => cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => cli::discovery::completion(shell).map_err(Into::into),
         Commands::Status => {
@@ -505,13 +512,19 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
 }
 async fn start_network(settings: Settings) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
-    service
+    let stopped = service
         .run_until(shutdown_signal(), |status| {
             let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
             writeln!(std::io::stdout().lock(), "{json}")
         })
         .await?;
-    Ok(())
+    // The last line a planned stop prints: what this node led, and what it
+    // handed off before it went (27 §5).
+    print_json(&serde_json::json!({
+        "condition": "Stopped",
+        "sessions_led": stopped.sessions_led,
+        "sessions_handed_off": stopped.sessions_handed_off,
+    }))
 }
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;

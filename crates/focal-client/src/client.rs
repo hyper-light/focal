@@ -27,6 +27,55 @@ impl Default for RetryPolicy {
         }
     }
 }
+impl RetryPolicy {
+    /// The pause before the attempt that follows `backoffs` refusals, as
+    /// this client takes it: the exponential step from the base, capped,
+    /// spread by full jitter over a fresh draw (`jittered`). For a caller
+    /// that resends outside the client — a transport's own tests — so that
+    /// it backs off as the client does, never in step with other callers.
+    pub fn pause(&self, backoffs: u32) -> Duration {
+        jittered(self, backoffs, Duration::MAX, entropy())
+    }
+}
+/// One past the largest draw: what a draw is measured against.
+const DRAWS: u128 = 1 << 64;
+/// The pause before the next attempt: the exponential step from the base,
+/// capped, then spread by full jitter — a wait drawn uniformly between
+/// nothing and the whole step (the audit's F64). Callers that failed
+/// together — a leader lost, a service opening, one capacity refusal for
+/// all — would otherwise return together at every step, each wave as tall
+/// as the last; a uniform draw over the step spreads a wave across it, and
+/// among the spreads of AWS's analysis (Brooker, 2015) it finishes the
+/// same work in the fewest calls. The attempt, elapsed and refusal budgets
+/// bound the retries as before: the draw never adds an attempt, and a
+/// pause never outlasts what remains of the clock.
+pub(crate) fn jittered(
+    policy: &RetryPolicy,
+    backoffs: u32,
+    remaining: Duration,
+    random: u64,
+) -> Duration {
+    let step = policy
+        .base_backoff
+        .saturating_mul(1u32 << backoffs.min(16))
+        .min(policy.max_backoff);
+    let drawn = step
+        .as_nanos()
+        .saturating_mul(u128::from(random))
+        .checked_div(DRAWS)
+        .unwrap_or(0);
+    Duration::from_nanos(u64::try_from(drawn).unwrap_or(u64::MAX)).min(remaining)
+}
+/// Sixty-four random bits from the operating system — and when it has none
+/// to give, the largest draw: the whole step, the pause without its spread,
+/// never a shorter one.
+pub(crate) fn entropy() -> u64 {
+    let mut bytes = [0; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => u64::MAX,
+    }
+}
 
 /// A committed managed receipt or a transient domain response. A Domain value
 /// never releases an issued ordinal and is not a historical receipt.
@@ -90,9 +139,16 @@ impl Routes {
         entry.used = self.clock;
         Some(entry.hint.clone())
     }
+    /// Hold `hint` for `ledger`. A hint at the epoch held that names
+    /// another endpoint replaces it: a route epoch names a placement, and
+    /// within one the session's leader moves (a drained leader hands
+    /// leadership on, 24 §19; leaders are spread over the voters, 27 §5),
+    /// so the node asked last knows where it went. A hint from an older
+    /// epoch is never adopted. What follows a hint is counted against the
+    /// request's attempts, so hints that lead in a circle end with them.
     fn insert(&mut self, ledger: LedgerId, hint: RouteHint) -> Result<(), ClientError> {
         if let Some(old) = self.entries.get(&ledger)
-            && (hint.epoch < old.hint.epoch || (hint.epoch == old.hint.epoch && hint != old.hint))
+            && hint.epoch < old.hint.epoch
         {
             return Err(ClientError::InvalidResponse);
         }
@@ -701,12 +757,12 @@ impl<T: ClientTransport> Client<T> {
                     break;
                 }
             }
-            let backoff = self
-                .policy
-                .base_backoff
-                .saturating_mul(1u32 << backoffs.min(16))
-                .min(self.policy.max_backoff)
-                .min(self.policy.max_elapsed.saturating_sub(start.elapsed()));
+            let backoff = jittered(
+                &self.policy,
+                backoffs,
+                self.policy.max_elapsed.saturating_sub(start.elapsed()),
+                entropy(),
+            );
             backoffs = backoffs.saturating_add(1);
             tokio::time::sleep(backoff).await;
         }

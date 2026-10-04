@@ -17,7 +17,11 @@ use crate::{
 pub struct Unstable {
     pub(crate) snapshot: Option<Snapshot>,
     pub(crate) entries: Vec<Entry>,
+    /// About the bytes the entries state (`proto::approximate_bytes`).
     pub(crate) bytes: usize,
+    /// The bytes the entries' buffers hold, by capacity: what they cost
+    /// resident, kept as they come and go so that asking costs nothing.
+    pub(crate) payload: usize,
     pub(crate) offset: u64,
 }
 
@@ -44,39 +48,62 @@ pub(crate) fn copy_entry(entry: &Entry) -> Result<Entry> {
         sync_log: entry.sync_log,
     })
 }
+/// Copies the entries after `into`'s, reserving for exactly that many: a
+/// page holds no spare room, whichever path builds it.
 pub(crate) fn copy_entries_of<'a>(
-    entries: impl Iterator<Item = &'a Entry>,
+    entries: impl Iterator<Item = &'a Entry> + Clone,
     into: &mut Vec<Entry>,
 ) -> Result<()> {
+    into.try_reserve_exact(entries.clone().count())
+        .map_err(|_| Error::Memory)?;
     for entry in entries {
-        into.try_reserve(1).map_err(|_| Error::Memory)?;
         into.push(copy_entry(entry)?);
     }
     Ok(())
 }
 pub(crate) fn copy_entries(entries: &[Entry], into: &mut Vec<Entry>) -> Result<()> {
-    into.try_reserve(entries.len()).map_err(|_| Error::Memory)?;
+    into.try_reserve_exact(entries.len())
+        .map_err(|_| Error::Memory)?;
     for entry in entries {
         into.push(copy_entry(entry)?);
     }
     Ok(())
 }
 /// Keeps as many entries as `max_bytes` of their encoding admit, and one at
-/// least.
+/// least: the longest prefix whose running total fits.
 pub(crate) fn limit_bytes(entries: &mut Vec<Entry>, max_bytes: u64) {
     if entries.len() <= 1 || max_bytes == u64::MAX {
         return;
     }
-    let mut bytes = 0u64;
-    let mut kept = 0usize;
-    for entry in entries.iter() {
+    let kept = page_of(entries, 0, 0, max_bytes);
+    entries.truncate(kept);
+}
+/// How many of `entries`, in order, a page admits that already holds
+/// `held` entries of `used` bytes: the rule of [`limit_bytes`] carried on
+/// across a boundary, so that a page is chosen before any of it is copied.
+/// Every entry is taken while the running total fits, and the first is
+/// taken whatever its bytes when the page holds nothing yet.
+pub(crate) fn page_of(entries: &[Entry], held: usize, used: u64, max_bytes: u64) -> usize {
+    if max_bytes == u64::MAX {
+        return entries.len();
+    }
+    let mut bytes = used;
+    let mut taken = 0usize;
+    for entry in entries {
         bytes = bytes.saturating_add(proto::encoded_bytes(entry));
-        if kept > 0 && bytes > max_bytes {
+        if held.saturating_add(taken) > 0 && bytes > max_bytes {
             break;
         }
-        kept = kept.saturating_add(1);
+        taken = taken.saturating_add(1);
     }
-    entries.truncate(kept);
+    taken
+}
+/// The bytes an entry's buffers hold, by capacity.
+pub(crate) fn payload_of(entry: &Entry) -> usize {
+    entry
+        .data
+        .capacity()
+        .saturating_add(entry.context.capacity())
 }
 
 impl Unstable {
@@ -135,9 +162,11 @@ impl Unstable {
         }
         for entry in self.entries.drain(kept..) {
             self.bytes = self.bytes.saturating_sub(proto::approximate_bytes(&entry));
+            self.payload = self.payload.saturating_sub(payload_of(&entry));
         }
         for entry in copies {
             self.bytes = self.bytes.saturating_add(proto::approximate_bytes(&entry));
+            self.payload = self.payload.saturating_add(payload_of(&entry));
             self.entries.push(entry);
         }
         Ok(())
@@ -154,6 +183,7 @@ impl Unstable {
     fn restore(&mut self, snapshot: Snapshot) {
         self.entries = Vec::new();
         self.bytes = 0;
+        self.payload = 0;
         self.offset = proto::snapshot_index(&snapshot).saturating_add(1);
         self.snapshot = Some(snapshot);
     }
@@ -163,24 +193,49 @@ impl Unstable {
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
-    /// The bytes held, by capacity.
-    pub fn resident_bytes(&self) -> usize {
-        let entries = self
-            .entries
-            .capacity()
-            .saturating_mul(std::mem::size_of::<Entry>());
-        let payload = self.entries.iter().fold(0usize, |bytes, entry| {
-            bytes
-                .saturating_add(entry.data.capacity())
-                .saturating_add(entry.context.capacity())
-        });
-        let snapshot = self.snapshot.as_ref().map_or(0, |snapshot| {
+    /// The bytes the entries' buffers hold, by capacity.
+    pub fn payload(&self) -> usize {
+        self.payload
+    }
+    /// About the bytes the entries encode to (`proto::approximate_bytes`).
+    pub fn encoded_bytes(&self) -> usize {
+        self.bytes
+    }
+    /// The bytes the snapshot holds, by capacity; zero for none.
+    pub fn snapshot_bytes(&self) -> usize {
+        self.snapshot.as_ref().map_or(0, |snapshot| {
             snapshot
                 .data
                 .capacity()
                 .saturating_add(std::mem::size_of::<Snapshot>())
-        });
-        entries.saturating_add(payload).saturating_add(snapshot)
+        })
+    }
+    /// The bytes held, by capacity: the entries' slots and buffers, and
+    /// the snapshot. Nothing is walked: the counters say it.
+    pub fn resident_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Entry>())
+            .saturating_add(self.payload)
+            .saturating_add(self.snapshot_bytes())
+    }
+    /// Whether the counters say what a walk of the entries says.
+    pub(crate) fn check(&self) -> Result<()> {
+        let (bytes, payload) =
+            self.entries
+                .iter()
+                .fold((0usize, 0usize), |(bytes, payload), entry| {
+                    (
+                        bytes.saturating_add(proto::approximate_bytes(entry)),
+                        payload.saturating_add(payload_of(entry)),
+                    )
+                });
+        if bytes != self.bytes || payload != self.payload {
+            return Err(Error::Invariant(
+                "what is not yet durable is not what its counters say",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -393,6 +448,7 @@ impl<S: Storage> Log<S> {
         // held before it was written to.
         self.unstable.entries = Vec::new();
         self.unstable.bytes = 0;
+        self.unstable.payload = 0;
         Ok(())
     }
     pub fn stable_snapshot(&mut self, index: u64) -> Result<()> {
@@ -418,13 +474,21 @@ impl<S: Storage> Log<S> {
             .truncate_and_append(entries, self.max_unstable)?;
         self.last_index()
     }
-    /// The entries from `index` on, as many as `max_bytes` admit.
-    pub fn entries(&self, index: u64, max_bytes: u64) -> Result<Vec<Entry>> {
+    /// The entries from `index` on: as many as `max_bytes` admit, and at
+    /// most `max_entries` of them. Both bound a prefix, so the page is the
+    /// same whichever is applied first: cutting the range to `max_entries`
+    /// before the bytes are counted takes exactly what cutting the
+    /// byte-limited page to `max_entries` would, and copies no more than
+    /// the page.
+    pub fn entries(&self, index: u64, max_bytes: u64, max_entries: usize) -> Result<Vec<Entry>> {
         let last = self.last_index()?;
         if index > last {
             return Ok(Vec::new());
         }
-        self.slice(index, last.saturating_add(1), max_bytes)
+        let high = index
+            .saturating_add(u64::try_from(max_entries).unwrap_or(u64::MAX))
+            .min(last.saturating_add(1));
+        self.slice(index, high, max_bytes)
     }
     pub fn is_up_to_date(&self, last_index: u64, term: u64) -> Result<bool> {
         let held = self.last_term()?;
@@ -498,29 +562,8 @@ impl<S: Storage> Log<S> {
         self.persisted = index;
         Ok(true)
     }
-    /// Visits `[low, high)` a page of `page_bytes` at a time until `visit`
-    /// says stop.
-    pub(crate) fn scan(
-        &self,
-        mut low: u64,
-        high: u64,
-        page_bytes: u64,
-        mut visit: impl FnMut(&[Entry]) -> bool,
-    ) -> Result<()> {
-        while low < high {
-            let page = self.slice(low, high, page_bytes)?;
-            if page.is_empty() {
-                return Err(Error::Invariant("the log holds no entry it must"));
-            }
-            low = low.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
-            if !visit(&page) {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-    /// The entries of `[low, high)`, as many as `max_bytes` admit.
-    pub fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Result<Vec<Entry>> {
+    /// The bounds of a range the log is asked about.
+    fn bounded(&self, low: u64, high: u64) -> Result<()> {
         if low > high {
             return Err(Error::Invariant("a range that ends before it begins"));
         }
@@ -530,22 +573,77 @@ impl<S: Storage> Log<S> {
         if high > self.last_index()?.saturating_add(1) {
             return Err(Error::Invariant("a range beyond the log"));
         }
+        Ok(())
+    }
+    /// Whether an entry of `[low, high)` satisfies `predicate`. Nothing is
+    /// copied: what storage holds is asked of storage, and what is not yet
+    /// durable is read where it is; the first entry that satisfies it ends
+    /// the walk.
+    pub fn any_entry(
+        &self,
+        low: u64,
+        high: u64,
+        mut predicate: impl FnMut(&Entry) -> bool,
+    ) -> Result<bool> {
+        self.bounded(low, high)?;
+        if low < self.unstable.offset
+            && self
+                .store
+                .any_entry(low, high.min(self.unstable.offset), &mut predicate)?
+        {
+            return Ok(true);
+        }
+        if high > self.unstable.offset {
+            let from = low.max(self.unstable.offset);
+            return Ok(self.unstable.slice(from, high)?.iter().any(predicate));
+        }
+        Ok(false)
+    }
+    /// The entries of `[low, high)`, as many as `max_bytes` admit: the
+    /// longest prefix whose running total fits, and one at least.
+    ///
+    /// The page is chosen before it is copied, and the copy is reserved
+    /// for exactly. Storage chooses its own part by the same rule; when it
+    /// gives the whole of what was asked of it, the running total carries
+    /// on into what is not yet durable, which is read where it is and
+    /// copied only as far as the page reaches. The result is what copying
+    /// everything and then cutting it ([`limit_bytes`]) would give, for
+    /// both keep the longest prefix that fits and the first entry whatever
+    /// its bytes; the cut is kept after all the same, so that a storage
+    /// that gives more than its part admits is cut here.
+    pub fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Result<Vec<Entry>> {
+        self.bounded(low, high)?;
         let mut entries = Vec::new();
         if low == high {
             return Ok(entries);
         }
+        // The bytes of the page so far, by the rule the cut counts.
+        let mut used = 0u64;
         if low < self.unstable.offset {
             let stored_high = high.min(self.unstable.offset);
             self.store
                 .entries(low, stored_high, max_bytes, &mut entries)?;
             let wanted = stored_high.saturating_sub(low);
             if u64::try_from(entries.len()).unwrap_or(u64::MAX) < wanted {
+                // Storage cut the page: it is complete.
                 return Ok(entries);
+            }
+            if max_bytes != u64::MAX {
+                used = entries.iter().fold(0u64, |bytes, entry| {
+                    bytes.saturating_add(proto::encoded_bytes(entry))
+                });
             }
         }
         if high > self.unstable.offset {
             let from = low.max(self.unstable.offset);
-            copy_entries(self.unstable.slice(from, high)?, &mut entries)?;
+            let tail = self.unstable.slice(from, high)?;
+            let taken = page_of(tail, entries.len(), used, max_bytes);
+            entries
+                .try_reserve_exact(taken)
+                .map_err(|_| Error::Memory)?;
+            for entry in tail.get(..taken).unwrap_or(&[]) {
+                entries.push(copy_entry(entry)?);
+            }
         }
         limit_bytes(&mut entries, max_bytes);
         Ok(entries)
@@ -668,12 +766,31 @@ pub(crate) mod tests {
             if low > high || high > self.last_index()? + 1 {
                 return Err(StorageError::Unavailable);
             }
-            let start = into.len();
-            into.extend_from_slice(&self.entries[(low - first) as usize..(high - first) as usize]);
-            let mut tail = into.split_off(start);
-            limit_bytes(&mut tail, max_bytes);
-            into.append(&mut tail);
+            let range = &self.entries[(low - first) as usize..(high - first) as usize];
+            let taken = page_of(range, 0, 0, max_bytes);
+            into.try_reserve_exact(taken)
+                .map_err(|_| StorageError::Unavailable)?;
+            into.extend(range[..taken].iter().cloned());
             Ok(())
+        }
+        fn any_entry(
+            &self,
+            low: u64,
+            high: u64,
+            predicate: &mut dyn FnMut(&Entry) -> bool,
+        ) -> std::result::Result<bool, StorageError> {
+            let first = self.first_index()?;
+            if low < first {
+                return Err(StorageError::Compacted);
+            }
+            if low > high || high > self.last_index()? + 1 {
+                return Err(StorageError::Unavailable);
+            }
+            Ok(
+                self.entries[(low - first) as usize..(high - first) as usize]
+                    .iter()
+                    .any(predicate),
+            )
         }
         fn term(&self, index: u64) -> std::result::Result<u64, StorageError> {
             let snapshot = proto::snapshot_index(&self.snapshot);
@@ -801,7 +918,10 @@ pub(crate) mod tests {
             store.append(&[entry(1, 1), entry(2, 2)]);
             let mut log = Log::new(store, 1024).unwrap();
             assert_eq!(log.append(&given).unwrap(), last);
-            assert_eq!(indexes(&log.entries(1, u64::MAX).unwrap()), held);
+            assert_eq!(
+                indexes(&log.entries(1, u64::MAX, usize::MAX).unwrap()),
+                held
+            );
             assert_eq!(log.unstable.offset, offset);
         }
     }
@@ -896,7 +1016,7 @@ pub(crate) mod tests {
             Err(Error::Violation("an entry replaces a committed one"))
         );
         assert_eq!(
-            indexes(&log.entries(1, u64::MAX).unwrap()),
+            indexes(&log.entries(1, u64::MAX, usize::MAX).unwrap()),
             vec![(1, 1), (2, 2), (3, 3)]
         );
     }
@@ -1045,15 +1165,101 @@ pub(crate) mod tests {
         ] {
             assert_eq!(log.slice(1, 5, max).unwrap().len(), count, "{max}");
         }
-        assert_eq!(log.entries(3, one).unwrap().len(), 1);
-        assert!(log.entries(5, one).unwrap().is_empty());
-        let mut pages = Vec::new();
-        log.scan(1, 5, 2 * one, |page| {
-            pages.push(page.len());
-            true
-        })
-        .unwrap();
-        assert_eq!(pages, vec![2, 2]);
+        assert_eq!(log.entries(3, one, usize::MAX).unwrap().len(), 1);
+        assert!(log.entries(5, one, usize::MAX).unwrap().is_empty());
+        // An entry bound cuts the same prefix as the bytes would.
+        assert_eq!(log.entries(1, u64::MAX, 3).unwrap().len(), 3);
+        assert_eq!(log.entries(1, 2 * one, 1).unwrap().len(), 1);
+        assert_eq!(log.entries(1, 2 * one, 3).unwrap().len(), 2);
+        // A question about the entries copies none of them.
+        let mut visited = Vec::new();
+        assert!(
+            !log.any_entry(1, 5, |entry| {
+                visited.push(entry.index);
+                false
+            })
+            .unwrap()
+        );
+        assert_eq!(visited, vec![1, 2, 3, 4]);
+        visited.clear();
+        assert!(
+            log.any_entry(1, 5, |entry| {
+                visited.push(entry.index);
+                entry.index == 3
+            })
+            .unwrap()
+        );
+        assert_eq!(visited, vec![1, 2, 3]);
+        assert!(!log.any_entry(3, 3, |_| true).unwrap());
+        assert!(matches!(
+            log.any_entry(1, 6, |_| true),
+            Err(Error::Invariant(_))
+        ));
+    }
+    /// A page is sized before it is copied: across the stable/unstable
+    /// boundary, at every budget, the copy's capacity is its length and
+    /// its entries are what copying everything and then cutting gives.
+    #[test]
+    fn a_page_is_chosen_before_it_is_copied_and_holds_no_spare_room() {
+        let payload = |index| Entry {
+            index,
+            term: 1,
+            data: vec![7; 4096],
+            ..Entry::default()
+        };
+        let one = proto::encoded_bytes(&payload(1));
+        let (stable, unstable) = (6u64, 6u64);
+        let boundary = stable + 1;
+        let last = stable + unstable;
+        let mut store = Memory::default();
+        store.append(&(1..=stable).map(payload).collect::<Vec<_>>());
+        let mut log = Log::new(store, 1024).unwrap();
+        log.append(&(boundary..=last).map(payload).collect::<Vec<_>>())
+            .unwrap();
+        // The reference: everything, then the cut.
+        let reference = |low: u64, high: u64, max: u64| {
+            let mut all: Vec<Entry> = (low..high).map(payload).collect();
+            limit_bytes(&mut all, max);
+            indexes(&all)
+        };
+        for low in [1, boundary - 1, boundary, boundary + 1, last] {
+            for max in [
+                0,
+                1,
+                one - 1,
+                one,
+                2 * one - 1,
+                2 * one,
+                4 * one + 7,
+                u64::MAX,
+            ] {
+                let page = log.slice(low, last + 1, max).unwrap();
+                assert_eq!(indexes(&page), reference(low, last + 1, max), "{low} {max}");
+                assert_eq!(page.capacity(), page.len(), "{low} {max}");
+                for entry in &page {
+                    assert_eq!(entry.data.capacity(), entry.data.len());
+                }
+            }
+        }
+        // An oversized first entry is taken alone, stable or not.
+        let huge = |index| Entry {
+            index,
+            term: 1,
+            data: vec![9; 64 * 1024],
+            ..Entry::default()
+        };
+        let mut store = Memory::default();
+        store.append(&[huge(1), payload(2)]);
+        let mut log = Log::new(store, 1024).unwrap();
+        log.append(&[huge(3), payload(4)]).unwrap();
+        for (low, expected) in [(1, vec![(1, 1)]), (3, vec![(3, 1)])] {
+            let page = log.slice(low, 5, one).unwrap();
+            assert_eq!(indexes(&page), expected);
+            assert_eq!(page.capacity(), 1);
+        }
+        // What follows an oversized stable entry is left for the next page.
+        assert_eq!(indexes(&log.slice(2, 5, one).unwrap()), vec![(2, 1)]);
+        assert_eq!(indexes(&log.slice(2, 5, 2 * one).unwrap()), vec![(2, 1)]);
     }
     #[test]
     fn a_rejection_names_where_the_logs_may_still_agree() {
@@ -1093,5 +1299,29 @@ pub(crate) mod tests {
         );
         assert_eq!(log.unstable.bytes, 36);
         assert!(log.unstable.resident_bytes() > 0);
+        assert_eq!(log.unstable.payload, 0);
+        log.unstable.check().unwrap();
+        // The bound is full: what is not yet durable admits nothing more
+        // until it is written, and then the counters start from nothing.
+        let fourth = Entry {
+            index: 4,
+            term: 2,
+            data: vec![1; 100],
+            ..Entry::default()
+        };
+        assert_eq!(
+            log.append(std::slice::from_ref(&fourth)),
+            Err(Error::Capacity("entries not yet durable"))
+        );
+        log.store.append(log.unstable.entries());
+        log.stable_entries(3, 2).unwrap();
+        assert_eq!(log.unstable.bytes, 0);
+        assert_eq!(log.unstable.payload, 0);
+        log.append(std::slice::from_ref(&fourth)).unwrap();
+        assert_eq!(log.unstable.payload, 100);
+        assert_eq!(log.unstable.bytes, proto::approximate_bytes(&fourth));
+        log.unstable.check().unwrap();
+        log.unstable.payload = 1;
+        assert!(log.unstable.check().is_err());
     }
 }

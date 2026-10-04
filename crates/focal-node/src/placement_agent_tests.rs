@@ -758,8 +758,17 @@ async fn the_controller_completes_a_plan_on_one_host_with_signed_readiness_and_f
     founder.stop().await;
 }
 
-/// Join a second host to a running founder and return its service.
-pub(crate) async fn join_peer(
+/// Join a second host to a running founder and return its service. Boxed
+/// by a plain function, as `Running::start` is and for the same frame.
+pub(crate) fn join_peer<'a>(
+    founder: &'a Running,
+    founder_dir: &'a Path,
+    name: &'a str,
+    peer_settings: &'a crate::network_service::tests::TestSettings,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = (Running, u64)> + 'a>> {
+    Box::pin(join_peer_inner(founder, founder_dir, name, peer_settings))
+}
+async fn join_peer_inner(
     founder: &Running,
     founder_dir: &Path,
     name: &str,
@@ -1032,18 +1041,30 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
     assert_eq!(grant.membership_epoch, 3);
     assert_eq!(grant.voters.len(), 3);
     assert!(grant.learners.is_empty());
-    // Losing one host keeps a quorum: the founder still answers a quorum read
-    // of its membership, and a voter that is still there leads. Which one is
-    // the placement's: it prefers the node the planner put first by load,
-    // and the leader hands over to that one (27 §5), so the founder leads
-    // only where it is preferred or the preferred one is the host lost.
+    // Losing one host keeps a quorum: a voter that is still there leads, and
+    // answers a quorum read of its membership — a read only the leader
+    // serves, a follower naming it instead. Which one leads is the
+    // placement's: it prefers the node the planner put first by load, and the
+    // leader hands over to that one (27 §5), so the founder leads only where
+    // it is preferred or the preferred one is the host lost. Asked of the
+    // founder alone, the read failed wherever the planner put another first
+    // (three suites at once, 2026-10-03).
     let preferred = active.active.placement.preferred_leader;
     peer_b.stop().await;
     let replica = founder.handles.ledger.as_ref().unwrap();
     if let Err(spent) = try_until(&[&founder, &peer_a], Duration::from_secs(20), async || {
         let leader = replica.progress().leader;
-        (replica.membership().await.is_ok() && (leader == founder_node || leader == node_a))
-            .then_some(())
+        let answered = if leader == founder_node {
+            replica.membership().await.is_ok()
+        } else if leader == node_a {
+            match peer_a.handles.fleet.current_host(ledger) {
+                Ok(host) => host.membership().await.is_ok(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        answered.then_some(())
     })
     .await
     {
@@ -1438,8 +1459,29 @@ async fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
             state.sessions[&ledger].pending.is_none()
                 && state.sessions[&ledger].route_epoch == RouteEpoch(2)
         },
-    );
-    activated.await.unwrap().unwrap();
+    )
+    .await;
+    if !matches!(activated, Ok(Some(_))) {
+        let mut seen = Vec::new();
+        for (name, running) in [("founder", &founder), ("a", &peer_a), ("b", &peer_b)] {
+            seen.push(format!(
+                "{name}: replica {:?}; agent {:?}",
+                running
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|replica| replica.progress()),
+                running.handles.placement.status().await
+            ));
+        }
+        panic!(
+            "the placement never activated: {:?}: {seen:#?}; session {:#?}",
+            activated.map(|_| "the service ended"),
+            observe(&founder, &host, 997)
+                .await
+                .map(|(state, _, _)| state.sessions[&ledger].clone())
+        );
+    }
 
     // A replacement joins; then a voter stops, and is drained.
     let (peer_c, node_c) =
@@ -1561,4 +1603,162 @@ fn a_death_stands_for_one_election_window_of_the_group() {
     assert_eq!(retirement_hold(Duration::ZERO, 0), 1);
     assert_eq!(retirement_hold(ms(100), 0), 1);
     assert_eq!(retirement_hold(Duration::MAX, u64::MAX), i64::MAX);
+}
+
+/// A session plan's waiters hear the intent's outcome, not its journaling
+/// (24 §16): `planned` once it committed, the partition's refusal by name,
+/// and nothing while the intent is still retried — so an operator told
+/// `planned` is never waiting on a plan the partition refused.
+#[test]
+fn a_plan_is_answered_by_its_commit_or_its_refusal_and_not_before() {
+    use crate::placement_journal::IntentOutcome;
+    let ledger = LedgerId {
+        tenant: focal_model::TenantId([3; 16]),
+        session: focal_model::SessionId([4; 16]),
+    };
+    let planned = (ledger, OperationId([5; 16]), vec![7, 8, 9]);
+    let receipt = focal_control::ControlReceipt {
+        request: ControlRequestId {
+            client: [1; 16],
+            sequence: 1,
+        },
+        request_hash: [2; 32],
+        committed_index: 10,
+        committed_term: 1,
+        revisions: focal_control::ControlRevisions::default(),
+    };
+    match plan_answer(&planned, &IntentOutcome::Committed(receipt)) {
+        Some(Ok(answer)) => {
+            assert_eq!(answer.ledger, ledger);
+            assert_eq!(answer.operation, OperationId([5; 16]));
+            assert_eq!(answer.voters, vec![7, 8, 9]);
+            assert_eq!(answer.state, PlanState::Planned);
+        }
+        other => panic!("a committed plan is planned: {other:?}"),
+    }
+    assert!(matches!(
+        plan_answer(
+            &planned,
+            &IntentOutcome::Refused(focal_control::ControlFailure::CompareFailed)
+        ),
+        Some(Err(AgentError::Control(
+            focal_control::ControlFailure::CompareFailed
+        )))
+    ));
+    assert!(
+        plan_answer(
+            &planned,
+            &IntentOutcome::Retry(focal_control::ControlFailure::OutcomeUnknown)
+        )
+        .is_none()
+    );
+}
+
+/// A load report the partition refuses on a stale compare — its evidence
+/// names an authority revision the owner has since replaced, as it does
+/// whenever the root commits after a restart — is planned again at the next
+/// pass, never held for the load interval; a committed one starts the
+/// interval; and the level the upgrade fence waits for (24 §21) is due until
+/// the directory holds this binary's, even when a report the previous
+/// process journaled commits after the restart with its own.
+#[test]
+fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_interval() {
+    use crate::placement_journal::IntentOutcome;
+    let partition = PartitionId([3; 16]);
+    let load = |generation, capability, report| NodeLoad {
+        node: 7,
+        generation,
+        report,
+        available_memory: 1,
+        active_weight: 0,
+        disk_available: 1,
+        capability,
+    };
+    let receipt = focal_control::ControlReceipt {
+        request: ControlRequestId {
+            client: [1; 16],
+            sequence: 1,
+        },
+        request_hash: [2; 32],
+        committed_index: 10,
+        committed_term: 1,
+        revisions: focal_control::ControlRevisions::default(),
+    };
+    let mut last = BTreeMap::new();
+    // A restarted agent reports at its first pass.
+    assert!(load_due(None, Some(load(1, 1, 10)), 1, 2, 100));
+    // Refused on a stale compare: due again at the next pass.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Refused(ControlFailure::CompareFailed),
+        100,
+    );
+    assert!(load_due(
+        last.get(&partition).copied(),
+        Some(load(1, 1, 10)),
+        1,
+        2,
+        100
+    ));
+    // Undecided: asked again by the journal, nothing noted.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Retry(ControlFailure::OutcomeUnknown),
+        100,
+    );
+    assert_eq!(last.get(&partition), None);
+    // Committed with this binary's level: the interval runs from the commit.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Committed(receipt),
+        101,
+    );
+    assert_eq!(last.get(&partition), Some(&(101, 1)));
+    let committed = Some(load(1, 2, 102));
+    assert!(!load_due(
+        last.get(&partition).copied(),
+        committed,
+        1,
+        2,
+        101 + LOAD_INTERVAL - 1
+    ));
+    assert!(load_due(
+        last.get(&partition).copied(),
+        committed,
+        1,
+        2,
+        101 + LOAD_INTERVAL
+    ));
+    // The previous process's report committed with the level it announced:
+    // this binary's level is due at once.
+    assert!(load_due(
+        last.get(&partition).copied(),
+        Some(load(1, 1, 102)),
+        1,
+        2,
+        102
+    ));
+    // A new generation is due at once.
+    assert!(load_due(
+        last.get(&partition).copied(),
+        committed,
+        2,
+        2,
+        102
+    ));
+    // Another intent's outcome leaves the interval where it stands.
+    note_load(
+        &mut last,
+        partition,
+        None,
+        &IntentOutcome::Refused(ControlFailure::CompareFailed),
+        102,
+    );
+    assert_eq!(last.get(&partition), Some(&(101, 1)));
 }

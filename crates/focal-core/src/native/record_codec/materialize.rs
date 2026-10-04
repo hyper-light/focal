@@ -150,18 +150,24 @@ fn affinity(key: Key) -> Option<Affinity> {
         | Key::Receipt(_)
         | Key::LegacyEvidenceSet(_)
         | Key::ByObject(..)
+        | Key::Epochs(_)
+        | Key::Seal(_)
         | Key::End => return None,
     })
 }
 /// The declared footprint of one record: its exact write keys and the
 /// objects they belong to, both sorted. `keys` names every written key (the
 /// barrier's truth); `shared` omits the meta row every record writes and
-/// every stage receives from its predecessor, so it never orders records.
+/// every stage receives from its predecessor, so it never orders records,
+/// and likewise the principal's window a request writes (F12), decoded
+/// ahead of the waves and handed to the next stage of the same principal.
 struct Footprint {
     keys: Vec<Key>,
     shared: Vec<Key>,
     cells: Vec<Affinity>,
     writes_meta: bool,
+    /// The principal whose window the record writes, if a request's.
+    window: Option<ParticipantId>,
 }
 fn footprint(record: &StructuralRecord<'_>) -> Result<Footprint, NativeError> {
     let quote = record.quote();
@@ -173,6 +179,7 @@ fn footprint(record: &StructuralRecord<'_>) -> Result<Footprint, NativeError> {
         .try_reserve_exact(quote.rows)
         .map_err(|_| MemoryError::AllocationFailed)?;
     let mut writes_meta = false;
+    let mut window = None;
     for row in record.rows(quote.visits).map_err(read_evidence::codec)? {
         let row = row.map_err(read_evidence::codec)?;
         if keys.len() == keys.capacity() {
@@ -180,6 +187,12 @@ fn footprint(record: &StructuralRecord<'_>) -> Result<Footprint, NativeError> {
         }
         keys.push(row.key);
         writes_meta |= row.key == Key::Meta;
+        if let Key::Epochs(principal) = row.key {
+            if window.is_some() {
+                return Err(ContractError::InvalidManifest.into());
+            }
+            window = Some(principal);
+        }
         if let Some(cell) = affinity(row.key) {
             cells.push(cell);
         }
@@ -191,12 +204,17 @@ fn footprint(record: &StructuralRecord<'_>) -> Result<Footprint, NativeError> {
     shared
         .try_reserve_exact(keys.len())
         .map_err(|_| MemoryError::AllocationFailed)?;
-    shared.extend(keys.iter().copied().filter(|key| *key != Key::Meta));
+    shared.extend(
+        keys.iter()
+            .copied()
+            .filter(|key| *key != Key::Meta && !matches!(key, Key::Epochs(_))),
+    );
     Ok(Footprint {
         keys,
         shared,
         cells,
         writes_meta,
+        window,
     })
 }
 fn intersects<T: Ord>(left: &[T], right: &[T]) -> bool {
@@ -232,6 +250,11 @@ struct TaskBase<'a> {
     /// waves so no stage waits on its predecessor for it.
     meta_before: Option<&'a Row>,
     meta_writer: Observed,
+    /// The record's principal's window as the latest earlier record of the
+    /// same principal wrote it (F12), decoded ahead of the waves likewise.
+    window_key: Option<ParticipantId>,
+    window_before: Option<&'a Row>,
+    window_writer: Observed,
     trace: Option<RefCell<Vec<(Key, Observed)>>>,
     overflow: Cell<bool>,
 }
@@ -252,6 +275,13 @@ impl BaseRows for TaskBase<'_> {
         if key == Key::Meta && self.meta_writer.is_some() {
             self.note(key, self.meta_writer);
             return self.meta_before;
+        }
+        if let Key::Epochs(principal) = key
+            && Some(principal) == self.window_key
+            && self.window_writer.is_some()
+        {
+            self.note(key, self.window_writer);
+            return self.window_before;
         }
         let writer = self
             .visible
@@ -281,6 +311,10 @@ struct Batch<'a, 'bytes> {
     /// Every writer per key, ascending: the truth the barrier checks against.
     writers: BTreeMap<Key, Vec<usize>>,
     metas: Vec<Option<Row>>,
+    /// Each record's window row (F12), decoded ahead of the waves; its heap
+    /// is held by `_windows` for the batch.
+    windows: Vec<Option<Row>>,
+    _windows: Option<focal_memory::Allocation>,
     staged: Vec<Option<StagedRecord>>,
     visible: BTreeMap<Key, Vec<usize>>,
     report: BatchReport,
@@ -441,6 +475,43 @@ fn stage_all<S: NativeSchemaVerifier + Sync, R: NativeCustodyReader + Sync>(
             None
         });
     }
+    // The windows ahead of the waves (F12): a stage of the same principal
+    // reads its predecessor's. Their heap is charged to the core's budget
+    // for the batch at the bound every window fits.
+    let window_heap = EpochWindow::heap_of(limits.native.seals)?;
+    let window_count = footprints.iter().filter(|f| f.window.is_some()).count();
+    let _windows = if window_count == 0 {
+        None
+    } else {
+        Some(
+            core.state
+                .budget
+                .reserve(
+                    focal_memory::BudgetKind::Recovery,
+                    focal_memory::BudgetLane::Completion,
+                    window_heap
+                        .checked_mul(window_count)
+                        .ok_or(NativeError::Capacity("window heap"))?,
+                )?
+                .commit(),
+        )
+    };
+    let mut windows = Vec::new();
+    windows
+        .try_reserve_exact(count)
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    for ((record, _), footprint) in records.iter().zip(&footprints) {
+        windows.push(if footprint.window.is_some() {
+            Some(replay::stage_window(
+                record,
+                limits.native.seals,
+                window_heap,
+                limits.work.parsing,
+            )?)
+        } else {
+            None
+        });
+    }
     let mut staged = Vec::new();
     staged
         .try_reserve_exact(count)
@@ -452,6 +523,8 @@ fn stage_all<S: NativeSchemaVerifier + Sync, R: NativeCustodyReader + Sync>(
         deps,
         writers,
         metas,
+        windows,
+        _windows,
         staged,
         visible: BTreeMap::new(),
         report: *report,
@@ -485,6 +558,24 @@ impl Batch<'_, '_> {
         }
         Ok(ready)
     }
+    /// The window a stage at `index` reads as its principal's predecessor's.
+    fn window_before(&self, index: usize) -> (Option<ParticipantId>, Option<&Row>, Observed) {
+        let Some(principal) = self.footprints.get(index).and_then(|f| f.window) else {
+            return (None, None, None);
+        };
+        let writer = self
+            .writers
+            .get(&Key::Epochs(principal))
+            .and_then(|writers| latest_before(writers, index));
+        match writer {
+            Some(writer) => (
+                Some(principal),
+                self.windows.get(writer).and_then(Option::as_ref),
+                Some(writer),
+            ),
+            None => (Some(principal), None, None),
+        }
+    }
     /// The meta row a stage at `index` reads as its predecessor's.
     fn meta_before(&self, index: usize) -> (Option<&Row>, Observed) {
         let writer = self
@@ -507,6 +598,7 @@ impl Batch<'_, '_> {
         max_trace: usize,
     ) -> Result<TaskBase<'a>, NativeError> {
         let (meta_before, meta_writer) = self.meta_before(index);
+        let (window_key, window_before, window_writer) = self.window_before(index);
         let trace = if traced {
             let mut trace = Vec::new();
             trace
@@ -523,6 +615,9 @@ impl Batch<'_, '_> {
             index,
             meta_before,
             meta_writer,
+            window_key,
+            window_before,
+            window_writer,
             trace,
             overflow: Cell::new(false),
         })

@@ -5,20 +5,20 @@ use crate::{
     embedded::{NodeError, NodeIdentity, atomic_file, decode_identity, durable_dir, new_identity},
 };
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     path::{Path, PathBuf},
 };
 
 pub struct NodeDirectory {
     identity: NodeIdentity,
     root: PathBuf,
-    _lock: File,
+    _lock: focal_platform::FileLock,
 }
 /// Owns the physical directory before a joining node has an assigned identity.
 pub struct JoinDirectory {
     root: PathBuf,
     existing: Option<NodeIdentity>,
-    lock: File,
+    lock: focal_platform::FileLock,
 }
 impl JoinDirectory {
     pub fn open(settings: &Settings) -> Result<Self, NodeError> {
@@ -164,7 +164,7 @@ fn mark_initialized(root: &Path) -> Result<(), NodeError> {
     }
     Ok(())
 }
-fn acquire(settings: &Settings) -> Result<(PathBuf, File), NodeError> {
+fn acquire(settings: &Settings) -> Result<(PathBuf, focal_platform::FileLock), NodeError> {
     settings.validate()?;
     let root = settings.data_dir()?;
     durable_dir(&root)?;
@@ -174,7 +174,7 @@ fn acquire(settings: &Settings) -> Result<(PathBuf, File), NodeError> {
         .read(true)
         .write(true)
         .open(root.join("LOCK"))?;
-    focal_platform::try_lock_exclusive(&lock).map_err(|error| {
+    let lock = focal_platform::FileLock::exclusive(lock).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             NodeError::Locked
         } else {

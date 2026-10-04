@@ -73,6 +73,12 @@ pub(crate) enum ClusterCommand {
         #[command(subcommand)]
         command: LeaderCommand,
     },
+    /// Inspect or change a directory partition group's configuration, or
+    /// hand its leadership on (24 §13).
+    Partitions {
+        #[command(subcommand)]
+        command: PartitionsCommand,
+    },
     /// Inspect or retry the exact latest durable local admin intent.
     Request {
         #[command(subcommand)]
@@ -233,7 +239,7 @@ pub(crate) enum NodeCommand {
     /// One readiness probe for a supervisor: exit 0 when it holds, 1
     /// (`probe_failed`) otherwise.
     Probe {
-        #[arg(long, value_parser = ["alive", "catching-up", "authoritative", "policy"])]
+        #[arg(long, value_parser = ["alive", "serving", "catching-up", "authoritative", "policy"])]
         check: String,
     },
 }
@@ -352,6 +358,13 @@ pub(crate) enum CredentialCommand {
     /// Rotate this node's own credential to a fresh key under the same
     /// identity; the previous certificate authorizes through the grace.
     Rotate,
+    /// The issuers the cluster's credentials chain to, as committed: the
+    /// one issuing, one staged, the one retiring, and the upgrade fence.
+    Issuers,
+    /// Stage the issuer's successor now (founder only): committed so every
+    /// node trusts it, then activated; the current issuer retires once
+    /// nothing live was issued under it.
+    RotateIssuer,
 }
 #[derive(Subcommand)]
 pub(crate) enum MembershipCommand {
@@ -375,6 +388,45 @@ pub(crate) enum MembershipCommand {
         expected_configuration_index: Option<u64>,
     },
     LeaveJoint {
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum PartitionsCommand {
+    Show {
+        #[arg(long)]
+        partition: String,
+    },
+    AddLearner {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+    Promote {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+    Remove {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+    Transfer {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
         #[arg(long)]
         expected_configuration_index: Option<u64>,
     },
@@ -682,6 +734,8 @@ pub(crate) fn run(
             )),
             CredentialCommand::Renew => runtime.block_on(admin.renew_credential()),
             CredentialCommand::Rotate => runtime.block_on(admin.rotate_credential()),
+            CredentialCommand::Issuers => runtime.block_on(admin.issuers()),
+            CredentialCommand::RotateIssuer => runtime.block_on(admin.rotate_issuer()),
         },
         ClusterCommand::Membership { command } => match command {
             MembershipCommand::Show => runtime.block_on(admin.read(AdminRead::Configuration)),
@@ -719,6 +773,60 @@ pub(crate) fn run(
                     expected_configuration_index,
                 },
         } => runtime.block_on(admin.transfer(node, expected_configuration_index)),
+        ClusterCommand::Partitions { command } => match command {
+            PartitionsCommand::Show { partition } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                runtime.block_on(admin.partition_show(partition))
+            }
+            PartitionsCommand::AddLearner {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                runtime.block_on(admin.partition_change(
+                    partition,
+                    MembershipChange::AddLearner { node },
+                    expected_configuration_index,
+                ))
+            }
+            PartitionsCommand::Promote {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                runtime.block_on(admin.partition_change(
+                    partition,
+                    MembershipChange::Promote { node },
+                    expected_configuration_index,
+                ))
+            }
+            PartitionsCommand::Remove {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                runtime.block_on(admin.partition_change(
+                    partition,
+                    MembershipChange::Remove { node },
+                    expected_configuration_index,
+                ))
+            }
+            PartitionsCommand::Transfer {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                runtime.block_on(admin.partition_transfer(
+                    partition,
+                    node,
+                    expected_configuration_index,
+                ))
+            }
+        },
         ClusterCommand::Request {
             command: RequestCommand::Inspect,
         } => admin.inspect(),

@@ -463,6 +463,107 @@ impl CustodyStore {
             _allocation: allocation,
         })
     }
+    /// Open a transfer of `content` to this copy, or find it open: what the
+    /// manifest names is scanned whole, and every chunk the store holds
+    /// verified is noted as taken, so the first chunk lacked is the first
+    /// the copy lacks and a sender is told what it holds (the audit's F50).
+    /// A chunk that fails its hash is lacked: the import installs verified
+    /// bytes over it (24 §20). The scan reads and hashes every chunk held,
+    /// what the scan of a prefix cost when the prefix was the object.
+    fn open_transfer(
+        &mut self,
+        scope: CustodyScope,
+        node_id: u64,
+        transfer: [u8; 16],
+        policy_revision: u64,
+        content: &ContentRef,
+        manifest: &[u8],
+    ) -> Result<&Transfer, AccessError> {
+        self.check_read_scope(
+            CustodyScope {
+                policy_revision,
+                ..scope
+            },
+            content,
+        )?;
+        let key = (scope, node_id, transfer);
+        let deadline = self.deadline()?;
+        if !self.transfers.contains_key(&key) {
+            self.take_inventory(key, content, manifest)?;
+        }
+        // The transfer, found or just opened: one of this object, its lease
+        // renewed by the ask.
+        let existing = self
+            .transfers
+            .get_mut(&key)
+            .ok_or(AccessError::Unavailable)?;
+        if existing.manifest.reference() != content || existing.manifest.encoded() != manifest {
+            return Err(AccessError::InvalidRequest);
+        }
+        existing.expires = deadline;
+        Ok(existing)
+    }
+    /// Open a new transfer of `content` under `key`, with the inventory of
+    /// what this copy holds of it.
+    fn take_inventory(
+        &mut self,
+        key: TransferKey,
+        content: &ContentRef,
+        manifest: &[u8],
+    ) -> Result<(), AccessError> {
+        let total = self.room(content)?;
+        // A bit for each chunk the manifest may name, in words.
+        let bits = manifest
+            .len()
+            .checked_div(CHUNK_NAME_BYTES)
+            .unwrap_or(0)
+            .div_ceil(8)
+            .checked_add(size_of::<u64>())
+            .ok_or(AccessError::Capacity)?;
+        let amount = manifest
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4096))
+            .and_then(|n| n.checked_add(bits))
+            .ok_or(AccessError::Capacity)?;
+        let allocation = self.reserve(BudgetKind::Control, BudgetLane::Ordinary, amount)?;
+        let descriptor = self
+            .store
+            .prepare_import(content.clone(), manifest.to_vec())
+            .map_err(content_error)?;
+        if descriptor.resident_bytes().map_err(content_error)? > amount {
+            return Err(AccessError::Capacity);
+        }
+        let words = descriptor.chunks().div_ceil(u64::BITS as usize);
+        if words.checked_mul(size_of::<u64>()).is_none_or(|n| n > bits) {
+            return Err(AccessError::InvalidRequest);
+        }
+        let mut taken = Vec::new();
+        taken
+            .try_reserve_exact(words)
+            .map_err(|_| AccessError::Capacity)?;
+        taken.resize(words, 0);
+        let mut retained = self.descriptor(descriptor, 0, taken, allocation)?;
+        let _scan = self.reserve(
+            BudgetKind::Payload,
+            BudgetLane::Ordinary,
+            self.store.max_chunk_bytes(),
+        )?;
+        for index in 0..retained.manifest.chunks() {
+            match self.store.read_transfer_chunk(&retained.manifest, index) {
+                Ok(_) => note(&mut retained, index)?,
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                // A chunk that fails its hash is missing too: the import
+                // installs verified bytes over it (24 §20).
+                Err(ContentError::Corrupt) => {}
+                Err(error) => return Err(content_error(error)),
+            }
+        }
+        advance(&mut retained)?;
+        self.transfers.insert(key, retained);
+        self.transfer_bytes = total;
+        Ok(())
+    }
     pub fn request(
         &mut self,
         verified: &VerifiedRequest,
@@ -477,8 +578,17 @@ impl CustodyStore {
             Operation::Custody(
                 CustodyRequest::SeedChunk { .. }
                     | CustodyRequest::Manifest { .. }
+                    // An ask of what a copy holds opens a transfer as an
+                    // open does, and is admitted where an open is: a copy
+                    // being prepared pulls before its placement activates
+                    // (24 §20). Held to the installed placement alone, a
+                    // copy's pull of an object it lacked was refused and its
+                    // delivery waited on it for ever (the gate run of the
+                    // audit's F50, 2026-10-03).
                     | CustodyRequest::Open { .. }
+                    | CustodyRequest::OpenHeld { .. }
                     | CustodyRequest::ReadChunk { .. }
+                    | CustodyRequest::ReadChunkPart { .. }
                     | CustodyRequest::Verify { .. }
                     | CustodyRequest::Cancel { .. }
             )
@@ -504,9 +614,19 @@ impl CustodyStore {
         let output = match operation {
             CustodyRequest::Manifest { max_bytes, .. }
             | CustodyRequest::ReadChunk { max_bytes, .. }
+            | CustodyRequest::ReadChunkPart { max_bytes, .. }
             | CustodyRequest::SeedChunk { max_bytes, .. } => {
                 usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?
             }
+            // The inventory answered: a word for every sixty-four chunks
+            // the manifest may name.
+            CustodyRequest::OpenHeld { manifest, .. } => manifest
+                .len()
+                .checked_div(CHUNK_NAME_BYTES)
+                .unwrap_or(0)
+                .div_ceil(u64::BITS as usize)
+                .checked_mul(size_of::<u64>())
+                .ok_or(AccessError::Capacity)?,
             _ => 0,
         };
         let response = self.reserve(
@@ -525,85 +645,31 @@ impl CustodyStore {
                 content,
                 manifest,
             } => {
-                self.check_read_scope(
-                    CustodyScope {
-                        policy_revision: *policy_revision,
-                        ..scope
-                    },
+                let retained = self.open_transfer(
+                    scope,
+                    node_id,
+                    *transfer,
+                    *policy_revision,
                     content,
+                    manifest,
                 )?;
-                let key = (scope, node_id, *transfer);
-                let deadline = self.deadline()?;
-                if let Some(existing) = self.transfers.get_mut(&key) {
-                    if existing.manifest.reference() != content
-                        || existing.manifest.encoded() != manifest
-                    {
-                        return Err(AccessError::InvalidRequest);
-                    }
-                    existing.expires = deadline;
-                    opened(existing)?
-                } else {
-                    let total = self.room(content)?;
-                    // A bit for each chunk the manifest may name, in words.
-                    let bits = manifest
-                        .len()
-                        .checked_div(CHUNK_NAME_BYTES)
-                        .unwrap_or(0)
-                        .div_ceil(8)
-                        .checked_add(size_of::<u64>())
-                        .ok_or(AccessError::Capacity)?;
-                    let amount = manifest
-                        .len()
-                        .checked_mul(4)
-                        .and_then(|n| n.checked_add(4096))
-                        .and_then(|n| n.checked_add(bits))
-                        .ok_or(AccessError::Capacity)?;
-                    let allocation =
-                        self.reserve(BudgetKind::Control, BudgetLane::Ordinary, amount)?;
-                    let descriptor = self
-                        .store
-                        .prepare_import(content.clone(), manifest.clone())
-                        .map_err(content_error)?;
-                    if descriptor.resident_bytes().map_err(content_error)? > amount {
-                        return Err(AccessError::Capacity);
-                    }
-                    let _scan = self.reserve(
-                        BudgetKind::Payload,
-                        BudgetLane::Ordinary,
-                        self.store.max_chunk_bytes(),
-                    )?;
-                    let mut next_missing = 0;
-                    for index in 0..descriptor.chunks() {
-                        match self.store.read_transfer_chunk(&descriptor, index) {
-                            Ok(_) => {
-                                next_missing = index.checked_add(1).ok_or(AccessError::Capacity)?
-                            }
-                            Err(ContentError::Io(error))
-                                if error.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                break;
-                            }
-                            // A chunk that fails its hash is missing too: the
-                            // import installs verified bytes over it (24 §20).
-                            Err(ContentError::Corrupt) => break,
-                            Err(error) => return Err(content_error(error)),
-                        }
-                    }
-                    let words = descriptor.chunks().div_ceil(u64::BITS as usize);
-                    if words.checked_mul(size_of::<u64>()).is_none_or(|n| n > bits) {
-                        return Err(AccessError::InvalidRequest);
-                    }
-                    let mut taken = Vec::new();
-                    taken
-                        .try_reserve_exact(words)
-                        .map_err(|_| AccessError::Capacity)?;
-                    taken.resize(words, 0);
-                    let retained = self.descriptor(descriptor, next_missing, taken, allocation)?;
-                    let reply = opened(&retained)?;
-                    self.transfers.insert(key, retained);
-                    self.transfer_bytes = total;
-                    reply
-                }
+                opened(retained)?
+            }
+            CustodyRequest::OpenHeld {
+                transfer,
+                policy_revision,
+                content,
+                manifest,
+            } => {
+                let retained = self.open_transfer(
+                    scope,
+                    node_id,
+                    *transfer,
+                    *policy_revision,
+                    content,
+                    manifest,
+                )?;
+                opened_held(retained)?
             }
             CustodyRequest::Chunk {
                 transfer,
@@ -622,34 +688,88 @@ impl CustodyStore {
                     .import_chunk(&retained.manifest, index_usize, bytes)
                     .map_err(content_error)?;
                 retained.expires = deadline;
-                let word = index_usize.checked_div(u64::BITS as usize).unwrap_or(0);
-                let bit = u32::try_from(index_usize.checked_rem(u64::BITS as usize).unwrap_or(0))
-                    .ok()
-                    .and_then(|bit| 1_u64.checked_shl(bit))
-                    .ok_or(AccessError::InvalidRequest)?;
-                *retained
-                    .taken
-                    .get_mut(word)
-                    .ok_or(AccessError::InvalidRequest)? |= bit;
-                // The first that is lacked is past everything taken
-                // after it without a gap.
-                while retained.next_missing < retained.manifest.chunks() {
-                    let next = retained.next_missing;
-                    let word = next.checked_div(u64::BITS as usize).unwrap_or(0);
-                    let bit = u32::try_from(next.checked_rem(u64::BITS as usize).unwrap_or(0))
-                        .ok()
-                        .and_then(|bit| 1_u64.checked_shl(bit))
-                        .ok_or(AccessError::InvalidRequest)?;
-                    if retained
-                        .taken
-                        .get(word)
-                        .is_none_or(|taken| taken & bit == 0)
-                    {
-                        break;
-                    }
-                    retained.next_missing = next.checked_add(1).ok_or(AccessError::Capacity)?;
-                }
+                taken(retained, index_usize)?;
                 CustodyReply::ChunkStored { index: *index }
+            }
+            CustodyRequest::ChunkPart {
+                transfer,
+                index,
+                offset,
+                bytes,
+            } => {
+                let deadline = self.deadline()?;
+                let retained = self
+                    .transfers
+                    .get_mut(&(scope, node_id, *transfer))
+                    .ok_or(AccessError::Unavailable)?;
+                let index_usize = usize::try_from(*index).map_err(|_| AccessError::Capacity)?;
+                let length = retained
+                    .manifest
+                    .chunk_length(index_usize)
+                    .map_err(content_error)?;
+                let staged = self
+                    .store
+                    .import_chunk_part(&retained.manifest, index_usize, u64::from(*offset), bytes)
+                    .map_err(content_error)?;
+                // A part taken is the transfer's progress: its lease is
+                // renewed by it, as by a chunk (the audit's F49).
+                retained.expires = deadline;
+                let staged = u32::try_from(staged).map_err(|_| AccessError::Capacity)?;
+                if usize::try_from(staged).map_err(|_| AccessError::Capacity)? < length {
+                    CustodyReply::PartStored {
+                        index: *index,
+                        staged,
+                    }
+                } else {
+                    taken(retained, index_usize)?;
+                    CustodyReply::ChunkStored { index: *index }
+                }
+            }
+            CustodyRequest::ReadChunkPart {
+                transfer,
+                index,
+                offset,
+                max_bytes,
+            } => {
+                let deadline = self.deadline()?;
+                // The whole chunk is read to verify it; the part is cut
+                // from what verified.
+                let _scan = self.reserve(
+                    BudgetKind::Payload,
+                    BudgetLane::Completion,
+                    self.store.max_chunk_bytes(),
+                )?;
+                let retained = self
+                    .transfers
+                    .get_mut(&(scope, node_id, *transfer))
+                    .ok_or(AccessError::Unavailable)?;
+                let index_usize = usize::try_from(*index).map_err(|_| AccessError::Capacity)?;
+                let length = retained
+                    .manifest
+                    .chunk_length(index_usize)
+                    .map_err(content_error)?;
+                let offset_usize = usize::try_from(*offset).map_err(|_| AccessError::Capacity)?;
+                if offset_usize >= length || *max_bytes == 0 {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let bytes = self
+                    .store
+                    .read_transfer_chunk(&retained.manifest, index_usize)
+                    .map_err(content_error)?;
+                let end = offset_usize
+                    .saturating_add(usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?)
+                    .min(length);
+                let part = bytes
+                    .get(offset_usize..end)
+                    .ok_or(AccessError::InvalidRequest)?
+                    .to_vec();
+                retained.expires = deadline;
+                CustodyReply::ChunkPart {
+                    index: *index,
+                    offset: *offset,
+                    length: u32::try_from(length).map_err(|_| AccessError::Capacity)?,
+                    bytes: part,
+                }
             }
             CustodyRequest::Seal { transfer } => {
                 let deadline = self.deadline()?;
@@ -755,7 +875,11 @@ impl CustodyStore {
                 }
             }
             CustodyRequest::Cancel { transfer } => {
-                self.transfers.remove(&(scope, node_id, *transfer));
+                if let Some(cancelled) = self.transfers.remove(&(scope, node_id, *transfer)) {
+                    self.store
+                        .discard_chunk_parts(&cancelled.manifest)
+                        .map_err(content_error)?;
+                }
                 self.recount()?;
                 CustodyReply::Cancelled
             }
@@ -899,7 +1023,29 @@ impl CustodyStore {
         }
     }
     pub fn expire(&mut self, now: Instant) -> Result<(), AccessError> {
-        self.transfers.retain(|_, transfer| transfer.expires > now);
+        // A transfer that expired holds no more of the volume: the parts
+        // of chunks it had not completed go with it (the audit's F49).
+        let mut gone = Vec::new();
+        gone.try_reserve_exact(
+            self.transfers
+                .values()
+                .filter(|transfer| transfer.expires <= now)
+                .count(),
+        )
+        .map_err(|_| AccessError::Capacity)?;
+        gone.extend(
+            self.transfers
+                .iter()
+                .filter(|(_, transfer)| transfer.expires <= now)
+                .map(|(key, _)| *key),
+        );
+        for key in gone {
+            if let Some(expired) = self.transfers.remove(&key) {
+                self.store
+                    .discard_chunk_parts(&expired.manifest)
+                    .map_err(content_error)?;
+            }
+        }
         self.exports.retain(|_, transfer| transfer.expires > now);
         self.recount()
     }
@@ -915,10 +1061,62 @@ impl CustodyStore {
         Ok(())
     }
 }
+/// Chunk `index` is held whole: noted, and the first chunk lacked is moved
+/// past everything held after it without a gap.
+fn taken(retained: &mut Transfer, index: usize) -> Result<(), AccessError> {
+    note(retained, index)?;
+    advance(retained)
+}
+/// Chunk `index` is held whole: its bit is set.
+fn note(retained: &mut Transfer, index: usize) -> Result<(), AccessError> {
+    let word = index.checked_div(u64::BITS as usize).unwrap_or(0);
+    let bit = u32::try_from(index.checked_rem(u64::BITS as usize).unwrap_or(0))
+        .ok()
+        .and_then(|bit| 1_u64.checked_shl(bit))
+        .ok_or(AccessError::InvalidRequest)?;
+    *retained
+        .taken
+        .get_mut(word)
+        .ok_or(AccessError::InvalidRequest)? |= bit;
+    Ok(())
+}
+/// The first chunk lacked is moved past everything held after it without
+/// a gap.
+fn advance(retained: &mut Transfer) -> Result<(), AccessError> {
+    while retained.next_missing < retained.manifest.chunks() {
+        let next = retained.next_missing;
+        let word = next.checked_div(u64::BITS as usize).unwrap_or(0);
+        let bit = u32::try_from(next.checked_rem(u64::BITS as usize).unwrap_or(0))
+            .ok()
+            .and_then(|bit| 1_u64.checked_shl(bit))
+            .ok_or(AccessError::InvalidRequest)?;
+        if retained
+            .taken
+            .get(word)
+            .is_none_or(|taken| taken & bit == 0)
+        {
+            break;
+        }
+        retained.next_missing = next.checked_add(1).ok_or(AccessError::Capacity)?;
+    }
+    Ok(())
+}
 fn opened(transfer: &Transfer) -> Result<CustodyReply, AccessError> {
     Ok(CustodyReply::Opened {
         chunks: u32::try_from(transfer.manifest.chunks()).map_err(|_| AccessError::Capacity)?,
         next_missing: u32::try_from(transfer.next_missing).map_err(|_| AccessError::Capacity)?,
+    })
+}
+/// What the copy holds of the object, a bit for each chunk (the audit's
+/// F50); charged to the request's reply beside the request.
+fn opened_held(transfer: &Transfer) -> Result<CustodyReply, AccessError> {
+    let mut held = Vec::new();
+    held.try_reserve_exact(transfer.taken.len())
+        .map_err(|_| AccessError::Capacity)?;
+    held.extend_from_slice(&transfer.taken);
+    Ok(CustodyReply::OpenedHeld {
+        chunks: u32::try_from(transfer.manifest.chunks()).map_err(|_| AccessError::Capacity)?,
+        held,
     })
 }
 pub(crate) fn content_error(error: ContentError) -> AccessError {

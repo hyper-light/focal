@@ -154,6 +154,8 @@ pub(super) fn check_family(key: Key, row: &Row) -> Result<(), NativeError> {
             | (Key::Cycle(_), Row::Cycle(_))
             | (Key::RetiredCycleHead(_), Row::RetiredCycleHead(_))
             | (Key::Retired(_), Row::Retired(_))
+            | (Key::Epochs(_), Row::Epochs(_))
+            | (Key::Seal(_), Row::Seal(_))
             | (Key::RetiredCycle(_), Row::RetiredCycle(_))
             | (Key::Work(_), Row::Work(_))
             | (Key::WorkSlot(..), Row::WorkSlot(_))

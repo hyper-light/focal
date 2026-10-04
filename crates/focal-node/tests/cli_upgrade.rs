@@ -109,8 +109,17 @@ fn spawn(
     (child, receive)
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    start_announcing(root, address, None)
+}
+/// Start a node announcing `announced` (a staged rollout, 24 §21), or the
+/// binary's own level.
+fn start_announcing(
+    root: &Path,
+    address: Option<&str>,
+    announced: Option<&str>,
+) -> (Server, Value) {
     deadline::observe(root);
-    let (child, receive) = spawn(root, address, None);
+    let (child, receive) = spawn(root, address, announced);
     let server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(30))
@@ -167,7 +176,26 @@ fn wait_for_upgrade(root: &Path, what: &str, condition: impl Fn(&Value) -> bool)
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    panic!("{what} did not happen; last: {last:#?}");
+    // What every node knows of itself, and the fleet as the asked node sees
+    // it, when the level it waited for never came: a level rides the
+    // placement agent's load report, and the node whose report never landed
+    // says why in its own health (ubuntu runs showed the host at the level
+    // before for 90 s with the founder's health alone, 2026-10-03).
+    let mut health = String::new();
+    for observed in deadline::observed() {
+        let output = run(&observed, &["cluster", "node", "health"]);
+        health.push_str(&format!(
+            "\n{}: {}{}",
+            observed.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let placement = run(root, &["cluster", "placement"]);
+    panic!(
+        "{what} did not happen; last: {last:#?}\nhealth:{health}\nplacement: {}",
+        String::from_utf8_lossy(&placement.stdout)
+    );
 }
 fn capability(view: &Value, node: u64) -> u64 {
     view["nodes"]
@@ -188,69 +216,131 @@ fn the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_ref
     let founder = dirs[0].path();
     let host = dirs[1].path();
     let addresses: Vec<String> = (0..2).map(|_| address()).collect();
-    let (_founder_server, status) = start(founder, Some(&addresses[0]));
+    // A rollout rehearsed from the level before this binary's: the cluster
+    // is founded by a founder announcing it, and holds the fence at that
+    // level from genesis (24 §21) — never at a level its founder would
+    // refuse to serve under.
+    let compiled = u64::from(focal_node::upgrade::CAPABILITY_LEVEL);
+    assert!(
+        compiled >= 2,
+        "this journey rehearses a rollout to the binary's level"
+    );
+    let before = compiled - 1;
+    let before_text = before.to_string();
+    let compiled_text = compiled.to_string();
+    let above_text = (compiled + 1).to_string();
+    let (_founder_server, status) =
+        start_announcing(founder, Some(&addresses[0]), Some(&before_text));
     assert_eq!(status["condition"], "Ready");
     let founder_node = admin(founder, &["identity"])["node"].as_u64().unwrap();
     let node = join(founder, host, "host", &addresses[1]);
-    let host_server = start(host, None).0;
-    // Both nodes report the level this binary implements; no fence yet.
+    let host_server = start_announcing(host, None, Some(&before_text)).0;
+    // Both nodes report the level they announce; the fence stands at the
+    // founder's level from genesis.
     let view = wait_for_upgrade(founder, "both nodes reporting", |view| {
-        capability(view, founder_node) == 1 && capability(view, node) == 1
+        capability(view, founder_node) == before && capability(view, node) == before
     });
-    assert_eq!(view["fence_level"], 0, "{view}");
-    assert_eq!(view["fence_activated_at"], 0);
-    assert_eq!(view["fence_revision"], 0);
-    assert_eq!(view["binary_level"], 1);
-    assert_eq!(view["announced_level"], 1);
-    assert_eq!(view["activatable"], 1);
+    assert_eq!(view["fence_level"], before, "{view}");
+    assert!(view["fence_activated_at"].as_i64().unwrap() > 0, "{view}");
+    assert_eq!(view["fence_revision"], 1, "{view}");
+    assert_eq!(view["binary_level"], compiled);
+    assert_eq!(view["announced_level"], before);
+    assert_eq!(view["activatable"], before);
     assert_eq!(view["nodes"].as_array().unwrap().len(), 2);
     assert!(view["registry_revision"].as_u64().unwrap() > 0);
     // A host reads the same fence; only the founder raises it.
     let host_view = wait_for_upgrade(host, "host view", |view| {
-        capability(view, founder_node) == 1 && capability(view, node) == 1
+        capability(view, founder_node) == before && capability(view, node) == before
     });
-    assert_eq!(host_view["fence_level"], 0, "{host_view}");
-    let (code, report) = failure(host, &["cluster", "upgrade", "activate", "--fence", "1"]);
-    assert_eq!(code, 3, "{report}");
-    // A level no node supports is refused by name, naming every node.
-    let (code, report) = failure(founder, &["cluster", "upgrade", "activate", "--fence", "2"]);
-    assert_eq!(code, 5, "{report}");
-    assert!(report.contains("[members_behind]"), "{report}");
-    assert!(
-        report.contains(&founder_node.to_string()) && report.contains(&node.to_string()),
-        "{report}"
-    );
-    assert_eq!(upgrade(founder)["fence_level"], 0);
-    // Zero is invalid input.
+    assert_eq!(host_view["fence_level"], before, "{host_view}");
+    // A level no node supports is refused by name, naming every node —
+    // read from any node, before the founder's authority is even asked.
+    for root in [host, founder] {
+        let (code, report) = failure(
+            root,
+            &["cluster", "upgrade", "activate", "--fence", &compiled_text],
+        );
+        assert_eq!(code, 5, "{report}");
+        assert!(report.contains("[members_behind]"), "{report}");
+        assert!(
+            report.contains(&founder_node.to_string()) && report.contains(&node.to_string()),
+            "{report}"
+        );
+    }
+    assert_eq!(upgrade(founder)["fence_level"], before);
+    // Zero is invalid input; the fence's own level reads as done.
     let (code, _) = failure(founder, &["cluster", "upgrade", "activate", "--fence", "0"]);
     assert_eq!(code, 2);
+    let standing = admin(
+        founder,
+        &["cluster", "upgrade", "activate", "--fence", &before_text],
+    );
+    assert_eq!(standing["result"]["changed"], false, "{standing}");
+    // The rollout: both binaries come back announcing their own level.
+    drop(host_server);
+    drop(_founder_server);
+    let (_founder_server, _) = start(founder, Some(&addresses[0]));
+    let host_server = start(host, None).0;
+    wait_for_upgrade(founder, "both nodes at the binary's level", |view| {
+        capability(view, founder_node) == compiled && capability(view, node) == compiled
+    });
+    // A level above the binary's is still refused by name.
+    let (code, report) = failure(
+        founder,
+        &["cluster", "upgrade", "activate", "--fence", &above_text],
+    );
+    assert_eq!(code, 5, "{report}");
+    assert!(report.contains("[members_behind]"), "{report}");
+    // Only the founder raises the fence: a host asking for the level every
+    // node now supports is refused at the founder's authority. The host
+    // reads the levels from its own view of the root, which must hold the
+    // fact first.
+    wait_for_upgrade(host, "the host sees both at the binary's level", |view| {
+        capability(view, founder_node) == compiled && capability(view, node) == compiled
+    });
+    let (code, report) = failure(
+        host,
+        &["cluster", "upgrade", "activate", "--fence", &compiled_text],
+    );
+    assert_eq!(code, 3, "{report}");
     // The fence rises to the level every node supports, exactly once.
-    let activated = admin(founder, &["cluster", "upgrade", "activate", "--fence", "1"]);
+    let activated = admin(
+        founder,
+        &["cluster", "upgrade", "activate", "--fence", &compiled_text],
+    );
     assert_eq!(
         activated["result"]["kind"], "fence_activated",
         "{activated}"
     );
     assert_eq!(activated["result"]["changed"], true);
     let fence = activated["result"]["upgrade"].clone();
-    assert_eq!(fence["fence_level"], 1, "{fence}");
+    assert_eq!(fence["fence_level"], compiled, "{fence}");
     assert!(fence["fence_activated_at"].as_i64().unwrap() > 0);
-    assert!(fence["fence_revision"].as_u64().unwrap() > 0);
-    let again = admin(founder, &["cluster", "upgrade", "activate", "--fence", "1"]);
+    assert!(fence["fence_revision"].as_u64().unwrap() > 1);
+    let again = admin(
+        founder,
+        &["cluster", "upgrade", "activate", "--fence", &compiled_text],
+    );
     assert_eq!(again["result"]["changed"], false, "{again}");
     assert_eq!(
         again["result"]["upgrade"]["fence_revision"],
         fence["fence_revision"]
     );
-    // A fence never lowers: refused as invalid input (there is no lower
-    // level than 1 above zero to ask for, so the check is on the reply).
-    let (code, report) = failure(founder, &["cluster", "upgrade", "activate", "--fence", "0"]);
+    // A fence never lowers: refused as invalid input.
+    let (code, report) = failure(
+        founder,
+        &["cluster", "upgrade", "activate", "--fence", &before_text],
+    );
     assert_eq!(code, 2, "{report}");
     // The host observes the committed fence.
-    wait_for_upgrade(host, "host sees the fence", |view| view["fence_level"] == 1);
+    wait_for_upgrade(host, "host sees the fence", |view| {
+        view["fence_level"] == compiled
+    });
     // A binary announcing less than the fence refuses to start: the host
-    // is restarted announcing level 0 and exits with `upgrade_fenced`.
+    // is restarted announcing the level before and exits with
+    // `upgrade_fenced`.
     drop(host_server);
-    let (mut child, receive) = spawn(host, None, Some("0"));
+    let (mut child, receive) = spawn(host, None, Some(&before_text));
     let exit = child.wait_timeout_or_kill(Duration::from_secs(60));
     let stderr = {
         let mut text = String::new();
@@ -273,13 +363,13 @@ fn the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_ref
         Some("Ready" | "CatchingUp")
     ));
     let view = wait_for_upgrade(host, "host serving under the fence", |view| {
-        view["fence_level"] == 1 && view["announced_level"] == 1
+        view["fence_level"] == compiled && view["announced_level"] == compiled
     });
-    assert_eq!(view["binary_level"], 1, "{view}");
+    assert_eq!(view["binary_level"], compiled, "{view}");
     // The announced level can be lowered to the fence, never raised past
     // the binary: a rehearsal at the fence's own level still serves.
     drop(server);
-    let (child, receive) = spawn(host, None, Some("1"));
+    let (child, receive) = spawn(host, None, Some(&compiled_text));
     let server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(30))
@@ -289,9 +379,9 @@ fn the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_ref
         "{status}"
     );
     let view = wait_for_upgrade(host, "announced at the fence", |view| {
-        view["announced_level"] == 1
+        view["announced_level"] == compiled
     });
-    assert_eq!(view["binary_level"], 1);
+    assert_eq!(view["binary_level"], compiled);
     drop(server);
 }
 trait WaitTimeout {

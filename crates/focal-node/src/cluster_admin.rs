@@ -23,9 +23,11 @@ const DIRECTORY: &str = "CLUSTER.admin";
 const MARKER: &str = "CLUSTER.admin.initialized";
 const LIMIT: usize = 55 * 1024;
 mod mcp;
+mod partitions;
 mod replicas;
 #[cfg(test)]
 mod tests;
+pub use partitions::{PartitionConfiguration, partition_reference};
 
 /// A remove that follows its drain waits this long, in this many polls, for the
 /// placement partition to observe the committed ineligibility.
@@ -65,6 +67,24 @@ pub enum ClusterAdminError {
     Expired,
     #[error("invalid admin request or inconsistent response")]
     Invalid,
+    #[error(
+        "the change does not apply to the group's configuration: {reason} (voters {voters:?}, learners {learners:?}, configuration index {configuration_index}, applied {applied_index})"
+    )]
+    Inapplicable {
+        reason: &'static str,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        configuration_index: u64,
+        applied_index: u64,
+    },
+    #[error("the group's configuration as read is inconsistent: {0}")]
+    Inconsistent(&'static str),
+    /// The upgrade fence is below the level the issuer succession needs
+    /// (24 §11, §21): raise it first.
+    #[error(
+        "the upgrade fence ({level}) is below the level the issuer succession needs ({needed}); raise it with `cluster upgrade activate --fence {needed}` once every node runs a binary at that level"
+    )]
+    Fenced { level: u32, needed: u32 },
     #[error("invitation was not found in the committed enrollment registry")]
     NotFound,
     #[error(
@@ -73,8 +93,20 @@ pub enum ClusterAdminError {
     NodeHolding { node: u64, sessions: usize },
     #[error("node {0} is still eligible for placement; drain it first")]
     NotDrained(u64),
-    #[error("node {0} is drained, but the placement controller has not observed it yet; retry")]
-    DrainPending(u64),
+    #[error(
+        "node {node} is drained at the root's generation {grant_generation}, but the placement observed generation {observed_generation} (eligible {observed_eligible}; partition led by node {partition_leader}); retry"
+    )]
+    DrainPending {
+        node: u64,
+        grant_generation: u64,
+        observed_generation: u64,
+        observed_eligible: bool,
+        partition_leader: u64,
+    },
+    #[error(
+        "node {node} still votes in directory partition {partition}; its seat is being vacated; retry"
+    )]
+    PartitionPending { node: u64, partition: String },
     #[error("node {0} still leads the root group; its leadership is being transferred; retry")]
     LeaderLeaving(u64),
     #[error("node {0} is not enrolled in the directory")]
@@ -139,7 +171,8 @@ impl ClusterAdminError {
             },
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
-            Self::DrainPending(_) => Failure::error("drain_pending", 5),
+            Self::DrainPending { .. } => Failure::error("drain_pending", 5),
+            Self::PartitionPending { .. } => Failure::error("partition_pending", 5),
             Self::LeaderLeaving(_) => Failure::error("leader_leaving", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
             Self::MembersBehind { .. } => Failure::error("members_behind", 5),
@@ -150,7 +183,10 @@ impl ClusterAdminError {
                 code: "probe_failed",
                 exit_code: 1,
             },
-            Self::Invalid | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
+            Self::Invalid
+            | Self::Inapplicable { .. }
+            | Self::Inconsistent(_)
+            | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
                 Failure::error("invalid_input", 2)
             }
             _ => Failure::error("admin", 1),
@@ -459,6 +495,18 @@ impl ClusterAdmin {
             CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
             CredentialReply::Failed(error) => Err(error.into()),
         }
+    }
+    /// The issuers credentials chain to, as committed (24 §11).
+    pub async fn issuers(&self) -> Result<AdminResult> {
+        let bytes = self.exchange_bytes(AdminCommand::Issuers).await?;
+        issuers_result(&bytes)
+    }
+    /// Stage the issuer's successor now (24 §11); founder only. The
+    /// issuers as committed after the step; a successor already staged or
+    /// committed is answered as it is.
+    pub async fn rotate_issuer(&self) -> Result<AdminResult> {
+        let bytes = self.exchange_bytes(AdminCommand::RotateIssuer).await?;
+        issuers_result(&bytes)
     }
     /// Rotate this node's own credential to a fresh key under the same
     /// identity (24 §11); the founder's identity is never rotated here.
@@ -905,7 +953,8 @@ impl ClusterAdmin {
             _ => Err(ClusterAdminError::Invalid),
         }
     }
-    async fn configuration(&self) -> Result<ControlConfiguration> {
+    /// The root group's configuration: its voters, learners and index.
+    pub async fn configuration(&self) -> Result<ControlConfiguration> {
         match self
             .exchange(AdminCommand::Read(AdminRead::Configuration))
             .await?
@@ -952,7 +1001,18 @@ impl ClusterAdmin {
         }
         change
             .apply_to(&current.configuration)
-            .map_err(|_| ClusterAdminError::Invalid)?;
+            .map_err(|error| match error {
+                focal_consensus::ConsensusError::Configuration(reason) => {
+                    ClusterAdminError::Inapplicable {
+                        reason,
+                        voters: current.configuration.voters.clone(),
+                        learners: current.configuration.learners.clone(),
+                        configuration_index: current.configuration_index,
+                        applied_index: current.applied_index,
+                    }
+                }
+                _ => ClusterAdminError::Invalid,
+            })?;
         let sequence = saved.next_control;
         let operation = saved.next;
         let next = operation
@@ -1075,6 +1135,7 @@ impl ClusterAdmin {
             return Err(ClusterAdminError::Invalid);
         };
         let (name, holds) = match check {
+            "serving" => ("serving", readiness.serving),
             "catching-up" => ("catching-up", readiness.catching_up),
             "authoritative" => ("authoritative", readiness.authoritative),
             "policy" => ("policy", readiness.policy_satisfied),
@@ -1094,7 +1155,9 @@ impl ClusterAdmin {
     /// Whether the committed grant for `node` is already ineligible: the
     /// eligibility prepare read yields no command when the grant already
     /// states what is asked.
-    async fn grant_ineligible(&self, node: u64) -> Result<bool> {
+    /// Whether the root's committed grant for `node` is ineligible already,
+    /// and the grant's generation.
+    async fn grant_state(&self, node: u64) -> Result<(bool, u64)> {
         let reply = self
             .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
                 node,
@@ -1105,9 +1168,10 @@ impl ClusterAdmin {
             Ok(ControlReply::Read(ControlReadResult::PreparedEligibility {
                 node: prepared,
                 eligible: false,
+                generation,
                 command,
                 ..
-            })) if prepared == node => Ok(command.is_none()),
+            })) if prepared == node => Ok((command.is_none(), generation)),
             Ok(_) => Err(ClusterAdminError::Invalid),
             Err(ClusterAdminError::Control(ControlFailure::Invalid)) => {
                 Err(ClusterAdminError::UnknownNode(node))
@@ -1289,17 +1353,41 @@ impl ClusterAdmin {
         // say so, and name the pending drain if it still has not.
         let mut placement = self.placement_view().await?;
         let mut waited = 0u32;
-        while placement
-            .partitions
-            .iter()
-            .flat_map(|partition| partition.nodes.iter())
-            .any(|entry| entry.node == node && entry.eligible)
+        let mut grant_generation = 0;
+        // Waited for, bounded: a placement not observed at all yet (the
+        // agent's last pass saw no partition), as much as one that still
+        // shows the node eligible — neither says the node is unknown.
+        while placement.partitions.is_empty()
+            || placement
+                .partitions
+                .iter()
+                .flat_map(|partition| partition.nodes.iter())
+                .any(|entry| entry.node == node && entry.eligible)
         {
-            if waited == 0 && !self.grant_ineligible(node).await? {
-                return Err(ClusterAdminError::NotDrained(node));
+            if waited == 0 {
+                let (ineligible, generation) = self.grant_state(node).await?;
+                if !ineligible {
+                    return Err(ClusterAdminError::NotDrained(node));
+                }
+                grant_generation = generation;
             }
             if waited >= REMOVE_DRAIN_POLLS {
-                return Err(ClusterAdminError::DrainPending(node));
+                let observed = placement
+                    .partitions
+                    .iter()
+                    .flat_map(|partition| partition.nodes.iter())
+                    .find(|entry| entry.node == node);
+                return Err(ClusterAdminError::DrainPending {
+                    node,
+                    grant_generation,
+                    observed_generation: observed.map_or(0, |entry| entry.generation),
+                    observed_eligible: observed.is_some_and(|entry| entry.eligible),
+                    partition_leader: placement
+                        .control
+                        .as_ref()
+                        .and_then(|control| control.partitions.first())
+                        .map_or(0, |group| group.leader),
+                });
             }
             waited = waited.saturating_add(1);
             tokio::time::sleep(REMOVE_DRAIN_POLL).await;
@@ -1340,6 +1428,15 @@ impl ClusterAdmin {
                 node,
                 sessions: holding,
             });
+        }
+        // Its seats in the directory's partition groups first (24 §13; F24):
+        // the root's grant seats a host while it is a root member, so the
+        // groups must stop counting it before the root does.
+        let mut partitions_vacated = 0u32;
+        for partition in self.partitions_seating(node).await? {
+            if self.partition_vacate(partition, node).await? {
+                partitions_vacated = partitions_vacated.saturating_add(1);
+            }
         }
         let current = self.configuration().await?;
         if current.configuration.voters.contains(&node) {
@@ -1404,6 +1501,7 @@ impl ClusterAdmin {
         Ok(AdminResult::NodeRemoved {
             node,
             membership_removed,
+            partitions_vacated,
             invitation,
             revoked,
             contact_retired,
@@ -1533,6 +1631,40 @@ impl ClusterAdmin {
             _ => Err(ClusterAdminError::Invalid),
         }
     }
+    /// An administrator's change is made where the root leads: when this
+    /// node's replica follows and votes, it asks the leader for leadership
+    /// (one transfer message the leader answers by timing this voter into a
+    /// campaign, 27 §5) and waits — bounded — until it leads; a node that
+    /// cannot lead reports who does, for the operator to ask there. Requests
+    /// are never forwarded: a leader cannot bind another node's administrator
+    /// to a client of its retry window (each node's admin principal is
+    /// derived from a key only that node holds).
+    async fn lead_here(&self) -> Result<()> {
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let AdminResult::Membership { leader, voters, .. } =
+                self.read(AdminRead::Membership).await?
+            else {
+                return Err(ClusterAdminError::Invalid);
+            };
+            if leader == self.identity.node {
+                return Ok(());
+            }
+            if !voters.contains(&self.identity.node) {
+                return Err(ControlFailure::NotLeader { leader }.into());
+            }
+            if leader != 0 {
+                match self.transfer(self.identity.node, None).await {
+                    Ok(_) | Err(ClusterAdminError::Control(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        let AdminResult::Membership { leader, .. } = self.read(AdminRead::Membership).await? else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        Err(ControlFailure::NotLeader { leader }.into())
+    }
     async fn drive(&self, journal: &mut PrivateJournal, saved: &mut Saved) -> Result<AdminResult> {
         let latest = saved.latest.as_ref().ok_or(ClusterAdminError::Corrupt)?;
         if let Some(receipt) = latest.receipt {
@@ -1541,6 +1673,7 @@ impl ClusterAdmin {
         if latest.superseded {
             return Err(ClusterAdminError::Expired);
         }
+        self.lead_here().await?;
         let operation = latest.operation;
         let request = latest.request.clone();
         let ControlReply::Committed(receipt) =
@@ -1750,21 +1883,43 @@ impl ClusterAdmin {
         let reply = self
             .plan_session_reply(tenant, session, survive_code, max_failures, dry_run)
             .await?;
-        Ok(AdminResult::SessionPlanned {
-            tenant: focal_model::TenantId(reply.tenant).to_string(),
-            session: focal_model::SessionId(reply.session).to_string(),
-            operation: hex(&reply.operation),
-            voters: reply.voters,
-            survive: survive.into(),
-            max_failures,
-            state: match reply.state {
-                0 => "planned",
-                1 => "pending",
-                _ => "satisfied",
-            }
-            .into(),
-            dry_run,
-        })
+        planned_result(reply, survive, max_failures)
+    }
+    /// The root voters a durability needs (F24; survive code 0 node, 1
+    /// zone, 2 region): reported, never journaled.
+    pub async fn plan_control_reply(
+        &self,
+        survive_code: u8,
+        max_failures: u16,
+    ) -> Result<crate::network_admin::ControlPlannedReply> {
+        if max_failures > 255 || survive_code > 2 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let bytes = self
+            .exchange_bytes(AdminCommand::PlanControl {
+                survive: survive_code,
+                max_failures,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::ControlPlannedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::CONTROL_PLANNED_REPLY_SCHEMA
+            || reply.voters.is_empty()
+            || reply.voters.len() > 64
+            || !matches!(reply.state, 0 | 2)
+            || reply.partitions.len() > crate::deployment::plan::MAX_PARTITIONS
+            || reply.partitions.iter().any(|group| {
+                group.partition == [0; 16]
+                    || group.group == [0; 16]
+                    || group.voters.is_empty()
+                    || group.voters.len() > 64
+                    || !matches!(group.state, 0 | 2 | 3)
+            })
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
     }
     /// The validated placement request reply (survive code 0 node, 1 zone,
     /// 2 region).
@@ -1788,21 +1943,7 @@ impl ClusterAdmin {
                 dry_run,
             })
             .await?;
-        let (reply, tail): (crate::network_admin::SessionPlannedReply, _) =
-            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
-        if !tail.is_empty()
-            || reply.schema != crate::network_admin::SESSION_PLANNED_REPLY_SCHEMA
-            || reply.tenant != tenant
-            || reply.session != session
-            || reply.operation == [0; 16]
-            || reply.voters.is_empty()
-            || reply.voters.len() > 64
-            || reply.state > 2
-            || reply.dry_run != dry_run
-        {
-            return Err(ClusterAdminError::Invalid);
-        }
-        Ok(reply)
+        planned_reply(&bytes, tenant, session, dry_run)
     }
     async fn exchange(&self, command: AdminCommand) -> Result<ControlReply> {
         match ControlReply::decode(
@@ -2073,4 +2214,86 @@ fn invitations_view(
             .collect(),
         next: next.map(|id| hex(&id)),
     }
+}
+/// The issuers an admin reply carries, as the client reports them.
+fn issuers_result(bytes: &[u8]) -> Result<AdminResult> {
+    use crate::credential_renewal::{IssuerDigest, IssuerReply};
+    let (reply, tail): (IssuerReply, _) =
+        postcard::take_from_bytes(bytes).map_err(|_| ClusterAdminError::Invalid)?;
+    if !tail.is_empty() {
+        return Err(ClusterAdminError::Invalid);
+    }
+    let digest = |digest: &IssuerDigest| focal_client::admin::AdminIssuerRecord {
+        fingerprint: hex(&digest.fingerprint),
+        issued_at: digest.issued_at,
+        expires_at: digest.expires_at,
+        endorsed: digest.endorsed,
+        staged_at: digest.staged_at,
+    };
+    match reply {
+        IssuerReply::Issuers(summary) => Ok(AdminResult::Issuers {
+            current: digest(&summary.current),
+            successor: summary.successor.as_ref().map(digest),
+            retiring: summary.retiring.as_ref().map(digest),
+            fence_level: summary.fence_level,
+            succession_level: summary.succession_level,
+        }),
+        IssuerReply::Fenced { level, needed } => Err(ClusterAdminError::Fenced { level, needed }),
+    }
+}
+
+/// A plan's reply, held to its shape: a planned session names its
+/// operation and voters, and a plan the partition refused (state 3, 24
+/// §16) names neither — a refusal with voters, or a plan without, is an
+/// inconsistent response.
+fn planned_reply(
+    bytes: &[u8],
+    tenant: [u8; 16],
+    session: [u8; 16],
+    dry_run: bool,
+) -> Result<crate::network_admin::SessionPlannedReply> {
+    let (reply, tail): (crate::network_admin::SessionPlannedReply, _) =
+        postcard::take_from_bytes(bytes).map_err(|_| ClusterAdminError::Invalid)?;
+    let refused = reply.state == 3 && reply.operation == [0; 16] && reply.voters.is_empty();
+    let planned = reply.state <= 2
+        && reply.operation != [0; 16]
+        && !reply.voters.is_empty()
+        && reply.voters.len() <= 64;
+    if !tail.is_empty()
+        || reply.schema != crate::network_admin::SESSION_PLANNED_REPLY_SCHEMA
+        || reply.tenant != tenant
+        || reply.session != session
+        || reply.dry_run != dry_run
+        || !(refused || planned)
+    {
+        return Err(ClusterAdminError::Invalid);
+    }
+    Ok(reply)
+}
+/// What a plan's reply is to the operator: the plan, or the refusal by
+/// name — the partition's observation went stale between the planning and
+/// the commit, and the operator plans again (24 §16).
+fn planned_result(
+    reply: crate::network_admin::SessionPlannedReply,
+    survive: &str,
+    max_failures: u16,
+) -> Result<AdminResult> {
+    if reply.state == 3 {
+        return Err(ClusterAdminError::Control(ControlFailure::CompareFailed));
+    }
+    Ok(AdminResult::SessionPlanned {
+        tenant: focal_model::TenantId(reply.tenant).to_string(),
+        session: focal_model::SessionId(reply.session).to_string(),
+        operation: hex(&reply.operation),
+        voters: reply.voters,
+        survive: survive.into(),
+        max_failures,
+        state: match reply.state {
+            0 => "planned",
+            1 => "pending",
+            _ => "satisfied",
+        }
+        .into(),
+        dry_run: reply.dry_run,
+    })
 }

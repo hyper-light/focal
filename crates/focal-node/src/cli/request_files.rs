@@ -15,7 +15,8 @@ use std::{
 
 #[derive(Args)]
 pub(crate) struct BuildArgs {
-    #[arg(value_parser = super::discovery::operation_names())]
+    /// A V1 operation: the raw envelope is a legacy wire request.
+    #[arg(value_parser = super::discovery::legacy_operation_names())]
     operation: String,
     #[command(flatten)]
     input: DocumentInput,
@@ -33,13 +34,18 @@ pub(crate) struct BuildArgs {
     expected_revision: Option<u64>,
 }
 
-pub(super) fn authored(name: &str, input: DocumentInput) -> Result<AuthoredOperation> {
+/// One authored document (JSON, YAML or a file) as bounded canonical JSON
+/// bytes, ready for either engine's strict decoder.
+pub(super) fn document_bytes(input: DocumentInput) -> Result<Vec<u8>> {
     let value: serde_json::Value = input
         .load(false)?
         .ok_or(InputError::Invalid("provide --json, --yaml, or --file"))?;
     let mut bytes = BoundedBytes(Vec::new());
     serde_json::to_writer(&mut bytes, &value).map_err(|_| InputError::Capacity)?;
-    Ok(operations::parse_json(name, &bytes.0)?)
+    Ok(bytes.0)
+}
+fn authored(name: &str, input: DocumentInput) -> Result<AuthoredOperation> {
+    Ok(operations::parse_json(name, &document_bytes(input)?)?)
 }
 
 pub(super) fn build(settings: &Settings, selection: Option<&str>, args: BuildArgs) -> Result<()> {

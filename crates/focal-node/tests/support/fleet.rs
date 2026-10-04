@@ -47,7 +47,9 @@ impl Node {
         self.dir.path()
     }
 }
-pub struct Server(pub Child);
+/// A started node and its status lines (`{"condition": ...}` on stdout),
+/// the last of which a planned stop prints.
+pub struct Server(pub Child, pub Option<mpsc::Receiver<Value>>);
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -217,7 +219,6 @@ pub fn spawn(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc:
 }
 pub fn start_with(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> Server {
     let (child, receive) = spawn(node, args, envs);
-    let server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(45))
         .unwrap_or_else(|_| panic!("{} did not publish readiness", node.root().display()));
@@ -225,7 +226,7 @@ pub fn start_with(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> Server {
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"
     );
-    server
+    Server(child, Some(receive))
 }
 pub fn start(node: &Node, args: &[&str]) -> Server {
     start_with(node, args, &[])
@@ -564,7 +565,6 @@ pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
             }
         }
     });
-    let server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(45))
         .expect("the limited node did not publish readiness");
@@ -572,7 +572,7 @@ pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"
     );
-    server
+    Server(child, Some(receive))
 }
 /// The largest file under the data directory, in bytes.
 pub fn largest_file(root: &Path) -> u64 {

@@ -538,6 +538,37 @@ pub(super) struct Remote {
     limits: WireLimits,
     initialized: Mutex<()>,
     transport: OnceLock<QuicTransport>,
+    /// Where an endorsed issuer this transport's verifier found, and the
+    /// context does not hold, is read and recorded (an enrolled context;
+    /// 24 §11).
+    adoption: Option<Adoption>,
+}
+/// A context's adoption of the endorsed issuers its verifier found.
+pub(super) struct Adoption {
+    roots: Mutex<focal_wire::AdoptedRoots>,
+    directory: PathBuf,
+}
+impl Adoption {
+    /// Record what the verifier found, once a request succeeded over the
+    /// connection. A record that cannot be written is said on standard
+    /// error and the request stands: the endorsement served it, and the
+    /// adoption is tried again at the next.
+    fn record(&self) {
+        let adopted = match self.roots.lock() {
+            Ok(mut roots) => roots.take(),
+            Err(_) => None,
+        };
+        let Some(adopted) = adopted else {
+            return;
+        };
+        if let Err(error) = focal_node::network_join::adopt_issuer(&self.directory, &adopted) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "focal: [trust_not_adopted] the issuer verified through its predecessor's endorsement was not recorded in {}: {error}",
+                self.directory.display()
+            );
+        }
+    }
 }
 impl ClientTransport for Transport {
     fn request<'a>(
@@ -573,12 +604,18 @@ impl ClientTransport for Transport {
                             .map_err(|_| WireError::Connection)?;
                     }
                 }
-                remote
+                let answer = remote
                     .transport
                     .get()
                     .ok_or(WireError::Connection)?
                     .request(route, request)
-                    .await
+                    .await;
+                if answer.is_ok()
+                    && let Some(adoption) = &remote.adoption
+                {
+                    adoption.record();
+                }
+                answer
             }),
         }
     }
@@ -618,15 +655,23 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
             let founder = &pending.invitation().genesis().founder;
             let trust = pending.invitation().invitation().trust();
             let limits = WireLimits::default();
-            let tls = client_tls(
+            // The roots are the invitation's issuers and the ones this
+            // context adopted since; an issuer a verified chain carries
+            // endorsed by one of them is adopted after the connection, so
+            // a later succession still verifies (24 §11).
+            let (tls, adopted) = focal_wire::client_tls_adopting(
                 TlsIdentity::from_pkcs8(
                     credentials.certificate_chain().to_vec(),
                     credentials.private_key_der().to_vec(),
                 ),
-                vec![trust.ca_certificate.clone()],
+                pending.trust_roots().map_err(other)?,
                 &limits,
             )
             .map_err(other)?;
+            let adoption = Adoption {
+                roots: Mutex::new(adopted),
+                directory: pending.directory().to_path_buf(),
+            };
             let actor = ParticipantId(receipt.identity.principal);
             // The enrolled identity may address another session of its
             // tenant: one the operator created or restored.
@@ -658,6 +703,7 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 limits: limits.clone(),
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
+                adoption: Some(adoption),
             }));
             let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
             let client = match super::trace::sink() {
@@ -724,6 +770,7 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 limits: limits.clone(),
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
+                adoption: None,
             }));
             let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
             let client = match super::trace::sink() {

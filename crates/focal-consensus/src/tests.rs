@@ -101,6 +101,44 @@ fn deeply_nested_unknown_protobuf_groups_fail_without_stack_overflow() {
 pub(crate) fn config(id: u64) -> NodeConfig {
     NodeConfig::single(id, [1; 16], [2; 16])
 }
+/// The scalar and borrowed views say what the owned status says (the
+/// audit's F53): the scalars copied, the members read in place.
+#[test]
+fn the_scalar_and_member_views_agree_with_the_owned_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut node = DurableNode::open(config(1), dir.path()).unwrap();
+    for _ in 0..2 {
+        let status = node.status();
+        let scalars = node.scalars();
+        assert_eq!(
+            (
+                scalars.node_id,
+                scalars.leader_id,
+                scalars.term,
+                scalars.committed_index,
+                scalars.applied_index,
+                scalars.role,
+            ),
+            (
+                status.node_id,
+                status.leader_id,
+                status.term,
+                status.committed_index,
+                status.applied_index,
+                status.role,
+            )
+        );
+        let members = node.membership();
+        assert_eq!(members.voters, status.voters.as_slice());
+        assert_eq!(members.learners, status.learners.as_slice());
+        assert_eq!(members.len(), status.voters.len() + status.learners.len());
+        assert!(members.holds(1));
+        assert!(!members.holds(2));
+        node.campaign().unwrap();
+        node.drain().unwrap();
+    }
+    assert_eq!(node.scalars().role, StateRole::Leader);
+}
 #[test]
 fn single_voter_restart_and_quorum_read_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -167,6 +205,12 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
     let index = node.drain().unwrap().applied_index;
     node.checkpoint(index, b"snapshot-prefix".to_vec()).unwrap();
     let term = node.status().term;
+    // The learner answers a heartbeat a beat after its probe went
+    // unanswered: the probe is sent again, as the checkpoint.
+    for _ in 0..node.heartbeat_tick() {
+        node.tick().unwrap();
+        drop(node.drain().unwrap());
+    }
     node.step(Message {
         from: 2,
         to: 1,
@@ -231,6 +275,13 @@ impl Cluster {
             applied: vec![Vec::new(); 3],
             snapshots: vec![Vec::new(); 3],
         }
+    }
+    /// The flushes each member's log has made.
+    fn flushes(&self) -> Vec<u64> {
+        self.nodes
+            .iter()
+            .map(|node| node.shared_wal().stats().unwrap().group_commits)
+            .collect()
     }
     pub(crate) fn pump(&mut self, isolated: Option<u64>) {
         for _ in 0..100 {
@@ -307,6 +358,8 @@ fn three_voters_partition_leader_change_and_restart() {
     for actual in &cluster.applied {
         assert_eq!(actual, &expected);
     }
+    // Every member stops and opens again alone: its log holds what it
+    // applied, the commit written behind each release (the audit's F17).
     let Cluster { dirs, nodes, .. } = cluster;
     drop(nodes);
     for (i, dir) in dirs.iter().enumerate() {
@@ -321,6 +374,120 @@ fn three_voters_partition_leader_change_and_restart() {
                 .map(|entry| entry.data)
                 .collect::<Vec<_>>(),
             expected
+        );
+    }
+}
+
+/// The audit's F17: what a write waits for at each member. A commit is
+/// waited for by no write of its own: the leader waits for one flush, its
+/// entry's, and each follower for one; the entry is applied everywhere
+/// while every disk is held; and the commit is written behind, so a member
+/// that stops finds in its log what it applied, and one cut before that
+/// write is told of the entry again.
+#[test]
+fn a_commit_is_waited_for_by_no_write_and_is_written_behind_what_it_released() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0].propose(b"settle".to_vec()).unwrap();
+    cluster.pump(None);
+    for _ in 0..4 {
+        for node in &mut cluster.nodes {
+            node.tick().unwrap();
+        }
+        cluster.pump(None);
+    }
+    let wals: Vec<SharedWal> = cluster.nodes.iter().map(DurableNode::shared_wal).collect();
+    // Each member's entry is durable, by one flush each, before any disk is
+    // held.
+    cluster.nodes[0].propose(b"released".to_vec()).unwrap();
+    let before = cluster.flushes();
+    let appends = cluster.nodes[0].drain().unwrap().messages;
+    let mut answers = Vec::new();
+    for message in appends {
+        let to = message.to as usize - 1;
+        cluster.nodes[to].step(message).unwrap();
+        answers.extend(cluster.nodes[to].drain().unwrap().messages);
+    }
+    for (before, after) in before.iter().zip(cluster.flushes()) {
+        assert_eq!(after - before, 1);
+    }
+    // Every disk is held from here on: nothing more can become durable.
+    let held: Vec<_> = wals
+        .iter()
+        .map(|wal| {
+            let mut lease = wal.lease(LogicalLogId([250; 16])).unwrap();
+            lease
+                .append(&[Record {
+                    log: LogicalLogId([250; 16]),
+                    kind: RecordKind::Entry,
+                    index: 1,
+                    term: 1,
+                    payload: vec![1],
+                }])
+                .unwrap();
+            let (entered, entry) = std::sync::mpsc::sync_channel(1);
+            let (resume, resumed) = std::sync::mpsc::sync_channel::<()>(1);
+            let worker = std::thread::spawn(move || {
+                let mut first = true;
+                lease
+                    .replay(|_| {
+                        if first {
+                            first = false;
+                            entered.send(()).unwrap();
+                            resumed.recv().unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                lease
+            });
+            entry.recv().unwrap();
+            (resume, worker)
+        })
+        .collect();
+    // The answers commit the entry at the leader, which applies it and
+    // tells its followers, which apply it: no member waits for its disk.
+    let mut commits = Vec::new();
+    for message in answers {
+        cluster.nodes[0].step(message).unwrap();
+        let events = cluster.nodes[0].drain().unwrap();
+        cluster.applied[0].extend(events.committed.into_iter().map(|entry| entry.data));
+        commits.extend(events.messages);
+    }
+    assert_eq!(cluster.applied[0].last().unwrap(), b"released");
+    assert!(!cluster.nodes[0].persistence_pending());
+    for message in commits {
+        let to = message.to as usize - 1;
+        cluster.nodes[to].step(message).unwrap();
+        let events = cluster.nodes[to].drain().unwrap();
+        cluster.applied[to].extend(events.committed.into_iter().map(|entry| entry.data));
+    }
+    for applied in &cluster.applied {
+        assert_eq!(applied.last().unwrap(), b"released");
+    }
+    // A member cut here — its commit not yet written — is told of the
+    // entry again; one that stops once its disk has caught up finds it in
+    // its log. The disks are released and the members stop.
+    for (resume, worker) in held {
+        resume.send(()).unwrap();
+        drop(worker.join().unwrap());
+    }
+    let Cluster { dirs, nodes, .. } = cluster;
+    drop(nodes);
+    drop(wals);
+    for (i, dir) in dirs.iter().enumerate() {
+        let mut cfg = config(i as u64 + 1);
+        cfg.voters = vec![1, 2, 3];
+        let mut node = DurableNode::open(cfg, dir.path()).unwrap();
+        assert_eq!(
+            node.drain()
+                .unwrap()
+                .committed
+                .into_iter()
+                .map(|entry| entry.data)
+                .collect::<Vec<_>>(),
+            vec![b"settle".to_vec(), b"released".to_vec()]
         );
     }
 }
@@ -502,6 +669,52 @@ fn learner_requires_durable_catchup_and_installs_snapshot_before_promotion() {
     assert_eq!(events.committed[0].data, b"after-promotion");
 }
 
+/// A member behind the log's start is sent the snapshot, and its answer
+/// that it holds it is sent the entries after it in the same transition.
+/// The leader stages the larger of the two: priced as the snapshot alone, a
+/// small snapshot with larger entries behind it outgrew the reservation the
+/// answer was stepped under, and the leader stopped itself (`Capacity`, then
+/// failed), a member seated after a split never caught up (focal PR #4's
+/// split test on macOS and Windows CI).
+#[test]
+fn a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0]
+        .propose_conf_change(member_change(4, ConfChangeType::AddLearnerNode))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(4);
+    cfg.voters = vec![1, 2, 3];
+    cfg.learners = vec![4];
+    cluster
+        .nodes
+        .push(DurableNode::open(cfg, dir.path()).unwrap());
+    cluster.dirs.push(dir);
+    cluster.applied.push(Vec::new());
+    cluster.snapshots.push(Vec::new());
+    cluster.pump(Some(4));
+    // A snapshot of one byte, and pages of entries after it far larger.
+    let index = cluster.nodes[0].status().applied_index;
+    cluster.nodes[0].checkpoint(index, b"s".to_vec()).unwrap();
+    let entries: Vec<Vec<u8>> = (0..8u8).map(|byte| vec![byte; 16 * 1024]).collect();
+    for entry in &entries {
+        cluster.nodes[0].propose(entry.clone()).unwrap();
+    }
+    cluster.pump(Some(4));
+    for _ in 0..8 {
+        for node in &mut cluster.nodes {
+            node.tick().unwrap();
+        }
+        cluster.pump(None);
+    }
+    assert!(!cluster.nodes[0].failed(), "the leader stopped itself");
+    assert_eq!(cluster.snapshots[3].len(), 1);
+    assert_eq!(cluster.snapshots[3][0].data, b"s");
+    assert_eq!(cluster.applied[3], entries);
+}
+
 #[test]
 fn follower_io_failure_cannot_supply_a_quorum_acknowledgment() {
     let mut cluster = Cluster::new();
@@ -562,6 +775,158 @@ fn isolated_leader_cannot_complete_a_quorum_read_barrier() {
         cluster.nodes[0].read_index(b"stale-authority".to_vec()),
         Err(ConsensusError::NotLeader { .. })
     ));
+}
+
+/// Reads asked before the leader's owner drains leave in one round: two
+/// heartbeats to two followers, whatever the number of reads, and the
+/// answer of one follower gives every barrier. A write that commits while a
+/// round is out is seen by the reads asked after it — they are asked for by
+/// the next round — and not required of those asked before.
+#[test]
+fn reads_asked_together_are_confirmed_by_one_round_of_heartbeats() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    let heartbeat = MessageType::MsgHeartbeat as i32;
+    let answer = MessageType::MsgHeartbeatResponse as i32;
+    let mut asked = 0u32;
+    for together in [1usize, 32, 128] {
+        let contexts: Vec<Vec<u8>> = (0..together)
+            .map(|_| {
+                asked += 1;
+                asked.to_be_bytes().to_vec()
+            })
+            .collect();
+        for context in &contexts {
+            cluster.nodes[0].read_index(context.clone()).unwrap();
+        }
+        assert!(cluster.nodes[0].reads_unasked());
+        let events = cluster.nodes[0].drain().unwrap();
+        assert!(events.read_states.is_empty());
+        assert!(!cluster.nodes[0].reads_unasked());
+        let round: Vec<Message> = events
+            .messages
+            .into_iter()
+            .filter(|message| message.msg_type == heartbeat)
+            .collect();
+        assert_eq!(
+            round.len(),
+            2,
+            "{together} reads left in {} heartbeats",
+            round.len()
+        );
+        // One follower answers; the other's heartbeat is lost.
+        let mut answers = Vec::new();
+        for message in round.into_iter().filter(|message| message.to == 2) {
+            cluster.nodes[1].step(message).unwrap();
+            answers.extend(cluster.nodes[1].drain().unwrap().messages);
+        }
+        for message in answers
+            .into_iter()
+            .filter(|message| message.msg_type == answer)
+        {
+            cluster.nodes[0].step(message).unwrap();
+        }
+        let barriers = cluster.nodes[0].drain().unwrap().read_states;
+        assert_eq!(
+            barriers
+                .iter()
+                .map(|barrier| barrier.context.clone())
+                .collect::<Vec<_>>(),
+            contexts
+        );
+    }
+    cluster.pump(None);
+    // A round is out for `before`; a write commits; `after` is asked.
+    let commit = cluster.nodes[0].status().committed_index;
+    cluster.nodes[0].read_index(b"before".to_vec()).unwrap();
+    let first: Vec<Message> = cluster.nodes[0].drain().unwrap().messages;
+    cluster.nodes[0].propose(b"write".to_vec()).unwrap();
+    let appends = cluster.nodes[0].drain().unwrap().messages;
+    let mut answers = Vec::new();
+    for message in appends {
+        let to = (message.to - 1) as usize;
+        cluster.nodes[to].step(message).unwrap();
+        answers.extend(cluster.nodes[to].drain().unwrap().messages);
+    }
+    let mut after_write = Vec::new();
+    for message in answers {
+        cluster.nodes[0].step(message).unwrap();
+        after_write.extend(cluster.nodes[0].drain().unwrap().messages);
+    }
+    assert_eq!(cluster.nodes[0].status().committed_index, commit + 1);
+    cluster.nodes[0].read_index(b"after".to_vec()).unwrap();
+    let second: Vec<Message> = cluster.nodes[0].drain().unwrap().messages;
+    // The answers to the first round confirm `before`, at the commit it was
+    // asked at, and not `after`.
+    let mut barriers = Vec::new();
+    for round in [first, second] {
+        let mut answers = Vec::new();
+        for message in round
+            .into_iter()
+            .filter(|message| message.msg_type == heartbeat && message.to == 2)
+        {
+            cluster.nodes[1].step(message).unwrap();
+            answers.extend(cluster.nodes[1].drain().unwrap().messages);
+        }
+        for message in answers
+            .into_iter()
+            .filter(|message| message.msg_type == answer)
+        {
+            cluster.nodes[0].step(message).unwrap();
+        }
+        barriers.push(cluster.nodes[0].drain().unwrap().read_states);
+    }
+    assert_eq!(
+        barriers
+            .iter()
+            .map(|round| round
+                .iter()
+                .map(|barrier| (barrier.context.clone(), barrier.index))
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![(b"before".to_vec(), commit)],
+            vec![(b"after".to_vec(), commit + 1)]
+        ]
+    );
+    drop(after_write);
+}
+
+/// A member is sent a page ahead of its answers until its owner says what
+/// the path to it carries; what the owner says is in force at once, is
+/// never nothing, and is never more than the group's budget can stage for
+/// one transition — a window the budget could not stage would refuse every
+/// answer of the member it was made for.
+#[test]
+fn the_bytes_sent_ahead_of_a_members_answers_are_what_its_path_carries_and_the_budget_stages() {
+    let dir = tempfile::tempdir().unwrap();
+    let limit = 96 * 1024 * 1024;
+    let budget = MemoryBudget::new(limit, 16 * 1024 * 1024).unwrap();
+    let mut cfg = config(1);
+    cfg.voters = vec![1, 2, 3];
+    let mut node = DurableNode::open_in(cfg, dir.path(), &budget).unwrap();
+    let page = node.page_bytes();
+    assert_eq!(node.inflight_bytes(2), Some((0, page)));
+    assert_eq!(node.inflight_bytes(9), None);
+    assert!(node.set_inflight_bytes(2, 6_000).unwrap());
+    assert_eq!(node.inflight_bytes(2), Some((0, 6_000)));
+    assert_eq!(node.inflight_bytes(3), Some((0, page)));
+    assert!(!node.set_inflight_bytes(9, 6_000).unwrap());
+    assert!(node.set_inflight_bytes(2, 0).unwrap());
+    assert_eq!(node.inflight_bytes(2), Some((0, 1)));
+    // More than the budget holds: what it can stage beside a page for each
+    // member, and no more.
+    assert!(node.set_inflight_bytes(3, u64::MAX).unwrap());
+    let (_, bound) = node.inflight_bytes(3).unwrap();
+    assert!(bound > page && bound < limit as u64 - 4 * page, "{bound}");
+    // The staging a transition reserves prices the window by its bound:
+    // with every member at a page it reserves far less than with one
+    // member at all the budget stages.
+    let wide = node.staging_estimate().unwrap();
+    assert!(node.set_inflight_bytes(3, page).unwrap());
+    let narrow = node.staging_estimate().unwrap();
+    assert!(narrow <= wide);
 }
 
 #[test]

@@ -47,6 +47,7 @@ pub mod input_codec;
 mod intent;
 mod layout;
 pub use layout::NativeLocation;
+mod epochs;
 #[cfg(test)]
 mod layout_tests;
 mod missing_owned;
@@ -87,12 +88,18 @@ mod responses;
 mod result_owned;
 mod retired_cycles;
 pub mod retirement;
+pub use epochs::{EpochWindow, OPEN_EPOCHS, OpenEpoch, SealedRange};
+pub mod seal;
+pub use seal::SealRow;
 #[cfg(test)]
 #[path = "native/retirement_tests.rs"]
 mod retirement_tests;
 mod scope_release;
 #[cfg(test)]
 mod scope_release_tests;
+#[cfg(test)]
+#[path = "native/seal_tests.rs"]
+mod seal_tests;
 #[cfg(test)]
 mod tests;
 mod transactions;
@@ -170,7 +177,13 @@ pub struct NativeLimits {
     pub plan_edges: usize,
     pub preparation_bytes: usize,
     pub claims: usize,
+    /// Resident outcomes: the open obligations and the unsealed tail, never
+    /// the ledger's lifetime (F12).
     pub outcomes: usize,
+    /// Principals with a request generation window: the enrollment bound.
+    pub principals: usize,
+    /// Resident seal rows; at the bound the oldest half fold into one.
+    pub seals: usize,
     pub events: usize,
     pub definitions: usize,
     pub evaluations: usize,
@@ -213,6 +226,8 @@ impl Default for NativeLimits {
             preparation_bytes: 4 * 1024 * 1024,
             claims: 1_000_000,
             outcomes: 1_000_000,
+            principals: 4096,
+            seals: seal::DEFAULT_SEAL_ROWS,
             events: 16_000_000,
             definitions: 4_000_000,
             evaluations: 8_000_000,
@@ -345,6 +360,9 @@ pub enum NativeInvocation {
     /// named claim to the archive; a session decision, never a request or
     /// a timer, owning the native sequence its publication consumed.
     Retirement(ClaimId),
+    /// A committed seal of closed outcomes (F12), by its ordinal: a session
+    /// decision owning the native sequence its publication consumed.
+    Seal(u64),
 }
 /// Custody request identity of an imported artifact (23 §5.2): derived from
 /// the ledger and artifact under a private domain, principal = producer, epoch
@@ -418,6 +436,11 @@ pub enum NativeCommand {
     /// This does not terminalize children or invent evaluation results.
     ReleaseScope {
         expected: Binding,
+    },
+    /// Advance the principal's own request generation floor (F12): the
+    /// generations below `minimum` close; their outcomes leave for a seal.
+    AdvanceEpochFloor {
+        minimum: RequestEpoch,
     },
     GenerateResultTestament {
         claim: Binding,
@@ -582,6 +605,10 @@ pub enum NativeOperation {
     Import,
     /// A family of claims retired to the archive (26 §4).
     Retire,
+    /// A principal advanced its request generation floor (F12).
+    AdvanceEpochFloor,
+    /// Closed outcomes sealed into a bundle (F12): a session decision.
+    Seal,
 }
 /// Address of one frozen legacy row retained by import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1029,6 +1056,11 @@ enum Key {
     /// written where the claim's rows were, so a reference resolves to the
     /// bundle that holds them rather than to nothing.
     Retired(ClaimId),
+    /// A principal's request generations (F12): under the control affinity.
+    Epochs(ParticipantId),
+    /// A seal of closed outcomes, by ordinal (F12): under the control
+    /// affinity; a fold's row is keyed by the last ordinal it covers.
+    Seal(u64),
     End,
 }
 
@@ -1116,6 +1148,16 @@ struct Meta {
     monitor_links: usize,
     creation_results: usize,
     legacy: usize,
+    /// Outcomes that left the core into a seal or a retirement bundle
+    /// (F12): resident outcomes are `outcomes - sealed`.
+    sealed: usize,
+    /// Event rows of the outcomes that left: what the resident events and
+    /// the retired continuations reconcile against.
+    sealed_events: usize,
+    /// Seals applied: the next seal's ordinal is one more.
+    seals: usize,
+    /// Principals with a request generation window.
+    principals: usize,
     logical_time: u64,
 }
 /// A resumable position in the committed rows, opaque to callers.
@@ -1143,13 +1185,20 @@ pub enum ContentRoot {
         root: ContentHash,
         bytes: u64,
     },
+    /// A seal's bundle (F12), by the seal's ordinal, content root and
+    /// length: the proof of the outcomes that left the core.
+    Seal {
+        ordinal: u64,
+        root: ContentHash,
+        bytes: u64,
+    },
 }
 impl ContentRoot {
     /// The object's content root.
     pub fn root(&self) -> ContentHash {
         match self {
             Self::Artifact { pointer, .. } | Self::Inline { pointer, .. } => pointer.root,
-            Self::Bundle { root, .. } => *root,
+            Self::Bundle { root, .. } | Self::Seal { root, .. } => *root,
         }
     }
 }
@@ -1218,6 +1267,8 @@ enum Row {
     /// The unit value of every secondary index row.
     Index,
     Retired(RetiredClaim),
+    Epochs(EpochWindow),
+    Seal(SealRow),
 }
 
 /// All allocated candidate rows, outcomes and events have one immutable root.
@@ -1402,6 +1453,8 @@ fn checked_native_limits(
         || limits.preparation_bytes == 0
         || limits.claims == 0
         || limits.outcomes == 0
+        || limits.principals == 0
+        || limits.seals < 2
         || limits.events == 0
         || limits.definitions == 0
         || limits.evaluations == 0
@@ -1598,6 +1651,11 @@ impl Core<NativeState> {
                 }
                 (Key::Retired(claim), Row::Retired(value)) => push(ContentRoot::Bundle {
                     claim: *claim,
+                    root: value.bundle,
+                    bytes: value.bytes,
+                })?,
+                (Key::Seal(ordinal), Row::Seal(value)) => push(ContentRoot::Seal {
+                    ordinal: *ordinal,
                     root: value.bundle,
                     bytes: value.bytes,
                 })?,

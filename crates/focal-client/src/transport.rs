@@ -1,5 +1,5 @@
 use focal_wire::*;
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Mutex};
+use std::{future::Future, pin::Pin};
 
 pub type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ResponseEnvelope, WireError>> + Send + 'a>>;
@@ -88,25 +88,11 @@ impl ClientTransport for UnixTransport {
     }
 }
 
+/// The participant's QUIC transport: one connection per route, dialed once
+/// however many calls arrive cold (`RouteConnections`, the audit's F60).
 pub struct QuicTransport {
-    connector: QuicConnector,
+    routes: RouteConnections,
     initial: RouteHint,
-    connections: Mutex<Connections>,
-    max_connections: usize,
-}
-
-/// A cached QUIC connection with the logical clock value of its last use, so the
-/// cache evicts the least-recently-used connection under pressure rather than
-/// the lexicographically smallest key.
-struct Cached {
-    remote: QuicRemote,
-    used: u64,
-}
-
-#[derive(Default)]
-struct Connections {
-    entries: BTreeMap<(String, String), Cached>,
-    clock: u64,
 }
 impl QuicTransport {
     pub fn new(
@@ -114,60 +100,17 @@ impl QuicTransport {
         initial: RouteHint,
         max_connections: usize,
     ) -> Result<Self, WireError> {
-        if max_connections == 0
-            || max_connections > 1024
-            || initial.endpoint.len() > 512
-            || initial.server_name.len() > 253
-        {
+        if initial.endpoint.len() > 512 || initial.server_name.len() > 253 {
             return Err(WireError::Limit);
         }
         Ok(Self {
-            connector,
+            routes: RouteConnections::new(connector, max_connections)?,
             initial,
-            connections: Mutex::new(Connections::default()),
-            max_connections,
         })
     }
-    async fn connection(&self, route: &RouteHint) -> Result<QuicRemote, WireError> {
-        tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
-        let key = (route.endpoint.clone(), route.server_name.clone());
-        {
-            let mut guard = self.connections.lock().map_err(|_| WireError::Connection)?;
-            guard.clock = guard.clock.saturating_add(1);
-            let clock = guard.clock;
-            if let Some(entry) = guard.entries.get_mut(&key) {
-                entry.used = clock;
-                return Ok(entry.remote.clone());
-            }
-        }
-        let mut addresses = tokio::net::lookup_host(route.endpoint.as_str())
-            .await
-            .map_err(|_| WireError::Connection)?;
-        let address = addresses.next().ok_or(WireError::Connection)?;
-        let connection = self.connector.connect(address, &route.server_name).await?;
-        let mut guard = self.connections.lock().map_err(|_| WireError::Connection)?;
-        guard.clock = guard.clock.saturating_add(1);
-        let clock = guard.clock;
-        // Evict the least-recently-used connection only when admitting a new key
-        // at capacity; a re-inserted key just refreshes its clock.
-        if !guard.entries.contains_key(&key)
-            && guard.entries.len() >= self.max_connections
-            && let Some(evict) = guard
-                .entries
-                .iter()
-                .min_by_key(|(_, cached)| cached.used)
-                .map(|(evict_key, _)| evict_key.clone())
-        {
-            guard.entries.remove(&evict);
-        }
-        guard.entries.insert(
-            key,
-            Cached {
-                remote: connection.clone(),
-                used: clock,
-            },
-        );
-        Ok(connection)
+    /// Physical dials this transport has started.
+    pub fn dials(&self) -> u64 {
+        self.routes.dials()
     }
 }
 impl ClientTransport for QuicTransport {
@@ -178,14 +121,16 @@ impl ClientTransport for QuicTransport {
     ) -> TransportFuture<'a> {
         Box::pin(async move {
             let route = route.unwrap_or(&self.initial);
-            let connection = self.connection(route).await?;
-            let result = connection.request(request).await;
+            let connected = self
+                .routes
+                .connect(&route.endpoint, &route.server_name)
+                .await?;
+            let result = connected.remote.request(request).await;
             if result.is_err() {
-                self.connections
-                    .lock()
-                    .map_err(|_| WireError::Connection)?
-                    .entries
-                    .remove(&(route.endpoint.clone(), route.server_name.clone()));
+                // The connection that failed leaves the cache — unless a
+                // newer one took its place meanwhile.
+                self.routes
+                    .forget(&route.endpoint, &route.server_name, connected.generation);
             }
             result
         })

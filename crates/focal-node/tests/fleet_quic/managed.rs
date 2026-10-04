@@ -4,16 +4,30 @@ fn managed_request(id: u128, operation: Operation) -> RequestEnvelope {
     value.protocol = MANAGED_PROTOCOL_VERSION;
     value
 }
+/// One exchange with `node` over a fresh connection. A request the client's
+/// clock gives up (`Timeout`) is sent again — the exact envelope, under a
+/// counted budget: every request here is answered from its receipt or its
+/// committed state on a retry, and an owner a loaded machine slows gives up
+/// nothing it would have answered (27 §3.1 P2), so the wall clock is the
+/// client's to retry against, never a verdict.
 async fn exchange(fleet: &Fleet, node: usize, request: &RequestEnvelope) -> Response {
     let endpoint = &fleet.routes[&(node as u64 + 1)];
-    let remote = fleet
-        .actor_connector
-        .connect(endpoint.address, &endpoint.server_name)
-        .await
-        .unwrap();
-    let reply = remote.request(request).await.unwrap();
-    remote.close();
-    reply.result
+    let mut timed_out = 0;
+    for _ in 0..8 {
+        let remote = fleet
+            .actor_connector
+            .connect(endpoint.address, &endpoint.server_name)
+            .await
+            .unwrap();
+        let reply = remote.request(request).await;
+        remote.close();
+        match reply {
+            Ok(reply) => return reply.result,
+            Err(WireError::Timeout) => timed_out += 1,
+            Err(error) => panic!("exchange: {error:?}"),
+        }
+    }
+    panic!("the exact request timed out {timed_out} times: {request:?}")
 }
 async fn current_leader(fleet: &Fleet, excluding: Option<usize>) -> usize {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -44,26 +58,30 @@ async fn current_leader(fleet: &Fleet, excluding: Option<usize>) -> usize {
     .await
     .unwrap()
 }
-async fn install_support(fleet: &Fleet, leader: usize) {
+pub(super) async fn install_support(fleet: &Fleet, leader: usize) {
+    install_support_among(fleet, leader, 3).await;
+}
+/// The first `members` replicas promise the decoder to each other.
+pub(super) async fn install_support_among(fleet: &Fleet, leader: usize, members: u64) {
     // Only an actual managed demand begins this upgrade. Its authenticated
-    // current-member probes make the other voters durably promise support.
-    for target in 1..=3 {
-        if target == leader as u64 + 1 {
-            continue;
-        }
+    // current-member probes make the other voters durably promise support;
+    // the asker is probed by another member, so that every member has
+    // begun before any records a promise.
+    for target in 1..=members {
+        let asker = if target == leader as u64 + 1 {
+            (leader + 1) % usize::try_from(members).unwrap()
+        } else {
+            leader
+        };
         let request = managed_request(
             450 + u128::from(target),
             Operation::ManagedSupport { group: [8; 16] },
         );
-        fleet.replicas[leader]
-            .pool
-            .send_managed_support(target, &request)
-            .await
-            .unwrap();
+        probe(&fleet.replicas[asker], target, &request).await;
     }
 
-    for (index, replica) in fleet.replicas.iter().enumerate() {
-        for target in 1..=3 {
+    for (index, replica) in fleet.replicas.iter().enumerate().take(members as usize) {
+        for target in 1..=members {
             if target == index as u64 + 1 {
                 continue;
             }
@@ -71,11 +89,7 @@ async fn install_support(fleet: &Fleet, leader: usize) {
                 500 + u128::from(target),
                 Operation::ManagedSupport { group: [8; 16] },
             );
-            let fact = replica
-                .pool
-                .send_managed_support(target, &request)
-                .await
-                .unwrap();
+            let fact = probe(replica, target, &request).await;
             assert_eq!(fact.node, target);
             replica
                 .host
@@ -251,10 +265,34 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
         matches!(found.page.result,RequestStreamReadResult::Receipt{resolution:ManagedReceiptResolution::Retained(ref receipt),..} if **receipt==cursor_receipt.receipt)
     );
     fleet.isolate(leader);
-    assert!(matches!(
-        exchange(&fleet, leader, &lookup).await,
-        Response::Error(AccessError::Unavailable)
-    ));
+    // An isolated leader answers nothing it cannot prove current: not from
+    // its own state as leader, not as the follower it becomes.
+    let isolated = exchange(&fleet, leader, &lookup).await;
+    assert!(
+        matches!(isolated, Response::Error(AccessError::Unavailable)),
+        "the isolated leader answered {isolated:?}"
+    );
+    // Once it stands down — an election timeout without its quorum — it
+    // leads no one and knows no leader, and a read's barrier cannot begin
+    // (`ConsensusError::NotLeader`): the read is unavailable, never an
+    // unknown outcome, which is a mutation's word (the macOS run that met
+    // the stood-down node answered `OutcomeUnknown`).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let progress = fleet.replicas[leader].host.progress();
+            if progress.leader != progress.node {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the isolated leader stood down");
+    let stood_down = exchange(&fleet, leader, &lookup).await;
+    assert!(
+        matches!(stood_down, Response::Error(AccessError::Unavailable)),
+        "the stood-down leader answered {stood_down:?}"
+    );
     let next = current_leader(&fleet, Some(leader)).await;
     let Response::Managed(retried) = exchange(&fleet, next, &mutation).await else {
         panic!("retry")
@@ -460,4 +498,47 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
         ));
     }
     reopened.stop().await;
+}
+
+/// A member admitted later promises the decoder when a current member asks
+/// it (as the service's managed-support driver asks a learner after its
+/// admission), and every earlier member records the promise.
+pub(super) async fn promise_of(fleet: &Fleet, asker: usize, member: u64) {
+    let request = managed_request(
+        600 + u128::from(member),
+        Operation::ManagedSupport { group: [8; 16] },
+    );
+    let fact = probe(&fleet.replicas[asker], member, &request).await;
+    assert_eq!(fact.node, member);
+    for (index, replica) in fleet.replicas.iter().enumerate() {
+        if index as u64 + 1 == member {
+            continue;
+        }
+        replica
+            .host
+            .record_managed_support(member, fact.clone())
+            .await
+            .unwrap();
+    }
+}
+
+/// One support probe, asked again while the member's promise write is
+/// still in flight (`OutcomeUnknown`), under a counted budget: the exact
+/// request, answered from the member's durable promise once it is.
+async fn probe(
+    replica: &Replica,
+    target: u64,
+    request: &RequestEnvelope,
+) -> focal_model::ManagedFormatSupport {
+    let mut unknown = 0;
+    loop {
+        match replica.pool.send_managed_support(target, request).await {
+            Ok(fact) => return fact,
+            Err(PeerSendError::Rejected(AccessError::OutcomeUnknown)) if unknown < 200 => {
+                unknown += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("support probe of {target}: {error:?} after {unknown} unknown"),
+        }
+    }
 }

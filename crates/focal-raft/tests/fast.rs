@@ -426,6 +426,84 @@ fn what_may_not_go_by_the_fast_track_is_refused() {
     assert!(plain.peek(2).unwrap().held().is_empty() && plain.net.is_empty());
 }
 
+/// One group with the fast track under the schedule of `seed`, which is
+/// safe and settles; what the fast track did is added to `did`.
+fn fast_schedule(
+    settings: Settings,
+    seed: u64,
+    steps: u64,
+    mix: &Mix,
+    did: &mut focal_raft::FastStats,
+) -> Cluster<New> {
+    let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], settings, seed);
+    let mut rng = Seeded(seed);
+    for _ in 0..steps {
+        let op = group.choose(&mut rng, mix);
+        // What a member did it forgets when it stops.
+        if let Op::Restart(member) = op
+            && let Some(node) = group.peek(member)
+        {
+            add(did, node.fast_stats());
+        }
+        group.act(&op);
+    }
+    assert!(group.settles(400), "seed {seed}: the group did not settle");
+    for member in group.up() {
+        add(did, group.peek(member).unwrap().fast_stats());
+    }
+    group
+}
+
+/// The schedule that found an election committing a second entry at an
+/// index that held a committed one (seed 9843 of forty thousand from seed
+/// 3,000, on the core before the audit's F43, F41 and F42, whose rules it
+/// keeps here so that it runs as it was found). A leader committed an index
+/// by a fast quorum of which two members held the entry beside their logs
+/// and had told the leader nothing of their logs; a member whose log held
+/// an entry of an older term at that index was later elected by them, kept
+/// its own entry and committed it. A member's held entry now counts for a
+/// fast commit only once the leader knows its log holds an entry of the
+/// leader's term (27 §4.6; `focal_raft::track`).
+#[test]
+fn an_election_never_commits_a_second_entry_at_a_committed_index() {
+    let found = Settings {
+        round_each: true,
+        max_inflight_bytes: u64::MAX,
+        bare_answers: true,
+        ..Settings::fast()
+    };
+    let mix = Mix {
+        leader_leaves: true,
+        fast: 60,
+        ..Mix::everything()
+    };
+    let mut did = focal_raft::FastStats::default();
+    let group = fast_schedule(found, 9843, 4_000, &mix, &mut did);
+    // It went on past the index, and every member agreed on it.
+    assert!(group.chosen.len() > 32, "{did:?}");
+}
+
+/// The schedule that found an election under a configuration a member had
+/// not yet applied committing a second entry (seed 54104 of forty thousand
+/// from seed 43,000, once the rule above was in). A leader whose
+/// configuration had demoted a member committed an index by a fast quorum
+/// of its voters; one of them had not committed the demotion and counted by
+/// the voters before it: it was elected by members that held another entry
+/// at that index, and took theirs. A fast quorum now counts only where it
+/// is a fast quorum of every configuration a member that holds an entry of
+/// the term may count by (27 §4.6; `focal_raft::track`).
+#[test]
+fn a_member_that_counts_by_the_configuration_before_commits_no_second_entry() {
+    let mix = Mix {
+        leader_leaves: true,
+        fast: 60,
+        ..Mix::everything()
+    };
+    let mut did = focal_raft::FastStats::default();
+    let group = fast_schedule(Settings::fast(), 54104, 4_000, &mix, &mut did);
+    assert!(group.chosen.len() > 11, "{did:?}");
+}
+
 #[test]
 fn a_group_with_the_fast_track_is_safe_and_settles() {
     let seeds = count("FOCAL_RAFT_SEEDS", 96);
@@ -439,22 +517,7 @@ fn a_group_with_the_fast_track_is_safe_and_settles() {
     let (mut terms, mut committed) = (0, 0);
     let mut did = focal_raft::FastStats::default();
     for seed in first..first + seeds {
-        let mut group: Cluster<New> = Cluster::new(5, &[1, 2, 3, 4, 5], Settings::fast(), seed);
-        let mut rng = Seeded(seed);
-        for _ in 0..steps {
-            let op = group.choose(&mut rng, &mix);
-            // What a member did it forgets when it stops.
-            if let Op::Restart(member) = op
-                && let Some(node) = group.peek(member)
-            {
-                add(&mut did, node.fast_stats());
-            }
-            group.act(&op);
-        }
-        assert!(group.settles(400), "seed {seed}: the group did not settle");
-        for member in group.up() {
-            add(&mut did, group.peek(member).unwrap().fast_stats());
-        }
+        let group = fast_schedule(Settings::fast(), seed, steps, &mix, &mut did);
         terms += group.leaders.len();
         committed += group.chosen.len();
     }

@@ -365,7 +365,14 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         config: RangeConfig,
         budget: MemoryBudget,
     ) -> Result<Self, MemoryError> {
-        Self::new_with_partition(id, initial_prefix, config, budget, None)
+        Self::new_with_partition(
+            id,
+            initial_prefix,
+            config,
+            budget,
+            None,
+            BudgetLane::Ordinary,
+        )
     }
 
     /// Create an owner whose leaves never mix different key partitions.
@@ -382,7 +389,27 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         budget: MemoryBudget,
         partition: fn(&K) -> u64,
     ) -> Result<Self, MemoryError> {
-        Self::new_with_partition(id, initial_prefix, config, budget, Some(partition))
+        Self::new_with_partition(
+            id,
+            initial_prefix,
+            config,
+            budget,
+            Some(partition),
+            BudgetLane::Ordinary,
+        )
+    }
+    /// [`Self::new_partitioned`] with its root charged to `lane`: recovery
+    /// and repair, which complete admitted work, build their owners under
+    /// the completion allowance and never wait on ordinary credit.
+    pub fn new_partitioned_in(
+        id: RangeId,
+        initial_prefix: u64,
+        config: RangeConfig,
+        budget: MemoryBudget,
+        partition: fn(&K) -> u64,
+        lane: BudgetLane,
+    ) -> Result<Self, MemoryError> {
+        Self::new_with_partition(id, initial_prefix, config, budget, Some(partition), lane)
     }
 
     fn new_with_partition(
@@ -391,13 +418,12 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         config: RangeConfig,
         budget: MemoryBudget,
         partition: Option<fn(&K) -> u64>,
+        lane: BudgetLane,
     ) -> Result<Self, MemoryError> {
         let config = config.validate()?;
         layout::validate::<K, V>(config)?;
         let charge = root_charge::<K, V>(0)?;
-        let allocation = budget
-            .reserve(BudgetKind::Roots, BudgetLane::Ordinary, charge)?
-            .commit();
+        let allocation = budget.reserve(BudgetKind::Roots, lane, charge)?.commit();
         Ok(Self {
             root: Arc::new(Root {
                 owner: crate::OwnerId::new()?,
@@ -720,7 +746,8 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
     where
         V: Clone,
     {
-        let mut store = Self::new_with_partition(id, 0, config, budget, partition)?;
+        let mut store =
+            Self::new_with_partition(id, 0, config, budget, partition, BudgetLane::Ordinary)?;
         let chunk_limit = config.page_entries.min(config.max_batch_entries);
         let mut source = entries.into_iter().peekable();
         while source.peek().is_some() {

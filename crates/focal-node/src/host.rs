@@ -47,6 +47,7 @@ impl LocalHost {
         let budget =
             MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).map_err(LedgerError::from)?;
         let host_limits = limits.clone();
+        let host_budget = budget.clone();
         let native = node.session.activation().is_native();
         let (sender, receiver) = mpsc::sync_channel(32);
         let (liveness, ended) = watch::channel(());
@@ -57,10 +58,13 @@ impl LocalHost {
             .name("focal-session-owner".into())
             .spawn(move || {
                 let _liveness = liveness;
+                let mut archive = crate::archive_agent::EmbeddedArchive::from_env();
                 let mut next_tick = Instant::now();
                 loop {
                     if Instant::now() >= next_tick {
-                        if let Err(error) = maintain(&mut node, &mut views) {
+                        if let Err(error) =
+                            maintain(&mut node, &mut views, &mut archive, &host_budget)
+                        {
                             use std::io::Write as _;
                             let _ = writeln!(
                                 std::io::stderr().lock(),
@@ -84,8 +88,14 @@ impl LocalHost {
                     match work {
                         Work::Request(request, response, charge) => {
                             // A vanished caller cannot cancel an already admitted mutation.
-                            let reply =
-                                dispatch(&mut node, &mut views, &mut streams, *request, &limits);
+                            let reply = dispatch(
+                                &mut node,
+                                &mut views,
+                                &mut streams,
+                                *request,
+                                &limits,
+                                &host_budget,
+                            );
                             let _ = response.send(finish_response(reply, charge));
                         }
                         Work::Stop(response) => {
@@ -366,6 +376,21 @@ pub(crate) fn known_receipt(
         ))
     }))
 }
+/// What a read barrier that could not be begun answers: nothing was taken,
+/// so the node is unavailable for the read — a replica that leads no one
+/// and knows no leader (an isolated leader once it stands down,
+/// `ConsensusError::NotLeader`), a session that stopped — never an unknown
+/// outcome, which is a mutation's word. Capacity and the client's standing
+/// keep their names.
+pub(crate) fn barrier_refused(error: LedgerError) -> AccessError {
+    match error {
+        LedgerError::Capacity
+        | LedgerError::Behind
+        | LedgerError::ResyncRequired
+        | LedgerError::Consensus(focal_consensus::ConsensusError::Capacity) => access(error),
+        _ => AccessError::Unavailable,
+    }
+}
 pub(crate) fn access(error: LedgerError) -> AccessError {
     match error {
         LedgerError::Managed(error) => match error {
@@ -390,7 +415,12 @@ pub(crate) fn access(error: LedgerError) -> AccessError {
         _ => AccessError::OutcomeUnknown,
     }
 }
-fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Result<(), NodeError> {
+fn maintain(
+    node: &mut EmbeddedNode,
+    views: &mut crate::reads::ReadViews,
+    archive: &mut crate::archive_agent::EmbeddedArchive,
+    budget: &MemoryBudget,
+) -> Result<(), NodeError> {
     views
         .advance(&mut node.session)
         .map_err(|error| NodeError::Domain(error.to_string()))?;
@@ -406,6 +436,10 @@ fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Res
     // Trusted timers of the native engine fire from this clock; a refusal
     // of one timer is that timer's outcome, not a maintenance failure.
     crate::native_timers::sweep(&mut node.session)?;
+    // The archive agent of this node (26 §4, F12): released families retire
+    // and closed outcomes seal here as on a network node, into this node's
+    // own store.
+    archive.maintain(node, budget)?;
     Ok(())
 }
 fn dispatch(
@@ -414,6 +448,7 @@ fn dispatch(
     streams: &mut crate::streams::Streams,
     verified: VerifiedRequest,
     limits: &WireLimits,
+    budget: &MemoryBudget,
 ) -> ResponseEnvelope {
     let principal = verified.peer().principal();
     let peer = verified.peer();
@@ -496,14 +531,37 @@ fn dispatch(
             Operation::Native { frame } => {
                 crate::native_ingress::admit_local(node, peer, request, frame)
             }
-            Operation::NativeRead(read) => crate::native_reads::local(
-                &mut node.session,
-                peer,
-                read,
-                request.request_id,
-                request.route_epoch,
-                limits,
-            )
+            // An archived object is read from the node's own custody (the
+            // audit's F11); every other read from the session's core.
+            Operation::NativeRead(read) => match &read.query {
+                NativeReadQuery::Archived(query) => crate::archive_reads::page(
+                    &node.content,
+                    budget,
+                    request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                ),
+                NativeReadQuery::Sealed(query) => crate::archive_reads::sealed_page(
+                    &node.content,
+                    request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                ),
+                _ => crate::native_reads::local(
+                    &mut node.session,
+                    peer,
+                    read,
+                    request.request_id,
+                    request.route_epoch,
+                    limits,
+                ),
+            }
             .map(Response::NativeRead),
             Operation::NativeList(list) => crate::native_lists::local(
                 &mut node.session,
@@ -643,6 +701,7 @@ fn dispatch(
                 .map(Response::Stream),
             Operation::Subscribe(_)
             | Operation::Raft { .. }
+            | Operation::RaftOrdered { .. }
             | Operation::Control { .. }
             | Operation::PeerControl { .. }
             | Operation::NodeContact { .. }
@@ -656,7 +715,8 @@ fn dispatch(
         }
     };
     response.result = result.unwrap_or_else(Response::Error);
-    if encode_payload(&response, limits.max_frame_bytes).is_err() {
+    // The limit alone decides: the reply is encoded once, by the transport.
+    if payload_len(&response, limits.max_frame_bytes).is_err() {
         response.result = Response::Error(AccessError::Capacity);
     }
     response

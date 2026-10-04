@@ -13,6 +13,7 @@
 //! Node composition and user-facing deployment intent.
 pub mod admission;
 pub mod archive_agent;
+mod archive_derive;
 pub mod backup;
 pub mod cluster;
 pub mod cluster_admin;
@@ -64,6 +65,7 @@ pub mod range_balancer;
 mod reads;
 mod reconciliation;
 pub mod replication;
+pub mod resequence;
 pub mod route_cache_host;
 #[cfg(test)]
 mod route_cache_tests;
@@ -82,6 +84,7 @@ mod managed_requests;
 mod participant_ingress;
 mod snapshot_feedback;
 
+mod archive_reads;
 mod ledger_summary;
 mod monitor_reads;
 pub mod native_activation;
@@ -92,6 +95,9 @@ mod native_host_tests;
 mod native_ingress;
 mod native_lists;
 mod native_reads;
+#[cfg(test)]
+#[path = "native_reads_tests.rs"]
+mod native_reads_tests;
 mod native_timers;
 
 /// Test-only: tighten a fresh temp path to owner-only. On Unix this sets the

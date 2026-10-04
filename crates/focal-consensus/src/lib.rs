@@ -62,6 +62,9 @@ pub struct RestoredLog {
     pub transition: Option<([u8; 32], [u8; 32])>,
 }
 
+/// The bytes of committed entries one Ready gives to apply: the page a
+/// transition reads from storage at most.
+pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: u64,
@@ -82,6 +85,10 @@ pub struct NodeConfig {
     /// is no part of the identity record, whose bytes are as they were: a
     /// group that has it says so in a record of its own, which a binary
     /// that knows no fast track refuses.
+    ///
+    /// No owner sets it: an owner must derive nothing from an entry's
+    /// term, and a leader that outlives two changes of its configuration
+    /// commits by the classic quorum until its term ends (27 §4.6).
     #[serde(skip)]
     pub fast: bool,
 }
@@ -110,7 +117,7 @@ impl NodeConfig {
             heartbeat_tick: 2,
             max_entry_bytes: 4 * 1024 * 1024,
             max_uncommitted_bytes: 32 * 1024 * 1024,
-            max_inflight_messages: 128,
+            max_inflight_messages: DEFAULT_INFLIGHT_WINDOW,
             fast: false,
         }
     }
@@ -174,6 +181,8 @@ pub enum ConsensusError {
     CheckpointIndex,
     #[error("learner is not durably caught up through the commit index")]
     LearnerBehind,
+    #[error("a membership change is committed and not yet applied here; ask again once it is")]
+    MembershipPending,
     #[error("invalid peer message: {0}")]
     MalformedMessage(&'static str),
     #[error("a leader does not remove itself; transfer leadership first")]
@@ -192,6 +201,11 @@ pub struct CommittedEntry {
     pub term: u64,
     pub data: Vec<u8>,
 }
+/// The messages a leader keeps in flight to one follower before an
+/// acknowledgement (`NodeConfig::max_inflight_messages`, thesis §10.2.1's
+/// pipeline): the wire's control lane to a peer is derived from it, so the
+/// pipeline is never narrower on the wire than in the core (27 §3.1 P1).
+pub const DEFAULT_INFLIGHT_WINDOW: usize = 128;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadBarrier {
     pub index: u64,
@@ -221,6 +235,26 @@ pub struct NodeEvents {
     pub applied_index: u64,
     allocation: Option<Allocation>,
 }
+/// Makes, for each write of a group, what the log's writer calls once the
+/// write is answered ([`focal_log::Persisted`]).
+pub type PersistedSignal = Box<dyn Fn() -> focal_log::Persisted + Send>;
+/// A member that is let go writes the commit its log does not hold: its
+/// log then says what it applied, and a restart needs no one to tell it.
+/// The write is queued, not waited for; the log finishes what it was given
+/// before it closes. Nothing is written for a member that failed or still
+/// persists something: its log answers for itself.
+impl Drop for DurableNode {
+    fn drop(&mut self) {
+        if !self.failed
+            && self.persistence.is_none()
+            && self.checkpoint.is_none()
+            && self.decoder_write.is_none()
+            && self.commit_unwritten
+        {
+            let _ = self.write_commit_behind();
+        }
+    }
+}
 impl NodeEvents {
     /// Transfer this permit alongside buffers moved into another owner/queue.
     pub fn take_allocation(&mut self) -> Option<Allocation> {
@@ -236,11 +270,17 @@ pub struct PeerProgress {
     pub node: u64,
     pub matched: u64,
     pub next_index: u64,
+    /// The leader's pipeline to the member: [`PEER_PROBE`] (one message
+    /// at a time, after a lost one or a rejection), [`PEER_REPLICATE`]
+    /// (streaming) or [`PEER_SNAPSHOT`] (being sent a snapshot).
     pub state: u8,
     pub recent_active: bool,
     pub paused: bool,
     pub pending_snapshot: u64,
 }
+pub const PEER_PROBE: u8 = 0;
+pub const PEER_REPLICATE: u8 = 1;
+pub const PEER_SNAPSHOT: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct NodeStatus {
     pub node_id: u64,
@@ -251,6 +291,39 @@ pub struct NodeStatus {
     pub role: StateRole,
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
+}
+/// The scalars of a [`NodeStatus`] without its membership (the audit's
+/// F53): what a check of the term, the role, the leader or an index reads,
+/// copied, so a scalar check allocates nothing. The owned status stays for
+/// what is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeScalars {
+    pub node_id: u64,
+    pub leader_id: u64,
+    pub term: u64,
+    pub committed_index: u64,
+    pub applied_index: u64,
+    pub role: StateRole,
+}
+/// The node's membership as it holds it, borrowed: a check of who is a
+/// voter or a learner reads it in place.
+#[derive(Clone, Copy, Debug)]
+pub struct MembershipView<'a> {
+    pub voters: &'a [u64],
+    pub learners: &'a [u64],
+}
+impl MembershipView<'_> {
+    /// Whether `node` is a voter or a learner.
+    pub fn holds(&self, node: u64) -> bool {
+        self.voters.contains(&node) || self.learners.contains(&node)
+    }
+    /// The voters and the learners together.
+    pub fn len(&self) -> usize {
+        self.voters.len().saturating_add(self.learners.len())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.voters.is_empty() && self.learners.is_empty()
+    }
 }
 
 pub struct DurableNode {
@@ -276,6 +349,26 @@ pub struct DurableNode {
     // membership is deferred until the decoder is confirmed. While it is pending,
     // no election or network step may observe the stale snapshot-only voter set.
     membership_rebuild_pending: bool,
+    /// The stored hard state names a commit the log does not hold yet: the
+    /// commit moved and no write was made for it (`persistence`). The
+    /// group's next record carries it.
+    commit_unwritten: bool,
+    /// The write of such a commit, behind what was released for it: one in
+    /// flight at a time, waited for by no one.
+    commit_write: Option<(focal_log::WalAppend, u64)>,
+    /// The commit the log holds: what a restart replays to. A change of
+    /// membership past it is not applied before a write has stated its
+    /// commit (`persistence`).
+    commit_durable: u64,
+    /// The group applies nothing on a commit its log does not hold
+    /// (`apply_on_written_commit`).
+    written_commit: bool,
+    /// The unwritten commit as the owner's last period found it: one that
+    /// is the same a period later is written (`settle_commit`).
+    commit_waiting: Option<u64>,
+    /// What tells this group's owner that a write of the group was answered
+    /// (`notify_persisted`): made anew for every write.
+    persisted: Option<PersistedSignal>,
     /// The election priority the owner configured; see `set_priority`.
     priority: i64,
     // Drop after any pending Ready/output payloads, including owner cancellation.
@@ -456,6 +549,11 @@ impl DurableNode {
         Self::open_on_wal_in(config, shared, &budget)
     }
 
+    /// What opening a group under `config` charges before its first drain
+    /// prices what it holds (`memory::initial_bytes`).
+    pub fn initial_estimate(config: &NodeConfig) -> Result<usize, ConsensusError> {
+        memory::initial_bytes(config)
+    }
     /// Charge this group's retained Raft data and operation staging to a tenant
     /// or node hierarchy. The physical shared WAL has its own node-wide budget.
     pub fn open_on_wal_in(
@@ -554,12 +652,15 @@ impl DurableNode {
         }
         storage.validate()?;
         let applied = proto::snapshot_index(&storage.snapshot);
+        // The recovered snapshot is an event awaiting the caller's first
+        // drain: charged as every delivered event is, so that the drain
+        // hands it over under the one charge it carries.
         let recovered_allocation = if storage.snapshot.is_empty() {
             None
         } else {
             Some(memory::reserve(
                 &budget,
-                BudgetKind::Recovery,
+                BudgetKind::Pending,
                 BudgetLane::Completion,
                 memory::snapshot_bytes(&storage.snapshot)?,
             )?)
@@ -572,8 +673,12 @@ impl DurableNode {
             applied,
             max_size_per_msg: (config.max_entry_bytes as u64).saturating_add(1024),
             max_inflight_msgs: config.max_inflight_messages,
+            // Until its owner says what the path to a member carries
+            // (`set_inflight_bytes`), a member is sent one page ahead of its
+            // answers: the least that always makes progress.
+            max_inflight_bytes: (config.max_entry_bytes as u64).saturating_add(1024),
             max_uncommitted_size: config.max_uncommitted_bytes,
-            max_committed_size_per_ready: 16 * 1024 * 1024,
+            max_committed_size_per_ready: COMMITTED_PAGE_BYTES,
             check_quorum: true,
             pre_vote: true,
             fast: config.fast,
@@ -603,6 +708,7 @@ impl DurableNode {
                 .checked_mul(4096)
                 .ok_or(ConsensusError::Capacity)?,
         )?;
+        let commit_durable = storage.hard_state.commit;
         let raw = catch_unwind(AssertUnwindSafe(|| RawNode::new(&raft_config, storage)))
             .map_err(|_| ConsensusError::DependencyFailure)??;
         let mut node = Self {
@@ -628,6 +734,12 @@ impl DurableNode {
             // (required_decoder set) cannot drain yet, so its rebuild is deferred
             // to decoder confirmation and fenced until then.
             membership_rebuild_pending: required_decoder.is_some(),
+            commit_unwritten: false,
+            commit_write: None,
+            commit_durable,
+            written_commit: false,
+            commit_waiting: None,
+            persisted: None,
             priority: 0,
         };
         // Rebuild committed membership before elections or network messages can
@@ -641,6 +753,18 @@ impl DurableNode {
 
     pub fn campaign(&mut self) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.campaign_inner())
+    }
+    /// What one transition of this node may stage at most, as its guard
+    /// reserves it (`memory::staging_bytes` for an operation that brings
+    /// nothing): the bound a heartbeat, a read barrier or a report is held
+    /// to, whatever the history.
+    pub fn staging_estimate(&self) -> Result<usize, ConsensusError> {
+        memory::staging_bytes(&self.raw, &self.config, 0, 0)
+    }
+    /// The bound a proposal of `incoming` bytes is held to
+    /// (`memory::staging_bytes` as its guard reserves it).
+    pub fn staging_estimate_for(&self, incoming: usize) -> Result<usize, ConsensusError> {
+        memory::staging_bytes(&self.raw, &self.config, incoming, 0)
     }
     pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
         self.budget.is_within(parent)
@@ -719,30 +843,31 @@ impl DurableNode {
     /// validated before Raft; unexpected dependency failures stop this replica.
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {
         let bytes = memory::message_bytes(&message)?;
-        let added = if message.entries.iter().any(proto::changes_configuration) {
-            1024
-        } else {
-            message
-                .get_snapshot()
-                .get_metadata()
-                .get_conf_state()
-                .voters
-                .len()
-                .saturating_add(
-                    message
-                        .get_snapshot()
-                        .get_metadata()
-                        .get_conf_state()
-                        .learners
-                        .len(),
-                )
+        // A change carried in an entry makes no member's progress here: the
+        // core appends it, and the members it adds are priced by the drain
+        // that applies it. A snapshot restores its configuration as it is
+        // stepped: the members it names that the core does not track yet.
+        let added = {
+            let conf = message.get_snapshot().get_metadata().get_conf_state();
+            let tracker = self.raw.raft.tracker();
+            conf.voters
+                .iter()
+                .chain(&conf.voters_outgoing)
+                .chain(&conf.learners)
+                .chain(&conf.learners_next)
+                .filter(|member| tracker.get(**member).is_none())
+                .count()
+                .min(focal_raft::MAX_MEMBERS)
         };
         self.guarded_in(bytes, added, BudgetLane::Completion, |replica| {
             replica.step_inner(message)
         })
     }
     pub fn tick(&mut self) -> Result<(), ConsensusError> {
-        self.guarded(|replica| replica.tick_inner())
+        self.guarded(|replica| replica.tick_inner())?;
+        // The period that passed is the measure of a quiet group: a commit
+        // no record has carried through it is written now.
+        self.settle_commit().inspect_err(|_| self.failed = true)
     }
     /// Completion arrives in drain after a quorum read barrier. Publication must
     /// reach that index before serving the read; there is no clock lease.
@@ -752,9 +877,11 @@ impl DurableNode {
         })
     }
     pub fn propose_conf_change(&mut self, change: ConfChangeV2) -> Result<(), ConsensusError> {
+        // Proposed, the change is an entry; the members it adds are priced
+        // by the drain that applies it.
         self.guarded_in(
             change.compute_size() as usize,
-            change.changes.len(),
+            0,
             BudgetLane::Completion,
             |replica| replica.propose_conf_change_inner(change),
         )
@@ -789,6 +916,51 @@ impl DurableNode {
         self.raw.set_priority(priority);
         Ok(())
     }
+    /// While this member leads, `peer` is sent no more than `bytes` of
+    /// entries ahead of its answers: what its owner learned the path to it
+    /// carries ([27 §11]). One entry that is larger is still sent, alone,
+    /// and a bound of nothing is one byte. Never more than this group's
+    /// budget can stage in one transition beside a page for every member:
+    /// a window the budget cannot stage would refuse every answer of the
+    /// member it was made for. False for a peer the configuration does not
+    /// name. The bound is kept until it is said again; a member the
+    /// configuration makes anew begins at one page (`page_bytes`).
+    ///
+    /// [27 §11]: ../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
+    pub fn set_inflight_bytes(&mut self, peer: u64, bytes: u64) -> Result<bool, ConsensusError> {
+        self.check()?;
+        let page = self.page_bytes();
+        // What one transition stages for its sends: a page for every
+        // member, and the window of the one whose answer it may be
+        // (`memory::staging_bytes`). The most one reservation may be under
+        // this budget and every budget above it, less what the group holds
+        // at rest and those pages, is the most a window can be and still
+        // be staged.
+        let members = u64::try_from(self.raw.raft.tracker().len()).unwrap_or(u64::MAX);
+        let held = u64::try_from(memory::raw_bytes(&self.raw)?).unwrap_or(u64::MAX);
+        let stageable = u64::try_from(self.budget.reservation_limit(BudgetLane::Completion))
+            .unwrap_or(u64::MAX)
+            .saturating_sub(held)
+            .saturating_sub(page.saturating_mul(members.saturating_add(1)));
+        Ok(self
+            .raw
+            .set_inflight_bytes(peer, bytes.min(stageable).max(1)))
+    }
+    /// The bytes of entries one message carries at most, and one entry at
+    /// least: what a member is sent ahead of its answers until its owner
+    /// says what the path to it carries.
+    pub fn page_bytes(&self) -> u64 {
+        self.raw.raft.config().max_size_per_msg
+    }
+    /// The bytes of entries in flight to `peer` and the bound on them, as
+    /// this member leads; `None` for a peer the configuration does not name.
+    pub fn inflight_bytes(&self, peer: u64) -> Option<(u64, u64)> {
+        self.raw
+            .raft
+            .tracker()
+            .get(peer)
+            .map(|progress| (progress.inflights.bytes(), progress.inflights.byte_cap()))
+    }
     /// Ticks without leader contact before this node campaigns.
     /// Ticks between a leader's heartbeats.
     pub fn heartbeat_tick(&self) -> usize {
@@ -807,6 +979,29 @@ impl DurableNode {
     }
     pub fn election_tick(&self) -> usize {
         self.config.election_tick
+    }
+    /// Whether a read asked here waits for a round of heartbeats that has
+    /// not left: it leaves with the next drain, carrying every read asked
+    /// by then (`focal_raft::Raft::ask_reads`). An owner with more work
+    /// already queued takes it first, so that reads queued together are
+    /// confirmed by one round and not by one each.
+    pub fn reads_unasked(&self) -> bool {
+        self.raw.raft.reads_unasked()
+    }
+    /// The reads asked here that wait for a quorum to confirm them.
+    pub fn reads_waiting(&self) -> usize {
+        self.raw.raft.pending_read_count()
+    }
+    /// The reads this member may hold in flight: the core's own bound, which
+    /// a follower's parked read barriers share (27 §5, follower reads).
+    pub fn pending_reads(&self) -> usize {
+        self.config.max_inflight_messages.saturating_add(1)
+    }
+    /// The messages this member lets one peer have in flight at once
+    /// (`NodeConfig::max_inflight_messages`): what an owner admits of a
+    /// peer's traffic beside its participants (F56).
+    pub fn inflight_window(&self) -> usize {
+        self.config.max_inflight_messages
     }
     /// The ticks this member waits beyond its election timeout before it
     /// campaigns (`focal_raft::Raft::set_patience`): what its owner gives
@@ -1058,7 +1253,13 @@ impl DurableNode {
     /// Quorum ReadIndex completion arrives in drain. Publication must also reach
     /// its index before a linearizable read is served. No clock lease is involved.
     fn read_index_inner(&mut self, context: Vec<u8>) -> Result<(), ConsensusError> {
-        self.check_leader()?;
+        // A follower asks through its leader: the core forwards the read and
+        // the answer names the leader's commit index (27 §5, follower reads).
+        // One that knows no leader has no one to ask.
+        self.check()?;
+        if self.raw.raft.state() != StateRole::Leader && self.raw.raft.leader_id() == 0 {
+            return Err(ConsensusError::NotLeader { leader: 0 });
+        }
         if context.is_empty() || context.len() > 1024 {
             return Err(ConsensusError::Capacity);
         }
@@ -1079,10 +1280,12 @@ impl DurableNode {
         if change.compute_size() as usize > self.config.max_entry_bytes {
             return Err(ConsensusError::Capacity);
         }
+        // A change committed and not yet applied by this member is a
+        // moment, not a fault in the request: the one that follows it is
+        // asked again once the configuration it builds on is applied (an
+        // administrator's promotion right after its admission's receipt).
         if self.raw.raft.has_pending_conf() {
-            return Err(ConsensusError::Configuration(
-                "a membership change is already in flight",
-            ));
+            return Err(ConsensusError::MembershipPending);
         }
         // One this member could not read where it is applied is not proposed.
         proto::Plan::of(&change)
@@ -1180,15 +1383,36 @@ impl DurableNode {
     }
     pub fn status(&self) -> NodeStatus {
         let conf = &self.raw.store().conf_state;
+        let scalars = self.scalars();
         NodeStatus {
+            node_id: scalars.node_id,
+            leader_id: scalars.leader_id,
+            term: scalars.term,
+            committed_index: scalars.committed_index,
+            applied_index: scalars.applied_index,
+            role: scalars.role,
+            voters: conf.voters.clone(),
+            learners: conf.learners.clone(),
+        }
+    }
+    /// The status's scalars, copied: a check that needs no membership
+    /// allocates nothing (the audit's F53).
+    pub fn scalars(&self) -> NodeScalars {
+        NodeScalars {
             node_id: self.config.node_id,
             leader_id: self.raw.raft.leader_id(),
             term: self.raw.raft.term(),
             committed_index: self.raw.raft.log().committed(),
             applied_index: self.delivered_index,
             role: self.raw.raft.state(),
-            voters: conf.voters.clone(),
-            learners: conf.learners.clone(),
+        }
+    }
+    /// The membership as this node holds it, borrowed.
+    pub fn membership(&self) -> MembershipView<'_> {
+        let conf = &self.raw.store().conf_state;
+        MembershipView {
+            voters: &conf.voters,
+            learners: &conf.learners,
         }
     }
     /// Per-peer replication progress this node tracks as leader (empty when not
@@ -1233,9 +1457,9 @@ impl DurableNode {
             matched: progress.matched,
             next_index: progress.next_index,
             state: match progress.state {
-                ProgressState::Probe => 0,
-                ProgressState::Replicate => 1,
-                ProgressState::Snapshot => 2,
+                ProgressState::Probe => PEER_PROBE,
+                ProgressState::Replicate => PEER_REPLICATE,
+                ProgressState::Snapshot => PEER_SNAPSHOT,
             },
             recent_active: progress.recent_active,
             paused: progress.paused,
@@ -1257,6 +1481,45 @@ impl DurableNode {
     /// configuration does not name the recipient.
     pub fn snapshot_index(&self) -> u64 {
         self.raw.store().snapshot_index()
+    }
+    /// The index of the last entry this node's log holds, durable or not:
+    /// an append that names an entry past it is refused.
+    pub fn last_index(&self) -> Result<u64, ConsensusError> {
+        Ok(self.raw.raft.log().last_index()?)
+    }
+    /// Whether the stored snapshot names every member of the configuration
+    /// this node has applied. Raft discards a snapshot that does not name
+    /// its recipient, so a member added after the log was compacted is
+    /// seeded only by a later snapshot; a log complete from its first entry
+    /// seeds anyone. A change that only promotes or removes leaves every
+    /// member named.
+    pub fn snapshot_names_every_member(&self) -> bool {
+        let store = self.raw.store();
+        if store.snapshot_index() == 0 {
+            return true;
+        }
+        let Some(stated) = store
+            .snapshot
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.conf_state.as_ref())
+        else {
+            return false;
+        };
+        let named = |node: &u64| {
+            stated.voters.contains(node)
+                || stated.learners.contains(node)
+                || stated.voters_outgoing.contains(node)
+                || stated.learners_next.contains(node)
+        };
+        let current = &store.conf_state;
+        current
+            .voters
+            .iter()
+            .chain(&current.learners)
+            .chain(&current.voters_outgoing)
+            .chain(&current.learners_next)
+            .all(named)
     }
     /// A leader cannot complete a quorum ReadIndex until it has committed an
     /// entry in its current term. Ingress uses this to defer readiness probes.

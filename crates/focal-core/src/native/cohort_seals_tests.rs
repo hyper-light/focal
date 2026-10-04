@@ -1,4 +1,4 @@
-use crate::native::claim_changes::{OriginalPlan, SealedChanges};
+use crate::native::claim_changes::{Admitted, OriginalPlan, SealedChanges};
 use crate::native::prepare::{Extras, Scratch};
 use crate::native::report_tests as fixture;
 use crate::native::*;
@@ -126,7 +126,7 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
     let Staged {
         plan,
         extras,
-        meta,
+        mut meta,
         outcome,
         mut scratch,
     } = staged;
@@ -134,11 +134,15 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
         state: &core.state,
         tail: None,
     };
+    let window = crate::native::epochs::staged(&view, &mut meta, outcome, core.limits);
     OriginalPlan::check(
         plan,
         extras,
-        meta,
-        outcome,
+        Admitted {
+            meta,
+            outcome,
+            window,
+        },
         &view,
         core.limits,
         &mut scratch,
@@ -522,7 +526,7 @@ fn suffix_refusal_for_bytes_or_visits_leaves_the_actual_source_reusable() {
         let Staged {
             plan,
             extras,
-            meta,
+            mut meta,
             outcome,
             mut scratch,
         } = stage(
@@ -549,8 +553,20 @@ fn suffix_refusal_for_bytes_or_visits_leaves_the_actual_source_reusable() {
                 admission_graph::checker_visits_bound(&sources, extras.rows.len(), extras.events())
                     .unwrap();
         }
-        let original =
-            OriginalPlan::check(plan, extras, meta, outcome, &view, limits, &mut scratch).unwrap();
+        let window = crate::native::epochs::staged(&view, &mut meta, outcome, limits);
+        let original = OriginalPlan::check(
+            plan,
+            extras,
+            Admitted {
+                meta,
+                outcome,
+                window,
+            },
+            &view,
+            limits,
+            &mut scratch,
+        )
+        .unwrap();
         if short_bytes {
             scratch.max = scratch.used;
         }

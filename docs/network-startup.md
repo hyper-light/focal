@@ -47,6 +47,16 @@ focal --data-dir /tmp/focal-worker-2 start
 
 The founder’s `Ready` record also waits for committed initial directory activation. This requires no new configuration or geographic labels.
 
+A planned stop — SIGTERM, a process manager's stop — prints one last record,
+`{"condition": "Stopped", "sessions_led": n, "sessions_handed_off": m}`: the
+sessions this node led when it was told to stop, and how many of those it handed
+off to another voter before it went ([27 §5](archictecutre/27-consensus-roadmap-and-slates-port.md)).
+A leader hands off by asking its most caught-up voter to campaign at once and
+waiting, for at most one election timeout of its own periods, until the log leads
+elsewhere; `sessions_handed_off < sessions_led` means a hand-off ran out of that
+time (no voter was reachable, or none was caught up), and the survivors elected
+after their election timeout instead.
+
 The joined node’s startup record is `CatchingUp`, with `assigned_ledger: false`. The network controller commits its authenticated contact and node capability before admitting it as a root learner. The capability records verified identity and eligibility; region and zone remain unknown until an infrastructure authority supplies them. No geography settings are needed for this step. The startup record is not a continuous progress report. A joined node has its own private local admin socket for live inspection and authorized membership operations; issuing invitations still requires the founder's signing backend.
 
 From another terminal, inspect the saved identities or the founder's published application prefix:
@@ -114,7 +124,7 @@ An unused invitation expires **one hour after its first preparation**. Repeating
 
 If `join` fails or its reply is lost, retry the exact command with the same directory, invitation, and endpoints. The saved private key, CSR, and request identity are reused. A previously committed enrollment can be recovered using that identity even after the invitation's initial redemption window closes, while the issued credential remains valid. Preserve the pending directory; substituting another invitation or endpoint is rejected. Do not delete unknown-outcome join state to manufacture a new attempt.
 
-After successful enrollment, keep the node directory intact. Startup uses its saved credentials and fails closed if initialized identity, policy, or join state is missing. Root and installed application membership removal are available through [cluster administration](cluster-admin.md). Membership removal does not drain application placement or complete evidence migration. A joined node renews its own credential ten days ahead of expiry, or on `cluster credentials renew` (the same key under a fresh certificate; see [cluster administration](cluster-admin.md)); the complete operational recovery journeys remain work in progress.
+After successful enrollment, keep the node directory intact. Startup uses its saved credentials and fails closed if initialized identity, policy, or join state is missing. Root and installed application membership removal are available through [cluster administration](cluster-admin.md). Membership removal does not drain application placement or complete evidence migration. Every node, the founder included, renews its own credential in the last third of its lifetime (thirty days by default, `node.credential_lifetime_seconds` committed at genesis), or on `cluster credentials renew` (the same key under a fresh certificate; see [cluster administration](cluster-admin.md)); the complete operational recovery journeys remain work in progress.
 
 ## Current deployment boundary
 

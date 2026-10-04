@@ -50,6 +50,7 @@ separately. Unknown outcomes retain the original expanded command.
 | `validation enter-whole-work ID --claim ID` | `validation.enter_whole_work` | Native: the issuer closes the increment cohort of the received testament and enters whole-work evaluation. |
 | `audit generate --claim ID`, `audit post ID` | `audit.generate`, `audit.post` | Native: the issuer generates and posts the closed claim's result testament. |
 | `monitor register\|rebind\|cancel` | `monitor.register`, `monitor.rebind`, `monitor.cancel` | Native: durable waits over committed claims with a logical-time deadline; rebinding follows a committed supersession; cancellation needs a terminal owner. |
+| `get archived CLAIM [--artifact\|--work\|--diagnostic\|--validation\|--testament\|--receipt ID]` | `archive.get` | Native: one object of a claim's family wherever the family is — from the ledger while it is live, from the archive bundle its `Retired` continuation names once it retired (the audit's F11); a validation comes with its evaluations and accepted results. |
 
 Each of the four families has singular `get` and plural `list` commands. List
 filters are optional. `get claim --source` enforces singular selection; use a list
@@ -78,6 +79,12 @@ exactly as the client journaled it; `NativeRead` (tag 26) returns fixed-prefix
 documents of committed native rows; `NativeList` (tag 27) is a bounded list
 over the native index families ([22 §7](22-native-record-format.md)), served
 statelessly from the committed prefix with a node-authenticated continuation.
+The registered encodings of the three operations are pinned by
+`native_tests::native_envelopes_and_replies_round_trip_with_frozen_bytes`; the
+read query's shape changed once, on 2026-09-29 (the audit's F07 and F08: the
+claim expansion's continuation, the declaration page's claim and the
+`SelectEvaluation` query), before any release carried the profile, and the
+fixture was re-registered with it.
 Under the profile the shared content transfer,
 managed request stream, reconcile, summary and stream operations stay
 admissible; legacy typed submissions and legacy reads do not, and native
@@ -106,8 +113,20 @@ acceptance slots, scopes and authored content; definitions with their program
 and authored specification; evaluations bound to their declaration; accepted
 results; artifacts with local custody; work artifacts and diagnostics;
 responses; result testaments; receipts; monitors; outcomes; creation results;
-events; frozen legacy rows as bytes). Claim expansions append the related
-objects to the same page. Bounded lists are served from the index families,
+events; frozen legacy rows as bytes). A claim expansion appends the related
+objects to the same page in one order — the responses from the latest cycle
+back, then the evaluations in key order — and a page that fills before the
+expansion ends carries the position to resume at (`after`, an exact read at
+the same prefix that never repeats the claim) rather than truncating. A
+declaration's evaluations page in key order under its claim, the continuation
+the last key the page consumed, so pages of any size concatenate to the whole
+span at one prefix. The owner selects the current evaluation of a declaration
+itself (`SelectEvaluation`: of the declaration's whole span — bounded by the
+core's evaluations per claim, never by a page — the targets the selector
+names, at the named generation when there is one, live when asked, the tie set
+at the highest generation; one object is the current evaluation, several an
+ambiguity the caller narrows, a set that does not fit a `Capacity` refusal,
+never a cut). Bounded lists are served from the index families,
 the validation context is composed from one prefix, and the node's timers
 are scheduled by the due-timer family
 ([22 §7](22-native-record-format.md#7-secondary-index-families)); claim
@@ -128,7 +147,8 @@ carries `wire = Native` and `retry = NativeN1`, and publishes a hand-written
 input schema ([native_schema.rs](../../crates/focal-client/src/operations/native_schema.rs)).
 The host first asks the compiler which committed objects the verb binds to
 (`requirements`: the claim, the claim and its response, or the claim and the
-current evaluations of one declaration), reads them once at a fixed prefix and
+owner's selection of the current evaluation of one declaration over its whole
+span — never a page of it), reads them once at a fixed prefix and
 extracts their bindings (`Resolved`), then compiles the document, the
 authenticated context, the claimed request identity and those bindings into a
 `NativeInput` and encodes the `FCNINPUT` frame
@@ -157,14 +177,33 @@ Identity is durable before transmission
 ([native_store.rs](../../crates/focal-client/src/native_store.rs)): the store
 claims an `n1:` reference (the request identity, epoch one) under the
 canonical document, persists the compiled frame, fingerprint and minted object
-identities, and only then marks the operation ready. `Client::submit_native`
+identities, and only then marks the operation ready. An operation's life ends
+by retirement (2026-09-29, the audit's F04–F06): once its committed receipt or
+a closed refusal has been reported it stays answered from its journal until a
+claim needs its slot; then the one reported longest ago retires — its frame
+and journal leave the store, its identity stays taken in the catalogue's
+retired table, bounded to the journal's capacity with the oldest leaving
+first — so the journal is bounded by its capacity rather than by the work
+ever done, and an old reference is never another operation under any intent
+(`Retired` answers it; the owner answers an exact retry from its receipt). A
+capacity refusal admitted nothing and keeps the frame for the exact retry,
+never retirable. A claim whose expansion fails is released with the failure, and
+a claim that never became ready is swept when the store is next opened: no
+bytes ever left under it. Every transition — receipt, delivery, refusal —
+reads, judges and writes under one hold of the store's lock, so a committed
+receipt is never overwritten by a stale refusal and a delivery never
+regresses, whichever process speaks second. `Client::submit_native`
 resends the identical frame while the owner answers with a pending ticket; if
 the ticket never commits within the retry policy the outcome is reported
 unknown with the request retained, and a refusal is final even after an
 uncertain attempt because the owner resolves the request key before admission.
 A capacity refusal from the node admitted nothing, so the client resends the
 identical request up to three times with backoff and then reports the refusal
-itself; the journaled reference stays pending for a later exact retry.
+itself; the journaled reference stays pending for a later exact retry. Each
+pause is the capped exponential step spread by full jitter — drawn uniformly
+from nothing to the step (2026-09-29, the audit's F64) — so callers refused
+together do not return together; the attempt, elapsed and refusal budgets
+bound the retries as before.
 Only a committed receipt whose invocation and intent equal the journaled frame
 is recorded. Refusal categories map to the exit classes of
 [failure.rs](../../crates/focal-client/src/failure.rs): invalid input 2,
@@ -277,6 +316,11 @@ Peer mutations use explicitly negotiated wire protocol 3. The server advertises
 that profile only through a handler implementing participant admission. Profiles
 1 and 2 retain their previous capability restrictions. A profile 3 envelope for
 another operation is rejected; a node certificate is not participant authority.
+Above it, profile 4 carries native frames (above) and profile 5, the ordered
+replication profile, is a node's alone: a node's replication handlers advertise
+it, a connection between nodes negotiates the highest profile both offer, and
+`Operation::RaftOrdered` is held to profile 5 as the plain `Raft` frame is held
+to the base ([27](27-consensus-roadmap-and-slates-port.md) §12).
 
 The ledger owner checks committed immutable issuer/producer identity before
 allowing an individual legacy runtime-gated command. Authentication alone leaves
@@ -611,8 +655,11 @@ relation index. The client packages these as authored shapes of
 `claim.follow_up`: typed documents lowered to one claim document by
 `focal-native-client/src/peer.rs`, so the coverage table claims them through
 `claim.submit`'s frame tags), composes `claim.lineage` from one full claim
-read, bounded ancestor reads and three relation lists at or after the first
-read's token (`observe.rs`), and observes `claim.wait` with the V1 bounds
+read, bounded ancestor reads and three relation lists, every later read exact
+at the first read's token, into one `NativeLineage` observation that names
+what its bounds left beyond it — the next ancestor past the depth, an
+ancestor unreadable at the prefix, followers listed but not read and each
+relation list's continuation (`observe.rs`; the audit's F10), and observes `claim.wait` with the V1 bounds
 plus the `testament` predicate; the CLI verbs `claim challenge|consult|
 correct|follow-up|lineage|wait` and the MCP tools of the same names share
 those documents.

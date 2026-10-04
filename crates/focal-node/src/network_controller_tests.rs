@@ -381,6 +381,7 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
         server_tls(identity(), roots.clone(), &limits).unwrap(),
         registry.clone(),
         limits.clone(),
+        MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
     let pool = PeerConnectionPool::new(
@@ -520,6 +521,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
         server_tls(identity(), roots.clone(), &limits).unwrap(),
         peers,
         limits.clone(),
+        MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
     // Keeping the UDP socket open suppresses an immediate unreachable-port
@@ -722,7 +724,7 @@ fn a_credential_is_retired_by_what_the_registry_knows_of_it_not_by_its_absence()
     let first = registry.release(&request, now).unwrap();
     let node = first.identity.node_id.unwrap();
     let material = key
-        .complete(&first, authority.ca_certificate(), now)
+        .complete(&first, authority.issuers().unwrap().trusted(), now)
         .unwrap();
     // The certificate listed, authorizing.
     assert!(!credential_retired(&registry, node, &first, now));

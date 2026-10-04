@@ -212,6 +212,16 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
         cluster.nodes[0].configuration().configuration.learners,
         vec![4]
     );
+    // The entry that changed the configuration is on record: what the
+    // group's voters attest to the root for its grant to follow (F24).
+    let admitted = ControlMembershipRecord {
+        index: receipt.committed_index,
+        term: receipt.committed_term,
+        request_hash: receipt.request_hash,
+        configuration: cluster.nodes[0].configuration().configuration,
+    };
+    assert_eq!(cluster.nodes[0].membership_record(), Some(&admitted));
+    assert_eq!(cluster.nodes[1].membership_record(), Some(&admitted));
     assert!(
         cluster.nodes[3]
             .configuration()
@@ -219,6 +229,7 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
             .learners
             .is_empty()
     );
+    assert_eq!(cluster.nodes[3].membership_record(), None);
     let promote = cluster.request(0, 2, MembershipChange::Promote { node: 4 });
     assert!(matches!(
         cluster.nodes[0].submit(promote.clone(), &NoEvidence),
@@ -235,6 +246,8 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
         cluster.nodes[3].configuration().configuration_index,
         receipt.committed_index
     );
+    // The snapshot carried the record to the replica that caught up by it.
+    assert_eq!(cluster.nodes[3].membership_record(), Some(&admitted));
     cluster.nodes[0]
         .submit(promote.clone(), &NoEvidence)
         .unwrap();
@@ -244,6 +257,13 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
         cluster.nodes[0].configuration().configuration.voters,
         vec![1, 2, 3, 4]
     );
+    let promotion = ControlMembershipRecord {
+        index: promoted.committed_index,
+        term: promoted.committed_term,
+        request_hash: promoted.request_hash,
+        configuration: cluster.nodes[0].configuration().configuration,
+    };
+    assert_eq!(cluster.nodes[0].membership_record(), Some(&promotion));
     assert!(
         cluster.nodes[0]
             .configuration()
@@ -273,6 +293,10 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
         cluster.nodes[3].receipt(promote.id).unwrap(),
         Some(promoted)
     );
+    // A restarted replica, whether it recovers the change from its log or
+    // from a checkpoint behind it, still attests it.
+    assert_eq!(cluster.nodes[0].membership_record(), Some(&promotion));
+    assert_eq!(cluster.nodes[3].membership_record(), Some(&promotion));
     cluster.nodes[0].campaign().unwrap();
     cluster.pump(None);
     let removed = cluster.request(0, 3, MembershipChange::Remove { node: 4 });

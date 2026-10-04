@@ -1,13 +1,16 @@
 //! Client-composed observations of the native engine: one claim's lineage as
-//! a bounded page of committed claims, and a bounded wait for a predicate on
-//! one claim. Both are reads only; neither mints an identity, registers a
+//! one bounded observation at one prefix, and a bounded wait for a predicate
+//! on one claim. Both are reads only; neither mints an identity, registers a
 //! monitor or touches a journal.
 use crate::CompileError;
 use crate::driver::{CLAIM_EXPAND, DriveError, Lists, READ_ITEMS, Reads};
 use focal_client::ClientError;
 use focal_client::claim_wait::{ClaimObservation, ClaimWaitCondition};
 use focal_client::input::{BuildContext, InputError, parse_id};
-use focal_client::operations::{NativeObjectDocument, NativeWaitDocument, NativeWaitResult};
+use focal_client::operations::{
+    NativeFollowersBeyond, NativeLineage, NativeObjectDocument, NativeWaitDocument,
+    NativeWaitResult,
+};
 use focal_model::*;
 use focal_wire::*;
 use std::time::{Duration, Instant};
@@ -37,7 +40,7 @@ const STATE_ONLY: NativeClaimExpand = NativeClaimExpand {
     history: false,
 };
 
-fn claim_of(page: &NativeReadPage) -> Option<&NativeClaim> {
+pub(crate) fn claim_of(page: &NativeReadPage) -> Option<&NativeClaim> {
     page.objects.iter().find_map(|object| match object {
         NativeObject::Claim(claim) => Some(&**claim),
         _ => None,
@@ -57,23 +60,29 @@ fn add(a: u32, b: u32) -> Result<u32, DriveError> {
     a.checked_add(b).ok_or_else(|| InputError::Capacity.into())
 }
 
-/// One claim's lineage: the claim itself (full expansion), its `caused_by`
-/// ancestors up to `LINEAGE_DEPTH`, then the committed claims that
-/// invalidate it, refine it or are caused by it (each with its content, up to
-/// `LINEAGE_RELATED`). The page carries the first read's token; every later
-/// read is at least at that token, so nothing shown predates the claim shown.
+/// One claim's lineage as one observation at one prefix (the audit's F10):
+/// the claim itself (full expansion), its `caused_by` ancestors up to
+/// `LINEAGE_DEPTH`, then the committed claims that invalidate it, refine it
+/// or are caused by it (each with its content, up to `LINEAGE_RELATED`). The
+/// first read is linearizable and every later read is exact at its token, so
+/// the observation is of one prefix; what its bounds left out — the next
+/// ancestor past the depth, an ancestor unreadable at the prefix, followers
+/// listed past the bound, a relation list that did not reach its end — is
+/// named beside what they took (`NativeLineage`), never mistaken for a
+/// complete lineage.
 pub fn lineage(
     document: &NativeObjectDocument,
     build: &BuildContext,
     reads: &mut Reads<'_>,
     lists: &mut Lists<'_>,
-) -> Result<NativeReadPage, DriveError> {
+) -> Result<NativeLineage, DriveError> {
     let id = ClaimId(parse_id(&document.id)?);
     let first = reads(NativeReadRequest {
         consistency: ReadConsistency::Linearizable,
         query: NativeReadQuery::Claim {
             id,
             expand: CLAIM_EXPAND,
+            after: None,
         },
         max_items: READ_ITEMS,
     })?;
@@ -85,39 +94,45 @@ pub fn lineage(
         .ok_or(CompileError::Missing("claim"))?
         .cause
         .clone();
-    let mut objects = Vec::new();
-    push(
-        &mut objects,
-        take_claim(first).ok_or(CompileError::Missing("claim"))?,
-    )?;
-    let mut at_least = |query: NativeReadQuery| {
+    let claim = take_claim(first).ok_or(CompileError::Missing("claim"))?;
+    let mut exact = |query: NativeReadQuery| {
         reads(NativeReadRequest {
-            consistency: ReadConsistency::AtLeast(token),
+            consistency: ReadConsistency::Exact(token),
             query,
             max_items: READ_ITEMS,
         })
     };
     // Ancestors, nearest first.
-    for _ in 0..LINEAGE_DEPTH {
+    let mut ancestors = Vec::new();
+    let mut ancestors_beyond = None;
+    let mut ancestors_missing = None;
+    loop {
         let Cause::Claim(parent) = cause else {
             break;
         };
-        let page = at_least(NativeReadQuery::Claim {
+        if ancestors.len() >= LINEAGE_DEPTH {
+            ancestors_beyond = Some(parent);
+            break;
+        }
+        let page = exact(NativeReadQuery::Claim {
             id: parent,
             expand: CONTENT_ONLY,
+            after: None,
         })?;
         visited = add(visited, page.visited)?;
         let Some(ancestor) = claim_of(&page) else {
+            ancestors_missing = Some(parent);
             break;
         };
         cause = ancestor.cause.clone();
         push(
-            &mut objects,
+            &mut ancestors,
             take_claim(page).ok_or(CompileError::Missing("claim"))?,
         )?;
     }
     // Followers: corrections, refinements and children, by relation index.
     let mut related: Vec<ClaimId> = Vec::new();
+    let mut followers_beyond = Vec::new();
     for kind in [
         RelationKind::Invalidates,
         RelationKind::Refines,
@@ -141,34 +156,55 @@ pub fn lineage(
             max_visits: 1024,
         })?;
         visited = add(visited, page.visited)?;
+        let mut listed_not_read = 0u32;
         for object in &page.objects {
             let NativeObject::Claim(claim) = object else {
                 continue;
             };
             let follower = ClaimId(claim.binding.object.0);
-            if follower == id || related.contains(&follower) || related.len() >= LINEAGE_RELATED {
+            if follower == id || related.contains(&follower) {
+                continue;
+            }
+            if related.len() >= LINEAGE_RELATED {
+                listed_not_read = add(listed_not_read, 1)?;
                 continue;
             }
             related.try_reserve(1).map_err(|_| InputError::Capacity)?;
             related.push(follower);
         }
+        if listed_not_read > 0 || page.next.is_some() {
+            followers_beyond
+                .try_reserve(1)
+                .map_err(|_| InputError::Capacity)?;
+            followers_beyond.push(NativeFollowersBeyond {
+                kind,
+                listed_not_read,
+                cursor: page.next,
+            });
+        }
     }
+    let mut followers = Vec::new();
     for follower in related {
-        let page = at_least(NativeReadQuery::Claim {
+        let page = exact(NativeReadQuery::Claim {
             id: follower,
             expand: CONTENT_ONLY,
+            after: None,
         })?;
         visited = add(visited, page.visited)?;
         if let Some(object) = take_claim(page) {
-            push(&mut objects, object)?;
+            push(&mut followers, object)?;
         }
     }
-    Ok(NativeReadPage {
+    Ok(NativeLineage {
         token,
         native_sequence,
         logical_time,
-        objects,
-        next: None,
+        claim,
+        ancestors,
+        ancestors_beyond,
+        ancestors_missing,
+        followers,
+        followers_beyond,
         visited,
     })
 }
@@ -200,6 +236,7 @@ pub fn wait(
             query: NativeReadQuery::Claim {
                 id,
                 expand: STATE_ONLY,
+                after: None,
             },
             max_items: 1,
         })?;

@@ -54,6 +54,7 @@ fn read_request() -> NativeReadRequest {
         query: NativeReadQuery::Claim {
             id: ClaimId::from_u128(5),
             expand: NativeClaimExpand::default(),
+            after: None,
         },
         max_items: 8,
     }
@@ -87,6 +88,14 @@ fn fixed_header_inspection_reads_exactly_the_registered_layout() {
             key: key(),
             command: 27,
         }
+    );
+    // The client protocol's generation floor (tag 28, F12) is a registered
+    // participant command; the tag after the registry is refused below.
+    assert_eq!(
+        inspect_native_frame(&frame(0, 0, ledger(), key(), 28))
+            .unwrap()
+            .command,
+        28
     );
     // Timer namespaces parse; admissibility refuses them.
     assert_eq!(
@@ -228,13 +237,16 @@ fn native_operations_carry_registered_tags_actor_capability_and_mutation_class()
         .collect();
     assert_eq!(tags.len(), NativeOperationKind::ALL.len());
     assert_eq!(names.len(), NativeOperationKind::ALL.len());
-    assert_eq!(tags.iter().max(), Some(&31));
+    // 32 advances a principal's generation floor and 33 seals closed
+    // outcomes (F12); the seal joins the timers, import and retirement as
+    // the operations no participant authors.
+    assert_eq!(tags.iter().max(), Some(&33));
     assert_eq!(
         NativeOperationKind::ALL
             .iter()
             .filter(|kind| !kind.participant_authored())
             .count(),
-        5
+        6
     );
     assert_eq!(
         NativeProfile::from_registered(1),
@@ -414,6 +426,7 @@ fn read_and_list_requests_validate_bounds_identities_and_cursors() {
         query: NativeReadQuery::Claim {
             id: ClaimId::from_u128(0),
             expand: NativeClaimExpand::default(),
+            after: None,
         },
         ..read_request()
     };
@@ -518,7 +531,7 @@ fn native_envelopes_and_replies_round_trip_with_frozen_bytes() {
         hashes,
         [
             "48dd17b32e540837c507bb4d6c5bfdbdad5f1344bc0714fd84652a3ed8b25084",
-            "a7f793ac79ad32d46e33f933d89058e11fdc1fc0bdf548bfce14b62cabb1c57f",
+            "34c4ba773b5f1ce97b7198b8a5d43515cbb0652a90e7c3706a173a1f4d685adc",
             "551ba3a5622360547dd0e1d999472cb23d777bad70d203433a22365f03c0693a",
         ]
     );
@@ -929,5 +942,322 @@ async fn the_native_profile_negotiates_over_the_local_socket_only_where_the_hand
         task.abort();
         let _ = task.await;
         drop(server);
+    }
+}
+
+#[test]
+fn native_pages_are_validated_against_the_shape_their_query_names() {
+    let limits = WireLimits::default();
+    let principal = Some(key().principal);
+    let claim = ClaimId::from_u128(5);
+    let validation = ValidationId::from_u128(6);
+    let token = ReadToken {
+        ledger: ledger(),
+        sequence: SessionSeq(4),
+        route_epoch: RouteEpoch(1),
+    };
+    let binding = |object: u128| NativeBinding {
+        object: ObjectId::from_u128(object),
+        content: ContentHash([9; 32]),
+        revision: ObjectRevision(1),
+    };
+    let key_of = |claim, validation, slot: u32, generation: u64| NativeEvaluationKey {
+        claim,
+        validation,
+        target: NativeEvaluationTarget::Work {
+            response: TestamentId::from_u128(16),
+            slot,
+            artifact: ArtifactId::from_u128(15),
+        },
+        generation,
+    };
+    let key = |slot, generation| key_of(claim, validation, slot, generation);
+    let evaluation = |key: NativeEvaluationKey, state: NativeValidationState| {
+        NativeObject::Evaluation(Box::new(NativeEvaluation {
+            binding: binding(500),
+            key,
+            target: NativeTarget::Artifact {
+                response: binding(16),
+                slot: 0,
+                artifact: binding(15),
+            },
+            state,
+            phase: NativePhase::Programmatic,
+            declared_phase: ValidationPhase::WholeWork,
+            declaration_index: 1,
+            issuer: ParticipantId::from_u128(1),
+            evaluator: Some(ParticipantId::from_u128(3)),
+            mode: ValidationMode::Required,
+            receipt: None,
+            has_begun: false,
+            attempt_index: None,
+            attempt_bound: 2,
+            fence: None,
+            suppression: None,
+            last_result: None,
+            sealed: None,
+            deadline: Deadline {
+                timer: TimerId::from_u128(1),
+                generation: 1,
+                at: 10_000,
+            },
+            current_attempt: None,
+        }))
+    };
+    let ready = |slot, generation| evaluation(key(slot, generation), NativeValidationState::Ready);
+    let request = |query, consistency| {
+        envelope(
+            NATIVE_PROTOCOL_VERSION,
+            Operation::NativeRead(NativeReadRequest {
+                consistency,
+                query,
+                max_items: 8,
+            }),
+        )
+    };
+    let page = |objects: Vec<NativeObject>, next| NativeReadPage {
+        token,
+        native_sequence: SessionSeq(4),
+        logical_time: 0,
+        visited: u32::try_from(objects.len()).unwrap().max(1),
+        objects,
+        next,
+    };
+    let valid = |request: &RequestEnvelope, page: NativeReadPage| {
+        validate_response(
+            request,
+            &request.reply(Response::NativeRead(page)),
+            principal,
+            &limits,
+        )
+        .is_ok()
+    };
+    let missing = NativeObject::Missing(NativeObjectRef::Definition(validation));
+    let standing = NativeObject::Standing(NativeStanding {
+        principal: ParticipantId::from_u128(1),
+        role: NativePeerRole::Actor,
+        profile: NativeProfile::AuthoredV1,
+        native_sequence: SessionSeq(4),
+        logical_time: 0,
+    });
+
+    // An evaluation page: the declaration's evaluations in strictly increasing
+    // key order after the cursor, continuing only forward from the last one.
+    let evaluations = |after| {
+        request(
+            NativeReadQuery::Evaluations {
+                claim,
+                validation,
+                after,
+            },
+            if after.is_none() {
+                ReadConsistency::AtLeast(token)
+            } else {
+                ReadConsistency::Exact(token)
+            },
+        )
+    };
+    let first = evaluations(None);
+    assert!(valid(
+        &first,
+        page(vec![ready(0, 1), ready(1, 1), ready(2, 1)], None)
+    ));
+    assert!(valid(
+        &first,
+        page(
+            vec![ready(0, 1), ready(1, 1)],
+            Some(NativeContinuation::Evaluations(key(1, 1)))
+        )
+    ));
+    // A row the page consumed but could not show still moves the cursor.
+    assert!(valid(
+        &first,
+        page(
+            vec![ready(0, 1)],
+            Some(NativeContinuation::Evaluations(key(1, 1)))
+        )
+    ));
+    assert!(valid(&first, page(vec![missing.clone()], None)));
+    assert!(valid(&first, page(vec![], None)));
+    for bad in [
+        page(vec![ready(1, 1), ready(0, 1)], None),
+        page(vec![ready(0, 1), ready(0, 1)], None),
+        page(
+            vec![evaluation(
+                key_of(claim, ValidationId::from_u128(7), 0, 1),
+                NativeValidationState::Ready,
+            )],
+            None,
+        ),
+        page(
+            vec![evaluation(
+                key_of(ClaimId::from_u128(8), validation, 0, 1),
+                NativeValidationState::Ready,
+            )],
+            None,
+        ),
+        page(
+            vec![ready(1, 1), ready(2, 1)],
+            Some(NativeContinuation::Evaluations(key(0, 1))),
+        ),
+        page(
+            vec![ready(0, 1)],
+            Some(NativeContinuation::Evaluations(key_of(
+                ClaimId::from_u128(8),
+                validation,
+                1,
+                1,
+            ))),
+        ),
+        page(
+            vec![ready(0, 1)],
+            Some(NativeContinuation::Responses { cycle: 1 }),
+        ),
+        page(vec![standing.clone()], None),
+        page(
+            vec![missing.clone()],
+            Some(NativeContinuation::Evaluations(key(0, 1))),
+        ),
+    ] {
+        assert!(!valid(&first, bad));
+    }
+    let resumed = evaluations(Some(key(1, 1)));
+    assert!(valid(&resumed, page(vec![ready(2, 1)], None)));
+    for bad in [
+        page(vec![ready(1, 1)], None),
+        page(vec![ready(0, 2)], None),
+        page(
+            vec![ready(2, 1)],
+            Some(NativeContinuation::Evaluations(key(1, 1))),
+        ),
+    ] {
+        assert!(!valid(&resumed, bad));
+    }
+
+    // A selection: one tie set the selector names, at one generation, live
+    // when asked, never continued.
+    let select = |selector, generation, live| {
+        request(
+            NativeReadQuery::SelectEvaluation(NativeSelectionQuery {
+                claim,
+                validation,
+                selector,
+                generation,
+                live,
+            }),
+            ReadConsistency::AtLeast(token),
+        )
+    };
+    let any = select(
+        NativeEvaluationSelector::WholeWork { slot: None },
+        None,
+        true,
+    );
+    assert!(valid(&any, page(vec![ready(0, 2), ready(1, 2)], None)));
+    assert!(valid(&any, page(vec![], None)));
+    assert!(valid(&any, page(vec![missing.clone()], None)));
+    for bad in [
+        page(vec![ready(0, 1), ready(1, 2)], None),
+        page(
+            vec![evaluation(key(0, 2), NativeValidationState::Validated)],
+            None,
+        ),
+        page(vec![standing.clone()], None),
+        page(
+            vec![ready(0, 2)],
+            Some(NativeContinuation::Evaluations(key(0, 2))),
+        ),
+    ] {
+        assert!(!valid(&any, bad));
+    }
+    let slot_zero = select(
+        NativeEvaluationSelector::WholeWork { slot: Some(0) },
+        None,
+        true,
+    );
+    assert!(valid(&slot_zero, page(vec![ready(0, 2)], None)));
+    assert!(!valid(&slot_zero, page(vec![ready(1, 2)], None)));
+    let admission = select(NativeEvaluationSelector::Admission, None, true);
+    assert!(!valid(&admission, page(vec![ready(0, 2)], None)));
+    let third = select(
+        NativeEvaluationSelector::WholeWork { slot: None },
+        Some(3),
+        false,
+    );
+    assert!(valid(
+        &third,
+        page(
+            vec![evaluation(key(0, 3), NativeValidationState::Validated)],
+            None
+        )
+    ));
+    assert!(!valid(&third, page(vec![ready(0, 2)], None)));
+
+    // A resumed claim expansion never repeats the claim and its continuation
+    // advances: responses run down the cycles, then the evaluations run up
+    // the keys.
+    let expansion = |after| {
+        request(
+            NativeReadQuery::Claim {
+                id: claim,
+                expand: NativeClaimExpand::default(),
+                after,
+            },
+            if after.is_none() {
+                ReadConsistency::AtLeast(token)
+            } else {
+                ReadConsistency::Exact(token)
+            },
+        )
+    };
+    let opening = expansion(None);
+    assert!(valid(
+        &opening,
+        page(vec![], Some(NativeContinuation::Responses { cycle: 5 }))
+    ));
+    assert!(valid(
+        &opening,
+        page(vec![], Some(NativeContinuation::Evaluations(key(0, 1))))
+    ));
+    assert!(!valid(
+        &opening,
+        page(
+            vec![],
+            Some(NativeContinuation::Evaluations(key_of(
+                ClaimId::from_u128(8),
+                validation,
+                0,
+                1
+            )))
+        )
+    ));
+    let after_responses = expansion(Some(NativeContinuation::Responses { cycle: 3 }));
+    assert!(valid(
+        &after_responses,
+        page(vec![], Some(NativeContinuation::Responses { cycle: 2 }))
+    ));
+    assert!(valid(
+        &after_responses,
+        page(vec![], Some(NativeContinuation::Evaluations(key(0, 1))))
+    ));
+    assert!(valid(&after_responses, page(vec![], None)));
+    assert!(!valid(
+        &after_responses,
+        page(vec![], Some(NativeContinuation::Responses { cycle: 3 }))
+    ));
+    let after_evaluations = expansion(Some(NativeContinuation::Evaluations(key(1, 1))));
+    assert!(valid(
+        &after_evaluations,
+        page(
+            vec![ready(2, 1)],
+            Some(NativeContinuation::Evaluations(key(2, 1)))
+        )
+    ));
+    for bad in [
+        page(vec![], Some(NativeContinuation::Evaluations(key(0, 1)))),
+        page(vec![], Some(NativeContinuation::Responses { cycle: 1 })),
+        page(vec![], Some(NativeContinuation::Results(ObjectRevision(1)))),
+    ] {
+        assert!(!valid(&after_evaluations, bad));
     }
 }

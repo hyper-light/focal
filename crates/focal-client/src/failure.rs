@@ -92,6 +92,8 @@ pub fn native(refusal: &NativeRefusal) -> Failure {
             NativeErrorCode::InvalidCut => Failure::error("invalid_cut", 5),
             NativeErrorCode::Legacy => Failure::error("legacy_engine", 2),
             NativeErrorCode::Unsupported => Failure::error("unsupported_operation", 2),
+            NativeErrorCode::RequestHistoryExpired => Failure::error("request_history_expired", 5),
+            NativeErrorCode::EpochNotAdmitted => Failure::error("epoch_not_admitted", 5),
         },
     }
 }
@@ -117,6 +119,7 @@ pub fn native_store(error: &NativeStoreError) -> Failure {
         | NativeStoreError::ReceiptMismatch => Failure::error("operation_conflict", 5),
         NativeStoreError::MissingOperation => Failure::error("not_found", 4),
         NativeStoreError::Incomplete => Failure::error("operation_conflict", 5),
+        NativeStoreError::Retired => Failure::error("operation_retired", 5),
         NativeStoreError::NotCommitted => Failure::outcome_unknown(),
     }
 }

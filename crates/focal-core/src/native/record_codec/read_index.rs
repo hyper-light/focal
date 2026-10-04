@@ -8,6 +8,9 @@ use focal_model::lifecycle::aggregation::PublicationPosition;
 use read_source::{Meter, model_error};
 
 pub(super) const PHASES: usize = 8;
+/// The hydration phase that holds the artifact rows, the ones whose custody
+/// a restore recovers.
+pub(super) const ARTIFACT_PHASE: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexKey {
     Claim(ClaimId),
@@ -65,6 +68,8 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::RetiredCycleHead(_)
         | Key::Retired(_)
         | Key::RetiredCycle(_)
+        | Key::Epochs(_)
+        | Key::Seal(_)
         | Key::WorkSlot(..)
         | Key::ClaimResultTestament(_)
         | Key::Outcome(_)
@@ -92,7 +97,7 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::DueTimer(..)
         | Key::ByObject(..) => 0,
         Key::Definition(_) | Key::ClaimContent(_) => 1,
-        Key::Artifact(_) => 2,
+        Key::Artifact(_) => ARTIFACT_PHASE,
         Key::Diagnostic(_) | Key::Work(_) => 3,
         Key::Evaluation(_) | Key::Accepted(_) | Key::DeliveryResult(_) | Key::MissingResult(_) => 4,
         Key::Response(_) => 5,
@@ -109,17 +114,19 @@ pub(super) fn lookup_work() -> Result<usize, NativeError> {
         .ok_or(NativeError::Capacity("recovery index work"))
 }
 impl<'a> Index<'a> {
-    pub(super) fn build(
-        checkpoint: &checkpoint::StructuralCheckpoint<'a>,
+    pub(super) fn build<F: inspect::RowFrame<'a>>(
+        checkpoint: &F,
         limits: NativeLimits,
         budget: &MemoryBudget,
         parsing: &Meter,
         lookup: &Meter,
+        lane: BudgetLane,
     ) -> Result<Self, NativeError> {
         // The index never exports owner capabilities and has a different key/
         // value type from the restored ledger. Its local RangeId is not the
-        // recorded or fresh ledger incarnation.
-        let mut rows = RangeStore::new_partitioned(
+        // recorded or fresh ledger incarnation. Its root is the restore's
+        // lane's, as every page it fills is.
+        let mut rows = RangeStore::new_partitioned_in(
             RangeId(0),
             0,
             limits.range,
@@ -128,6 +135,7 @@ impl<'a> Index<'a> {
                 IndexKey::Claim(_) => 0,
                 IndexKey::Artifact(_) => 1,
             },
+            lane,
         )?;
         let capacity = limits
             .range
@@ -189,8 +197,7 @@ impl<'a> Index<'a> {
                             NativeInvocation::Import => ArtifactRequest::Import,
                             _ => return Err(invalid()),
                         };
-                        if binding.ledger != checkpoint.header().ledger || binding.object.is_zero()
-                        {
+                        if binding.ledger != checkpoint.ledger() || binding.object.is_zero() {
                             return Err(invalid());
                         }
                         Some(Entry::new(

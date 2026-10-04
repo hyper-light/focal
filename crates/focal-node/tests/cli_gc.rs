@@ -326,28 +326,54 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     assert_eq!(config["grace_ms"], 1500);
     assert_eq!(config["quarantine_ms"], 600_000);
     assert_eq!(config["interval_ms"], 300);
-    // The orphan comes back on request, exactly once.
-    let restored = admin(
-        root,
-        &[
-            "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-        ],
-    );
-    assert_eq!(restored["result"]["kind"], "gc_restored", "{restored}");
-    assert_eq!(restored["result"]["restored"], true);
-    all = manifests(root, &tenant);
-    assert!(all.contains(&orphan), "{all:?}");
-    let again = admin(
-        root,
-        &[
-            "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-        ],
-    );
-    assert_eq!(again["result"]["restored"], false);
-    // A later pass takes it again; its bytes are still old.
-    let before = status["passes"].as_u64().unwrap();
+    // The orphan comes back on request, exactly once: a second request finds
+    // it back and restores nothing. A pass between the two would take it
+    // again — its bytes are old — and the second would truly bring it back,
+    // so the pair is judged across a window no pass entered: none completed
+    // and none was collecting at either end (a pass quarantines only while it
+    // shows itself collecting, and its completion clears that and counts it
+    // in one publication). A window a pass entered is asked again once a pass
+    // has taken the orphan back (a macOS runner put one between the two
+    // requests, 2026-10-03).
+    let restore = || {
+        admin(
+            root,
+            &[
+                "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
+            ],
+        )
+    };
+    let mut window = Deadline::after(Duration::from_secs(60));
+    let settled = loop {
+        let opened = gc_status(root);
+        let restored = restore();
+        assert_eq!(restored["result"]["kind"], "gc_restored", "{restored}");
+        assert_eq!(restored["result"]["restored"], true, "{restored}");
+        all = manifests(root, &tenant);
+        assert!(all.contains(&orphan), "{all:?}");
+        let again = restore();
+        let closed = gc_status(root);
+        if opened["passes"] == closed["passes"]
+            && opened["collecting"] == false
+            && closed["collecting"] == false
+        {
+            assert_eq!(
+                again["result"]["restored"], false,
+                "{again}; collector {opened} then {closed}"
+            );
+            break closed["passes"].as_u64().unwrap();
+        }
+        assert!(
+            window.open(),
+            "no two requests fell between passes: {opened} then {closed}"
+        );
+        pass_where(root, |_| manifests(root, &tenant) == bound);
+    };
+    // A later pass takes it again; its bytes are still old. Counted from
+    // the window the restores were judged in: the pass after the one that
+    // may have begun its roots by then sees the orphan back.
     pass_where(root, |_| {
-        gc_status(root)["passes"].as_u64().unwrap() > before + 1
+        gc_status(root)["passes"].as_u64().unwrap() > settled + 1
     });
     assert_eq!(manifests(root, &tenant), bound);
     // The claim retires: its family's bundle is a new object, the payload's

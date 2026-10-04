@@ -81,7 +81,8 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
         settled(view, &ledger, &[founder_node, node], 0)
     });
     let before = journey.demo(&founder, &demo, "before the upgrade");
-    // ---- Both nodes report the binary's level; the fence starts at zero.
+    // ---- Both nodes report the binary's level; a cluster founded by this
+    // binary holds the fence at its founder's level from genesis (24 §21).
     let view = journey.admin(
         &founder,
         "upgrade status",
@@ -94,9 +95,12 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
     wait_upgrade(&founder, "both nodes reporting", |v| {
         capability(v, founder_node) == level && capability(v, node) == level
     });
-    assert_eq!(upgrade(&founder)["fence_level"], 0);
-    // Only the founder raises the fence, and only to a level all support.
-    let (code, _) = journey.failure(
+    assert_eq!(upgrade(&founder)["fence_level"], level);
+    // The fence rises only to a level every node supports: a level above
+    // the binary's is refused by name from any node, before the founder's
+    // authority is asked (only the founder raises it; the CLI journey
+    // proves the refusal of a host asking a level every node supports).
+    let (code, report) = journey.failure(
         &host,
         None,
         "upgrade activate",
@@ -106,10 +110,11 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
             "upgrade",
             "activate",
             "--fence",
-            &level.to_string(),
+            &(level + 1).to_string(),
         ],
     );
-    assert_eq!(code, 3, "a host cannot raise the fence");
+    assert_eq!(code, 5, "{report}");
+    assert!(report.contains("[members_behind]"), "{report}");
     let (code, report) = journey.failure(
         &founder,
         None,

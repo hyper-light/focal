@@ -182,13 +182,24 @@ does at most one thing:
    (`placement_journal.rs`, directories `cluster/placement-root` and
    `cluster/placement-partition`, markers `PLACEMENT-ROOT.initialized` and
    `PLACEMENT-PARTITION.initialized`) hold the agent's last unresolved
-   `ControlRequest` per metadata owner under one stable client identity
-   (`PlacementAgent::client(cluster, node)`). An intent is journaled before it
-   is proposed and resubmitted with the identical request identity until the
-   owner returns a receipt or refuses it before admission (a stale compare, an
-   unverified proof, an invalid or foreign command); not-leader, not-ready,
-   capacity, unavailable and unknown outcomes keep it pending. A restart reopens
-   both journals, so a decision is neither repeated nor lost.
+   `ControlRequest` per metadata owner under a client identity bound to the
+   node: its local client (`PlacementAgent::local_client(cluster, node)`) where
+   it submits to an owner it leads, its enrolled principal where it submits
+   through the owner's leader (§16; a root intent is named by the client derived
+   from the principal). A node that leads a partition at one time and follows it
+   at another — the founder restarted into a group that grew past it (the
+   audit's F24) — names the same journal by both in turn: the journal keeps one
+   retry window per client (schema 2, at most four), adopts the client it is
+   opened with whenever nothing is pending and resumes that client's window
+   where it stood, so the owner's retry floor for a client is never crossed; and
+   the owners' placement-control ingress admits a node's local client beside its
+   principal and its root-intent client, so an intent journaled while the node
+   led still resolves through the node that leads now. An intent is journaled
+   before it is proposed and resubmitted with the identical request identity
+   until the owner returns a receipt or refuses it before admission (a stale
+   compare, an unverified proof, an invalid or foreign command); not-leader,
+   not-ready, capacity, unavailable and unknown outcomes keep it pending. A
+   restart reopens both journals, so a decision is neither repeated nor lost.
 2. **Register the founder's session.** From the hosted replica's exported
    facts (`ReplicaHost::registration_facts`, read on the owner thread) the
    agent captures the existing `FirstSessionPlan`, submits the root
@@ -199,8 +210,13 @@ does at most one thing:
    creates the session descriptor. Once the directory holds the session the
    agent never captures the plan again, so a session whose log has moved past
    its creation fence is not a registration conflict.
-3. **Report load.** Whenever the node has no load row, its enrollment
-   generation changed, or 30 s passed: `NodeLoad { available_memory }` from the
+3. **Report load.** Whenever the node has no load row, the row holds
+   another enrollment generation or another capability level than the
+   node's own (§21), or 30 s passed since its last committed report — a
+   report the partition refuses on a stale compare (its evidence names an
+   authority the owner has since replaced, as it does whenever the root
+   commits) is planned again at the next pass from a fresh observation,
+   never held for the interval: `NodeLoad { available_memory }` from the
    node's whole memory allowance, `active_weight` from the installed replica
    count, `disk_available` as the data volume's free bytes that no queued
    durable write has been promised (§10), and a report epoch above both the
@@ -531,8 +547,12 @@ certificate. A renewal decided within the second the current certificate was
 issued cannot extend it and is refused. Revoking the invitation revokes both
 certificates.
 
-**The holder.** The network controller of a joined node renews ten days ahead
-of expiry, or now on `cluster credentials renew` (`AdminCommand::RenewCredential`
+**The holder.** The network controller of every node — the founder's
+included, below — renews in the last third of the credential's lifetime
+(`credential_renewal::renewal_window`: a third, as ACME clients renew; the
+lifetime is read from the receipt itself and is the cluster's committed
+`node.credential_lifetime_seconds`, thirty days by default), or now on
+`cluster credentials renew` (`AdminCommand::RenewCredential`
 over the admin socket, `cluster.credentials.renew` in the MCP catalogue,
 served by a `CredentialHandle` in the node's handles). It signs the request
 with the credential it holds, installs the renewed receipt over the one on
@@ -554,8 +574,253 @@ sponsor's commit and the install leaves the node holding the retired receipt:
 it starts (its registry knows the same identity and key), sees the committed
 registry ahead of what it holds, renews at once and converges on the
 committed renewal without another issuance, and never announces the retired
-certificate over the renewed one. A failed attempt is retried after a minute;
-the controller keeps running on the credential it holds.
+certificate over the renewed one. A failed attempt is retried at a sixtieth
+of the window (`renewal_retry`: certbot's cadence across its own window —
+four hours under the default lifetime, never under the second the registry
+decides in); the controller keeps running on the credential it holds.
+
+**The founder (2026-09-30; the audit's F13).** The founder's node credential
+is an ordinary credential of its genesis key: issued at genesis under the
+founding subject (`focal-genesis-principal:<principal>`, since its principal
+is assigned rather than derived from the key) and renewed under the same
+subject at every revision (`issue_founder` in `prepare_renew`;
+`founding_principal` no longer requires revision 1), so every checkpoint
+and holder check keeps verifying the binding; a rotation of the founder's
+key carries the principal as any rotation does. Its controller asks the
+enrollment host it runs itself (`NetworkController::with_local_sponsor`,
+`QuorumEnrollmentHost::renew` in-process) rather than the registered
+handler, whose wait for the renewed certificate's grant is this very
+controller's next refresh; the key is `cluster/network/node-key` beside the
+genesis authority. At start the founder presents the receipt its key holds
+(the genesis one at the first start, the latest renewal installed since);
+when the committed registry renewed the same key and a crash lost the
+install, the committed renewal is adopted at once, and the founding draft
+accepts a key a committed rotation moved the identity to (the draft binds
+the genesis receipt to the key it began with or to a later receipt of the
+same identity the key holds). The sponsor route a joined node keeps is
+checked against the founder's certificate as committed now, not the genesis
+one. The lifetime is the cluster's policy: `node.credential_lifetime_seconds`
+is committed in the registry's limits at genesis, a start that asks for
+another is refused as a committed-policy change, and
+`EnrollmentRegistry::restore` adopts the committed lifetimes and compares
+only the capacities (the restoring process's own bound). A registry admits a
+lifetime of three seconds at least (`MIN_CREDENTIAL_LIFETIME`: a second to be
+issued in, one to renew in, one to expire in) and a year at most. The
+founder's authority over the root (`FounderControlAuthority`) pins its
+identity — its node and its assigned principal — and no certificate: an
+enrollment-control request is authorized by the certificate it presented,
+against the committed registry, at dispatch and again at completion (its
+`RootPeer`, as a Raft or peer-control request's), and the founder's own
+enrollment control presents the certificate its controller published last
+(a watch the controller sets once a refresh has granted the certificate it
+holds, so the control never presents one its registry does not grant yet).
+The seat the root's own group record gives the founder in its first
+directory partition names the generation of the grant that seated it; the
+founder re-granted since — its key rotated, its topology changed — holds it
+at or below its current generation (the verifier's rule for the root's group
+records, §19), where a re-granted founder could not restart its directory
+before.
+
+**The bootstrap server certificate (2026-09-30; the audit's F13, stage 2).**
+The certificate the founder's enrollment endpoint presents — what every
+invitation and every joined node's `NetworkState.sponsor` pin — is issued
+for the cluster's credential lifetime, as everything the cluster issues is
+(`BootstrapAuthority::open_or_create_for`), and succeeds itself before it
+expires. The registry (schema 5) names it: `BootstrapServer { current,
+successor }`, each a `ServerRecord` (fingerprint, issued, expires), with the
+successor's `staged_at` and the invitations open when it was staged
+(`awaiting`); one change under the founder authority,
+`Change::BootstrapServer`, moves it three ways and no other — the record of
+a certificate a registry founded before schema 5 does not name, the staging
+of a successor over the same current, the staged successor made current
+(`prepare_bootstrap_server` derives the next move from what the authority
+holds). The authority's bundle (schema 2) keeps a staged successor beside
+the current certificate (`stage_successor`, issued for the committed
+lifetime, once; `activate_successor` presents it). The founder's controller
+steps the succession at the cadence of a credential's retries
+(`QuorumEnrollmentHost::maintain_bootstrap_server`): the successor is staged
+in the last third of the current certificate's lifetime
+(`credential_renewal::window_of`), committed with the invitations open at
+that moment — which pin the current certificate alone — and activated once
+every one of them has closed (redeemed, revoked or expired:
+`bootstrap_ready_to_activate`); the bundle is swapped after the commit, and
+an activation the registry committed before the authority presented it (a
+crash between) is presented at the next step. On an activation the listener
+presents the new enrollment identity from the next handshake
+(`ListenerIdentity::replace(node, enrollment)`). `ServerTrust` carries the
+successor's pin beside the current one (`successor_fingerprint`; invitations
+are schema 2, network states schema 3, older ones decode with one pin), and
+accepts either on the connection (`accepts`); an invitation issued while a
+successor is staged carries both, so it redeems whichever the founder
+presents when it arrives; a joined node adopts the pins the committed
+registry names on every refresh (`NetworkState::write`), so a succession it
+observed reaches its next renewal. One it has not observed yet — its root
+replica behind the activation — is learned when the sponsor's endpoint
+presents a certificate it does not pin (`EnrollmentError::Unpinned`, told
+from a chain that does not verify): the founder presents a certificate only
+after the root committed it, so a control read that begins after the
+refusal — confirmed by the root's leader, answered once this node's replica
+applied what it names — holds the commit, the node adopts the pins it reads
+and dials again (`NetworkController::ask_sponsor`); a certificate the
+registry does not name even then is not the sponsor's, and the renewal
+waits as for a sponsor not reached. Before, the refusal was reported as the
+node's own credential material being inconsistent, and a host asked to
+renew the moment the successor issued failed so (2026-10-03). The
+pins are facts, not identity: `same_identity` compares the sponsor's
+endpoint, name and CA (`ServerTrust::same_sponsor`). An invitation's record
+binds the trust as the invitation's schema encoded it
+(`ServerTrust::fingerprint_as`), so an invitation issued by a schema-1
+binary still matches its record. Two horizons the renewals had left in
+place go with them. A node's grant in the root authority expired with the
+credential it was granted under; now a renewed credential extends the grant
+at the same generation (`AuthorityOperation::GrantNode` with the grant as it
+stands and a later expiry, issued by `next_root_command` when the committed
+receipt outlives the grant), so the node's seats and proofs, keyed by the
+generation, stay. A group's grant expired with the members' grants at the
+time it was issued; now a group is authorized while its members are — its
+end is the earliest of its members' current grants
+(`AuthorityCheckpoint::group_expires_at`), read wherever the grant's own
+expiry was (the proof verifier, the placement proofs, the founder's directory
+at restart), and a group grant re-issued for a membership change lasts as its
+members do. And a peer that has not applied a renewal's commit must
+still admit the renewed node — it may learn of the commit only from that
+node (a leader replicating to a learner), and one that slept through the
+grace would otherwise never be reached again — so the transport admits a
+renewal it does not know by the key it renews: the grant projection carries
+the enrolled keys beside the certificates (`PeerRegistry::replace_projection`
+with each unrevoked node enrollment's key and the start of validity of the
+certificate the registry names), and a certificate the projection does not
+name, whose chain the listener verified to the cluster's CA, is granted as
+its key is when it was issued after the one named
+(`authenticate_certificate`; an earlier certificate of the key, and a key no
+enrollment holds, are refused; the admission lasts until the projection
+names the certificate or drops the key). At dispatch the replica authorizes
+such a peer by the certificate when its registry names it and otherwise by
+the key its unrevoked enrollment holds (`authorize_node_peer`,
+`focal_control::authorize_enrolled_key`), so the renewal's own commit is
+accepted from the node that renewed.
+
+**The issuer (2026-10-02; the audit's F13, stage 3).** The issuer every
+credential chains to succeeds itself as the certificates it issues do. An
+issuer lasts `node.issuer_lifetime_seconds` ([08](08-stepped-complexity-and-deployment.md)
+§2; committed at genesis in `EnrollmentLimits::issuer_lifetime`, twelve
+credential lifetimes by default — Let's Encrypt's ratio of intermediate to
+leaf — and six at least: its succession is staged in the last third of its
+lifetime, and that third holds the activation and the retirement of the
+issuer it succeeded, a credential lifetime each; ten years at most, the
+lifetime the genesis issuer was created with before). The registry (schema
+6) names the issuers as committed, `IssuerSuccession { current, successor,
+retiring }`, each an `IssuerRecord` — the self-signed certificate, its
+*endorsement*, its validity — and `Change::Issuer` moves them three ways
+under the founder authority: a successor staged (`IssuerChange::Stage`,
+refused while one is staged or retiring, or when the endorsement is not the
+current issuer's), the staged one activated (`Activate`: it issues from now,
+the one it succeeds retires), the retiring one retired (`Retire`, refused
+while a receipt issued under it lives). The genesis issuer stays the
+cluster's *identity* (`ca_certificate` in the registry, the sponsor's trust
+and the authority anchor, compared wherever it was); the issuers are the
+*trust*: every verifier's roots are the committed set (`trust_roots`), the
+listener's for clients, the pool's and the joiner's for peers, an
+invitation's for the bootstrap endpoint (`ServerTrust.issuers`, invitations
+schema 3, network states schema 4; older ones decode with the genesis issuer
+alone), adopted by every node on each refresh (`NetworkController::refresh`,
+re-presented to the listener and the pool when they change). A verifier
+that has not adopted a successor yet — a node behind the commit, a client
+holding the trust its invitation carried — would refuse every credential
+issued under it and could never catch up through the peers it refuses (the
+class of hole the renewal's enrolled-key rule closed), so a successor is
+endorsed by its predecessor: a CA certificate for the successor's key and
+name under the predecessor's signature (`BootstrapAuthority::stage_issuer`
+issues both; `endorses` checks the pair), committed beside the self-signed
+one and presented in every chain (`[leaf, issuer, endorsement]`,
+`JoinKey::complete`/`renew`/`rotate_into`, the bootstrap server's
+`server_identity`). To a verifier that holds the predecessor the endorsement
+is an ordinary intermediate: the leaf chains through it to the anchor by
+path building alone (webpki, in both TLS directions and in the enrollment
+trust's `verify_chain`). The genesis issuer's path length of zero does not
+stand in the way: a trust anchor's own constraints are not applied in path
+building (RFC 5280 §6.1.1 leaves them to policy; webpki applies none),
+which the wire's tests hold the dependency to
+(`webpki_crosses_a_zero_length_anchor_through_an_endorsement`; the design
+first read the zero as a block and carried verifiers of its own for the
+crossing, which were never reached and are gone). Every verifier is built
+from the same bounded root set (`focal_wire::TrustRoots`: at most four
+roots, each parseable).
+The founder's authority (bundle schema 3) keeps the staged successor's key
+and endorsement, the current issuer's endorsement, and the issuer it
+succeeded while the bootstrap server certificate it issued is still
+presented; `activate_issuer` adopts a committed activation. The controller
+steps the succession at the cadence of a credential's retries
+(`QuorumEnrollmentHost::maintain_issuer`): the successor is staged in the
+last third of the issuer's lifetime, or when the operator asks (`cluster
+credentials rotate-issuer`, `cluster.credentials.rotate_issuer`, founder
+only; `cluster credentials issuers` reads the set), activated at the next
+step, and the predecessor retired once nothing live was issued under it —
+no receipt in the registry, current or retired, that is unexpired, and not
+the bootstrap server certificate, which is staged under the new issuer as
+soon as it is not under the one issuing and succeeds itself as §11 says —
+a fact, reached within a credential lifetime of the activation. A holder
+chains a renewed receipt on the issuers its controller has read from the
+root; a receipt the sponsor issued under an issuer the holder has not read
+yet — the activation committed and the renewal answered before the holder's
+root replica applied it, or before its controller's next refresh — has the
+root observed up to the receipt's revision first (`NetworkController::
+trust_for`, bounded by the revisions as they come and by the root's reply
+time; a credential request is served after the refresh that follows it,
+never between a commit and the read of it), and one the registry at that
+revision names no issuer of is refused as uninstallable. A renewal
+decided within the second the current certificate was issued would not
+extend it and is answered with the current certificate, as a retry of a
+committed renewal is (`prepare_renew`): a holder's own renewal and an
+operator's asked in one second are one renewal. The
+succession is the first behaviour gated on the upgrade fence (§21,
+`upgrade::ISSUER_SUCCESSION_LEVEL`, 2): a binary below it cannot verify an
+endorsed chain, so staging is refused (`Fenced`, by name) until the fence
+is at the level; a cluster founded by such a binary holds the fence at the
+level its founder announces from genesis (`EnrollmentRegistry::founding`
+with `upgrade::announced_level()`: its one node runs it), so a fresh
+cluster is never behind an operator step its own issuer's expiry would wait
+on. An expired
+receipt in a checkpoint may have been issued under an issuer retired since;
+`restore` holds it to its shape and verifies the signature of the live ones.
+A participant's context holds the issuers its invitation carried (its join
+journal is read beside other readers and never rewritten); its verifier
+(`focal_wire::AdoptingServerVerifier`, `client_tls_adopting`) verifies as
+any does and then reports an issuer the verified chain carried that the
+roots do not hold, endorsed by one they do (at most four presented
+certificates read), and the context adopts it beside the journal
+(`trust-adopted.bin`, replaced atomically, the newest adoptions within the
+roots a verifier holds; `network_join::adopt_issuer`, read by
+`PendingClientJoin::trust_roots` at the next start), so a later succession
+— endorsed by that successor, not by the issuer the invitation named —
+still verifies. The adoption is recorded once a request succeeded over the
+connection; a record that cannot be written is said on standard error
+(`trust_not_adopted`) and tried again at the next.
+
+**Closed records (2026-10-02; the audit's F22).** The registry kept every
+record it ever made — invitations expired unredeemed, consumed and long
+retired with their credentials, revoked — under the one bound
+(`max_invitations`) that also holds its live population, so ordinary churn
+spent the bound for good. A record is *closed* at the later of its
+invitation's expiry and its credential's: past that moment a token is
+expired, a certificate expired and a revocation holds by time, so nothing
+of the record can regain meaning once the committed time floor (every
+decision's `decided_at`, which only rises and below which no request is
+admitted) has passed it. Closed records leave the table with the next
+committed decision (`apply_committed`, after the retired sweep), in
+closing order, each visited once — an index by closing moment
+(`closing`), derived from the records and rebuilt at restore; their
+certificates, enrolled keys and retired entries go with them and their
+charge is released; the registry counts them (`compacted`, schema 7; a
+schema-6 checkpoint restores with none counted). A renewal or rotation
+moves a record's closing with the credential, so the live keep their
+records and an exact redeem retry is preserved while the credential
+lives; a compacted token or certificate is unknown, which never redeems
+or authorizes — what was `Expired` or `Revoked` before is `Unauthorized`
+after, and neither admits. `max_invitations` therefore bounds the open
+and live population; the issuance and revocation history is the committed
+command stream until the log compacts, and `cluster invitations list` is
+its export while a record is open.
 
 **Rotation (2026-09-10, R9.3).** `cluster credentials rotate`
 (`AdminCommand::RotateCredential`, `cluster.credentials.rotate`) moves a
@@ -592,9 +857,23 @@ generation before any other root work (`next_root_command`); the partition
 learns the re-grant like a drain's (§19) and the node's seats stay its own.
 `cluster credentials get` and the renewal reply report `key_identity`.
 
-**Limits.** The founder's identity is the bootstrap authority's own server
-certificate and is neither renewed nor rotated here; CA rotation is not
-implemented; client (participant) credentials are not renewed or rotated
+**A host that joins an old cluster (2026-09-30).** A joined host's first
+observation of the root is the genesis, and the genesis names the founder
+by the certificate it was founded with, which lasts one credential lifetime.
+The controller routed to its sponsor only while the certificate the observed
+registry names for the founder was granted, so a host that joined a cluster
+older than a credential lifetime had no route to announce itself through:
+it was enrolled and never admitted. The route stands while the founder's
+enrollment does — its key enrolled and unrevoked
+(`NetworkController::refresh`); the founder presents a renewal of that key,
+which the pool verifies under the cluster's roots and the founder's name,
+and the host's own listener admits as a renewal of an enrolled key.
+
+**Limits.** CA succession and issuer recovery are designed and not built
+(the remediation record, F13: a successor CA cross-signed both ways,
+committed and accepted from the pinned one; a lost `authority.bin` recovered
+from a verified backup of the private directory or by a documented
+re-founding); client (participant) credentials are not renewed or rotated
 yet; the contact re-announcement's request sequence is the committed
 contact generation plus one, which assumes every committed contact command
 of a node advanced its generation.
@@ -808,9 +1087,34 @@ absorbs, the upper host retires. A restart resumes from the committed facts:
 the hosted record, the seal, the root's delegations and each partition's
 epoch say exactly which step is next.
 
-**Limits.** Partition groups are hosted by the founder alone (one voter; the
-controller does not place control groups on other hosts yet, so a split
-bounds each metadata owner's state but not the founder's total); a merge
+**Limits.** The first partition's group is seated across hosts by the
+deployment's plan (§15) or by hand (`cluster partitions
+show|add-learner|promote|remove|transfer`, each one exact journaled request
+under `PARTITION.admin`, made where the group leads: a node whose replica
+votes and follows asks for leadership first and waits, bounded, and one that
+cannot lead reports who does — requests are never forwarded, since a leader
+cannot bind another node's administrator to a client of its retry window),
+and a leaving host's seat is vacated by `cluster nodes remove`
+before its root membership (handing the group's leadership on first where
+it led). The groups a split creates are seated like the first: a member's
+replica opens with the group's identity (the genesis the root's grant
+carries, the image digest the delegation's fence does) and no state, and is
+brought up by the founder's snapshot — the founder compacts before it
+admits its first member (in its own submit of the admission, so no tick's
+timing decides it), and its log begins after the image: no member is ever
+sent the image's prefix; an entry from the log's beginning reaching an empty member is a
+stated corruption (`ControlOptions::founded_elsewhere`). A split's and a
+merge's delegation fence is signed by a majority of each group's installed
+voters (`SessionFact::Delegation`, collected over `SessionSign`), the
+founder's alone only for a group seated on it alone. A member's seat stands
+while the root's grant seats it; a merge drops the source's delegation and
+keeps its grant until the destination has absorbed it — the absorb's fence
+needs the source group's majority — and the root then releases the group
+(`AuthorityOperation::ReleaseGroup`): its grant and every seat go, and the
+member's record goes with its seat. A seal
+the reshaper intends for a group another node leads is made where the
+group leads: the reshaper's node, a voter of the group, takes its
+leadership first and seals on its next pass; a merge
 moves at most 256 sessions because the absorb command carries the sealed
 checkpoint; the founder's session is the only session a test can create,
 so the split qualification uses a threshold of one; there is no route cache
@@ -868,8 +1172,18 @@ the leader the replica's consensus state names, and a current read is served
 here whoever leads. The replica's own route-epoch check stays as the last
 fence behind the cache. The client already follows `RouteChanged` hints over
 QUIC (a new connection to the hinted endpoint under the cluster's trust,
-the epoch updated per ledger) and refuses to loop on an unchanged hint; the
-local socket transport cannot follow one and surfaces it.
+the epoch updated per ledger) and refuses to loop on an unchanged hint; a
+hint at the epoch it holds that names another endpoint is followed — a
+route epoch names a placement, and within one the leader moves (a drained
+leader hands leadership on, §19; leaders are spread, 27 §5) — each hint
+counted against the request's attempts, and a hint from an older epoch is
+refused (until 2026-09-30 a second hint within one epoch was refused as an
+invalid response, which a request arriving during a hand-off met); it
+keeps one connection per route (`focal_wire::RouteConnections`: concurrent
+cold calls to a route join its one dial in flight and share the connection,
+and a failed request forgets a route only while the connection that failed
+is the one cached); the local socket transport cannot follow a hint and
+surfaces it.
 
 **Limits.** The directory's `leader` is the placement's preferred leader,
 not the log's: without leader transfer the two differ after an expansion,
@@ -909,10 +1223,35 @@ due). Two descriptors expose it on every surface: `cluster placement` /
 `cluster.placement` and `cluster plan` / `cluster.plan` (client
 `AdminResult::{Placement, Plan}`, the cluster skill at version 4).
 
+**The control plane in the view (2026-10-02, the audit's F24).** The
+reply carries `control`: the root group (its voters and learners from the
+node's own observation of its root replica, its leader and configuration
+index), every directory partition's group from the root's authority grants,
+and the issuer (the nodes holding its signing key: the founder, until F13
+stage 3 hands it on), each measured against the partition's live nodes by
+the rule the sessions are measured by (`focal_directory::voters_tolerance`,
+the voter half of `effective_guarantee`): what the voters tolerate of nodes,
+zones and regions as a quorum, and what blocks them. A session's data is
+only as available as the metadata that routes to and places it; the view
+says both, never one for the other. Readiness's `policy_satisfied` holds the
+committed policy to the root as well (`control_satisfied`), and
+`root.peers` names where each member's log stands as the leader knows it.
+A control read is answered on a follower too: the replica asks through the
+leader it knows (the core forwards the read index; 27 §5) and serves the
+read once it has applied the index the leader named — so a node whose root
+follows another voter still answers `membership show`, its own startup's
+membership read and the agent's root reads; before, every control read
+needed the leader, which the founder had always been. The permit a hosted
+partition opens with is minted by the node's root replica on the same
+terms — committed facts behind the barrier — leading or following, so the
+founder reopens its partition after a restart whichever voter leads.
+
 **Limits.** The view is the agent's last observation, up to one tick old;
 on a node that leads no partition it is what the founder answered; there is
 no session creation for a second tenant yet, so every placement view of a
-fresh cluster shows the founder's session alone.
+fresh cluster shows the founder's session alone. A partition group's leader
+is not named (the root's observation does not know it) and its groups are
+the founder's alone until they are placed like the root (F24, open).
 
 **Readiness (2026-09-10, R9.3).** `OperatorRead::Readiness` derives the
 four probes of [08 §9](08-stepped-complexity-and-deployment.md) from what
@@ -1026,8 +1365,17 @@ active placement whose policy already carries the durability and still
 verifies against the live registry is `satisfied`; otherwise the planner
 (`propose_placement`) picks live, eligible nodes under the active policy
 with the requested durability, the agent journals `SessionChange::Plan` for
-the partition (`planned`), and the controller executes it unattended as it
-executes every plan ([§9](#9-the-controller)). The plan's identity derives
+the partition and answers `planned` once it committed — the directory pends
+it from that commit, and the controller executes it unattended as it
+executes every plan ([§9](#9-the-controller)). A plan the partition refused
+(`CompareFailed`: the observation it was planned on went stale between the
+planning and the commit) is answered by name, `compare_failed`, and the
+operator plans again on the next observation; until 2026-10-02 the request
+was answered `planned` before the intent was journaled, so a refused plan
+was lost with the operator told it was under way — the macOS run of the
+drain journey waited three minutes on an activation that was never pending.
+A request whose partition has an intent still pending is held, with its
+waiters, to the next observation. The plan's identity derives
 from the session, its authority record and the requested durability
 (`focal.placement.request.v1`), so a retry names the same plan, and a
 request under a different durability replaces a queued one. Requests wait
@@ -1035,6 +1383,28 @@ in the agent's memory only; one that outlives the agent is answered again by
 its exact retry. The reply names the plan's operation, its voters and its
 state. R9's `deployment plan/apply` composes this request with observed
 revisions and rollback bounds; it does not replace it.
+
+**The root group under the same request (2026-10-02, F24).** A plan seats
+the root's voters before the sessions': `AdminCommand::PlanControl` asks the
+agent for the voters the durability needs — those there are, when they
+already tolerate it (`voters_tolerance`), else what `propose_placement_
+keeping` seats among the live, eligible nodes keeping the incumbents, under
+the founder's session's residency and home regions — and the plan carries
+`plan_root` with its own promise (`control_guarantee`) beside the data's.
+Apply promotes each planned voter once the root holds it as a learner (the
+network controller admits every enrolled node as one), one exact `a1:`
+request each; a learner behind or a request still deciding is asked again
+as the root moves, within the operator's allowance, and a repeated apply
+resumes what is journaled. The directory's partition groups follow (batch
+2): planned by the same rule from the grant's voters (`plan_partition`), each
+planned voter admitted as a learner by apply, hosting a replica of the group
+once the root's grant seats it (§13: the permit admits the seat, voter's or
+learner's; the replica catches up from the founder's log) and promoted once
+caught up; the root's grant follows the group's committed configuration by
+the installed voters' attestation of the entry that changed it
+(`ControlMembershipRecord`, `ChangeGroup`), as a session's does. Zone survival asked of a deployment is thereby
+zone survival of the root too; the partition groups and the issuer are
+reported as the founder's until they follow (§15).
 
 **Qualification on real binaries** (`crates/focal-node/tests/placement_binary.rs`):
 three `focal` processes over QUIC (founder, two invited and joined hosts),
@@ -1097,7 +1467,15 @@ prepared and installed, and its signatures still count toward the
 majorities of the facts it is asked to attest (`InstalledAuthorityVerifier`,
 `prepare_membership_proof`) — until 2026-09-10 each of those refused an
 ineligible member, which would have left a drained voter's log unable to
-prove any later fact. A seat belongs to the node identity it was granted
+prove any later fact; and the permit that seats a member in a directory
+partition group (§13, `authorize_first_directory`) admits the seat whatever
+the host's eligibility — until 2026-10-02 it required the host eligible, so
+a drained host that led the group could not install the root's authority
+into it, the drain itself among it, and nothing healed. A node's partition intents
+are named by its local client while its replica leads the group and by its principal
+while it follows (§16); leadership may move between the two, so an intent is presented
+as the client it was journaled under on the local path, and the leader's ingress admits
+a sender's local client in its `Submit` and `Receipt` checks as its decoder does. A seat belongs to the node identity it was granted
 to, at the generation of that grant: the same key re-granted since (a drain
 or an undrain) still holds every seat at or below its current generation,
 so its signatures verify and its own proofs prepare; a membership epoch
@@ -1221,9 +1599,9 @@ every artifact with content, in artifact order from `after` and at most
 (`CustodyRequest::Verify`, the manifest and every chunk) and counts it
 verified; an object it lacks or that fails its hash is pulled from another
 required copy — the content copies first, then the voters, each once — with
-the copy's manifest, chunk by verified chunk, resuming at the first chunk
-this node lacks or holds corrupt (a transfer opened over a chunk that fails
-its hash now installs verified bytes over it), and counts as repaired; an
+the copy's manifest, chunk by verified chunk, pulling every chunk this node
+lacks or holds corrupt and none it holds (a transfer opened over a chunk that
+fails its hash installs verified bytes over it), and counts as repaired; an
 object no copy answers with is unrecoverable, listed (bounded to 64,
 counted exactly) and turns `restore_required` on. This node then records
 its own receipt when it is a required copy, and asks every other required
@@ -1266,7 +1644,7 @@ object no peer supplies leaves the delivery retained and the copy short of
 readiness, which the placement view reports. Only an activated native
 engine projects rows into the evidence export; a replica that can host one
 but still serves legacy history exports the graph's projection. Custody reads — a seed, an object's manifest, the transfer
-that describes it, its chunks, a verification and a cancel — are admitted
+that describes it (an open, or an ask of what the copy holds), its chunks, a verification and a cancel — are admitted
 from the nodes of the installed placement *and* of an announced pending
 placement at that placement's route (`authorize_read`, `check_read_scope`),
 since a copy being prepared reads before the placement activates; writes
@@ -1276,16 +1654,38 @@ content-addressed name replaces it (`install_transferred_chunk`): the file
 was corrupt and the bytes are verified; every other install path still
 refuses a differing existing file.
 
+**What a copy holds is what it says (2026-10-03; the audit's F50).** A
+transfer opened on a copy takes an inventory of the whole object, not of the
+prefix before the first chunk lacked: every chunk the manifest names that the
+store holds verified — read and hashed, never taken on its name — is noted
+as taken, and the first chunk lacked is the first the copy lacks
+(`CustodyStore::open_transfer`). Before, the chunks past a gap were
+forgotten by the next transfer, which sent them all again, and a seal over an
+object made whole by the gap's chunk alone was refused. A sender whose
+connection to the copy admits the ordered profile asks what the copy holds
+(`CustodyRequest::OpenHeld`, answered `OpenedHeld { chunks, held }`: a bit for
+each chunk, a word for every sixty-four the manifest names, held to the
+manifest at the sender) and sends only the chunks the copy lacks
+(`striped` over the lacked); a copy of an older binary is asked `Open` and
+sent from the first chunk it lacks, as it was (`PeerConnectionPool::
+negotiated_with` reads the connection's profile, dialling it where there is
+none). A pull takes this node's own inventory the same way. Chunk files are
+content-addressed per domain, so a second object that shares chunks with one
+the copy holds crosses the path only where it differs: over relays of 2 ms at 100 Mbit/s, a second object sharing three of four 64 KiB chunks crossed toward the copy with 69,559 bytes — the chunk it lacked, the manifest and the exchanges — where a holder offering an older binary's profiles sent 203,932 (`evidence_quic`, `a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds`).
+
 ## 21. The upgrade fence
 
 Upgrades roll one binary at a time and activate incompatible behaviour only
 behind a committed fence ([08](08-stepped-complexity-and-deployment.md)
 §10). Each binary implements a capability level (`upgrade::CAPABILITY_LEVEL`,
-1 for this release) and announces it — the compiled level, or a lower one
+2 for this release) and announces it — the compiled level, or a lower one
 the operator sets through `FOCAL_CAPABILITY_LEVEL` for a staged rollout or
 a rehearsal; the variable never raises it — in every load report
 (`NodeLoad::capability`; the frozen V1 row codec restores it as zero,
-unknown). The fence itself is a fact of the enrollment registry
+unknown), and reports it at the first pass whose report commits while the
+directory holds another level (§7 step 3): a restarted binary's level never
+waits for the load interval, even behind a report its previous process
+journaled with the level that process announced. The fence itself is a fact of the enrollment registry
 (`UpgradeFence { level, activated_at, revision }`, registry schema 4; a
 schema-3 checkpoint restores with no fence), raised only by the founder
 authority through `Change::ActivateFence { level }`: a fence only rises
@@ -1313,9 +1713,17 @@ the fence is above it (`ControllerError::Fenced`, exit `upgrade_fenced`):
 a binary rolled back past the fence stops as soon as its root replica
 applies the activation, and does not start again while its applied registry
 carries it. Behaviour gated on a level opens when `upgrade::opened(fence,
-level)` holds; this release gates nothing yet, so the fence's first work is
-the rollback refusal the release qualification (R10) needs. A rollback past
-the fence is a restore from a verified backup (26 §6), never a downgrade.
+level)` holds; the issuer's succession is gated on level 2
+(`upgrade::ISSUER_SUCCESSION_LEVEL`, §11): a binary below it cannot verify
+the endorsed chain a credential issued under a successor presents, so the
+founder refuses to stage one until every node runs at the level and the
+fence says so. A cluster founded by a binary holds the fence at the level
+its founder *announces* from genesis (its one node runs it; a founder
+staging a rollout at a lower level founds at that level, never at one it
+would refuse to serve under), so what the fence gates is open to a fresh
+cluster without an operator's step. A rollback
+past the fence is a restore from a verified backup (26 §6), never a
+downgrade.
 
 ## 22. Topology facts and the residency fence
 
@@ -1378,14 +1786,26 @@ reads (`OperatorRead::Metrics` → `AdminResult::Metrics { text }`, CLI
 0.0.4) with `# HELP`/`# TYPE` per series and fixed labels on every sample
 (`node`, `cluster`; `focal_node_info` carries `role`, `region`, `zone` and
 `capability`); label values are escaped. Nothing is sampled on a caller's
-behalf: a read renders the latest snapshot, so a scraper's cadence never
-drives owner work.
+behalf: a read serves the latest page, so a scraper's cadence never drives
+owner work. Every hosted replica is asked at once and the round closes at
+the cadence (2026-09-29, the audit's F65): an owner that is refused at its
+door, gone or late costs its entry the owner-side series — the entry says
+`focal_session_observed 0` and carries what the node knows without the
+owner — and is counted in `focal_metrics_sessions_unobserved`, never read
+as healthy and never in the way of another entry; `focal_metrics_collection_milliseconds`
+is how long the round took, and the next round starts on the cadence
+whatever this one took. The text is rendered once, when the snapshot is
+published (`metrics::MetricsPage`); the socket and the loopback serve it
+as it is.
 
 `node.metrics_listen` (local configuration, loopback only, [08](08-stepped-complexity-and-deployment.md)
 §2) binds a `TcpListener` at open and serves `GET /metrics` over HTTP/1.0
-(`metrics::serve_loopback`): one connection at a time, a request bounded to
-4 KiB and two seconds, `Connection: close`, `404` for another path and
-`405` for another method, no HTTP crate. It is read-only and
+(`metrics::serve_loopback`): as many connections at once as the admin
+socket admits operators (eight; one beyond them is closed unanswered),
+each request bounded to 4 KiB and two seconds and read before anything is
+written, `Connection: close`, `404` for another path and `405` for another
+method, no HTTP crate; a scrape that never speaks costs no other its
+answer. It is read-only and
 unauthenticated by construction, which is why it never leaves the loopback
 interface; the admin socket stays the authenticated path. Sessions beyond
 `metrics::MAX_SESSIONS` are counted as truncated, never silently dropped.
@@ -1447,6 +1867,10 @@ probe or a bounded control read that gives up neither abandons the dial
 nor makes the next caller start over from the dead address, and the
 dial's outcome — the cached connection, or the unreachable cooldown when
 every candidate failed — is recorded whether or not anyone still waits.
+The pool's retry pause and its cooldown are spread by equal jitter, a
+draw from half the configured pause to the whole of it (2026-09-29, the
+audit's F64), so peers that lost one node at once do not return to it in
+step; half of each pause is kept because it is the pause's meaning.
 (Revised 2026-09-13: the first shape awaited the announced address inline
 to the connector's deadline before trying the name; every caller's shorter
 deadline cancelled it, so a fleet whose pods all moved at once never

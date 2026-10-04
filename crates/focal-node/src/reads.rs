@@ -84,7 +84,7 @@ impl ReadViews {
             context.extend_from_slice(&request_id.0);
             session
                 .read_index(context.clone())
-                .map_err(super::host::access)?;
+                .map_err(super::host::barrier_refused)?;
             let mut complete = false;
             for _ in 0..4 {
                 let events = session.poll().map_err(super::host::access)?;
@@ -131,9 +131,8 @@ impl ReadViews {
                 return Err(AccessError::Unavailable);
             };
             let object = convert(*kind, *id, object)?;
-            let size = encode_payload(&object, limits.max_frame_bytes)
-                .map_err(|_| AccessError::Capacity)?
-                .len();
+            let size =
+                payload_len(&object, limits.max_frame_bytes).map_err(|_| AccessError::Capacity)?;
             bytes = bytes.checked_add(size).ok_or(AccessError::Capacity)?;
             if bytes > limits.max_frame_bytes as usize {
                 return Err(AccessError::Capacity);

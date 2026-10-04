@@ -117,6 +117,14 @@ pub enum ContractError {
     ConflictingCause,
     #[error("committed transition position is invalid")]
     InvalidCut,
+    #[error(
+        "the request generation is below the principal's floor; its history is sealed and is never executed again"
+    )]
+    RequestHistoryExpired,
+    #[error(
+        "the request generation is not admitted: generations open in order, two at a time, until the floor advances"
+    )]
+    EpochNotAdmitted,
 }
 
 #[cfg(test)]

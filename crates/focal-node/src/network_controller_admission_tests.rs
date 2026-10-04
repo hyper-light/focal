@@ -452,6 +452,47 @@ async fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
     grant.expires_at = fixture.now + 60;
     fixture.install(grant.clone(), None).await;
     let observation = fixture.observe().await;
+    // A grant that ends before the credential the registry holds is
+    // extended to it first, at its generation (24 §11), whether or not the
+    // grant has run out already: the capability lasts as the credential does.
+    for at in [grant.expires_at - 1, grant.expires_at] {
+        let Some(ControlCommand::Authority(command)) = next_root_command(
+            &fixture.state,
+            &observation,
+            &BTreeSet::from([node]),
+            at,
+            &[],
+        )
+        .unwrap() else {
+            panic!("the grant follows its credential")
+        };
+        let AuthorityOperation::GrantNode {
+            grant: extended,
+            expected_generation,
+        } = &command.operation
+        else {
+            panic!("the grant is extended")
+        };
+        assert_eq!(*expected_generation, Some(grant.enrollment.generation));
+        assert_eq!(extended.enrollment.generation, grant.enrollment.generation);
+        assert_eq!(extended.expires_at, receipt.expires_at);
+    }
+    // An expired credential extends nothing and selects no learner.
+    assert_eq!(
+        next_root_command(
+            &fixture.state,
+            &observation,
+            &BTreeSet::from([node]),
+            receipt.expires_at,
+            &[]
+        )
+        .unwrap(),
+        None
+    );
+    let generation = grant.enrollment.generation;
+    grant.expires_at = receipt.expires_at;
+    fixture.install(grant.clone(), Some(generation)).await;
+    let observation = fixture.observe().await;
     assert!(matches!(
         next_root_command(
             &fixture.state,

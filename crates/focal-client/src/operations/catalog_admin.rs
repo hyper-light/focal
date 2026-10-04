@@ -674,6 +674,96 @@ const CLUSTER_LEADER_TRANSFER: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_PARTITIONS_SHOW: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.show",
+    version: 1,
+    description: "Read a directory partition group's committed configuration and applied fence from the replica this node hosts (24 §13).",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions show"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["partition"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_ADD_LEARNER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.add_learner",
+    version: 1,
+    description: "Journal and commit a learner admission to a directory partition group, through the replica this node hosts when it leads the group; the root's grant seats the learner and it hosts a replica. On a lost response the exact p1: reference is asked again.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions add-learner"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_PROMOTE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.promote",
+    version: 1,
+    description: "Journal and commit a voter promotion in a directory partition group after actual catch-up, through the replica this node hosts when it leads the group.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions promote"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_REMOVE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.remove",
+    version: 1,
+    description: "Journal and commit a removal from a directory partition group, through the replica this node hosts when it leads the group; cluster.nodes.remove vacates a leaving node's seats itself.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions remove"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_TRANSFER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.transfer",
+    version: 1,
+    description: "Initiate a transfer of a directory partition group's leadership to one of its voters, from the replica this node hosts when it leads, or to this node itself through the leader. Success is initiation.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions transfer"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_REQUEST_INSPECT: OperationDescriptor = OperationDescriptor {
     name: "cluster.request.inspect",
     version: 1,
@@ -872,6 +962,42 @@ const CLUSTER_CREDENTIALS_RENEW: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_CREDENTIALS_ISSUERS: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.issuers",
+    version: 1,
+    description: "The issuers the cluster's credentials chain to, as committed (24 §11): the one issuing, one staged to succeed it (trusted from its staging, endorsed by the one it succeeds), the one it succeeded while a credential issued under it still lives, each with its fingerprint and validity, and the upgrade fence the succession is gated on (24 §21). A read of committed enrollment facts.",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials issuers"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_CREDENTIALS_ROTATE_ISSUER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.rotate_issuer",
+    version: 1,
+    description: "Stage the issuer's successor now (24 §11), under the founder's authority: a fresh issuer, endorsed by the current one, committed so every node trusts it before anything is issued under it; the next step activates it, every credential renews under it, and the current issuer retires once nothing live was issued under it. Refused by name while the upgrade fence is below the level that verifies an endorsed chain (24 §21); a successor already staged or committed is answered as it is. Answers with the issuers as committed.",
+    capability: Capability::FounderNode,
+    mutation: true,
+    destructive: false,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials rotate-issuer"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_PLACEMENT: OperationDescriptor = OperationDescriptor {
     name: "cluster.placement",
     version: 1,
@@ -999,7 +1125,7 @@ const CLUSTER_SESSIONS_CREATE: OperationDescriptor = OperationDescriptor {
 const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     name: "cluster.sessions.plan",
     version: 2,
-    description: "Plan a session's placement under a requested durability (survive node, zone or region with up to N failures): the planner picks live, eligible nodes from the committed directory and the controller executes the plan unattended (install, catch up, promote, cut over, activate). The reply names the plan: planned, pending when one is already under way, or satisfied when the active placement already provides it. With dry_run the same plan is reported without being journaled, so nothing changes. Exact on retry.",
+    description: "Plan a session's placement under a requested durability (survive node, zone or region with up to N failures): the planner picks live, eligible nodes from the committed directory and the controller executes the plan unattended (install, catch up, promote, cut over, activate). The reply names the plan once it committed: planned, pending when one is already under way, or satisfied when the active placement already provides it; a plan the partition refused (planned on an observation that went stale) is compare_failed, and the caller plans again. With dry_run the same plan is reported without being journaled, so nothing changes. Exact on retry.",
     capability: Capability::Node,
     mutation: true,
     destructive: false,
@@ -1014,7 +1140,7 @@ const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
-pub const ADMIN_TOOL_COUNT: usize = 57;
+pub const ADMIN_TOOL_COUNT: usize = 64;
 const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_NODE_IDENTITY,
     CLUSTER_NODE_HEALTH,
@@ -1054,6 +1180,11 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_MEMBERSHIP_REMOVE,
     CLUSTER_MEMBERSHIP_LEAVE_JOINT,
     CLUSTER_LEADER_TRANSFER,
+    CLUSTER_PARTITIONS_SHOW,
+    CLUSTER_PARTITIONS_ADD_LEARNER,
+    CLUSTER_PARTITIONS_PROMOTE,
+    CLUSTER_PARTITIONS_REMOVE,
+    CLUSTER_PARTITIONS_TRANSFER,
     CLUSTER_REQUEST_INSPECT,
     CLUSTER_REQUEST_RECONCILE,
     CLUSTER_REQUEST_RETRY,
@@ -1064,6 +1195,8 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_CREDENTIALS_REVOKE,
     CLUSTER_CREDENTIALS_RENEW,
     CLUSTER_CREDENTIALS_ROTATE,
+    CLUSTER_CREDENTIALS_ISSUERS,
+    CLUSTER_CREDENTIALS_ROTATE_ISSUER,
     CLUSTER_CLIENT_INVITE,
     CLUSTER_PLACEMENT,
     CLUSTER_PLAN,

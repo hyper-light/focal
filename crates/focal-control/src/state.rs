@@ -85,6 +85,11 @@ impl ControlBootstrap {
             directory: directory.checkpoint().clone(),
         }
     }
+    /// Whether this is a partition's sealed image (a split destination's
+    /// first state), as against a group's empty beginning.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Partition { directory } if directory.revision > 0 || directory.sealed.is_some())
+    }
     pub fn identity(&self, options: &ControlOptions) -> Result<ControlIdentity, ControlError> {
         let (cluster, scope) = match self {
             Self::Root { directory, .. } => (directory.cluster, ControlScope::Root),
@@ -105,7 +110,10 @@ impl ControlBootstrap {
             cluster,
             group: options.consensus.group_id,
             scope,
-            genesis: hash("focal.control.genesis.v1", self)?,
+            genesis: match options.founded_elsewhere {
+                Some(genesis) => genesis,
+                None => hash("focal.control.genesis.v1", self)?,
+            },
         })
     }
 }

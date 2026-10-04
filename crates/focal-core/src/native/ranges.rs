@@ -63,7 +63,7 @@ impl RangeLayout {
     /// One member holding every key.
     pub(super) fn single(id: RangeId, budget: &MemoryBudget) -> Result<Self, MemoryError> {
         let mut members = Vec::new();
-        let allocation = reserve::<RangeBoundary>(budget, 1)?;
+        let allocation = reserve::<RangeBoundary>(budget, 1, BudgetLane::Ordinary)?;
         members
             .try_reserve_exact(1)
             .map_err(|_| MemoryError::AllocationFailed)?;
@@ -193,14 +193,16 @@ impl RangeLayout {
     }
 }
 
-fn reserve<T>(budget: &MemoryBudget, count: usize) -> Result<Allocation, MemoryError> {
+fn reserve<T>(
+    budget: &MemoryBudget,
+    count: usize,
+    lane: BudgetLane,
+) -> Result<Allocation, MemoryError> {
     let bytes = array::<T>(count).map_err(|_| MemoryError::Capacity {
         requested: count,
         available: MAX_LAYOUT_MEMBERS,
     })?;
-    Ok(budget
-        .reserve(BudgetKind::Roots, BudgetLane::Ordinary, bytes)?
-        .commit())
+    Ok(budget.reserve(BudgetKind::Roots, lane, bytes)?.commit())
 }
 
 fn route<T>(members: &[T], start: impl Fn(&T) -> Option<Affinity>, affinity: &Affinity) -> usize {
@@ -282,7 +284,10 @@ impl NativeRanges {
         if members == 0 {
             return Err(MemoryError::InvalidConfiguration("empty range layout"));
         }
-        let allocation = reserve::<RangeStore<Key, Row>>(budget, members)?;
+        // The group's own directory is charged to the assembly's lane, as
+        // its stores are: a restore funded by the completion allowance
+        // assembles under it alone.
+        let allocation = reserve::<RangeStore<Key, Row>>(budget, members, lane)?;
         let mut stores = Vec::new();
         stores
             .try_reserve_exact(members)
@@ -865,8 +870,8 @@ impl NativeRanges {
             lane,
             copy,
         )?;
-        let stores_allocation = reserve::<RangeStore<Key, Row>>(&budget, next)?;
-        let layout_allocation = reserve::<RangeBoundary>(&budget, next)?;
+        let stores_allocation = reserve::<RangeStore<Key, Row>>(&budget, next, lane)?;
+        let layout_allocation = reserve::<RangeBoundary>(&budget, next, lane)?;
         let mut stores = Vec::new();
         stores
             .try_reserve_exact(next)
@@ -926,8 +931,8 @@ impl NativeRanges {
             .ok_or(MemoryError::WrongRange)?;
         let joined = left.merge_with(right, left.id(), lane)?;
         let count = self.stores.len().saturating_sub(1);
-        let stores_allocation = reserve::<RangeStore<Key, Row>>(&budget, count)?;
-        let layout_allocation = reserve::<RangeBoundary>(&budget, count)?;
+        let stores_allocation = reserve::<RangeStore<Key, Row>>(&budget, count, lane)?;
+        let layout_allocation = reserve::<RangeBoundary>(&budget, count, lane)?;
         let mut stores = Vec::new();
         stores
             .try_reserve_exact(count)

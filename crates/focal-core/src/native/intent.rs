@@ -234,6 +234,10 @@ pub(super) fn fingerprint(
             hash_optional_receipt(&mut hash, *receipt);
             hash.update(&id.0);
         }
+        NativeCommand::AdvanceEpochFloor { minimum } => {
+            hash.update(&[28]);
+            hash.update(&minimum.0.to_le_bytes());
+        }
         NativeCommand::ReleaseScope { expected } => {
             hash.update(&[23]);
             hash_binding(&mut hash, *expected);

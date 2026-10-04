@@ -212,6 +212,11 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     )
     .unwrap();
     let ca = authority.ca_certificate().to_vec();
+    // The issuers as the authority holds them at genesis, and its server
+    // certificate, for what the test needs after the authority moves into
+    // its driver.
+    let issuers = authority.issuers().unwrap();
+    let authority_server = authority.server_certificate().to_vec();
     let enrollment_identity = authority.server_identity();
     let key = JoinKey::open_or_create(disk.path().join("founder-key"), CLUSTER).unwrap();
     let draft = FoundingEnrollmentDraft::open_or_create(
@@ -221,6 +226,7 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
         1,
         [1; 16],
         EnrollmentLimits::default(),
+        0,
         now(),
     )
     .unwrap();
@@ -244,7 +250,13 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     control.read_index(b"founding-genesis".to_vec()).unwrap();
     assert!(!control.drain(&NoAuthority).unwrap().read_states.is_empty());
     let founder_name = draft.receipt().identity.server_name.clone();
-    let founder = key.complete(draft.receipt(), &ca, now()).unwrap();
+    let founder = key
+        .complete(
+            draft.receipt(),
+            authority.issuers().unwrap().trusted(),
+            now(),
+        )
+        .unwrap();
     assert_ne!(
         founder.certificate_chain()[0],
         enrollment_identity.certificate_chain()[0]
@@ -277,13 +289,16 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     .unwrap();
     let signing = tokio::spawn(async move { driver.run(&router).await });
     let registry = PeerRegistry::new(16).unwrap();
-    let network_budget = MemoryBudget::new(16 * 1024 * 1024, 0).unwrap();
+    // The listener's budget carries a completion reserve, as the node's does:
+    // nodes' bodies are admitted on the completion lane, participants' on the
+    // ordinary one, so that control traffic is never starved by participants.
+    let network_budget = MemoryBudget::new(16 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
     let listener = Arc::new(
         NetworkListener::bind(
             "127.0.0.1:0".parse().unwrap(),
             &founder,
             Some(&enrollment_identity),
-            &ca,
+            std::slice::from_ref(&ca),
             registry.clone(),
             limits(),
             network_budget.clone(),
@@ -354,10 +369,18 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     )
     .unwrap();
     // Changing only the leaf pin keeps normal CA/name validation valid, but no
-    // application request or invitation secret may reach the handler.
+    // application request or invitation secret may reach the handler. The
+    // pin is the server certificate's fingerprint, encoded once in the
+    // token (24 §11): its last digit is flipped where it stands.
     let mut rogue_token = invitation.expose_token().unwrap().to_string();
-    let last = rogue_token.pop().unwrap();
-    rogue_token.push(if last == '0' { '1' } else { '0' });
+    let pin: String = server_fingerprint(authority_server.as_slice())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(rogue_token.matches(&pin).count(), 1, "{rogue_token}");
+    let at = rogue_token.find(&pin).unwrap() + pin.len() - 1;
+    let last = rogue_token.remove(at);
+    rogue_token.insert(at, if last == '0' { '1' } else { '0' });
     let rogue = Invitation::parse(&rogue_token).unwrap();
     assert!(
         client
@@ -380,7 +403,9 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
             .unwrap(),
         receipt
     );
-    let credentials = joining_key.complete(&receipt, &ca, now()).unwrap();
+    let credentials = joining_key
+        .complete(&receipt, issuers.trusted(), now())
+        .unwrap();
     let connector = connector(&credentials, &ca);
     // TLS issuance alone does not grant the data path admission.
     assert!(connector.connect(address, &founder_name).await.is_err());
@@ -560,20 +585,36 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     })
     .await
     .unwrap();
+    // A participant holds a connection through the pressure that follows.
+    let actor = actor_connector
+        .connect(address, &founder_name)
+        .await
+        .unwrap();
+    let stats = network_budget.stats();
     let pressure = network_budget
         .reserve(
             focal_memory::BudgetKind::Control,
             focal_memory::BudgetLane::Ordinary,
-            network_budget.stats().limit - network_budget.stats().used,
+            stats.limit - stats.completion_reserve - stats.ordinary_used,
         )
         .unwrap()
         .commit();
+    // The ordinary lane is full: no connection is admitted, and a
+    // participant's body is refused before any of it is allocated — the
+    // stream is reset as capacity, the connection kept. A node's body is
+    // funded from the completion reserve and served.
     assert!(connector.connect(address, &founder_name).await.is_err());
+    assert!(actor.request(&discovery()).await.is_err());
     assert!(matches!(
         remote.request(&discovery()).await.unwrap().result,
         Response::Control { .. }
     ));
     drop(pressure);
+    assert_eq!(
+        actor.request(&discovery()).await.unwrap().result,
+        Response::Error(AccessError::Unauthorized)
+    );
+    actor.close();
     registry.revoke(fingerprint).unwrap();
     // Revocation is checked before decoding a stream, so no error envelope with
     // a caller-controlled request identity is manufactured after rejection.
@@ -617,7 +658,7 @@ fn listener_bind_rejects_runtimes_missing_drivers() {
                 "127.0.0.1:0".parse().unwrap(),
                 &identity,
                 None,
-                authority.ca_certificate(),
+                &[authority.ca_certificate().to_vec()],
                 PeerRegistry::new(1).unwrap(),
                 limits(),
                 memory.clone(),

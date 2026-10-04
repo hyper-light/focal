@@ -23,7 +23,9 @@ fn admission_error(error: ControlError) -> DirectoryBootstrapError {
         | ControlError::Consensus(ConsensusError::Capacity) => DirectoryBootstrapError::Capacity,
         ControlError::NotReady
         | ControlError::Consensus(
-            ConsensusError::PersistencePending | ConsensusError::LearnerBehind,
+            ConsensusError::PersistencePending
+            | ConsensusError::LearnerBehind
+            | ConsensusError::MembershipPending,
         ) => DirectoryBootstrapError::NotReady,
         ControlError::Consensus(ConsensusError::NotLeader { .. }) => {
             DirectoryBootstrapError::Unavailable
@@ -101,10 +103,12 @@ impl<V: AuthorityVerifier> Owner<V> {
             {
                 return Err(DirectoryBootstrapError::Capacity);
             }
+            // The root replica this node runs mints the permit, leading or
+            // following: the barrier below is asked of the leader either way
+            // (a replica that knows none is refused there), and the facts it
+            // is minted on are committed state.
             let status = self.replica.status();
-            if self.replica.identity().scope != ControlScope::Root
-                || status.role != StateRole::Leader
-            {
+            if self.replica.identity().scope != ControlScope::Root {
                 return Err(DirectoryBootstrapError::Unavailable);
             }
             let deadline = self
@@ -146,10 +150,10 @@ impl<V: AuthorityVerifier> Owner<V> {
             return;
         }
         let status = self.replica.status();
-        if pending.term != status.term
-            || status.role != StateRole::Leader
-            || self.pace.periods() >= pending.deadline
-        {
+        // The barrier is the leader's, confirmed by this replica as leader
+        // or asked through the leader it follows (27 §5); the permit needs
+        // the term it was asked in, not this replica's leadership.
+        if pending.term != status.term || self.pace.periods() >= pending.deadline {
             pending.finish(Err(DirectoryBootstrapError::Unavailable));
         } else if events.read_states.iter().any(|read| {
             read.context == pending.context && read.index <= self.replica.applied_index()

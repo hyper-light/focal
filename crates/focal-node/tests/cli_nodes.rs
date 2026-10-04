@@ -11,8 +11,9 @@
 //! Draining, removing and replacing nodes through the real binary (24 §19,
 //! DC19): a session placed on three of four hosts loses one host to a
 //! drain — the directory heals the placement onto the remaining hosts and
-//! retires the drained copies — after which the host is removed (root
-//! membership, then its credential) and a repeat resumes; a drain the
+//! retires the drained copies — after which the host is removed (its seat
+//! in the directory's partition group, which it led, then root membership,
+//! then its credential) and a repeat resumes; a drain the
 //! remaining hosts cannot absorb keeps the copies where they are and the
 //! removal is refused; undraining heals again; the founder is never
 //! drained; a replacement must be enrolled and reporting before it drains
@@ -215,6 +216,63 @@ fn private_dir(name: &str) -> tempfile::TempDir {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     dir
 }
+/// One membership change of the directory's partition group by hand
+/// (`cluster partitions`, 24 §13), asked again while the group is not
+/// ready for it — a learner still catching up before its promotion, a
+/// change still committing, an outcome lost — within a bounded wait.
+fn partition_change(founder: &Path, verb: &str, partition: &str, node: u64) -> Value {
+    let text = node.to_string();
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
+    loop {
+        let output = command(
+            founder,
+            &[
+                "cluster",
+                "partitions",
+                verb,
+                "--partition",
+                partition,
+                "--node",
+                &text,
+            ],
+        );
+        if output.status.success() {
+            return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("[not_ready]")
+                || stderr.contains("[unavailable]")
+                || stderr.contains("[compare_failed]")
+                || stderr.contains("[outcome_unknown]"),
+            "{verb} of {node}: {stderr}"
+        );
+        if !deadline.open() {
+            let health = command(founder, &["cluster", "node", "health"]);
+            let shown = command(
+                founder,
+                &["cluster", "partitions", "show", "--partition", partition],
+            );
+            let view = command(founder, &["cluster", "placement"]);
+            panic!(
+                "{verb} of {node} stayed refused: {stderr}\nhealth: {}\nshown: {}\nplacement: {}",
+                String::from_utf8_lossy(&health.stdout),
+                String::from_utf8_lossy(&shown.stdout),
+                String::from_utf8_lossy(&view.stdout),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+/// The directory partition group's configuration as the founder's replica
+/// applied it.
+fn partition_shown(founder: &Path, partition: &str) -> Value {
+    success(
+        founder,
+        &["cluster", "partitions", "show", "--partition", partition],
+    )["result"]["configuration"]
+        .clone()
+}
 /// Every listed node alive and reporting, and the session settled at
 /// `max_failures` with no plan pending.
 fn settled(view: &Value, nodes: &[u64], max_failures: u64) -> bool {
@@ -251,11 +309,39 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let view = wait_for(founder, "four hosts", Duration::from_secs(90), |view| {
         settled(view, &all, 0)
     });
+    // The directory's partition group is seated on every host by hand
+    // (24 §13; the audit's F24): each is admitted as a learner — the root's
+    // grant seats it and it opens a replica — and promoted once caught up,
+    // so that whichever host leaves takes a seat with it.
+    let partition = view["control"]["partitions"][0]["partition"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for node in [node_a, node_b, node_c] {
+        let added = partition_change(founder, "add-learner", &partition, node);
+        assert_eq!(added["kind"], "committed", "{added}");
+        assert!(
+            added["operation_id"].as_str().unwrap().starts_with("p1:"),
+            "{added}"
+        );
+        let promoted = partition_change(founder, "promote", &partition, node);
+        assert_eq!(promoted["kind"], "committed", "{promoted}");
+    }
+    let seated = partition_shown(founder, &partition);
+    let mut seated_voters = ids(&seated["voters"]);
+    seated_voters.sort_unstable();
+    let mut everyone = all.to_vec();
+    everyone.sort_unstable();
+    assert_eq!(seated_voters, everyone, "{seated}");
+    assert!(ids(&seated["learners"]).is_empty(), "{seated}");
     let registered = session(&view).unwrap().clone();
     let tenant = registered["tenant"].as_str().unwrap().to_owned();
     let ledger = registered["session"].as_str().unwrap().to_owned();
     // One tolerated node loss: three of the four hosts become voters.
-    let planned = success(
+    // A plan is answered once it committed; one the partition refused —
+    // planned on an observation that went stale — is answered
+    // `compare_failed`, and the operator plans again (24 §16).
+    let planned = plan_until_planned(
         founder,
         &[
             "cluster",
@@ -268,8 +354,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
             "--max-failures",
             "1",
         ],
-    )["result"]
-        .clone();
+    );
     assert_eq!(planned["state"], "planned");
     let view = wait_for(founder, "activation", Duration::from_secs(180), |view| {
         settled(view, &all, 1)
@@ -285,6 +370,29 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         .expect("one host is not a voter");
     let founder_text = founder_node.to_string();
     let drained_text = drained.to_string();
+    // The host about to leave leads the partition group: its removal must
+    // hand that leadership on before it can take the seat away.
+    let handed = success(
+        founder,
+        &[
+            "cluster",
+            "partitions",
+            "transfer",
+            "--partition",
+            &partition,
+            "--node",
+            &drained_text,
+        ],
+    )["result"]
+        .clone();
+    assert_eq!(handed["kind"], "transfer_initiated", "{handed}");
+    assert_eq!(handed["target"], drained);
+    wait_for(
+        founder,
+        "the partition led by the leaving host",
+        Duration::from_secs(60),
+        |view| view["control"]["partitions"][0]["leader"] == drained,
+    );
 
     // The founder is never drained; a host that is still eligible is not
     // removed; unknown nodes are named.
@@ -337,8 +445,20 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         founder,
         &["cluster", "nodes", "remove", "--node", &drained_text],
     );
-    assert_eq!(code, 5, "{report}");
-    assert!(report.contains("[node_holding]"), "{report}");
+    if code != 5 || !report.contains("[node_holding]") {
+        // What each side saw of the drain: the founder's view, and the
+        // drained host's own, which hosts a replica of the partition.
+        let drained_dir = dirs[all.iter().position(|id| *id == drained).unwrap()].path();
+        let founder_view = command(founder, &["cluster", "placement"]);
+        let drained_view = command(drained_dir, &["cluster", "placement"]);
+        let drained_health = command(drained_dir, &["cluster", "node", "health"]);
+        panic!(
+            "{report}\nfounder placement: {}\ndrained placement: {}\ndrained health: {}",
+            String::from_utf8_lossy(&founder_view.stdout),
+            String::from_utf8_lossy(&drained_view.stdout),
+            String::from_utf8_lossy(&drained_health.stdout),
+        );
+    }
     let again = success(
         founder,
         &["cluster", "nodes", "drain", "--node", &drained_text],
@@ -376,6 +496,19 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert_eq!(removed["kind"], "node_removed", "{removed}");
     assert_eq!(removed["node"], drained);
     assert_eq!(removed["membership_removed"], true, "{removed}");
+    // Its seat in the partition group went first — leadership handed back
+    // to a voter that stays — so the group counts no voter that is gone.
+    assert_eq!(removed["partitions_vacated"], 1, "{removed}");
+    let vacated = partition_shown(founder, &partition);
+    assert!(!ids(&vacated["voters"]).contains(&drained), "{vacated}");
+    assert!(!ids(&vacated["learners"]).contains(&drained), "{vacated}");
+    assert_eq!(ids(&vacated["voters"]).len(), 3, "{vacated}");
+    let view = placement(founder).unwrap();
+    let partition_leader = view["control"]["partitions"][0]["leader"].as_u64().unwrap();
+    assert!(
+        partition_leader != drained && partition_leader != 0,
+        "{view}"
+    );
     assert_eq!(removed["revoked"], true, "{removed}");
     assert_eq!(removed["contact_retired"], true, "{removed}");
     let invitation = removed["invitation"].as_str().unwrap().to_owned();
@@ -396,6 +529,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     )["result"]
         .clone();
     assert_eq!(repeated["membership_removed"], false, "{repeated}");
+    assert_eq!(repeated["partitions_vacated"], 0, "{repeated}");
     assert_eq!(repeated["revoked"], false);
     assert_eq!(repeated["contact_retired"], false, "{repeated}");
     assert_eq!(repeated["invitation"], invitation);
@@ -534,7 +668,157 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let final_voters = ids(&session(&view).unwrap()["voters"]);
     assert!(final_voters.contains(&node_d), "{view}");
     assert!(!final_voters.contains(&victim));
+
+    // An administrator's change is made where the partition group leads
+    // (24 §13): from a host whose replica votes and follows — neither the
+    // founder, which leads, nor the drained victim, whose seat is what the
+    // operator vacates by hand — the node takes the group's leadership
+    // first and the change commits there.
+    let before = partition_shown(founder, &partition);
+    let actor = *ids(&before["voters"])
+        .iter()
+        .find(|id| **id != founder_node && **id != victim)
+        .unwrap();
+    let actor_dir = dirs[all.iter().position(|id| *id == actor).unwrap()].path();
+    let led = placement(founder).unwrap();
+    assert_ne!(led["control"]["partitions"][0]["leader"], actor, "{led}");
+    let removed = partition_change(actor_dir, "remove", &partition, victim);
+    assert_eq!(removed["kind"], "committed", "{removed}");
+    // The founder's replica follows the group now: its view is what it
+    // applied, a moment behind the leader's commit (macOS CI read the
+    // victim still seated right after the receipt, 2026-10-02), so the
+    // fact is waited on, bounded.
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    let after = loop {
+        let shown = partition_shown(founder, &partition);
+        if !ids(&shown["voters"]).contains(&victim) {
+            break shown;
+        }
+        assert!(
+            deadline.open(),
+            "the founder never applied the victim's removal: {shown}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(!ids(&after["learners"]).contains(&victim), "{after}");
+    let view = placement(founder).unwrap();
+    assert_eq!(view["control"]["partitions"][0]["leader"], actor, "{view}");
+    // The issuers the cluster's credentials chain to (24 §11): the genesis
+    // issuer alone, under a fence a cluster founded by this binary holds at
+    // its level from genesis. The operator stages the successor: endorsed
+    // by the genesis issuer, trusted everywhere from its staging, issuing
+    // from the controller's next step; asked again, it is answered as it is.
+    // A participant enrolled under the genesis issuer, before it succeeds
+    // itself: its context holds that issuer alone.
+    let client_dir = private_dir("client");
+    let client = client_dir.path();
+    let invitation = founder.join("alice.invite");
+    success(
+        founder,
+        &[
+            "cluster",
+            "client",
+            "invite",
+            "--name",
+            "alice",
+            "--output",
+            invitation.to_str().unwrap(),
+        ],
+    );
+    success(
+        client,
+        &[
+            "context",
+            "enroll",
+            "alice",
+            "--invite-file",
+            invitation.to_str().unwrap(),
+        ],
+    );
+    let standing = success(client, &["--client-context", "alice", "status"]);
+    assert!(
+        standing["result"].is_object() || standing.is_object(),
+        "{standing}"
+    );
+    let adopted_file = client
+        .join("CLIENT.contexts")
+        .join("enrollment-alice")
+        .join("trust-adopted.bin");
+    assert!(
+        !adopted_file.exists(),
+        "nothing endorsed beyond the invitation's issuers, nothing adopted"
+    );
+    let issuers = success(founder, &["cluster", "credentials", "issuers"])["result"].clone();
+    assert!(issuers["successor"].is_null(), "{issuers}");
+    assert!(issuers["retiring"].is_null(), "{issuers}");
+    assert_eq!(issuers["current"]["endorsed"], false, "{issuers}");
+    assert_eq!(
+        issuers["fence_level"], issuers["succession_level"],
+        "{issuers}"
+    );
+    let genesis_issuer = issuers["current"]["fingerprint"].clone();
+    let rotated = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+    let staged = rotated["successor"].clone();
+    assert_eq!(staged["endorsed"], true, "{rotated}");
+    assert!(staged["staged_at"].is_number(), "{rotated}");
+    assert_ne!(staged["fingerprint"], genesis_issuer, "{rotated}");
+    assert_eq!(
+        rotated["current"]["fingerprint"], genesis_issuer,
+        "{rotated}"
+    );
+    let again = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+    assert!(
+        again["successor"]["fingerprint"] == staged["fingerprint"]
+            || (again["current"]["fingerprint"] == staged["fingerprint"]
+                && again["retiring"]["fingerprint"] == genesis_issuer),
+        "{again}"
+    );
+    // Asked on, the succession is stepped to its activation: the successor
+    // issues, the genesis issuer retires while what it issued lives.
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    let activated = loop {
+        let view = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+        if view["current"]["fingerprint"] == staged["fingerprint"] {
+            break view;
+        }
+        assert!(deadline.open(), "the successor never issued: {view}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(
+        activated["retiring"]["fingerprint"], genesis_issuer,
+        "{activated}"
+    );
+    // The founder renews under the successor and presents the endorsed
+    // chain; the participant, holding the genesis issuer alone, verifies it
+    // through the endorsement and adopts the successor beside its journal
+    // (24 §11) — and serves on the adopted root from then on.
+    let renewed = success(founder, &["cluster", "credentials", "renew"])["result"].clone();
+    assert!(renewed["issued_at"].is_number(), "{renewed}");
+    let endorsed = success(client, &["--client-context", "alice", "status"]);
+    assert!(endorsed.is_object(), "{endorsed}");
+    assert!(
+        adopted_file.is_file(),
+        "the successor the participant was shown endorsed was not adopted at {}",
+        adopted_file.display()
+    );
+    let adopted_again = success(client, &["--client-context", "alice", "status"]);
+    assert!(adopted_again.is_object(), "{adopted_again}");
     drop(servers);
+}
+/// A plan refused as `compare_failed` was made on an observation that went
+/// stale; the operator plans again, on the next.
+fn plan_until_planned(founder: &Path, args: &[&str]) -> Value {
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
+    loop {
+        let output = command(founder, args);
+        if output.status.success() {
+            return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("[compare_failed]"), "{stderr}");
+        assert!(deadline.open(), "the plan stayed refused: {stderr}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 /// Removal waits for the retiring copies to leave the directory; until
 /// then it is refused as holding.
@@ -550,7 +834,9 @@ fn wait_for_removal(founder: &Path, node: u64) -> Value {
         assert!(
             stderr.contains("[node_holding]")
                 || stderr.contains("[not_leader]")
-                || stderr.contains("[unavailable]"),
+                || stderr.contains("[unavailable]")
+                || stderr.contains("[partition_pending]")
+                || stderr.contains("[leader_leaving]"),
             "{stderr}"
         );
         assert!(deadline.open(), "removal stayed refused: {stderr}");

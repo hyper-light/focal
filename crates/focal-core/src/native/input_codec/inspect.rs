@@ -79,7 +79,7 @@ impl<'a> StructuralInput<'a> {
                     epoch: RequestEpoch(scan.cursor.u64()?),
                     id: RequestId(scan.cursor.fixed()?),
                 };
-                let command = scan.closed8(27, "command")?;
+                let command = scan.closed8(28, "command")?;
                 if matches!(
                     (profile, command),
                     (NativeContentProfile::ProjectionOnly, 27)
@@ -606,6 +606,10 @@ impl Scan<'_> {
                 self.binding()?;
                 self.optional_receipt()?;
                 self.id()
+            }
+            28 => {
+                self.cursor.u64()?;
+                Ok(())
             }
             27 => {
                 for _ in 0..self.count()? {

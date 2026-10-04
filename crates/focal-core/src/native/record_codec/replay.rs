@@ -551,6 +551,31 @@ pub(super) fn stage_meta(
     Err(ContractError::InvalidManifest.into())
 }
 
+/// The principal's window row a request's record writes (F12), decoded
+/// ahead of the waves as the meta row is; its ranges fit `allowance`.
+pub(super) fn stage_window(
+    record: &StructuralRecord<'_>,
+    max_ranges: usize,
+    allowance: usize,
+    visits: usize,
+) -> Result<Row, NativeError> {
+    let quote = record.quote();
+    for row in record.rows(quote.visits).map_err(read_evidence::codec)? {
+        let row = row.map_err(read_evidence::codec)?;
+        if !matches!(row.key, Key::Epochs(_)) || row.deleted() {
+            continue;
+        }
+        let body = row.body();
+        let mut cursor =
+            bytes::Cursor::new(body, body.len(), visits).map_err(read_evidence::codec)?;
+        let plan = read_rows::EpochsPlan::read(row.key, &mut cursor, max_ranges)?;
+        cursor.finish().map_err(read_evidence::codec)?;
+        let (window, _) = plan.build(allowance, visits)?;
+        return Ok(window);
+    }
+    Err(ContractError::InvalidManifest.into())
+}
+
 /// Build the staged record's pages against the Core's published root. The
 /// record must extend the Core's current prefix; the remaining recovery work
 /// of its staging pays for the page copies.

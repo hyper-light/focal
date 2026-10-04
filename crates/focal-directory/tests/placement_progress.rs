@@ -1379,3 +1379,100 @@ fn holders_publish_in_epoch_order_for_placement_members_only() {
     assert!(restored.sessions[&ledger()].holders.is_none());
     assert_eq!(restored.sessions[&ledger()].founder, Some(1));
 }
+
+/// The control plane is measured by the sessions' rule (the audit's F24): a
+/// group's voters, named without a generation as a log's configuration
+/// names them, tolerate as a quorum what the sessions' voters would; a
+/// dead, ineligible or unknown voter blocks, and a voter in no known domain
+/// of the class makes the class unevaluable.
+#[test]
+fn the_control_groups_voters_are_measured_by_the_sessions_rule() {
+    let mut directory = partition(PartitionConfig::default());
+    planned(&mut directory, &regional());
+    let nodes = directory.checkpoint().nodes.as_ref().clone();
+    let alone = voters_tolerance([1].into_iter(), FailureClass::Zone, &nodes).unwrap();
+    assert_eq!(alone.achieved, Some(0));
+    assert!(alone.blocked_by.is_empty());
+    let three = voters_tolerance([1, 2, 3].into_iter(), FailureClass::Region, &nodes).unwrap();
+    assert_eq!(three.achieved, Some(1));
+    assert!(three.blocked_by.is_empty());
+    // Two of three in one region: no region may be lost; by node, one may.
+    let mut shared = nodes.clone();
+    shared.get_mut(&2).unwrap().enrollment.region = RegionId::from_u128(1);
+    assert_eq!(
+        voters_tolerance([1, 2, 3].into_iter(), FailureClass::Region, &shared)
+            .unwrap()
+            .achieved,
+        Some(0)
+    );
+    assert_eq!(
+        voters_tolerance([1, 2, 3].into_iter(), FailureClass::Node, &shared)
+            .unwrap()
+            .achieved,
+        Some(1)
+    );
+    // A dead voter is a blocker and no longer counted; so is one the registry
+    // does not know, and one that is ineligible.
+    let mut dead = nodes.clone();
+    dead.get_mut(&2).unwrap().liveness = Some(NodeLiveness {
+        alive: false,
+        incarnation: 1,
+        witness: 1,
+        decided_at: 1,
+    });
+    let report = voters_tolerance([1, 2, 3].into_iter(), FailureClass::Node, &dead).unwrap();
+    assert_eq!(report.achieved, Some(0));
+    assert_eq!(
+        report.blocked_by,
+        vec![Blocker {
+            node: Some(2),
+            reason: BlockReason::DeadNode
+        }]
+    );
+    let report = voters_tolerance([1, 2, 4].into_iter(), FailureClass::Node, &nodes).unwrap();
+    assert_eq!(report.blocked_by[0].reason, BlockReason::MissingNode);
+    let mut ineligible = nodes.clone();
+    ineligible.get_mut(&3).unwrap().enrollment.eligible = false;
+    let report = voters_tolerance([1, 2, 3].into_iter(), FailureClass::Node, &ineligible).unwrap();
+    assert_eq!(report.blocked_by[0].reason, BlockReason::IneligibleNode);
+    // A voter in no known zone: the zone class cannot be evaluated, the node
+    // class still can. A generation is never asked of a control voter: the
+    // re-enrolled node counts at its current grant.
+    let mut unknown = nodes.clone();
+    unknown.get_mut(&3).unwrap().enrollment.zone = ZoneId([0; 16]);
+    unknown.get_mut(&3).unwrap().enrollment.generation = 2;
+    let report = voters_tolerance([1, 2, 3].into_iter(), FailureClass::Zone, &unknown).unwrap();
+    assert_eq!(report.achieved, None);
+    assert_eq!(report.blocked_by[0].reason, BlockReason::UnknownDomain);
+    assert_eq!(
+        voters_tolerance([1, 2, 3].into_iter(), FailureClass::Node, &unknown)
+            .unwrap()
+            .achieved,
+        Some(1)
+    );
+    // The sessions' measurement is the same rule: the active placement's
+    // voters, measured as control voters in the active class, tolerate
+    // what the session's report says they do.
+    let active = session(&directory);
+    let class = active.active.policy.durability.survive;
+    let report = effective_guarantee(&active, &nodes).unwrap();
+    let voters = voters_tolerance(
+        active.active.placement.voters.keys().copied(),
+        class,
+        &nodes,
+    )
+    .unwrap();
+    assert_eq!(
+        report.achieved.map(|achieved| achieved.max_failures),
+        voters.achieved
+    );
+    // The session's report adds the plan's own blockers (awaiting activation),
+    // which name no node; the voters' are the same.
+    let on_nodes: Vec<Blocker> = report
+        .blocked_by
+        .iter()
+        .copied()
+        .filter(|blocker| blocker.node.is_some())
+        .collect();
+    assert_eq!(on_nodes, voters.blocked_by);
+}

@@ -4,8 +4,8 @@ use super::report_tests as f;
 use super::retirement::*;
 use super::*;
 use focal_evidence::BuiltinNativeSchemas;
-use focal_model::Cause;
 use focal_model::lifecycle::{creation::Owner, succession::Lineage};
+use focal_model::{Cause, ValidationMode, VerdictValue};
 
 fn id(value: u128) -> ClaimId {
     ClaimId::from_u128(value)
@@ -40,6 +40,35 @@ fn limits() -> record_codec::EncodingLimits {
         bytes: 1 << 20,
         visits: 1 << 24,
         rows: 1 << 16,
+    }
+}
+/// Create, cancel and release one claim: a family of one, three outcomes.
+fn finished(core: &mut Core<NativeState>, claim: u128, request: u128, time: u64) {
+    f::publish(core, time, f::creation(request, claim, &[], None));
+    cancel(core, request + 1, claim, time + 10);
+    release(core, request + 2, claim, time + 20);
+}
+/// The family rooted at `root`, its bundle's digest and length, and the
+/// prefix it claims.
+fn bundle_of(
+    core: &Core<NativeState>,
+    root: ClaimId,
+) -> (RetirementFamily, ContentHash, u64, SessionSeq) {
+    let family = core.retirement_family(root).unwrap();
+    let through = core.native_sequence();
+    let quote = core
+        .archive_family_quote(&family, through, limits())
+        .unwrap();
+    let mut bytes = vec![0; quote.bytes];
+    let hash = core
+        .archive_family_into(&family, through, &mut bytes, quote.visits)
+        .unwrap();
+    (family, hash, bytes.len() as u64, through)
+}
+fn outcomes_of(core: &Core<NativeState>) -> usize {
+    match core.state.rows.get(&Key::Meta) {
+        Some(Row::Meta(meta)) => meta.outcomes,
+        _ => panic!("meta row"),
     }
 }
 fn events_of(core: &Core<NativeState>, claim: ClaimId) -> usize {
@@ -463,4 +492,340 @@ fn an_authored_family_leaves_with_its_identities_and_the_owner_reconstructs() {
     // The core keeps admitting authored claims.
     a::publish(&mut core, a::create(4, vec![a::proposal(3, 13)]));
     assert!(core.native_claim(id(3)).is_some());
+}
+
+fn restore_with(
+    core: &Core<NativeState>,
+    limits: NativeLimits,
+    store: &focal_evidence::ContentStore,
+) -> Result<Core<NativeState>, NativeError> {
+    let encoded = ckpt::encode(core);
+    recovery::restore(
+        &ckpt::inspect(&encoded),
+        RangeId(779),
+        ckpt::limits(limits),
+        ckpt::budget(),
+        store,
+        &BuiltinNativeSchemas,
+    )
+}
+
+/// One under the outcome bound (three outcomes under a bound of four) the
+/// retirement fits: it publishes the fourth outcome at the fourth prefix,
+/// the checkpoint restores and the owner rebuilds under the same bound, an
+/// exact retry of the retired creation is still answered from its outcome,
+/// and a fresh request meets the bound itself.
+#[test]
+fn a_retirement_that_fits_the_outcome_bound_restores_under_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = f::core();
+    core.limits.outcomes = 4;
+    finished(&mut core, 1, 1, 10);
+    let (family, hash, length, through) = bundle_of(&core, id(1));
+    core.retire_native_family(&family, hash, length, through)
+        .unwrap();
+    assert_eq!(core.native_sequence(), SessionSeq(4));
+    assert_eq!(outcomes_of(&core), 4);
+    let restored = restore_with(&core, core.limits, &store).unwrap();
+    ckpt::compare(&core, &restored);
+    let owner =
+        NativeOwner::with_record_buffers(restored, &BuiltinNativeSchemas, limits()).unwrap();
+    assert!(owner.committed_core().native_retired(id(1)).is_some());
+    let core = owner.into_committed_core().unwrap();
+    assert!(matches!(
+        core.prepare_native(f::context(f::ISSUER, 50), f::creation(1, 1, &[], None), &[]),
+        Ok(NativePreparation::Existing {
+            committed: true,
+            ..
+        })
+    ));
+    assert!(matches!(
+        core.prepare_native(f::context(f::ISSUER, 50), f::creation(9, 9, &[], None), &[]),
+        Err(NativeError::Capacity("outcomes"))
+    ));
+}
+
+/// At the outcome bound (three outcomes under a bound of three) the
+/// retirement is refused before anything changes: the derivation refuses
+/// the family (`OutcomeCapacity`), and a family derived under a wider
+/// bound is refused at publication with the same `Capacity` ordinary
+/// admission answers, the sequence, the rows and the budget untouched.
+#[test]
+fn a_retirement_at_the_outcome_bound_is_refused_before_anything_changes() {
+    let mut core = f::core();
+    core.limits.outcomes = 3;
+    finished(&mut core, 1, 1, 10);
+    assert_eq!(outcomes_of(&core), 3);
+    assert_eq!(core.native_sequence(), SessionSeq(3));
+    assert_eq!(
+        core.retirement_family(id(1)).unwrap_err(),
+        RetirementRefusal::OutcomeCapacity
+    );
+    core.limits.outcomes = 4;
+    let (family, hash, length, through) = bundle_of(&core, id(1));
+    core.limits.outcomes = 3;
+    let sequence = core.native_sequence();
+    let stats = core.native_stats();
+    let budget = core.state.budget.stats();
+    assert!(matches!(
+        core.retire_native_family(&family, hash, length, through),
+        Err(NativeError::Capacity("outcomes"))
+    ));
+    assert_eq!(core.native_sequence(), sequence);
+    assert_eq!(core.native_stats(), stats);
+    assert_eq!(core.state.budget.stats(), budget);
+    assert_eq!(outcomes_of(&core), 3);
+    assert!(core.native_claim(id(1)).is_some());
+    assert!(core.native_retired(id(1)).is_none());
+}
+
+/// Why both checks exist: a retirement allowed under a bound of four makes
+/// four outcomes, which a bound of three cannot restore (`Contract(Capacity)`
+/// from the checkpoint) nor rebuild an owner over (`Capacity`) — the state
+/// the unchecked retirement used to make under the bound of three itself.
+#[test]
+fn a_retirement_past_the_bound_is_what_both_checks_refuse() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = f::core();
+    core.limits.outcomes = 4;
+    finished(&mut core, 1, 1, 10);
+    let (family, hash, length, through) = bundle_of(&core, id(1));
+    core.retire_native_family(&family, hash, length, through)
+        .unwrap();
+    assert_eq!(outcomes_of(&core), 4);
+    let mut lowered = core.limits;
+    lowered.outcomes = 3;
+    assert!(matches!(
+        restore_with(&core, lowered, &store),
+        Err(NativeError::Contract(ContractError::Capacity))
+    ));
+    core.limits = lowered;
+    let refused = NativeOwner::with_record_buffers(core, &BuiltinNativeSchemas, limits())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            refused.error,
+            NativeOwnerError::Native(NativeError::Capacity(_))
+        ),
+        "{:?}",
+        refused.error
+    );
+}
+
+/// Three finished families under a bound with two outcomes to spare:
+/// exactly two retire, each at the next prefix, and the third is refused
+/// at derivation with nothing changed.
+#[test]
+fn families_retire_while_outcomes_remain_and_no_further() {
+    let mut core = f::core();
+    core.limits.outcomes = 11;
+    for claim in 1..=3u128 {
+        finished(&mut core, claim, claim * 10, claim as u64 * 100);
+    }
+    assert_eq!(outcomes_of(&core), 9);
+    for claim in 1..=2u128 {
+        let (family, hash, length, through) = bundle_of(&core, id(claim));
+        core.retire_native_family(&family, hash, length, through)
+            .unwrap();
+        assert_eq!(core.native_sequence(), SessionSeq(9 + claim as u64));
+        assert!(core.native_retired(id(claim)).is_some());
+    }
+    assert_eq!(outcomes_of(&core), 11);
+    assert_eq!(
+        core.retirement_family(id(3)).unwrap_err(),
+        RetirementRefusal::OutcomeCapacity
+    );
+    assert!(core.native_claim(id(3)).is_some());
+    assert_eq!(core.native_sequence(), SessionSeq(11));
+}
+
+/// The smallest outcome bound under which an owner rebuilds over `core`:
+/// the outcomes published plus those promised to its live reports and the
+/// one control.
+fn smallest_owner_bound(mut core: Core<NativeState>) -> (usize, Core<NativeState>) {
+    for bound in outcomes_of(&core).. {
+        core.limits.outcomes = bound;
+        match NativeOwner::new(core) {
+            Ok(owner) => return (bound, owner.into_committed_core().unwrap()),
+            Err(refused) => core = refused.core,
+        }
+    }
+    panic!("no bound rebuilds the owner");
+}
+fn reserved_core() -> Core<NativeState> {
+    let mut core = f::running(&[(ValidationMode::Required, false)]);
+    finished(&mut core, 2, 20, 40);
+    core
+}
+
+/// The owner holds the outcomes it promised to live reports and one
+/// control back from a retirement, as it holds them back from every fresh
+/// candidate: at the smallest bound the owner rebuilds under, the core's
+/// own check passes (the bound has room for one more outcome) and the owner
+/// refuses (`OutcomesReserved` at the session); retiring through the core
+/// regardless leaves a state no owner rebuilds over — the deadlock the
+/// unchecked retirement used to make. One above that bound the retirement
+/// is allowed, the owner rebuilds, and the promised report and a deadline
+/// control are admitted after it.
+#[test]
+fn a_retirement_never_takes_an_outcome_promised_to_a_live_report() {
+    let (bound, mut core) = smallest_owner_bound(reserved_core());
+    assert!(bound > outcomes_of(&core) + 1, "reports are promised");
+    core.limits.outcomes = bound;
+    assert!(core.retirement_family(id(2)).is_ok());
+    let owner = NativeOwner::new(core).unwrap();
+    assert!(matches!(
+        owner.check_retirement(),
+        Err(NativeOwnerError::Native(NativeError::Capacity(_)))
+    ));
+    let mut core = owner.into_committed_core().unwrap();
+    let (family, hash, length, through) = bundle_of(&core, id(2));
+    core.retire_native_family(&family, hash, length, through)
+        .unwrap();
+    let refused = NativeOwner::new(core).err().unwrap();
+    assert!(
+        matches!(
+            refused.error,
+            NativeOwnerError::Native(NativeError::Capacity(_))
+        ),
+        "{:?}",
+        refused.error
+    );
+    // One above: allowed, rebuilt, and what was promised is admitted.
+    let (_, mut core) = smallest_owner_bound(reserved_core());
+    core.limits.outcomes = bound + 1;
+    let owner = NativeOwner::new(core).unwrap();
+    owner.check_retirement().unwrap();
+    let mut core = owner.into_committed_core().unwrap();
+    let (family, hash, length, through) = bundle_of(&core, id(2));
+    core.retire_native_family(&family, hash, length, through)
+        .unwrap();
+    let mut owner = NativeOwner::new(core).unwrap();
+    let mut custody = f::Custody::new();
+    let report = f::report_for(
+        owner.committed_core(),
+        None,
+        30_001,
+        1,
+        VerdictValue::Pass,
+        f::descriptor(f::artifact_spec(30_001, f::EVALUATOR, VerdictValue::Pass)),
+    );
+    let evidence = f::verified(&mut custody, &report);
+    assert!(matches!(
+        owner.prepare(f::context(f::EVALUATOR, 100), report, Some(&evidence)),
+        Ok(NativeStaging::Prepared { .. })
+    ));
+    owner.discard_all();
+    let view = owner.effective();
+    let deadline = view
+        .evaluation(f::key(1))
+        .unwrap()
+        .bind(view.definition(f::key(1).validation).unwrap())
+        .unwrap()
+        .deadline();
+    let input = NativeDeadlineInput {
+        evaluation: f::key(1),
+        deadline,
+    };
+    assert!(matches!(
+        owner.prepare_evaluation_deadline(input, deadline.at),
+        Ok(NativeStaging::Prepared { .. })
+    ));
+}
+
+/// The audit's F11: a family's bundle hydrates into a core of the family
+/// alone, read as the live core was read before the family left — the same
+/// decoders, verification and custody recovery a checkpoint restore runs —
+/// at the prefix the bundle claims, holding nothing of any other family.
+#[test]
+fn a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was() {
+    use super::authored::tests as a;
+    use record_codec::archive::StructuralArchive;
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = a::core();
+    core.limits.plan_edges = 65_536;
+    a::publish(
+        &mut core,
+        a::create(1, vec![a::proposal(1, 11), a::proposal(2, 12)]),
+    );
+    let expected = binding_of(&core, 1);
+    a::publish(&mut core, a::input(2, NativeCommand::Cancel { expected }));
+    let expected = binding_of(&core, 1);
+    a::publish(
+        &mut core,
+        a::input(3, NativeCommand::ReleaseScope { expected }),
+    );
+    let (family, hash, bytes_len, through) = bundle_of(&core, id(1));
+    let quote = core
+        .archive_family_quote(&family, through, limits())
+        .unwrap();
+    let mut bytes = vec![0; quote.bytes];
+    let written = core
+        .archive_family_into(&family, through, &mut bytes, quote.visits)
+        .unwrap();
+    assert_eq!((written, bytes.len() as u64), (hash, bytes_len));
+    // What the live core says of the family before it leaves.
+    let live = core.native_claim(id(1)).unwrap();
+    let (live_binding, live_status, live_issuer) = (live.binding(), live.status(), live.issuer());
+    let live_definition = core
+        .native_definition(ValidationId::from_u128(11))
+        .unwrap()
+        .binding();
+    assert!(core.native_claim_content(id(1)).is_some());
+    let archive = StructuralArchive::inspect(
+        &bytes,
+        record_codec::InspectionLimits {
+            bytes: bytes.len(),
+            visits: 1_000_000_000,
+            rows: 100_000,
+            row_bytes: 32 << 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(archive.header().members, vec![id(1)]);
+    let hydrated = archive
+        .hydrate(
+            RangeId(7),
+            ckpt::limits(core.limits),
+            ckpt::budget(),
+            &store,
+            &BuiltinNativeSchemas,
+        )
+        .unwrap();
+    assert_eq!(hydrated.digest(), hash);
+    let view = hydrated.core();
+    assert_eq!(view.native_sequence(), through);
+    let archived = view.native_claim(id(1)).unwrap();
+    assert_eq!(archived.binding(), live_binding);
+    assert_eq!(archived.status(), live_status);
+    assert_eq!(archived.issuer(), live_issuer);
+    assert_eq!(
+        view.native_definition(ValidationId::from_u128(11))
+            .unwrap()
+            .binding(),
+        live_definition
+    );
+    assert!(view.native_claim_content(id(1)).is_some());
+    // Nothing of the sibling family, and no accounting.
+    assert!(view.native_claim(id(2)).is_none());
+    assert!(
+        view.native_definition(ValidationId::from_u128(12))
+            .is_none()
+    );
+    assert!(view.native_outcome(f::request(f::ISSUER, 1)).is_none());
+    // The family leaves the live core behind its continuation; the bundle
+    // still answers for it.
+    core.retire_native_family(&family, hash, bytes_len, through)
+        .unwrap();
+    assert!(core.native_claim(id(1)).is_none());
+    let continuation = core.native_retired(id(1)).unwrap();
+    assert_eq!((continuation.bundle, continuation.bytes), (hash, bytes_len));
+    assert_eq!(
+        hydrated.core().native_claim(id(1)).unwrap().binding(),
+        live_binding
+    );
 }

@@ -438,6 +438,36 @@ mod native_adapters {
                 NativeAuthoredOperation::ReceiptAcquire(native_documents::receipt(args).unwrap().0)
             }
             Commands::Claim {
+                command: ClaimCommand::Post(args),
+            } => {
+                NativeAuthoredOperation::ClaimPost(native_documents::claim_target(args).unwrap().0)
+            }
+            Commands::Claim {
+                command: ClaimCommand::Challenge(args),
+            } => NativeAuthoredOperation::ClaimChallenge(Box::new(
+                native_documents::challenge(*args).unwrap().0,
+            )),
+            Commands::Claim {
+                command: ClaimCommand::Consult(args),
+            } => NativeAuthoredOperation::ClaimConsult(Box::new(
+                native_documents::consult(*args).unwrap().0,
+            )),
+            Commands::Claim {
+                command: ClaimCommand::Correct(args),
+            } => NativeAuthoredOperation::ClaimCorrect(Box::new(
+                native_documents::correct(*args).unwrap().0,
+            )),
+            Commands::Claim {
+                command: ClaimCommand::FollowUp(args),
+            } => NativeAuthoredOperation::ClaimFollowUp(Box::new(
+                native_documents::follow_up(*args).unwrap().0,
+            )),
+            Commands::Testament {
+                command: TestamentCommand::Receive(args),
+            } => NativeAuthoredOperation::TestamentReceive(
+                native_documents::response_target(args).unwrap().0,
+            ),
+            Commands::Claim {
                 command: ClaimCommand::Cancel(args),
             } => NativeAuthoredOperation::ClaimCancel(native_documents::cancel(args).unwrap().0),
             Commands::Claim {
@@ -892,6 +922,63 @@ mod native_adapters {
             panic!()
         };
         assert!(native_documents::cancel(args).is_err());
+    }
+
+    /// The engine's example of every authored descriptor, loaded through the
+    /// command the coverage table names (`--file`, the quickstart's path),
+    /// is the document the shared decoder produces: one canonical intent, so
+    /// what `schema example --native` prints is what the command journals.
+    #[test]
+    fn every_authored_descriptor_example_loads_through_its_command_with_the_same_intent() {
+        use focal_client::operations::{
+            WireProfile, authored_shape, example, native_descriptors, parse_native_json,
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let mut commands: Vec<(&str, String)> = native_coverage_table()
+            .into_iter()
+            .filter(|row| row.exposure == NativeExposure::AuthoredTool)
+            .map(|row| (row.name.unwrap(), row.cli.to_string()))
+            .collect();
+        // The peer shapes are `focal claim challenge|consult|correct|follow-up`.
+        for descriptor in native_descriptors()
+            .iter()
+            .filter(|descriptor| authored_shape(descriptor).is_some())
+        {
+            let verb = descriptor
+                .name
+                .strip_prefix("claim.")
+                .unwrap()
+                .replace('_', "-");
+            commands.push((descriptor.name, format!("focal claim {verb}")));
+        }
+        let mut checked = std::collections::BTreeSet::new();
+        for (name, cli) in commands {
+            if !checked.insert(name) {
+                continue;
+            }
+            let value = example(WireProfile::Native, name).unwrap();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let path = scratch.path().join(format!("{name}.json"));
+            std::fs::write(&path, &bytes).unwrap();
+            let path = path.to_str().unwrap();
+            let mut args: Vec<&str> = cli.split(' ').skip(1).collect();
+            args.extend(["--file", path]);
+            let loaded = native_document(&args);
+            let decoded = parse_native_json(name, &bytes).unwrap();
+            assert_eq!(loaded.name(), name, "{cli}");
+            assert_eq!(
+                loaded.canonical_intent().unwrap(),
+                decoded.canonical_intent().unwrap(),
+                "{cli}"
+            );
+        }
+        assert_eq!(
+            checked.len(),
+            native_descriptors()
+                .iter()
+                .filter(|descriptor| descriptor.mutation)
+                .count()
+        );
     }
 
     #[test]

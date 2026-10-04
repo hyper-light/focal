@@ -5,9 +5,11 @@
 //! restored as a core; it is read, and what it says about itself is
 //! verified against what it holds.
 use super::checkpoint::{ARCHIVE_HASH_DOMAIN, ARCHIVE_MAGIC, ARCHIVE_VERSION};
-use super::inspect::{EncodedRow, InspectionLimits, RecordRows};
+use super::inspect::{EncodedRow, InspectionLimits, InspectionQuote, RecordRows};
 use super::*;
 use bytes::Cursor;
+use focal_evidence::{NativeCustodyReader, NativeSchemaVerifier};
+use focal_memory::BudgetLane;
 
 /// What an archive bundle declares about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,7 @@ pub struct StructuralArchive<'a> {
     rows: &'a [u8],
     row_limit: usize,
     visits: usize,
+    quote: InspectionQuote,
 }
 
 impl<'a> StructuralArchive<'a> {
@@ -137,9 +140,20 @@ impl<'a> StructuralArchive<'a> {
             if row.deleted() || previous.is_some_and(|last| last >= row.key) {
                 return Err(CodecError::InvalidTag("archive row"));
             }
+            // The accounting stays in the core; a member's timer outcomes
+            // are the family's rows (F12) and leave with it.
             if matches!(
                 row.key,
-                Key::Meta | Key::Outcome(_) | Key::CreationResult(_)
+                Key::Meta
+                    | Key::CreationResult(_)
+                    | Key::Epochs(_)
+                    | Key::Seal(_)
+                    | Key::Outcome(
+                        NativeInvocation::Request(_)
+                            | NativeInvocation::Import
+                            | NativeInvocation::Retirement(_)
+                            | NativeInvocation::Seal(_)
+                    )
             ) {
                 return Err(CodecError::InvalidTag("archive accounting row"));
             }
@@ -148,6 +162,12 @@ impl<'a> StructuralArchive<'a> {
         if cursor.remaining() != 0 {
             return Err(CodecError::TrailingBytes);
         }
+        // The scan this inspection took, with the digest's: what a
+        // hydration of the bundle is quoted per pass.
+        let visits = cursor
+            .visits_used()
+            .checked_add(hash_visits)
+            .ok_or(CodecError::Capacity)?;
         let rows = payload.get(start..).ok_or(CodecError::Truncated)?;
         Ok(Self {
             header: ArchiveHeader {
@@ -164,6 +184,82 @@ impl<'a> StructuralArchive<'a> {
             rows,
             row_limit: limits.row_bytes,
             visits: limits.visits,
+            quote: InspectionQuote {
+                bytes: bytes.len(),
+                visits,
+                rows: count,
+            },
+        })
+    }
+    /// The bundle's rows hydrated into a core of the family alone (the
+    /// audit's F11): every row built as a checkpoint restore builds it —
+    /// the same decoders, the same schema verification and custody recovery
+    /// of its artifacts against `store` — validated as a family (every member
+    /// claim present, nothing but the family's rows), and laid out as one
+    /// member at the prefix the bundle claims. The core is read-only by
+    /// construction (`ArchiveCore`): it has no accounting rows, so it is
+    /// never proposed to, checkpointed or published.
+    pub fn hydrate<S: NativeSchemaVerifier, R: NativeCustodyReader>(
+        &self,
+        range: RangeId,
+        limits: recovery::Limits,
+        budget: MemoryBudget,
+        store: &R,
+        schemas: &S,
+    ) -> Result<ArchiveCore, NativeError> {
+        let mut limits = limits;
+        limits.native = checked_native_limits(self.header.ledger, limits.native)?;
+        let header = checkpoint::CheckpointHeader {
+            ledger: self.header.ledger,
+            profile: self.header.profile,
+            range,
+            prefix: self.header.through,
+            rows: u64::try_from(self.header.count)
+                .map_err(|_| NativeError::Capacity("archive rows"))?,
+            hash: self.digest,
+        };
+        let work = recovery::Work::for_shape(self.quote.visits, self.quote.bytes, self.quote.rows)
+            .min(limits.work);
+        let members = &self.header.members;
+        let lane = BudgetLane::Ordinary;
+        let hydrated = recovery::hydrate_frame(
+            self,
+            header,
+            range,
+            limits,
+            &budget,
+            store,
+            schemas,
+            lane,
+            work,
+            |view, meter, _| {
+                // A family: its root and every member claim present, and
+                // no row of another family or of the accounting.
+                meter
+                    .charge(members.len().saturating_mul(64))
+                    .map_err(read_evidence::codec)?;
+                for member in members {
+                    if view.get(&Key::Claim(*member)).is_none() {
+                        return Err(ContractError::InvalidManifest.into());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let layout = ranges::RangeLayout::single(range, &budget)?;
+        let (rows, _) = hydrated.assemble(range, layout, &budget, lane)?;
+        Ok(ArchiveCore {
+            core: Core {
+                state: NativeState {
+                    ledger: self.header.ledger,
+                    profile: self.header.profile,
+                    rows,
+                    budget,
+                },
+                limits: limits.native,
+            },
+            header: self.header.clone(),
+            digest: self.digest,
         })
     }
     pub fn header(&self) -> &ArchiveHeader {
@@ -173,6 +269,10 @@ impl<'a> StructuralArchive<'a> {
     /// name it by.
     pub fn digest(&self) -> ContentHash {
         self.digest
+    }
+    /// What the inspection took: the scan and the digest.
+    pub fn quote(&self) -> InspectionQuote {
+        self.quote
     }
     /// The rows in key order, each already structurally checked.
     pub(in crate::native) fn rows(&self) -> Result<RecordRows<'a>, CodecError> {
@@ -197,5 +297,38 @@ impl<'a> StructuralArchive<'a> {
             }
         }
         Ok(counts)
+    }
+}
+
+impl<'a> inspect::RowFrame<'a> for StructuralArchive<'a> {
+    fn ledger(&self) -> LedgerId {
+        self.header.ledger
+    }
+    fn quote(&self) -> InspectionQuote {
+        self.quote
+    }
+    fn rows(&self, max_visits: usize) -> Result<RecordRows<'a>, CodecError> {
+        RecordRows::new(self.rows, self.header.count, self.row_limit, max_visits)
+    }
+}
+
+/// One retired family's rows as a core of their own, hydrated from its
+/// bundle (`StructuralArchive::hydrate`): read as a live core is read, and
+/// nothing else — no accounting rows, no admission, no checkpoint.
+pub struct ArchiveCore {
+    core: Core<NativeState>,
+    header: ArchiveHeader,
+    digest: ContentHash,
+}
+impl ArchiveCore {
+    /// The family's rows, read as a live core is read.
+    pub fn core(&self) -> &Core<NativeState> {
+        &self.core
+    }
+    pub fn header(&self) -> &ArchiveHeader {
+        &self.header
+    }
+    pub fn digest(&self) -> ContentHash {
+        self.digest
     }
 }

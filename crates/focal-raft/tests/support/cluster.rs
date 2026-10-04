@@ -28,11 +28,17 @@ pub enum Op {
     Change(u64, ConfChangeV2),
     Transfer(u64, u64),
     Read(u64, Vec<u8>),
+    /// Several reads asked of one member before it is asked what there is
+    /// to do: this core sends one round for them.
+    Reads(u64, Vec<Vec<u8>>),
     Restart(u64),
     Compact(u64),
     Block(u64, u64),
     Heal,
     Priority(u64, i64),
+    /// The member is told what the path to another carries before it
+    /// answers.
+    Window(u64, u64, u64),
     Campaign(u64),
     Unreachable(u64, u64),
     Ping(u64),
@@ -57,6 +63,13 @@ pub struct Mix {
     pub compaction: bool,
     pub partitions: bool,
     pub priorities: bool,
+    /// Whether the bytes a member is sent ahead of its answers change
+    /// while a schedule runs. Where the cores are compared they do not:
+    /// `raft-rs` has no such bound.
+    pub windows: bool,
+    /// Whether reads are asked several at a time. Where the cores are
+    /// compared they are not: `raft-rs` sends a round for each.
+    pub bursts: bool,
     /// Of a hundred proposals, how many go by the fast track.
     pub fast: u64,
     pub lose: u64,
@@ -71,6 +84,8 @@ impl Mix {
             compaction: true,
             partitions: true,
             priorities: true,
+            windows: false,
+            bursts: false,
             fast: 0,
             lose: 8,
             repeat: 5,
@@ -97,6 +112,11 @@ pub struct Cluster<R> {
     /// is not: the comparison ends there.
     pub stop_who_left: bool,
     reads: u64,
+    /// For each read that waits, the highest index any member had
+    /// committed when it was asked: what it is answered with is no less.
+    asked: BTreeMap<Vec<u8>, u64>,
+    /// How many reads were answered.
+    pub answered: u64,
     opened: u64,
 }
 
@@ -119,6 +139,8 @@ impl<R: Replica> Cluster<R> {
             deposed: 0,
             stop_who_left: false,
             reads: 0,
+            asked: BTreeMap::new(),
+            answered: 0,
             opened: 0,
         };
         for id in 1..=count {
@@ -185,6 +207,19 @@ impl<R: Replica> Cluster<R> {
                 None => {
                     self.chosen.insert(committed.0, committed.clone());
                 }
+            }
+        }
+        for (index, context) in &output.reads {
+            // A read sees what was committed before it was asked, whoever
+            // leads by the time it is answered: a leader that was deposed
+            // meanwhile answers nothing.
+            if let Some(floor) = self.asked.remove(context) {
+                assert!(
+                    *index >= floor,
+                    "seed {}: member {member} answered a read at {index}, asked when {floor} was committed",
+                    self.seed
+                );
+                self.answered += 1;
             }
         }
         if view.role == 2 {
@@ -267,8 +302,20 @@ impl<R: Replica> Cluster<R> {
                 reports.push(self.report(*id, None));
             }
             Op::Read(id, context) => {
+                let floor = self.chosen.keys().next_back().copied().unwrap_or(0);
+                self.asked.insert(context.clone(), floor);
                 if let Some(node) = self.node(*id) {
                     node.read(context.clone());
+                }
+                reports.push(self.report(*id, None));
+            }
+            Op::Reads(id, contexts) => {
+                let floor = self.chosen.keys().next_back().copied().unwrap_or(0);
+                for context in contexts {
+                    self.asked.insert(context.clone(), floor);
+                    if let Some(node) = self.node(*id) {
+                        node.read(context.clone());
+                    }
                 }
                 reports.push(self.report(*id, None));
             }
@@ -292,6 +339,12 @@ impl<R: Replica> Cluster<R> {
             Op::Priority(id, priority) => {
                 if let Some(node) = self.node(*id) {
                     node.set_priority(*priority);
+                }
+                reports.push(self.report(*id, None));
+            }
+            Op::Window(id, member, bytes) => {
+                if let Some(node) = self.node(*id) {
+                    node.set_window(*member, *bytes);
                 }
                 reports.push(self.report(*id, None));
             }
@@ -426,6 +479,15 @@ impl<R: Replica> Cluster<R> {
                     return Op::Transfer(leader(rng), rng.pick(&all).unwrap_or(1));
                 }
                 90..=91 if !up.is_empty() => {
+                    if mix.bursts && rng.chance(50) {
+                        let contexts = (0..2 + rng.below(7))
+                            .map(|_| {
+                                self.reads += 1;
+                                self.reads.to_le_bytes().to_vec()
+                            })
+                            .collect();
+                        return Op::Reads(leader(rng), contexts);
+                    }
                     self.reads += 1;
                     return Op::Read(leader(rng), self.reads.to_le_bytes().to_vec());
                 }
@@ -439,6 +501,12 @@ impl<R: Replica> Cluster<R> {
                     }
                 }
                 95 if mix.partitions => return Op::Heal,
+                96 if mix.windows && !up.is_empty() && rng.chance(50) => {
+                    // From less than one entry to more than a schedule
+                    // ever has in flight.
+                    let bytes = [1, 24, 96, 512, 1 << 20][rng.below(5) as usize];
+                    return Op::Window(leader(rng), rng.pick(&all).unwrap_or(1), bytes);
+                }
                 96 if mix.priorities && !up.is_empty() => {
                     return Op::Priority(any(rng), rng.below(4) as i64);
                 }
@@ -463,7 +531,9 @@ impl<R: Replica> Cluster<R> {
                 self.act(&Op::Restart(id));
             }
         }
-        let mut proposed = None;
+        // The index the proposal took, and the term of the leader that
+        // took it.
+        let mut proposed: Option<(u64, u64)> = None;
         for round in 0..budget {
             // A member that joined after the leader's snapshot was taken is
             // not named by it and discards it: it is seeded by a snapshot
@@ -481,7 +551,20 @@ impl<R: Replica> Cluster<R> {
                     lose: false,
                 });
             }
-            if let Some(index) = proposed {
+            // A proposal taken by a leader that was deposed before it
+            // committed may be gone with its term: it is proposed again to
+            // the leader that followed, as its client would.
+            let leads = self
+                .leaders_now()
+                .into_iter()
+                .filter_map(|id| self.peek(id).map(|node| node.view().term))
+                .max();
+            if let (Some((_, term)), Some(now)) = (proposed, leads)
+                && now > term
+            {
+                proposed = None;
+            }
+            if let Some((index, _)) = proposed {
                 let leader = self.leaders_now().into_iter().next();
                 let conf =
                     leader.map(|leader| self.stores[(leader - 1) as usize].0.borrow().conf.clone());
@@ -501,7 +584,10 @@ impl<R: Replica> Cluster<R> {
             {
                 let reports = self.act(&Op::Propose(leader, b"settled".to_vec()));
                 if reports.iter().any(|report| report.accepted == Some(true)) {
-                    proposed = self.peek(leader).map(|node| node.view().last_index);
+                    proposed = self.peek(leader).map(|node| {
+                        let view = node.view();
+                        (view.last_index, view.term)
+                    });
                 }
             }
             for id in self.ids() {

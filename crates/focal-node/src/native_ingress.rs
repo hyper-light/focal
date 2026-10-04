@@ -13,7 +13,7 @@ use focal_wire::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Polls after a fresh proposal before the reply reports a pending ticket.
-const COMMIT_POLLS: usize = 8;
+pub(crate) const COMMIT_POLLS: usize = 8;
 
 /// Command tags whose bodies carry an artifact payload and therefore need
 /// custody verification by the exclusive content writer (21 §4).
@@ -115,6 +115,8 @@ fn code(error: ContractError) -> NativeErrorCode {
         ContractError::Capacity => NativeErrorCode::Capacity,
         ContractError::ConflictingCause => NativeErrorCode::ConflictingCause,
         ContractError::InvalidCut => NativeErrorCode::InvalidCut,
+        ContractError::RequestHistoryExpired => NativeErrorCode::RequestHistoryExpired,
+        ContractError::EpochNotAdmitted => NativeErrorCode::EpochNotAdmitted,
     }
 }
 fn native_kind(error: &NativeError) -> NativeRefusalKind {

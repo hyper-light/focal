@@ -85,6 +85,49 @@ impl Session {
         {
             return Ok(None);
         }
+        // Expiry releases only projection pins. This maintenance does
+        // not request any additional global history retirement.
+        let operation = CursorOperation::AdvanceFloor {
+            through: self.cursors.checkpoint().floor,
+        };
+        self.propose_maintenance(now, operation).map(Some)
+    }
+    /// Renew `consumer`'s lease to `expires_at` by the node's own hand — for
+    /// a consumer whose poll found the lease past its half-life (the audit's
+    /// F61): one committed entry with no receipt, no request key and no
+    /// client bookkeeping, and at most two a term for a consumer that keeps
+    /// polling. `None` while the lease is in its first half.
+    pub fn propose_cursor_renewal(
+        &mut self,
+        consumer: ConsumerId,
+        generation: u64,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<Option<CursorMaintenance>, LedgerError> {
+        self.check()?;
+        let row = self
+            .cursors
+            .get(consumer)
+            .ok_or(StreamError::MissingConsumer)?;
+        if row.token.generation != generation {
+            return Err(StreamError::WrongGeneration.into());
+        }
+        if !renewal_due(row, now, expires_at) {
+            return Ok(None);
+        }
+        let operation = CursorOperation::Renew {
+            consumer,
+            generation,
+            expires_at,
+        };
+        self.propose_maintenance(now, operation).map(Some)
+    }
+    /// One trusted maintenance entry: the leader's, pending until its quorum.
+    fn propose_maintenance(
+        &mut self,
+        now: u64,
+        operation: CursorOperation,
+    ) -> Result<CursorMaintenance, LedgerError> {
         let status = self.status();
         if status.role != StateRole::Leader || self.ready_term != Some(status.term) {
             return Err(LedgerError::NotReady {
@@ -102,11 +145,7 @@ impl Session {
             command: CursorCommand {
                 expected_revision: self.cursor_revision(),
                 now,
-                // Expiry releases only projection pins. This maintenance does
-                // not request any additional global history retirement.
-                operation: CursorOperation::AdvanceFloor {
-                    through: self.cursors.checkpoint().floor,
-                },
+                operation,
             },
         };
         let _encode = self.budget.reserve(
@@ -118,12 +157,12 @@ impl Session {
         let digest = ContentHash(*blake3::hash(&data).as_bytes());
         let candidate = self.prepare_maintenance(&envelope, digest)?;
         let target = CursorMaintenance {
-            revision: candidate.prepared.checkpoint().revision,
+            revision: candidate.prepared.revision(),
             clock: now,
         };
         self.consensus.propose_in(data, BudgetLane::Completion)?;
         self.pending_maintenance = Some(candidate);
-        Ok(Some(target))
+        Ok(target)
     }
 
     fn prepare_maintenance(
@@ -131,22 +170,42 @@ impl Session {
         envelope: &MaintenanceEnvelope,
         digest: ContentHash,
     ) -> Result<MaintenanceCandidate, LedgerError> {
+        // Floors and positions are values of the stream line (23 §6), whose
+        // published end is past the legacy domain sequence on a native
+        // ledger; the entry keeps naming the domain sequence it was made at.
+        let published = self.stream_published();
         if envelope.schema != 1
             || envelope.ledger != self.ledger
             || envelope.domain_sequence != self.sequence()
-            || envelope.replay_floor > self.sequence()
+            || envelope.replay_floor > published
             || envelope.replay_floor < self.cursors.checkpoint().floor
-            || envelope.command.operation
-                != (CursorOperation::AdvanceFloor {
-                    through: self.cursors.checkpoint().floor,
-                })
-            || self
-                .next_cursor_expiry()
-                .is_none_or(|expires| expires > envelope.command.now)
         {
             return Err(LedgerError::Corrupt);
         }
-        let prepared = self.cursors.prepare(&envelope.command, self.sequence())?;
+        // What the node maintains by its own hand, and only that: the clock
+        // when a lease is due, a polled lease past its half-life. Every
+        // replica judges both from the committed registry and the entry.
+        let due = match &envelope.command.operation {
+            CursorOperation::AdvanceFloor { through } => {
+                *through == self.cursors.checkpoint().floor
+                    && self
+                        .next_cursor_expiry()
+                        .is_some_and(|expires| expires <= envelope.command.now)
+            }
+            CursorOperation::Renew {
+                consumer,
+                generation,
+                expires_at,
+            } => self.cursors.get(*consumer).is_some_and(|row| {
+                row.token.generation == *generation
+                    && renewal_due(row, envelope.command.now, *expires_at)
+            }),
+            _ => false,
+        };
+        if !due {
+            return Err(LedgerError::Corrupt);
+        }
+        let prepared = self.cursors.prepare(&envelope.command, published)?;
         Ok(MaintenanceCandidate {
             digest,
             prepared,
@@ -186,4 +245,18 @@ impl Session {
         self.retire_deltas(candidate.replay_floor)?;
         Ok(())
     }
+}
+
+/// A lease is renewed once it has passed its half-life: what remains of it
+/// is at most half the term the renewal grants. Renewing at the half is the
+/// point that keeps the two distances equal — the time between renewals and
+/// the time a consumer that keeps polling has to recover a lost renewal —
+/// so a consumer polling more often than half a term needs every poll in the
+/// remaining half to fail before it expires, and an idle one costs at most
+/// two entries a term.
+fn renewal_due(row: &focal_stream::CursorRecord, now: u64, expires_at: u64) -> bool {
+    let remaining = row.expires_at.saturating_sub(now);
+    expires_at
+        .checked_sub(now)
+        .is_some_and(|term| remaining.checked_mul(2).is_some_and(|twice| twice <= term))
 }

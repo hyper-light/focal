@@ -19,8 +19,11 @@ pub struct ReadState {
 pub struct PendingRead {
     /// What the asker calls the read.
     pub context: Vec<u8>,
-    /// Who asked; zero or the leader itself for a read asked here.
-    pub from: NodeId,
+    /// Who asked, in the order they asked: zero or the leader itself for a
+    /// read asked here, and every other member that asked under the same
+    /// context while it waited. A read asked twice is one read, and each
+    /// asker is answered.
+    origins: Vec<NodeId>,
     /// The leader's commit when it was asked.
     pub index: u64,
     /// Who confirmed the leader since, in order.
@@ -30,6 +33,13 @@ impl PendingRead {
     pub fn acks(&self) -> &[NodeId] {
         &self.acks
     }
+    pub fn origins(&self) -> &[NodeId] {
+        &self.origins
+    }
+    /// The askers, the index and the context, to answer each asker.
+    pub fn into_parts(self) -> (Vec<NodeId>, u64, Vec<u8>) {
+        (self.origins, self.index, self.context)
+    }
 }
 
 /// Reads in the order asked, at most `limit` of them.
@@ -37,13 +47,28 @@ impl PendingRead {
 pub struct ReadOnly {
     queue: VecDeque<PendingRead>,
     limit: usize,
+    /// How many of them, from the first, a round that was sent asks for:
+    /// its heartbeat carried the context of the last of them, and a quorum
+    /// that answers it confirms them all. Those behind were asked after it
+    /// was sent, and it proves nothing for them.
+    asked: usize,
 }
 impl ReadOnly {
     pub fn new(limit: usize) -> Self {
         Self {
             queue: VecDeque::new(),
             limit,
+            asked: 0,
         }
+    }
+    /// Whether a read waits that no round sent asks for.
+    pub fn unasked(&self) -> bool {
+        self.asked < self.queue.len()
+    }
+    /// A round was sent with the context of the last read: it asks for
+    /// every read that waits.
+    pub fn asked(&mut self) {
+        self.asked = self.queue.len();
     }
     pub fn len(&self) -> usize {
         self.queue.len()
@@ -53,13 +78,15 @@ impl ReadOnly {
     }
     pub fn clear(&mut self) {
         self.queue = VecDeque::new();
+        self.asked = 0;
     }
     fn position(&self, context: &[u8]) -> Option<usize> {
         self.queue
             .iter()
             .position(|read| read.context.as_slice() == context)
     }
-    /// A read asked twice is one read.
+    /// A read asked twice is one read; a second asker of a read that waits
+    /// is answered with it, never lost to the first.
     pub fn add(
         &mut self,
         index: u64,
@@ -67,7 +94,17 @@ impl ReadOnly {
         from: NodeId,
         leader: NodeId,
     ) -> Result<()> {
-        if self.position(&context).is_some() {
+        if let Some(position) = self.position(&context) {
+            let Some(read) = self.queue.get_mut(position) else {
+                return Ok(());
+            };
+            if !read.origins.contains(&from) {
+                if read.origins.len() >= crate::MAX_MEMBERS {
+                    return Err(Error::Capacity("members that ask one read"));
+                }
+                read.origins.try_reserve(1).map_err(|_| Error::Memory)?;
+                read.origins.push(from);
+            }
             return Ok(());
         }
         if self.queue.len() >= self.limit {
@@ -80,9 +117,14 @@ impl ReadOnly {
         acks.try_reserve(1)
             .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
         acks.push(leader);
+        let mut origins = Vec::new();
+        origins
+            .try_reserve(1)
+            .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
+        origins.push(from);
         self.queue.push_back(PendingRead {
             context,
-            from,
+            origins,
             index,
             acks,
         });
@@ -112,6 +154,7 @@ impl ReadOnly {
         let count = self
             .position(context)
             .map_or(0, |position| position.saturating_add(1));
+        self.asked = self.asked.saturating_sub(count);
         if count == self.queue.len() {
             // All of them: the queue is given up with them, so that a
             // member that rests holds what it held before it was asked.
@@ -134,6 +177,11 @@ impl ReadOnly {
         self.queue.iter().fold(slots, |bytes, read| {
             bytes
                 .saturating_add(read.context.capacity())
+                .saturating_add(
+                    read.origins
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<NodeId>()),
+                )
                 .saturating_add(
                     read.acks
                         .capacity()
@@ -160,6 +208,12 @@ mod tests {
             Err(Error::Capacity("reads that wait for their quorum"))
         );
         assert_eq!(reads.last_context(), Some(b"c".as_slice()));
+        // A round sent now asks for the three; what is asked after it is
+        // asked for by none, and a confirmation takes what it confirms
+        // from those asked for.
+        assert!(reads.unasked());
+        reads.asked();
+        assert!(!reads.unasked());
         assert_eq!(reads.ack(3, b"b").unwrap(), Some([1, 3].as_slice()));
         assert_eq!(reads.ack(2, b"b").unwrap(), Some([1, 2, 3].as_slice()));
         assert_eq!(reads.ack(2, b"b").unwrap(), Some([1, 2, 3].as_slice()));
@@ -169,13 +223,17 @@ mod tests {
         assert_eq!(
             confirmed
                 .iter()
-                .map(|read| (read.index, read.from))
+                .map(|read| (read.index, read.origins().to_vec()))
                 .collect::<Vec<_>>(),
-            vec![(5, 0), (6, 2)]
+            // The second asker of "a" (member 3) is answered with it.
+            vec![(5, vec![0, 3]), (6, vec![2])]
         );
         assert_eq!(confirmed[1].acks(), [1, 2, 3]);
         assert_eq!(reads.advance(b"b").count(), 0);
         assert_eq!(reads.len(), 1);
+        assert!(!reads.unasked());
+        reads.add(8, b"d".to_vec(), 0, 1).unwrap();
+        assert!(reads.unasked());
         reads.clear();
         assert!(reads.is_empty() && reads.last_context().is_none());
     }

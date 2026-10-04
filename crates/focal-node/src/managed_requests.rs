@@ -1,6 +1,11 @@
 //! Owner-side managed replies. A protocol capability never supplies mutation
 //! authority, and read/control success requires the owner's fresh read barrier.
-use crate::{embedded::EmbeddedNode, host::access, reads::ReadViews, streams::Streams};
+use crate::{
+    embedded::EmbeddedNode,
+    host::{access, barrier_refused},
+    reads::ReadViews,
+    streams::Streams,
+};
 use focal_ledger::{ManagedSubmission, RequestStreamSubmission, Session};
 use focal_model::*;
 use focal_wire::*;
@@ -309,7 +314,9 @@ fn barrier(
     let mut context = b"focal.local.managed.read.v1\0".to_vec();
     context.extend_from_slice(&principal.0);
     context.extend_from_slice(&id.0);
-    session.read_index(context.clone()).map_err(access)?;
+    session
+        .read_index(context.clone())
+        .map_err(barrier_refused)?;
     let events = session.poll().map_err(access)?;
     if !events.messages.is_empty() || session.status().term != term || !session.is_authoritative() {
         return Err(AccessError::Unavailable);

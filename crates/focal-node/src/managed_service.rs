@@ -22,6 +22,7 @@ pub struct ManagedService {
     signing: Option<(
         crate::control_host::ControlHost,
         crate::placement_control::PlacementHandle,
+        crate::network_service::DirectoryHandle,
     )>,
     liveness: Option<crate::liveness::LivenessHandle>,
     /// The directory's routes, with this node's own identity for hints that
@@ -141,12 +142,13 @@ impl ManagedService {
         mut self,
         control: crate::control_host::ControlHost,
         signer: crate::placement_control::PlacementHandle,
+        directory: crate::network_service::DirectoryHandle,
     ) -> Self {
-        self.signing = Some((control, signer));
+        self.signing = Some((control, signer, directory));
         self
     }
     async fn sign(&self, request: &VerifiedRequest) -> Response {
-        let Some((control, signer)) = &self.signing else {
+        let Some((control, signer, directory)) = &self.signing else {
             return Response::Error(AccessError::UnsupportedOperation);
         };
         let Operation::SessionSign {
@@ -157,7 +159,9 @@ impl ManagedService {
             return Response::Error(AccessError::InvalidRequest);
         };
         let ledger = request.request().ledger;
-        if *group != ledger.session.0 {
+        // A session's fact names its own group; a partition group's names
+        // the group under the directory's namespace (F24).
+        if *group != ledger.session.0 && ledger != directory.namespace() {
             return Response::Error(AccessError::InvalidRequest);
         }
         let Ok(decoded) =
@@ -171,6 +175,7 @@ impl ManagedService {
         let reply = match crate::placement_control::sign_session_fact(
             &self.fleet,
             control,
+            directory,
             signer,
             ledger,
             decoded.fact,
@@ -203,7 +208,7 @@ impl ManagedService {
     /// hosts when it leads the session's log.
     async fn session_control(&self, request: &VerifiedRequest) -> Response {
         use crate::session_control::{SESSION_CONTROL_SCHEMA, SessionControlRequest};
-        let Some((control, signer)) = &self.signing else {
+        let Some((control, signer, _)) = &self.signing else {
             return Response::Error(AccessError::UnsupportedOperation);
         };
         let Operation::SessionControl {

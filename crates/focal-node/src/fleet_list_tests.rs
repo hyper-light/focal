@@ -143,7 +143,9 @@ impl Fixture {
             }
         }
         for (sender, frame) in messages {
-            let Operation::Raft { message, .. } = &frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                &frame.request.operation
+            else {
                 panic!("Raft expected")
             };
             self.owners[frame.target as usize - 1]
@@ -188,6 +190,10 @@ fn listed(reply: OwnedResponse) -> ListPage {
     }
 }
 
+#[path = "fleet_append_order_tests.rs"]
+mod append_order_tests;
+#[path = "fleet_peer_admission_tests.rs"]
+mod peer_admission_tests;
 #[path = "fleet_summary_owner_tests.rs"]
 mod summary_owner_tests;
 
@@ -265,6 +271,9 @@ mod traversal_tests;
 
 #[path = "fleet_monitor_owner_tests.rs"]
 mod monitor_owner_tests;
+
+#[path = "fleet_read_round_tests.rs"]
+mod read_round_tests;
 
 #[path = "fleet_selection_tests.rs"]
 mod selection_tests;

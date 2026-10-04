@@ -110,13 +110,33 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         partition: fn(&K) -> u64,
         limits: RangeHydrationLimits,
     ) -> Result<RangeHydration<K, V>, MemoryError> {
+        Self::begin_hydration_partitioned_in(
+            id,
+            config,
+            budget,
+            partition,
+            limits,
+            crate::BudgetLane::Ordinary,
+        )
+    }
+    /// [`Self::begin_hydration_partitioned`] with the owner's root charged
+    /// to `lane`; the pages the hydration fills follow the same lane through
+    /// its phases.
+    pub fn begin_hydration_partitioned_in(
+        id: RangeId,
+        config: RangeConfig,
+        budget: MemoryBudget,
+        partition: fn(&K) -> u64,
+        limits: RangeHydrationLimits,
+        lane: crate::BudgetLane,
+    ) -> Result<RangeHydration<K, V>, MemoryError> {
         if limits.max_phases == 0 {
             return Err(MemoryError::InvalidConfiguration(
                 "hydration phase limit must be nonzero",
             ));
         }
         Ok(RangeHydration {
-            store: Self::new_partitioned(id, 0, config, budget, partition)?,
+            store: Self::new_partitioned_in(id, 0, config, budget, partition, lane)?,
             limits,
             phases: 0,
         })

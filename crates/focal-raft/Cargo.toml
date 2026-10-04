@@ -21,3 +21,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "allocs"
+harness = false

@@ -14,7 +14,7 @@ focal-core = { version = "0.1.0", path = "../focal-core" }
 focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
 focal-graph = { version = "0.1.0", path = "../focal-graph" }
-focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-memory = { version = "0.1.0", path = "../focal-memory", features = ["serde"] }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }
 focal-ranges = { version = "0.1.0", path = "../focal-ranges" }

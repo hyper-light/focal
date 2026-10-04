@@ -84,7 +84,16 @@ renewal. `cluster.credentials.rotate` moves the local node's credential to a
 fresh key under the same identity: the previous certificate authorizes
 through the grace, the root re-grants the node under its new key, and the
 reply names the new `key_identity`. The founder's identity is neither
-renewed nor rotated this way.
+renewed nor rotated this way. `cluster.credentials.issuers` reads the issuers
+every credential chains to as committed — the one issuing, one staged, one
+retiring, and the upgrade fence the succession is gated on.
+`cluster.credentials.rotate_issuer` (founder only) stages the successor now:
+endorsed by the current issuer, trusted everywhere from its staging, issuing
+from the next step; every node renews under it, and the current issuer
+retires once nothing live was issued under it. Completion: `issuers` shows
+the successor staged, then issuing with the predecessor retiring, then alone.
+A `fenced` refusal names the upgrade fence to raise first
+(`cluster.upgrade.activate`).
 
 ## Inspect placement and the controller's plan
 
@@ -158,9 +167,17 @@ quorum and decoder support; enrollment is not evidence of readiness.
 
 - Root group: `cluster.membership.add_learner`, `cluster.membership.promote`,
   `cluster.membership.remove`, `cluster.membership.leave_joint`.
+- Directory partition group (`partition` from `cluster.placement`'s
+  `control.partitions`): `cluster.partitions.show`,
+  `cluster.partitions.add_learner`, `cluster.partitions.promote`,
+  `cluster.partitions.remove`. A seat is admitted as a learner first; the
+  root's grant seats the host and it hosts a replica; promote once caught up.
+  The deployment's apply seats these groups by plan; `cluster.nodes.remove`
+  vacates a leaving host's seats itself.
 - Application group: `cluster.replicas.add_learner`, `cluster.replicas.promote`,
   `cluster.replicas.remove`, `cluster.replicas.leave_joint`.
-- Leadership: `cluster.leader.transfer` or `cluster.replicas.transfer`.
+- Leadership: `cluster.leader.transfer`, `cluster.partitions.transfer` or
+  `cluster.replicas.transfer`.
 
 Completion: retain the actual committed membership receipt and reread the
 selected configuration. Transfer reports initiation; observe the subsequent

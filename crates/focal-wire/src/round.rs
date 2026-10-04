@@ -117,8 +117,10 @@ mod tests {
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
     }
-    /// A near group: opens for 100 ms, judged at 75 ms, extended 100 ms at
-    /// a time, stalled after 200 ms without an answer.
+    /// A near group: opens for 100 ms, given all of it while nothing has
+    /// arrived, judged at 75 ms of the deadline in force once something
+    /// has, extended 100 ms at a time, stalled after 200 ms without an
+    /// answer.
     fn budget() -> RoundBudget {
         RoundBudget::derive(ms(100), Some(ms(10)), ms(5_000))
     }
@@ -189,14 +191,23 @@ mod tests {
         );
     }
     #[tokio::test(start_paused = true)]
-    async fn a_round_with_no_answer_ends_at_its_lookahead() {
+    async fn a_round_with_no_answer_ends_at_its_deadline() {
         let (round, _, took) = run(&[(NEVER, true), (NEVER, true)], budget(), 1).await;
         assert_eq!((round.end, round.reported), (RoundEnd::Expired, 0));
-        assert_eq!(took, ms(75));
+        assert_eq!(took, ms(100));
         // A refusal is a report and no answer: it does not extend the round.
         let (round, _, took) = run(&[(5, false), (NEVER, true)], budget(), 1).await;
         assert_eq!((round.end, round.reported), (RoundEnd::Expired, 1));
-        assert_eq!(took, ms(75));
+        assert_eq!(took, ms(100));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_in_the_last_quarter_of_the_deadline_is_collected() {
+        // The deadline is the tail of these peers: an answer at 90 ms of a
+        // 100 ms round is the answer the round opened for.
+        let (round, answers, took) = run(&[(90, true), (NEVER, true)], budget(), 1).await;
+        assert_eq!((round.end, round.answered), (RoundEnd::Enough, 1));
+        assert_eq!(answers, vec![1]);
+        assert_eq!(took, ms(90));
     }
     #[tokio::test(start_paused = true)]
     async fn a_round_whose_answers_keep_arriving_is_extended_past_its_deadline() {

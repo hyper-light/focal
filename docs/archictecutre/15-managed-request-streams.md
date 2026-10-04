@@ -73,7 +73,10 @@ requiring another revision increment, allowing closure at maximum revision.
    contiguous manifest of complete keys and hashes over all receipt fields.
    Commit the new floor and receipt removal atomically. Both outcome families
    participate; acknowledging a cursor command does not acknowledge its consumer's
-   separate delta position or release consumer retention.
+   separate delta position or release consumer retention. A tail poll with
+   nothing new to acknowledge is not a managed request at all (2026-09-29, the
+   audit's F61): the watch sends it as a plain read the source answers without
+   a commit, so it takes no ordinal and leaves nothing to retire.
 4. **Seal:** commit a decision for the exact key, family and intent. Earlier
    committed work returns its original receipt; otherwise a committed seal
    prevents subsequent admission. A timeout, ordinary refusal, abandoned process

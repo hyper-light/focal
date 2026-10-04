@@ -120,7 +120,7 @@ enum BootstrapError {
 // first initialization fails closed rather than creating a second ID namespace.
 struct Bootstrap {
     root: PathBuf,
-    _lock: File,
+    _lock: focal_platform::FileLock,
     first: bool,
     #[cfg(test)]
     fault: std::cell::Cell<Option<Fault>>,
@@ -147,7 +147,7 @@ impl Bootstrap {
                 }
             })?;
         check_open_file(&lock_path, &lock, &owner)?;
-        focal_platform::try_lock_exclusive(&lock).map_err(|error| {
+        let lock = focal_platform::FileLock::exclusive(lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 BootstrapError::Locked
             } else {
@@ -155,7 +155,7 @@ impl Bootstrap {
             }
         })?;
         if first {
-            lock.sync_all()?;
+            lock.file().sync_all()?;
             #[cfg(unix)]
             {
                 File::open(root)?.sync_all()?;

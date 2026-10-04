@@ -604,7 +604,11 @@ fn responses(
         walk.visited = 1;
         return Ok(());
     };
-    // The response chain runs from the latest cycle back to the first.
+    // The response chain runs from the latest cycle back to the first. The
+    // rows above a resumed page's cursor are the way to it, not the page's
+    // work: they are passed before the walk, uncharged, so a page of one
+    // reaches the end of the chain and a response committed since the last
+    // page is never sent again.
     let mut cursor = state.latest_response().map(|link| link.testament);
     let chain = std::iter::from_fn(move || {
         let id = cursor?;
@@ -612,14 +616,12 @@ fn responses(
         let identity = response.identity();
         cursor = identity.prior;
         Some((identity.cycle, response))
-    });
+    })
+    .skip_while(move |(cycle, _)| below.is_some_and(|below| *cycle >= below));
     walk.run(
         chain,
         |(cycle, _)| Position::Cycle(*cycle),
-        |(cycle, response)| {
-            if below.is_some_and(|below| cycle >= below) {
-                return Ok(None);
-            }
+        |(_, response)| {
             Ok(Some(NativeObject::Response(Box::new(docs::response(
                 response,
             )))))

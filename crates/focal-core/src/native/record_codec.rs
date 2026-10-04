@@ -8,6 +8,7 @@
 pub mod archive;
 mod buffer;
 pub mod checkpoint;
+pub mod seal;
 pub use buffer::FundedRecord;
 #[cfg(test)]
 pub(in crate::native) use buffer::{
@@ -67,7 +68,7 @@ use bytes::{
     CountingSink, Sink, SliceSink, write_count, write_raw, write_u8, write_u16, write_u32,
     write_u64,
 };
-pub(in crate::native) use checkpoint::{ArchiveFrame, archive_frame};
+pub(in crate::native) use checkpoint::{ArchiveFrame, archive_frame, seal_frame};
 pub use fixed::RowFamily;
 pub(in crate::native) use read_history::event_object;
 /// A measuring sink for a two-pass encoding.
@@ -82,12 +83,13 @@ pub use archive::{ArchiveHeader, StructuralArchive};
 pub use inspect::{
     EncodedRow, InspectionLimits, InspectionQuote, RecordHeader, RecordRows, StructuralRecord,
 };
+pub use seal::{SealHeader, StructuralSeal};
 
 pub const MAGIC: [u8; 8] = *b"FCMUTATE";
 // Version 2 records the actual graph snapshot boundary on consequence events.
 // These dormant native bytes are separate from the frozen live V1 formats.
 // Version 5 orders rows by the storage layout (25 §3): affinity, family, fields.
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 const HASH_DOMAIN: &str = "focal.native.record.v2";
 
 #[derive(Debug, Clone, Copy)]

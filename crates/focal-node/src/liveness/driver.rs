@@ -298,6 +298,7 @@ impl LivenessHandle {
             config,
             facts: facts_rx,
             view: view_tx,
+            published: LivenessCounters::default(),
             inbox: inbox_rx,
             state: State::new(node, &config),
             _allocation: allocation,
@@ -609,6 +610,10 @@ pub struct LivenessDriver {
     view: watch::Sender<LivenessView>,
     inbox: mpsc::Receiver<Inbound>,
     state: State,
+    /// The counters the published view was built from: the view is rebuilt
+    /// once they differ, and before any answer leaves, so what an answer
+    /// reports of this member is in the view a reader takes after it.
+    published: LivenessCounters,
     _allocation: Allocation,
 }
 impl LivenessDriver {
@@ -620,7 +625,6 @@ impl LivenessDriver {
         let mut next = started.checked_add(period).unwrap_or(started);
         loop {
             let now_ms = elapsed_ms(started);
-            let counters = self.state.counters;
             let mut refresh = false;
             tokio::select! {
                 biased;
@@ -665,12 +669,22 @@ impl LivenessDriver {
             // on the periodic tick (which refreshes RTT/coordinate-derived view
             // fields). A stale or duplicate message and a no-op probe ack no
             // longer rebuild the whole view every event.
-            if refresh || self.state.counters != counters {
+            if refresh || self.state.counters != self.published {
                 self.publish();
             }
         }
     }
+    /// An answer leaves after the view it changed is published: a reader
+    /// that takes the view once it has the answer sees what the answer
+    /// reports (an extension granted, a probe counted).
+    fn answer_published(&mut self, reply: oneshot::Sender<ProbeReply>, answer: ProbeReply) {
+        if self.state.counters != self.published {
+            self.publish();
+        }
+        let _ = reply.send(answer);
+    }
     fn publish(&mut self) {
+        self.published = self.state.counters;
         let state = &self.state;
         let config = &self.config;
         let view = LivenessView {
@@ -1082,21 +1096,21 @@ impl LivenessDriver {
                 self.state.counters.probes_answered =
                     self.state.counters.probes_answered.saturating_add(1);
                 let answer = self.reply(ProbeOutcome::Ack, request.sequence, extension);
-                let _ = reply.send(answer);
+                self.answer_published(reply, answer);
             }
             ProbeKind::Indirect { target } => {
                 let can_relay =
                     self.state.members.contains_key(&target) && self.state.inflight < MAX_INFLIGHT;
                 if !can_relay {
                     let answer = self.reply(ProbeOutcome::Refused, request.sequence, extension);
-                    let _ = reply.send(answer);
+                    self.answer_published(reply, answer);
                     return;
                 }
                 let relay = self.request(ProbeKind::Direct, None);
                 let sequence = relay.sequence;
                 let Ok(body) = relay.encode() else {
                     let answer = self.reply(ProbeOutcome::Refused, request.sequence, extension);
-                    let _ = reply.send(answer);
+                    self.answer_published(reply, answer);
                     return;
                 };
                 let timeout = Duration::from_millis(self.timeout_for(target));
@@ -1279,7 +1293,7 @@ impl LivenessDriver {
                     request.sequence,
                     None,
                 );
-                let _ = reply.send(answer);
+                self.answer_published(reply, answer);
             }
         }
         false

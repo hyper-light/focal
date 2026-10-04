@@ -71,6 +71,104 @@ pub struct PendingClientJoin {
     bundle: ClientInvitation,
     key: JoinKey,
     _journal: PrivateJournal,
+    directory: std::path::PathBuf,
+}
+/// The issuers a client adopted beside its journal (24 §11): issuers its
+/// verified chains carried endorsed by a root it held, kept so a later
+/// succession — endorsed by the adopted issuer, not by the one the
+/// invitation carried — still verifies. Bounded by the roots a verifier
+/// holds; the newest adoptions stay.
+const ADOPTED_FILE: &str = "trust-adopted.bin";
+const ADOPTED_TEMPORARY: &str = "trust-adopted.bin.next";
+const ADOPTED_MAGIC: &[u8; 8] = b"FCLTRST1";
+/// The most the file may be: the roots a verifier holds, each an issuer's
+/// certificate and endorsement at the registry's bound, and the envelope.
+const MAX_ADOPTED_BYTES: usize = focal_wire::MAX_TRUST_ROOTS * 2 * 4096 + 1024;
+#[derive(Serialize, Deserialize)]
+struct AdoptedTrust {
+    schema: u16,
+    issuers: Vec<focal_enrollment::IssuerRecord>,
+}
+/// The issuers adopted in `directory`, newest last; none when nothing was.
+pub fn adopted_issuers(directory: &Path) -> Result<Vec<focal_enrollment::IssuerRecord>, JoinError> {
+    let path = directory.join(ADOPTED_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_ADOPTED_BYTES as u64 {
+        return Err(JoinError::Invalid);
+    }
+    let bytes = fs::read(&path)?;
+    let payload = bytes.get(40..).ok_or(JoinError::Invalid)?;
+    if bytes.get(..8) != Some(ADOPTED_MAGIC.as_slice())
+        || bytes.get(8..40) != Some(blake3::hash(payload).as_bytes().as_slice())
+    {
+        return Err(JoinError::Invalid);
+    }
+    let (adopted, tail): (AdoptedTrust, _) = postcard::take_from_bytes(payload)?;
+    if !tail.is_empty()
+        || adopted.schema != 1
+        || adopted.issuers.len() > focal_wire::MAX_TRUST_ROOTS
+    {
+        return Err(JoinError::Invalid);
+    }
+    for issuer in &adopted.issuers {
+        // What was written is what the certificate says, or the file is
+        // not this one.
+        if focal_enrollment::IssuerRecord::of(&issuer.certificate, issuer.endorsement.as_deref())?
+            != *issuer
+        {
+            return Err(JoinError::Invalid);
+        }
+    }
+    Ok(adopted.issuers)
+}
+/// Adopt an issuer a client's verified chain carried endorsed (24 §11): the issuer's
+/// own certificate when the chain carried it, else the endorsement itself,
+/// which anchors the same key and name. Written beside the journal and
+/// replaced atomically; the oldest adoption leaves when the bound is full.
+/// `false` when it was adopted already.
+pub fn adopt_issuer(directory: &Path, adopted: &focal_wire::Adopted) -> Result<bool, JoinError> {
+    let record = match &adopted.issuer {
+        Some(issuer) => {
+            focal_enrollment::IssuerRecord::of(issuer, Some(adopted.anchor.as_slice()))?
+        }
+        None => focal_enrollment::IssuerRecord::of(&adopted.anchor, None)?,
+    };
+    let mut issuers = adopted_issuers(directory)?;
+    if issuers
+        .iter()
+        .any(|known| known.fingerprint == record.fingerprint)
+    {
+        return Ok(false);
+    }
+    while issuers.len() >= focal_wire::MAX_TRUST_ROOTS {
+        issuers.remove(0);
+    }
+    issuers.push(record);
+    let payload = postcard::to_stdvec(&AdoptedTrust { schema: 1, issuers })?;
+    if payload.len().saturating_add(40) > MAX_ADOPTED_BYTES {
+        return Err(JoinError::Capacity);
+    }
+    let mut bytes = ADOPTED_MAGIC.to_vec();
+    bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+    bytes.extend_from_slice(&payload);
+    let temporary = directory.join(ADOPTED_TEMPORARY);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    {
+        use std::io::Write;
+        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    focal_platform::fs::atomic_replace(&temporary, &directory.join(ADOPTED_FILE))?;
+    Ok(true)
 }
 impl PendingClientJoin {
     pub fn open(path: impl AsRef<Path>, bundle: ClientInvitation) -> Result<Self, JoinError> {
@@ -182,8 +280,29 @@ impl PendingClientJoin {
         Ok(Self {
             bundle,
             key,
+            directory: path.to_path_buf(),
             _journal: journal,
         })
+    }
+    /// The directory this join lives in: its journal, key, and the issuers
+    /// it adopted.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+    /// The roots this client's verifier holds (24 §11): the issuers its
+    /// invitation carried and the ones it adopted since, the invitation's
+    /// first, within the bound a verifier holds.
+    pub fn trust_roots(&self) -> Result<Vec<Vec<u8>>, JoinError> {
+        let mut roots = self.bundle.invitation().trust().root_certificates();
+        for issuer in adopted_issuers(&self.directory)? {
+            if roots.len() >= focal_wire::MAX_TRUST_ROOTS {
+                break;
+            }
+            if !roots.contains(&issuer.certificate) {
+                roots.push(issuer.certificate);
+            }
+        }
+        Ok(roots)
     }
     pub fn invitation(&self) -> &ClientInvitation {
         &self.bundle
@@ -244,7 +363,7 @@ impl PendingClientJoin {
         }
         Ok(self.key.complete(
             receipt,
-            &self.bundle.invitation().trust().ca_certificate,
+            self.bundle.invitation().trust().issuers.iter(),
             now,
         )?)
     }
