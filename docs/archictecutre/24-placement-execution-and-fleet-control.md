@@ -1773,7 +1773,7 @@ The node's metrics are one bounded snapshot the service samples on a fixed
 cadence (`metrics::SAMPLE_INTERVAL`, five seconds) from what it already
 owns — its memory budget, the content host's volume envelope and staged
 uploads, the WAL writer's counters, the fleet's and root replica's
-progress, every hosted replica's diagnostics (indices, apply lag, sequence,
+progress, the listed replicas' diagnostics (indices, apply lag, sequence,
 pending proposals, log kept beyond the checkpoint, retention floor and
 cursor lag, pending seeds and objects), the peer pool's delivery counters,
 the failure detector's view (§12), the credential's expiry (§11), the
@@ -1787,7 +1787,7 @@ reads (`OperatorRead::Metrics` → `AdminResult::Metrics { text }`, CLI
 (`node`, `cluster`; `focal_node_info` carries `role`, `region`, `zone` and
 `capability`); label values are escaped. Nothing is sampled on a caller's
 behalf: a read serves the latest page, so a scraper's cadence never drives
-owner work. Every hosted replica is asked at once and the round closes at
+owner work. Every listed replica is asked at once and the round closes at
 the cadence (2026-09-29, the audit's F65): an owner that is refused at its
 door, gone or late costs its entry the owner-side series — the entry says
 `focal_session_observed 0` and carries what the node knows without the
@@ -1798,6 +1798,44 @@ whatever this one took. The text is rendered once, when the snapshot is
 published (`metrics::MetricsPage`); the socket and the loopback serve it
 as it is.
 
+The page is bounded by what one operator read carries (`metrics::MAX_PAGE_BYTES`:
+the admin socket's `MAX_COMMAND` less the reply's envelope, so `diagnose node --metrics`
+reads any page; the loopback serves the same page), and it holds two kinds of series
+(2026-10-04, the audit's F26). Aggregates are over every member of a family, every round,
+with no ask of an owner: the hosted sessions, read in place (`ReplicaHost::observe`) —
+hosted, stopped, leading, leaderless, stretched, seeding, waiting for content or an
+import, the longest period, and the counts their replicas made (`focal_sessions_*`),
+kept across rounds with what a session that left, started over or was installed again
+had counted, so a node-level counter never falls; the root leader's members by
+pipeline state, inactive, paused and the most a member is behind; the measured peer
+paths (how many, shortest and longest); the admitted tenants' queued work and how many
+are at their memory limit. Then entities one by one, within what is left of the page:
+each family's flagged entities first (a session stopped, leaderless, stretched, waiting,
+unanswered last round or refused periods since; a root member not replicating, inactive,
+paused or being sent a snapshot; a peer not alive; a tenant at its limit), then the next
+of the rest after where the family's last round stopped. The room is shared among the
+families in proportion to what each family's entities cost at their widest, measured by
+rendering (`metrics::rounds::PageBudget`), so every family is listed at the same fraction
+a round and the page never exceeds its bound. `focal_metrics_family_total`,
+`_flagged` and `_listed` say, per family, how many there are, are flagged and are listed
+this round; `focal_metrics_rounds_total` is the rotation's progress, and
+`focal_metrics_rounds_refused_total` the rounds refused their room, which keep the page
+before. Only the sessions listed are asked for their diagnostics. The page and what the
+rounds keep are charged to the node's budget.
+
+Measured with this node's labels (`metrics::rounds` tests): the fixed part at its widest
+is 38,506 bytes of the 61,436-byte page, a session 6,698 bytes, a root member 741, a
+measured peer 139, a tenant 328 — so a node hosting 4,096 sessions lists four a round
+(three beside a member, a peer and a tenant), flagged ones first, and every one within
+1,365 rounds. Per-session series of every session each round would be 131,072 series a
+node; the aggregates are what an alert reads, and a session is read in full by
+`diagnose cluster --replicas --session`. With 4,096 sessions in one grouped owner and the only
+stopped one placed past the first 512 by key, the first round's aggregates count it and
+the page lists it, in every round, under a load average of 31 to 36 on 18 cores
+(`fleet::async_tests::the_only_stopped_session_past_the_first_512_shows_in_the_first_round`);
+the rounds keep 1.9 MiB for those sessions, charged, and the process held 285 MiB
+resident beside the 164 MiB its fleet's budget accounted.
+
 `node.metrics_listen` (local configuration, loopback only, [08](08-stepped-complexity-and-deployment.md)
 §2) binds a `TcpListener` at open and serves `GET /metrics` over HTTP/1.0
 (`metrics::serve_loopback`): as many connections at once as the admin
@@ -1807,8 +1845,7 @@ written, `Connection: close`, `404` for another path and `405` for another
 method, no HTTP crate; a scrape that never speaks costs no other its
 answer. It is read-only and
 unauthenticated by construction, which is why it never leaves the loopback
-interface; the admin socket stays the authenticated path. Sessions beyond
-`metrics::MAX_SESSIONS` are counted as truncated, never silently dropped.
+interface; the admin socket stays the authenticated path.
 
 ## 24. Reachability and packaging
 

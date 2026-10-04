@@ -73,11 +73,13 @@ fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) ->
             stream: 0,
         }),
         // A queue with a place for every session's write, so that as many
-        // sessions as the test has can each have one out at once.
+        // sessions as the test has can each have one out at once — up to the
+        // most a writer admits, past which the sessions' writes take turns.
         WalWriterLimits {
             queue_items: WalWriterLimits::default()
                 .queue_items
-                .max(usize::try_from(count).unwrap().saturating_mul(4)),
+                .max(usize::try_from(count).unwrap().saturating_mul(4))
+                .min(focal_log::MAX_QUEUE_ITEMS),
             ..WalWriterLimits::default()
         },
         wal_budget.clone(),
@@ -648,4 +650,101 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
             queued - asked_before
         );
     }
+}
+
+/// The audit's F26 acceptance: 4,096 sessions in one grouped owner, the only
+/// stopped one placed past the first 512 by key. The node's aggregates count
+/// it in the first round; the page lists it in the first round, flagged,
+/// and in every round after; every healthy session is listed within
+/// ⌈healthy / (room − flagged)⌉ rounds; and the rounds keep no more than
+/// the hosted set. The process's resident memory is printed beside what the
+/// fleet's budget accounts, for the audit's comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_only_stopped_session_past_the_first_512_shows_in_the_first_round() {
+    use crate::metrics::{MetricLabels, rounds::Rounds};
+    use std::collections::BTreeSet;
+    let count = 4096u128;
+    let path = tempfile::tempdir().unwrap();
+    let fixture = fixture(path.path(), count);
+    settle(&fixture).await;
+    let stopped = ledger(3000);
+    assert!(
+        fixture
+            .hosts
+            .keys()
+            .position(|ledger| *ledger == stopped)
+            .unwrap()
+            >= 512
+    );
+    fixture.hosts[&stopped].stop().await.unwrap();
+    let labels = MetricLabels {
+        node: 1,
+        cluster: "0".repeat(32),
+        region: None,
+        zone: None,
+        role: "host",
+    };
+    let memory = MemoryBudget::new(1 << 30, 1 << 20).unwrap();
+    let mut rounds = Rounds::new(&labels, memory.clone()).unwrap();
+    let hosted: Vec<(LedgerId, &ReplicaHost)> = fixture
+        .hosts
+        .iter()
+        .map(|(ledger, host)| (*ledger, host))
+        .collect();
+    let survey = |rounds: &mut Rounds| {
+        rounds
+            .survey(
+                |visit: &mut dyn FnMut(LedgerId, u64, &ReplicaHost)| {
+                    for (index, (ledger, host)) in hosted.iter().enumerate() {
+                        visit(*ledger, u64::try_from(index).unwrap(), host);
+                    }
+                },
+                hosted.len(),
+                1,
+            )
+            .unwrap()
+    };
+    let first = survey(&mut rounds);
+    assert_eq!(first.aggregates.hosted, 4096);
+    assert_eq!(first.aggregates.stopped, 1);
+    assert_eq!(first.aggregates.leading, 4095);
+    let flagged: Vec<LedgerId> = first
+        .flags
+        .iter()
+        .filter(|(_, flagged)| *flagged)
+        .map(|(ledger, _)| *ledger)
+        .collect();
+    assert_eq!(flagged, [stopped]);
+    let room = rounds.budget().capacities([hosted.len(), 0, 0, 0])[0];
+    assert!(room >= 2, "room {room}");
+    let mut seen = BTreeSet::new();
+    let mut listed = 0usize;
+    let rounds_bound = 4095usize.div_ceil(room - 1);
+    let mut survey_next = Some(first);
+    while seen.len() < hosted.len() {
+        let current = survey_next.take().unwrap_or_else(|| survey(&mut rounds));
+        let chosen = rounds.choose_sessions(&current.flags, room).unwrap();
+        assert!(chosen.contains(&stopped), "round {listed}");
+        assert_eq!(rounds.kept().0, hosted.len());
+        seen.extend(chosen);
+        listed += 1;
+        assert!(
+            listed <= rounds_bound,
+            "{} of 4096 after {listed}",
+            seen.len()
+        );
+    }
+    let resident = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_else(|| "unknown".into());
+    println!(
+        "4096 sessions: {room} listed a round, every one within {listed} rounds; \
+         resident {resident} KiB, fleet budget used {} bytes, rounds kept {} bytes",
+        fixture.budget.stats().used,
+        rounds.kept().1,
+    );
 }

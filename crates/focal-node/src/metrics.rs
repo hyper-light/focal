@@ -8,15 +8,29 @@
 use crate::{admission::AdmissionReport, fleet::FleetStatus};
 use focal_client::admin::AdminRetention;
 use focal_log::WalWriterStats;
-use focal_memory::{BudgetStats, DiskStats};
+use focal_memory::{
+    Allocation, BudgetKind, BudgetLane, BudgetStats, DiskStats, MemoryBudget, MemoryError,
+};
 use focal_wire::PeerPoolStats;
 use std::fmt::Write as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How often the service samples a fresh snapshot.
 pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-/// Sessions a snapshot lists at most; more are counted as truncated.
-pub const MAX_SESSIONS: usize = 512;
+/// What `OperatorReply::Metrics` adds to its text in postcard: the
+/// variant's tag (one byte while the reply has fewer than 128 variants) and
+/// the text's length (a varint, three bytes below 2^21).
+const METRICS_REPLY_ENVELOPE: usize = 4;
+/// The longest page: what one operator read carries
+/// (`network_admin::MAX_COMMAND`, an admin frame less its envelope), so a
+/// node's own `diagnose node --metrics` can always read its page (the audit's
+/// F26). The loopback endpoint serves the same page. What does not fit is
+/// counted in the page's aggregates and listed in a later round
+/// (`rounds`).
+pub const MAX_PAGE_BYTES: usize =
+    crate::network_admin::MAX_COMMAND.saturating_sub(METRICS_REPLY_ENVELOPE);
+#[path = "metrics_rounds.rs"]
+pub mod rounds;
 /// Scrapes the loopback endpoint serves at once: as many as the admin
 /// socket admits operators; a connection beyond them is closed unanswered,
 /// as the socket closes one.
@@ -38,6 +52,9 @@ pub struct MetricLabels {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RootMetrics {
+    /// The root leader's account of every member of its group; `peers` are
+    /// the members this round lists one by one.
+    pub peer_aggregates: RootPeerAggregates,
     pub leader: u64,
     pub term: u64,
     pub applied_index: u64,
@@ -147,12 +164,176 @@ pub struct SessionMetrics {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMetrics {
+    /// Every admitted tenant's queued work; `admission.tenants` are the
+    /// tenants this round lists one by one.
+    pub tenant_aggregates: TenantAggregates,
     pub root_intents: u64,
     pub partition_intents: u64,
     pub installed: u64,
     pub last_error: bool,
     pub last_refusal: bool,
     pub admission: AdmissionReport,
+}
+/// What every hosted session adds to the node's totals: the counts its
+/// replica's progress makes, which only grow while it runs (the audit's
+/// F26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionCounters {
+    pub peers_unreachable: u64,
+    pub appends_rejected: u64,
+    pub appends_rejected_in_order: u64,
+    pub frames_held: u64,
+    pub frames_let_go: u64,
+    pub frames_stale: u64,
+    pub replication_dropped: u64,
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
+    pub waits_asked: u64,
+    pub waits_answered: u64,
+    pub waits_swept: u64,
+    pub refused_periods: u64,
+}
+impl SessionCounters {
+    /// A replica's counts, read in place, and the periods its owner was
+    /// refused.
+    pub fn of(progress: &crate::fleet::ReplicaProgress, refused_periods: u64) -> Self {
+        Self {
+            peers_unreachable: progress.peers_unreachable,
+            appends_rejected: progress.appends_rejected,
+            appends_rejected_in_order: progress.appends_rejected_in_order,
+            frames_held: progress.frames_held,
+            frames_let_go: progress.frames_let_go,
+            frames_stale: progress.frames_stale,
+            replication_dropped: progress.dropped_replication,
+            peer_reports_coalesced: progress.peer_reports_coalesced,
+            peer_reports_dropped: progress.peer_reports_dropped,
+            waits_asked: progress.waits_asked,
+            waits_answered: progress.waits_answered,
+            waits_swept: progress.waits_swept,
+            refused_periods,
+        }
+    }
+    fn fields(&self) -> [u64; 13] {
+        [
+            self.peers_unreachable,
+            self.appends_rejected,
+            self.appends_rejected_in_order,
+            self.frames_held,
+            self.frames_let_go,
+            self.frames_stale,
+            self.replication_dropped,
+            self.peer_reports_coalesced,
+            self.peer_reports_dropped,
+            self.waits_asked,
+            self.waits_answered,
+            self.waits_swept,
+            self.refused_periods,
+        ]
+    }
+    /// Whether any count fell since `last`: the replica started over, and
+    /// what it had counted before is the node's still.
+    pub fn restarted_since(&self, last: &Self) -> bool {
+        self.fields()
+            .iter()
+            .zip(last.fields())
+            .any(|(now, before)| *now < before)
+    }
+    /// Each count of `other` added to this one's, saturating.
+    pub fn add(&mut self, other: &Self) {
+        let sum = |a: u64, b: u64| a.saturating_add(b);
+        self.peers_unreachable = sum(self.peers_unreachable, other.peers_unreachable);
+        self.appends_rejected = sum(self.appends_rejected, other.appends_rejected);
+        self.appends_rejected_in_order = sum(
+            self.appends_rejected_in_order,
+            other.appends_rejected_in_order,
+        );
+        self.frames_held = sum(self.frames_held, other.frames_held);
+        self.frames_let_go = sum(self.frames_let_go, other.frames_let_go);
+        self.frames_stale = sum(self.frames_stale, other.frames_stale);
+        self.replication_dropped = sum(self.replication_dropped, other.replication_dropped);
+        self.peer_reports_coalesced =
+            sum(self.peer_reports_coalesced, other.peer_reports_coalesced);
+        self.peer_reports_dropped = sum(self.peer_reports_dropped, other.peer_reports_dropped);
+        self.waits_asked = sum(self.waits_asked, other.waits_asked);
+        self.waits_answered = sum(self.waits_answered, other.waits_answered);
+        self.waits_swept = sum(self.waits_swept, other.waits_swept);
+        self.refused_periods = sum(self.refused_periods, other.refused_periods);
+    }
+}
+/// The node's account of every session it hosts, read in place each round
+/// with no ask of an owner (the audit's F26): a stopped, leaderless or
+/// waiting session shows here whether or not this round lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionAggregates {
+    pub hosted: u64,
+    pub stopped: u64,
+    /// Sessions this node's running replica leads.
+    pub leading: u64,
+    /// Sessions whose running replica knows no leader.
+    pub leaderless: u64,
+    /// Sessions whose owner's period is stretched past the configured one.
+    pub stretched: u64,
+    /// Sessions waiting on a seed's chunks, a delivery's content, or an
+    /// import's sealing.
+    pub seeding: u64,
+    pub custody_pending: u64,
+    pub importing: u64,
+    /// The longest period any hosted session's owner took, in milliseconds.
+    pub longest_period_ms: u64,
+    /// Every count the node's sessions made, those that left or started
+    /// over included: it never falls.
+    pub totals: SessionCounters,
+}
+/// The root leader's account of every member of its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RootPeerAggregates {
+    pub members: u64,
+    pub probing: u64,
+    pub replicating: u64,
+    pub snapshotting: u64,
+    /// Members the leader has not heard from within its last check.
+    pub inactive: u64,
+    /// Members whose pipeline is paused.
+    pub paused: u64,
+    /// The most entries a member's stored log is behind this replica's
+    /// applied index.
+    pub lag_max: u64,
+}
+/// The liveness view's measured paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RttAggregates {
+    pub measured: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+/// The admitted tenants' queued work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TenantAggregates {
+    pub queued_items: u64,
+    pub queued_bytes: u64,
+    /// Tenants charging their whole memory limit.
+    pub at_limit: u64,
+}
+/// How many of a family exist, how many are flagged, and how many this
+/// round lists one by one (the audit's F26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Listing {
+    pub total: u64,
+    pub flagged: u64,
+    pub listed: u64,
+}
+impl Listing {
+    /// Its counts in the order the page names them.
+    pub fn fields(&self) -> [u64; 3] {
+        [self.total, self.flagged, self.listed]
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Listings {
+    pub sessions: Listing,
+    pub root_peers: Listing,
+    pub peer_rtts: Listing,
+    pub tenants: Listing,
 }
 /// One sample of the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,8 +357,17 @@ pub struct MetricsSnapshot {
     pub peer_rtts: Vec<PeerRtt>,
     pub liveness: LivenessMetrics,
     pub credential: Option<CredentialMetrics>,
+    /// Every hosted session, aggregated; `sessions` are those this round
+    /// lists one by one.
+    pub session_aggregates: SessionAggregates,
+    pub rtt_aggregates: RttAggregates,
+    pub listings: Listings,
+    /// Rounds the sampler has run: the rotation's progress.
+    pub rounds: u64,
+    /// Rounds that published no page, refused their room: the page before
+    /// stood.
+    pub rounds_refused: u64,
     pub sessions: Vec<SessionMetrics>,
-    pub sessions_truncated: bool,
     /// Sessions asked in this round whose owner had not answered when the
     /// round closed — refused at its door, gone, or late (the audit's F65).
     /// Their entries carry what the node knows without the owner, and say
@@ -190,18 +380,47 @@ pub struct MetricsSnapshot {
     pub fence_level: u32,
     pub announced_level: u32,
 }
-/// A published sample: the snapshot and its text, rendered once when it was
-/// sampled (the audit's F65). Every reader — the admin socket's and the
-/// loopback's — serves the text as it is.
+/// Why a round published no page: the room for it was refused, or its
+/// text outgrew the page, which the rounds' choice keeps it within — a
+/// defect, said so.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageError {
+    Memory(MemoryError),
+    Oversized { bytes: usize },
+}
+/// A published sample: the snapshot and its text, rendered once when it was
+/// sampled (the audit's F65), within one page and charged for as long as it
+/// is published (the audit's F26). Every reader — the admin socket's and
+/// the loopback's — serves the text as it is.
+#[derive(Debug)]
 pub struct MetricsPage {
     pub snapshot: MetricsSnapshot,
     pub text: String,
+    _charge: Allocation,
 }
 impl MetricsPage {
-    pub fn new(snapshot: MetricsSnapshot) -> Self {
-        let text = snapshot.render();
-        Self { snapshot, text }
+    pub fn new(snapshot: MetricsSnapshot, memory: &MemoryBudget) -> Result<Self, PageError> {
+        let bytes = snapshot
+            .held_bytes()
+            .and_then(|held| held.checked_add(MAX_PAGE_BYTES))
+            .and_then(|held| held.checked_add(focal_memory::ALLOCATOR_OVERHEAD))
+            .ok_or(PageError::Oversized { bytes: usize::MAX })?;
+        let charge = memory
+            .reserve(BudgetKind::Control, BudgetLane::Ordinary, bytes)
+            .map_err(PageError::Memory)?
+            .commit();
+        let mut out = String::new();
+        out.try_reserve_exact(MAX_PAGE_BYTES)
+            .map_err(|_| PageError::Memory(MemoryError::AllocationFailed))?;
+        let text = snapshot.render_into(out);
+        if text.len() > MAX_PAGE_BYTES {
+            return Err(PageError::Oversized { bytes: text.len() });
+        }
+        Ok(Self {
+            snapshot,
+            text,
+            _charge: charge,
+        })
     }
 }
 /// Every session asked at once and each answer taken as it comes, the round
@@ -253,15 +472,12 @@ struct Text {
     base: String,
 }
 impl Text {
-    fn new(labels: &MetricLabels) -> Self {
+    fn new(labels: &MetricLabels, out: String) -> Self {
         let mut base = String::new();
         let _ = write!(base, "node=\"{}\",cluster=\"", labels.node);
         escape(&labels.cluster, &mut base);
         base.push('"');
-        Self {
-            out: String::new(),
-            base,
-        }
+        Self { out, base }
     }
     fn header(&mut self, name: &str, kind: &str, help: &str) {
         let _ = writeln!(self.out, "# HELP {name} {help}");
@@ -288,7 +504,32 @@ impl Text {
 impl MetricsSnapshot {
     /// The snapshot as Prometheus text exposition (version 0.0.4).
     pub fn render(&self) -> String {
-        let mut text = Text::new(&self.labels);
+        self.render_into(String::new())
+    }
+    /// What the snapshot's lists hold beside it: the entities a round lists,
+    /// each with its owned text (a session's two labels).
+    pub fn held_bytes(&self) -> Option<usize> {
+        let session = size_of::<SessionMetrics>()
+            .checked_add(self.sessions.first().map_or(0, |session| {
+                session.tenant.len().saturating_add(session.session.len())
+            }))?
+            .checked_add(focal_memory::ALLOCATOR_OVERHEAD.checked_mul(2)?)?;
+        let tenants = self
+            .agent
+            .as_ref()
+            .map_or(0, |agent| agent.admission.tenants.len());
+        size_of::<Self>()
+            .checked_add(session.checked_mul(self.sessions.len())?)?
+            .checked_add(
+                size_of::<focal_consensus::PeerProgress>().checked_mul(self.root.peers.len())?,
+            )?
+            .checked_add(size_of::<PeerRtt>().checked_mul(self.peer_rtts.len())?)?
+            .checked_add(size_of::<crate::admission::TenantReport>().checked_mul(tenants)?)?
+            .checked_add(focal_memory::ALLOCATOR_OVERHEAD.checked_mul(4)?)
+    }
+    /// The snapshot as Prometheus text, written into `out`.
+    pub fn render_into(&self, out: String) -> String {
+        let mut text = Text::new(&self.labels, out);
         text.header(
             "focal_node_info",
             "gauge",
@@ -317,6 +558,45 @@ impl MetricsSnapshot {
             "How long the sample took to observe its sessions; a round closes at the sampling cadence.",
             self.collection_ms,
         );
+        text.counter(
+            "focal_metrics_rounds_total",
+            "Rounds the sampler has run; each lists the flagged entities of every family first, then the next of the rest.",
+            self.rounds,
+        );
+        text.counter(
+            "focal_metrics_rounds_refused_total",
+            "Rounds that published no page, refused their room; the page before stood.",
+            self.rounds_refused,
+        );
+        let families = [
+            ("sessions", self.listings.sessions),
+            ("root_peers", self.listings.root_peers),
+            ("peer_rtts", self.listings.peer_rtts),
+            ("tenants", self.listings.tenants),
+        ];
+        for (field, (name, help)) in [
+            (
+                "focal_metrics_family_total",
+                "Entities of a family the node knows: every one is in the family's aggregates.",
+            ),
+            (
+                "focal_metrics_family_flagged",
+                "Entities of a family flagged this round: listed first.",
+            ),
+            (
+                "focal_metrics_family_listed",
+                "Entities of a family this round lists one by one, within one page.",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            text.header(name, "gauge", help);
+            for (family, listing) in families {
+                let value = listing.fields().get(field).copied().unwrap_or(0);
+                text.labeled(name, &[("family", family)], value);
+            }
+        }
         text.gauge(
             "focal_memory_limit_bytes",
             "The node's memory allowance.",
@@ -523,7 +803,35 @@ impl MetricsSnapshot {
             "Whether the root replica stopped.",
             u8::from(self.root.stopped),
         );
-        if !self.root.peers.is_empty() {
+        let members = self.root.peer_aggregates;
+        text.header(
+            "focal_root_members",
+            "gauge",
+            "The root group's members as its leader tracks them, by their pipeline's state.",
+        );
+        for (state, value) in [
+            ("probe", members.probing),
+            ("replicate", members.replicating),
+            ("snapshot", members.snapshotting),
+        ] {
+            text.labeled("focal_root_members", &[("state", state)], value);
+        }
+        text.gauge(
+            "focal_root_members_inactive",
+            "Root members the leader has not heard from within its last check.",
+            members.inactive,
+        );
+        text.gauge(
+            "focal_root_members_paused",
+            "Root members whose pipeline is paused.",
+            members.paused,
+        );
+        text.gauge(
+            "focal_root_member_lag_max",
+            "The most entries a root member's stored log is behind this replica's applied index.",
+            members.lag_max,
+        );
+        {
             text.header(
                 "focal_root_peer_matched",
                 "gauge",
@@ -674,19 +982,32 @@ impl MetricsSnapshot {
             "Bytes of request bodies permitted to the listener's identities and not yet given back.",
             self.listener.bytes,
         );
-        if !self.peer_rtts.is_empty() {
-            text.header(
+        text.gauge(
+            "focal_peer_rtt_measured",
+            "Peers with a measured round-trip time.",
+            self.rtt_aggregates.measured,
+        );
+        text.gauge(
+            "focal_peer_rtt_min_ms",
+            "The shortest last measured round-trip time to a peer, milliseconds.",
+            self.rtt_aggregates.min_ms,
+        );
+        text.gauge(
+            "focal_peer_rtt_max_ms",
+            "The longest last measured round-trip time to a peer, milliseconds.",
+            self.rtt_aggregates.max_ms,
+        );
+        text.header(
+            "focal_peer_rtt_ms",
+            "gauge",
+            "Last measured round-trip time to a peer, milliseconds.",
+        );
+        for peer in &self.peer_rtts {
+            text.labeled(
                 "focal_peer_rtt_ms",
-                "gauge",
-                "Last measured round-trip time to a peer, milliseconds.",
+                &[("peer", &peer.peer.to_string())],
+                peer.rtt_ms,
             );
-            for peer in &self.peer_rtts {
-                text.labeled(
-                    "focal_peer_rtt_ms",
-                    &[("peer", &peer.peer.to_string())],
-                    peer.rtt_ms,
-                );
-            }
         }
         text.header(
             "focal_liveness_members",
@@ -811,6 +1132,21 @@ impl MetricsSnapshot {
                 "Bytes the admitted tenants charge.",
                 agent.admission.memory_used,
             );
+            text.gauge(
+                "focal_admission_tenants_queued_items",
+                "Queued work items over every admitted tenant.",
+                agent.tenant_aggregates.queued_items,
+            );
+            text.gauge(
+                "focal_admission_tenants_queued_bytes",
+                "Queued work bytes over every admitted tenant.",
+                agent.tenant_aggregates.queued_bytes,
+            );
+            text.gauge(
+                "focal_admission_tenants_at_limit",
+                "Admitted tenants charging their whole memory limit.",
+                agent.tenant_aggregates.at_limit,
+            );
             text.header(
                 "focal_admission_queued_items",
                 "gauge",
@@ -839,15 +1175,130 @@ impl MetricsSnapshot {
             }
         }
         text.gauge(
-            "focal_metrics_sessions_truncated",
-            "Whether sessions beyond the bound were left out.",
-            u8::from(self.sessions_truncated),
-        );
-        text.gauge(
             "focal_metrics_sessions_unobserved",
             "Sessions asked whose owner had not answered when the round closed.",
             self.sessions_unobserved,
         );
+        let sessions = self.session_aggregates;
+        for (name, help, value) in [
+            (
+                "focal_sessions_hosted",
+                "Sessions this node hosts.",
+                sessions.hosted,
+            ),
+            (
+                "focal_sessions_stopped",
+                "Hosted sessions whose replica stopped.",
+                sessions.stopped,
+            ),
+            (
+                "focal_sessions_leading",
+                "Hosted sessions this node's running replica leads.",
+                sessions.leading,
+            ),
+            (
+                "focal_sessions_leaderless",
+                "Hosted sessions whose running replica knows no leader.",
+                sessions.leaderless,
+            ),
+            (
+                "focal_sessions_stretched",
+                "Hosted sessions whose owner's period is stretched past the configured one.",
+                sessions.stretched,
+            ),
+            (
+                "focal_sessions_seeding",
+                "Hosted sessions waiting for a seeded checkpoint's chunks.",
+                sessions.seeding,
+            ),
+            (
+                "focal_sessions_custody_pending",
+                "Hosted sessions waiting for the content a retained delivery names.",
+                sessions.custody_pending,
+            ),
+            (
+                "focal_sessions_importing",
+                "Hosted sessions waiting for an import's payloads to be sealed.",
+                sessions.importing,
+            ),
+            (
+                "focal_sessions_period_longest_ms",
+                "The longest period any hosted session's owner took, from one to the next.",
+                sessions.longest_period_ms,
+            ),
+        ] {
+            text.gauge(name, help, value);
+        }
+        let totals = sessions.totals;
+        for (name, help, value) in [
+            (
+                "focal_sessions_peers_unreachable_total",
+                "Exchanges of the hosted sessions' replicas the driver could not make at all; those of sessions gone included.",
+                totals.peers_unreachable,
+            ),
+            (
+                "focal_sessions_appends_rejected_total",
+                "Appends the hosted sessions' replicas refused for not holding the entry before them.",
+                totals.appends_rejected,
+            ),
+            (
+                "focal_sessions_appends_rejected_in_order_total",
+                "Of those, the refusals the order of a leader's appends should have spared.",
+                totals.appends_rejected_in_order,
+            ),
+            (
+                "focal_sessions_frames_held_total",
+                "Frames held for one they overtook.",
+                totals.frames_held,
+            ),
+            (
+                "focal_sessions_frames_let_go_total",
+                "Frames let go past their patience or their lane.",
+                totals.frames_let_go,
+            ),
+            (
+                "focal_sessions_frames_stale_total",
+                "Frames behind what was already stepped from their source.",
+                totals.frames_stale,
+            ),
+            (
+                "focal_sessions_replication_dropped_total",
+                "Replication messages dropped beyond a peer's bound.",
+                totals.replication_dropped,
+            ),
+            (
+                "focal_sessions_peer_reports_coalesced_total",
+                "Reports of a lost exchange coalesced into one already held for the core.",
+                totals.peer_reports_coalesced,
+            ),
+            (
+                "focal_sessions_peer_reports_dropped_total",
+                "Reports of a lost exchange dropped beyond the peers a configuration can name.",
+                totals.peer_reports_dropped,
+            ),
+            (
+                "focal_sessions_waits_asked_total",
+                "Times an owner asked what the log had answered and found its write still out.",
+                totals.waits_asked,
+            ),
+            (
+                "focal_sessions_waits_answered_total",
+                "Times the log's answer to a write woke its owner.",
+                totals.waits_answered,
+            ),
+            (
+                "focal_sessions_waits_swept_total",
+                "Times a replica with a write out was looked at because an answer found its owner's signals full.",
+                totals.waits_swept,
+            ),
+            (
+                "focal_sessions_periods_refused_total",
+                "Periods in which a hosted session's replica was not ticked: refused the room, or still persisting.",
+                totals.refused_periods,
+            ),
+        ] {
+            text.counter(name, help, value);
+        }
         let series: [(&str, &str, &str); 32] = [
             (
                 "focal_session_observed",
@@ -1227,7 +1678,11 @@ mod tests {
                 applied_index: 7,
                 ..SessionMetrics::default()
             }],
-            sessions_truncated: false,
+            session_aggregates: SessionAggregates::default(),
+            rtt_aggregates: RttAggregates::default(),
+            listings: Listings::default(),
+            rounds: 1,
+            rounds_refused: 0,
             sessions_unobserved: 0,
             collection_ms: 3,
             agent: None,
@@ -1271,7 +1726,10 @@ mod tests {
         assert!(!text.contains(&format!(
             "focal_session_apply_lag{{{base},tenant=\"t\",session=\"u\"}}"
         )));
-        assert_eq!(MetricsPage::new(sample.clone()).text, text);
+        assert_eq!(
+            MetricsPage::new(sample.clone(), &budget).unwrap().text,
+            text
+        );
     }
     /// A round takes every answer that comes and closes at its deadline:
     /// the late and the failed stay unobserved, in their places. On the
@@ -1302,8 +1760,9 @@ mod tests {
     async fn a_silent_scrape_delays_no_other_and_the_text_is_the_page_s() {
         use tokio::net::{TcpListener, TcpStream};
         let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
-        let page = MetricsPage::new(snapshot(budget.stats()));
-        let (_publish, view) = tokio::sync::watch::channel(Some(page.clone()));
+        let page = MetricsPage::new(snapshot(budget.stats()), &budget).unwrap();
+        let rendered = page.text.clone();
+        let (_publish, view) = tokio::sync::watch::channel(Some(page));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_loopback(listener, view));
@@ -1319,7 +1778,7 @@ mod tests {
         };
         let (head, body) = exchange("GET /metrics HTTP/1.0\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.0 200 OK"), "{head}");
-        assert_eq!(body, page.text);
+        assert_eq!(body, rendered);
         let (head, body) = exchange("GET /nothing HTTP/1.0\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.0 404"), "{head}");
         assert_eq!(body, "not found\n");

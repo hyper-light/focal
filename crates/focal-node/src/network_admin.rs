@@ -21,7 +21,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const ADMIN_SOCKET: &str = "focal-admin.sock";
 const MAGIC: &[u8] = b"FCLADMIN1";
-const MAX_COMMAND: usize = 60 * 1024;
+pub(crate) const MAX_COMMAND: usize = 60 * 1024;
 /// The lease a repair's export holds; a walk that outlives it resumes.
 const REPAIR_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const WORKSPACE: usize = 2 * 1024 * 1024;

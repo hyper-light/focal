@@ -284,7 +284,9 @@ impl ClusterAdmin {
             {
                 Ok(AdminResult::Readiness { readiness: *value })
             }
-            (OperatorRead::Metrics, OperatorReply::Metrics(text)) if text.len() <= 8 << 20 => {
+            (OperatorRead::Metrics, OperatorReply::Metrics(text))
+                if text.len() <= crate::metrics::MAX_PAGE_BYTES =>
+            {
                 Ok(AdminResult::Metrics { text })
             }
             (OperatorRead::Gc, OperatorReply::Gc(value))

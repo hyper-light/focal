@@ -217,7 +217,7 @@ pub struct Wal {
 
 mod writer;
 #[cfg(feature = "test-support")]
-pub use writer::WalPause;
+pub use writer::{MAX_QUEUE_ITEMS, WalPause};
 pub use writer::{
     Persisted, SharedWal, WalAppend, WalLease, WalWriterId, WalWriterLimits, WalWriterStats,
 };

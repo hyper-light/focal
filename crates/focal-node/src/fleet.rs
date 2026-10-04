@@ -1088,6 +1088,18 @@ impl ReplicaHost {
     pub fn progress(&self) -> ReplicaProgress {
         self.progress.borrow().value.clone()
     }
+    /// Reads the replica's progress where it is, without copying it: what
+    /// a view over every hosted session reads each round (the audit's F26).
+    /// The progress is held for `read`'s length only, so `read` asks
+    /// nothing of the replica.
+    pub fn observe<R>(&self, read: impl FnOnce(&ReplicaProgress) -> R) -> R {
+        read(&self.progress.borrow().value)
+    }
+    /// Whether the owner's tick period in force is stretched past the
+    /// configured one, for a far or slow group (27 §3.1 P2).
+    pub fn stretched(&self) -> bool {
+        self.tick_period() > self.tick
+    }
     /// Derive this replica's tick period from the measured paths to its
     /// group's other voters (27 §3.1 P2), in force from its next tick.
     pub fn pace<'a>(

@@ -39,7 +39,7 @@ hyper-raft and its siblings — at the stage named; see below).
 | F23 | P2 | open | 6 | — |
 | F24 | P1 | in tree (root and partition groups; a seated member's service end under load open) | 5 | [F24](#f24) |
 | F25 | P2 | in tree | 5 | [F25](#f25) |
-| F26 | P2 | open | 7 | — |
+| F26 | P2 | in tree (the page, every family's aggregates, the rotating listing; refusal classes, stop causes and histograms open) | 7 | [F26](#f26) |
 | F27 | P3 | closed (a6cb86e) | 1 | [F27](#f27) |
 | F28 | P1 | open | 7 | — |
 | F29 | P3 | open | 7 | — |
@@ -4074,3 +4074,72 @@ by its caller).
 - Grouped fences (one directory fence over several chunks): only with explicit covering receipts, so that no chunk's `ChunkStored` is answered before its fence.
 - Source selection in `ensure_local` by measured health, with bounded hedging for immutable reads.
 - Both are recorded as what each would need.
+
+## F26
+
+**Cause.** The metrics sampler listed the first 512 hosted sessions by key, every round
+(`metrics::MAX_SESSIONS`, no stated basis), asked each for its diagnostics, and set a
+truncation flag; nothing aggregated over all of them, so a failing session past the 512th
+was never shown. Reading for the fix found a worse defect of the same view: every
+operator reply is bounded by one admin frame (`network_admin::MAX_COMMAND`, 60 KiB), and
+the page went out in one reply. At about 7 KiB a detailed session, a node hosting more
+than a few sessions answered its own metrics read (`cluster node metrics`, now `diagnose node --metrics`) with `Capacity`; the
+reader's 8 MiB check could never be reached. The root leader's members, the liveness
+view's measured peers and the admitted tenants grew the page with the cluster as the
+sessions did.
+
+**Fix (2026-10-04).**
+- **The page is what one operator read carries.** `metrics::MAX_PAGE_BYTES` is
+  `MAX_COMMAND` less the reply's postcard envelope; a test serializes a full page and
+  finds exactly `MAX_COMMAND`. The reader checks the same constant. The page's text and
+  snapshot are charged to the node's budget while published; a round refused its room
+  keeps the page before and is counted (`focal_metrics_rounds_refused_total`).
+- **Every family is aggregated whole, every round, with no ask.** Each hosted session is
+  read in place (`ReplicaHost::observe`, `FleetManager::visit_hosted`; no clone):
+  hosted, stopped, leading and leaderless among the running, stretched, seeding, waiting
+  for content or an import, the longest period, and the thirteen counts its replica
+  makes (`focal_sessions_*`). What a session counted is kept across rounds by ledger and
+  installation sequence, bounded by the hosted set and charged; what one that left,
+  started over or was installed again had counted joins a retired total, so no node-level
+  counter falls. The root members, measured peers and tenants have their own aggregates.
+- **Entities are listed within what is left, flagged first, then rotating.** A session
+  stopped, leaderless, stretched, waiting, unanswered last round or refused periods since;
+  a root member not replicating, inactive, paused or being sent a snapshot; a peer not
+  alive; a tenant at its limit. The room is shared among the four families in
+  proportion to what their entities cost at their widest, measured by rendering the
+  page itself with every value counted at twenty characters (`metrics::rounds::PageBudget`),
+  so the choice and the renderer cannot drift. Only listed sessions are asked for
+  diagnostics. `focal_metrics_family_{total,flagged,listed}` say how much each round
+  covers.
+
+**Evidence.**
+- `metrics::rounds::tests` (eight): a full page fits one operator read exactly; the fixed
+  part and one of each family fit; capacities stay within the page and waste less than
+  one entity a family; flagged first and every entity within ⌈rest / (room − flagged)⌉
+  rounds; flagged beyond the room rotate among themselves; counts never fall through
+  leave, restart and reinstall, and the kept counts and their charge are the hosted set's;
+  history flags; a page of the widest entities the room allows stays within one read and
+  is charged.
+- The acceptance, `fleet::async_tests::the_only_stopped_session_past_the_first_512_shows_in_the_first_round`:
+  4,096 sessions in one grouped owner, the only stopped one at key 3,000. The first
+  round's aggregates count it (stopped 1, leading 4,095) and it is the only one flagged;
+  it is listed in every round; every session is listed within 1,365 rounds (four a
+  round). Run under a load average of 31 to 36 on 18 cores: the rounds keep 1.9 MiB,
+  charged; the process held 285 MiB resident beside the 164 MiB the fleet's budget
+  accounted.
+- The fixture's writer queue had asked four places a session, past the writer's own
+  bound at 4,096 sessions; that bound is named now (`focal_log::MAX_QUEUE_ITEMS`) and the
+  fixture takes at most it.
+
+**Open, F26's second half.**
+- Refusals by class at the node's ingress (overload, fenced, unknown outcome,
+  unavailable, unauthorized, invalid, managed), counted in the listener's admission, and a
+  replica's stop cause (planned, failed, corrupt) kept in its progress and aggregated: the
+  audit's separation of overload from corruption, fencing and owner termination. The
+  wire's `Unavailable` cannot tell them apart today.
+- Histograms (`hyper_timing::Histogram`, eight log-linear buckets a doubling, owner-held,
+  copied out to the scrape) for owner queue delay, quorum, apply, custody commands, the
+  WAL's sync and group-commit wait (hyper-log's `Log::stats`), and client-observed
+  latency in `focal-client`; they arrive with the shared crates taken at 2e9fd39, which
+  wait on an adaptation of `focal-consensus` to hyper-raft's R-3 API.
+

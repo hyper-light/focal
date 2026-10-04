@@ -13567,3 +13567,19 @@ Run beside a machine held at a load average of sixty on eighteen cores, two test
   evidence suite passes at a load of 46 to 69.
 A recorded operator command in a deployment journey (`Journey::manual`) is now parsed by
 the binary itself, with its flags, so a transcript cannot name a command the CLI lacks.
+
+### 2026-10-04 — F26: the metrics page is what one operator read carries, and covers every session
+
+The sampler listed the first 512 sessions by key and nothing over all of them; and a page
+of more than a few sessions passed the 60 KiB an operator reply carries, so a node's own
+metrics read (`cluster node metrics`, now `diagnose node --metrics`) answered `Capacity`. The page is now bounded by that reply
+(`metrics::MAX_PAGE_BYTES`), every family — hosted sessions, root members, measured peers,
+admitted tenants — is aggregated whole each round without an ask, the counts sessions
+made are kept with a retired total so no node counter falls, and entities are listed
+within what is left of the page, flagged first, then rotating, the room shared in
+proportion to each family's measured cost. With 4,096 sessions in one grouped owner and
+the only stopped one past the first 512, the first round counts and lists it, under a
+load average of 31 to 36 on 18 cores; four sessions are listed a round and every one
+within 1,365 rounds; the process held 285 MiB resident beside 164 MiB its fleet's budget
+accounted. The record's F26 has the evidence; its second half (refusal classes, stop
+causes, histograms) is open there. Doc 24 §23 says how the page is made.

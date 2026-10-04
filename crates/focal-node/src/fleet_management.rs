@@ -23,6 +23,14 @@ pub struct FleetIncarnation {
     owner: OwnerId,
     sequence: u64,
 }
+impl FleetIncarnation {
+    /// The installation's place in its manager's sequence: no two
+    /// installations of one manager share it, so a session installed again
+    /// has another.
+    pub(crate) fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FleetStatus {
     pub latest_sequence: u64,
@@ -284,8 +292,25 @@ impl FleetManager {
         state
             .entries
             .range((lower, std::ops::Bound::Unbounded))
-            .find(|(_, entry)| !entry.host.progress().stopped)
+            .find(|(_, entry)| !entry.host.observe(|progress| progress.stopped))
             .map(|(ledger, entry)| (*ledger, entry.host.clone()))
+    }
+    /// Visits every installed replica in ledger order, stopped ones too,
+    /// with its installation's incarnation and without copying a host: the
+    /// hosted set a view over all sessions covers (the audit's F26). Nothing while the fleet stops or
+    /// quiesces, as `next_host`. The visit holds the fleet's registry for
+    /// its length, so `visit` asks nothing of the fleet.
+    pub(crate) fn visit_hosted(
+        &self,
+        mut visit: impl FnMut(LedgerId, FleetIncarnation, &ReplicaHost),
+    ) {
+        let state = self.state.borrow();
+        if state.status.stopped || state.quiesced {
+            return;
+        }
+        for (ledger, entry) in &state.entries {
+            visit(*ledger, entry.incarnation, &entry.host);
+        }
     }
     fn permit(&self) -> Result<ManagementPermit, FleetError> {
         if self.status().stopped {

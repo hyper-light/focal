@@ -45,6 +45,8 @@ fn reject_replay_reentry() -> Result<(), LogError> {
     }
 }
 
+/// The most queued commands a writer admits (`WalWriterLimits::queue_items`).
+pub const MAX_QUEUE_ITEMS: usize = 4096;
 /// Internal node resource policy. Defaults require no operator configuration.
 #[derive(Clone, Debug)]
 pub struct WalWriterLimits {
@@ -770,7 +772,7 @@ impl SharedWal {
     ) -> Result<Self, LogError> {
         reject_replay_reentry()?;
         let directory_path = directory.as_ref().to_path_buf();
-        if !(1..=4096).contains(&limits.queue_items)
+        if !(1..=MAX_QUEUE_ITEMS).contains(&limits.queue_items)
             || !(1..=64).contains(&limits.max_batch_requests)
             || !(1..=65536).contains(&limits.max_groups)
         {

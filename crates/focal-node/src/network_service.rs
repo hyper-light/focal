@@ -33,7 +33,7 @@ use focal_evidence::{ContentStore, StoreLimits};
 use focal_ledger::{Session, SessionLimits};
 use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
 use focal_memory::{
-    Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget,
+    Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget, MemoryError,
 };
 use focal_model::*;
 use focal_wire::*;
@@ -1178,18 +1178,22 @@ impl NetworkService {
             owners: Some(owners),
         })
     }
-    /// One metrics sample of everything this node knows about itself (24 §23).
+    /// One metrics sample of everything this node knows about itself (24 §23):
+    /// every family aggregated whole, and the entities this round lists one
+    /// by one within one page (the audit's F26, `metrics::rounds`).
     async fn sample_metrics(
         &self,
         started: tokio::time::Instant,
-    ) -> crate::metrics::MetricsSnapshot {
+        rounds: &mut crate::metrics::rounds::Rounds,
+    ) -> Result<crate::metrics::MetricsSnapshot, MemoryError> {
         fn count(value: usize) -> u64 {
             u64::try_from(value).unwrap_or(u64::MAX)
         }
         use crate::metrics::{
-            AgentMetrics, CredentialMetrics, LivenessMetrics, MetricsSnapshot, RootMetrics,
-            SessionMetrics,
+            AgentMetrics, CredentialMetrics, Listing, Listings, LivenessMetrics, MetricsSnapshot,
+            RootMetrics, RootPeerAggregates, RttAggregates, SessionMetrics, TenantAggregates,
         };
+        let round = rounds.begin();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -1199,7 +1203,7 @@ impl NetworkService {
             Ok((disk, uploads, bytes)) => (Some(disk), count(uploads), bytes),
             Err(_) => (None, 0, 0),
         };
-        let root = self.handles.control.progress();
+        let mut root = self.handles.control.progress();
         let pace = self.handles.control.current_pace();
         let view = self.handles.liveness.view();
         let mut liveness = LivenessMetrics {
@@ -1212,15 +1216,6 @@ impl NetworkService {
             refutations: view.counters.refutations,
             ..LivenessMetrics::default()
         };
-        let mut peer_rtts = Vec::new();
-        for (node, member) in &view.members {
-            if let Some(rtt_ms) = member.rtt_ms {
-                peer_rtts.push(crate::metrics::PeerRtt {
-                    peer: *node,
-                    rtt_ms,
-                });
-            }
-        }
         for member in view.members.values() {
             match member.status {
                 crate::liveness::MemberStatus::Alive => {
@@ -1245,13 +1240,14 @@ impl NetworkService {
                 renewals: summary.renewals,
                 rotations: summary.rotations,
             });
-        let (directory, agent) = match (
+        let (directory, mut agent) = match (
             self.handles.placement.directory().await,
             self.handles.placement.status().await,
         ) {
             (Ok(directory), Ok(status)) => (
                 Some(directory),
                 Some(AgentMetrics {
+                    tenant_aggregates: TenantAggregates::default(),
                     root_intents: status.root_intents,
                     partition_intents: status.partition_intents,
                     installed: count(status.installed.len()),
@@ -1263,49 +1259,194 @@ impl NetworkService {
             (Ok(directory), Err(_)) => (Some(directory), None),
             (Err(_), _) => (None, None),
         };
-        // Every hosted replica asked at once, the round closed at the
-        // cadence (the audit's F65): an owner that is refused, gone or late
-        // costs its entry the owner-side numbers, never another entry and
-        // never the round.
+
+        // Every hosted session, read in place with no ask of its owner: the
+        // aggregates count each one, and what each counted is kept across
+        // rounds, so the node's counters never fall as sessions come and go.
+        let survey = rounds.survey(
+            |visit| {
+                self.handles
+                    .fleet
+                    .visit_hosted(|ledger, incarnation, host| {
+                        visit(ledger, incarnation.sequence(), host)
+                    })
+            },
+            self.handles.fleet.status().installed,
+            self.status.node,
+        )?;
+        let sessions = survey.aggregates;
+        let flags = &survey.flags;
+
+        // The root leader's members, the liveness view's measured paths and
+        // the admitted tenants: each family aggregated whole, its flagged
+        // entities found.
+        let mut members = RootPeerAggregates::default();
+        for peer in &root.peers {
+            members.members = members.members.saturating_add(1);
+            match peer.state {
+                focal_consensus::PEER_PROBE => members.probing = members.probing.saturating_add(1),
+                focal_consensus::PEER_REPLICATE => {
+                    members.replicating = members.replicating.saturating_add(1)
+                }
+                _ => members.snapshotting = members.snapshotting.saturating_add(1),
+            }
+            if !peer.recent_active {
+                members.inactive = members.inactive.saturating_add(1);
+            }
+            if peer.paused {
+                members.paused = members.paused.saturating_add(1);
+            }
+            members.lag_max = members
+                .lag_max
+                .max(root.applied_index.saturating_sub(peer.matched));
+        }
+        root.peers.sort_unstable_by_key(|peer| peer.node);
+        let mut member_flags: Vec<(u64, bool)> = Vec::new();
+        member_flags
+            .try_reserve_exact(root.peers.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        member_flags.extend(root.peers.iter().map(|peer| {
+            (
+                peer.node,
+                peer.state != focal_consensus::PEER_REPLICATE
+                    || !peer.recent_active
+                    || peer.paused
+                    || peer.pending_snapshot != 0,
+            )
+        }));
+        let mut rtts = RttAggregates::default();
+        let mut rtt_flags: Vec<(u64, bool)> = Vec::new();
+        rtt_flags
+            .try_reserve_exact(view.members.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for (node, member) in &view.members {
+            if let Some(rtt_ms) = member.rtt_ms {
+                rtts.min_ms = if rtts.measured == 0 {
+                    rtt_ms
+                } else {
+                    rtts.min_ms.min(rtt_ms)
+                };
+                rtts.max_ms = rtts.max_ms.max(rtt_ms);
+                rtts.measured = rtts.measured.saturating_add(1);
+                rtt_flags.push((
+                    *node,
+                    !matches!(member.status, crate::liveness::MemberStatus::Alive),
+                ));
+            }
+        }
+        let mut tenant_flags: Vec<(focal_model::TenantId, bool)> = Vec::new();
+        if let Some(agent) = &mut agent {
+            let tenants = &mut agent.admission.tenants;
+            tenants.sort_unstable_by_key(|tenant| tenant.tenant);
+            tenant_flags
+                .try_reserve_exact(tenants.len())
+                .map_err(|_| MemoryError::AllocationFailed)?;
+            for tenant in tenants.iter() {
+                let at_limit = tenant.memory_used >= tenant.memory_limit;
+                let totals = &mut agent.tenant_aggregates;
+                totals.queued_items = totals
+                    .queued_items
+                    .saturating_add(count(tenant.queued_items));
+                totals.queued_bytes = totals.queued_bytes.saturating_add(tenant.queued_bytes);
+                if at_limit {
+                    totals.at_limit = totals.at_limit.saturating_add(1);
+                }
+                tenant_flags.push((tenant.tenant, at_limit));
+            }
+        }
+
+        // What this round lists: within one page, each family's flagged
+        // entities first, then the next of the rest.
+        let [session_room, member_room, rtt_room, tenant_room] = rounds.budget().capacities([
+            flags.len(),
+            member_flags.len(),
+            rtt_flags.len(),
+            tenant_flags.len(),
+        ]);
+        fn listing<K>(flags: &[(K, bool)], listed: usize) -> Listing {
+            Listing {
+                total: count(flags.len()),
+                flagged: count(flags.iter().filter(|(_, flagged)| *flagged).count()),
+                listed: count(listed),
+            }
+        }
+        let chosen_sessions = rounds.choose_sessions(flags, session_room)?;
+        let chosen_members = rounds.choose_root_peers(&member_flags, member_room)?;
+        let chosen_rtts = rounds.choose_peer_rtts(&rtt_flags, rtt_room)?;
+        let chosen_tenants = rounds.choose_tenants(&tenant_flags, tenant_room)?;
+        let mut listings = Listings {
+            sessions: listing(flags, chosen_sessions.len()),
+            root_peers: listing(&member_flags, chosen_members.len()),
+            peer_rtts: listing(&rtt_flags, chosen_rtts.len()),
+            tenants: listing(&tenant_flags, chosen_tenants.len()),
+        };
+        // The aggregates count every hosted session; one installed after the
+        // round was charged is counted there and listed in a later round.
+        listings.sessions.total = sessions.hosted;
+        root.peers
+            .retain(|peer| chosen_members.binary_search(&peer.node).is_ok());
+        let mut peer_rtts = Vec::new();
+        peer_rtts
+            .try_reserve_exact(chosen_rtts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for node in &chosen_rtts {
+            if let Some(rtt_ms) = view.members.get(node).and_then(|member| member.rtt_ms) {
+                peer_rtts.push(crate::metrics::PeerRtt {
+                    peer: *node,
+                    rtt_ms,
+                });
+            }
+        }
+        if let Some(agent) = &mut agent {
+            agent
+                .admission
+                .tenants
+                .retain(|tenant| chosen_tenants.binary_search(&tenant.tenant).is_ok());
+        }
+
+        // Only the sessions listed are asked, all at once, the round closed
+        // at the cadence (the audit's F65): an owner that is refused, gone
+        // or late costs its entry the owner-side numbers, never another
+        // entry and never the round.
         let deadline = started
             .checked_add(crate::metrics::SAMPLE_INTERVAL)
             .unwrap_or(started);
         let mut hosts = Vec::new();
-        let mut truncated = false;
-        let mut after = None;
-        while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
-            after = Some(ledger);
-            if hosts.len() >= crate::metrics::MAX_SESSIONS || hosts.try_reserve(1).is_err() {
-                truncated = true;
-                break;
+        hosts
+            .try_reserve_exact(chosen_sessions.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        self.handles.fleet.visit_hosted(|ledger, _, host| {
+            if hosts.len() < chosen_sessions.len() && chosen_sessions.binary_search(&ledger).is_ok()
+            {
+                hosts.push((ledger, host.clone()));
             }
-            hosts.push((ledger, host));
-        }
+        });
         let mut asks = Vec::new();
-        if asks.try_reserve_exact(hosts.len()).is_err() {
-            truncated = true;
-            hosts.clear();
-        }
+        asks.try_reserve_exact(hosts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
         for (_, host) in &hosts {
             let host = host.clone();
             asks.push(async move { host.diagnostics().await.ok() });
         }
         let answers = crate::metrics::collect(asks, deadline).await;
-        let mut sessions = Vec::new();
+        let mut listed = Vec::new();
+        listed
+            .try_reserve_exact(hosts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut asked = Vec::new();
+        asked
+            .try_reserve_exact(hosts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
         let mut unobserved = 0u64;
         for (index, (ledger, host)) in hosts.iter().enumerate() {
-            if sessions.try_reserve(1).is_err() {
-                truncated = true;
-                break;
-            }
             let ledger = *ledger;
-            let progress = host.progress();
             let diagnostics = answers.get(index).and_then(Option::as_ref);
+            asked.push((ledger, diagnostics.is_some()));
             if diagnostics.is_none() {
                 unobserved = unobserved.saturating_add(1);
             }
             let diagnostics = diagnostics.map(|reply| reply.value());
-            let listed = directory.as_ref().and_then(|report| {
+            let directory_listed = directory.as_ref().and_then(|report| {
                 report.partitions.iter().find_map(|(_, checkpoint)| {
                     checkpoint.sessions.get(&ledger).map(|descriptor| {
                         let guarantee =
@@ -1326,12 +1467,22 @@ impl NetworkService {
                     })
                 })
             });
-            sessions.push(SessionMetrics {
+            let (leader, term, peers_unreachable, peer_reports_coalesced, peer_reports_dropped) =
+                host.observe(|progress| {
+                    (
+                        progress.leader,
+                        progress.term,
+                        progress.peers_unreachable,
+                        progress.peer_reports_coalesced,
+                        progress.peer_reports_dropped,
+                    )
+                });
+            listed.push(SessionMetrics {
                 tenant: ledger.tenant.to_string(),
                 session: ledger.session.to_string(),
                 observed: diagnostics.is_some(),
-                leader: progress.leader,
-                term: progress.term,
+                leader,
+                term,
                 committed_index: diagnostics.map_or(0, |d| d.committed_index),
                 applied_index: diagnostics.map_or(0, |d| d.applied_index),
                 sequence: diagnostics.map_or(0, |d| d.sequence),
@@ -1348,23 +1499,24 @@ impl NetworkService {
                 custody_objects_missing: diagnostics
                     .and_then(|d| d.custody_objects_missing.map(count)),
                 delivery_retained: diagnostics.is_some_and(|d| d.delivery_retained),
-                route_epoch: listed.map(|listed| listed.0),
-                placement_epoch: listed.map(|listed| listed.1),
-                desired_max_failures: listed.map(|listed| listed.2),
-                achieved_max_failures: listed.and_then(|listed| listed.3),
-                blocked: listed.and_then(|listed| listed.4),
+                route_epoch: directory_listed.map(|listed| listed.0),
+                placement_epoch: directory_listed.map(|listed| listed.1),
+                desired_max_failures: directory_listed.map(|listed| listed.2),
+                achieved_max_failures: directory_listed.and_then(|listed| listed.3),
+                blocked: directory_listed.and_then(|listed| listed.4),
                 tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
                 broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
                 pace_samples: host.current_pace().samples,
                 periods: host.periods(),
                 refused_periods: host.refused_periods(),
-                peers_unreachable: progress.peers_unreachable,
-                peer_reports_coalesced: progress.peer_reports_coalesced,
-                peer_reports_dropped: progress.peer_reports_dropped,
+                peers_unreachable,
+                peer_reports_coalesced,
+                peer_reports_dropped,
                 longest_period_ms: u64::try_from(host.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
             });
         }
+        rounds.answered(&asked);
         let fence_level = self
             .handles
             .control
@@ -1384,7 +1536,7 @@ impl NetworkService {
                 _ => None,
             })
             .unwrap_or(0);
-        MetricsSnapshot {
+        Ok(MetricsSnapshot {
             sampled_ms: now,
             labels: self.metrics_labels.clone(),
             memory: self.budget.stats(),
@@ -1394,6 +1546,7 @@ impl NetworkService {
             wal: self.wal.stats().ok(),
             fleet: self.handles.fleet.status(),
             root: RootMetrics {
+                peer_aggregates: members,
                 leader: root.leader,
                 term: root.term,
                 applied_index: root.applied_index,
@@ -1406,7 +1559,7 @@ impl NetworkService {
                 refused_periods: self.handles.control.refused_periods(),
                 longest_period_ms: u64::try_from(self.handles.control.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
-                peers: root.peers.clone(),
+                peers: root.peers,
                 peers_unreachable: root.peers_unreachable,
                 peer_reports_coalesced: root.peer_reports_coalesced,
                 peer_reports_dropped: root.peer_reports_dropped,
@@ -1416,14 +1569,18 @@ impl NetworkService {
             peer_rtts,
             liveness,
             credential,
-            sessions,
-            sessions_truncated: truncated,
+            session_aggregates: sessions,
+            rtt_aggregates: rtts,
+            listings,
+            rounds: round,
+            sessions: listed,
             sessions_unobserved: unobserved,
             collection_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             agent,
+            rounds_refused: rounds.refused_rounds(),
             fence_level,
             announced_level: crate::upgrade::announced_level(),
-        }
+        })
     }
 
     /// Drive borrowed ingress and egress on a runtime with IO and time enabled.
@@ -1650,15 +1807,33 @@ impl NetworkService {
         // (24 §23); the admin socket and the loopback endpoint render the
         // latest one, never sampling on a caller's behalf.
         let metrics_sampler = async {
+            // Where each family's listing resumes, and what every session
+            // counted (the audit's F26); none when no page could list each
+            // family, and then no page is published.
+            let mut rounds =
+                crate::metrics::rounds::Rounds::new(&self.metrics_labels, self.budget.clone());
             loop {
                 // A round has the cadence to observe its sessions: a slow
                 // or stuck owner costs its entry, never the round, and the
                 // next round starts on the cadence whatever this one took
-                // (the audit's F65). The text is rendered here, once.
+                // (the audit's F65). The text is rendered here, once. A
+                // round refused its room keeps the last page, whose sample
+                // time says its age, and the next page counts it.
                 let started = tokio::time::Instant::now();
-                let snapshot = self.sample_metrics(started).await;
-                self.metrics
-                    .send_replace(Some(crate::metrics::MetricsPage::new(snapshot)));
+                if let Some(rounds) = rounds.as_mut() {
+                    let page = match self.sample_metrics(started, rounds).await {
+                        Ok(snapshot) => {
+                            crate::metrics::MetricsPage::new(snapshot, &self.budget).ok()
+                        }
+                        Err(_) => None,
+                    };
+                    match page {
+                        Some(page) => {
+                            self.metrics.send_replace(Some(page));
+                        }
+                        None => rounds.refused(),
+                    }
+                }
                 tokio::time::sleep_until(
                     started
                         .checked_add(crate::metrics::SAMPLE_INTERVAL)
