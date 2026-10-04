@@ -2684,12 +2684,16 @@ impl Owner {
         self.ordered.retain(|peer, _| member(*peer));
         self.append_streams.retain(|peer, _| member(*peer));
     }
-    /// Step the frames the resequencer let go, in their order.
+    /// Step the frames the resequencer let go, in their order. Each is a
+    /// loss, noted once the frame is stepped (`Owner::lost_to`): a frame let
+    /// go that the log takes — what a full lane let go behind one that
+    /// came — moves the hole past its entries.
     fn step_due(&mut self) {
         while let Some(held) = self.resequencer.take_due() {
             self.frames_let_go = self.frames_let_go.saturating_add(1);
-            self.lost_to(held.source);
+            let source = held.source;
             self.step_held(held);
+            self.lost_to(source);
         }
     }
     /// Step what was held behind the frame from `source` just stepped.
@@ -2734,6 +2738,7 @@ impl Owner {
         // A bulk frame is stepped in the order it left its sender: one
         // that overtook the frame before it is held for it, for its
         // patience at most.
+        let mut late = false;
         if let Some((epoch, sequence)) = order {
             match self.resequencer.admit(node_id, epoch, sequence) {
                 Err(crate::resequence::Capacity) => return Err(AccessError::Capacity),
@@ -2749,7 +2754,7 @@ impl Owner {
                 }
                 Ok(crate::resequence::Admission::Stale) => {
                     self.frames_stale = self.frames_stale.saturating_add(1);
-                    self.lost_to(node_id);
+                    late = true;
                 }
                 Ok(crate::resequence::Admission::Step) => {}
             }
@@ -2763,6 +2768,14 @@ impl Owner {
                 self.lost_to(node_id);
             }
             return Err(access(error));
+        }
+        if late {
+            // A frame found stale is a loss, noted once it is stepped: one
+            // the log takes carries the hole past its entries, and what is
+            // refused behind the hole is refused at the log's new end (CI on
+            // 8d4f322: a follower took two late frames after noting their
+            // loss, and fifty refusals behind them were judged the order's).
+            self.lost_to(node_id);
         }
         if order.is_some() {
             self.step_ready(node_id);
@@ -3729,8 +3742,10 @@ impl Owner {
         }
     }
     /// A frame of `source` was lost to this log: what it refuses in this
-    /// term short of the first entry it lacks now is the loss's. Where the
-    /// log cannot say where it ends, every refusal of the term is.
+    /// term short of the first entry it lacks now is the loss's. Noted once
+    /// the frame lost — let go, found stale, or not stepped — has been
+    /// stepped, so that what it carried, if the log took it, counts as held.
+    /// Where the log cannot say where it ends, every refusal of the term is.
     fn lost_to(&mut self, source: u64) {
         let term = self.session.scalars().term;
         let from = self

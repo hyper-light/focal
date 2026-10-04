@@ -13286,3 +13286,14 @@ given up at the role change as well.
 isolates a leader until check-quorum steps it down in its term, and requires the summary
 it was asked to be answered `Unavailable` at once. With the role change ignored, the
 test fails.
+
+### 2026-10-04 — a late frame the follower takes moves its loss with it
+
+Ubuntu CI on 8d4f322 failed F42's lossy-path test: 22 refusals of 46 were counted as the
+order's. Four copies at once reproduced it (one of four, 50 counted). A follower's trace
+showed the cause. The follower noted a loss where its log ended, then stepped frames it
+had let go that came after all, stale, and took them. The refusals behind the hole then
+fell at or past the noted index, and were judged the order's though the loss caused
+them. A loss is now noted once the frame lost has been stepped (`Owner::lost_to`).
+`fleet::list_tests::append_order_tests::a_late_frame_the_log_takes_moves_the_loss_with_it`
+counts (3, 0); with the loss noted before the step, (3, 1).

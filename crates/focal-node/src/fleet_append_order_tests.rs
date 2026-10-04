@@ -110,6 +110,49 @@ fn a_follower_counts_a_refusal_as_the_orders_only_where_no_loss_explains_it() {
     assert_eq!(refused(&mut fixture, 2), (2, 1));
 }
 
+/// A frame let go past its patience that comes after all — stale — and is
+/// taken by the log moves the hole past its entries: what is refused behind
+/// the hole is the loss's, refused at the log's new end. The loss was noted
+/// before the late frame was stepped, where the log ended without it, and
+/// the refusals behind it were judged the order's (CI on 8d4f322: a
+/// follower took two late frames, and fifty refusals behind them were
+/// counted in order).
+#[test]
+fn a_late_frame_the_log_takes_moves_the_loss_with_it() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::open(root.path());
+    let opening = next_append(&mut fixture, 40, 2);
+    deliver(&mut fixture, 2, opening);
+    assert_eq!(refused(&mut fixture, 2), (0, 0));
+    let first = next_append(&mut fixture, 41, 2);
+    let second = next_append(&mut fixture, 42, 2);
+    let third = next_append(&mut fixture, 43, 2);
+    let fourth = next_append(&mut fixture, 44, 2);
+    // The second overtakes the first and is held for it; its patience
+    // passes, and it is let go and refused: the loss's.
+    deliver(&mut fixture, 2, second);
+    fixture.owners[1].resequencer.expire(u64::MAX).unwrap();
+    fixture.owners[1].step_due();
+    assert_eq!(refused(&mut fixture, 2), (1, 0));
+    // The third comes in its turn and is refused behind the hole.
+    deliver(&mut fixture, 2, third);
+    assert_eq!(refused(&mut fixture, 2), (2, 0));
+    // The first comes late, stale, and the log takes it.
+    let before = fixture.owners[1].session.last_log_index().unwrap();
+    deliver(&mut fixture, 2, first);
+    assert_eq!(refused(&mut fixture, 2), (2, 0));
+    assert_eq!(fixture.owners[1].frames_stale, 1);
+    assert_eq!(
+        fixture.owners[1].session.last_log_index().unwrap(),
+        before + 1,
+        "the late frame was taken"
+    );
+    // The fourth, behind the second and third the log still lacks, is
+    // refused at the log's new end: the loss's, not the order's.
+    deliver(&mut fixture, 2, fourth);
+    assert_eq!(refused(&mut fixture, 2), (3, 0));
+}
+
 #[test]
 fn a_leader_that_sends_its_appends_plain_is_spared_nothing_by_the_order() {
     let root = tempfile::tempdir().unwrap();

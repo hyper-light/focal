@@ -3638,6 +3638,30 @@ a defect of batching** (2026-10-04).
     same term, and requires `Unavailable` at once. With the role change ignored, the
     read is still waiting there.
 
+**A late frame the follower took moved its loss with it** (Ubuntu CI, 8d4f322's push
+run, F42's `fleet_quic` `a_peers_appends_are_stepped_in_their_order_across_a_lossy_path`:
+"an ordered frame was refused for overtaking within its patience: 22 of 46 refused, 16
+let go"). It passed in the other three CI checks and locally.
+- *Reproduced* with four copies at once, one of four, with 50 refusals counted in order.
+  The follower's trace (temporary, removed) named the cause:
+  - In term 5 the follower noted a loss at index 368, its log ending at 367, as frames
+    were let go past their patience. Their refusals, with hint 367, were the loss's.
+  - Then three of the frames it had let go came after all, stale. Each loss was noted
+    before the frame was stepped, and the log took two of them, so it ended at 369.
+  - The appends pipelined behind the frames refused while the hole stood were refused
+    with hint 369. That is not before 368 or 369, so all were judged the order's.
+  - The order did its work; its judge did not. The refusals were the loss's cascade:
+    entries 370–373 had gone with the frames refused.
+- *Fix.* A loss is noted once the frame lost has been stepped (`Owner::lost_to`, called
+  after `step_held` and after a stale frame's step). What the log took from it then
+  counts as held, and the refusals behind the hole fall before the loss's index. This
+  is the rule's own statement: a loss is kept as the place it left in the log.
+- *Test.* `fleet::list_tests::append_order_tests::a_late_frame_the_log_takes_moves_the_loss_with_it`:
+  a frame overtaken, let go and refused; the next refused behind the hole; the
+  overtaken frame arriving stale and taken; the next refused at the log's new end, and
+  counted as the loss's, (3, 0). With the loss noted before the step, (3, 1).
+- *Measured.* The lossy-path test, four copies at once for six rounds: none of the 24 counted a refusal in order, with 0 to 57 frames let go a run and 812 to 1,054 held. Before the fix, one of the first four counted 50.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms
