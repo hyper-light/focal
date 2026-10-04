@@ -13134,3 +13134,16 @@ From a peer's loaded run on PR #4's tree: the enrollment-control test asked the 
 eight times 25 ms apart while the root was electing, and read the root's state under ten
 seconds of the clock. Both are charged to the control replicas' own periods now
 (`focal_timing::ProgressDeadline`), asked again a period of theirs later.
+
+### 2026-10-03 — a checkpoint does not wait for the proposals above it
+
+Found while fixing the heal: a session refused to checkpoint while any proposal was
+pending, and the owner asked only when none was, so under a steady load a replica
+checkpointed only at a period that found nothing in flight — three replicas at a cadence
+of 32 kept up to 182 entries past a checkpoint. A checkpoint is of the applied prefix and
+a proposal is above it; a domain candidate, a managed or cursor command and a cursor
+maintenance change nothing a checkpoint holds until they apply, so they no longer hold it
+back (a delivery under way and the rare membership, placement, evidence and activation
+records still do). The same load now keeps 31 at most. A ledger test checkpoints under a
+candidate held from its quorum, commits it after and replays it once from a restart; the
+follower checkpoint of the QUIC schedules waits out a native follower's `CheckpointIndex`.

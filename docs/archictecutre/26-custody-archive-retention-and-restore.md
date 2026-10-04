@@ -130,10 +130,17 @@ applied prefix once the entries applied past its last snapshot reach
 `ReplicaConfig::checkpoint_after_entries` (4,096 by default) and the log
 behind the snapshot is compacted by consensus as before: nothing is
 retired before the checkpoint that covers it is durable, and a replica
-that cannot checkpoint yet (candidates pending, a checkpoint in flight,
-unpersisted state, a resource condition) waits for a later tick. The
-bound is the log's retirement boundary (instruction 4); `cluster replicas
-diagnostics` shows `log_entries_since_checkpoint`.
+that cannot checkpoint yet (a checkpoint in flight, unpersisted state, a
+delivery under way, a membership, placement, evidence or activation
+record in flight, a resource condition) waits for a later tick. A
+proposal waiting for its quorum does not hold it back (2026-10-03): the
+checkpoint is of the applied prefix and the proposal above it, and a
+domain candidate, a managed or cursor command or a cursor maintenance
+changes nothing a checkpoint holds until it applies — a session that
+waited for its proposals to drain checkpointed under a steady load only
+at a period that found none. The bound is the log's retirement boundary
+(instruction 4); `cluster replicas diagnostics` shows
+`log_entries_since_checkpoint`.
 
 **The retention floor.** `RetentionReport` names, per native session, the
 published prefix, the prefix registered consumers still need

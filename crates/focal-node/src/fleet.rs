@@ -1765,9 +1765,11 @@ impl Owner {
     }
     /// Checkpoint now unless the replica cannot yet: a resource condition or
     /// unpersisted state waits for a later tick, and nothing is a failure.
+    /// A proposal in flight does not hold it back: the checkpoint is of the
+    /// applied prefix, below every proposal (`Session::checkpoint` refuses
+    /// what does change that prefix, and its refusal waits here as any).
     fn try_checkpoint(&mut self) -> Result<bool, LedgerError> {
-        if self.session.pending_count() != 0
-            || self.session.persistence_pending()
+        if self.session.persistence_pending()
             || self.session.checkpoint_in_flight()
             || self.stopping.is_some()
         {

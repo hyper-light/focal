@@ -646,11 +646,18 @@ impl Session {
         retain_bytes: bool,
     ) -> Result<Option<EncodedCheckpoint>, LedgerError> {
         self.check()?;
-        if self.pending_managed.is_some()
-            || !self.pending.is_empty()
-            || self.pending_cursor.is_some()
-            || self.pending_maintenance.is_some()
-            || self.pending_membership.is_some()
+        // A checkpoint is of the applied prefix, and a proposal in flight is
+        // above it, in the log the checkpoint leaves: a domain candidate, a
+        // managed or cursor command or a cursor maintenance changes the core,
+        // the graph, the deltas, the cursors or the request streams only
+        // when it applies (each is prepared from a copy), so it neither waits
+        // for nor holds back the checkpoint. A replica a steady load kept
+        // with some proposal pending checkpointed only at a period that
+        // found none, and kept 182 entries past a cadence of 32 (26 §3). A
+        // delivery under way is the prefix itself moving; a membership,
+        // placement, evidence or activation record still in flight is rare,
+        // one at a time and short, and waits as before.
+        if self.pending_membership.is_some()
             || self.pending_placement.is_some()
             || self.pending_evidence.is_some()
             || self.pending_activation.is_some()

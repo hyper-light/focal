@@ -1212,25 +1212,61 @@ async fn checkpoint_every_voter(fleet: &Fleet) -> usize {
     let (leader, view) = membership_on_leader(fleet).await;
     for voter in view.view().configuration.voters.clone() {
         let replica = usize::try_from(voter - 1).unwrap();
-        if replica == leader {
-            continue;
-        }
-        let mut moved = 0;
-        loop {
-            match fleet.replicas[replica].host.checkpoint().await {
-                Ok(()) => break,
-                Err(LedgerError::NotReady { .. }) if moved < 40 => {
-                    moved += 1;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(error) => panic!(
-                    "checkpoint of {replica}: {error}; replicas={:?}",
-                    fleet.diagnostics()
-                ),
-            }
+        if replica != leader {
+            checkpoint_follower(fleet, replica).await;
         }
     }
     checkpoint_on_leader(fleet).await
+}
+/// Checkpoint the follower `replica`, asked again a tick later while its
+/// refusal is one that passes as the owner's own checkpoint waits it out —
+/// not ready, a write or a room it waits for, or a prefix its delivery has
+/// yet to reach (a native follower that committed what it has not applied:
+/// `CheckpointIndex`, which a first version took for a failure) — charged to
+/// the replicas' own periods.
+async fn checkpoint_follower(fleet: &Fleet, replica: usize) {
+    let periods = || -> Vec<u64> {
+        fleet
+            .replicas
+            .iter()
+            .map(|replica| replica.host.periods())
+            .collect()
+    };
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &periods(),
+        focal_timing::ProgressDeadline::periods(Duration::from_secs(10), TICK),
+        FROZEN,
+    );
+    loop {
+        let refused = match fleet.replicas[replica].host.checkpoint().await {
+            Ok(()) => return,
+            Err(
+                refused @ (LedgerError::NotReady { .. }
+                | LedgerError::Capacity
+                | LedgerError::Consensus(
+                    focal_consensus::ConsensusError::CheckpointIndex
+                    | focal_consensus::ConsensusError::PersistencePending
+                    | focal_consensus::ConsensusError::Capacity,
+                )),
+            ) => refused,
+            Err(LedgerError::Native(error))
+                if error.class() == focal_ledger::FailureClass::Retryable =>
+            {
+                LedgerError::Native(error)
+            }
+            Err(error) => panic!(
+                "checkpoint of {replica}: {error}; replicas={:?}",
+                fleet.diagnostics()
+            ),
+        };
+        if let Err(spent) = wait.check(&periods()) {
+            panic!(
+                "checkpoint of {replica}: {refused} after {spent}; replicas={:?}",
+                fleet.diagnostics()
+            );
+        }
+        tokio::time::sleep(TICK).await;
+    }
 }
 /// Checkpoint on the leader of the moment; returns which replica did.
 async fn checkpoint_on_leader(fleet: &Fleet) -> usize {

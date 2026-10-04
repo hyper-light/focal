@@ -3290,13 +3290,42 @@ the voter given leadership kept its log from the first entry and brought the mem
 by appends, so they passed with the flag. Every voter checkpoints in them now, as the
 cadence has every replica do, and without the derived checkpoint all three fail, the
 member never reaching the leader's compacted index. The drain test itself did not fail here: twelve copies
-three at a time beside a whole suite all healed. *Open, found on the way:* a session's
-checkpoint waits until none of its proposals is pending (`Session::encode_checkpoint`
-refuses while any is, and the owner's `try_checkpoint` asks only when none is), so a
-group whose pending proposals never drain to none would checkpoint neither by cadence
-nor for a member it added, and its log would grow past the cadence's bound. Whether
-sustained load holds a group there is to be measured next, under a workload that keeps
-its pending queue from emptying.
+three at a time beside a whole suite all healed. *Found on the way:* a session's
+checkpoint waited for its proposals — the next entry.
+
+**A session's checkpoint waited for its proposals** (found while fixing the heal, measured
+2026-10-03). `Session::encode_checkpoint` refused while any proposal was pending, and the
+fleet owner's `try_checkpoint` asked only when none was, so a replica checkpointed — by
+cadence or for a member it added — only at a period that found no proposal in flight. A
+steady load holds some proposal pending at nearly every period: three replicas with a
+cadence of 32 entries, sixteen clients each asking forty entries one after another, kept
+up to 182 entries past a checkpoint, above the cadence plus the session's pending bound
+(32 + 128); a write path that carried more proposals at once would have held it longer.
+The refusal dates from the first server and names no reason. A checkpoint is of the
+applied prefix and a proposal is above it, in the log the checkpoint leaves; and a domain
+candidate (staged over the core, `pending_rows`), a managed command (its stream prepared
+from a copy of the slot), a cursor command and a cursor maintenance (built from the
+registry by reference) change the core, the graph, the deltas, the cursors and the
+request streams only when they apply. *Fix.* None of them holds a checkpoint back any
+more; a delivery under way (the prefix itself moving) and a membership, placement,
+evidence or activation record in flight — rare, one at a time and short — wait as
+before, and so do the consensus's own conditions (no write unpersisted, no `Ready` in
+hand). *Tests.* `session::tests::a_checkpoint_is_taken_while_a_proposal_waits_for_its_quorum`
+(a domain candidate written and held from its quorum: checkpointed under it, committed
+after it, replayed once by a restart from it);
+`fleet_tests::a_replica_under_a_steady_load_checkpoints_by_cadence` (the load above,
+held to the cadence plus the pending bound: 31 entries at most past a checkpoint at a cadence of 32 after, 182 before, the host at a load of ninety beside a peer's build). The cursor test that asserted the
+refusal in passing no longer does. *Open:* the control host skips compaction while a
+proposal, a directory bootstrap, an enrollment refresh or a caller read is in flight, so
+that no in-flight fence is invalidated; whether that holds the root's and the partitions'
+logs past their cadence under a steady control load is to be measured as this was.
+*Found on the way, in a test of the batch before:* `fleet_quic`'s `checkpoint_every_voter`
+(written for the heal) took a follower's refusal for a failure where it should wait: a
+native follower that has committed what it has not yet delivered refuses with
+`CheckpointIndex`, which its session classes as retryable and the owner's own checkpoint
+waits out — a peer's gate on PR #4's tree met it
+(`a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader`). The follower is asked
+again a tick later while its refusal passes, charged to the replicas' periods.
 
 **An ordered frame's refusals told apart by where the log stood** (ubuntu, 27b0531's push
 run, focal-node `fleet_quic`'s

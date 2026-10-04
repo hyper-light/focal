@@ -419,6 +419,68 @@ fn pump_sessions(sessions: &mut [Session]) {
     }
     panic!("transport did not quiesce");
 }
+/// A checkpoint is of the applied prefix, and a proposal waiting for its
+/// quorum is above it (26 §3): the leader checkpoints while a domain
+/// candidate waits, the candidate commits after the checkpoint, and a
+/// restart from the checkpoint replays it once. A session used to refuse
+/// any checkpoint while a proposal was pending, so a steady load held its
+/// log past the cadence.
+#[test]
+fn a_checkpoint_is_taken_while_a_proposal_waits_for_its_quorum() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |id: u64| {
+        let mut cfg = config();
+        cfg.node_id = id;
+        cfg.voters = vec![1, 2, 3];
+        Session::open(
+            dir.path().join(id.to_string()),
+            identity(),
+            cfg,
+            SessionLimits::default(),
+        )
+        .unwrap()
+    };
+    let mut sessions = (1..=3).map(open).collect::<Vec<_>>();
+    sessions[0].campaign().unwrap();
+    pump_sessions(&mut sessions);
+    sessions[0].propose(&epoch(1)).unwrap();
+    pump_sessions(&mut sessions);
+    assert_eq!(sessions[0].sequence(), SessionSeq(1));
+    // The second waits: written here, its appends held back from the others.
+    let second = epoch(2);
+    assert!(matches!(
+        sessions[0].propose(&second).unwrap(),
+        Submission::Pending(_)
+    ));
+    let held = sessions[0].poll().unwrap().messages;
+    assert_eq!(sessions[0].pending_count(), 1);
+    sessions[0].checkpoint().unwrap();
+    let floor = sessions[0].snapshot_index();
+    assert!(floor > 0, "the applied prefix is checkpointed");
+    assert_eq!(sessions[0].pending_count(), 1, "the candidate still waits");
+    for message in held {
+        sessions[message.to as usize - 1].step(message).unwrap();
+    }
+    pump_sessions(&mut sessions);
+    let key = RequestKey {
+        principal: second.principal,
+        epoch: second.request_epoch,
+        id: second.request_id,
+    };
+    for session in &sessions {
+        assert_eq!(session.sequence(), SessionSeq(2));
+    }
+    let receipt = sessions[0].receipt(&key).unwrap().clone();
+    assert_eq!(sessions[0].pending_count(), 0);
+    // Reopened from the checkpoint, the leader replays what came after it.
+    let leader = sessions.remove(0);
+    drop(leader);
+    let reopened = open(1);
+    assert_eq!(reopened.snapshot_index(), floor);
+    assert_eq!(reopened.sequence(), SessionSeq(2));
+    assert_eq!(reopened.receipt(&key), Some(&receipt));
+}
+
 #[test]
 fn cursor_metadata_needs_quorum_and_lost_leadership_drops_reservations() {
     let dir = tempfile::tempdir().unwrap();
@@ -462,7 +524,6 @@ fn cursor_metadata_needs_quorum_and_lost_leadership_drops_reservations() {
     let baseline = s.memory_stats().used;
     s.submit_cursor(&acknowledgment).unwrap();
     assert!(s.memory_stats().used > baseline);
-    assert!(matches!(s.checkpoint(), Err(LedgerError::Capacity)));
     let mut heartbeat = Message::default();
     heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
     heartbeat.from = 2;
