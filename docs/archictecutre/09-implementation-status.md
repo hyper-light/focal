@@ -13254,3 +13254,19 @@ Two gaps the shell had are settled:
   context);
 - the fast track's displaced proposals are not reported on the shell, so its backend and the
   conversion refuse a fast group until a deadline §14 records.
+
+### 2026-10-03 — the shell's crates again, at the revision D-2 builds on
+
+`vendor/` takes the six shared crates again at `687244f`, its CI green on all six targets. Two
+changes to the shell there are what the hand-over machine of
+[27](27-consensus-roadmap-and-slates-port.md) §15.7 needs:
+- an image states the configuration the group held at its point, and a snapshot sent from it
+  carries that configuration, not the replica's latest (the Raft paper's §7: a snapshot holds the
+  last configuration as of its last included index). The hand-over machine reads it back from the
+  group's image file;
+- a drive applies one page at most, and the next drive the next, so the entries a drain hands
+  over have a bound the backend reserves before it drives (contract (g)).
+
+focal runs as before: hyper-raft's sources are unchanged, hyper-timing's election law changed only
+in its tests, and its detector and hyper-liveness, which changed with the detector model the shared
+repository merged, are called by nothing in focal yet. No manifest and no locked dependency moved.

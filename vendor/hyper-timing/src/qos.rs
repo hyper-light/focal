@@ -3,18 +3,30 @@
 //!
 //! The detector is Chen, Toueg and Aguilera's NFD-E (DSN 2000; IEEE Transactions on Computers
 //! 51(5), 2002): heartbeats every `η`, trusted while one is fresh, freshness at the expected arrival
-//! plus a margin `α`. Their Theorems 7–8 bound its quality from the loss probability and the
-//! delay's mean and variance alone, through the one-sided (Cantelli) inequality
-//! `Pr(D > t) ≤ V / (V + (t − E)²)` for `t > E`:
-//! - a crash is detected within `E(D) + α + η`;
-//! - mistakes recur no more often than every `η / β`, with
-//!   `β = Π_{j=0}^{k₀} (V + p_L·x_j²) / (V + x_j²)`, `x_j = α − jη`, over the heartbeats still
-//!   fresh, `k₀ = ⌈α/η⌉ − 1`.
+//! plus a margin `α`. A crash is detected within `E(D) + α + η` (their Theorem 4). Its mistakes are
+//! bounded from the measured arrivals alone, through the one-sided (Cantelli) inequality
+//! `Pr(X − E ≥ x) ≤ V / (V + x²)`, which holds for any distribution with that mean and variance, in
+//! one of two forms:
+//! - **per arrival**, the node-pair stream's ([`configure_arrivals`], [`arrival_detector_at`],
+//!   [`lateness_bound`]): a freshness point errs only when the heartbeat taken after it comes past
+//!   it, so the detector errs at most once a heartbeat taken, with chance at most
+//!   `β(α) = u + (1 − u)·V/(V + (α − μ)²)` for `α > μ`, over the lateness `ℓ` of each heartbeat
+//!   taken past its expected arrival (mean `μ`, variance `V`) and the chance `u` that one is past
+//!   every lateness seen ([`Arrivals`], `docs/timing.md` §2.2). One factor, whatever the heartbeats
+//!   the margin holds: it assumes no independence between them, so any margin is admitted, and a
+//!   heartbeat the sender skipped or the network lost is the next one's lateness;
+//! - **Theorem 7's product**, a SWIM member's probe detector's (`hyper-swim`, §2.7; [`detector_at`],
+//!   [`mistake_bound`]): `β = Π_{j=0}^{k₀} (V + p_L·x_j²) / (V + x_j²)`, `x_j = α − jη`, over the
+//!   heartbeats still fresh, `k₀ = ⌈α/η⌉ − 1`, with the loss `p_L` and the delay's variance. The
+//!   product takes the heartbeats in the margin as independent, which the traces refute below the
+//!   correlation time `T_c` ([`Floors`]); below it the margin holds one heartbeat.
 //!
 //! Chen et al. configure `η` and `α` from requirements an application states. Here they minimize
 //! what those requirements stand for, a group's expected unavailability
 //! `U = (E(D) + α + η + T_E) / MTBF + T_E · β / η`: an election `T_E` after each detected crash of
-//! the leader's node, and one after each false suspicion.
+//! the leader's node, and one after each false suspicion, at most one an interval. By Little's law
+//! (Little 1961) `U` is the mean number of elections in progress, so it bounds the share of time
+//! one is: at one or more it promises no availability at all, and is no configuration.
 //!
 //! The election span `W` minimizes the expected time to a leader. A suspicion starts each of the
 //! `s` available voters' campaigns after a delay drawn uniformly from `[0, W)`; the vote splits when
@@ -37,6 +49,25 @@ pub struct LinkBehaviour {
     pub mean_delay: Duration,
     /// The standard deviation of the one-way delay, `√V(D)`.
     pub delay_deviation: Duration,
+}
+
+/// What a link's arrivals were measured to do, for NFD-E judged where it can err
+/// (`docs/timing.md` §2.2): the lateness `ℓ` of each heartbeat taken past the expected arrival its
+/// predecessor's freshness point was set from. The detector suspects a live sender at that
+/// freshness point exactly when `ℓ` passes the margin, once for every heartbeat taken; a heartbeat
+/// the sender skipped or the network lost lengthens the next one's `ℓ` and is nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Arrivals {
+    /// The chance the next lateness is past every one the window holds, `1/(m + 1)` over its `m`
+    /// independent arrivals (Rényi 1962): what no deviation within the range seen can bound.
+    pub unseen: f64,
+    /// The mean lateness `μ`, at least zero: a mean below it only tightens Cantelli's bound.
+    pub lateness: Duration,
+    /// Its standard deviation `√V`.
+    pub deviation: Duration,
+    /// `E(D)` where the sender's schedule is on this clock, for the detection bound; zero where it
+    /// is not.
+    pub mean_delay: Duration,
 }
 
 /// What an election costs and how often the leader's node fails.
@@ -146,8 +177,8 @@ fn golden(mut low: f64, mut high: f64, resolution: f64, f: &impl Fn(f64) -> f64)
 /// point is late or lost, `Π_{j≥0, x_j>0} (V + p_L x_j²)/(V + x_j²)` with `x_j = α − jη`, for margin
 /// `alpha`, interval `eta`, variance `variance` and loss `loss`. The product is a ratio of squares, so
 /// any one unit serves for the times (seconds, nanoseconds) with its square for the variance. The
-/// configurator and the trace analyser (`crates/hyper-timing-trace`) both use this one, so the bound
-/// they report and the one the configurator minimizes cannot differ.
+/// probe configurator ([`detector_at`]) and the trace analyser (`crates/hyper-timing-trace`) both
+/// use this one, so the bound they report and the one the configurator minimizes cannot differ.
 pub fn mistake_bound(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
     beta(loss, variance, eta, alpha)
 }
@@ -167,22 +198,6 @@ fn beta(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
         x -= eta;
     }
     product
-}
-
-/// The normal distribution's two-sided 95 % point, `Φ⁻¹(0.975)`.
-pub const Z95: f64 = 1.959_963_984_540_054;
-
-/// The 95 % score interval of a Poisson count `k`, `k + z²/2 ∓ z√(k + z²/4)` (Brown, Cai and
-/// DasGupta, "Interval estimation in exponential families", Statistica Sinica 13, 2003), whose
-/// coverage is close to nominal down to small counts. A run refutes Theorem 7's allowance for its
-/// mistakes only when the interval's lower end passes it: the rule the replay, the trace analyser
-/// and the cluster tests of hyper-swim and hyper-liveness all apply (`docs/timing.md` §2.6).
-pub fn poisson95(k: u64) -> (f64, f64) {
-    // u64 → f64 rounds only past 2⁵³ mistakes.
-    let k = k as f64;
-    let centre = k + Z95 * Z95 / 2.0;
-    let half = Z95 * (k + Z95 * Z95 / 4.0).sqrt();
-    ((centre - half).max(0.0), centre + half)
 }
 
 /// The expected share of time a group cannot commit with detector `(eta, alpha)`, seconds.
@@ -208,30 +223,11 @@ pub struct Floors {
     pub correlation: Duration,
 }
 
-/// The detector that minimizes a group's expected unavailability on `link`, within `floors`.
-///
-/// Two regimes, the better kept. With one heartbeat in the margin (`α < η`) Theorem 7's product has
-/// one factor and assumes no independence, so `η` need only clear `G` and the sender's floor. With
-/// more, the heartbeats it multiplies must be independent, so `η ≥ T_c` as well. `None` when nothing
-/// can be configured: a link that loses every heartbeat, or a granularity, MTBF or election time that
-/// is not a positive finite time.
-pub fn configure(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option<Detector> {
-    let resolution = resolution(link, costs, floors)?;
-    let base = resolution.max(floors.sender.as_secs_f64());
-    let independent = base.max(floors.correlation.as_secs_f64());
-    // One heartbeat in the margin: `α` below `η`.
-    let single = search(link, costs, resolution, base, true);
-    // Any margin, its heartbeats independent.
-    let any = search(link, costs, resolution, independent, false);
-    let (eta, alpha, value) = if single.2 <= any.2 { single } else { any };
-    detector(link, eta, alpha, value)
-}
-
-/// The detector that minimizes a group's expected unavailability on `link` at a given `interval`:
-/// the margin alone is searched. It is the detector for the heartbeats a link is sending now, while
-/// [`configure`]'s interval, where it differs, is the one to move the link to. Below the correlation
-/// time the margin holds one heartbeat (`α < η`), as in [`configure`]. `None` where [`configure`]
-/// would give none, or for a zero interval.
+/// The detector that minimizes a group's expected unavailability on `link` at a given `interval`,
+/// Theorem 7's: the margin alone is searched. Below the correlation time the margin holds one
+/// heartbeat (`α < η`), whose bound is a single Cantelli factor; at or past it, any margin, its
+/// heartbeats independent. `None` on a link that loses every heartbeat, at a zero interval, or where
+/// a granularity, MTBF or election time is not a positive finite time.
 pub fn detector_at(
     link: &LinkBehaviour,
     costs: &Costs,
@@ -316,25 +312,177 @@ fn best_margin(
     })
 }
 
-/// The interval at or above `floor` and its margin that minimize `U`, to within `resolution`: the
-/// interval, the margin and `U`. With `single`, the margin stays below the interval.
-fn search(
-    link: &LinkBehaviour,
-    costs: &Costs,
-    resolution: f64,
-    floor: f64,
-    single: bool,
-) -> (f64, f64, f64) {
+/// A nanosecond in seconds: the resolution of every stamp the estimates are taken from, the
+/// nearest margin past a lateness that never varies.
+const NANOSECOND: f64 = 1e-9;
+
+/// Bisections that can still shrink a bracket: from the widest `f64` bracket to the narrowest a
+/// halving at a time, `MAX_EXP − MIN_EXP + MANTISSA_DIGITS`, 2,098. A search ends sooner, once the
+/// bracket is within its resolution.
+fn halvings() -> u32 {
+    let bits = f64::MAX_EXP
+        .saturating_sub(f64::MIN_EXP)
+        .saturating_add_unsigned(f64::MANTISSA_DIGITS);
+    u32::try_from(bits).unwrap_or(0)
+}
+
+/// The bound on the chance that a heartbeat taken comes later than `margin` past its expected
+/// arrival (`docs/timing.md` §2.2): the unseen share, and within the range seen Cantelli's one-sided
+/// inequality `Pr(m − μ ≥ x) ≤ V/(V + x²)`, which holds for any distribution with that mean and
+/// variance and assumes no independence between heartbeats. At or below the mean it bounds
+/// nothing. Seconds.
+pub fn lateness_bound(arrivals: &Arrivals, margin: Duration) -> f64 {
+    arrival_beta(arrivals, margin.as_secs_f64())
+}
+
+fn arrival_beta(arrivals: &Arrivals, alpha: f64) -> f64 {
+    let unseen = arrivals.unseen.clamp(0.0, 1.0);
+    let past = alpha - arrivals.lateness.as_secs_f64();
+    if past <= 0.0 {
+        return 1.0;
+    }
+    let variance = arrivals.deviation.as_secs_f64().powi(2);
+    let tail = variance / (variance + past * past);
+    (unseen + (1.0 - unseen) * tail).clamp(0.0, 1.0)
+}
+
+/// The expected share of time a group cannot commit with detector `(eta, alpha)` on `arrivals`,
+/// seconds: a crash detected within `E(D) + α + η` and then an election, once per MTBF; and an
+/// election after each mistake, at most one a heartbeat taken, so at most one every `η`, each with
+/// chance at most `β(α)`. By Little's law (Little 1961) it is the mean number of elections in
+/// progress, so it also bounds the share of time one is: one or more promises nothing.
+fn arrival_unavailability(arrivals: &Arrivals, costs: &Costs, eta: f64, alpha: f64) -> f64 {
     let mtbf = costs.mtbf.as_secs_f64();
-    // `U ≥ η / MTBF`, so an interval past `MTBF · U` at the floor costs more than any it could save.
-    let (_, at_floor) = best_margin(link, costs, resolution, floor, single);
-    let high = (mtbf * at_floor).max(floor);
-    let (eta, _) = minimize(floor, high, resolution, |eta| {
-        best_margin(link, costs, resolution, eta, single).1
+    let election = costs.election.as_secs_f64();
+    let detected = arrivals.mean_delay.as_secs_f64() + alpha + eta + election;
+    detected / mtbf + election * arrival_beta(arrivals, alpha) / eta
+}
+
+/// The margin at interval `eta` that minimizes `U` on `arrivals`, and that `U`, the margin to
+/// within `resolution` past its exact minimum.
+///
+/// With `y = α − μ`, `U = const + y/MTBF + c·V/(V + y²)` past the mean, `c = T_E(1 − unseen)/η`,
+/// and at or below it `U` only grows with `α`, so `α = 0` is the best there. Past it the slope
+/// `1/MTBF − c·h(y)`, `h(y) = 2Vy/(V + y²)²`, is positive until `h` (which rises to its peak at
+/// `y = √(V/3)` and falls after) passes `1/(c·MTBF)`, and positive again from where it falls back:
+/// `U` has one valley, whose floor is the root of `c·h(y) = 1/MTBF` on `h`'s falling side,
+/// bracketed by the peak and `(2cV·MTBF)^{1/3}`, where `c·h(y) < 2cV/y³` meets it, and found by
+/// bisection, `h` being monotone there. The better of `α = 0` and that floor is the minimum.
+fn arrival_margin(arrivals: &Arrivals, costs: &Costs, eta: f64, resolution: f64) -> (f64, f64) {
+    let at = |alpha: f64| (alpha, arrival_unavailability(arrivals, costs, eta, alpha));
+    let none = at(0.0);
+    let better = |candidate: (f64, f64)| {
+        if candidate.1 < none.1 {
+            candidate
+        } else {
+            none
+        }
+    };
+    let mu = arrivals.lateness.as_secs_f64();
+    let variance = arrivals.deviation.as_secs_f64().powi(2);
+    let mtbf = costs.mtbf.as_secs_f64();
+    let cost = costs.election.as_secs_f64() * (1.0 - arrivals.unseen.clamp(0.0, 1.0)) / eta;
+    if cost <= 0.0 || !cost.is_finite() {
+        return none;
+    }
+    if variance <= 0.0 {
+        // Every lateness is the mean: a margin past it is passed only by the unseen.
+        return better(at(mu + NANOSECOND));
+    }
+    let h = |y: f64| 2.0 * variance * y / (variance + y * y).powi(2);
+    let target = 1.0 / mtbf;
+    let peak = (variance / 3.0).sqrt();
+    if cost * h(peak) <= target {
+        return none;
+    }
+    let (mut low, mut high) = (peak, (2.0 * cost * variance * mtbf).cbrt().max(peak));
+    for _ in 0..halvings() {
+        let middle = 0.5 * (low + high);
+        if high - low <= resolution || middle <= low || middle >= high {
+            break;
+        }
+        if cost * h(middle) > target {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    better(at(mu + high))
+}
+
+/// The detector `(eta, alpha)` on `arrivals`, seconds, with its unavailability `value`.
+fn arrival_detector(arrivals: &Arrivals, eta: f64, alpha: f64, value: f64) -> Option<Detector> {
+    let beta = arrival_beta(arrivals, alpha);
+    Some(Detector {
+        interval: Duration::try_from_secs_f64(eta).ok()?,
+        margin: Duration::try_from_secs_f64(alpha).ok()?,
+        detection: Duration::try_from_secs_f64(arrivals.mean_delay.as_secs_f64() + alpha + eta)
+            .ok()?,
+        mistake_recurrence: if beta > 0.0 {
+            Duration::try_from_secs_f64(eta / beta).unwrap_or(Duration::MAX)
+        } else {
+            Duration::MAX
+        },
+        unavailability: value,
+    })
+}
+
+/// The search's resolution for `arrivals`, the granularity in seconds, or `None` when nothing can
+/// be configured: an unseen share of one, or a granularity, MTBF or election time that is not a
+/// positive finite time.
+fn arrival_resolution(arrivals: &Arrivals, costs: &Costs, granularity: Duration) -> Option<f64> {
+    let resolution = granularity.as_secs_f64();
+    let mtbf = costs.mtbf.as_secs_f64();
+    let election = costs.election.as_secs_f64();
+    if !(0.0..1.0).contains(&arrivals.unseen) || resolution <= 0.0 || mtbf <= 0.0 || election <= 0.0
+    {
+        return None;
+    }
+    Some(resolution)
+}
+
+/// The detector that minimizes a group's expected unavailability on `arrivals`, its interval at
+/// or above the sender's `floor` and the timer's `granularity` (the search's resolution too).
+/// Any margin is admitted: the bound is one Cantelli factor on the arrival's lateness, whatever
+/// the heartbeats the margin holds, so no correlation time enters. `None` when nothing can be
+/// configured ([`arrival_resolution`]).
+pub fn configure_arrivals(
+    arrivals: &Arrivals,
+    costs: &Costs,
+    granularity: Duration,
+    floor: Duration,
+) -> Option<Detector> {
+    let resolution = arrival_resolution(arrivals, costs, granularity)?;
+    let base = resolution.max(floor.as_secs_f64());
+    let mtbf = costs.mtbf.as_secs_f64();
+    // `U ≥ η / MTBF`, so an interval past `MTBF · U` at the floor costs more than any it could
+    // save.
+    let (_, at_floor) = arrival_margin(arrivals, costs, base, resolution);
+    let high = (mtbf * at_floor).max(base);
+    let (eta, _) = minimize(base, high, resolution, |eta| {
+        arrival_margin(arrivals, costs, eta, resolution).1
     });
-    let eta = eta.max(floor);
-    let (alpha, value) = best_margin(link, costs, resolution, eta, single);
-    (eta, alpha, value)
+    let eta = eta.max(base);
+    let (alpha, value) = arrival_margin(arrivals, costs, eta, resolution);
+    arrival_detector(arrivals, eta, alpha, value)
+}
+
+/// The detector that minimizes a group's expected unavailability on `arrivals` at a given
+/// `interval`: the margin alone is searched. `None` where [`configure_arrivals`] would give none,
+/// or for a zero interval.
+pub fn arrival_detector_at(
+    arrivals: &Arrivals,
+    costs: &Costs,
+    granularity: Duration,
+    interval: Duration,
+) -> Option<Detector> {
+    let resolution = arrival_resolution(arrivals, costs, granularity)?;
+    let eta = interval.as_secs_f64();
+    if eta <= 0.0 {
+        return None;
+    }
+    let (alpha, value) = arrival_margin(arrivals, costs, eta, resolution);
+    arrival_detector(arrivals, eta, alpha, value)
 }
 
 /// `Pr(Binomial(trials, p) ≥ at_least)`.
@@ -448,37 +596,107 @@ mod tests {
         assert!(found.election.as_secs_f64() < at_fixed_edge, "{found:?}");
     }
 
+    /// A rational `numerator / denominator`, exact in `i128` for the small groups checked here.
+    #[derive(Clone, Copy, Debug)]
+    struct Ratio(i128, i128);
+
+    impl Ratio {
+        fn add(self, other: Self) -> Self {
+            Self(self.0 * other.1 + other.0 * self.1, self.1 * other.1).reduced()
+        }
+        fn times(self, other: Self) -> Self {
+            Self(self.0 * other.0, self.1 * other.1).reduced()
+        }
+        fn reduced(self) -> Self {
+            let (mut a, mut b) = (self.0.abs(), self.1.abs());
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            let g = a.max(1) * self.1.signum();
+            Self(self.0 / g, self.1 / g)
+        }
+        fn equals(self, other: Self) -> bool {
+            self.0 * other.1 == other.0 * self.1
+        }
+        fn value(self) -> f64 {
+            self.0 as f64 / self.1 as f64
+        }
+    }
+
+    fn choose(n: i128, k: i128) -> i128 {
+        (0..k).fold(1, |acc, i| acc * (n - i) / (i + 1))
+    }
+
+    fn power(x: Ratio, n: i128) -> Ratio {
+        (0..n).fold(Ratio(1, 1), |acc, _| acc.times(x))
+    }
+
+    /// `Pr(T_(c) − T_(1) < x)` for `s` uniform starts, from the order statistics' joint density
+    /// (David and Nagaraja, *Order Statistics*, 2003, §2.2): the spacing has density
+    /// `s!/((c−2)!(s−c+1)!) · w^{c−2}(1 − w)^{s−c+1}` (the density of `(T_(1), T_(c))` with the
+    /// first integrated out), integrated term by term from `0` to `x`, exactly.
+    fn spacing_below(s: i128, c: i128, x: Ratio) -> Ratio {
+        let factorial = |n: i128| (1..=n).product::<i128>();
+        let scale = factorial(s) / (factorial(c - 2) * factorial(s - c + 1));
+        (0..=s - c + 1).fold(Ratio(0, 1), |sum, k| {
+            let sign = if k % 2 == 0 { 1 } else { -1 };
+            let term =
+                Ratio(sign * scale * choose(s - c + 1, k), c - 1 + k).times(power(x, c - 1 + k));
+            sum.add(term)
+        })
+    }
+
+    /// `Pr(Binomial(s, x) ≥ at_least)`, exactly.
+    fn binomial_at_least(s: i128, x: Ratio, at_least: i128) -> Ratio {
+        let rest = Ratio(x.1 - x.0, x.1);
+        (at_least..=s).fold(Ratio(0, 1), |sum, j| {
+            sum.add(
+                Ratio(choose(s, j), 1)
+                    .times(power(x, j))
+                    .times(power(rest, s - j)),
+            )
+        })
+    }
+
+    /// The split probability is Ongaro's order statistic in closed form: the spacing's law,
+    /// integrated exactly from the order statistics' density, equals the binomial tail the code
+    /// computes, as rationals, for every group of two to seven voters with every count up and
+    /// latencies on a grid of the span; and the code's floating value is that rational to within
+    /// its rounding. The two smallest have textbook forms: two starts within `x` of each other,
+    /// `1 − (1 − x)²`; the second of three within `x` of the first, `1 − (1 − x)³`.
     #[test]
     fn the_split_probability_is_ongaros_order_statistic() {
-        // Five voters, four up: the vote splits when three of four start within l of the first
-        // (Ongaro §9.2, Figure 9.4). At l = W every start is within l: always split.
-        assert_eq!(split(5, 4, 1.0, 1.0), 1.0);
-        // A Monte Carlo of the same event agrees with the closed form.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut draw = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        };
-        for (voters, available, x) in [(5u32, 4u32, 0.1), (5, 5, 0.2), (3, 2, 0.3), (7, 6, 0.05)] {
-            let crowd = available - voters / 2 + 1;
-            let trials = 200_000;
-            let mut splits = 0;
-            for _ in 0..trials {
-                let mut times: Vec<f64> = (0..available).map(|_| draw()).collect();
-                times.sort_by(f64::total_cmp);
-                if times[crowd as usize - 1] - times[0] < x {
-                    splits += 1;
+        assert_eq!(
+            split(5, 4, 1.0, 1.0),
+            1.0,
+            "at l = W every start is within l"
+        );
+        for voters in 2..=7u32 {
+            for available in (voters / 2 + 1)..=voters {
+                let crowd = i128::from(available - voters / 2 + 1);
+                for x in (1..10).map(|p| Ratio(p, 10)) {
+                    let s = i128::from(available);
+                    let tail = binomial_at_least(s, x, crowd - 1);
+                    if crowd >= 2 {
+                        assert!(
+                            spacing_below(s, crowd, x).equals(tail),
+                            "{voters} voters, {available} up, x {x:?}"
+                        );
+                    }
+                    let closed = split(voters, available, x.value(), 1.0);
+                    let exact = if crowd <= 1 { 1.0 } else { tail.value() };
+                    assert!(
+                        (closed - exact).abs() <= 8.0 * f64::EPSILON,
+                        "{voters} voters, {available} up, x {x:?}: {closed} against {exact}"
+                    );
                 }
             }
-            let simulated = f64::from(splits) / f64::from(trials);
-            let closed = split(voters, available, x, 1.0);
-            assert!(
-                (simulated - closed).abs() < 0.005,
-                "{voters} voters, {available} up, l/W {x}: simulated {simulated}, closed {closed}"
-            );
         }
+        let x = Ratio(3, 10);
+        let one = Ratio(1, 1);
+        let rest = Ratio(7, 10);
+        assert!(spacing_below(2, 2, x).equals(one.add(power(rest, 2).times(Ratio(-1, 1)))));
+        assert!(spacing_below(3, 2, x).equals(one.add(power(rest, 3).times(Ratio(-1, 1)))));
     }
 
     /// The margin's bracket closed by probing finds the margin the whole bracket `[0, MTBF·U(η,η)]`
@@ -522,18 +740,6 @@ mod tests {
                 "{link:?} {costs:?} η {eta}: {value} against {before}"
             );
         }
-    }
-
-    #[test]
-    fn the_poisson_interval_is_the_score_interval() {
-        // k = 0: the lower end is zero and the upper z², the score interval's own closed form.
-        let (low, high) = poisson95(0);
-        assert_eq!(low, 0.0);
-        assert!((high - Z95 * Z95).abs() < 1e-12);
-        // Around a large count it is close to the normal interval k ± z√k.
-        let (low, high) = poisson95(10_000);
-        assert!((low - (10_000.0 - Z95 * 100.0)).abs() < 2.0);
-        assert!((high - (10_000.0 + Z95 * 100.0)).abs() < 2.0);
     }
 
     #[test]
@@ -590,83 +796,179 @@ mod tests {
         assert_eq!(beta(0.0, 0.0, 1e-3, 1e-3), 0.0);
     }
 
+    /// The configured detector does at least as well as its neighbours, and a node that fails
+    /// more often is worth detecting sooner: on a LAN-like link (0.2 ms delay, 0.1 ms deviation, one
+    /// arrival in a hundred past every one seen, 10 ms elections), a month's MTBF against a day's.
     #[test]
     fn the_detector_trades_detection_against_mistakes() {
-        let link = LinkBehaviour {
-            loss: 0.01,
+        let link = Arrivals {
+            unseen: 0.01,
+            lateness: Duration::ZERO,
+            deviation: ms(0.1),
             mean_delay: ms(0.2),
-            delay_deviation: ms(0.1),
         };
         let floor = ms(0.05);
         let monthly = Costs {
             election: ms(10.0),
             mtbf: Duration::from_secs(30 * 24 * 3600),
         };
-        let floors = Floors {
-            granularity: floor,
-            sender: floor,
-            correlation: floor,
-        };
-        let found = configure(&link, &monthly, &floors).unwrap();
-        // It does at least as well as the neighbours of its choice.
-        let u = |eta: f64, alpha: f64| unavailability(&link, &monthly, eta, alpha);
+        let found = configure_arrivals(&link, &monthly, floor, floor).unwrap();
+        let u = |eta: f64, alpha: f64| arrival_unavailability(&link, &monthly, eta, alpha);
         let (eta, alpha) = (found.interval.as_secs_f64(), found.margin.as_secs_f64());
         for (de, da) in [(1.1, 1.0), (0.9, 1.0), (1.0, 1.1), (1.0, 0.9)] {
             let other = (eta * de).max(floor.as_secs_f64());
             assert!(found.unavailability <= u(other, alpha * da) * 1.0001);
         }
-        // Mistakes are rarer than failures: a false suspicion must not cost more than a crash.
-        assert!(found.mistake_recurrence > monthly.mtbf / 10);
-        // A node that fails more often is worth detecting sooner.
         let daily = Costs {
             mtbf: Duration::from_secs(24 * 3600),
             ..monthly
         };
-        let sooner = configure(&link, &daily, &floors).unwrap();
+        let sooner = configure_arrivals(&link, &daily, floor, floor).unwrap();
         assert!(sooner.detection <= found.detection);
     }
 
+    /// A xorshift stream (Marsaglia 2003) of `[0, 1)` draws: deterministic test noise.
+    fn draws(mut state: u64) -> impl FnMut() -> f64 {
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// The margin found is the minimum of `U` over every margin, to within the resolution: against
+    /// a grid finer than the resolution from zero to far past the deviation, on arrivals from tight
+    /// to stalled, with means from none to past the deviation.
     #[test]
-    fn heartbeats_counted_together_are_a_correlation_time_apart() {
-        // A link with a heavy tail, as the traces measured on a flushing macOS link (mean 7 ms,
-        // deviation 10.8 ms), and correlation times from none to past any useful interval.
-        let link = LinkBehaviour {
-            loss: 0.0005,
-            mean_delay: ms(7.0),
-            delay_deviation: ms(10.8),
+    fn the_arrival_margin_is_the_minimum_of_its_unavailability() {
+        let mut draw = draws(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..200 {
+            let arrivals = Arrivals {
+                unseen: draw() * 0.2,
+                lateness: Duration::from_secs_f64(draw() * draw() * 0.05),
+                deviation: Duration::from_secs_f64(1e-5 + draw() * draw() * 0.2),
+                mean_delay: Duration::ZERO,
+            };
+            let costs = Costs {
+                election: Duration::from_secs_f64(1e-4 + draw() * 0.1),
+                mtbf: Duration::from_secs_f64(1.0 + draw() * 3e5),
+            };
+            let resolution = 1e-5 + draw() * 2e-3;
+            let eta = resolution * (1.0 + draw() * 400.0);
+            let (alpha, value) = arrival_margin(&arrivals, &costs, eta, resolution);
+            assert!((value - arrival_unavailability(&arrivals, &costs, eta, alpha)).abs() <= 1e-12);
+            let reach = 20.0 * arrivals.deviation.as_secs_f64() + arrivals.lateness.as_secs_f64();
+            let steps = 20_000;
+            let least = (0..=steps)
+                .map(|i| reach * f64::from(i) / f64::from(steps))
+                .map(|a| arrival_unavailability(&arrivals, &costs, eta, a))
+                .fold(f64::INFINITY, f64::min);
+            // Within one resolution past the minimum: U's slope there is at most 1/MTBF plus the
+            // mistake term's, whose magnitude the step bounds.
+            let slack = resolution / costs.mtbf.as_secs_f64()
+                + arrival_unavailability(&arrivals, &costs, eta, alpha + resolution)
+                - arrival_unavailability(&arrivals, &costs, eta, alpha);
+            assert!(
+                value <= least + slack.abs() + 1e-12,
+                "{arrivals:?} {costs:?} η {eta}: {value} at {alpha} against {least}"
+            );
+        }
+    }
+
+    /// The bound per arrival: one at or below the mean, falling with the margin to the unseen
+    /// share, never below it.
+    #[test]
+    fn the_lateness_bound_is_cantellis_with_the_unseen_share() {
+        let arrivals = Arrivals {
+            unseen: 0.01,
+            lateness: ms(2.0),
+            deviation: ms(3.0),
+            mean_delay: Duration::ZERO,
+        };
+        assert_eq!(lateness_bound(&arrivals, ms(1.0)), 1.0);
+        assert_eq!(lateness_bound(&arrivals, ms(2.0)), 1.0);
+        let at = |margin: f64| lateness_bound(&arrivals, ms(margin));
+        let expected = 0.01 + 0.99 * 9.0 / (9.0 + 16.0);
+        assert!((at(6.0) - expected).abs() < 1e-12);
+        assert!(at(6.0) < at(4.0) && at(60.0) < at(6.0) && at(6_000.0) >= 0.01);
+    }
+
+    /// A margin is not capped by the interval: on a link whose deviation is several intervals and
+    /// whose receiver's granularity is past the interval (an E2E pair of `docs/timing.md` §2.9 that
+    /// the single-heartbeat cap configured with `α = 0`: `η` 1.64 ms, `G` 5.2 ms, deviation 8 ms
+    /// past the mean), the margin covers the deviation and the unavailability is far below one,
+    /// where the cap left no margin at all.
+    #[test]
+    fn a_margin_covers_a_deviation_of_several_intervals() {
+        let costs = Costs {
+            election: ms(22.6),
+            mtbf: Duration::from_secs(60),
+        };
+        let granularity = ms(5.195);
+        let interval = ms(1.640);
+        let capped = detector_at(
+            &LinkBehaviour {
+                loss: 0.5431,
+                mean_delay: Duration::ZERO,
+                delay_deviation: ms(8.0),
+            },
+            &costs,
+            &Floors {
+                granularity,
+                sender: granularity,
+                correlation: Duration::MAX,
+            },
+            interval,
+        )
+        .unwrap();
+        assert_eq!(capped.margin, Duration::ZERO);
+        assert!(capped.unavailability > 1.0, "{capped:?}");
+        let arrivals = Arrivals {
+            unseen: 0.01,
+            lateness: ms(1.6),
+            deviation: ms(8.0),
+            mean_delay: Duration::ZERO,
+        };
+        let found = arrival_detector_at(&arrivals, &costs, granularity, interval).unwrap();
+        assert!(found.margin > interval * 4, "{found:?}");
+        assert!(found.unavailability < 1.0, "{found:?}");
+    }
+
+    /// The best interval does at least as well as its neighbours and as the interval in force.
+    #[test]
+    fn the_best_arrival_detector_is_no_worse_than_its_neighbours() {
+        let arrivals = Arrivals {
+            unseen: 0.004,
+            lateness: ms(0.4),
+            deviation: ms(2.5),
+            mean_delay: Duration::ZERO,
         };
         let costs = Costs {
-            election: ms(5.7),
-            mtbf: Duration::from_secs(30 * 24 * 3600),
+            election: ms(40.0),
+            mtbf: Duration::from_secs(3_600),
         };
-        for correlation in [0.0, 50.0, 200.0, 2_000.0, 60_000.0] {
-            let floors = Floors {
-                granularity: ms(1.6),
-                sender: ms(7.0),
-                correlation: ms(correlation),
-            };
-            let found = configure(&link, &costs, &floors).unwrap();
+        let (granularity, floor) = (ms(1.0), ms(4.0));
+        let best = configure_arrivals(&arrivals, &costs, granularity, floor).unwrap();
+        assert!(best.interval >= floor);
+        for scale in [0.8, 0.95, 1.05, 1.25, 2.0] {
+            let other = Duration::from_secs_f64(best.interval.as_secs_f64() * scale).max(floor);
+            let at = arrival_detector_at(&arrivals, &costs, granularity, other).unwrap();
             assert!(
-                found.margin < found.interval || found.interval >= floors.correlation,
-                "T_c {correlation} ms: {found:?}"
+                best.unavailability <= at.unavailability * 1.0001,
+                "{at:?} {best:?}"
             );
-            assert!(found.interval >= floors.sender && found.interval >= floors.granularity);
         }
-        // With no correlation the floors alone bind, and a correlation time can only cost.
-        let free = Floors {
-            granularity: ms(1.6),
-            sender: ms(7.0),
-            correlation: Duration::ZERO,
+        assert!(best.mistake_recurrence > costs.election);
+        let none = Arrivals {
+            unseen: 1.0,
+            ..arrivals
         };
-        let bound = Floors {
-            correlation: ms(200.0),
-            ..free
-        };
-        let (a, b) = (
-            configure(&link, &costs, &free).unwrap(),
-            configure(&link, &costs, &bound).unwrap(),
+        assert_eq!(configure_arrivals(&none, &costs, granularity, floor), None);
+        assert_eq!(
+            arrival_detector_at(&arrivals, &costs, Duration::ZERO, floor),
+            None
         );
-        assert!(a.unavailability <= b.unavailability);
     }
 
     #[test]
@@ -685,12 +987,13 @@ mod tests {
             sender: ms(1.0),
             correlation: ms(1.0),
         };
-        assert_eq!(configure(&dead, &costs, &floors), None);
+        assert_eq!(detector_at(&dead, &costs, &floors, ms(1.0)), None);
         let link = LinkBehaviour { loss: 0.0, ..dead };
         let zero = Floors {
             granularity: Duration::ZERO,
             ..floors
         };
-        assert_eq!(configure(&link, &costs, &zero), None);
+        assert_eq!(detector_at(&link, &costs, &zero, ms(1.0)), None);
+        assert_eq!(detector_at(&link, &costs, &floors, Duration::ZERO), None);
     }
 }

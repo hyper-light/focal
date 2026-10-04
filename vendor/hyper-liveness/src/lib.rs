@@ -7,7 +7,8 @@
 //! groups, not the machines, each a constant someone picked. Here a node keeps one stream to each
 //! node it shares a group with ([`Liveness::attach`] counts the groups), sends one heartbeat on it
 //! every `η`, and judges the peer's stream with NFD-E (Chen, Toueg and Aguilera 2002) through
-//! `hyper_timing::LinkEstimator`, configured by `hyper_timing::qos` from measured floors. A group
+//! `hyper_timing::LinkEstimator`, configured by `hyper_timing::configure_arrivals` from measured
+//! floors. A group
 //! sends nothing of its own for liveness; its core asks this crate whether the leader's node is
 //! suspected (L-2). A pair with no group in common sends nothing at all.
 //!
@@ -23,12 +24,17 @@
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
 //! the sender's stability floor `E[flush] + G` (Lindley 1952; `docs/timing.md` §2.6); before the
-//! receiver has chosen, the floor. `G` is the measured lateness of the owner's wakes
-//! (`hyper_timing::Wakes`), `E[flush]` the mean of the durable completions reported, one heartbeat
-//! in each margin (Theorem 7's single factor, which assumes no independence between heartbeats a
-//! young link cannot vouch for), the MTBF the Jeffreys posterior over
+//! receiver has chosen, the floor. `G` is the mean lateness of the owner's waits for the stream's
+//! wakes, each begun before its deadline and ended at or past it, whatever ended it
+//! ([`Liveness::on_wait`]): how late past its wakes the stream is polled while its owner waits for
+//! them, not what the owner's own work adds. `E[flush]` the mean of the
+//! durable completions reported, the margin
+//! bounded by one Cantelli factor on each heartbeat's lateness past its expected arrival (a slot
+//! the sender skipped or the network lost being the next one's lateness), which assumes no
+//! independence between heartbeats (`docs/timing.md` §2.2), the MTBF the Jeffreys posterior over
 //! the pairs watched and the restarts seen (`hyper_timing::Exposure`), and the election cost the
-//! owner's (`Liveness::set_election`, the election law's `T_E`).
+//! owner's (`Liveness::set_election`, the election law's `T_E`). A configuration whose
+//! unavailability is one or more promises nothing and is not made.
 //!
 //! **Every link judged** (`docs/timing.md` §2.8–§2.9, §3 item 10). A link whose heartbeats are too
 //! correlated at its interval for its estimator to measure its evidence asks the interval its Allan
@@ -36,14 +42,15 @@
 //! follows its floor up, not down, so the receiver's evidence is not started again at each move of
 //! a mean. Until a link configures, it is judged by the margin what its node measured of its links
 //! configures for it: the wider of its pool's measure and the widest of its configured links', and
-//! of what the link's own errors show; a peer from which nothing has come is judged from the attach. A receiver expects
+//! of what the link's own latenesses show; a peer from which nothing has come is judged from the
+//! attach. A receiver expects
 //! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
 //! ([`Change::Restarted`]).
 //!
 //! **The bound.** Each suspicion states when the sender's last heartbeat was due on the sender's
-//! clock and the bound past it within which NFD-E suspects, `η + α + E(D)`, with `E(D)` bounded by
-//! the echoed round trip of the heartbeats in the expected arrival's window (`bound`), which no
-//! clock synchronization or path symmetry enters.
+//! clock and the bound past it within which NFD-E suspected: the difference of the two clocks'
+//! readings less their offset, which the echoed round trips bound from below and the clocks' drift
+//! ages (`bound`); no clock synchronization or path symmetry enters it.
 //!
 //! **Sans-io.** The crate is fed `now`, messages with their kernel receive stamps (hyper-tokio's
 //! `PlaneSocket`), and durable completions, and returns heartbeats to queue on the datagram plane,
@@ -74,8 +81,8 @@ use std::time::Duration;
 
 pub use codec::{Echo, Heartbeat, KIND, MAX_BYTES, VERSION, is_liveness};
 use hyper_timing::{
-    Configuration, Detector, ExchangeRtt, Exposure, Flushes, LinkBehaviour, LinkEstimator, Trust,
-    Wakes,
+    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, Flushes, Lateness, LinkEstimator,
+    Trust,
 };
 use pair::Pair;
 
@@ -169,11 +176,12 @@ pub struct Suspicion {
     /// The latest heartbeat taken from the peer: its number, its arrival (the kernel's stamp) on
     /// this node's clock, and when it was due and sent on the peer's.
     pub last: Option<Last>,
-    /// The bound from the last heartbeat's schedule to `at_ns`, `η + α + E(D)` with `E(D)` bounded
-    /// by the echoed round trips of the window's heartbeats (the `bound` module); `None` while a
-    /// heartbeat in the window carried no echo. For a peer from which no heartbeat came (`last` is
-    /// `None`), the time from the node's first poll with the pair attached, an interval and the
-    /// margin of the node's evidence (`docs/timing.md` §3, item 10).
+    /// The bound on the time from the last heartbeat's schedule, on the peer's clock, to `at_ns`, on
+    /// this node's: their difference less the clocks' offset, bounded from below by the echoed round
+    /// trips of the run's heartbeats and aged by the clocks' drift (the `bound` module); `None`
+    /// before any heartbeat of the run carried an echo. For a peer from which no heartbeat came
+    /// (`last` is `None`), the time from the node's first poll with the pair attached, an interval
+    /// and the margin of the node's evidence (`docs/timing.md` §3, item 10).
     pub detection: Option<Duration>,
     /// The detector in force when it suspected, if configured (the pair's configuration's
     /// `current`, [`Liveness::configuration`]).
@@ -234,6 +242,9 @@ pub struct PairReport {
     pub groups: u32,
     /// Heartbeats sent to the peer.
     pub sent: u64,
+    /// Slots of the stream to the peer that came due while this node was behind and were never
+    /// sent: the peer takes each as the next heartbeat's lateness, not as a loss.
+    pub skipped: u64,
     /// Heartbeats taken from the peer.
     pub taken: u64,
     /// Heartbeats refused for their flush proof.
@@ -256,11 +267,12 @@ pub struct PairReport {
     pub configurations: u64,
     /// Suspicions of the peer.
     pub suspicions: u64,
-    /// Theorem 7's allowance for them: `Σβ` over every freshness point judged while a margin was in
-    /// force, each `β` at that margin from the estimates as they stood (the node's evidence, scaled
-    /// to the link's window and widened by its own, while the margin was the evidence's), the
-    /// expected number of suspicions were the peer alive throughout (`β` bounds the chance of a
-    /// mistake at each, `η/β` the mistake recurrence).
+    /// The allowance for them: over every heartbeat taken that ended a gap a freshness point
+    /// judged, the bound that point put on the heartbeat's coming past it, at the margin in force
+    /// on the arrivals as they stood (the node's evidence, scaled to the link's window and widened
+    /// by its own, while the margin was the evidence's): the expected number of suspicions were the
+    /// peer alive throughout, since each heartbeat taken is the one mistake its predecessor's
+    /// freshness point can make (`docs/timing.md` §2.2).
     pub allowance: f64,
 }
 
@@ -288,7 +300,13 @@ pub struct Liveness {
     run: u64,
     max_peers: usize,
     pairs: BTreeMap<PeerId, Pair>,
-    wakes: Wakes,
+    /// `G`: the lateness of the timed waits the owner reports ([`on_wait`](Self::on_wait)).
+    timer: Lateness,
+    /// The wake the latest poll asked of the owner, and the most the owner has been past one: what
+    /// a bound the owner states adds (Lifeguard's local health, measured: `docs/timing.md` §2.7),
+    /// its own stalls and all.
+    asked: Option<u64>,
+    late_most: u64,
     flushes: Flushes,
     durable: Durable,
     /// Whether a liveness write is out.
@@ -300,30 +318,29 @@ pub struct Liveness {
     next_wake: Option<u64>,
     message: [u8; MAX_BYTES],
     /// The node's pool of its links (`docs/timing.md` §3, item 10): one more estimator, fed the
-    /// prediction errors of every link that has no configuration of its own, the links it exists
-    /// to judge, and of every link until it has its evidence (hyper-swim's rule, §2.7), numbered by
-    /// the heartbeats due across them so a heartbeat lost on any is a loss to it. Fed by the young
-    /// links alone, a pool whose links configured before it could measure would never measure,
-    /// and a peer never heard from would never be judged. Built on the first error fed: one
-    /// allocation, boxed with its ring.
+    /// latenesses of every link that has no configuration of its own, the links it exists to
+    /// judge, and of every link until it has its evidence (hyper-swim's rule, §2.7), one an
+    /// arrival. Fed by the young links alone, a pool whose links configured before it could
+    /// measure would never measure, and a peer never heard from would never be judged. Built on
+    /// the first lateness fed: one allocation, boxed with its ring.
     pool: Option<Box<LinkEstimator>>,
     pool_seq: u64,
-    /// What the pool measured, as of the latest error fed that it could say it from. A refusal
+    /// What the pool measured, as of the latest lateness fed that it could say it from. A refusal
     /// leaves it in force, as `LinkEstimator::configure` leaves its margin and hyper-swim's pool
     /// its verdict (`docs/timing.md` §2.7): more of a stall can make the pool's `τ_int` unmeasured
     /// again, and a pair judged by its margin would then judge nothing, a peer it had suspected
     /// before it was heard never trusted again on its heartbeats.
-    pool_measured: Option<LinkBehaviour>,
-    /// The widest behaviour the node's links configured their own detectors from, each measure
+    pool_measured: Option<Arrivals>,
+    /// The widest arrivals the node's links configured their own detectors from, each measure
     /// the largest over the pairs that have a configuration: kept at each configuration made and
     /// at each pair let go, so it is read without walking the pairs.
-    configured: Option<LinkBehaviour>,
+    configured: Option<Arrivals>,
     /// What the node has measured of its links, the wider of `pool_measured` and `configured`
     /// ([`renew_evidence`](Self::renew_evidence)): kept where either changes, so a heartbeat and a
     /// poll read it, and only for a pair with no configuration of its own. Computed at every
     /// heartbeat, it was three maxima a heartbeat that every configured pair threw away
     /// (`docs/benchmarks.md`, "The node's evidence, kept").
-    evidence: Option<LinkBehaviour>,
+    evidence: Option<Arrivals>,
 }
 
 /// The margins a pair that waits for one takes from its node's pool: its own link's, or, for a
@@ -331,7 +348,7 @@ pub struct Liveness {
 /// for such a pair.
 fn pool_margins(
     pair: &mut Pair,
-    pool: &LinkBehaviour,
+    pool: &Arrivals,
     granularity: Duration,
     floor: Option<Duration>,
     mtbf: &mut Option<Option<Duration>>,
@@ -372,7 +389,9 @@ impl Liveness {
             run: settings.run,
             max_peers: settings.max_peers,
             pairs: BTreeMap::new(),
-            wakes: Wakes::new(),
+            timer: Lateness::new(),
+            asked: None,
+            late_most: 0,
             flushes: Flushes::new(),
             durable: Durable::default(),
             flushing: false,
@@ -393,26 +412,27 @@ impl Liveness {
     /// parts moved: the wider of its pool's measure and the widest configured link's
     /// (`pair::wider`). A configured link measured its own behaviour at one interval with its
     /// `τ_int` within Madras and Sokal's window, the evidence its estimator refuses to configure
-    /// without; the pool, fed by the same links' errors, mixes intervals and links, and once the
-    /// links configure it is fed at the intervals they asked, seconds apart on a coarse timer. Under
-    /// the pool's premise, that the stalls are the hosts' (§2.6), the widest configured link bounds
-    /// what the pool would measure of them: the pool's loss and the variance of its zero-mean errors
-    /// are weighted means of the links', no more than the largest of each.
+    /// without; the pool, fed by the same links' latenesses, mixes intervals and links, and once
+    /// the links configure it is fed at the intervals they asked, seconds apart on a coarse timer.
+    /// Under the pool's premise, that the stalls are the hosts' (§2.6), the widest configured link
+    /// bounds what the pool stands for: the pool's latenesses are a mixture of its links', so their
+    /// chance of passing a margin is a weighted mean of the links' chances, each at most its own
+    /// link's bound and so at most the widest's, the bound growing with each measure.
     fn renew_evidence(&mut self) {
         self.evidence = pair::wider(self.pool_measured, self.configured);
     }
 
-    /// The widest behaviour the pairs' configurations were made from.
-    fn widest_configured(&self) -> Option<LinkBehaviour> {
+    /// The widest arrivals the pairs' configurations were made from.
+    fn widest_configured(&self) -> Option<Arrivals> {
         self.pairs
             .values()
             .filter_map(|pair| pair.configuration().map(|configured| configured.link))
             .fold(None, |widest, link| pair::wider(widest, Some(link)))
     }
 
-    /// Feeds the pool a link's prediction error, `due` heartbeats after the link's previous one.
-    fn feed_pool(&mut self, due: u64, error: i64, interval: Duration) {
-        let Some(granularity) = self.wakes.granularity() else {
+    /// Feeds the pool a link's lateness.
+    fn feed_pool(&mut self, lateness: i64, interval: Duration) {
+        let Some(granularity) = self.granularity() else {
             return;
         };
         if self.pool.is_none() {
@@ -424,10 +444,11 @@ impl Liveness {
             return;
         };
         pool.set_granularity(granularity);
-        self.pool_seq = self.pool_seq.saturating_add(due);
-        // An error past what a window can sum is refused, as any estimator refuses such an offset.
-        let _ = pool.on_offset(self.pool_seq, error);
-        if let Ok(measured) = pool.behaviour() {
+        self.pool_seq = self.pool_seq.saturating_add(1);
+        // A lateness past what a window can sum is refused, as any estimator refuses such an
+        // offset.
+        let _ = pool.on_lateness(self.pool_seq, lateness);
+        if let Ok(measured) = pool.arrivals() {
             self.pool_measured = Some(measured);
             self.renew_evidence();
         }
@@ -509,7 +530,7 @@ impl Liveness {
             return Err(Refusal::FromSelf);
         }
         let beat = Heartbeat::decode(message)?;
-        let granularity = self.wakes.granularity();
+        let granularity = self.granularity();
         let pair = self.pairs.get_mut(&from).ok_or(Refusal::UnknownPeer)?;
         let context = pair::Context {
             granularity,
@@ -536,22 +557,31 @@ impl Liveness {
             self.configured = self.widest_configured();
             self.renew_evidence();
         }
-        if let Some((due, error)) = taken.error
+        if let Some(lateness) = taken.lateness
             && (!taken.own || self.pool_measured.is_none())
         {
-            self.feed_pool(due, error, Duration::from_nanos(beat.interval_ns));
+            self.feed_pool(lateness, Duration::from_nanos(beat.interval_ns));
         }
         outcome
     }
 
     /// Advances to `now_ns`: suspects peers whose freshness passed, sends the heartbeats due that
     /// a flush proves, and asks for a flush where none does. Call it at every [`wake`](Self::wake)
-    /// and after each message or completion fed in.
+    /// and after each message or completion fed in. Every message stamped before `now_ns` must be
+    /// fed first, or a peer whose heartbeat came is suspected: the owner reads its clock for
+    /// `now_ns`, then reads its socket, which holds by then every datagram stamped before it, then
+    /// polls. Read the other way round, a stop between the socket and the clock leaves the
+    /// datagrams of the stop unread (`tests/processes.rs` traced one, a stopped member's).
     pub fn poll(&mut self, now_ns: u64, out: &mut impl Output) {
-        self.wakes.woke(now_ns);
+        if let Some(at) = self.asked
+            && now_ns >= at
+        {
+            self.late_most = self.late_most.max(now_ns.saturating_sub(at));
+            self.asked = None;
+        }
         self.expose(now_ns);
         let mut wants_flush = false;
-        let granularity = self.wakes.granularity();
+        let granularity = self.granularity();
         let floor = self.floor_at(granularity);
         let sender = pair::Sender {
             local_run: self.run,
@@ -597,7 +627,7 @@ impl Liveness {
             self.flushing = true;
             out.flush();
         }
-        self.wakes.ask(wake);
+        self.asked = wake;
         self.next_wake = if self.last_poll_ns == Some(now_ns) {
             wake
         } else {
@@ -636,7 +666,7 @@ impl Liveness {
 
     /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured.
     pub fn floor(&self) -> Option<Duration> {
-        self.floor_at(self.wakes.granularity())
+        self.floor_at(self.granularity())
     }
 
     /// The floor at the granularity `G` already read.
@@ -651,14 +681,36 @@ impl Liveness {
         self.flushes.mean()
     }
 
-    /// `G`, the measured lateness of the owner's wakes.
-    pub fn granularity(&self) -> Option<Duration> {
-        self.wakes.granularity()
+    /// A wait the owner began before `deadline_ns`, the stream's [`wake`](Self::wake), that ended
+    /// at `woke_ns`, at or past it, on the clock the stream is polled by, whatever ended it: the
+    /// deadline, or a message, a completion or a command that came after it. Reported as the wait
+    /// ends, before anything it brought is fed. `G` is the mean lateness of these waits
+    /// (`docs/timing.md` §2.4): how late past its wakes the stream is polled while its owner waits
+    /// for them, a stop or a frozen host included, and nothing the owner's own work adds. A wait
+    /// that ended before its deadline reached nothing, and a wake the owner came to late because
+    /// its thread was in its own work began no wait before it: neither is a sample. Taken from
+    /// every poll past a wake, such wakes made `G` the owner's stalls, 4.8–7.4 s in a run whose
+    /// timer was late by milliseconds; counted only where the deadline ended them, the waits of an
+    /// owner woken past its wakes by messages before its timer fired counted nothing, and its
+    /// stream refused every heartbeat as unmeasured (§2.9). A wait for a deadline other than the
+    /// wake asked is not the stream's and measures nothing.
+    pub fn on_wait(&mut self, deadline_ns: u64, woke_ns: u64) {
+        if self.next_wake == Some(deadline_ns) {
+            // A full fold keeps its mean: `G` stands as measured.
+            let _ = self.timer.on_wait(deadline_ns, woke_ns);
+        }
     }
 
-    /// The latest the owner has woken past a wake asked, or is past one at `now_ns`.
+    /// `G`, the mean lateness of the owner's waits for the stream's wakes
+    /// ([`on_wait`](Self::on_wait)), once measured and not zero.
+    pub fn granularity(&self) -> Option<Duration> {
+        self.timer.granularity().filter(|g| !g.is_zero())
+    }
+
+    /// The latest the owner has polled past a wake asked, or is past one at `now_ns`.
     pub fn latest_wake(&self, now_ns: u64) -> Duration {
-        Duration::from_nanos(self.wakes.latest_ns(now_ns))
+        let past = self.asked.map_or(0, |at| now_ns.saturating_sub(at));
+        Duration::from_nanos(past.max(self.late_most))
     }
 
     /// What this node believes of `peer`, if they share a group.

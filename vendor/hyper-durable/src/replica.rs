@@ -267,6 +267,8 @@ enum Stop {
     Done,
     /// This entry waits for the commit fence.
     Fence(u64),
+    /// This entry is past the drive's page: it waits for the next drive.
+    Page(u64),
     /// A change of configuration, applied by the core before the walk goes on.
     Change(Point, ConfChangeV2),
     /// The state machine or the entry failed.
@@ -294,8 +296,17 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     told_applied: u64,
     /// The index of the entry that made the configuration.
     conf_index: u64,
-    /// Committed entries given to apply that wait for the commit fence: the first and last.
+    /// Committed entries given to apply that wait: the first and last. They wait for the commit
+    /// fence, or, when `paged`, for the next drive.
     fence: Option<(u64, u64)>,
+    /// The entries that wait are past a drive's page, not behind the commit fence.
+    paged: bool,
+    /// The bytes of entries a drive applies at most, as the core counts them
+    /// (`EntryRef::encoded_bytes`): its committed page (`max_committed_size_per_ready`), or one
+    /// entry larger than it.
+    page: u64,
+    /// The bytes of entries applied in this drive.
+    drive_applied: u64,
     /// Reads confirmed, waiting to be applied far enough: index and context.
     reads: VecDeque<(u64, Vec<u8>)>,
     /// Snapshot reports that came while stalled: one a member.
@@ -392,6 +403,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             told_applied: durable.index,
             conf_index: durable.index,
             fence: None,
+            paged: false,
+            page,
+            drive_applied: 0,
             reads: VecDeque::new(),
             reports: Vec::new(),
             fenced: None,
@@ -455,7 +469,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     /// Committed entries that wait for the commit fence: the first and the last.
     pub fn behind_fence(&self) -> Option<(u64, u64)> {
-        self.fence
+        self.fence.filter(|_| !self.paged)
     }
 
     /// Writes out.
@@ -588,6 +602,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.writes.clear();
         self.stall = None;
         self.fence = None;
+        self.paged = false;
         self.reads.clear();
         self.reports.clear();
         self.fenced = Some(cause.clone());
@@ -1014,6 +1029,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         out: &mut Output<M::Answer>,
     ) -> Result<Driven, ReplicaError> {
         self.guarded(|r| {
+            r.drive_applied = 0;
             r.take_answers(now, out)?;
             if r.stall.is_some() {
                 r.make_again(now, waker)?;
@@ -1033,12 +1049,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
 
     fn driven(&mut self) -> Driven {
         let slot = self.has_slot();
+        let paged = self.paged && self.fence.is_some();
         let more = self.stall.is_none()
-            && slot
-            && (self.ready_due()
-                || self
-                    .fence
-                    .is_some_and(|(_, last)| !self.fence_covered(last)));
+            && (paged
+                || (slot
+                    && (self.ready_due()
+                        || self
+                            .behind_fence()
+                            .is_some_and(|(_, last)| !self.fence_covered(last)))));
         Driven {
             more,
             out: self.writes.len(),
@@ -1328,7 +1346,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         out: &mut Output<M::Answer>,
     ) -> Result<(), ReplicaError> {
         let due = self.ready_due();
-        if let Some((_, last)) = self.fence
+        if let Some((_, last)) = self.behind_fence()
             && !due
             && !self.fence_covered(last)
             && self.has_slot()
@@ -1470,6 +1488,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.applied = point;
         self.conf_index = point.index;
         if self.fence.take().is_some() {
+            self.paged = false;
             self.node.resume_apply();
         }
     }
@@ -1509,7 +1528,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// member that stops reopens with what it applied (focal F17's `settle_commit`).
     fn quiet_commit(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let behind = self.writes.is_empty()
-            && self.fence.is_none()
+            && self.behind_fence().is_none()
             && self.applied.index > self.durable_commit();
         if !behind {
             self.quiet_since = None;
@@ -1547,15 +1566,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
     }
 
-    /// What waits behind the fence is applied once the durable commit covers its first entry.
+    /// What waits behind the fence is applied once the durable commit covers its first entry;
+    /// what waits past a drive's page, at the next drive, a page of it.
     fn release_fence(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
         let Some((first, last)) = self.fence else {
             return Ok(());
         };
-        if first > self.durable_commit() {
+        if !self.paged && first > self.durable_commit() {
             return Ok(());
         }
         self.fence = None;
+        self.paged = false;
         self.node.resume_apply();
         self.apply_from(first, last, out)?;
         self.tell_applied()
@@ -1575,6 +1596,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 Stop::Done => break,
                 Stop::Fence(index) => {
                     self.fence = Some((index, last));
+                    self.paged = false;
+                    self.node.pause_apply();
+                    return Ok(());
+                }
+                Stop::Page(index) => {
+                    self.fence = Some((index, last));
+                    self.paged = true;
                     self.node.pause_apply();
                     return Ok(());
                 }
@@ -1601,8 +1629,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             node,
             machine,
             applied,
+            page,
+            drive_applied,
             ..
         } = self;
+        let page = *page;
         let held = node.store();
         let unstable = node.raft.log().unstable().entries();
         let tail = unstable.first().map_or(u64::MAX, |e| e.index);
@@ -1613,6 +1644,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 stop = Stop::Fence(entry.index);
                 return true;
             }
+            // One page a drive, as one `Ready` a drive (§7's quantum), and at least one entry.
+            let bytes = entry.encoded_bytes();
+            if *drive_applied > 0 && drive_applied.saturating_add(bytes) > page {
+                stop = Stop::Page(entry.index);
+                return true;
+            }
+            *drive_applied = drive_applied.saturating_add(bytes);
             if entry.changes_configuration() {
                 stop = match change_of(&entry) {
                     Ok(change) => Stop::Change(point_of(&entry), change),
@@ -1664,7 +1702,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             Err(error) if !error.is_fatal() => self.machine.configuration().clone(),
             Err(error) => return Err(self.fence(Cause::Core(error))),
         };
-        let kept = self.machine.apply_change(at, &configuration);
+        let kept = self.machine.apply_change(at, change, &configuration);
         self.machine_did(kept)?;
         self.applied = at;
         self.conf_index = at.index;
@@ -1731,15 +1769,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// Prepares the snapshot the core serves to members behind the log's start: the state
-    /// machine's image of everything applied, with its configuration.
+    /// machine's image, with the configuration the group held at its point. Not the
+    /// configuration applied since: a member installing it applies the changes after the
+    /// image's point from the log, each once.
     fn prepare(&mut self) -> Result<(), ReplicaError> {
         let mut data = Vec::new();
         let imaged = self.machine.image(&mut data);
-        let point = self.machine_did(imaged)?;
+        let (point, configuration) = self.machine_did(imaged)?;
         let snapshot = Snapshot {
             data,
             metadata: Some(SnapshotMetadata {
-                conf_state: Some(self.machine.configuration().clone()),
+                conf_state: Some(configuration),
                 index: point.index,
                 term: point.term,
             }),

@@ -2,10 +2,11 @@
 //!
 //! Raft needs `broadcast time ≪ election timeout ≪ MTBF` (Ongaro and Ousterhout, ATC 2014, §5.6).
 //! Each side of that is measured here and none is a picked multiple of another:
-//! - **When a leader is gone** is the failure detector's answer ([`LinkEstimator`], [`configure`]):
-//!   NFD-E on the leader's node-pair link, its interval `η` and margin `α` chosen to minimize the
-//!   time a group cannot commit from the link's measured loss, delay and variance, the timer's
-//!   measured granularity ([`Lateness`]) and the fleet's measured MTBF ([`Exposure`]). A follower's
+//! - **When a leader is gone** is the failure detector's answer ([`LinkEstimator`],
+//!   [`configure_arrivals`]): NFD-E on the leader's node-pair link, its interval `η` and margin `α`
+//!   chosen to minimize the time a group cannot commit from the link's measured arrivals (each
+//!   heartbeat's lateness past its expected arrival), the timer's measured granularity
+//!   ([`Lateness`]) and the fleet's measured MTBF ([`Exposure`]). A follower's
 //!   base election timeout is the detector's freshness horizon, `η + α` past the leader's latest
 //!   heartbeat.
 //! - **How long the voters that suspected together spread their campaigns** is the span `W` that
@@ -48,15 +49,15 @@ mod round;
 pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
 mod qos;
 pub use qos::{
-    Costs, Detector, Floors, LinkBehaviour, Span, Z95, configure, detector_at, election_span,
-    mistake_bound, poisson95,
+    Arrivals, Costs, Detector, Floors, LinkBehaviour, Span, arrival_detector_at,
+    configure_arrivals, detector_at, election_span, lateness_bound, mistake_bound,
 };
 mod folds;
 pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};
 mod link;
 pub use link::{
-    Configuration, EstimateError, Estimates, Event, LinkEstimator, Refusal, Schedule, Trust,
-    WINDOW_LIMIT, Window,
+    Configuration, EstimateError, Estimates, Event, LinkEstimator, MILLION, PHI_PER_MILLION,
+    Refusal, Schedule, Trust, WINDOW_LIMIT, Window,
 };
 mod election;
 pub use election::{
