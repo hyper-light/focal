@@ -24,6 +24,7 @@ mod membership;
 mod memory;
 pub use membership::*;
 mod checkpoint;
+mod core_state;
 mod decoder;
 pub mod envelope;
 mod facade;
@@ -718,31 +719,7 @@ impl LogNode {
         };
         let recovered_snapshot = (!proto::snapshot_is_empty(&storage.snapshot))
             .then(|| snapshot_event(&storage.snapshot));
-        let raft_config = Config {
-            election_tick: config.election_tick,
-            heartbeat_tick: config.heartbeat_tick,
-            applied,
-            max_size_per_msg: (config.max_entry_bytes as u64).saturating_add(1024),
-            max_inflight_msgs: config.max_inflight_messages,
-            // Until its owner says what the path to a member carries
-            // (`set_inflight_bytes`), a member is sent one page ahead of its
-            // answers: the least that always makes progress.
-            max_inflight_bytes: (config.max_entry_bytes as u64).saturating_add(1024),
-            max_uncommitted_size: config.max_uncommitted_bytes,
-            max_committed_size_per_ready: COMMITTED_PAGE_BYTES,
-            check_quorum: true,
-            pre_vote: true,
-            fast: config.fast,
-            seed: election_seed(&config),
-            limits: Limits {
-                // Reads are admitted against the window (`read_index_inner`);
-                // the core's own bound is the same and never the first met.
-                pending_reads: config.max_inflight_messages.saturating_add(1),
-                ..Limits::default()
-            },
-            ..Config::new(config.node_id)
-        };
-        raft_config.validate()?;
+        let raft_config = core_state::raft_config(&config, applied)?;
         // Snapshot membership can differ from bootstrap membership on recovery.
         let recovered_members = storage
             .conf_state
@@ -844,9 +821,7 @@ impl LogNode {
         if !self.config.fast {
             return Err(ConsensusError::Configuration("the group has no fast track"));
         }
-        if data.is_empty() || data.len() > self.config.max_entry_bytes {
-            return Err(ConsensusError::Capacity);
-        }
+        core_state::check_entry(&self.config, data.len())?;
         self.guarded_in(data.capacity(), 0, lane, |replica| {
             Ok(replica.raw.propose_fast(Vec::new(), data)?)
         })
@@ -875,9 +850,7 @@ impl LogNode {
         lane: BudgetLane,
     ) -> Result<(), ConsensusError> {
         self.check_leader()?;
-        if data.is_empty() || data.len() > self.config.max_entry_bytes {
-            return Err(ConsensusError::Capacity);
-        }
+        core_state::check_entry(&self.config, data.len())?;
         self.guarded_in(data.len(), 0, lane, |replica| {
             let mut owned = Vec::new();
             owned
@@ -1108,15 +1081,7 @@ impl LogNode {
         status: SnapshotStatus,
     ) -> Result<(), ConsensusError> {
         self.check()?;
-        if index == 0
-            || self.raw.raft.term() != term
-            || self
-                .raw
-                .raft
-                .tracker()
-                .get(node)
-                .is_none_or(|progress| progress.pending_snapshot != index)
-        {
+        if !core_state::snapshot_still_pending(&self.raw, node, term, index) {
             return Ok(());
         }
         self.report_snapshot(node, status)
@@ -1141,136 +1106,20 @@ impl LogNode {
     }
     fn campaign_inner(&mut self) -> Result<(), ConsensusError> {
         self.check()?;
-        if !self.raw.raft.promotable() {
-            return Err(ConsensusError::Configuration(
-                "only an applied voter can campaign",
-            ));
-        }
+        core_state::check_campaign(&self.raw)?;
         self.raw.campaign()?;
         Ok(())
     }
     fn propose_inner(&mut self, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.check_leader()?;
-        if data.is_empty() || data.len() > self.config.max_entry_bytes {
-            return Err(ConsensusError::Capacity);
-        }
+        core_state::check_entry(&self.config, data.len())?;
         self.raw.propose(Vec::new(), data)?;
         Ok(())
     }
     /// The authenticated transport envelope must bind cluster/group identity.
     fn step_inner(&mut self, message: Message) -> Result<(), ConsensusError> {
         self.check()?;
-        if message.to != self.config.node_id || message.from == 0 {
-            return Err(ConsensusError::Configuration(
-                "wrong destination or missing sender",
-            ));
-        }
-        // Its length in the encoding a peer's message comes in; a change it
-        // carries that does not read has none, and is malformed.
-        let encoded = envelope::message_len(&message)
-            .map_err(|error| ConsensusError::MalformedMessage(error.reason()))?;
-        if encoded > 9 * 1024 * 1024
-            || message
-                .entries
-                .iter()
-                .any(|entry| entry.data.len() > self.config.max_entry_bytes)
-            || message
-                .snapshot
-                .as_deref()
-                .is_some_and(|snapshot| snapshot.data.len() > 8 * 1024 * 1024)
-        {
-            return Err(ConsensusError::Capacity);
-        }
-        let kind = message.msg_type;
-        if kind == MessageType::MsgFastPropose || kind == MessageType::MsgFastVote {
-            return self.step_fast(message);
-        }
-        if kind == MessageType::MsgPropose {
-            return Err(ConsensusError::MalformedMessage(
-                "proposals must enter through the leader's application admission",
-            ));
-        }
-        if [
-            message.term,
-            message.index,
-            message.commit,
-            message.log_term,
-            message.commit_term,
-            message.request_snapshot,
-            message.reject_hint,
-        ]
-        .contains(&u64::MAX)
-        {
-            return Err(ConsensusError::Capacity);
-        }
-        if let Some(snapshot) = message.snapshot.as_deref()
-            && !proto::snapshot_is_empty(snapshot)
-        {
-            let metadata = metadata_of(snapshot);
-            if metadata.index == u64::MAX || metadata.term == u64::MAX {
-                return Err(ConsensusError::Capacity);
-            }
-            validate_conf_state(conf_of(metadata))?;
-        }
-        let mut expected_index = message
-            .index
-            .checked_add(1)
-            .ok_or(ConsensusError::Capacity)?;
-        for entry in &message.entries {
-            if kind == MessageType::MsgAppend {
-                if entry.index != expected_index || entry.term > message.term {
-                    return Err(ConsensusError::MalformedMessage(
-                        "invalid appended log sequence",
-                    ));
-                }
-                expected_index = expected_index
-                    .checked_add(1)
-                    .ok_or(ConsensusError::Capacity)?;
-            }
-            if entry.index == u64::MAX || entry.term == u64::MAX {
-                return Err(ConsensusError::Capacity);
-            }
-            // A change is read here as it is where it is applied: one that
-            // does not decode, or names a kind or a transition this member
-            // does not know, is no entry a peer may send.
-            proto::Plan::of_entry(entry)
-                .map_err(|_| ConsensusError::MalformedMessage("an entry that cannot be read"))?;
-        }
-        self.raw.step(message)?;
-        Ok(())
-    }
-
-    /// A proposal by the fast track, or what a voter holds of one.
-    fn step_fast(&mut self, message: Message) -> Result<(), ConsensusError> {
-        if !self.config.fast {
-            return Err(ConsensusError::MalformedMessage(
-                "the fast track in a group that has none",
-            ));
-        }
-        if message.term == u64::MAX || message.commit == u64::MAX {
-            return Err(ConsensusError::Capacity);
-        }
-        if message.entries.is_empty() || message.entries.len() > 256 {
-            return Err(ConsensusError::MalformedMessage(
-                "a proposal that states nothing, or too much",
-            ));
-        }
-        for entry in &message.entries {
-            if entry.entry_type != EntryType::EntryNormal
-                || entry.data.is_empty()
-                || entry.index == 0
-            {
-                return Err(ConsensusError::MalformedMessage(
-                    "what may not go by the fast track",
-                ));
-            }
-            if entry.data.len() > self.config.max_entry_bytes
-                || entry.index == u64::MAX
-                || entry.term == u64::MAX
-            {
-                return Err(ConsensusError::Capacity);
-            }
-        }
+        core_state::check_message(&self.config, &message)?;
         self.raw.step(message)?;
         Ok(())
     }
@@ -1309,84 +1158,16 @@ impl LogNode {
     /// Quorum ReadIndex completion arrives in drain. Publication must also reach
     /// its index before a linearizable read is served. No clock lease is involved.
     fn read_index_inner(&mut self, context: Vec<u8>) -> Result<(), ConsensusError> {
-        // A follower asks through its leader: the core forwards the read and
-        // the answer names the leader's commit index (27 §5, follower reads).
-        // One that knows no leader has no one to ask.
         self.check()?;
-        if self.raw.raft.state() != StateRole::Leader && self.raw.raft.leader_id() == 0 {
-            return Err(ConsensusError::NotLeader { leader: 0 });
-        }
-        if context.is_empty() || context.len() > 1024 {
-            return Err(ConsensusError::Capacity);
-        }
-        if self
-            .raw
-            .raft
-            .pending_read_count()
-            .saturating_add(self.raw.raft.ready_read_count())
-            >= self.config.max_inflight_messages
-        {
-            return Err(ConsensusError::Capacity);
-        }
+        let held = self.raw.raft.ready_read_count();
+        core_state::check_read(&self.config, &self.raw, &context, held)?;
         self.raw.read_index(context)?;
         Ok(())
     }
     fn propose_conf_change_inner(&mut self, change: ConfChangeV2) -> Result<(), ConsensusError> {
-        self.check_leader()?;
-        // The entry holds the change as the core writes it, and the log and
-        // the wire as raft-rs does: each must fit.
-        if change
-            .encoded_len()
-            .max(envelope::conf_change_v2_len(&change)?)
-            > self.config.max_entry_bytes
-        {
-            return Err(ConsensusError::Capacity);
-        }
-        // A change committed and not yet applied by this member is a
-        // moment, not a fault in the request: the one that follows it is
-        // asked again once the configuration it builds on is applied (an
-        // administrator's promotion right after its admission's receipt).
-        if self.raw.raft.has_pending_conf() {
-            return Err(ConsensusError::MembershipPending);
-        }
-        // One this member could not read where it is applied is not proposed.
-        proto::Plan::of(&change)
-            .map_err(|_| ConsensusError::Configuration("unknown kind of membership change"))?;
-        let joint = !self.raw.store().conf_state.voters_outgoing.is_empty();
-        if joint != change.changes.is_empty() {
-            return Err(ConsensusError::Configuration(
-                "joint membership must be entered and left in separate committed changes",
-            ));
-        }
-        if change.changes.len() > 1024 {
-            return Err(ConsensusError::Capacity);
-        }
-        for update in &change.changes {
-            if update.node_id == 0 {
-                return Err(ConsensusError::Configuration("zero member ID"));
-            }
-            // Leadership moves first, by the decision of who removes the
-            // node; the next leader removes it (27 §5). A leader that
-            // applies its own removal all the same, proposed by one that
-            // led before it, hands the group to a voter that holds the
-            // whole log and follows.
-            let leaves = update.change_type == ConfChangeType::RemoveNode
-                || update.change_type == ConfChangeType::AddLearnerNode;
-            if leaves && update.node_id == self.raw.raft.id() {
-                return Err(ConsensusError::LeaderLeaving);
-            }
-            if update.change_type == ConfChangeType::AddNode {
-                let progress = self
-                    .raw
-                    .raft
-                    .tracker()
-                    .get(update.node_id)
-                    .ok_or(ConsensusError::LearnerBehind)?;
-                if progress.matched < self.raw.raft.log().committed() {
-                    return Err(ConsensusError::LearnerBehind);
-                }
-            }
-        }
+        self.check()?;
+        let conf = &self.raw.store().conf_state;
+        core_state::check_conf_change(&self.config, &self.raw, conf, &change)?;
         self.raw.propose_conf_change(Vec::new(), &change)?;
         Ok(())
     }
@@ -1397,21 +1178,8 @@ impl LogNode {
     /// to request.
     fn transfer_leader_inner(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.check()?;
-        let voter = self.raw.store().conf_state.voters.contains(&node);
-        if self.raw.raft.state() == StateRole::Leader {
-            if !voter || node == self.config.node_id {
-                return Err(ConsensusError::Configuration(
-                    "transfer target must be another current voter",
-                ));
-            }
-            self.raw.transfer_leader(node)?;
-            return Ok(());
-        }
-        if node != self.config.node_id || !voter || self.raw.raft.leader_id() == 0 {
-            return Err(ConsensusError::NotLeader {
-                leader: self.raw.raft.leader_id(),
-            });
-        }
+        let conf = &self.raw.store().conf_state;
+        core_state::check_transfer(&self.config, &self.raw, conf, node)?;
         self.raw.transfer_leader(node)?;
         Ok(())
     }
@@ -1445,29 +1213,12 @@ impl LogNode {
     }
     pub fn status(&self) -> NodeStatus {
         let conf = &self.raw.store().conf_state;
-        let scalars = self.scalars();
-        NodeStatus {
-            node_id: scalars.node_id,
-            leader_id: scalars.leader_id,
-            term: scalars.term,
-            committed_index: scalars.committed_index,
-            applied_index: scalars.applied_index,
-            role: scalars.role,
-            voters: conf.voters.clone(),
-            learners: conf.learners.clone(),
-        }
+        core_state::status(&self.raw, self.config.node_id, self.delivered_index, conf)
     }
     /// The status's scalars, copied: a check that needs no membership
     /// allocates nothing (the audit's F53).
     pub fn scalars(&self) -> NodeScalars {
-        NodeScalars {
-            node_id: self.config.node_id,
-            leader_id: self.raw.raft.leader_id(),
-            term: self.raw.raft.term(),
-            committed_index: self.raw.raft.log().committed(),
-            applied_index: self.delivered_index,
-            role: self.raw.raft.state(),
-        }
+        core_state::scalars(&self.raw, self.config.node_id, self.delivered_index)
     }
     /// The membership as this node holds it, borrowed.
     pub fn membership(&self) -> MembershipView<'_> {
@@ -1481,52 +1232,14 @@ impl LogNode {
     /// leading). Diagnostic only; it reflects in-memory Raft progress and is
     /// never persisted or replicated.
     pub fn peer_progress(&self) -> Vec<PeerProgress> {
-        if self.raw.raft.state() != StateRole::Leader {
-            return Vec::new();
-        }
-        let self_id = self.config.node_id;
-        self.raw
-            .raft
-            .tracker()
-            .iter()
-            .filter(|(node, _)| *node != self_id)
-            .map(|(node, progress)| PeerProgress {
-                node,
-                matched: progress.matched,
-                next_index: progress.next_index,
-                state: match progress.state {
-                    ProgressState::Probe => 0,
-                    ProgressState::Replicate => 1,
-                    ProgressState::Snapshot => 2,
-                },
-                recent_active: progress.recent_active,
-                paused: progress.paused,
-                pending_snapshot: progress.pending_snapshot,
-            })
-            .collect()
+        core_state::peer_progress(&self.raw, self.config.node_id)
     }
 
     /// What this leader tracks of one member's replication; nothing when
     /// it does not lead or tracks no such member. Allocates nothing, so an
     /// owner may ask on every tick.
     pub fn peer(&self, node: u64) -> Option<PeerProgress> {
-        if self.raw.raft.state() != StateRole::Leader || node == self.config.node_id {
-            return None;
-        }
-        let progress = self.raw.raft.tracker().get(node)?;
-        Some(PeerProgress {
-            node,
-            matched: progress.matched,
-            next_index: progress.next_index,
-            state: match progress.state {
-                ProgressState::Probe => PEER_PROBE,
-                ProgressState::Replicate => PEER_REPLICATE,
-                ProgressState::Snapshot => PEER_SNAPSHOT,
-            },
-            recent_active: progress.recent_active,
-            paused: progress.paused,
-            pending_snapshot: progress.pending_snapshot,
-        })
+        core_state::peer(&self.raw, self.config.node_id, node)
     }
     /// The member this leader is handing leadership to, while it is.
     pub fn transferring(&self) -> Option<u64> {
@@ -1590,11 +1303,7 @@ impl LogNode {
             && self.decoder_confirmed()
             && !self.membership_rebuild_pending
             && !self.persistence_pending()
-            && self
-                .raw
-                .store()
-                .term(self.raw.raft.log().committed())
-                .is_ok_and(|term| term == self.raw.raft.term())
+            && core_state::committed_in_term(&self.raw)
     }
 
     fn apply_entries(
@@ -1764,21 +1473,13 @@ impl LogNode {
     fn check_state(&self) -> Result<(), ConsensusError> {
         if self.failed {
             Err(ConsensusError::Failed)
-        } else if self.raw.raft.term() == u64::MAX || self.raw.store().last_index()? == u64::MAX {
-            Err(ConsensusError::Capacity)
         } else {
-            Ok(())
+            core_state::check_core(&self.raw)
         }
     }
     fn check_leader(&self) -> Result<(), ConsensusError> {
         self.check()?;
-        if self.raw.raft.state() == StateRole::Leader {
-            Ok(())
-        } else {
-            Err(ConsensusError::NotLeader {
-                leader: self.raw.raft.leader_id(),
-            })
-        }
+        core_state::check_leader(&self.raw)
     }
 }
 
