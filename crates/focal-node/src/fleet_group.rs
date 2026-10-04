@@ -285,7 +285,7 @@ impl ReplicaFleet {
                 .ok()
                 .and_then(|count| count.checked_add(1))
                 .ok_or(LedgerError::Capacity)?;
-            let writer = replica.session.shared_wal();
+            let writer = replica.session.shared_wal()?;
             if !wal_owners
                 .iter()
                 .any(|retained| writer.is_same_writer(retained))

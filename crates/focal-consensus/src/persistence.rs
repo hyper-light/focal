@@ -85,8 +85,8 @@ struct ReadyPhase {
     held: Vec<Entry>,
 }
 impl LogNode {
-    pub fn shared_wal(&self) -> SharedWal {
-        self.wal.shared_wal()
+    pub fn shared_wal(&self) -> Result<SharedWal, ConsensusError> {
+        Ok(self.wal.shared_wal())
     }
     /// True from Ready acquisition until its full output prefix is released.
     /// Mutations return PersistencePending in this state; no Raft input is lost.

@@ -44,7 +44,7 @@ fn opening(fixture: &mut Fixture, id: u128) -> Work {
 fn an_owner_writes_the_proposals_of_a_batch_at_once() {
     let root = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::open(root.path());
-    let wal = fixture.owners[0].session.shared_wal();
+    let wal = fixture.owners[0].session.shared_wal().unwrap();
     let commits = || wal.stats().unwrap().group_commits;
     // One at a time: each proposal its own write.
     let before = commits();

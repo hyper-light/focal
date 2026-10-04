@@ -322,9 +322,10 @@ impl FleetManager {
             || candidate.session.status().node_id != state.node
             || candidate.session.cluster_id() != state.cluster
             || !candidate.session.is_budgeted_within(tenant)
-            || !state
-                .writers
-                .contains(&candidate.session.shared_wal().writer_id())
+            || !candidate
+                .session
+                .shared_wal()
+                .is_ok_and(|wal| state.writers.contains(&wal.writer_id()))
             || candidate.config.queue_items < 4
             || candidate
                 .session
@@ -651,7 +652,10 @@ impl ManagementOwner {
             if previous.ledger == ledger
                 && previous.group == replica.session.group_id()
                 && previous.config == replica.config
-                && previous.writer == replica.session.shared_wal().writer_id()
+                && replica
+                    .session
+                    .shared_wal()
+                    .is_ok_and(|wal| previous.writer == wal.writer_id())
             {
                 return Ok(previous);
             }
@@ -694,7 +698,11 @@ impl ManagementOwner {
             owner: self.owner,
             sequence,
         };
-        let writer = replica.session.shared_wal().writer_id();
+        let writer = replica
+            .session
+            .shared_wal()
+            .map_err(|_| FleetError::InvalidSession)?
+            .writer_id();
         let id = replica.session.group_id();
         let config = replica.config.clone();
         let sender = HostSender::Group {

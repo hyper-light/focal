@@ -165,7 +165,12 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
             .unwrap()
             .is_none()
     );
-    let pause = owner.session.shared_wal().pause_for_test().unwrap();
+    let pause = owner
+        .session
+        .shared_wal()
+        .unwrap()
+        .pause_for_test()
+        .unwrap();
     assert!(owner.session.try_poll().unwrap().is_none());
     assert!(matches!(
         owner.session.membership(),

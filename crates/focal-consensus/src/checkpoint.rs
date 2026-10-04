@@ -73,7 +73,7 @@ impl LogNode {
         {
             return Err(ConsensusError::CheckpointIndex);
         }
-        if data.len() > 8 * 1024 * 1024 {
+        if data.len() > IMAGE_BYTES {
             return Err(ConsensusError::Capacity);
         }
         let bytes = memory::staging_bytes(&self.raw, &self.config, data.capacity(), 0)?;
@@ -329,7 +329,7 @@ mod tests {
             node.drain().unwrap();
             node.propose(b"retained-published-entry".to_vec()).unwrap();
             let index = node.drain().unwrap().applied_index;
-            node.inject_fault_once(point);
+            node.inject_fault_once(point).unwrap();
             node.begin_checkpoint(index, b"durable-application-prefix".to_vec())
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

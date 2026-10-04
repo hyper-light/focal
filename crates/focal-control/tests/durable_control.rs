@@ -340,7 +340,7 @@ fn io_failure_has_no_completion_and_fail_stops_until_disk_recovery() {
         leader(&mut replica);
         let request = request(1, 1, 0, region(0, 1));
         replica.submit(request.clone(), &Evidence).unwrap();
-        replica.inject_fault_once(fault);
+        replica.inject_fault_once(fault).unwrap();
         assert!(replica.drain(&Evidence).is_err());
         assert_eq!(replica.root().unwrap().revision(), 0);
         assert!(matches!(

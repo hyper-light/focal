@@ -90,6 +90,7 @@ fn writes(owner: &Owner) -> u64 {
     owner
         .session
         .shared_wal()
+        .unwrap()
         .stats()
         .map_or(0, |stats| stats.group_commits)
 }
@@ -121,7 +122,12 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
     ));
     assert!(!owner.session.managed_support_demanded());
     let baseline = budget.stats().used;
-    let pause = owner.session.shared_wal().pause_for_test().unwrap();
+    let pause = owner
+        .session
+        .shared_wal()
+        .unwrap()
+        .pause_for_test()
+        .unwrap();
     let verified = verify_request(actor(), register(), &owner.client_limits).unwrap();
     let charge = budget
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
@@ -599,7 +605,12 @@ fn a_learner_added_past_the_snapshot_is_seeded_whoever_made_the_change() {
 fn a_lost_peer_reported_while_a_write_persists_is_told_next_period() {
     let directory = tempfile::tempdir().unwrap();
     let (mut owner, _outgoing, budget) = assemble(session(directory.path(), 1));
-    let pause = owner.session.shared_wal().pause_for_test().unwrap();
+    let pause = owner
+        .session
+        .shared_wal()
+        .unwrap()
+        .pause_for_test()
+        .unwrap();
     let verified = verify_request(actor(), register(), &owner.client_limits).unwrap();
     let charge = budget
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
@@ -637,7 +648,12 @@ fn a_lost_peer_reported_while_a_write_persists_is_told_next_period() {
 fn lost_peers_are_held_each_once_and_told_when_the_core_can_be() {
     let directory = tempfile::tempdir().unwrap();
     let (mut owner, _outgoing, budget) = assemble(session(directory.path(), 1));
-    let pause = owner.session.shared_wal().pause_for_test().unwrap();
+    let pause = owner
+        .session
+        .shared_wal()
+        .unwrap()
+        .pause_for_test()
+        .unwrap();
     let verified = verify_request(actor(), register(), &owner.client_limits).unwrap();
     let charge = budget
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)

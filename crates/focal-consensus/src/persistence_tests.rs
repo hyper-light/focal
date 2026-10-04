@@ -225,7 +225,7 @@ fn a_failed_write_never_releases_success_and_recovery_uses_its_exact_fence() {
         node.propose(vec![42; 8192]).unwrap();
         // The cut is installed for the one write the entry and its commit
         // share.
-        node.inject_fault_once(fault);
+        node.inject_fault_once(fault).unwrap();
         assert!(node.drain().is_err());
         assert_eq!(node.status().applied_index, published);
         assert!(matches!(node.tick(), Err(ConsensusError::Failed)));
@@ -329,7 +329,11 @@ fn a_leaders_appends_leave_while_it_flushes_and_a_followers_answer_after() {
         }
         cluster.pump(None);
     }
-    let wals: Vec<SharedWal> = cluster.nodes.iter().map(DurableNode::shared_wal).collect();
+    let wals: Vec<SharedWal> = cluster
+        .nodes
+        .iter()
+        .map(|node| node.shared_wal().unwrap())
+        .collect();
     let flushes = |wal: &SharedWal| wal.stats().unwrap().group_commits;
     // The leader's disk is held: its write cannot finish.
     let blocked = blocker(&wals[0]);
@@ -532,7 +536,7 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
         nodes[1].step(message).unwrap();
         answers.extend(nodes[1].drain().unwrap().messages);
     }
-    let wal = nodes[0].shared_wal();
+    let wal = nodes[0].shared_wal().unwrap();
     let (resume, worker) = pause(blocker(&wal));
     for message in answers {
         nodes[0].step(message).unwrap();
@@ -649,7 +653,7 @@ fn cut_after_applying(written_commit: bool) -> [bool; 2] {
         answers.extend(nodes[1].drain().unwrap().messages);
     }
     // The leader's disk is held while the answer commits the entry.
-    let wal = nodes[0].shared_wal();
+    let wal = nodes[0].shared_wal().unwrap();
     let (resume, worker) = pause(blocker(&wal));
     for message in answers {
         nodes[0].step(message).unwrap();
@@ -673,7 +677,7 @@ fn cut_after_applying(written_commit: bool) -> [bool; 2] {
     assert_eq!(events.committed.len(), 1);
     assert_eq!(events.committed[0].data, b"entry");
     // The follower is told, and applies by the same rule.
-    let wal = nodes[1].shared_wal();
+    let wal = nodes[1].shared_wal().unwrap();
     let (resume, worker) = pause(blocker(&wal));
     for message in events.messages {
         nodes[1].step(message).unwrap();

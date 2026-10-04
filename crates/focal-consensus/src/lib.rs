@@ -30,6 +30,8 @@ pub mod envelope;
 mod facade;
 pub mod group_files;
 mod persistence;
+mod shell;
+mod shell_node;
 mod storage;
 /// A group's timing, derived from the round trips it measures (27 §3.1 P2).
 pub use focal_timing as timing;
@@ -71,6 +73,9 @@ pub struct RestoredLog {
 /// The bytes of committed entries one Ready gives to apply: the page a
 /// transition reads from storage at most.
 pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// The most bytes of the application's state a snapshot, a checkpoint or a
+/// restored image holds.
+pub(crate) const IMAGE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: u64,
@@ -342,9 +347,17 @@ pub struct DurableNode {
 }
 
 /// What a [`DurableNode`] runs over.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "focal-log's member stays where its owner keeps it, as before the shell: a box would \
+              be an allocation every group's allowance counts; the shell's member is boxed and holds \
+              its box's bytes under its group's budget"
+)]
 enum Backend {
     /// focal-log and the core driven by focal's own persistence (`LogNode`).
     Log(LogNode),
+    /// hyper-durable's shell over the node's hyper-log log (`ShellNode`), boxed.
+    Shell(Box<shell_node::ShellNode>),
 }
 
 /// Calls the backend's method of the same name.
@@ -352,6 +365,7 @@ macro_rules! dispatch {
     ($node:ident = $backend:expr => $call:expr) => {
         match $backend {
             Backend::Log($node) => $call,
+            Backend::Shell($node) => $call,
         }
     };
 }
@@ -363,12 +377,14 @@ impl DurableNode {
     pub(crate) fn log(&self) -> &LogNode {
         match &self.backend {
             Backend::Log(node) => node,
+            Backend::Shell(_) => panic!("a member on the shell has no focal-log backend"),
         }
     }
     /// As [`DurableNode::log`], to change.
     pub(crate) fn log_mut(&mut self) -> &mut LogNode {
         match &mut self.backend {
             Backend::Log(node) => node,
+            Backend::Shell(_) => panic!("a member on the shell has no focal-log backend"),
         }
     }
 }
@@ -496,7 +512,7 @@ impl LogNode {
         if image.index == 0
             || image.term == 0
             || image.data.is_empty()
-            || image.data.len() > 8 * 1024 * 1024
+            || image.data.len() > IMAGE_BYTES
             || image
                 .transition
                 .is_some_and(|(predecessor, successor)| predecessor == successor)
@@ -1267,28 +1283,12 @@ impl LogNode {
         if store.snapshot_index() == 0 {
             return true;
         }
-        let Some(stated) = store
+        store
             .snapshot
             .metadata
             .as_ref()
             .and_then(|metadata| metadata.conf_state.as_ref())
-        else {
-            return false;
-        };
-        let named = |node: &u64| {
-            stated.voters.contains(node)
-                || stated.learners.contains(node)
-                || stated.voters_outgoing.contains(node)
-                || stated.learners_next.contains(node)
-        };
-        let current = &store.conf_state;
-        current
-            .voters
-            .iter()
-            .chain(&current.learners)
-            .chain(&current.voters_outgoing)
-            .chain(&current.learners_next)
-            .all(named)
+            .is_some_and(|stated| core_state::names_every_member(stated, &store.conf_state))
     }
     /// A leader cannot complete a quorum ReadIndex until it has committed an
     /// entry in its current term. Ingress uses this to defer readiness probes.
@@ -1368,8 +1368,9 @@ impl LogNode {
         }
         Ok(())
     }
-    pub fn inject_fault_once(&mut self, point: FaultPoint) {
+    pub fn inject_fault_once(&mut self, point: FaultPoint) -> Result<(), ConsensusError> {
         self.wal.inject_fault_once(point);
+        Ok(())
     }
     /// The core returns what it refuses and never unwinds; what it depends on
     /// (the codec, the allocator's collections) is not the core. No unwind

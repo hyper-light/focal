@@ -137,7 +137,7 @@ impl MembershipChange {
         next.validate()?;
         Ok(next)
     }
-    fn encode(self, context: Vec<u8>) -> ConfChangeV2 {
+    pub(crate) fn encode(self, context: Vec<u8>) -> ConfChangeV2 {
         let mut change = ConfChangeV2 {
             context,
             ..Default::default()
