@@ -74,8 +74,46 @@ async fn delegations(running: &Running) -> BTreeMap<NamespaceKey, focal_director
     };
     directory.delegations.as_ref().clone()
 }
+/// What each partition `running` hosts stands at: sealed or not, its
+/// revision and epoch, the configuration its group applied, and its owner's
+/// progress — role, term, leader, applied index, the frames it held, let go
+/// and found stale, and the failure it stopped on, if any.
+async fn hosted_report(running: &Running) -> String {
+    let mut hosted = Vec::new();
+    for partition in running.handles.directory.hosted() {
+        let state = partition_state(running, partition.plan.partition()).await;
+        let witness = partition.host.witness_membership().await.ok();
+        let mut progress = partition.host.progress();
+        progress.peers.clear();
+        hosted.push(format!(
+            "{:?}: state {:?}; voters {:?}; progress {progress:?}",
+            partition.plan.partition(),
+            state.as_ref().map(|state| {
+                (
+                    state.revision,
+                    state.delegation.epoch,
+                    state
+                        .sealed
+                        .as_ref()
+                        .map(|seal| (seal.destination, seal.revision)),
+                )
+            }),
+            witness.map(|witness| witness.configuration.configuration.voters.clone()),
+        ));
+    }
+    format!(
+        "node {} (service ended {:?}): [{}]",
+        running.status.node,
+        running.ended(),
+        hosted.join("; ")
+    )
+}
+/// The root's delegations once `condition` holds of them, charged to the
+/// progress of `running`; on a wait spent, what `running` and each of
+/// `members` host and stand at.
 async fn wait_delegations(
     running: &Running,
+    members: &[&Running],
     what: &str,
     condition: impl Fn(&BTreeMap<NamespaceKey, focal_directory::Delegation>) -> bool,
 ) -> BTreeMap<NamespaceKey, focal_directory::Delegation> {
@@ -88,30 +126,12 @@ async fn wait_delegations(
         Ok(current) => current,
         Err(spent) => {
             let status = running.handles.placement.status().await;
-            // What each hosted partition stood at: sealed or not, its
-            // revision and epoch, and the configuration its group applied.
-            let mut hosted = Vec::new();
-            for partition in running.handles.directory.hosted() {
-                let state = partition_state(running, partition.plan.partition()).await;
-                let witness = partition.host.witness_membership().await.ok();
-                hosted.push((
-                    partition.plan.partition(),
-                    partition.host.progress().leader,
-                    state.as_ref().map(|state| {
-                        (
-                            state.revision,
-                            state.delegation.epoch,
-                            state
-                                .sealed
-                                .as_ref()
-                                .map(|seal| (seal.destination, seal.revision)),
-                        )
-                    }),
-                    witness.map(|witness| witness.configuration.configuration.voters.clone()),
-                ));
+            let mut hosted = vec![hosted_report(running).await];
+            for member in members {
+                hosted.push(hosted_report(member).await);
             }
             panic!(
-                "root delegations never reached: {what}: {spent}; hosted {hosted:?}; agent {:?}; delegations {:?}",
+                "root delegations never reached: {what}: {spent}; hosted {hosted:#?}; agent {:?}; delegations {:?}",
                 status.map(|status| (
                     status.last_error,
                     status.last_refusal,
@@ -184,7 +204,10 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
     // The founder's session registers, the partition seals, a destination
     // group is hosted on the image, the root splits, the destination
     // installs and the source releases.
-    let split = wait_delegations(&founder, "two delegations", |current| current.len() == 2).await;
+    let split = wait_delegations(&founder, &[], "two delegations", |current| {
+        current.len() == 2
+    })
+    .await;
     let at = NamespaceKey::of(ledger);
     let lower = split.get(&NamespaceKey::MIN).unwrap();
     let upper = split.get(&at).unwrap();
@@ -310,9 +333,12 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
     // delegations untouched.
     founder.stop().await;
     let founder = Running::start(&settings).await;
-    let after = wait_delegations(&founder, "two delegations after restart", |current| {
-        current.len() == 2
-    })
+    let after = wait_delegations(
+        &founder,
+        &[&peer],
+        "two delegations after restart",
+        |current| current.len() == 2,
+    )
     .await;
     assert_eq!(after, split);
     let reopened = wait_partition(
@@ -328,7 +354,10 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
     // Both halves are small enough to merge once the knobs allow it: the
     // upper seals for the lower, the root merges, the lower absorbs.
     super::override_thresholds(cluster, 3, 1);
-    let merged = wait_delegations(&founder, "one delegation", |current| current.len() == 1).await;
+    let merged = wait_delegations(&founder, &[&peer], "one delegation", |current| {
+        current.len() == 1
+    })
+    .await;
     let only = merged.get(&NamespaceKey::MIN).unwrap();
     assert_eq!(only.partition, first);
     assert_eq!(only.namespace, NamespaceRange::all());

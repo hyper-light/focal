@@ -294,6 +294,7 @@ impl ReplicaFleet {
                 outbound.clone(),
             )?;
             owner.nonblocking = true;
+            owner.batching = true;
             owner.session.notify_persisted(Some(wake.persisted(ledger)));
             owner.incarnation = incarnation;
             owner.next_tick = now;

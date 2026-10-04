@@ -816,6 +816,13 @@ struct Owner {
     /// When leadership goes back to the placement's preferred leader.
     leader_return: crate::leader_return::LeaderReturn,
     nonblocking: bool,
+    /// The owner takes its work in batches (27 §9): a request it admits
+    /// leaves its drain to the batch's end, so the proposals and reads of a
+    /// batch go in one write and one round. An owner that shares its thread
+    /// among sessions always does — the session drains at its next pass,
+    /// after what was dispatched to it in this one; a replica's own owner
+    /// does while it takes what is queued (`Owner::take`).
+    batching: bool,
     /// The reply to a stop, and the owner's period at which the stop is
     /// given up on.
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
@@ -1014,6 +1021,7 @@ impl ReplicaHost {
             dropped_snapshots: 0,
             budget: budget.clone(),
             nonblocking: false,
+            batching: false,
             stopping: None,
             handing_off: None,
             stop_hand_off: None,
@@ -1727,17 +1735,29 @@ impl Owner {
         }
         self.close();
     }
-    /// Takes `work`, and while a read waits for its round, what is queued
-    /// behind it, before the drain that sends the round: the reads among it
-    /// share the round (27 §9). Counted by what the owner admits at once;
-    /// work that is no read drains for itself, which sends the round and
-    /// ends this. Whether the owner is to stop.
+    /// Takes `work` and what is queued behind it, as a batch, before the
+    /// drain that writes it (27 §9): the proposals among it go in one write
+    /// and the reads in one round. Counted by what the owner admits at once.
+    /// Whether the owner is to stop.
     fn take(&mut self, work: Work, receiver: &mpsc::Receiver<Work>) -> Result<bool, LedgerError> {
+        self.batching = true;
+        let stop = self.take_batch(work, receiver);
+        self.batching = false;
+        if self.session.has_ready() {
+            self.drain()?;
+        }
+        stop
+    }
+    fn take_batch(
+        &mut self,
+        work: Work,
+        receiver: &mpsc::Receiver<Work>,
+    ) -> Result<bool, LedgerError> {
         if self.accept(work)? {
             return Ok(true);
         }
         let mut taken = 1usize;
-        while self.session.reads_unasked() && taken < self.config.pending_clients {
+        while taken < self.config.pending_clients {
             let Ok(work) = receiver.try_recv() else {
                 break;
             };
@@ -2171,9 +2191,16 @@ impl Owner {
                 // round that leaves with its drain carries every read asked
                 // by then (27 §9). Reads queued together are confirmed by
                 // one round of heartbeats, and one asked alone leaves with
-                // the drain that follows at once. Anything else is drained
-                // for as it was.
-                if self.session.reads_waiting() <= waiting || !self.session.reads_unasked() {
+                // the drain that follows at once. Nor is a proposal, in a
+                // batch: the batch's drain writes every proposal of it at
+                // once. A proposal drained for as it came started its write
+                // there, and a session with a write out is dispatched
+                // nothing, so each write carried one proposal — a group
+                // committing six entries a second held 28 requests queued
+                // behind it (six fleets at once, 2026-10-03).
+                if !self.batching
+                    && (self.session.reads_waiting() <= waiting || !self.session.reads_unasked())
+                {
                     self.drain()?;
                 }
             }

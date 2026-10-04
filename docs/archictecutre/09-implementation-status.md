@@ -13175,3 +13175,15 @@ type equal to its bytes, every prefix and one-byte mutation read alike). The acc
 committed change in place through `hyper_raft::wire::changes_stated`. Every crate's suite passes
 on it; the types are the core's (typed kinds), and the tests that sent a kind no message has now
 send it as raft-rs writes it, refused by the envelope.
+
+### 2026-10-03 — a session writes the proposals of a batch at once
+
+Found under six fleets at once: an owner drained after every request that was no read,
+so each proposal began a write of its own, and a grouped owner dispatches nothing to a
+session with a write out — a leader wrote one proposal a write however many waited. An
+owner takes its work in batches now (`Owner::batching`): a grouped owner drains a
+session at its next pass, after what it dispatched to it; a replica's own owner takes
+what is queued, up to what it admits at once, and drains once. Three grouped replicas
+under sixteen clients, on hyper-raft (96c61ad), wrote 5.25 to 6.10 entries a write and
+committed 31 to 38 a second, against one entry a write and 17 a second before (on
+focal-raft: 5.0 to 5.6 entries a write, 32 to 38 a second, against 15 to 18).

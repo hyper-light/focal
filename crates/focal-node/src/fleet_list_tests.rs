@@ -196,6 +196,8 @@ mod append_order_tests;
 mod peer_admission_tests;
 #[path = "fleet_summary_owner_tests.rs"]
 mod summary_owner_tests;
+#[path = "fleet_write_batch_tests.rs"]
+mod write_batch_tests;
 
 #[path = "fleet_reconciliation_owner_tests.rs"]
 mod reconciliation_tests;

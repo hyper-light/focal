@@ -719,6 +719,7 @@ impl ManagementOwner {
             .send_modify(|progress| progress._allocation = Some(allocation));
         session.incarnation = sequence;
         session.nonblocking = true;
+        session.batching = true;
         session
             .session
             .notify_persisted(Some(self.sender.persisted(ledger)));

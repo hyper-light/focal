@@ -7,7 +7,8 @@ A larger limit, a longer timeout, a quiet log or a renamed guarantee is not clos
 Statuses: **open** (not started), **designed** (a written design with the exact sites,
 awaiting implementation or a decision), **in tree** (implemented and tested, not yet
 committed), **closed** (committed, gates green), **decision** (needs the operator's
-ruling before work starts).
+ruling before work starts), **shared** (closes in the integration of the shared crates —
+hyper-raft and its siblings — at the stage named; see below).
 
 ## Index
 
@@ -51,20 +52,20 @@ ruling before work starts).
 | F36 | P1 | in tree | 9 | [F36](#f38-and-f36) |
 | F37 | P1 | in tree | 8 | [F37](#f37) |
 | F38 | P2 | in tree | 8 | [F38](#f38-and-f36) |
-| F39 | P2 | in tree (Copa's competing mode open) | 12 | [F39](#f39) |
-| F40 | P2 | open | 10 | — |
+| F39 | P2 | in tree (Copa's competing mode: shared, hyper-quic's Copa, step 4) | 12 | [F39](#f39) |
+| F40 | P2 | shared (hyper-transport, step 4) | 10 | [shared](#findings-closed-with-the-shared-crates) |
 | F41 | P2 | in tree | 10 | [F41](#f41) |
 | F42 | P1 | in tree | 9 | [F42](#f42) |
 | F43 | P2 | in tree (the leader's read bound open) | 10 | [F43](#f43) |
-| F44 | P2 | open | 10 | — |
+| F44 | P2 | shared (hyper-timing and hyper-liveness, step 3) | 10 | [shared](#findings-closed-with-the-shared-crates) |
 | F45 | P2 | in tree | 10 | [F45](#f45) |
 | F46 | P1 | in tree | 8 | [F46](#f46) |
-| F47 | P2 | open | 11 | — |
+| F47 | P2 | shared (hyper-durable, step 2) | 11 | [shared](#findings-closed-with-the-shared-crates) |
 | F48 | P1 | in tree | 9 | [F48](#f48) |
 | F49 | P1 | in tree | 9 | [F49](#f49) |
 | F50 | P2 | in tree | 11 | [F50](#f50) |
 | F51 | P2 | open | 11 | — |
-| F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
+| F52 | P2 | in tree (encode); the WAL's encoder shared (hyper-log, step 1) | 11 | [F52](#f52) |
 | F53 | P2 | in tree | 10 | [F53](#f53) |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
 | F55 | P1 | in tree | 13 | [F55](#f55) |
@@ -119,6 +120,41 @@ serializer's size changes between passes (a fallible, capacity-limited append si
 F54's report header still says "bytes copied" for preserved length and the allocation
 record's §6 (lines 382–386) still converts faults to bytes and claims agreement with
 RSS — to be removed. F25 and F31 it credits as addressed, within their stated scope.
+
+### Findings closed with the shared crates
+
+Since PR #4 (2026-10-04) focal's consensus core is the shared repository's hyper-raft,
+vendored with hyper-timing (`vendor/`), and `crates/focal-raft` is gone. Its integration
+runs in stages, in an order the operator approved (2026-10-03): the core; hyper-log (step
+1); hyper-durable (step 2); timing and liveness (step 3); transport (step 4). Findings whose
+code a stage replaces close in that stage, each held to its acceptance as the stage's
+scenarios in the shared simulation and end-to-end tests, and focal's code they name is
+left as it stands until then:
+- **F52**, the WAL record encoder's zeroing (R6), with hyper-log.
+- **F47**, checkpoint installation streaming, with hyper-durable's API.
+- **F44**, freshness of the path estimates, with hyper-timing and hyper-liveness: each node
+  pair an NFD-E detector on the datagram plane, the election law on the measured span,
+  exchange delay and the owner's own lateness kept apart, focal-timing's 16-sample
+  median/MAD retired. Taken into hyper-timing before the stage: each path sample stamped
+  with its time and its endpoint's generation, samples of another generation or older than
+  a bound derived from the probe schedule dropped, and the sample's age given to readers so
+  quorum paths are probed fresh first.
+- **F40**, byte-fair replication, with hyper-transport on hyper-quic: a message's class from
+  its kind and its sender's role, a credit reserve for the classes above each class, strict
+  priority where credit is taken and in QUIC's send order, long-lived per-shard lanes;
+  votes and control urgent, appends and snapshots bulk, heartbeats on the datagram plane.
+- **F39's open findings** — Copa's competing mode — with hyper-quic's Copa (quinn-proto
+  conformed, its controllers a closed set): focal-wire's Copa is replaced there. The
+  analysis is handed over with the harness: the mode judged over five round trips, the
+  period of Copa's own oscillation (§2.2, §3); the delay sample judged against the window
+  its packet was sent under, without which the loop loses its lag once `1/δ` passes the
+  path's bandwidth-delay product in packets (the current window's test reads
+  `q_lag + Δ·q_lag/W_lag ≤ 1/δ`; the paper's §3 takes the queue short beside the path);
+  `1/δ` grown by `d_q/RTT` a round trip while competing, so Copa's rate `(1/δ)/d_q` grows
+  as a classic sender's `W/RTT` does (grown a packet a round trip it grew `RTT/d_q` times
+  faster, the measured 33.8% against a bar of 43.3%); and the competition a single-queue
+  manager hides, still to design. Sources: Copa (NSDI 2018), Nimbus (SIGCOMM 2022), Copa+
+  (INFOCOM 2022, ToN 2024), mvfst's Copa with a fixed δ and Copa2's removal (2026-01).
 
 ## F01
 
@@ -3426,6 +3462,49 @@ reached on a peer's stale view. Not reproduced: 22 copies here, ten at once and 
 background priority. The assertion now prints the whole placement view — which member
 each blocker names, and the liveness verdict, incarnation and witness the registry holds
 — so the next run says which. Open.
+
+**A session's writes carried one proposal each** (found under six fleets at once,
+2026-10-03; measured). An owner drained after every request that was no read, so a
+proposal's write began as it came, and a grouped owner dispatches nothing to a session
+with a write out: a leader wrote its proposals one a write however many waited — a
+group committing six entries a second held 28 requests queued, and its leader's log
+took 640 entries in 649 writes. F43 took the reads queued together into one round and
+left proposals as they were. *Fix.* An owner takes its work in batches
+(`Owner::batching`, 27 §10): a grouped owner's session drains at its next pass, after
+what was dispatched to it in this one, and a replica's own owner takes what is queued
+behind a request — up to what it admits at once (`Owner::take`) — and drains once; a
+lone request drains at once, as before. *Measured* (three grouped replicas, one session,
+sixteen clients each asking forty entries one after another, three runs each way
+alternating), on PR #4's core (hyper-raft, 96c61ad) at a host load of five to six: with
+batching 37, 38 and 31 entries a second at 5.25, 6.10 and 5.57 entries a write; without, 17
+a second in each run at one entry a write (640 writes for 640 entries). On the core
+before it (focal-raft, 9a2e14e) at a load of four: 38, 32 and 38 a second at 5.4, 5.0 and
+5.6 entries a write against 18, 17 and 15 at one; under a peer's builds, 23 and 10 against
+5 and 6. The measurement's pump carries each frame on its own task, as a connection's
+streams do: a pump that waited for each frame's answer — given once its receiver
+persisted it — made the followers' writes the pace, and both modes wrote one entry a
+write. *Tests.* `fleet::list_tests::write_batch_tests::an_owner_writes_the_proposals_of_a_batch_at_once`
+(two proposals taken one by one: two writes; four in a batch: one, nothing written
+before the batch's drain); `fleet_group`'s `a_sessions_queued_proposals_share_its_writes`
+(the burst commits; its pace and entries a write printed). *Open:* the control host
+drains a request that is no read as it comes; its requests take turns in its drain, and
+batching them is a design of its own.
+
+**The split test's merge waited on a group with no leader** (macOS CI, 9a2e14e's push
+run, `placement_agent::split::tests::a_crowded_partition_splits_survives_a_restart_and_merges_back`:
+"root delegations never reached: one delegation: every owner ran its budget of 1200
+periods"). After the founder's restart the destination partition's group — two voters,
+the founder and the host seated after the split — had no leader on the founder for the
+merge wait's whole budget. A merge's seal is made where the upper group leads
+(`PlacementAgent::lead_group_here` asks its leader to hand over), so nothing past it
+moved; the agent reported no error. The commit's other three runs passed the test in
+under a minute. Not reproduced: 36 copies on PR #4's core (hyper-raft, 96c61ad), twelve
+at once, and twelve on 9a2e14e's. Read in passing: the transfer a follower asks for itself
+is forwarded to its leader, which drops proposals while it hands over (as raft-rs does),
+and the order's epochs only grow across the restart and the hand-over. The wait prints
+now, for the founder and the seated host, each hosted group's state and its owner's
+progress — term, leader, applied index, frames held, let go and found stale, the failure
+it stopped on — and whether each service ended, so the next run names the cause. Open.
 
 ## F48
 
