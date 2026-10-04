@@ -13290,3 +13290,13 @@ read, a change of membership, a hand-over of leadership and a snapshot's feedbac
 core is given them, and the status, its scalars and the peers' progress as reported. Each is moved
 from `LogNode` unchanged, and `LogNode` calls it; the shell's backend will call the same.
 focal-consensus's suite passes unchanged.
+
+### 2026-10-03 — the decoder gate, one type both backends keep
+
+What a group's records state of the decoders its entries need, and what its application confirmed
+it compiled, decide the same things over either backend: whether the group may take part, which
+decoder is required, whether a floor is ready to advertise, and whether a floor or transition write
+is due ([27](27-consensus-roadmap-and-slates-port.md) §15.7). `DecoderGate` holds those decisions,
+moved from `LogNode`'s methods unchanged; `LogNode` stages and makes durable the write the gate asks
+for as before, and the shell's backend will write its group files for it. The decoder suites pass
+unchanged.

@@ -105,8 +105,10 @@ impl LogNode {
                 .checked_add(3)
                 .and_then(|count| count.checked_add(self.raw.store().proposals.len()))
                 .and_then(|count| count.checked_add(usize::from(self.config.fast)))
-                .and_then(|count| count.checked_add(usize::from(self.required_decoder.is_some())))
-                .and_then(|count| count.checked_add(usize::from(self.decoder_transition.is_some())))
+                .and_then(|count| count.checked_add(usize::from(self.decoders.required.is_some())))
+                .and_then(|count| {
+                    count.checked_add(usize::from(self.decoders.transition.is_some()))
+                })
                 .ok_or(ConsensusError::Capacity)?;
             records
                 .try_reserve_exact(count)
@@ -115,10 +117,10 @@ impl LogNode {
             if self.config.fast {
                 records.push(fast_track_record(&self.config));
             }
-            if let Some(hash) = self.required_decoder {
+            if let Some(hash) = self.decoders.required {
                 records.push(decoder::floor_record(self.config.group_id, hash)?);
             }
-            if let Some(pair) = self.decoder_transition {
+            if let Some(pair) = self.decoders.transition {
                 records.push(decoder::transition_record(self.config.group_id, pair)?);
             }
             records.push(proto_record(
