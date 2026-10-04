@@ -13547,3 +13547,23 @@ restarted between entries, which opens to the same state on both. Each settle en
 nothing ready, as focal's owner now owes every request one (`Owner::drain_owed`), and both backends
 give nothing. Both backends' identity checks are one rule (`NodeConfig::same_identity`), so a test's
 seed restarts on either. The differential over the consensus simulations is next.
+
+
+### 2026-10-04 — two waits that a busy machine broke, and the rig behind one of them
+
+Run beside a machine held at a load average of sixty on eighteen cores, two tests failed.
+- `control_host`'s turn test failed 7 runs of 26: write 4, held then let through, was
+  committed after its request time and answered `OutcomeUnknown`. A trace of every
+  replica showed both followers running their periods and the leader's probes to them
+  paused for 87 of its periods after the hold opened, its heartbeats arriving tens of
+  periods late. The cause was the rig's router: it sampled the path with a millisecond's
+  sleep after every frame it delivered, so the backlog held behind a hold drained one
+  wake at a time. It samples at most once a tick now; neither the core nor the owner was
+  at fault (hyper-raft resends a probe told lost at once, and on a heartbeat's answer two
+  ticks after it). 16 runs of 16 pass at a load of 52 to 78. The test now also names
+  every write's answer when it fails.
+- `evidence_quic`'s seals were bounded by four crossings of the shaped path in the
+  wall clock; they are charged to the replicas' periods now, as every other wait. The
+  evidence suite passes at a load of 46 to 69.
+A recorded operator command in a deployment journey (`Journey::manual`) is now parsed by
+the binary itself, with its flags, so a transcript cannot name a command the CLI lacks.

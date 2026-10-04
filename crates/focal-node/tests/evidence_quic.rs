@@ -1307,11 +1307,13 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
     });
     // The upload comes to the leader over the loopback; the seal waits for
     // the required copy on node 2, across its relay. The seal is asked
-    // again, exactly, for as long as four crossings take at the least.
+    // again, exactly, for as long as four crossings take at the least, in the
+    // replicas' periods: a starved machine stretches the wait with them.
     let began = std::time::Instant::now();
     let seal = upload(&fleet.replicas[leader].actor, 1, &bytes).await;
     let least = Duration::from_secs(BYTES as u64 * 8 / bits);
     let budget = least.saturating_mul(4);
+    let (live, mut wait) = fleet.wait(budget);
     let sealed = loop {
         let response = fleet.replicas[leader].actor.request(&seal).await.unwrap();
         if !matches!(
@@ -1322,10 +1324,11 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
         ) {
             break response;
         }
-        assert!(
-            began.elapsed() < budget,
-            "the seal did not complete in {budget:?} at {bits} bit/s: {response:?}"
-        );
+        if let Err(spent) = wait.check(&fleet.periods(&live)) {
+            panic!(
+                "the seal did not complete in {budget:?} at {bits} bit/s: {spent}: {response:?}"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
     let took = began.elapsed();
@@ -1449,11 +1452,11 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
 }
 /// Upload `bytes` to the leader and seal, asking the seal again, exactly,
 /// while the copy is being made: for as long as four exchanges across the
-/// path take at the least.
+/// path take at the least, in the replicas' periods.
 async fn sealed(fleet: &Fleet, leader: usize, slow: &Slow, id: u8, bytes: &[u8]) -> ContentRef {
-    let began = std::time::Instant::now();
     let seal = upload(&fleet.replicas[leader].actor, id, bytes).await;
     let budget = slow.dial().max(DIAL) * 4;
+    let (live, mut wait) = fleet.wait(budget);
     loop {
         let response = fleet.replicas[leader].actor.request(&seal).await.unwrap();
         match response.result {
@@ -1461,10 +1464,9 @@ async fn sealed(fleet: &Fleet, leader: usize, slow: &Slow, id: u8, bytes: &[u8])
             Response::Error(
                 AccessError::OutcomeUnknown | AccessError::Unavailable | AccessError::Capacity,
             ) => {
-                assert!(
-                    began.elapsed() < budget,
-                    "the seal of object {id} did not complete in {budget:?}"
-                );
+                if let Err(spent) = wait.check(&fleet.periods(&live)) {
+                    panic!("the seal of object {id} did not complete in {budget:?}: {spent}");
+                }
                 tokio::time::sleep(TICK).await;
             }
             other => panic!("the seal of object {id}: {other:?}"),

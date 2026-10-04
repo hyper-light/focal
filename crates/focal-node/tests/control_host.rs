@@ -226,6 +226,12 @@ impl Rig {
                 // pace fed its own period holds itself wherever it is.
                 let mut paths: std::collections::BTreeMap<u64, focal_timing::PathRtt> =
                     std::collections::BTreeMap::new();
+                // The path is sampled at most once a tick: a sample after
+                // every frame put a wake on the delivery of each, and a
+                // backlog held behind a hold drained a wake at a time — on a
+                // runner at a load of sixty, tens of the leader's periods
+                // before its heartbeats reached a follower (2026-10-04).
+                let mut sampled: Option<std::time::Instant> = None;
                 while let Some(frame) = channel.recv().await {
                     let excluded = isolated.load(Ordering::SeqCst);
                     if excluded == from || excluded == frame.target {
@@ -267,12 +273,15 @@ impl Rig {
                     )
                     .unwrap();
                     let _ = target.handle(&verified).await;
-                    let asked = std::time::Instant::now();
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    let taken = u64::try_from(asked.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    paths.entry(frame.target).or_default().on_sample(taken);
-                    if let Some(sender) = hosts.get(from.saturating_sub(1) as usize) {
-                        sender.pace(paths.values());
+                    if sampled.is_none_or(|at| at.elapsed() >= RIG_TICK) {
+                        let asked = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        let taken = u64::try_from(asked.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        paths.entry(frame.target).or_default().on_sample(taken);
+                        if let Some(sender) = hosts.get(from.saturating_sub(1) as usize) {
+                            sender.pace(paths.values());
+                        }
+                        sampled = Some(std::time::Instant::now());
                     }
                     drop(frame);
                 }
@@ -1585,14 +1594,20 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
     // Five writes at once, each expecting the revision the one before it
     // leaves, and a transfer of leadership behind them.
     let host = rig.hosts[leader].clone();
+    // Each write's answer as it arrives, for a failure to name.
+    let answered = std::sync::Mutex::new(Vec::new());
     let write = |at: u64| {
         let host = host.clone();
+        let answered = &answered;
         async move {
-            host.submit(
-                peer(PeerRole::Runtime),
-                request(at, region(revision + at - 1, u128::from(at))),
-            )
-            .await
+            let answer = host
+                .submit(
+                    peer(PeerRole::Runtime),
+                    request(at, region(revision + at - 1, u128::from(at))),
+                )
+                .await;
+            answered.lock().unwrap().push((at, format!("{answer:?}")));
+            answer
         }
     };
     let target = (leader as u64 + 1) % 3 + 1;
@@ -1618,7 +1633,8 @@ async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
             while host.progress().applied_index < applied + written {
                 if let Err(spent) = wait.check(&rig.periods()) {
                     panic!(
-                        "write {written} never applied: {spent}; {:?}",
+                        "write {written} never applied: {spent}; answered {:?}; {:?}",
+                        answered.lock().unwrap(),
                         host.progress()
                     );
                 }
