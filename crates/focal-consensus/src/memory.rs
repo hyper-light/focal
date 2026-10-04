@@ -604,9 +604,9 @@ mod tests {
         node.drain().unwrap();
         node.propose(vec![7; 300]).unwrap();
         node.drain().unwrap();
-        let none = staging_bytes(&node.raw, &node.config, 657, 0).unwrap();
-        let most = staging_bytes(&node.raw, &node.config, 657, MAX_MEMBERS).unwrap();
-        let last = last_entry_bytes(&node.raw).unwrap();
+        let none = staging_bytes(&node.log().raw, &node.log().config, 657, 0).unwrap();
+        let most = staging_bytes(&node.log().raw, &node.log().config, 657, MAX_MEMBERS).unwrap();
+        let last = last_entry_bytes(&node.log().raw).unwrap();
         assert!((300..1024).contains(&last), "{last}");
         // Two places in the queue a member (`Outgoing::growth_of` reserves
         // twice the count) and the two messages' allowances, its share of
@@ -615,7 +615,7 @@ mod tests {
         let each = 4 * std::mem::size_of::<Message>()
             + 2 * proto::MESSAGE_ALLOWANCE
             + 657
-            + member_bytes(node.config.max_inflight_messages).unwrap()
+            + member_bytes(node.log().config.max_inflight_messages).unwrap()
             + last;
         assert_eq!(most - none, MAX_MEMBERS * each);
         assert!(most < 8 * 1024 * 1024, "{most}");
@@ -642,9 +642,9 @@ mod tests {
         }
         cluster.nodes[0].report_unreachable(3).unwrap();
         let leader = &cluster.nodes[0];
-        let raft = &leader.raw.raft;
+        let raft = &leader.log().raw.raft;
         let core = raft.config();
-        let store = leader.raw.store();
+        let store = leader.log().raw.store();
         assert!(raft.log().unstable().entries().is_empty());
         let last = raft.log().last_index().unwrap();
         let page = |pages: usize| {
@@ -678,9 +678,9 @@ mod tests {
             more = more.max(all - one);
         }
         assert_eq!(behind, 1, "member 3 alone is behind");
-        assert_eq!(sends_bytes(&leader.raw).unwrap(), expected + more);
+        assert_eq!(sends_bytes(&leader.log().raw).unwrap(), expected + more);
         // The estimate names that page once, whatever lies behind it.
-        let with = staging_bytes(&leader.raw, &leader.config, 0, 0).unwrap();
+        let with = staging_bytes(&leader.log().raw, &leader.log().config, 0, 0).unwrap();
         assert!(with >= expected, "{with} < {expected}");
     }
 }

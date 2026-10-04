@@ -110,7 +110,7 @@ fn queue_pressure_retains_the_ready_without_clearing_authority() {
         node.drain(),
         Err(ConsensusError::PersistencePending)
     ));
-    assert!(!node.failed);
+    assert!(!node.log().failed);
     assert!(matches!(
         node.tick(),
         Err(ConsensusError::PersistencePending)

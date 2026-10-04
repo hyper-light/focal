@@ -84,7 +84,7 @@ struct ReadyPhase {
     /// write, which states it, is durable.
     held: Vec<Entry>,
 }
-impl DurableNode {
+impl LogNode {
     pub fn shared_wal(&self) -> SharedWal {
         self.wal.shared_wal()
     }

@@ -13457,3 +13457,13 @@ changes to the shell there are what the hand-over machine of
 focal runs as before: hyper-raft's sources are unchanged, hyper-timing's election law changed only
 in its tests, and its detector and hyper-liveness, which changed with the detector model the shared
 repository merged, are called by nothing in focal yet. No manifest and no locked dependency moved.
+
+### 2026-10-03 — DurableNode answers through its backend
+
+The first step of [27](27-consensus-roadmap-and-slates-port.md) §15.7 in code. The member over
+focal-log is `LogNode`, crate-private, its fields and methods as they were. `DurableNode` holds
+its backend, so far that one, inline: the owners keep the node where they kept it, and its memory
+allowance, the size of `DurableNode`, counts what it counted. Each public method is the backend's
+method of the same name, and each constructor opens the backend. Nothing an owner sees changes:
+focal-consensus's suite passes unchanged, the counting allocator's allowance test among it. The
+shell's backend comes beside it next.

@@ -92,6 +92,7 @@ impl Group {
     }
     fn held(&self, node: usize) -> Vec<(u64, Vec<u8>)> {
         self.nodes[node]
+            .log()
             .raw
             .raft
             .proposals()

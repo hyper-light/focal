@@ -226,7 +226,13 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
         index
     );
     assert_eq!(
-        node.raw.raft.tracker().get(2).unwrap().pending_snapshot,
+        node.log()
+            .raw
+            .raft
+            .tracker()
+            .get(2)
+            .unwrap()
+            .pending_snapshot,
         index
     );
     for (peer, expected_term, expected_index) in [
@@ -238,15 +244,30 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
         node.report_snapshot_at(peer, expected_term, expected_index, SnapshotStatus::Failure)
             .unwrap();
         assert_eq!(
-            node.raw.raft.tracker().get(2).unwrap().pending_snapshot,
+            node.log()
+                .raw
+                .raft
+                .tracker()
+                .get(2)
+                .unwrap()
+                .pending_snapshot,
             index
         );
     }
     node.report_snapshot_at(2, term, index, SnapshotStatus::Failure)
         .unwrap();
-    assert_eq!(node.raw.raft.tracker().get(2).unwrap().pending_snapshot, 0);
     assert_eq!(
-        node.raw.raft.tracker().get(2).unwrap().state,
+        node.log()
+            .raw
+            .raft
+            .tracker()
+            .get(2)
+            .unwrap()
+            .pending_snapshot,
+        0
+    );
+    assert_eq!(
+        node.log().raw.raft.tracker().get(2).unwrap().state,
         hyper_raft::progress::ProgressState::Probe
     );
 }
@@ -328,7 +349,8 @@ fn three_voters_partition_leader_change_and_restart() {
     assert_eq!(cluster.applied[0].len(), 1);
     for _ in 0..30 {
         for (i, node) in cluster.nodes.iter_mut().enumerate() {
-            node.raw
+            node.log_mut()
+                .raw
                 .raft
                 .set_randomized_election_timeout(10 + i * 3)
                 .unwrap();
@@ -938,7 +960,7 @@ fn a_failure_of_the_core_stops_only_this_replica_until_disk_recovery() {
         node.propose(b"durable-before-the-failure".to_vec())
             .unwrap();
         let committed = node.drain().unwrap().committed;
-        let result = node.guarded(|replica| {
+        let result = node.log_mut().guarded(|replica| {
             if unwinds {
                 // Nothing the core does unwinds; what it depends on is
                 // fenced all the same.
@@ -978,7 +1000,7 @@ fn upstream_invariant_failure_stops_only_this_replica_until_disk_recovery() {
     node.propose(b"durable-before-dependency-failure".to_vec())
         .unwrap();
     let committed = node.drain().unwrap().committed;
-    let result = node.guarded(|_| -> Result<(), ConsensusError> {
+    let result = node.log_mut().guarded(|_| -> Result<(), ConsensusError> {
         std::panic::resume_unwind(Box::new("a dependency unwound"))
     });
     assert!(matches!(result, Err(ConsensusError::DependencyFailure)));
