@@ -13198,3 +13198,28 @@ write out due (`GroupOwner::sweep`, counted in `ReplicaProgress::waits_swept`).
 `fleet::grouped::tests::an_answer_that_finds_the_signals_full_arms_the_sweep`; the held
 log's test counts a sweep's look as a wake.
 
+### 2026-10-04 — the gate on 7a4fba1: a batch owes its drain; two tests restated
+
+The gate on 7a4fba1 failed three tests. One hid a defect of batching; the other two were
+the tests' own.
+- **A peer's frame whose step left nothing ready waited for its deadline.** Batching
+  left a request's drain to the batch's end, which drained only a replica with
+  something ready. A frame such as a message of an older term made the session neither
+  ready nor due, so its answer, given by a drain's poll, waited for its deadline. On a
+  path that carries a peer's frames one after another, everything behind it waited
+  too. `fleet_group`'s quorum test, its wait charged to the replicas' periods, found
+  three replicas at term 23 with no leader. Every request a batch takes owes the batch
+  its drain now, run whether or not anything is ready (`Owner::drain_owed`).
+  `fleet::list_tests::write_batch_tests::a_peer_frame_that_leaves_nothing_ready_is_answered_by_its_batchs_drain`;
+  the quorum test passes 3 runs of 3 (it failed 3 of 3 on 2b7a62a, and passed 3 of 3 on
+  96c61ad).
+- **The read-round test** asserted the owner's contract from before batching. It now
+  checks that a batch's drain sends one round for the batch's reads, and that a write
+  among them goes in the same drain.
+- **The lossy-path test's client** dialed once for every request that found its slot
+  empty. That went past the server's sixteen connections for one identity, and the
+  server replaced connections while they carried requests. The client now dials each
+  slot once, as the product's `RouteConnections` does, and reads a lost connection from
+  the connection's own state.
+- **`fleet_group`'s quorum test** now charges its two waits to the replicas' periods.
+

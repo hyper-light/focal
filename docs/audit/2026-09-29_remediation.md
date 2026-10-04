@@ -3527,6 +3527,63 @@ owner, which takes its input at every pass. *Tests.*
 filled, one token for two drops, taken, armed again); the held log's test takes a session
 woken by its signal or by a sweep, and prints how many sweeps looked.
 
+**The gate on 7a4fba1 failed three tests: two were the tests' own defects, and one hid
+a defect of batching** (2026-10-04).
+- **A peer's frame whose step left nothing ready waited for its deadline.**
+  `fleet_group`'s `multiple_session_quorums_share_node_workers_and_wal_through_leader_loss_and_restart`
+  failed its fifteen seconds of the clock waiting for a leader. Charged to the replicas'
+  periods (27 §3.1 P8), the wait named the state: three replicas at term 23 with no
+  leader after 750 periods; in other runs a leader at term 1 whose read was never
+  answered, and a write not committed after the leader was confirmed. It failed alone,
+  3 runs of 3.
+  - *Cause.* Batching (2b7a62a) left a request's drain to the batch's end, which drained
+    only a replica with something ready. A peer's frame is answered by the poll a drain
+    makes (`PeerAccepted`, at the Ready fence). A frame whose step leaves nothing ready —
+    a message of an older term the core passes over, a heartbeat's answer at a follower —
+    made the session neither ready nor due, so its answer waited for an unrelated drain
+    or for its deadline (750 ms in the test). The test's pump carries a node's frames
+    one after another, as a connection whose streams are held would. Everything behind
+    the frame waited with it: elections outlasted their timeouts, and read rounds were
+    never confirmed. Before batching, the drain that followed each frame answered it
+    with an empty poll.
+  - *Bisected.* focal-node's source of 96c61ad passed 3 runs of 3 (about four seconds
+    each), and 2b7a62a's failed 3 of 3. With peers' frames drained as they came, and
+    nothing else changed, 2b7a62a passed 3 of 3.
+  - *Fix.* Every request a batch takes owes the batch its drain (`Owner::drain_owed`).
+    The batch's end runs it whether or not anything is ready: `Owner::take`, a grouped
+    owner's pass (`progress_group`), and its deadline (`group_deadline`, due at once).
+    A drain discharges it, whatever its poll makes of it: a write still in flight answers
+    its frames when it is answered, as before.
+  - *Tests.* `fleet::list_tests::write_batch_tests::a_peer_frame_that_leaves_nothing_ready_is_answered_by_its_batchs_drain`
+    delivers a heartbeat's answer to a follower, which leaves nothing ready. Taken
+    alone, it is answered by the take's drain. Accepted in a grouped owner's batch, it
+    makes the session due at once, and the pass answers it. Without the fix, the test
+    fails at the first answer. The quorum test passes 3 runs of 3 alone and beside the
+    rest of its binary.
+- **The read-round test held the contract before batching.**
+  `fleet::list_tests::read_round_tests::reads_queued_together_leave_in_one_round_and_all_are_answered`
+  still asserted that `Owner::take` left a read's round to the owner's loop, and that a
+  write queued behind a read ended the taking. Now a batch's drain sends the round. A
+  write between two reads is taken with them: its entry and the reads' one round leave
+  in the same drain, and the read behind it is answered with the first. The test asserts
+  this now.
+- **The lossy-path test's client dialed once for every request that found its slot empty.**
+  `fleet_quic`'s `a_peers_appends_are_stepped_in_their_order_across_a_lossy_path` failed
+  with `Io(NotConnected … ApplicationClosed … "replaced")`.
+  - When a replica began to lead, every request in flight dialed its slots at once,
+    past the sixteen connections a server holds for one identity (F20's admission). The
+    server then closed the least recently used connections while they carried requests.
+  - The product's client dials once per route (`RouteConnections`, F60); the test's
+    client now does too (`ActorConnections`).
+  - A loss ends the exchange with whatever error its stream met: a write or a read on a
+    closed connection is `Io`. So the test's client reads the loss from the connection's
+    own state, as the peer pool does (`connection_failed`). The product's client
+    forgets a connection on any error, so it was never exposed.
+- **`fleet_group`'s quorum test waited on the clock**: fifteen seconds for a leader, and
+  fifteen again for the replicas to catch up. Both waits are now charged to the
+  replicas' periods, and each names every replica's state when it is spent. That is
+  how the defect above was found.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

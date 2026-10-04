@@ -81,3 +81,92 @@ fn an_owner_writes_the_proposals_of_a_batch_at_once() {
     );
     assert_eq!(commits() - before, 1, "a batch: one write");
 }
+
+fn node_peer(node: u64) -> AuthenticatedPeer {
+    AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId::from_u128(node as u128),
+        tenants: [identity().ledger.tenant].into_iter().collect(),
+        role: PeerRole::Node { node_id: node },
+    })
+    .unwrap()
+}
+/// Node 2's answer to a heartbeat sent to the follower `owner`, which the
+/// core passes over: a follower takes no heartbeat's answer.
+fn passed_over(owner: &Owner, id: u128) -> (Work, oneshot::Receiver<OwnedResponse>) {
+    let message = focal_consensus::Message {
+        msg_type: focal_consensus::MessageType::MsgHeartbeatResponse,
+        from: 2,
+        to: 3,
+        term: owner.session.scalars().term,
+        ..Default::default()
+    };
+    let request = RequestEnvelope {
+        protocol: PROTOCOL_VERSION,
+        ledger: identity().ledger,
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(id),
+        operation: Operation::Raft {
+            group: owner.session.group_id(),
+            message: focal_consensus::encode_message(&message).unwrap(),
+        },
+    };
+    let verified = verify_request(node_peer(2), request, &owner.limits).unwrap();
+    let charge = owner
+        .budget
+        .reserve(BudgetKind::Query, BudgetLane::Completion, 64 * 1024)
+        .unwrap()
+        .commit();
+    let (send, receive) = oneshot::channel();
+    (
+        Work::Request(
+            Box::new(AdmittedRequest {
+                verified,
+                witness: None,
+                native: None,
+            }),
+            send,
+            charge,
+        ),
+        receive,
+    )
+}
+
+/// A peer's frame whose step leaves the replica nothing ready is answered
+/// by the drain that ends its batch — an empty poll, as the drain of a frame
+/// taken alone was. Before, a batch's end drained only a replica with
+/// something ready, and such a frame waited for its deadline: on a path that
+/// carries a peer's frames one after another everything behind it waited
+/// with it, and fleet_group's quorum test held elections to term 23 with no
+/// leader (the gate on 7a4fba1). Both ends of a batch: a replica's own
+/// owner's (`Owner::take`), and a grouped owner's, which makes the session
+/// due at once and drains it at its pass.
+#[test]
+fn a_peer_frame_that_leaves_nothing_ready_is_answered_by_its_batchs_drain() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::open(root.path());
+    for _ in 0..10 {
+        fixture.pump();
+    }
+    let follower = &mut fixture.owners[2];
+    let (_sender, receiver) = mpsc::sync_channel(1);
+    let (work, mut answer) = passed_over(follower, 1);
+    assert!(!follower.take(work, &receiver).unwrap());
+    assert!(!follower.session.has_ready(), "nothing was left ready");
+    assert!(matches!(
+        answer.try_recv().unwrap().envelope().result,
+        Response::PeerAccepted
+    ));
+    // A grouped owner's session: every request is taken in a batch.
+    follower.batching = true;
+    let (work, mut answer) = passed_over(follower, 2);
+    assert!(!follower.accept(work).unwrap());
+    assert!(!follower.session.has_ready(), "nothing was left ready");
+    assert!(answer.try_recv().is_err(), "answered at the batch's drain");
+    assert!(follower.group_deadline().unwrap() <= Instant::now());
+    assert!(!follower.progress_group().unwrap());
+    assert!(matches!(
+        answer.try_recv().unwrap().envelope().result,
+        Response::PeerAccepted
+    ));
+}

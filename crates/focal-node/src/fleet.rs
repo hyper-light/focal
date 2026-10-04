@@ -829,6 +829,15 @@ struct Owner {
     /// after what was dispatched to it in this one; a replica's own owner
     /// does while it takes what is queued (`Owner::take`).
     batching: bool,
+    /// A request of the batch waits for the batch's drain: the drain runs
+    /// at the batch's end whether or not the replica has anything ready. A
+    /// peer's frame is answered at the Ready fence, by the poll the drain
+    /// makes; a frame whose step left nothing ready — a message of an older
+    /// term the core passes over — is answered by an empty poll. Left to
+    /// what else made the replica ready, it waited for its deadline: on a
+    /// path that carries a peer's frames one after another, everything
+    /// behind it with it, elections and read rounds outlasting their timeouts.
+    drain_owed: bool,
     /// The reply to a stop, and the owner's period at which the stop is
     /// given up on.
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
@@ -1030,6 +1039,7 @@ impl ReplicaHost {
             budget: budget.clone(),
             nonblocking: false,
             batching: false,
+            drain_owed: false,
             stopping: None,
             handing_off: None,
             stop_hand_off: None,
@@ -1751,7 +1761,7 @@ impl Owner {
         self.batching = true;
         let stop = self.take_batch(work, receiver);
         self.batching = false;
-        if self.session.has_ready() {
+        if self.drain_owed || self.session.has_ready() {
             self.drain()?;
         }
         stop
@@ -2073,7 +2083,7 @@ impl Owner {
             .map_err(|_| LedgerError::Failed)?;
         self.expire_pending();
         self.progress_evidence()?;
-        if self.session.has_ready() {
+        if self.drain_owed || self.session.has_ready() {
             self.drain_with_runtime(self.stopping.is_none())?;
         }
         self.progress_evidence()?;
@@ -2157,8 +2167,9 @@ impl Owner {
             return Ok(self.next_tick);
         }
         // A delivery waiting for seed chunks its host has not pulled yet
-        // makes no progress on its own; it resumes when a chunk lands.
-        if self.session.has_ready() && !self.session.seed_waiting() {
+        // makes no progress on its own; it resumes when a chunk lands. The
+        // drain a batch owes is due at once either way.
+        if self.drain_owed || (self.session.has_ready() && !self.session.seed_waiting()) {
             return Ok(self.next_tick.min(Instant::now()));
         }
         if self.beats() {
@@ -2205,10 +2216,11 @@ impl Owner {
                 // there, and a session with a write out is dispatched
                 // nothing, so each write carried one proposal — a group
                 // committing six entries a second held 28 requests queued
-                // behind it (six fleets at once, 2026-10-03).
-                if !self.batching
-                    && (self.session.reads_waiting() <= waiting || !self.session.reads_unasked())
-                {
+                // behind it (six fleets at once, 2026-10-03). The batch owes
+                // its drain all the same (`Owner::drain_owed`).
+                if self.batching {
+                    self.drain_owed = true;
+                } else if self.session.reads_waiting() <= waiting || !self.session.reads_unasked() {
                     self.drain()?;
                 }
             }
@@ -3598,6 +3610,9 @@ impl Owner {
         self.drain_with_runtime(true)
     }
     fn drain_with_runtime(&mut self, drive_runtime: bool) -> Result<(), LedgerError> {
+        // The batch's drain, whatever its poll makes of it: a write still in
+        // flight answers its frames when it is (`Owner::drain_owed`).
+        self.drain_owed = false;
         // A retained delivery (a retryable native refusal, an import waiting
         // for sealed custody) resumes at the next poll; it never stops the
         // replica.

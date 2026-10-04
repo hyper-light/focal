@@ -150,32 +150,63 @@ async fn ready(
     ledger: LedgerId,
     excluded: Option<usize>,
 ) -> usize {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            for (i, hosts) in hosts.iter().enumerate() {
-                if Some(i) == excluded {
-                    continue;
-                }
-                let host = &hosts[&ledger];
-                let status = host.progress();
-                if status.node == status.leader && status.term > 0 {
-                    let reply = dispatch(
-                        host,
-                        actor(ledger),
-                        read(ledger),
-                        &ReplicaHost::wire_limits(),
-                    )
-                    .await;
-                    if matches!(reply.result, Response::Read(_)) {
-                        return i;
-                    }
+    // Charged to the replicas' own periods (27 §3.1 P8): fifteen seconds of
+    // their ticks, not of the clock. Held to the clock, a gate's run of the
+    // suite beside heavier tests in this binary spent it while the replicas
+    // were starved of their periods (2026-10-04).
+    let tick = Duration::from_millis(20);
+    let periods = || -> Vec<u64> {
+        hosts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != excluded)
+            .map(|(_, hosts)| hosts[&ledger].periods())
+            .collect()
+    };
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &periods(),
+        focal_timing::ProgressDeadline::periods(Duration::from_secs(15), tick),
+        Duration::from_secs(60),
+    );
+    loop {
+        for (i, hosts) in hosts.iter().enumerate() {
+            if Some(i) == excluded {
+                continue;
+            }
+            let host = &hosts[&ledger];
+            let status = host.progress();
+            if status.node == status.leader && status.term > 0 {
+                let reply = dispatch(
+                    host,
+                    actor(ledger),
+                    read(ledger),
+                    &ReplicaHost::wire_limits(),
+                )
+                .await;
+                if matches!(reply.result, Response::Read(_)) {
+                    return i;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    })
-    .await
-    .expect("no authoritative session leader")
+        if let Err(spent) = wait.check(&periods()) {
+            let states: Vec<_> = hosts
+                .iter()
+                .map(|hosts| {
+                    let progress = hosts[&ledger].progress();
+                    (
+                        progress.node,
+                        progress.leader,
+                        progress.term,
+                        progress.sequence,
+                    )
+                })
+                .collect();
+            panic!(
+                "no authoritative session leader: {spent}; (node, leader, term, sequence) {states:?}"
+            );
+        }
+        tokio::time::sleep(tick).await;
+    }
 }
 async fn stop(hosts: &BTreeMap<LedgerId, ReplicaHost>) {
     for host in hosts.values() {
@@ -380,17 +411,47 @@ async fn multiple_session_quorums_share_node_workers_and_wal_through_leader_loss
         "{committed:?}"
     );
     isolated.store(0, Ordering::Release);
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while groups.iter().any(|group| {
-            group.hosts.iter().any(|(id, host)| {
-                host.progress().sequence < SessionSeq(if *id == ledger(0) { 2 } else { 1 })
-            })
-        }) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // Every replica catches up once the old leader rejoins, the wait charged
+    // to their own periods as `ready`'s is.
+    let periods = || -> Vec<u64> {
+        groups
+            .iter()
+            .flat_map(|group| group.hosts.values().map(|host| host.periods()))
+            .collect()
+    };
+    let tick = Duration::from_millis(20);
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &periods(),
+        focal_timing::ProgressDeadline::periods(Duration::from_secs(15), tick),
+        Duration::from_secs(60),
+    );
+    while groups.iter().any(|group| {
+        group.hosts.iter().any(|(id, host)| {
+            host.progress().sequence < SessionSeq(if *id == ledger(0) { 2 } else { 1 })
+        })
+    }) {
+        if let Err(spent) = wait.check(&periods()) {
+            let states: Vec<_> = groups
+                .iter()
+                .flat_map(|group| {
+                    group.hosts.iter().map(|(id, host)| {
+                        let progress = host.progress();
+                        (
+                            id.session,
+                            progress.node,
+                            progress.leader,
+                            progress.term,
+                            progress.sequence,
+                        )
+                    })
+                })
+                .collect();
+            panic!(
+                "the replicas did not catch up: {spent}; (session, node, leader, term, sequence) {states:?}"
+            );
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(tick).await;
+    }
     for group in &groups {
         stop(&group.hosts).await;
     }
