@@ -81,7 +81,7 @@ fn server_config(
     roots: &[Vec<u8>],
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(focal_wire::crypto_provider());
     // A client's chain is verified against the issuers this node trusts; a
     // successor issuer's endorsement by one of them is an ordinary
     // intermediate to it (24 §11). The enrollment protocol authenticates

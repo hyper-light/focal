@@ -15,6 +15,8 @@
 //! Missing runtime context returns a typed transport error before dispatch.
 mod admission;
 mod auth;
+mod crypto;
+pub use crypto::{crypto_provider, quic_client, quic_server};
 pub mod congestion;
 mod frame;
 mod handler;

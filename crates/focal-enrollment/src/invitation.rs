@@ -202,7 +202,7 @@ impl ServerTrust {
     /// credential; the exact leaf pin is checked on the connection.
     pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
         self.validate()?;
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(focal_wire::crypto_provider());
         let verifier = self.verifier(provider.clone())?;
         let mut config = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -257,7 +257,7 @@ impl ServerTrust {
         let (first, intermediates) = certificates
             .split_first()
             .ok_or(EnrollmentError::Unauthorized)?;
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(focal_wire::crypto_provider());
         let verifier = self.verifier(provider)?;
         let now = UnixTime::since_unix_epoch(Duration::from_secs(
             u64::try_from(now).map_err(|_| EnrollmentError::Invalid)?,

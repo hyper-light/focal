@@ -5667,3 +5667,118 @@ fn a_part_is_what_the_path_delivered_in_an_exchange_time() {
         4096
     );
 }
+
+/// Every connection focal makes exchanges its keys post-quantum
+/// (`crypto`): a client that offers only a classical exchange is refused at
+/// the handshake, as is one whose traffic would be sealed with a 128-bit
+/// key, while one that offers the hybrid is served; and a focal client
+/// refuses a server that speaks only a classical exchange.
+#[tokio::test]
+async fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
+    use rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256;
+    use rustls::crypto::aws_lc_rs::kx_group::{X25519, X25519MLKEM768};
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(4).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> =
+        Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+    let (server, task) = server(&pki, registry, handler).await;
+    let client = |groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+                  suites: Option<Vec<rustls::SupportedCipherSuite>>| {
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.kx_groups = groups;
+        if let Some(suites) = suites {
+            provider.cipher_suites = suites;
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(pki.ca.der().to_vec()))
+            .unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![CertificateDer::from(certificate.clone())],
+                PrivatePkcs8KeyDer::from(key.clone()).into(),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        ))
+    };
+    let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = server.local_addr().unwrap();
+    let refused = endpoint
+        .connect_with(client(vec![X25519], None), address, "localhost")
+        .unwrap()
+        .await;
+    assert!(refused.is_err(), "a classical exchange was accepted");
+    let short_key = endpoint
+        .connect_with(
+            client(vec![X25519MLKEM768], Some(vec![TLS13_AES_128_GCM_SHA256])),
+            address,
+            "localhost",
+        )
+        .unwrap()
+        .await;
+    assert!(short_key.is_err(), "a 128-bit traffic key was accepted");
+    let served = endpoint
+        .connect_with(
+            client(vec![X25519MLKEM768, X25519], None),
+            address,
+            "localhost",
+        )
+        .unwrap()
+        .await;
+    assert!(served.is_ok(), "{served:?}");
+    // A server that speaks only a classical exchange, to a focal client.
+    let (server_certificate, server_key) = pki.issue(true);
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![X25519];
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(server_certificate)],
+            PrivatePkcs8KeyDer::from(server_key).into(),
+        )
+        .unwrap();
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let classical = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        )),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let accepting = classical.clone();
+    tokio::spawn(async move {
+        if let Some(incoming) = accepting.accept().await {
+            let _ = incoming.await;
+        }
+    });
+    let focal = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate.clone()], key.clone()),
+        vec![pki.ca.der().to_vec()],
+        &limits(),
+    )
+    .unwrap();
+    let to_classical = endpoint
+        .connect_with(focal, classical.local_addr().unwrap(), "localhost")
+        .unwrap()
+        .await;
+    assert!(
+        to_classical.is_err(),
+        "a focal client accepted a classical exchange"
+    );
+    classical.close(0u8.into(), b"done");
+    server.close();
+    task.await.unwrap().unwrap();
+}

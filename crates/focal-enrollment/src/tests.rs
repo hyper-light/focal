@@ -710,8 +710,7 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
     // body allocation or reach metadata by declaring an unbounded frame length.
     let mut raw_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     let tls = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(invitation.client_config().unwrap())
-            .unwrap(),
+        focal_wire::quic_client(invitation.client_config().unwrap()).unwrap(),
     ));
     raw_endpoint.set_default_client_config(tls);
     let raw = raw_endpoint

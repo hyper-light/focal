@@ -13583,3 +13583,24 @@ load average of 31 to 36 on 18 cores; four sessions are listed a round and every
 within 1,365 rounds; the process held 285 MiB resident beside 164 MiB its fleet's budget
 accounted. The record's F26 has the evidence; its second half (refusal classes, stop
 causes, histograms) is open there. Doc 24 §23 says how the page is made.
+
+### 2026-10-04 — F58: every connection exchanges its keys post-quantum
+
+Every TLS configuration focal builds — the node's QUIC listener, the wire client and
+server, enrollment's invitation client and authority server, the PKI's server — took
+aws-lc-rs's default provider, which offers X25519MLKEM768 first but lets a peer choose
+X25519, SecP256r1 or SecP384r1 alone, and AES-128-GCM traffic. A recorder of today's
+traffic could read whatever a quantum computer later breaks. One function,
+`focal_wire::crypto_provider`, now builds every provider: key exchange X25519MLKEM768 or
+SecP256r1MLKEM768 only, traffic AES-256-GCM or ChaCha20-Poly1305 only; `quic_client` and
+`quic_server` build the QUIC configurations, keeping RFC 9001's AES-128-GCM for Initial
+packets only, whose keys any observer derives from the connection id. `check-contracts.py`
+refuses a provider or a QUIC configuration built anywhere else in production code (a
+probe file is refused). `a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways`
+asserts a client offering only X25519 is refused, one offering only AES-128 traffic is
+refused, one offering the hybrid is served, and a focal client refuses a server speaking
+only X25519; run against the default provider it fails ("a classical exchange was
+accepted"). Three tests that wrapped focal's own configurations with quinn's `try_from`,
+which requires AES-128-GCM among the negotiated suites, now take `quic_client` /
+`quic_server` as production does. Certificates still sign classically (decision F58 says
+why); at-rest encryption is hyper-seal's, designed in the shared repository.

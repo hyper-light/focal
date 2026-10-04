@@ -2,10 +2,7 @@
 //! bidirectional stream; slow work on one stream does not serialize other streams.
 use crate::*;
 use focal_memory::MemoryBudget;
-use quinn::{
-    Connection, Endpoint,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-};
+use quinn::{Connection, Endpoint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -341,7 +338,7 @@ pub fn server_tls(
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(crate::crypto_provider());
     // A client's chain is verified against the roots this server knows;
     // a successor issuer's endorsement by one of them is an ordinary
     // intermediate to it (`trust`).
@@ -370,9 +367,7 @@ pub fn server_transport(
 ) -> Result<quinn::ServerConfig, WireError> {
     let transport = transport(limits)?;
     tls.max_early_data_size = 0;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(tls).map_err(|_| WireError::Authentication)?,
-    ));
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crate::quic_server(tls)?));
     config.transport_config(transport);
     Ok(config)
 }
@@ -382,7 +377,7 @@ pub fn client_tls(
     limits: &WireLimits,
 ) -> Result<quinn::ClientConfig, WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(crate::crypto_provider());
     // The server's chain is verified against the roots this client knows;
     // a successor issuer's endorsement by one of them is an ordinary
     // intermediate to it (`trust`).
@@ -403,7 +398,7 @@ pub fn client_tls_adopting(
     limits: &WireLimits,
 ) -> Result<(quinn::ClientConfig, crate::AdoptedRoots), WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(crate::crypto_provider());
     let (verifier, adopted) = crate::AdoptingServerVerifier::new(
         crate::TrustRoots::new(server_roots)?,
         provider.clone(),
@@ -428,9 +423,7 @@ fn client_tls_with(
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     tls.enable_early_data = false;
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(tls).map_err(|_| WireError::Authentication)?,
-    ));
+    let mut config = quinn::ClientConfig::new(Arc::new(crate::quic_client(tls)?));
     config.transport_config(transport(limits)?);
     Ok(config)
 }

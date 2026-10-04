@@ -39,6 +39,27 @@ for manifest in sorted(list((ROOT / "crates").glob("*/Cargo.toml")) + list((ROOT
                 errors.append(
                     f"{manifest.relative_to(ROOT)}: {crate} must use the {aws_feature} feature, not {ring_feature}"
                 )
+# Post-quantum key exchange only (decision F58, doc 07): every TLS
+# configuration in production code is built from `focal_wire::crypto_provider`
+# and every QUIC one from `focal_wire::quic_client` / `quic_server`, so no
+# site can rebuild aws-lc-rs's default provider, whose classical groups a
+# peer could pick. Test sources build classical peers on purpose and are
+# exempt.
+PROVIDER_HOME = ROOT / "crates/focal-wire/src/crypto.rs"
+PROVIDER_PATTERNS = (
+    r"\bdefault_provider\s*\(",
+    r"\bQuic(?:Client|Server)Config::try_from\b",
+    r"\bQuic(?:Client|Server)Config::with_initial\b",
+)
+for source in sorted(list((ROOT / "crates").glob("*/src/**/*.rs")) + list((ROOT / "tools").glob("*/src/**/*.rs"))):
+    if source == PROVIDER_HOME or source.name == "tests.rs" or source.stem.endswith("_tests") or "tests" in source.relative_to(ROOT).parts[3:-1]:
+        continue
+    text = source.read_text()
+    for pattern in PROVIDER_PATTERNS:
+        if re.search(pattern, text):
+            errors.append(
+                f"{source.relative_to(ROOT)}: builds a TLS provider or QUIC configuration outside focal_wire::crypto"
+            )
 for path in sorted(DOCS.glob("*.md")):
     for target in re.findall(r"(?<!!)\[[^\]]*\]\(([^)]+)\)", path.read_text()):
         target = target.split("#", 1)[0]

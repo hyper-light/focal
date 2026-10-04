@@ -172,8 +172,7 @@ async fn edited_join(
     edit: impl FnOnce(&mut SubmittedJoin),
 ) -> JoinResponse {
     let config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(invitation.client_config().unwrap())
-            .unwrap(),
+        focal_wire::quic_client(invitation.client_config().unwrap()).unwrap(),
     ));
     let (_endpoint, connection) =
         connect_raw(config, address, &invitation.trust().server_name).await;
@@ -693,10 +692,7 @@ async fn enrollment_connection_without_time_returns_unknown_and_closes() {
     .unwrap();
     let server = quinn::Endpoint::server(
         quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(
-                authority.server_identity().server_config().unwrap(),
-            )
-            .unwrap(),
+            focal_wire::quic_server(authority.server_identity().server_config().unwrap()).unwrap(),
         )),
         "127.0.0.1:0".parse().unwrap(),
     )
