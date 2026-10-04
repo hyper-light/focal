@@ -102,6 +102,12 @@ pub struct NodeConfig {
     /// commits by the classic quorum until its term ends (27 §4.6).
     #[serde(skip)]
     pub fast: bool,
+    /// A test's election seed, in place of the system's randomness, so that two backends given
+    /// one input stream draw alike (the differential, 27 §15.10). Never serialized; it exists only
+    /// in this crate's tests.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) election_seed: Option<u64>,
 }
 
 impl NodeConfig {
@@ -130,7 +136,20 @@ impl NodeConfig {
             max_uncommitted_bytes: 32 * 1024 * 1024,
             max_inflight_messages: DEFAULT_INFLIGHT_WINDOW,
             fast: false,
+            #[cfg(test)]
+            election_seed: None,
         }
+    }
+
+    /// Whether `other` names the same member of the same group with the same bootstrap
+    /// membership: what a member's persisted identity must match when it opens again, on either
+    /// backend. The tunables (ticks, entry and window sizes) may change between starts.
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.node_id == other.node_id
+            && self.cluster_id == other.cluster_id
+            && self.group_id == other.group_id
+            && self.voters == other.voters
+            && self.learners == other.learners
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
@@ -684,13 +703,7 @@ impl LogNode {
             return Err(error);
         }
         if let Some(persisted) = persisted_config {
-            if persisted.node_id != config.node_id
-                || persisted.cluster_id != config.cluster_id
-                || persisted.group_id != config.group_id
-                || persisted.voters != config.voters
-                || persisted.learners != config.learners
-                || persisted_fast != config.fast
-            {
+            if !persisted.same_identity(&config) || persisted_fast != config.fast {
                 return Err(ConsensusError::Configuration(
                     "persisted identity/bootstrap configuration mismatch",
                 ));
@@ -1506,6 +1519,10 @@ fn proto_record(
 /// randomness, and where there is none, the replica's own identity, which
 /// no other member of its group shares.
 fn election_seed(config: &NodeConfig) -> u64 {
+    #[cfg(test)]
+    if let Some(seed) = config.election_seed {
+        return seed;
+    }
     let mut bytes = [0u8; 8];
     if getrandom::fill(&mut bytes).is_ok() {
         return u64::from_le_bytes(bytes);
@@ -1734,6 +1751,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ConsensusError> {
 
 #[cfg(test)]
 mod borrowed_proposal_tests;
+#[cfg(test)]
+mod differential_tests;
 #[cfg(test)]
 mod envelope_tests;
 #[cfg(test)]

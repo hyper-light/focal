@@ -274,7 +274,8 @@ impl ShellNode {
         let dir = group_files::group_dir(root, config.group_id);
         let records = match group_files::read_records(&medium, &dir).map_err(file_error)? {
             Some(records) => {
-                if records.identity != config || records.fast {
+                // The identity as focal-log checks it: the tunables may change between starts.
+                if !records.identity.same_identity(&config) || records.fast {
                     return Err(ConsensusError::Configuration(
                         "persisted identity/bootstrap configuration mismatch",
                     ));

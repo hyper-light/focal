@@ -13528,3 +13528,22 @@ replicating and serving a follower's read, the owners' poll, wait and drain loop
 signal. The backend takes calls hyper-durable gained for it: the core's priority and windows, the
 reads the replica holds, the budget's lane, and a wait on the group store. Only its tests construct
 it yet; the differential over the consensus simulations (§15.10) is next.
+
+### 2026-10-04 — one input stream, both backends: the differential begins
+
+[27](27-consensus-roadmap-and-slates-port.md) §15.10's differential, in scenarios. The same members
+run on focal-log's backend and on the shell (`differential_tests.rs`, `Twin`), driven by one input
+stream, each member's election seed given (`NodeConfig::election_seed`, a test's, never
+serialized), every member drained to quiescence after each input. After each round the backends
+must agree on what each member's owner was handed: the committed entries and the changes of
+membership in order, the messages in order, the snapshots, the applied index, and the reads as the
+round's set (the shell gives a read once its apply reaches the index, where focal-log may give it a
+drain earlier for the owner to park). A round that differs fails, naming the member, the round and
+what differs.
+
+Three scenarios pass: an election, entries and a follower's read; elections by timeout across a
+partition, where the members left elect one of their own and the healed leader follows; and a member
+restarted between entries, which opens to the same state on both. Each settle ends with a drain with
+nothing ready, as focal's owner now owes every request one (`Owner::drain_owed`), and both backends
+give nothing. Both backends' identity checks are one rule (`NodeConfig::same_identity`), so a test's
+seed restarts on either. The differential over the consensus simulations is next.

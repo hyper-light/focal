@@ -16,6 +16,7 @@ fn records(floor: Option<[u8; 32]>) -> GroupRecords {
             max_uncommitted_bytes: 1 << 24,
             max_inflight_messages: 32,
             fast: false,
+            election_seed: None,
         },
         fast: true,
         decoder_floor: floor,
