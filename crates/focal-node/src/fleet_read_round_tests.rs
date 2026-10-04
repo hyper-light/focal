@@ -58,11 +58,12 @@ fn rounds(fixture: &mut Fixture) -> Vec<(u64, Vec<u8>)> {
 }
 
 /// Reads queued for the owner together are asked for by one round of
-/// heartbeats: the owner takes what is queued behind a read before the
-/// drain that sends its round. A hundred reads leave in two heartbeats, one
-/// to each follower, where a drain after each sent two hundred; a read
-/// queued alone leaves in two as well, with the drain that follows it; and
-/// every one of them is answered.
+/// heartbeats: the owner takes what is queued behind a read as one batch,
+/// and the batch's drain sends its round (27 §9). A hundred reads leave in
+/// two heartbeats, one to each follower, where a drain after each sent two
+/// hundred; a read queued alone leaves in two as well, with its own drain;
+/// and every one of them is answered. A write among them is of the batch
+/// too: its entry and the reads' one round leave with the same drain.
 #[test]
 fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
     let root = tempfile::tempdir().unwrap();
@@ -85,13 +86,11 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
                 sender.try_send(work).ok().unwrap();
             }
         }
-        // As the owner's loop does: the work it was woken by, and what is
-        // queued behind it while a read waits for its round.
+        // As the owner's loop does: the work it was woken by and what is
+        // queued behind it, taken as one batch whose drain sends the round.
         assert!(!fixture.owners[0].take(first.unwrap(), &receiver).unwrap());
         assert!(receiver.try_recv().is_err());
         assert_eq!(fixture.owners[0].session.reads_waiting(), together);
-        assert!(rounds(&mut fixture).is_empty());
-        fixture.owners[0].drain().unwrap();
         let sent = rounds(&mut fixture);
         assert_eq!(
             sent.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
@@ -111,8 +110,9 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
             ));
         }
     }
-    // A write queued behind a read ends the taking: it is drained for as it
-    // was, and its drain sends the round with its entry.
+    // A write queued between two reads is taken with them: no drain for the
+    // write alone, which sent the first read's round with its entry and left
+    // the read behind it for a round of its own.
     let (sender, receiver) = mpsc::sync_channel(2);
     let (read, mut answer) = summary(&fixture.owners[0], 5_000);
     let request = RequestEnvelope {
@@ -148,8 +148,9 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
     let (late, mut late_answer) = summary(&fixture.owners[0], 5_001);
     sender.try_send(late).ok().unwrap();
     assert!(!fixture.owners[0].take(read, &receiver).unwrap());
-    // The write was taken and drained for; the read behind it was not taken.
-    assert!(receiver.try_recv().is_ok());
+    // All three were taken, and both reads went in the batch's one round.
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(fixture.owners[0].session.reads_waiting(), 2);
     let sent = rounds(&mut fixture);
     assert_eq!(
         sent.iter().map(|(to, _)| *to).collect::<Vec<_>>(),
@@ -166,7 +167,10 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
         written.try_recv().unwrap().envelope().result,
         Response::Submitted(_)
     ));
-    assert!(late_answer.try_recv().is_err());
+    assert!(matches!(
+        late_answer.try_recv().unwrap().envelope().result,
+        Response::Summary(_)
+    ));
 }
 
 /// The bytes a leader sends a peer ahead of its answers follow what the

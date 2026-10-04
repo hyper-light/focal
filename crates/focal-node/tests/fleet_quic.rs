@@ -853,28 +853,61 @@ struct Refusals {
     /// Frames let go past their patience or their lane.
     let_go: u64,
 }
-/// The actor's connection in `slot` to `replica`, opened where none is
-/// held; none while it cannot be opened, which the caller waits out as a
-/// leader not there.
-async fn actor_connection(
-    fleet: &Fleet,
-    held: &std::sync::Mutex<Vec<Option<QuicRemote>>>,
-    replica: usize,
-    slot: usize,
-) -> Option<QuicRemote> {
-    if let Some(remote) = held.lock().unwrap()[slot].clone() {
-        return Some(remote);
+/// The actor's connections to the replicas, a slot each. A slot is dialed
+/// once however many requests find it empty at once, and a connection
+/// leaves it only while the one a request found lost is still the one it
+/// holds, as the product's client keeps its routes (`RouteConnections`,
+/// the audit's F60). Each request that found its slot empty used to dial
+/// one of its own: the slots of a replica that began to lead took a dial
+/// from every request in flight, past the sixteen connections a server
+/// holds for one identity, and the server closed the least recently used
+/// under the requests they carried ("replaced", the gate on 7a4fba1).
+struct ActorConnections {
+    slots: Vec<tokio::sync::Mutex<Option<(u64, QuicRemote)>>>,
+    dials: std::sync::atomic::AtomicU64,
+}
+impl ActorConnections {
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: (0..slots).map(|_| tokio::sync::Mutex::new(None)).collect(),
+            dials: std::sync::atomic::AtomicU64::new(0),
+        }
     }
-    let remote = fleet
-        .actor_connector
-        .connect(
-            fleet.replicas[replica].server.local_addr().unwrap(),
-            &fleet.routes[&(replica as u64 + 1)].server_name,
-        )
-        .await
-        .ok()?;
-    held.lock().unwrap()[slot] = Some(remote.clone());
-    Some(remote)
+    /// The connection in `slot` to `replica`, with the dial it came from,
+    /// dialed with the slot held where none is: a request that finds the
+    /// slot dialing waits for that dial. None while it cannot be opened,
+    /// which the caller waits out as a leader not there.
+    async fn connect(
+        &self,
+        fleet: &Fleet,
+        replica: usize,
+        slot: usize,
+    ) -> Option<(u64, QuicRemote)> {
+        let mut held = self.slots[slot].lock().await;
+        if let Some(connection) = held.as_ref() {
+            return Some(connection.clone());
+        }
+        let remote = fleet
+            .actor_connector
+            .connect(
+                fleet.replicas[replica].server.local_addr().unwrap(),
+                &fleet.routes[&(replica as u64 + 1)].server_name,
+            )
+            .await
+            .ok()?;
+        let dial = self
+            .dials
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *held = Some((dial, remote.clone()));
+        Some((dial, remote))
+    }
+    /// Forget the connection of `dial` in `slot`, while it is still held.
+    async fn forget(&self, slot: usize, dial: u64) {
+        let mut held = self.slots[slot].lock().await;
+        if held.as_ref().is_some_and(|(held, _)| *held == dial) {
+            *held = None;
+        }
+    }
 }
 /// The appends the followers refused while a burst of entries crossed a
 /// path of 5 ms each way that loses one datagram in fifty, the connectors
@@ -914,15 +947,13 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
     // and the exact retry finds the receipt (27 §3.1). Every attempt goes
     // to the replica that leads at the time, as the client follows a leader
     // that moved, over eight connections opened to it when it first leads
-    // and again where one is lost: a test that asked the first leader alone
-    // waited out its budget on a follower when leadership moved under load.
+    // and again where one is lost, each dialed once (`ActorConnections`): a
+    // test that asked the first leader alone waited out its budget on a
+    // follower when leadership moved under load.
     const CONNECTIONS: u128 = 8;
-    let held = std::sync::Mutex::new(vec![
-        None;
-        fleet.replicas.len()
-            * usize::try_from(CONNECTIONS).unwrap()
-    ]);
-    let held = &held;
+    let connections =
+        ActorConnections::new(fleet.replicas.len() * usize::try_from(CONNECTIONS).unwrap());
+    let connections = &connections;
     let fleet_ref = &fleet;
     let replicas = &fleet.replicas;
     // A refused attempt is asked again after the pause the client itself
@@ -983,15 +1014,19 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                         })
                         .unwrap_or(leader);
                     let slot = leading * usize::try_from(CONNECTIONS).unwrap() + connection;
-                    let actor = actor_connection(fleet_ref, held, leading, slot).await;
-                    let answer = match actor {
-                        Some(actor) => match actor.request(&envelope).await {
+                    let answer = match connections.connect(fleet_ref, leading, slot).await {
+                        Some((dial, actor)) => match actor.request(&envelope).await {
                             Ok(answer) => answer.result,
                             Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
                             // A connection lost is opened again for the next
                             // attempt, which waits as for a leader not there.
-                            Err(WireError::Connection) => {
-                                held.lock().unwrap()[slot] = None;
+                            // A loss ends the exchange under way with the
+                            // error its stream met — a write or a read on a
+                            // closed connection is `Io` — so the connection's
+                            // own state says whether it was lost, as the
+                            // product's peer pool asks it.
+                            Err(error) if matches!(error, WireError::Connection) || actor.closed() => {
+                                connections.forget(slot, dial).await;
                                 Response::Error(AccessError::Unavailable)
                             }
                             Err(error) => panic!("entry {epoch}: {error:?}"),
