@@ -166,16 +166,22 @@ async fn pending_export(
     let host = fixture.hosts[&ledger(1)].clone();
     while fixture.observations.try_recv().is_ok() {}
     let export = tokio::spawn(async move { host.checkpoint_evidence(ttl).await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            // This signal follows successful snapshot preparation and its
-            // first pending disk poll. Ordinary Raft/read progress cannot
-            // satisfy the causal precondition for the independent-writer test.
-            if fixture.observations.recv().await.unwrap() == ledger(1) {
-                break;
+    let hosts: Vec<&ReplicaHost> = fixture.hosts.values().collect();
+    crate::test_waits::within(
+        &hosts,
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        async {
+            loop {
+                // This signal follows successful snapshot preparation and its
+                // first pending disk poll. Ordinary Raft/read progress cannot
+                // satisfy the causal precondition for the independent-writer test.
+                if fixture.observations.recv().await.unwrap() == ledger(1) {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert!(

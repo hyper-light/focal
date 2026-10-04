@@ -74,6 +74,8 @@ pub mod session_registration;
 mod streams;
 #[cfg(test)]
 mod streams_tests;
+#[cfg(test)]
+mod test_waits;
 pub mod topology;
 pub mod upgrade;
 

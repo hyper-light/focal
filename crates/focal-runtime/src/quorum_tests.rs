@@ -122,7 +122,9 @@ impl Group {
         index: usize,
         mut done: impl FnMut(&Runtime, &Session) -> bool,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The validators run on the runtime's workers, which report no
+        // period: the wedge window bounds the wait.
+        let deadline = Instant::now() + FROZEN;
         loop {
             runtime.drive(self.node(index)).unwrap();
             if done(runtime, self.node(index)) {
@@ -383,10 +385,13 @@ fn leadership_loss_cancels_old_execution_and_discards_its_late_pass() {
     assert_eq!(status(group.node(next)), ClaimStatus::ValidationFailed);
     group.isolated = None;
     group.settle();
-    let until = Instant::now() + Duration::from_secs(2);
+    let until = Instant::now() + FROZEN;
     while old.active_count() != 0 {
         assert!(old.drive(group.node(0)).is_err());
-        assert!(Instant::now() < until);
+        assert!(
+            Instant::now() < until,
+            "the old runtime kept its work: nothing for {FROZEN:?}"
+        );
         std::thread::yield_now();
     }
     assert_eq!(gate.started.load(Ordering::SeqCst), 1);

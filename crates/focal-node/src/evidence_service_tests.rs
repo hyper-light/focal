@@ -391,16 +391,27 @@ async fn control_mailbox_replaces_policy_while_all_transfer_slots_are_blocked() 
             ));
             let mut request = std::pin::pin!(request);
             let mut datagram = [0; 2048];
-            tokio::time::timeout(Duration::from_secs(2), async {
-                tokio::select! {
-                    result=blackhole.recv(&mut datagram)=>{assert!(result.unwrap()>0);}
-                    _=&mut request=>panic!("custody unexpectedly completed without a peer"),
-                }
-            })
+            // No owner runs either: the request reaches the path, and the
+            // placement is replaced while it stays stuck there, or the wait
+            // is wedged — bounded by the frozen window alone
+            // (`crate::test_waits`).
+            crate::test_waits::charged(
+                Vec::new,
+                Duration::from_secs(2),
+                Duration::from_millis(10),
+                async {
+                    tokio::select! {
+                        result=blackhole.recv(&mut datagram)=>{assert!(result.unwrap()>0);}
+                        _=&mut request=>panic!("custody unexpectedly completed without a peer"),
+                    }
+                },
+            )
             .await
             .unwrap();
-            tokio::time::timeout(
+            crate::test_waits::charged(
+                Vec::new,
                 Duration::from_secs(1),
+                Duration::from_millis(10),
                 coordinator.replace_placement(Some(first.scope()), next.clone()),
             )
             .await

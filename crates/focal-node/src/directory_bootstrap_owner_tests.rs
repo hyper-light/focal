@@ -43,16 +43,21 @@ async fn directory_owner_is_registered_before_blocking_recovery_and_retains_esca
     assert_eq!(before.node, plan.founder_node());
     assert_eq!(before.leader, 0);
     assert_eq!(before.applied_index, 0);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let progress = host.progress();
-            assert!(!progress.stopped, "directory activation failed");
-            if progress.applied_index > 0 && progress.leader == progress.node {
-                break;
+    crate::test_waits::charged(
+        || vec![host.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        async {
+            loop {
+                let progress = host.progress();
+                assert!(!progress.stopped, "directory activation failed");
+                if progress.applied_index > 0 && progress.leader == progress.node {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let authority = host
@@ -104,9 +109,16 @@ async fn directory_startup_failure_closes_ingress_and_preserves_host_charge_afte
     .unwrap();
     let (host, owner, outgoing) =
         ControlHost::spawn_directory(permit, wrong, budget.clone(), None).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), host.closed())
-        .await
-        .unwrap();
+    // A stopped owner runs no more periods: its close is bounded by the
+    // frozen window alone.
+    crate::test_waits::charged(
+        || vec![host.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        host.closed(),
+    )
+    .await
+    .unwrap();
     owner.join().unwrap();
     assert!(host.progress().stopped);
     assert_eq!(host.progress().applied_index, 0);

@@ -147,10 +147,15 @@ async fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_
         .unwrap();
     commit(&mut network.control, 6, ControlCommand::Enrollment(revoke));
     let permit = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    let receipt = tokio::time::timeout(Duration::from_secs(5), host.refresh_directory(permit))
-        .await
-        .unwrap()
-        .unwrap();
+    let receipt = crate::test_waits::charged(
+        || vec![host.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        host.refresh_directory(permit),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(receipt.root_index, network.control.applied_index());
     assert_eq!(receipt.receipt.request.sequence, 2);
     assert!(receipt.applied_index >= receipt.receipt.committed_index);

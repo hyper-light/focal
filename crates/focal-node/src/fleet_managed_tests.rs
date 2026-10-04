@@ -81,11 +81,29 @@ fn support(owner: &mut Owner) -> Result<ManagedSupportReply, LedgerError> {
     );
     receive.blocking_recv().unwrap()
 }
+/// The writes the session's log has completed: what a wait on the
+/// session's own persistence is charged in (27 §3.1 P8). The test's session
+/// has no clients, so its writes are finite: once it has nothing left to
+/// persist the count stands still, and a wait whose fact never came ends
+/// after `FROZEN` with none.
+fn writes(owner: &Owner) -> u64 {
+    owner
+        .session
+        .shared_wal()
+        .stats()
+        .map_or(0, |stats| stats.group_commits)
+}
+/// A wait on the session's writes (`writes`).
+fn on_writes(owner: &Owner) -> focal_timing::ProgressDeadline {
+    focal_timing::ProgressDeadline::begin(&[writes(owner)], u64::MAX, crate::test_waits::FROZEN)
+}
 fn settle(owner: &mut Owner) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut wait = on_writes(owner);
     while owner.session.persistence_pending() || owner.session.has_ready() {
         owner.progress_group().unwrap();
-        assert!(Instant::now() < deadline);
+        if let Err(spent) = wait.check(&[writes(owner)]) {
+            panic!("the session never settled: {spent}");
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     owner.progress_managed().unwrap();
@@ -285,7 +303,7 @@ fn trusted_membership_nominates_real_joining_decoder_and_waits_for_fact() {
     assert_eq!(fact.configuration_index, 0);
     assert_eq!(fact.voters, [1]);
     owner.session.record_managed_support(2, fact).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut wait = on_writes(&owner);
     loop {
         owner.drain().unwrap();
         while outgoing.try_recv().is_ok() {}
@@ -299,7 +317,9 @@ fn trusted_membership_nominates_real_joining_decoder_and_waits_for_fact() {
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(error) => panic!("{error:?}"),
         };
-        assert!(Instant::now() < deadline);
+        if let Err(spent) = wait.check(&[writes(&owner)]) {
+            panic!("the membership was never answered: {spent}");
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(owner.memberships.is_empty());

@@ -131,6 +131,34 @@ struct Fleet {
     /// is shaped; kept until the fleet is dropped.
     _relays: Vec<relay::Relay>,
 }
+/// A wait on the fleet, charged to the periods of the replicas running when
+/// it began (27 §3.1 P8): what an allowance holds at their tick, however
+/// long the machine takes to run them, and no longer than `FROZEN` while
+/// the slowest runs none. A replica stopped since runs no more periods,
+/// and while another runs it is charged none: the wait is charged to the
+/// others' as they run.
+struct FleetWait {
+    live: Vec<usize>,
+    deadline: focal_timing::ProgressDeadline,
+}
+impl FleetWait {
+    fn check(&mut self, fleet: &Fleet) -> Result<(), focal_timing::Spent> {
+        let stopped = |index: &usize| fleet.replicas[*index].host.progress().stopped;
+        let running = self.live.iter().any(|index| !stopped(index));
+        let periods: Vec<u64> = self
+            .live
+            .iter()
+            .map(|index| {
+                if running && stopped(index) {
+                    u64::MAX
+                } else {
+                    fleet.replicas[*index].host.periods()
+                }
+            })
+            .collect();
+        self.deadline.check(&periods)
+    }
+}
 /// A path between the replicas slower than the loopback and out of order:
 /// every datagram between them crosses a relay that delays it `delay` and
 /// up to `jitter` more, and where `loss` is given loses one datagram in so
@@ -227,23 +255,26 @@ async fn trusted_membership_commits_catchup_promotion_and_exact_failover_retry()
             node: target as u64 + 1,
         },
     };
-    let promoted = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match fleet.replicas[leader]
-                .host
-                .change_membership(promote.clone())
-                .await
-            {
-                Ok(reply) => break reply,
-                Err(LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind)) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await
+    let mut wait = fleet.wait(Duration::from_secs(5));
+    let promoted = loop {
+        match fleet.replicas[leader]
+            .host
+            .change_membership(promote.clone())
+            .await
+        {
+            Ok(reply) => break reply,
+            Err(LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind)) => {
+                if let Err(spent) = wait.check(&fleet) {
+                    panic!(
+                        "the learner never caught up: {spent}; replicas={:?}",
+                        fleet.diagnostics()
+                    );
                 }
-                Err(error) => panic!("promotion: {error}"),
+                tokio::time::sleep(Duration::from_millis(10)).await
             }
+            Err(error) => panic!("promotion: {error}"),
         }
-    })
-    .await
-    .unwrap();
+    };
     assert_eq!(promoted.view().configuration.voters, vec![1, 2, 3]);
     let receipt = promoted.view().latest.clone().unwrap();
     fleet.isolate(leader);
@@ -541,46 +572,47 @@ impl Fleet {
             _relays: relays,
         }
     }
+    /// The replica that leads and answers a linearizable read, the wait
+    /// charged to the replicas' periods ([`FleetWait`]).
     async fn leader(&self, excluding: Option<usize>) -> usize {
         let mut last_probe = String::new();
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                for (index, replica) in self.replicas.iter().enumerate() {
-                    let progress = replica.host.progress();
-                    if Some(index) != excluding
-                        && !progress.stopped
-                        && progress.node == progress.leader
-                        && progress.term > 0
-                    {
-                        let probe = request(
-                            9000,
-                            Operation::Read(ReadRequest {
-                                consistency: ReadConsistency::Linearizable,
-                                query: ReadQuery::Objects(vec![]),
-                                max_items: 1,
-                            }),
-                        );
-                        match replica.actor.request(&probe).await {
-                            Ok(response) if matches!(response.result, Response::Read(_)) => {
-                                return index;
-                            }
-                            response => {
-                                last_probe = format!("node {}: {response:?}", progress.node)
-                            }
+        let mut wait = self.wait(Duration::from_secs(10));
+        loop {
+            for (index, replica) in self.replicas.iter().enumerate() {
+                let progress = replica.host.progress();
+                if Some(index) != excluding
+                    && !progress.stopped
+                    && progress.node == progress.leader
+                    && progress.term > 0
+                {
+                    let probe = request(
+                        9000,
+                        Operation::Read(ReadRequest {
+                            consistency: ReadConsistency::Linearizable,
+                            query: ReadQuery::Objects(vec![]),
+                            max_items: 1,
+                        }),
+                    );
+                    match replica.actor.request(&probe).await {
+                        Ok(response) if matches!(response.result, Response::Read(_)) => {
+                            return index;
                         }
+                        response => last_probe = format!("node {}: {response:?}", progress.node),
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        })
-        .await;
-        result.unwrap_or_else(|error| panic!("no quorum leader excluding {excluding:?}: {error}; last probe={last_probe}; replicas={:?}",self.diagnostics()))
+            if let Err(spent) = wait.check(self) {
+                panic!(
+                    "no quorum leader excluding {excluding:?}: {spent}; last probe={last_probe}; replicas={:?}",
+                    self.diagnostics()
+                );
+            }
+            tokio::time::sleep(TICK).await;
+        }
     }
-    /// A wait for every running replica to publish `sequence`, charged to
-    /// the running owners' own periods (27 §3.1 P8): what ten seconds hold
-    /// at their tick, however long that takes on the machine the test runs
-    /// on; the report names each replica's state when the wait is spent.
-    async fn all_at(&self, sequence: SessionSeq) {
+    /// A wait of what `allowance` holds at the running replicas' tick
+    /// ([`FleetWait`]).
+    fn wait(&self, allowance: Duration) -> FleetWait {
         let live: Vec<usize> = self
             .replicas
             .iter()
@@ -588,21 +620,30 @@ impl Fleet {
             .filter(|(_, replica)| !replica.host.progress().stopped)
             .map(|(index, _)| index)
             .collect();
-        let periods = |live: &[usize]| -> Vec<u64> {
-            live.iter()
-                .map(|index| self.replicas[*index].host.periods())
-                .collect()
-        };
-        let mut wait = focal_timing::ProgressDeadline::begin(
-            &periods(&live),
-            focal_timing::ProgressDeadline::periods(Duration::from_secs(10), TICK),
-            FROZEN,
-        );
+        let periods: Vec<u64> = live
+            .iter()
+            .map(|index| self.replicas[*index].host.periods())
+            .collect();
+        FleetWait {
+            live,
+            deadline: focal_timing::ProgressDeadline::begin(
+                &periods,
+                focal_timing::ProgressDeadline::periods(allowance, TICK),
+                FROZEN,
+            ),
+        }
+    }
+    /// A wait for every running replica to publish `sequence`, charged to
+    /// the running owners' own periods (27 §3.1 P8): what ten seconds hold
+    /// at their tick, however long that takes on the machine the test runs
+    /// on; the report names each replica's state when the wait is spent.
+    async fn all_at(&self, sequence: SessionSeq) {
+        let mut wait = self.wait(Duration::from_secs(10));
         while self.replicas.iter().any(|replica| {
             let progress = replica.host.progress();
             !progress.stopped && progress.sequence < sequence
         }) {
-            if let Err(spent) = wait.check(&periods(&live)) {
+            if let Err(spent) = wait.check(self) {
                 let replicas: Vec<_> = self
                     .replicas
                     .iter()
@@ -1344,13 +1385,17 @@ async fn hand_off(fleet: &Fleet, to: usize) {
             }
             Err(error) => panic!("transfer: {error}; replicas={:?}", fleet.diagnostics()),
         }
-        let led = tokio::time::timeout(Duration::from_secs(10), async {
-            while fleet.replicas[to].host.progress().leader != to as u64 + 1 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut wait = fleet.wait(Duration::from_secs(10));
+        let led = loop {
+            if fleet.replicas[to].host.progress().leader == to as u64 + 1 {
+                break true;
             }
-        })
-        .await;
-        if led.is_ok() {
+            if wait.check(fleet).is_err() {
+                break false;
+            }
+            tokio::time::sleep(TICK).await;
+        };
+        if led {
             return;
         }
         moved += 1;
@@ -1363,52 +1408,53 @@ async fn hand_off(fleet: &Fleet, to: usize) {
 }
 /// Promote `node` through the leader of the moment once it has caught up.
 async fn promote_when_caught_up(fleet: &Fleet, node: u64, id: [u8; 16]) {
-    let promoted = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let (_, current) = membership_on_leader(fleet).await;
-            if current.view().configuration.voters.contains(&node) {
-                break current;
-            }
-            let promote = SessionMembershipRequest {
-                id,
-                expected_index: current.view().configuration_index,
-                expected: current.view().configuration.clone(),
-                change: MembershipChange::Promote { node },
-            };
-            match change_on_leader(fleet, &promote).await {
-                Ok((_, reply)) => break reply,
-                Err(LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind)) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await
-                }
-                Err(error) => panic!("promotion: {error}; replicas={:?}", fleet.diagnostics()),
-            }
+    let mut wait = fleet.wait(Duration::from_secs(20));
+    let promoted = loop {
+        let (_, current) = membership_on_leader(fleet).await;
+        if current.view().configuration.voters.contains(&node) {
+            break current;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("promotion never took: replicas={:?}", fleet.diagnostics()));
+        let promote = SessionMembershipRequest {
+            id,
+            expected_index: current.view().configuration_index,
+            expected: current.view().configuration.clone(),
+            change: MembershipChange::Promote { node },
+        };
+        match change_on_leader(fleet, &promote).await {
+            Ok((_, reply)) => break reply,
+            Err(LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind)) => {
+                if let Err(spent) = wait.check(fleet) {
+                    panic!(
+                        "promotion never took: {spent}; replicas={:?}",
+                        fleet.diagnostics()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await
+            }
+            Err(error) => panic!("promotion: {error}; replicas={:?}", fleet.diagnostics()),
+        }
+    };
     assert!(promoted.view().configuration.voters.contains(&node));
 }
 /// Wait until `replica` applied at least `index` (and, when asked, is
 /// native), from its own diagnostics.
 async fn applied_at_least(fleet: &Fleet, replica: usize, index: u64, native: bool) {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Ok(reply) = fleet.replicas[replica].host.diagnostics().await
-                && reply.value().applied_index >= index
-                && (!native || reply.value().native_active)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut wait = fleet.wait(Duration::from_secs(30));
+    loop {
+        if let Ok(reply) = fleet.replicas[replica].host.diagnostics().await
+            && reply.value().applied_index >= index
+            && (!native || reply.value().native_active)
+        {
+            break;
         }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "replica {replica} never reached {index}: replicas={:?}",
-            fleet.diagnostics()
-        )
-    });
+        if let Err(spent) = wait.check(fleet) {
+            panic!(
+                "replica {replica} never reached {index}: {spent}; replicas={:?}",
+                fleet.diagnostics()
+            );
+        }
+        tokio::time::sleep(TICK).await;
+    }
 }
 
 /// A member whose log ends before the leader's first retained entry — one
@@ -1547,20 +1593,23 @@ async fn a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader() {
             Err(error) => panic!("activation: {error}; replicas={:?}", fleet.diagnostics()),
         }
     }
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let leader = fleet.leader(None).await;
-            if let Ok(reply) = fleet.replicas[leader].host.diagnostics().await
-                && reply.value().native_active
-                && reply.value().native_authoritative
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut wait = fleet.wait(Duration::from_secs(10));
+    loop {
+        let leader = fleet.leader(None).await;
+        if let Ok(reply) = fleet.replicas[leader].host.diagnostics().await
+            && reply.value().native_active
+            && reply.value().native_authoritative
+        {
+            break;
         }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("native never activated: replicas={:?}", fleet.diagnostics()));
+        if let Err(spent) = wait.check(&fleet) {
+            panic!(
+                "native never activated: {spent}; replicas={:?}",
+                fleet.diagnostics()
+            );
+        }
+        tokio::time::sleep(TICK).await;
+    }
     let leader = checkpoint_every_voter(&fleet).await;
     let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
     let compacted_applied = compacted.value().applied_index;

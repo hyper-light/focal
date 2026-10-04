@@ -34,6 +34,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "support/owners.rs"]
+mod owners;
+
 const CLUSTER: [u8; 16] = [121; 16];
 const GROUP: [u8; 16] = [122; 16];
 const SIGNER: [u8; 16] = [123; 16];
@@ -577,12 +580,21 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     );
     // Closed transient handshakes/enrollment exchanges release their owned
     // reservations; only the listener runtime and this established data
-    // connection remain resident.
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while network_budget.stats().used != listener_residency + 64 * 1024 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    // connection remain resident. Charged to the listener's admission
+    // changes: each release it still owes pairs with a place it took, so the
+    // changes made so far bound them. An enrollment exchange ends without a
+    // change, its join timeout bounding it inside the frozen window.
+    let taken = listener.admission().changes;
+    owners::counted(
+        || vec![listener.admission().changes],
+        taken,
+        Duration::from_millis(5),
+        async {
+            while network_budget.stats().used != listener_residency + 64 * 1024 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     // A participant holds a connection through the pressure that follows.
@@ -726,10 +738,11 @@ async fn enrollment_connection_without_time_returns_unknown_and_closes() {
         .join()
         .unwrap();
         assert!(matches!(result, Err(JoinTransportError::OutcomeUnknown)));
+        // Bounded by the connection's idle timeout (quinn's default, at both
+        // raw ends): a close that never arrives ends it as TimedOut, which
+        // the assertion refuses.
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), client_connection.closed())
-                .await
-                .unwrap(),
+            client_connection.closed().await,
             quinn::ConnectionError::ApplicationClosed(_)
         ));
     }

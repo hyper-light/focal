@@ -13,6 +13,8 @@
 mod client_context;
 #[path = "support/cli_cluster.rs"]
 mod cluster;
+#[path = "support/progress.rs"]
+mod progress;
 #[path = "support/cli_replicas.rs"]
 mod replicas;
 use focal_node::network_join::NodeInvitation;
@@ -31,6 +33,18 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+/// The periods the root owner of the node at `root` has run, read from its
+/// metrics as an operator reads them: what a wait on it is charged in
+/// (`progress`). None while the node does not answer.
+fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
+    move || {
+        let output = command(root, &["cluster", "node", "metrics"]);
+        if !output.status.success() {
+            return None;
+        }
+        progress::periods_in(&String::from_utf8_lossy(&output.stdout))
     }
 }
 fn command(root: &Path, args: &[&str]) -> Output {

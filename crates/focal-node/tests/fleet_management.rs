@@ -16,6 +16,12 @@ use focal_node::fleet::*;
 use focal_wire::*;
 use std::time::Duration;
 
+#[path = "support/owners.rs"]
+mod owners;
+
+/// The replicas' configured tick (`fixture`).
+const TICK: Duration = Duration::from_millis(20);
+
 const CLUSTER: [u8; 16] = [141; 16];
 fn ledger(index: u128) -> LedgerId {
     LedgerId {
@@ -114,9 +120,11 @@ async fn epoch(host: &ReplicaHost, index: u128) -> ResponseEnvelope {
 }
 async fn stopped(host: &ReplicaHost) {
     host.stop().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), host.closed())
+    // A stopped owner runs no more periods: its close is bounded by the
+    // frozen window alone.
+    owners::within(&[host], Duration::from_secs(2), TICK, host.closed())
         .await
-        .unwrap();
+        .expect("the stopped host closed");
 }
 
 #[tokio::test]
@@ -558,18 +566,31 @@ async fn removing_final_session_on_stalled_writer_does_not_block_live_installati
     let paused = first_wal.pause_for_test().unwrap();
     drop(first_wal);
     drop(second_wal); // Pause guard owns no writer handle.
-    let stopped = tokio::time::timeout(Duration::from_secs(2), installed.host().stop()).await;
-    let closed = tokio::time::timeout(Duration::from_secs(2), installed.host().closed()).await;
-    let removed = tokio::time::timeout(
+    // Each must end while the disk stays paused: charged to the periods of
+    // the owner it waits on, and where none runs — a stopped owner, the
+    // manager — bounded by the frozen window alone, past which a wait on the
+    // paused disk would hang.
+    let host = installed.host();
+    let stopped = owners::within(&[host], Duration::from_secs(2), TICK, host.stop()).await;
+    let closed = owners::within(&[host], Duration::from_secs(2), TICK, host.closed()).await;
+    let removed = owners::within(
+        &[],
         Duration::from_secs(2),
+        TICK,
         manager.remove(2, ledger(1), installed.incarnation()),
     )
     .await;
-    let replacement =
-        tokio::time::timeout(Duration::from_secs(2), manager.install(3, second)).await;
+    let replacement = owners::within(
+        &[],
+        Duration::from_secs(2),
+        TICK,
+        manager.install(3, second),
+    )
+    .await;
     let live = match &replacement {
         Ok(Ok(reply)) => {
-            Some(tokio::time::timeout(Duration::from_secs(2), epoch(reply.value().host(), 2)).await)
+            let host = reply.value().host();
+            Some(owners::within(&[host], Duration::from_secs(2), TICK, epoch(host, 2)).await)
         }
         _ => None,
     };

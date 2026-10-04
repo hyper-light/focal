@@ -29,34 +29,39 @@ async fn exchange(fleet: &Fleet, node: usize, request: &RequestEnvelope) -> Resp
     }
     panic!("the exact request timed out {timed_out} times: {request:?}")
 }
+/// The replica that leads and answers a linearizable read, the wait
+/// charged to the replicas' periods (`FleetWait`).
 async fn current_leader(fleet: &Fleet, excluding: Option<usize>) -> usize {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            for (index, replica) in fleet.replicas.iter().enumerate() {
-                let progress = replica.host.progress();
-                if excluding != Some(index)
-                    && !progress.stopped
-                    && progress.node == progress.leader
-                    && progress.term > 0
-                {
-                    let request = request(
-                        9999,
-                        Operation::Read(ReadRequest {
-                            consistency: ReadConsistency::Linearizable,
-                            query: ReadQuery::Objects(vec![]),
-                            max_items: 1,
-                        }),
-                    );
-                    if matches!(exchange(fleet, index, &request).await, Response::Read(_)) {
-                        return index;
-                    }
+    let mut wait = fleet.wait(Duration::from_secs(10));
+    loop {
+        for (index, replica) in fleet.replicas.iter().enumerate() {
+            let progress = replica.host.progress();
+            if excluding != Some(index)
+                && !progress.stopped
+                && progress.node == progress.leader
+                && progress.term > 0
+            {
+                let request = request(
+                    9999,
+                    Operation::Read(ReadRequest {
+                        consistency: ReadConsistency::Linearizable,
+                        query: ReadQuery::Objects(vec![]),
+                        max_items: 1,
+                    }),
+                );
+                if matches!(exchange(fleet, index, &request).await, Response::Read(_)) {
+                    return index;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    })
-    .await
-    .unwrap()
+        if let Err(spent) = wait.check(fleet) {
+            panic!(
+                "no leader excluding {excluding:?}: {spent}; replicas={:?}",
+                fleet.diagnostics()
+            );
+        }
+        tokio::time::sleep(TICK).await;
+    }
 }
 pub(super) async fn install_support(fleet: &Fleet, leader: usize) {
     install_support_among(fleet, leader, 3).await;
@@ -277,17 +282,21 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
     // (`ConsensusError::NotLeader`): the read is unavailable, never an
     // unknown outcome, which is a mutation's word (the macOS run that met
     // the stood-down node answered `OutcomeUnknown`).
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let progress = fleet.replicas[leader].host.progress();
-            if progress.leader != progress.node {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // Its own quorum check decides it, in its own periods.
+    let mut wait = fleet.wait(Duration::from_secs(10));
+    loop {
+        let progress = fleet.replicas[leader].host.progress();
+        if progress.leader != progress.node {
+            break;
         }
-    })
-    .await
-    .expect("the isolated leader stood down");
+        if let Err(spent) = wait.check(&fleet) {
+            panic!(
+                "the isolated leader never stood down: {spent}; replicas={:?}",
+                fleet.diagnostics()
+            );
+        }
+        tokio::time::sleep(TICK).await;
+    }
     let stood_down = exchange(&fleet, leader, &lookup).await;
     assert!(
         matches!(stood_down, Response::Error(AccessError::Unavailable)),

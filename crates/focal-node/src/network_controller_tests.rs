@@ -415,17 +415,25 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
     tokio::select! {
         result = running.as_mut() => panic!("controller terminated before cancellation: {result:?}"),
         _ = async {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let observed = host.observe_root().await.unwrap();
-                    if observed.contacts().contacts.records.iter().any(|record| {
-                        record.node == network.state.node
-                    }) {
-                        break;
+            // Charged to the root owner's periods (27 §3.1 P8).
+            crate::test_waits::charged(
+                || vec![host.periods()],
+                Duration::from_secs(5),
+                crate::test_waits::CONTROL_TICK,
+                async {
+                    loop {
+                        let observed = host.observe_root().await.unwrap();
+                        if observed.contacts().contacts.records.iter().any(|record| {
+                            record.node == network.state.node
+                        }) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }).await.unwrap();
+                },
+            )
+            .await
+            .expect("the controller committed its contact");
         } => {}
     }
     // The actual run published its grant and committed its contact. Cancel it
@@ -551,6 +559,11 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
         limits,
     )
     .unwrap();
+    // The pool timeout deliberately exceeds the entire controller round.
+    // Without a per-probe bound, the alternate cannot be reached in time: a
+    // controller that waited it out on the blackholed leader reaches the
+    // alternate no sooner, which is what the announce is held to below.
+    let pool_timeout = Duration::from_secs(10);
     let pool = PeerConnectionPool::new(
         connector,
         PeerPoolLimits {
@@ -558,9 +571,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
             max_connections: 2,
             max_inflight: 2,
             attempts: 1,
-            // The pool timeout deliberately exceeds the entire controller round.
-            // Without a per-probe bound, the alternate cannot be reached in time.
-            timeout: Duration::from_secs(10),
+            timeout: pool_timeout,
             retry_backoff: Duration::ZERO,
             ..PeerPoolLimits::default()
         },
@@ -616,7 +627,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
     });
     tokio::pin!(serving);
     tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(5),controller.announce_remote(&pool,&request,99,1)) => {
+        result = tokio::time::timeout(pool_timeout, controller.announce_remote(&pool, &request, 99, 1)) => {
             result.expect("blackholed preferred leader starved the reachable alternate").unwrap();
         }
         result = &mut serving => panic!("test server ended before delivery: {result:?}"),

@@ -250,10 +250,15 @@ async fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and
     ));
     assert!(budget.stats().used >= 16 * 1024);
     pause.resume().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), write)
-        .await
-        .unwrap()
-        .unwrap();
+    crate::test_waits::charged(
+        || vec![host.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        write,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // A later owner request proves the queued write has been processed; the
     // abandoned reply releases its journal lock and admission charge.
     drop(host.observe_root().await.unwrap());

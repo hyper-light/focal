@@ -31,7 +31,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "support/owners.rs"]
+mod owners;
+
 const CLUSTER: [u8; 16] = [101; 16];
+/// The replicas' owners' period: what the waits on them are charged in.
+const TICK: Duration = Duration::from_millis(25);
 const GROUP: [u8; 16] = [102; 16];
 const OPERATOR: [u8; 16] = [103; 16];
 struct RejectUnverifiedEvidence;
@@ -247,8 +252,16 @@ struct Replica {
     driver: tokio::task::JoinHandle<()>,
     remote: QuicRemote,
 }
+/// The replica that leads with quorum authority, other than `exclude`:
+/// charged to the periods every replica's owner runs, the isolated included.
 async fn leader(replicas: &[Replica], exclude: usize) -> usize {
-    tokio::time::timeout(Duration::from_secs(8), async {
+    let periods = || {
+        replicas
+            .iter()
+            .map(|replica| replica.host.periods())
+            .collect()
+    };
+    owners::charged(periods, Duration::from_secs(8), TICK, async {
         loop {
             for (index, replica) in replicas.iter().enumerate() {
                 let progress = replica.host.progress();
@@ -389,7 +402,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
     for (index, (identity, (replica, allowance))) in identities.iter().zip(seeded).enumerate() {
         let id = index as u64 + 1;
         let mut config = ControlHostConfig::new(namespace());
-        config.tick = Duration::from_millis(25);
+        config.tick = TICK;
         config.request_timeout = Duration::from_millis(400);
         let (host, owner, channel) =
             ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();

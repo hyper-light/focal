@@ -226,32 +226,31 @@ async fn unix_slow_response_keeps_output_charge_until_write_finishes_or_disconne
         .await
         .unwrap();
         stream.shutdown().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        // The response's header arriving is the server's write begun; this
+        // client reads no further, so the write cannot finish, and its
+        // output charge is still held.
+        let header = unfrozen(
+            "the response never began",
+            read_frame_header(&mut stream, FrameKind::Response, limits().max_frame_bytes),
+        )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(budget.stats().used >= 900 * 1024 * 3);
         if !disconnect {
-            let response: ResponseEnvelope =
-                read_frame(&mut stream, FrameKind::Response, limits().max_frame_bytes)
-                    .await
-                    .unwrap();
+            let mut buffer = vec![0; header.payload_bytes()];
+            let payload = read_frame_payload_into(&mut stream, header, &mut buffer)
+                .await
+                .unwrap();
+            let response: ResponseEnvelope = decode_payload(payload).unwrap();
             assert!(
                 matches!(response.result, Response::Content(ContentChunk { bytes, .. }) if bytes.len() == 900 * 1024)
             );
         }
         drop(stream);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used != 0 {
-                tokio::task::yield_now().await;
-            }
+        settles("the output charge was never given back", || {
+            budget.stats().used == 0
         })
-        .await
-        .unwrap();
+        .await;
     }
     server.close();
     task.await.unwrap().unwrap();
@@ -316,20 +315,22 @@ async fn quic_flow_control_keeps_response_permit_until_ack_or_connection_loss() 
         .await
         .unwrap();
         send.finish().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        // The response's header arriving is the server's write begun; this
+        // client reads no further, so the write cannot finish, and its
+        // output charge is still held.
+        let header = unfrozen(
+            "the response never began",
+            read_frame_header(&mut receive, FrameKind::Response, limits().max_frame_bytes),
+        )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(budget.stats().used >= 900 * 1024 * 3);
         if !disconnect {
-            let response: ResponseEnvelope =
-                read_frame(&mut receive, FrameKind::Response, limits().max_frame_bytes)
-                    .await
-                    .unwrap();
+            let mut buffer = vec![0; header.payload_bytes()];
+            let payload = read_frame_payload_into(&mut receive, header, &mut buffer)
+                .await
+                .unwrap();
+            let response: ResponseEnvelope = decode_payload(payload).unwrap();
             assert!(
                 matches!(response.result, Response::Content(ContentChunk { bytes, .. }) if bytes.len() == 900 * 1024)
             );
@@ -340,13 +341,10 @@ async fn quic_flow_control_keeps_response_permit_until_ack_or_connection_loss() 
                 b"test disconnect while response is flow controlled",
             );
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used != 0 {
-                tokio::task::yield_now().await;
-            }
+        settles("the output charge was never given back", || {
+            budget.stats().used == 0
         })
-        .await
-        .unwrap();
+        .await;
         connection.close(0u8.into(), b"done");
     }
     server.close();
@@ -429,10 +427,14 @@ async fn mutual_tls_tenant_isolation_live_revocation_and_independent_streams() {
     let slow_remote = remote.clone();
     let slow = tokio::spawn(async move { slow_remote.request(&request(1)).await });
     slow_started.notified().await;
-    let fast = tokio::time::timeout(Duration::from_secs(1), remote.request(&request(2)))
-        .await
-        .unwrap()
-        .unwrap();
+    // The slow request is held until the fast one is answered: a fast one
+    // queued behind it would wait for ever.
+    let fast = unfrozen(
+        "the fast request waited behind the slow one",
+        remote.request(&request(2)),
+    )
+    .await
+    .unwrap();
     assert_eq!(fast, response(&request(2)));
     release.notify_one();
     slow.await.unwrap().unwrap();
@@ -497,15 +499,36 @@ fn request_header(payload: u32) -> [u8; HEADER_BYTES] {
     header
 }
 /// A wait on the listener's admission, charged to its changes.
+/// How long what a wait observes may make no progress before the wait is
+/// over: a wedge, not slowness (27 §3.1 P8). The in-process servers and
+/// peers these tests wait on report no period, so where no counter is
+/// observed this window is the wait's only bound.
+const FROZEN: Duration = Duration::from_secs(60);
+
+/// What `future` yields, unless it yields nothing for [`FROZEN`].
+async fn unfrozen<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    match tokio::time::timeout(FROZEN, future).await {
+        Ok(output) => output,
+        Err(_) => panic!("{what}: nothing for {FROZEN:?}"),
+    }
+}
+
+/// Polls until `settled` holds, unless it does not for [`FROZEN`].
+async fn settles(what: &str, settled: impl Fn() -> bool) {
+    unfrozen(what, async {
+        while !settled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
 async fn admission_settles(
     server: &QuicServer,
     settled: impl Fn(&AdmissionStats) -> bool,
 ) -> AdmissionStats {
-    let mut wait = focal_timing::ProgressDeadline::begin(
-        &[server.admission().changes],
-        u64::MAX,
-        Duration::from_secs(30),
-    );
+    let mut wait =
+        focal_timing::ProgressDeadline::begin(&[server.admission().changes], u64::MAX, FROZEN);
     loop {
         let stats = server.admission();
         if settled(&stats) {
@@ -551,9 +574,9 @@ async fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_
     registry.revoke(fingerprint).unwrap();
     // The connection is closed by the revocation: the rest of the body
     // has nowhere to go, and the permit it held is given back.
-    let closed = tokio::time::timeout(Duration::from_secs(5), connection.closed())
-        .await
-        .expect("the revoked connection closes");
+    // Bounded by the connection's idle timeout (the test limits'): a close
+    // that never came would end it as TimedOut, which is refused below.
+    let closed = connection.closed().await;
     assert!(
         matches!(
             &closed,
@@ -1506,25 +1529,21 @@ async fn peer_pool_reaches_a_peer_that_moved_behind_its_name_while_every_caller_
         group: [2; 16],
         message: vec![1],
     };
-    // Every caller allows far less than the dead address's deadline.
-    let started = std::time::Instant::now();
-    let mut delivered = false;
-    while started.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(200), pool.send(2, &packet)).await {
-            Ok(Ok(_)) => {
-                delivered = true;
-                break;
+    // Every caller allows far less than the dead address's deadline. The
+    // one dial ends by that deadline: a caller is answered through the
+    // name's fresh address before it, or the caller after it fails.
+    unfrozen("no caller ever reached the moved peer", async {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), pool.send(2, &packet)).await {
+                Ok(Ok(_)) => break,
+                Ok(Err(error)) => panic!("the send failed rather than timing out: {error}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             }
-            Ok(Err(error)) => panic!("the send failed rather than timing out: {error}"),
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
-    }
-    assert!(delivered, "no caller ever reached the moved peer");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the moved peer was reached only after {:?}",
-        started.elapsed()
-    );
+    })
+    .await;
+    // One dial, bounded by the dead address's deadline, delivered: the
+    // name's fresh address won it.
     let stats = pool.stats();
     assert_eq!(stats.dials, 1, "one dial served every caller");
     assert_eq!(stats.connections_opened, 1);
@@ -1593,23 +1612,20 @@ async fn peer_pool_callers_that_give_up_share_one_dial_whose_outcome_is_still_re
         }
     }
     assert_eq!(pool.stats().dials, 1, "the callers shared one dial");
-    // The dial decides on its own after the callers left; wait for it.
-    let deadline = std::time::Instant::now() + limits().request_timeout + Duration::from_secs(2);
-    loop {
-        let started = std::time::Instant::now();
-        let result = pool.send(2, &packet).await;
+    // The dial decides on its own after the callers left, by its deadline.
+    // A send joins it and ends with its outcome, which marks the peer
+    // unreachable before anyone is told; the next send is refused at once.
+    for _ in 0..2 {
+        let result = unfrozen("a send outlived the dial", pool.send(2, &packet)).await;
         assert_eq!(result, Err(PeerSendError::Lost));
-        if started.elapsed() < Duration::from_millis(50) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the abandoned dial never marked the peer unreachable"
-        );
     }
+    let stats = pool.stats();
+    assert!(
+        stats.refused_unreachable >= 1,
+        "the abandoned dial never marked the peer unreachable: {stats:?}"
+    );
     assert_eq!(
-        pool.stats().dials,
-        1,
+        stats.dials, 1,
         "the recorded outcome spared every later caller a dial"
     );
     pool.close();
@@ -1666,15 +1682,12 @@ async fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadl
         };
         let sending = pool.clone();
         let pending = tokio::spawn(async move { sending.send(2, &packet).await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .unwrap();
-        let asked = std::time::Instant::now();
+        unfrozen("the request never reached the peer", started.notified()).await;
         pool.replace_routes(revision + 1, BTreeMap::new()).unwrap();
-        let ended = tokio::time::timeout(deadline / 2, pending)
+        let ended = unfrozen("the request outlived its retired route", pending)
             .await
-            .expect("the request waited out its deadline")
             .unwrap();
+        // Ended by the retirement: its deadline would have ended it as Lost.
         assert!(
             matches!(
                 ended,
@@ -1682,7 +1695,6 @@ async fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadl
             ),
             "{ended:?}"
         );
-        assert!(asked.elapsed() < deadline / 2);
         assert_eq!(pool.stats().inflight, 0);
         assert_eq!(pool.stats().cached_connections, 0);
     }
@@ -1737,9 +1749,8 @@ async fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
             tokio::task::yield_now().await;
         }
         pool.replace_routes(revision + 1, BTreeMap::new()).unwrap();
-        let ended = tokio::time::timeout(Duration::from_secs(30), pending)
+        let ended = unfrozen("a send outlived its retired route", pending)
             .await
-            .expect("a send outlived its retired route")
             .unwrap();
         if ended.is_err() {
             retired_in_flight += 1;
@@ -1916,9 +1927,7 @@ async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connect
     let sent = packet.clone();
     let sending = pool.clone();
     let pending = tokio::spawn(async move { sending.send(2, &sent).await });
-    tokio::time::timeout(Duration::from_secs(1), started.notified())
-        .await
-        .unwrap();
+    unfrozen("the request never reached the peer", started.notified()).await;
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Busy));
     assert_eq!(pool.stats().inflight, 1);
     assert_eq!(pool.stats().busy, 1);
@@ -3164,15 +3173,15 @@ async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_res
     };
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
     assert_eq!(pool.stats().dials, 1, "the first send dialed");
-    let started = std::time::Instant::now();
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
     assert_eq!(
         pool.stats().dials,
         1,
         "a send within the cooldown does not dial"
     );
-    assert!(
-        started.elapsed() < cooldown,
+    assert_eq!(
+        pool.stats().refused_unreachable,
+        1,
         "the send failed at once, not after a dial deadline"
     );
     tokio::time::sleep(cooldown).await;
@@ -3286,9 +3295,7 @@ async fn an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take() {
         let sending = pool.clone();
         let packet = ask(730 + id);
         let pending = tokio::spawn(async move { sending.send_placement(2, &packet).await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .unwrap();
+        unfrozen("the exchange never reached the peer", started.notified()).await;
         pending.abort();
         let _ = pending.await;
         expected *= 2;

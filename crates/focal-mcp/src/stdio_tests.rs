@@ -23,6 +23,9 @@ use std::{
 use tokio::sync::oneshot;
 
 const OPERATION_ID: &str = "000000000000000000000000000000ab";
+/// How long a wait may see no progress before it is over: a wedge, not
+/// slowness (27 §3.1 P8).
+const FROZEN: Duration = Duration::from_secs(60);
 struct Observed {
     request: RequestEnvelope,
     response: oneshot::Sender<Result<ResponseEnvelope, WireError>>,
@@ -163,8 +166,8 @@ impl Running {
         self.input.shutdown(Shutdown::Write).unwrap();
         let result = self
             .done
-            .recv_timeout(Duration::from_secs(5))
-            .expect("EOF did not finish within bound");
+            .recv_timeout(FROZEN)
+            .expect("EOF did not finish: nothing for the frozen window");
         assert!(result.is_ok(), "runner shutdown: {result:?}");
         self.join.take().unwrap().join().unwrap();
     }
@@ -272,7 +275,8 @@ fn pending_mutation_keeps_control_responsive_cancel_suppressed_and_restart_retri
     );
     runner
         .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The server's threads report no period: the wedge window bounds it.
+    let deadline = Instant::now() + FROZEN;
     while !pending.response.is_closed() {
         assert!(Instant::now() < deadline, "backend request did not cancel");
         thread::sleep(Duration::from_millis(2));
@@ -391,9 +395,9 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     reopened.tool(2, "request.retry", json!({"operation_id":OPERATION_ID}));
     let pending = reopened.observed();
     assert_eq!(pending.request, saved);
-    let start = Instant::now();
+    // EOF cancels the pending backend call: the shutdown is clean (`stop`
+    // refuses the bounded one, which would have waited for it).
     reopened.stop();
-    assert!(start.elapsed() < Duration::from_secs(4));
     assert!(pending.response.is_closed());
     let store = OperationStore::open(&path, StoreLimits::default()).unwrap();
     let journal = store.open_existing(OPERATION_ID, &context()).unwrap();

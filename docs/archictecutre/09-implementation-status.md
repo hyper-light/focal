@@ -13297,3 +13297,69 @@ fell at or past the noted index, and were judged the order's though the loss cau
 them. A loss is now noted once the frame lost has been stepped (`Owner::lost_to`).
 `fleet::list_tests::append_order_tests::a_late_frame_the_log_takes_moves_the_loss_with_it`
 counts (3, 0); with the loss noted before the step, (3, 1).
+
+### 2026-10-04 — every test wait is charged to what it waits on
+
+A wait bounded by a guess of how long its fact takes reads the fact's absence as
+slowness, and fails a slow machine; converting such waits found three of this week's
+defects. P8 had charged the fleet suites of 27 §3.3 to their owners' periods. The 69
+waits that still bounded a test by the clock, and the assertions on elapsed time found
+beside them, now wait on the fact they need, charged to what makes it
+([27](27-consensus-roadmap-and-slates-port.md) §3.1 P8):
+- **In-process owners**: their periods, the allowance counted at their tick
+  (`test_waits` in `focal-node`, `tests/support/owners.rs` beside its integration
+  tests). One step of an owner is two of its periods, the one a request arrives in and
+  the next (`test_waits::STEP`); an owner stopped during a wait is charged nothing
+  while another runs.
+- **Real processes**: the root owner's periods, read from `cluster node metrics`
+  (`tests/support/progress.rs`): a cluster's convergence, a revoke reaching the
+  controller, a claim's expiry.
+- **The listener**: its admission changes. Each release it owes pairs with a place it
+  took, so the changes it has made bound them.
+- **What the system bounds itself**: a QUIC close by the connection's idle timeout, a
+  child `claim wait` by its `--timeout-ms`, the MCP adapter by its shutdown bound, a
+  pool's send by its deadline. Beyond that bound stands only the frozen window (60 s),
+  a wedge.
+- **Servers and workers that report no period**: the frozen window alone.
+
+Assertions on elapsed time now state what they stood for. A moved peer is reached by
+one dial, bounded by the dead address's deadline, that delivered. A send within a
+peer's cooldown is refused without a dial, and the pool counts it
+(`PeerPoolStats::refused_unreachable`, `focal_peer_messages_unreachable_total`). A
+request ended by its route's retirement is NoRoute or RouteChanged, never Lost, its
+deadline's word. A flow-controlled response keeps its charge once its header has
+arrived. A silent scrape is still held when the others are answered. A round's
+deadline holds exactly, on tokio's paused clock. Dropping a runtime, or stopping the
+MCP adapter, would wait for ever were it to wait on the held work. A lost reply is
+cancelled at its commit, which the transport reports.
+
+Under injected load, as [27](27-consensus-roadmap-and-slates-port.md) §6 measures it:
+eighteen processes held every core of this machine busy (load averages 25 to 31 on 18
+cores, from 6 before; a peer's builds ran alongside) while the converted suites ran from
+this batch's own binaries, four tests at a time, in two passes. Every suite passed, in
+the time it takes without the burners:
+
+| Suite | Under load | Without |
+|---|---|---|
+| `fleet_quic` (9 tests) | 54.8 s | 48.3 s |
+| `mcp_stdio` (16) | 32.0 s | 28.1 s |
+| `cli_native_a3` (1) | 16.5 s | 17.0 s |
+| `cli_network` (6) | 11.9 s | 11.3 s |
+| `runtime_host` (2) | 2.9 s | 3.1 s |
+| `control_quic` (1) | 2.0 s | 2.0 s |
+| `fleet_management` (7), `network_listener` (3) | 0.5 s, 0.5 s | 0.6 s, 0.5 s |
+| `focal-node` `fleet::async_tests` (4) | 38.7 s | 36.9 s |
+| `focal-node` `network_service` (18) | 18.4 s | 19.1 s |
+| the eight other converted `focal-node` modules (44) | 8.8 s | 8.9 s |
+| `focal-wire` unit tests (131) | 47.2 s | 42.3 s |
+| `focal-runtime` unit tests (26) | 10.0 s | 11.0 s |
+
+`runtime_host`'s check that a runtime refusing for capacity makes no call now waits for
+the owners to run the periods a quarter of a second holds, not for the quarter second.
+Recorded open: sleeps that only choose which path a test exercises, since no fact yet
+says that the path began (a child `claim wait` started 100 ms before its claim is
+cancelled and 80 ms before SIGINT, where nothing reports a wait begun; a monitor timer
+read 1.5 s past its instant, where nothing reports a timer fired: F26's metrics are where
+both belong); and production waits with no stated derivation that the sweep found: the
+MCP adapter's 3 s shutdown bound and its 20 ms poll, the transfer backend's 30 s,
+`network_state`'s 5 s DNS lookups, the controller's 250 ms pass.

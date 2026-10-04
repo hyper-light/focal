@@ -612,6 +612,7 @@ error that stopped it).
 |---|---|---|
 | A | P8 per-progress deadlines; P7 network model in `focal-sim` | fleet suites pass under injected CPU load |
 | | *State 2026-09-28:* P7 in place with 32 tests. P8 in place for the suites named in section 3.3, and the run under injected load recorded ([09](09-implementation-status.md)): every core held busy, the fleet modules and ten binary suites pass, in the time they take on an idle machine. What the load does to an owner is measured (its longest period) and covered (its replica's patience). | |
+| | *State 2026-10-04:* P8 in every suite of the workspace. The waits that still bounded a test by the clock, and the assertions on elapsed time beside them, wait on their facts: an owner's periods, a process's root periods, a listener's admission changes, or the bound the system states itself, with the frozen window beyond it ([09](09-implementation-status.md)); the converted suites pass under injected load. | |
 | B | Priority elections wired; transfer on drain; P2 derived timing | election tests under LAN, regional and geographic profiles |
 | | *State 2026-09-28:* wired for session groups, with `drain_leader` on real processes. Elections run over `focal_sim::path` at the three profiles (`sim_election_tests`): real replicas on real logs in virtual time, at the derived pace. | |
 | C | P1 progress-aware fan-out; P5, P6 | dead-voter and straggler tests; no round waits out a dead peer |

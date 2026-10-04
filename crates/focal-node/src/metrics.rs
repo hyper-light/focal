@@ -606,6 +606,11 @@ impl MetricsSnapshot {
             self.peers.dials,
         );
         text.counter(
+            "focal_peer_messages_unreachable_total",
+            "Peer requests refused at once within the peer's unreachable cooldown, each spared a dial.",
+            self.peers.refused_unreachable,
+        );
+        text.counter(
             "focal_peer_connections_opened_total",
             "Peer connections opened.",
             self.peers.connections_opened,
@@ -1197,6 +1202,7 @@ mod tests {
                 lost: 0,
                 busy: 0,
                 dials: 1,
+                refused_unreachable: 0,
                 connections_opened: 1,
                 cached_connections: 1,
                 inflight: 0,
@@ -1268,8 +1274,9 @@ mod tests {
         assert_eq!(MetricsPage::new(sample.clone()).text, text);
     }
     /// A round takes every answer that comes and closes at its deadline:
-    /// the late and the failed stay unobserved, in their places.
-    #[tokio::test]
+    /// the late and the failed stay unobserved, in their places. On the
+    /// paused clock the answers and the deadline fall in their order.
+    #[tokio::test(start_paused = true)]
     async fn a_round_closes_at_its_deadline_with_the_late_unobserved() {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
         let asks: Vec<std::pin::Pin<Box<dyn Future<Output = Option<u8>> + Send>>> = vec![
@@ -1286,8 +1293,7 @@ mod tests {
         ];
         let answers = collect(asks, deadline).await;
         assert_eq!(answers, vec![Some(1), None, None, Some(4)]);
-        assert!(tokio::time::Instant::now() >= deadline);
-        assert!(tokio::time::Instant::now() < deadline + std::time::Duration::from_secs(1));
+        assert_eq!(tokio::time::Instant::now(), deadline);
     }
     /// The loopback serves the page's text as it was rendered, judges the
     /// request before it writes, and a scrape that never speaks costs no
@@ -1302,7 +1308,6 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(serve_loopback(listener, view));
         let silent = TcpStream::connect(address).await.unwrap();
-        let started = std::time::Instant::now();
         let exchange = |request: &'static str| async move {
             let mut stream = TcpStream::connect(address).await.unwrap();
             stream.write_all(request.as_bytes()).await.unwrap();
@@ -1321,11 +1326,13 @@ mod tests {
         let (head, _) = exchange("POST /metrics HTTP/1.0\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.0 405"), "{head}");
         // Three answers while the silent scrape still holds its connection:
-        // served side by side, not behind its two-second bound.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+        // served side by side, not behind its two-second bound, which
+        // would have released it first.
+        let silent = silent.into_std().unwrap();
+        assert_eq!(
+            silent.peek(&mut [0u8; 1]).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "the silent scrape was released before the others were answered"
         );
         drop(silent);
         server.abort();

@@ -507,6 +507,19 @@ fn quality_evaluator_runs_only_after_programmatic_pass() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(status(&session), ClaimStatus::Satisfied);
 }
+/// How long a wait may see no progress before it is over: a wedge, not
+/// slowness (27 §3.1 P8). The workers these tests wait on report no period,
+/// so the window is the waits' only bound.
+const FROZEN: Duration = Duration::from_secs(60);
+
+/// Spins until `settled` holds, unless it does not for [`FROZEN`].
+fn settles(what: &str, mut settled: impl FnMut() -> bool) {
+    let until = Instant::now() + FROZEN;
+    while !settled() {
+        assert!(Instant::now() < until, "{what}: nothing for {FROZEN:?}");
+        std::thread::yield_now();
+    }
+}
 struct Gate {
     started: AtomicUsize,
     open: Mutex<bool>,
@@ -525,11 +538,9 @@ impl Gate {
         self.wake.notify_all();
     }
     fn wait_started(&self) {
-        let until = Instant::now() + Duration::from_secs(2);
-        while self.started.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < until);
-            std::thread::yield_now();
-        }
+        settles("the gated callback never started", || {
+            self.started.load(Ordering::SeqCst) != 0
+        });
     }
 }
 impl Executor for Gate {
@@ -1189,9 +1200,9 @@ fn dropping_owner_transfers_payload_charge_until_blocked_callback_exits() {
     gate.wait_started();
     let budget = runtime.budget.clone();
     let charged = budget.stats().used;
-    let before = Instant::now();
+    // Dropping the runtime does not wait on the callback: were it to, it
+    // would wait for ever, the gate opening only after it returns.
     drop(runtime);
-    assert!(before.elapsed() < Duration::from_secs(1));
     assert!(
         budget.stats().used > 0,
         "worker still owns its evidence allocation"
@@ -1201,14 +1212,9 @@ fn dropping_owner_transfers_payload_charge_until_blocked_callback_exits() {
         "owner metadata was released independently"
     );
     gate.release();
-    let until = Instant::now() + Duration::from_secs(2);
-    while budget.stats().used != 0 {
-        assert!(
-            Instant::now() < until,
-            "detached callback charge did not release"
-        );
-        std::thread::yield_now();
-    }
+    settles("detached callback charge did not release", || {
+        budget.stats().used == 0
+    });
 }
 
 #[test]

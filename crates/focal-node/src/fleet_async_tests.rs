@@ -6,6 +6,9 @@ use focal_log::{
 };
 
 const CLUSTER: [u8; 16] = [119; 16];
+/// The replicas' configured tick in these fixtures: what a wait's
+/// allowance is counted in (`crate::test_waits`).
+const TICK: Duration = Duration::from_secs(1);
 fn ledger(index: u128) -> LedgerId {
     LedgerId {
         tenant: TenantId::from_u128(119),
@@ -96,7 +99,7 @@ fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) ->
                 session.poll().unwrap();
             }
             let mut config = ReplicaConfig::new(RootCommandId::from_u128(119));
-            config.tick = Duration::from_secs(1);
+            config.tick = TICK;
             config.tick_ceiling = ceiling;
             config.request_timeout = Duration::from_millis(500);
             FleetReplica { session, config }
@@ -220,7 +223,11 @@ async fn shared_owner_queues_covering_flush_and_serves_another_group_while_disk_
             .await
         }));
     }
-    let independent = tokio::time::timeout(Duration::from_millis(250), async {
+    // Charged to the owners' periods, two steps of them (the drains, then
+    // the read): a group the paused writer held would answer in none.
+    let observed: Vec<&ReplicaHost> = fixture.hosts.values().collect();
+    let steps = TICK * (2 * crate::test_waits::STEP);
+    let independent = crate::test_waits::within(&observed, steps, TICK, async {
         // Every group has reached its nonblocking drain and published progress;
         // the physical writer is still stopped before all of their fences.
         for observation in &mut observations {
@@ -310,12 +317,14 @@ async fn host_stop_reaches_retained_ready_and_expires_unknown_under_pinned_wal_b
         )
         .await
     });
-    tokio::time::timeout(Duration::from_millis(250), observation.changed())
+    let observed: Vec<&ReplicaHost> = fixture.hosts.values().collect();
+    let step = TICK * crate::test_waits::STEP;
+    crate::test_waits::within(&observed, step, TICK, observation.changed())
         .await
-        .unwrap()
+        .expect("the session's progress changed")
         .unwrap();
     let stopped =
-        tokio::time::timeout(Duration::from_secs(2), fixture.hosts[&ledger(1)].stop()).await;
+        crate::test_waits::within(&observed, step, TICK, fixture.hosts[&ledger(1)].stop()).await;
     let result = write.await.unwrap();
     drop(pressure);
     let other = dispatch(
@@ -366,7 +375,7 @@ async fn stopping_last_session_on_a_stalled_writer_does_not_join_it_on_the_fleet
             session.poll().unwrap();
         }
         let mut config = ReplicaConfig::new(RootCommandId::from_u128(119));
-        config.tick = Duration::from_secs(1);
+        config.tick = TICK;
         config.request_timeout = Duration::from_millis(400);
         replicas.push(FleetReplica { session, config });
         if index == 1 {
@@ -418,10 +427,15 @@ async fn stopping_last_session_on_a_stalled_writer_does_not_join_it_on_the_fleet
         )
         .await
     });
-    let pending = tokio::time::timeout(Duration::from_millis(250), observation.changed()).await;
-    let stopped = tokio::time::timeout(Duration::from_secs(2), hosts[&ledger(1)].stop()).await;
-    let other = tokio::time::timeout(
-        Duration::from_millis(250),
+    // Each a step of the owners' periods (`test_waits::STEP`).
+    let observed: Vec<&ReplicaHost> = hosts.values().collect();
+    let step = TICK * crate::test_waits::STEP;
+    let pending = crate::test_waits::within(&observed, step, TICK, observation.changed()).await;
+    let stopped = crate::test_waits::within(&observed, step, TICK, hosts[&ledger(1)].stop()).await;
+    let other = crate::test_waits::within(
+        &observed,
+        step,
+        TICK,
         dispatch(
             &hosts[&ledger(2)],
             peer(),

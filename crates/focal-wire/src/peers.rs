@@ -127,6 +127,9 @@ pub struct PeerPoolStats {
     pub busy: u64,
     /// Dials attempted, successful or not.
     pub dials: u64,
+    /// Asks for a connection refused at once within a peer's unreachable
+    /// cooldown, each spared a dial.
+    pub refused_unreachable: u64,
     pub connections_opened: u64,
     pub cached_connections: usize,
     pub inflight: usize,
@@ -139,6 +142,7 @@ struct Counters {
     lost: AtomicU64,
     busy: AtomicU64,
     dials: AtomicU64,
+    unreachable: AtomicU64,
     opened: AtomicU64,
 }
 struct Connected {
@@ -1223,6 +1227,7 @@ impl PeerConnectionPool {
         // another dial deadline, so unreachable peers never consume the
         // capacity reachable ones need.
         if slot.unreachable() {
+            increment(&self.counters.unreachable);
             return Err(PeerSendError::Lost);
         }
         {
@@ -1337,6 +1342,7 @@ impl PeerConnectionPool {
             lost: self.counters.lost.load(Ordering::Relaxed),
             busy: self.counters.busy.load(Ordering::Relaxed),
             dials: self.counters.dials.load(Ordering::Relaxed),
+            refused_unreachable: self.counters.unreachable.load(Ordering::Relaxed),
             connections_opened: self.counters.opened.load(Ordering::Relaxed),
             cached_connections: self
                 .state
