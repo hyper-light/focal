@@ -1016,6 +1016,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             && self.applied_raft != 0
             && consensus.has_committed_current_term()
             && consensus.published_term(self.applied_raft)? == status.term
+            // Past the entry the term began with: in a fast group what the new leader recovered
+            // is of its term too, and precedes that entry, so a candidate restamped there is
+            // published before it, never discarded (hyper-raft S-4).
+            && consensus.term_began_by(self.applied_raft)?
         {
             self.resolve_suffix(SuffixEvidence::NewerTermBarrier)?;
         }

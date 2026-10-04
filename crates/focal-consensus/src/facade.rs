@@ -317,6 +317,12 @@ impl DurableNode {
     pub fn published_term(&self, index: u64) -> Result<u64, ConsensusError> {
         dispatch!(inner = &self.backend => inner.published_term(index))
     }
+    /// Whether the entry the current term began with is at or below `index`, a published entry:
+    /// what a newer term proves of a former leader's proposals holds only past it (hyper-raft S-4;
+    /// the backends' `term_began_by`).
+    pub fn term_began_by(&self, index: u64) -> Result<bool, ConsensusError> {
+        dispatch!(inner = &self.backend => inner.term_began_by(index))
+    }
     /// Decode through the bounded prost codec and bind the Raft sender to the
     /// authenticated transport principal before any state-machine transition.
     pub fn step_authenticated(

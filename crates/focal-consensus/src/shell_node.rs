@@ -629,6 +629,15 @@ impl ShellNode {
         }
         Ok(self.replica.core().store().term(index)?)
     }
+    /// As focal-log's backend's: whether the entry the current term began with is at or below
+    /// `index`, a published entry.
+    pub fn term_began_by(&self, index: u64) -> Result<bool, ConsensusError> {
+        let core = self.replica.core();
+        if self.published_term(index)? != core.raft.term() {
+            return Ok(false);
+        }
+        Ok(core_state::term_began_by(core, index))
+    }
     pub fn step_authenticated(
         &mut self,
         peer_node_id: u64,

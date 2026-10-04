@@ -1133,6 +1133,19 @@ impl LogNode {
         }
         self.raw.store().term(index).map_err(Into::into)
     }
+    /// Whether the entry the member's current term began with is at or below `index`, an entry
+    /// it has published: what an entry of a newer term proves of what a former leader proposed
+    /// (focal-ledger's `settle`) holds only past it. In a fast group the new leader takes what its
+    /// voters approved into its log under its own term, before that entry, so an entry of the term
+    /// published is not enough (hyper-raft S-4); where the log cannot show the term-start entry
+    /// the answer is no, and what waits on it waits. Without the fast track every entry of the term
+    /// follows the one it began with.
+    pub fn term_began_by(&self, index: u64) -> Result<bool, ConsensusError> {
+        if self.published_term(index)? != self.raw.raft.term() {
+            return Ok(false);
+        }
+        Ok(core_state::term_began_by(&self.raw, index))
+    }
     fn campaign_inner(&mut self) -> Result<(), ConsensusError> {
         self.check()?;
         core_state::check_campaign(&self.raw)?;

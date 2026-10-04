@@ -468,6 +468,18 @@ fn a_fast_leader_is_ready_only_once_its_term_start_entry_commits() {
     assert!(group.nodes[1].status().committed_index > committed);
     assert!(group.nodes[1].has_committed_current_term());
     assert!(group.nodes[2].has_committed_current_term());
+    // What the term-1 fast quorum committed is in every log under the new term, before the entry
+    // the term began with. An entry of the new term published there is no proof the term began:
+    // focal-ledger's `settle`, which resolves a former leader's proposals by it, waits for the
+    // term-start entry (hyper-raft S-4).
+    let start = term_start(&group, 2).expect("the follower's term-start entry");
+    assert!(committed < start);
+    for node in [1, 2] {
+        let term = group.nodes[node].status().term;
+        assert_eq!(group.nodes[node].published_term(committed).unwrap(), term);
+        assert!(!group.nodes[node].term_began_by(committed).unwrap());
+        assert!(group.nodes[node].term_began_by(start).unwrap());
+    }
 }
 
 /// A group of three on the classic track.

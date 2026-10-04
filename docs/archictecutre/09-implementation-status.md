@@ -13645,6 +13645,13 @@ focal's adaptation:
     first index, then the empty entry among the next `Limits::proposals` and one. Where its log
     cannot show it, compacted past the term's start, it says no and disposition waits.
   - A follower of a classic group keeps the old rule. Nothing is restamped there.
+  - `settle` also asked that the entry it had applied be of the new term. A follower applies
+    committed entries a page at a time, so it can stop at a restamped entry with its commit already
+    past the term-start entry. It now asks `DurableNode::term_began_by(applied)`: past the
+    term-start entry in a fast group, or of the new term without the fast track. In
+    `a_fast_leader_is_ready_only_once_its_term_start_entry_commits`, the entry the term-1 fast
+    quorum committed is published under the new term below the term-start entry, and
+    `term_began_by` says no there and yes at the term-start entry. The old test said yes at both.
   - `a_fast_leader_is_ready_only_once_its_term_start_entry_commits` checks the rule at the leader
     and at a follower after every message of a fast leader change. It cannot fail on the old rule
     in focal's bounds, and no setting of a test can make it:

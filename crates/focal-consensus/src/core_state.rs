@@ -393,7 +393,13 @@ pub(crate) fn committed_in_term<S: Storage>(raw: &RawNode<S>) -> bool {
         .is_ok_and(|term| term == raw.raft.term())
 }
 
-/// The index of the empty entry a follower's current term began with, where its log shows it.
+/// Whether the entry the current term began with is at or below `index`, an entry of the term
+/// (`DurableNode::term_began_by`).
+pub(crate) fn term_began_by<S: Storage>(raw: &RawNode<S>, index: u64) -> bool {
+    !raw.raft.config().fast || term_start(raw).is_some_and(|start| start <= index)
+}
+
+/// The index of the empty entry the member's current term began with, where its log shows it.
 fn term_start<S: Storage>(raw: &RawNode<S>) -> Option<u64> {
     let term = raw.raft.term();
     let store = raw.store();
