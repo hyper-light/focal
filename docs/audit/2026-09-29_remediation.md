@@ -2889,7 +2889,11 @@ ending with frames still waiting for a peer's lane when its owner's egress ended
 dropped without a count or a word to their owners; it gives them up as every frame
 not sent is now, and its report says so (`sent`, beside `attempted`, `accepted`,
 `lost`, `saturated` and `refused`; the QUIC harness asserts both halves of the
-identity at every stop).
+identity at every stop). **Closed (2026-10-03):** the promises the diagnostics now
+print named it on the next run (macOS, 27b0531): the replacement was a learner the
+leader's snapshot did not name, and the checkpoint that would have named it was owed
+by a flag on the host leadership had moved off. "Found by CI (2026-10-03)" below, "A
+drained leader's replacement never seeded once leadership moved".
 
 ## Found by CI (2026-10-02)
 
@@ -3244,6 +3248,55 @@ placement; the leader return's wait prints each replica's role (`ReplicaProgress
 added), its owner's periods, the periods without its tick and its longest. A trace of the
 owners every 25 periods under the suites showed leaders stepping down within their term
 for want of a quorum (39 in 36 runs) and patience of 35 ticks at most.
+
+**A drained leader's replacement never seeded once leadership moved** (macOS, 27b0531's
+push run, focal-node `drain_leader`'s
+`a_drained_session_leader_hands_leadership_on_before_it_is_removed`: "the heal did not
+happen", the replacement `Installed` and never `CaughtUp`; the fourth such run, two on
+macOS and one on Linux before it recorded open above). The failure's own diagnostics
+named it. The replacement named leader 680 at term 6 with nothing applied — so the leader
+sent it heartbeats, and it was a learner; the leader's promise cache stood at
+configuration index 19 (applying a change resets it, so the learner was added there) and
+its stored snapshot at 12 (applied 20, eight entries past it). Raft discards a snapshot
+that does not name its recipient (`Raft::restore`, "a snapshot that does not name this
+member is not for it"), answering with its commit, and the leader sent the same snapshot
+at every probe. The checkpoint that would name the learner was owed by a flag
+(`Owner::checkpoint_due`) that only the owner that resolved the `AddLearner` request
+set. Leader 680 had not resolved it — it would have checkpointed, nothing pending — so
+another had: the drained host led until the controller moved leadership off it, and an
+addition made there before the move left the flag on a host that no longer led. The
+leader that followed never knew. The learner's every answer to discovery, its bootstrap configuration at index
+zero, was refused as no member's (`record_managed_support`'s
+`Managed(Unsupported)`, seen 76 times in a passing run's trace). *Fix.* As the root's
+owner refreshes a snapshot whose configuration is stale (`ControlHost::maybe_checkpoint`),
+the replica derives the need from what it has applied: a stored snapshot that does not
+name every member of the configuration in force is refreshed, at every period and beside
+work (`Owner::checkpoint_for_members`; `DurableNode::snapshot_names_every_member`,
+`Session::configuration_index`), on every replica — whichever leads when the member asks
+to be seeded holds a snapshot that names it, however leadership moved or an owner
+restarted. The answer is kept for the configuration and snapshot indexes it was found at,
+so a period reads two integers; a change that only promotes or removes asks for no
+checkpoint (a native one carries the session's whole state); a log complete from its
+first entry needs none.
+*Tests.* `fleet::managed_support_owner::tests::a_learner_added_past_the_snapshot_is_seeded_whoever_made_the_change`:
+a leader compacts its log, a learner is added by the log alone (as a leader before this
+owner would have added it), and the owner's periods seed it; without the derived
+checkpoint the leader's snapshot stayed at index 1, the learner added at 2, and the test
+fails there; and the learner's removal
+after, a change that adds no one, takes no checkpoint. The three `fleet_quic`
+schedules written for this failure on 2026-10-02 — a member, a fresh copy and a native
+fresh copy brought up "by any leader" after a hand-off — checkpointed the leader alone:
+the voter given leadership kept its log from the first entry and brought the member up
+by appends, so they passed with the flag. Every voter checkpoints in them now, as the
+cadence has every replica do, and without the derived checkpoint all three fail, the
+member never reaching the leader's compacted index. The drain test itself did not fail here: twelve copies
+three at a time beside a whole suite all healed. *Open, found on the way:* a session's
+checkpoint waits until none of its proposals is pending (`Session::encode_checkpoint`
+refuses while any is, and the owner's `try_checkpoint` asks only when none is), so a
+group whose pending proposals never drain to none would checkpoint neither by cadence
+nor for a member it added, and its log would grow past the cadence's bound. Whether
+sustained load holds a group there is to be measured next, under a workload that keeps
+its pending queue from emptying.
 
 ## F48
 

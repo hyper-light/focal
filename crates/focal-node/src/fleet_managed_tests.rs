@@ -487,6 +487,94 @@ fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission
     accepted
 }
 
+/// A learner added after the log was compacted is seeded whoever made the
+/// change: Raft discards a snapshot that does not name its recipient, so a
+/// replica whose stored snapshot is older than the configuration it has
+/// applied checkpoints at its period. The owner that resolved the addition
+/// alone used to; once leadership had moved off it, the leader that
+/// followed sent the learner a snapshot that did not name it at every
+/// probe, and the learner was never seeded (the drained leader's heal,
+/// macOS CI at 27b0531). The change here is the log's own, as a leader
+/// before this owner made it, and no request of it ever reaches the owner.
+#[test]
+fn a_learner_added_past_the_snapshot_is_seeded_whoever_made_the_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut initial = session(&directory.path().join("leader"), 1);
+    initial.checkpoint().unwrap();
+    let floor = initial.snapshot_index();
+    assert!(floor > 0, "the log is compacted");
+    let view = initial.membership().unwrap();
+    initial
+        .propose_membership(&SessionMembershipRequest {
+            id: [9; 16],
+            expected_index: view.configuration_index,
+            expected: view.configuration,
+            change: MembershipChange::AddLearner { node: 2 },
+        })
+        .unwrap();
+    for _ in 0..4 {
+        initial.poll().unwrap();
+    }
+    let added = initial.configuration_index();
+    assert!(added > floor, "the learner is added past the snapshot");
+    let learner = session(&directory.path().join("learner"), 2);
+    let (mut leader, mut outgoing, leader_budget) = assemble(initial);
+    let (mut learner, mut replies, learner_budget) = assemble(learner);
+    for _ in 0..80 {
+        settle(&mut leader);
+        leader.tick().unwrap();
+        settle(&mut leader);
+        while let Ok(frame) = outgoing.try_recv() {
+            deliver_frame(&mut learner, frame, false);
+        }
+        while let Ok(frame) = replies.try_recv() {
+            deliver_frame(&mut leader, frame, false);
+        }
+        settle(&mut learner);
+        if learner.session.scalars().applied_index >= added {
+            break;
+        }
+    }
+    assert!(
+        leader.session.snapshot_index() >= added,
+        "the leader's snapshot names the learner: {} below {added}",
+        leader.session.snapshot_index()
+    );
+    assert!(
+        learner.session.scalars().applied_index >= added,
+        "the learner was never seeded: {:?}",
+        learner.session.status()
+    );
+    // A change that adds no one asks for no checkpoint: the snapshot that
+    // names the learner names every member left once it is removed.
+    let refreshed = leader.session.snapshot_index();
+    let view = leader.session.membership().unwrap();
+    leader
+        .session
+        .propose_membership(&SessionMembershipRequest {
+            id: [10; 16],
+            expected_index: view.configuration_index,
+            expected: view.configuration,
+            change: MembershipChange::Remove { node: 2 },
+        })
+        .unwrap();
+    for _ in 0..4 {
+        settle(&mut leader);
+        leader.tick().unwrap();
+        while outgoing.try_recv().is_ok() {}
+    }
+    assert!(leader.session.configuration_index() > refreshed);
+    assert_eq!(leader.session.snapshot_index(), refreshed);
+    leader.close();
+    learner.close();
+    drop(leader);
+    drop(learner);
+    drop(outgoing);
+    drop(replies);
+    assert_eq!(leader_budget.stats().used, 0);
+    assert_eq!(learner_budget.stats().used, 0);
+}
+
 /// A peer the driver could not reach is told to the core (27 §3.3) — but a
 /// core fenced by a write it still persists refuses the report, which is
 /// then told next period, the report keeping its place on the owner's own

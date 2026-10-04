@@ -13093,3 +13093,20 @@ from the log's first entry, and the window beyond them, as for any member.
 `a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging` fails on 27b0531
 (the leader's step refused) and passes after. PR #4's core made the split test meet it under the
 whole focal-node suite's load: 4 of 7 failed without the fix, none of 6 with it.
+### 2026-10-03 — a replica refreshes a snapshot that does not name every member
+
+From 27b0531's macOS run: a drained leader's replacement stayed `Installed` for the whole
+budget, a learner its leader beat and never seeded. Raft discards a snapshot that does
+not name its recipient, and the leader's snapshot predated the learner. The checkpoint
+that would have named it was owed by a flag only the owner that resolved the addition
+set; that host led until the controller moved leadership off it, and the leader that
+followed never knew. Each replica now derives the need from what it has applied, as the
+root's owner does: a stored snapshot that does not name every member of the configuration
+in force is refreshed at its period (`Owner::checkpoint_for_members`,
+`DurableNode::snapshot_names_every_member`), the answer kept per configuration and
+snapshot, and a change that adds no one asks for nothing. An owner test adds a learner by
+the log alone, seeds it, and removes it without a checkpoint; the three
+QUIC schedules that bring a late member up "by any leader" checkpoint every voter now,
+since the voter they handed leadership to had kept its log from the first entry and
+hidden the stale snapshot.
+

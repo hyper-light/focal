@@ -773,9 +773,9 @@ struct Owner {
     support_cursor: u64,
     dropped: u64,
     unreachable: u64,
-    /// A member was added after the log was compacted: the next checkpoint
-    /// is due so the snapshot that seeds it names it in its configuration.
-    checkpoint_due: bool,
+    /// Whether the stored snapshot named every member, at the configuration
+    /// and snapshot indexes it was last asked at (`checkpoint_for_members`).
+    members_named: Option<((u64, u64), bool)>,
     #[cfg(test)]
     dropped_snapshots: u64,
     budget: MemoryBudget,
@@ -973,7 +973,7 @@ impl ReplicaHost {
             support_cursor: 0,
             dropped: 0,
             unreachable: 0,
-            checkpoint_due: false,
+            members_named: None,
             #[cfg(test)]
             dropped_snapshots: 0,
             budget: budget.clone(),
@@ -1678,7 +1678,7 @@ impl Owner {
                             return Ok(());
                         }
                         self.progress_managed()?;
-                        self.checkpoint_if_due()?;
+                        self.checkpoint_for_members()?;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -1712,12 +1712,6 @@ impl Owner {
         }
         Ok(false)
     }
-    /// A member added after the log was compacted can only be seeded by a
-    /// snapshot whose configuration names it (Raft discards any other), so
-    /// the authority checkpoints once such a change has applied; a log that
-    /// is complete from its first entry needs no checkpoint. Retried while
-    /// proposals or persistence are pending; the checkpoint itself is the
-    /// synchronous one an operator's request takes.
     /// Entries applied past the last snapshot: the log this replica keeps
     /// beyond its checkpoint (26 §3).
     pub(super) fn log_entries_since_checkpoint(&self) -> u64 {
@@ -1765,42 +1759,39 @@ impl Owner {
             Err(error) => Err(error),
         }
     }
-    fn checkpoint_if_due(&mut self) -> Result<(), LedgerError> {
-        if !self.checkpoint_due {
+    /// A member added after the log was compacted can only be seeded by a
+    /// snapshot whose configuration names it — Raft discards any other — so
+    /// a replica whose stored snapshot does not name every member of the
+    /// configuration it has applied checkpoints. Derived from what the
+    /// replica has applied: whichever replica leads when the member asks to
+    /// be seeded has refreshed its own snapshot, however leadership moved or
+    /// the owner restarted since the change. A flag kept by the owner that
+    /// resolved the change alone left a drained leader's replacement
+    /// unseeded for good: leadership moved off that owner before it
+    /// checkpointed, and the leader that followed sent the replacement a
+    /// snapshot that did not name it at every probe (macOS CI, 27b0531).
+    /// A change that only promotes or removes asks for nothing; what is
+    /// pending or persisting waits for a later period. The answer is kept
+    /// for the configuration and the snapshot it was found at, so a period
+    /// reads two indexes.
+    fn checkpoint_for_members(&mut self) -> Result<(), LedgerError> {
+        let at = (
+            self.session.configuration_index(),
+            self.session.snapshot_index(),
+        );
+        if at.1 >= at.0 {
             return Ok(());
         }
-        if self.session.snapshot_index() == 0 {
-            self.checkpoint_due = false;
-            return Ok(());
-        }
-        if self.session.pending_count() != 0
-            || self.session.persistence_pending()
-            || self.session.checkpoint_in_flight()
-            || self.stopping.is_some()
-        {
-            return Ok(());
-        }
-        match self.session.checkpoint() {
-            Ok(()) => {
-                self.checkpoint_due = false;
-                Ok(())
+        let named = match self.members_named {
+            Some((seen, named)) if seen == at => named,
+            _ => {
+                let named = self.session.snapshot_names_every_member();
+                self.members_named = Some((at, named));
+                named
             }
-            // Resource conditions and unpersisted state wait for a later tick.
-            Err(
-                LedgerError::Capacity
-                | LedgerError::NotReady { .. }
-                | LedgerError::Consensus(
-                    focal_consensus::ConsensusError::PersistencePending
-                    | focal_consensus::ConsensusError::Capacity
-                    | focal_consensus::ConsensusError::CheckpointIndex,
-                ),
-            ) => Ok(()),
-            Err(LedgerError::Native(error))
-                if error.class() == focal_ledger::FailureClass::Retryable =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error),
+        };
+        if named {
+            return Ok(());
         }
     }
     fn tick(&mut self) -> Result<(), LedgerError> {
@@ -1835,6 +1826,7 @@ impl Owner {
                 ),
             ) => self.pace.refuse(),
             Err(error) => return Err(error),
+        self.try_checkpoint().map(|_| ())
         }
         self.return_leadership()?;
         if self.session.scalars().role == StateRole::Leader {
@@ -1888,6 +1880,9 @@ impl Owner {
             node != status.node_id
                 && membership.voters.contains(&node)
                 && self
+        // At every period, not only beside work: a replica no request
+        // reaches still seeds the members its configuration added.
+        self.checkpoint_for_members()?;
                     .session
                     .active_placement()
                     .is_some_and(|spec| spec.placement.voters.contains_key(&node))
@@ -2020,7 +2015,7 @@ impl Owner {
             self.poll_snapshot_feedback()?;
         }
         self.progress_managed()?;
-        self.checkpoint_if_due()?;
+        self.checkpoint_for_members()?;
         let handing_off = self.handing_off();
         if let Some((_, deadline)) = self.stopping.as_ref()
             && !handing_off
@@ -4315,12 +4310,6 @@ impl Owner {
                     if !receipt_ready {
                         self.finish_membership(pending, Err(LedgerError::MembershipConflict));
                     } else {
-                        if matches!(
-                            pending.call.request.as_ref().map(|request| &request.change),
-                            Some(focal_consensus::MembershipChange::AddLearner { .. })
-                        ) {
-                            self.checkpoint_due = true;
-                        }
                         let view = self.session.membership();
                         self.finish_membership(pending, view);
                     }

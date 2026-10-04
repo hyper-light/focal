@@ -73,6 +73,12 @@ impl Session {
             latest: self.membership_state.latest.clone(),
         })
     }
+    /// The index of the configuration change in force, as applied: what a
+    /// checkpoint must reach for its snapshot to name every member, since
+    /// Raft discards a snapshot that does not name its recipient.
+    pub fn configuration_index(&self) -> u64 {
+        self.membership_state.configuration_index
+    }
     pub fn membership_receipt(
         &self,
         request: &SessionMembershipRequest,

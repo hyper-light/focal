@@ -1200,6 +1200,38 @@ async fn applied_at_least(fleet: &Fleet, replica: usize, index: u64, native: boo
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
+/// Checkpoint every voter, the leader of the moment last; returns which
+/// replica that was. Each compacts its log behind a snapshot of its own,
+/// as the cadence does on every replica: a voter that leads after a
+/// hand-off seeds a late member from its own snapshot, not from a log kept
+/// from the first entry. The leader after a drained one had compacted its
+/// own (macOS CI at 27b0531); the voter these tests handed leadership to
+/// had not, and brought the member up by appends, hiding that its snapshot
+/// would not have named it.
+async fn checkpoint_every_voter(fleet: &Fleet) -> usize {
+    let (leader, view) = membership_on_leader(fleet).await;
+    for voter in view.view().configuration.voters.clone() {
+        let replica = usize::try_from(voter - 1).unwrap();
+        if replica == leader {
+            continue;
+        }
+        let mut moved = 0;
+        loop {
+            match fleet.replicas[replica].host.checkpoint().await {
+                Ok(()) => break,
+                Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                    moved += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!(
+                    "checkpoint of {replica}: {error}; replicas={:?}",
+                    fleet.diagnostics()
+                ),
+            }
+        }
+    }
+    checkpoint_on_leader(fleet).await
+}
     .await
     .unwrap_or_else(|_| {
         panic!(
@@ -1235,7 +1267,7 @@ async fn a_member_behind_a_compacted_log_is_brought_up_by_snapshot_by_any_leader
     };
     let (_, removed) = change_on_leader(&fleet, &removal).await.unwrap();
     assert_eq!(removed.view().configuration.voters.len(), 2);
-    let leader = checkpoint_on_leader(&fleet).await;
+    let leader = checkpoint_every_voter(&fleet).await;
     let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
     let compacted_applied = compacted.value().applied_index;
     assert_eq!(
@@ -1282,7 +1314,7 @@ async fn a_fresh_copy_with_an_empty_log_is_brought_up_by_snapshot_by_any_leader(
     let fresh_node = 4u64;
     // The leader checkpoints before the fresh copy is admitted: nothing of
     // its log before the checkpoint is retained for a late member.
-    let leader = checkpoint_on_leader(&fleet).await;
+    let leader = checkpoint_every_voter(&fleet).await;
     let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
     let compacted_applied = compacted.value().applied_index;
     assert_eq!(
@@ -1359,7 +1391,7 @@ async fn a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader() {
     })
     .await
     .unwrap_or_else(|_| panic!("native never activated: replicas={:?}", fleet.diagnostics()));
-    let leader = checkpoint_on_leader(&fleet).await;
+    let leader = checkpoint_every_voter(&fleet).await;
     let compacted = fleet.replicas[leader].host.diagnostics().await.unwrap();
     let compacted_applied = compacted.value().applied_index;
     assert_eq!(

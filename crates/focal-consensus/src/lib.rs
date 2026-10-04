@@ -1482,6 +1482,40 @@ impl DurableNode {
     pub fn snapshot_index(&self) -> u64 {
         self.raw.store().snapshot_index()
     }
+    /// Whether the stored snapshot names every member of the configuration
+    /// this node has applied. Raft discards a snapshot that does not name
+    /// its recipient, so a member added after the log was compacted is
+    /// seeded only by a later snapshot; a log complete from its first entry
+    /// seeds anyone. A change that only promotes or removes leaves every
+    /// member named.
+    pub fn snapshot_names_every_member(&self) -> bool {
+        let store = self.raw.store();
+        if store.snapshot_index() == 0 {
+            return true;
+        }
+        let Some(stated) = store
+            .snapshot
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.conf_state.as_ref())
+        else {
+            return false;
+        };
+        let named = |node: &u64| {
+            stated.voters.contains(node)
+                || stated.learners.contains(node)
+                || stated.voters_outgoing.contains(node)
+                || stated.learners_next.contains(node)
+        };
+        let current = &store.conf_state;
+        current
+            .voters
+            .iter()
+            .chain(&current.learners)
+            .chain(&current.voters_outgoing)
+            .chain(&current.learners_next)
+            .all(named)
+    }
     /// A leader cannot complete a quorum ReadIndex until it has committed an
     /// entry in its current term. Ingress uses this to defer readiness probes.
     pub fn has_committed_current_term(&self) -> bool {

@@ -1154,6 +1154,11 @@ impl Session {
     pub fn snapshot_index(&self) -> u64 {
         self.consensus.snapshot_index()
     }
+    /// Whether the stored checkpoint can seed every member of the
+    /// configuration in force (`DurableNode::snapshot_names_every_member`).
+    pub fn snapshot_names_every_member(&self) -> bool {
+        self.consensus.snapshot_names_every_member()
+    }
     /// A retained delivery is waiting for seed chunks no host has pulled yet.
     pub fn seed_waiting(&self) -> bool {
         self.retained.is_some() && self.seed_pending.is_some() && !self.seed_progress
