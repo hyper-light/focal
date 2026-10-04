@@ -388,10 +388,7 @@ pub(crate) struct LogNode {
     recovered_allocation: Option<Allocation>,
     persistence: Option<persistence::PendingDrain>,
     checkpoint: Option<Box<checkpoint::PendingCheckpoint>>,
-    required_decoder: Option<[u8; 32]>,
-    confirmed_decoder: Option<[u8; 32]>,
-    compiled_decoders: Option<decoder::DecoderPair>,
-    decoder_transition: Option<decoder::DecoderPair>,
+    decoders: decoder::DecoderGate,
     decoder_write: Option<decoder::PendingDecoderFloor>,
     // A decoder-gated recovery cannot drain at open (the unconfirmed decoder
     // makes `check` refuse), so the committed conf-change replay that rebuilds
@@ -753,10 +750,7 @@ impl LogNode {
             recovered_allocation,
             persistence: None,
             checkpoint: None,
-            required_decoder,
-            confirmed_decoder: None,
-            compiled_decoders: None,
-            decoder_transition,
+            decoders: decoder::DecoderGate::new(required_decoder, decoder_transition),
             decoder_write: None,
             // The complement of the constructor rebuild below: a gated recovery
             // (required_decoder set) cannot drain yet, so its rebuild is deferred
@@ -772,7 +766,7 @@ impl LogNode {
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
-        if node.required_decoder.is_none() {
+        if node.decoders.required.is_none() {
             let events = node.drain()?;
             node.recovered_events = Some(events);
         }
