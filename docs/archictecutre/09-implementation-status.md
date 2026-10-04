@@ -13467,3 +13467,13 @@ allowance, the size of `DurableNode`, counts what it counted. Each public method
 method of the same name, and each constructor opens the backend. Nothing an owner sees changes:
 focal-consensus's suite passes unchanged, the counting allocator's allowance test among it. The
 shell's backend comes beside it next.
+
+### 2026-10-03 — what both backends check, in one place
+
+The core is the same over focal-log and over the shell, so what it reports and what an owner may
+ask of it are the same whichever backend holds it ([27](27-consensus-roadmap-and-slates-port.md)
+§15.7). `core_state` holds them: the core's settings at open, the checks a message, a proposal, a
+read, a change of membership, a hand-over of leadership and a snapshot's feedback pass before the
+core is given them, and the status, its scalars and the peers' progress as reported. Each is moved
+from `LogNode` unchanged, and `LogNode` calls it; the shell's backend will call the same.
+focal-consensus's suite passes unchanged.
