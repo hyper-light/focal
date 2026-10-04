@@ -27,6 +27,16 @@ impl Default for RetryPolicy {
         }
     }
 }
+impl RetryPolicy {
+    /// The pause before the attempt that follows `backoffs` refusals, as
+    /// this client takes it: the exponential step from the base, capped,
+    /// spread by full jitter over a fresh draw (`jittered`). For a caller
+    /// that resends outside the client — a transport's own tests — so that
+    /// it backs off as the client does, never in step with other callers.
+    pub fn pause(&self, backoffs: u32) -> Duration {
+        jittered(self, backoffs, Duration::MAX, entropy())
+    }
+}
 /// One past the largest draw: what a draw is measured against.
 const DRAWS: u128 = 1 << 64;
 /// The pause before the next attempt: the exponential step from the base,

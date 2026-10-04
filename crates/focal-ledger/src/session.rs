@@ -1154,6 +1154,10 @@ impl Session {
     pub fn snapshot_index(&self) -> u64 {
         self.consensus.snapshot_index()
     }
+    /// The index of the last entry the Raft log holds, durable or not.
+    pub fn last_log_index(&self) -> Result<u64, LedgerError> {
+        Ok(self.consensus.last_index()?)
+    }
     /// Whether the stored checkpoint can seed every member of the
     /// configuration in force (`DurableNode::snapshot_names_every_member`).
     pub fn snapshot_names_every_member(&self) -> bool {

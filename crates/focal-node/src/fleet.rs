@@ -236,6 +236,14 @@ pub struct ReplicaProgress {
     /// (27 §12): what a frame that overtook another cost before the order
     /// was kept, and what a lost frame costs still.
     pub appends_rejected: u64,
+    /// Of those, the ones the order should have spared (27 §12): refused
+    /// for an entry past the last this log held when a frame of its leader
+    /// was last lost to it, in a term in which the leader sent its appends
+    /// ordered and one of them was taken. What a lost frame costs — the
+    /// frame let go past its patience, found stale or not stepped, and the
+    /// appends behind it until the leader sends again — and a term's first
+    /// exchange are not among them.
+    pub appends_rejected_in_order: u64,
     /// Frames held for the one they overtook (27 §12), and frames let go
     /// past their patience or their lane without it: the first is what
     /// the path reordered, the second what it lost.
@@ -682,6 +690,23 @@ struct HeldFrame {
     message: Vec<u8>,
     pending: Pending,
 }
+/// One leader's appends as this replica took them (`Owner::append_streams`).
+/// An answer is judged when the log is durable, after frames stepped since;
+/// so a loss is kept as the place it left in the log, not as a moment.
+#[derive(Clone, Copy, Debug, Default)]
+struct AppendStream {
+    /// The term and the first index this log lacked when a frame of the
+    /// leader was last lost to it — let go past its patience, found stale,
+    /// or not stepped: an append refused in that term for an entry before
+    /// it is the loss's, since every append past it waits for the entries
+    /// the lost frame carried.
+    lost_from: Option<(u64, u64)>,
+    /// The term an append of it was last taken in.
+    taken_in: Option<u64>,
+    /// The term it last sent an ordered frame in: a leader of an older
+    /// binary sends its appends plain, and the order spares them nothing.
+    ordered_in: Option<u64>,
+}
 /// How a peer's frame was admitted (`admit_replication`).
 enum Replication {
     /// Stepped; answered at the Ready fence by the owner's period given.
@@ -766,6 +791,11 @@ struct Owner {
     resequencer: crate::resequence::Resequencer<HeldFrame>,
     /// `ReplicaProgress::appends_rejected`.
     appends_rejected: u64,
+    /// `ReplicaProgress::appends_rejected_in_order`.
+    appends_rejected_in_order: u64,
+    /// What became of each leader's appends here (`AppendStream`), for as
+    /// many peers as the order is kept for, pruned with the configuration.
+    append_streams: std::collections::BTreeMap<u64, AppendStream>,
     /// `ReplicaProgress::frames_held`, `frames_let_go` and `frames_stale`.
     frames_held: u64,
     frames_let_go: u64,
@@ -897,6 +927,7 @@ impl ReplicaHost {
                 frames_let_go: 0,
                 frames_stale: 0,
                 appends_rejected: 0,
+                appends_rejected_in_order: 0,
                 peer_reports_coalesced: 0,
                 peer_reports_dropped: 0,
                 waits_asked: 0,
@@ -967,6 +998,8 @@ impl ReplicaHost {
             ordered: std::collections::BTreeMap::new(),
             resequencer: crate::resequence::Resequencer::new(lane, LOST_PEERS),
             appends_rejected: 0,
+            appends_rejected_in_order: 0,
+            append_streams: std::collections::BTreeMap::new(),
             frames_held: 0,
             frames_let_go: 0,
             frames_stale: 0,
@@ -1793,6 +1826,7 @@ impl Owner {
         if named {
             return Ok(());
         }
+        self.try_checkpoint().map(|_| ())
     }
     fn tick(&mut self) -> Result<(), LedgerError> {
         self.pace
@@ -1826,7 +1860,6 @@ impl Owner {
                 ),
             ) => self.pace.refuse(),
             Err(error) => return Err(error),
-        self.try_checkpoint().map(|_| ())
         }
         self.return_leadership()?;
         if self.session.scalars().role == StateRole::Leader {
@@ -1847,6 +1880,9 @@ impl Owner {
             .map_err(|_| LedgerError::Failed)?;
         self.drain()?;
         self.checkpoint_by_cadence()?;
+        // At every period, not only beside work: a replica no request
+        // reaches still seeds the members its configuration added.
+        self.checkpoint_for_members()?;
         self.progress_managed()
     }
     /// The election priority of `node` by the session's committed
@@ -1880,9 +1916,6 @@ impl Owner {
             node != status.node_id
                 && membership.voters.contains(&node)
                 && self
-        // At every period, not only beside work: a replica no request
-        // reaches still seeds the members its configuration added.
-        self.checkpoint_for_members()?;
                     .session
                     .active_placement()
                     .is_some_and(|spec| spec.placement.voters.contains_key(&node))
@@ -2478,6 +2511,7 @@ impl Owner {
                 frames_let_go: self.frames_let_go,
                 frames_stale: self.frames_stale,
                 appends_rejected: self.appends_rejected,
+                appends_rejected_in_order: self.appends_rejected_in_order,
                 peer_reports_coalesced: self.lost_coalesced,
                 peer_reports_dropped: self.lost_dropped,
                 waits_asked: self.waits_asked,
@@ -2572,11 +2606,13 @@ impl Owner {
             }
         }
         self.ordered.retain(|peer, _| member(*peer));
+        self.append_streams.retain(|peer, _| member(*peer));
     }
     /// Step the frames the resequencer let go, in their order.
     fn step_due(&mut self) {
         while let Some(held) = self.resequencer.take_due() {
             self.frames_let_go = self.frames_let_go.saturating_add(1);
+            self.lost_to(held.source);
             self.step_held(held);
         }
     }
@@ -2627,6 +2663,7 @@ impl Owner {
                 Err(crate::resequence::Capacity) => return Err(AccessError::Capacity),
                 Ok(crate::resequence::Admission::Hold) => {
                     self.frames_held = self.frames_held.saturating_add(1);
+                    self.sent_ordered(node_id);
                     return Ok(Replication::Held {
                         source: node_id,
                         sequence,
@@ -2636,14 +2673,21 @@ impl Owner {
                 }
                 Ok(crate::resequence::Admission::Stale) => {
                     self.frames_stale = self.frames_stale.saturating_add(1);
+                    self.lost_to(node_id);
                 }
                 Ok(crate::resequence::Admission::Step) => {}
             }
+            self.sent_ordered(node_id);
             self.step_due();
         }
-        self.session
-            .step_authenticated(node_id, message)
-            .map_err(access)?;
+        if let Err(error) = self.session.step_authenticated(node_id, message) {
+            // An ordered frame not stepped is lost to this log as much as
+            // one that never came: the appends behind it are refused.
+            if order.is_some() {
+                self.lost_to(node_id);
+            }
+            return Err(access(error));
+        }
         if order.is_some() {
             self.step_ready(node_id);
         }
@@ -2664,7 +2708,10 @@ impl Owner {
                 pending.waiting = WaitingFor::PeerPersistence;
                 self.pending.push_back(pending);
             }
-            Err(error) => pending.finish(Response::Error(access(error))),
+            Err(error) => {
+                self.lost_to(source);
+                pending.finish(Response::Error(access(error)));
+            }
         }
     }
     fn request(
@@ -3587,6 +3634,66 @@ impl Owner {
         let _charge = early.take_allocation();
         self.send(&early.messages)
     }
+    /// The stream of `source`'s appends, kept for as many peers as the order
+    /// is (`LOST_PEERS`); none beyond them.
+    fn append_stream(&mut self, source: u64) -> Option<&mut AppendStream> {
+        if !self.append_streams.contains_key(&source) && self.append_streams.len() >= LOST_PEERS {
+            return None;
+        }
+        Some(self.append_streams.entry(source).or_default())
+    }
+    /// `source` sent an ordered frame in this replica's term.
+    fn sent_ordered(&mut self, source: u64) {
+        let term = self.session.scalars().term;
+        if let Some(stream) = self.append_stream(source) {
+            stream.ordered_in = Some(term);
+        }
+    }
+    /// A frame of `source` was lost to this log: what it refuses in this
+    /// term short of the first entry it lacks now is the loss's. Where the
+    /// log cannot say where it ends, every refusal of the term is.
+    fn lost_to(&mut self, source: u64) {
+        let term = self.session.scalars().term;
+        let from = self
+            .session
+            .last_log_index()
+            .map_or(u64::MAX, |last| last.saturating_add(1));
+        if let Some(stream) = self.append_stream(source) {
+            stream.lost_from = Some(match stream.lost_from {
+                Some((lost_in, before)) if lost_in == term => (term, before.max(from)),
+                _ => (term, from),
+            });
+        }
+    }
+    /// What this replica's answer to `leader`'s append says (27 §12). One
+    /// refused is counted; and counted as the order's to have spared when
+    /// the leader sent ordered and had an append taken in the answer's
+    /// term, and it was refused at or past where the log stood when a
+    /// frame of the leader was last lost to it — its hint, the last entry
+    /// this log could agree on, no earlier than that. A refusal that asks
+    /// for a snapshot is not one for an entry.
+    fn judge_append_answer(&mut self, answer: &focal_consensus::Message) {
+        if answer.reject {
+            self.appends_rejected = self.appends_rejected.saturating_add(1);
+        }
+        let Some(stream) = self.append_stream(answer.to) else {
+            return;
+        };
+        if !answer.reject {
+            stream.taken_in = Some(answer.term);
+            return;
+        }
+        let lost = stream
+            .lost_from
+            .is_some_and(|(term, from)| term == answer.term && answer.reject_hint < from);
+        if stream.ordered_in == Some(answer.term)
+            && stream.taken_in == Some(answer.term)
+            && answer.request_snapshot == 0
+            && !lost
+        {
+            self.appends_rejected_in_order = self.appends_rejected_in_order.saturating_add(1);
+        }
+    }
     /// Hand the replica's messages to the driver that carries them. A
     /// message that is not handed over — no room for it here, or in the
     /// driver's queue — is told to the core as one the driver gave up is
@@ -3594,10 +3701,8 @@ impl Owner {
     /// its way that is not.
     fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
         for message in messages {
-            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32
-                && message.reject
-            {
-                self.appends_rejected = self.appends_rejected.saturating_add(1);
+            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32 {
+                self.judge_append_answer(message);
             }
             let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
                 Ok(snapshot) => snapshot,

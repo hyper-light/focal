@@ -3298,6 +3298,68 @@ nor for a member it added, and its log would grow past the cadence's bound. Whet
 sustained load holds a group there is to be measured next, under a workload that keeps
 its pending queue from emptying.
 
+**An ordered frame's refusals told apart by where the log stood** (ubuntu, 27b0531's push
+run, focal-node `fleet_quic`'s
+`a_peers_appends_are_stepped_in_their_order_across_a_lossy_path`: "9 refused, 5 let
+go"). The F42 residual's test held the refusals with the order kept to the frames let go
+past their patience, one each; a frame let go has the appends pipelined behind it refused
+too, until the leader sends again, so one loss is several refusals. *Fix.* Each follower
+counts, of its refusals, those the order should have spared
+(`ReplicaProgress::appends_rejected_in_order`). An answer is judged when the log is
+durable, after frames stepped since, so a loss is kept as the place it left in the log,
+not as a moment: where a frame of the leader is let go past its patience, found stale or
+not stepped, the follower notes the first index its log lacked then, and a refusal in
+that term whose hint — the last entry the log could agree on — falls before it is the
+loss's. A term's first exchange is not counted either, nor a leader of an older binary's
+plain appends (none of its frames came ordered in the term), nor a refusal that asks for
+a snapshot. The test asserts there are none while the path made the followers hold frames.
+It no longer compares the plain run's refusals with the ordered run's, nor requires the
+plain run to have some: how many frames a loss overtakes name entries their follower
+lacks rests on how the leader's sends fall against the path's recovery, which load moves —
+29 on the ubuntu CI, 14 on a laptop running the test alone, none in three copies run there
+at once beside a suite (whose ordered bursts held 61 to 70 frames each). The plain run
+stays as the older binary's path: the burst commits through it. *Found on the way, the
+test's own client* (copies run at once): it asked the first leader alone, so a
+leadership change under load left every request on a follower (one of three copies); it
+paused a fixed tick after a refusal, so refused requests came back in step; and it
+charged each request's wait to the replicas' periods, which a group committing six
+entries a second ran through — six copies at once failed all six with the first two
+changed, the earliest requests' budgets spent while the burst went on committing (the
+leader's queue slots all held, `Capacity` to everyone else). It now
+asks the replica that leads at the time, over connections opened when it first leads and
+again where one is lost; pauses as the client does (`RetryPolicy::pause`, the client's
+own jittered step, the audit's F64); and restarts a request's budget whenever a replica's
+sequence advances, so the budget measures a stall and the burst's commits bound the
+restarts. Six copies at once then all pass, their ordered bursts refusing 12 to 53 appends
+with 13 to 49 frames let go, and none in order — where the first statement, one refusal a
+frame let go, would have failed two of the six. *Tests.*
+`fleet::list_tests::append_order_tests`: a frame stepped plain ahead of its turn is
+counted, the frames held and stepped in order are not, and the frame behind a lost one,
+let go past its patience and refused, is not;
+`a_leader_that_sends_its_appends_plain_is_spared_nothing_by_the_order`. A first version
+judged by an event — the gap closed at the next append taken — and an answer for a frame
+stepped before a let-go, judged after it, would have closed the gap it did not belong to.
+
+**A signer's decision held to eight asks** (a peer session's loaded run of the focal-node
+suite on PR #4's tree, `network_control::tests::founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and_revocation`:
+"the signer's decision did not settle: Some(NotLeader { leader: 0 })", the root electing,
+one replica a pre-candidate at term 2). The test asked the signer again eight times 25 ms
+apart while the root answered with a failure the founder retries, and read the root's
+state under a ten-second timeout: guesses of the clock. *Fix.* Both are charged to the
+control replicas' own periods (`focal_timing::ProgressDeadline`, as the test's other
+waits are), asked again a period of theirs later, and a wait spent prints each replica's
+progress. (The "timers are disabled" panic printed before it is the test's own probe of
+the adapter under a runtime without a timer driver, caught and answered `Unavailable`.)
+
+**A member behind the log was staged for the snapshot alone** (PR #4's macOS and Windows
+CI, the split test's member never caught up; a peer session's commit b0fd606, landed in
+this batch). The leader's staging priced a member behind the log's start as the snapshot,
+while the member's answer that it holds the snapshot moves it to the log's first entry
+and the page from there with the window beyond it go in the same transition: the core
+retained more than was reserved, the step was refused for capacity, and the node stopped.
+This core priced it the same way. It is priced at the larger of the snapshot and the page
+from the first entry, plus the window beyond the first page (doc 09 has the account).
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

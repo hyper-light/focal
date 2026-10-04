@@ -69,20 +69,44 @@ fn runtime(namespace: LedgerId) -> AuthenticatedPeer {
     })
     .unwrap()
 }
-async fn state(adapter: &NetworkEnrollmentControl<'_>) -> ControlSnapshot {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match adapter.read_state(RequestId::from_u128(7)).await {
-                Ok(state) => return state,
-                Err(error) if retryable(error) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await
+/// The periods the control replicas have run: what a wait for the root is
+/// charged to (27 §3.1 P8).
+fn periods(replicas: &[Running]) -> Vec<u64> {
+    replicas
+        .iter()
+        .map(|replica| replica.host.periods())
+        .collect()
+}
+/// A wait for the root charged to the replicas' own periods: what five
+/// seconds hold at their tick, however long a loaded machine takes to run
+/// them, and a minute of none run at all for a wedged one.
+fn settling(replicas: &[Running]) -> focal_timing::ProgressDeadline {
+    focal_timing::ProgressDeadline::begin(
+        &periods(replicas),
+        focal_timing::ProgressDeadline::periods(
+            Duration::from_secs(5),
+            replicas[0].host.tick_period(),
+        ),
+        Duration::from_secs(60),
+    )
+}
+/// The root's state, read again a period later while the replicated root
+/// answers with a failure the founder retries (`retryable`): a root between
+/// leaders answers as soon as it elects one.
+async fn state(adapter: &NetworkEnrollmentControl<'_>, replicas: &[Running]) -> ControlSnapshot {
+    let mut wait = settling(replicas);
+    loop {
+        match adapter.read_state(RequestId::from_u128(7)).await {
+            Ok(state) => return state,
+            Err(error) if retryable(error) => {
+                if let Err(spent) = wait.check(&periods(replicas)) {
+                    panic!("the root's state was not read: {spent}: {error:?}");
                 }
-                Err(error) => panic!("root state failed: {error:?}"),
+                tokio::time::sleep(replicas[0].host.tick_period()).await;
             }
+            Err(error) => panic!("root state failed: {error:?}"),
         }
-    })
-    .await
-    .unwrap()
+    }
 }
 fn registry(state: &ControlSnapshot) -> EnrollmentRegistry {
     let ControlBootstrap::Root { enrollment, .. } = &state.state else {
@@ -90,25 +114,36 @@ fn registry(state: &ControlSnapshot) -> EnrollmentRegistry {
     };
     EnrollmentRegistry::restore(enrollment, CLUSTER, EnrollmentLimits::default()).unwrap()
 }
-/// A decision asked of the signer once more — the exact request — while the
-/// replicated root answers with a failure the founder retries (`retryable`):
-/// an invitation or an admission is answered from its committed fact on a
-/// retry and never made twice, and a call round a loaded machine outlasts is
-/// the caller's to ask again, under a counted budget.
+/// A decision asked of the signer once more — the exact request — a period
+/// of the replicas later while the replicated root answers with a failure
+/// the founder retries (`retryable`): an invitation or an admission is
+/// answered from its committed fact on a retry and never made twice, and a
+/// root between leaders decides once it has one. The asking is charged to
+/// the replicas' progress: eight asks 25 ms apart ran out while a loaded
+/// root was still electing (`NotLeader { leader: 0 }`, a peer's run of
+/// three suites at once, 2026-10-03).
 async fn decided<T>(
+    replicas: &[Running],
     mut call: impl AsyncFnMut() -> Result<T, QuorumEnrollmentError>,
 ) -> Result<T, QuorumEnrollmentError> {
-    let mut last = None;
-    for _ in 0..8 {
+    let mut wait = settling(replicas);
+    loop {
         match call().await {
             Err(QuorumEnrollmentError::Control(failure)) if retryable(failure) => {
-                last = Some(failure);
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                if let Err(spent) = wait.check(&periods(replicas)) {
+                    panic!(
+                        "the signer's decision did not settle: {spent}: {failure:?}; {:?}",
+                        replicas
+                            .iter()
+                            .map(|replica| replica.host.progress())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                tokio::time::sleep(replicas[0].host.tick_period()).await;
             }
             other => return other,
         }
     }
-    panic!("the signer's decision did not settle: {last:?}")
 }
 struct Running {
     host: ControlHost,
@@ -473,7 +508,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             .join()
             .unwrap();
     });
-    let initial = state(&adapter).await;
+    let initial = state(&adapter, &replicas).await;
     assert_eq!(initial.identity, identity);
     assert_eq!(registry(&initial).revision(), 5);
     assert_eq!(replicas[1].host.progress().leader, 2);
@@ -628,14 +663,14 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         lifetime_seconds: 600,
     };
     let (result, token) = tokio::join!(driver.run(&adapter), async {
-        let invitation = decided(async || {
+        let invitation = decided(&replicas, async || {
             signer
                 .invite(RequestId::from_u128(41), intent.clone())
                 .await
         })
         .await
         .unwrap();
-        assert_eq!(registry(&state(&adapter).await).revision(), 6);
+        assert_eq!(registry(&state(&adapter, &replicas).await).revision(), 6);
         let token = invitation.expose_token().unwrap();
         let operator = runtime(namespace);
         let ControlReadResult::Configuration(configuration) = replicas[1]
@@ -664,25 +699,9 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             .await
             .unwrap();
         // Charged to the periods the replicas run (27 §3.1 P8).
-        let periods = || -> Vec<u64> {
-            replicas
-                .iter()
-                .map(|replica| replica.host.periods())
-                .collect()
-        };
-        let deadline = || {
-            focal_timing::ProgressDeadline::begin(
-                &periods(),
-                focal_timing::ProgressDeadline::periods(
-                    Duration::from_secs(5),
-                    replicas[0].host.tick_period(),
-                ),
-                Duration::from_secs(60),
-            )
-        };
-        let mut wait = deadline();
+        let mut wait = settling(&replicas);
         while replicas[2].host.progress().leader != 3 || replicas[0].host.progress().leader != 3 {
-            if let Err(spent) = wait.check(&periods()) {
+            if let Err(spent) = wait.check(&periods(&replicas)) {
                 panic!(
                     "leadership never moved to 3: {spent}: {:?}",
                     replicas
@@ -702,14 +721,14 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         // call on to the routes, and the dead one among them is asked in
         // its turn: so without the bypass no call leaves the cursor where
         // it was, and with it a call does once the leader answers in time.
-        let mut wait = deadline();
+        let mut wait = settling(&replicas);
         loop {
             let cursor = adapter.route_cursor.load(Ordering::Relaxed);
-            state(&adapter).await;
+            state(&adapter, &replicas).await;
             if adapter.route_cursor.load(Ordering::Relaxed) == cursor {
                 break;
             }
-            if let Err(spent) = wait.check(&periods()) {
+            if let Err(spent) = wait.check(&periods(&replicas)) {
                 panic!(
                     "no call went to the known leader alone: {spent}: {:?}",
                     replicas
@@ -720,14 +739,14 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             }
         }
         replicas[0].pool.replace_routes(3, routes.clone()).unwrap();
-        decided(async || {
+        decided(&replicas, async || {
             signer
                 .invite(RequestId::from_u128(42), intent.clone())
                 .await
         })
         .await
         .unwrap();
-        assert_eq!(registry(&state(&adapter).await).revision(), 7);
+        assert_eq!(registry(&state(&adapter, &replicas).await).revision(), 7);
         signer.stop().await.unwrap();
         token
     });
@@ -745,7 +764,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         QuorumEnrollmentHost::open(authority, &staging, config, allowance.clone()).unwrap();
     let (result, ()) = tokio::join!(driver.run(&adapter), async {
         assert_eq!(
-            decided(async || {
+            decided(&replicas, async || {
                 signer
                     .invite(RequestId::from_u128(41), intent.clone())
                     .await
@@ -759,16 +778,16 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         // A tenant is admitted once under the founder authority; a retry
         // reads as done, and every certificate's grant names it from then on
         // without a restart (doc 24 §16).
-        decided(async || signer.admit_tenant([9; 16]).await)
+        decided(&replicas, async || signer.admit_tenant([9; 16]).await)
             .await
             .unwrap();
-        let view = state(&adapter).await;
+        let view = state(&adapter, &replicas).await;
         assert_eq!(registry(&view).revision(), 8);
         assert!(registry(&view).admits_tenant([9; 16]));
-        decided(async || signer.admit_tenant([9; 16]).await)
+        decided(&replicas, async || signer.admit_tenant([9; 16]).await)
             .await
             .unwrap();
-        assert_eq!(registry(&state(&adapter).await).revision(), 8);
+        assert_eq!(registry(&state(&adapter, &replicas).await).revision(), 8);
         assert!(matches!(
             signer.admit_tenant([0; 16]).await,
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Invalid))
@@ -781,7 +800,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             granted.tenants,
             BTreeSet::from([namespace.tenant, TenantId([9; 16])])
         );
-        let view = state(&adapter).await;
+        let view = state(&adapter, &replicas).await;
         assert_eq!(registry(&view).revision(), 8);
         let revoke = registry(&view)
             .prepare_revoke(receipts[0].invitation, now())

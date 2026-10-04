@@ -1482,6 +1482,11 @@ impl DurableNode {
     pub fn snapshot_index(&self) -> u64 {
         self.raw.store().snapshot_index()
     }
+    /// The index of the last entry this node's log holds, durable or not:
+    /// an append that names an entry past it is refused.
+    pub fn last_index(&self) -> Result<u64, ConsensusError> {
+        Ok(self.raw.raft.log().last_index()?)
+    }
     /// Whether the stored snapshot names every member of the configuration
     /// this node has applied. Raft discards a snapshot that does not name
     /// its recipient, so a member added after the log was compacted is

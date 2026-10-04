@@ -190,6 +190,8 @@ fn listed(reply: OwnedResponse) -> ListPage {
     }
 }
 
+#[path = "fleet_append_order_tests.rs"]
+mod append_order_tests;
 #[path = "fleet_peer_admission_tests.rs"]
 mod peer_admission_tests;
 #[path = "fleet_summary_owner_tests.rs"]

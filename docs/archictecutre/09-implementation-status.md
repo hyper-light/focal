@@ -13093,6 +13093,7 @@ from the log's first entry, and the window beyond them, as for any member.
 `a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging` fails on 27b0531
 (the leader's step refused) and passes after. PR #4's core made the split test meet it under the
 whole focal-node suite's load: 4 of 7 failed without the fix, none of 6 with it.
+
 ### 2026-10-03 — a replica refreshes a snapshot that does not name every member
 
 From 27b0531's macOS run: a drained leader's replacement stayed `Installed` for the whole
@@ -13110,3 +13111,26 @@ QUIC schedules that bring a late member up "by any leader" checkpoint every vote
 since the voter they handed leadership to had kept its log from the first entry and
 hidden the stale snapshot.
 
+### 2026-10-03 — a follower counts the refusals the order should have spared
+
+From 27b0531's ubuntu run: the lossy path's test held the refusals with appends ordered
+to one per frame let go, while one lost frame has the appends behind it refused too. A
+follower counts the refusals no loss explains (`ReplicaProgress::appends_rejected_in_order`):
+a loss — a frame let go past its patience, found stale or not stepped — is kept as the
+first index the log lacked then, and a refusal in that term whose hint falls before it is
+the loss's; a term's first exchange, an older binary's plain appends and a request for a
+snapshot are not counted either. The test asserts none, while the followers held frames.
+It no longer compares the plain run's refusals with the ordered run's: their number
+rests on load (29 on the CI, 14 on a laptop alone, none in three copies beside a suite).
+Its client asks the replica that leads at the time, pauses as the client does
+(`RetryPolicy::pause`) and charges each request's wait to the group's commits; six copies
+at once pass, their ordered bursts refusing up to 53 appends with up to 49 frames let go
+and none in order. An owner test drives the leader's own appends to a follower
+overtaken, plain and with one lost.
+
+### 2026-10-03 — the signer's decision and the root's state wait on the replicas
+
+From a peer's loaded run on PR #4's tree: the enrollment-control test asked the signer
+eight times 25 ms apart while the root was electing, and read the root's state under ten
+seconds of the clock. Both are charged to the control replicas' own periods now
+(`focal_timing::ProgressDeadline`), asked again a period of theirs later.

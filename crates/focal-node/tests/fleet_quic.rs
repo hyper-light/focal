@@ -800,47 +800,81 @@ mod relay;
 /// that loses completes the streams in any order — a datagram lost is
 /// sent again a round trip and an acknowledgement delay later, the frame
 /// behind it arriving first: an append that overtook the one before it
-/// was refused by the core and the member probed. With every connector
-/// offering what a binary before the ordered profile offered, the
-/// followers refuse appends across the lossy path; with the ordered
+/// was refused by the core and the member probed. With the ordered
 /// profile a frame that overtook another is held for it and stepped in
-/// its order, and a refusal is left only for a frame let go past its
-/// patience — the one before it lost twice, or its exchange given up —
-/// which the core judges as it did.
+/// its order, and a refusal is left only for what a loss costs — a frame
+/// let go past its patience (the one before it lost twice, or its
+/// exchange given up), found stale or not stepped, and the appends behind
+/// it until the leader sends again — and for a term's first exchange.
+/// Each follower counts the refusals that are none of those
+/// (`ReplicaProgress::appends_rejected_in_order`): there are none, while
+/// the path made the followers hold frames for the ones they overtook.
+/// With every connector offering what a binary before the ordered profile
+/// offered, the frames go plain and the burst commits as well.
+///
+/// What the test may not claim is how many appends a run refuses: how
+/// many of the frames a loss overtakes name entries their follower lacks
+/// rests on how the leader's sends fall against the path's recovery,
+/// which the machine's load moves. The plain burst's followers refused 29
+/// on the ubuntu CI of 27b0531, 14 on a laptop running the test alone and
+/// none in three copies run there at once beside a suite, whose ordered
+/// bursts held 61 to 70 frames: the count is printed, never compared. A
+/// first statement held the ordered
+/// refusals to the frames let go, one each, which a loss with appends
+/// behind it on the path passed (9 refused, 5 let go, the same CI).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peers_appends_are_stepped_in_their_order_across_a_lossy_path() {
     let plain = appends_refused_across_a_lossy_path(&[1, 2, 3]).await;
     let ordered = appends_refused_across_a_lossy_path(&[]).await;
     println!(
-        "lossy path: {} appends refused with plain frames; {} with ordered ones, {} held, {} let go past their patience",
-        plain.refused, ordered.refused, ordered.held, ordered.let_go
+        "lossy path: {} appends refused with plain frames; {} with ordered ones ({} in order), {} held, {} let go past their patience",
+        plain.refused, ordered.refused, ordered.in_order, ordered.held, ordered.let_go
     );
     assert!(
-        plain.refused > 0,
-        "the path reordered nothing: the test has no teeth"
+        ordered.held > 0,
+        "the path made no ordered frame overtake another: the test has no teeth"
     );
-    assert!(
-        ordered.refused <= ordered.let_go,
-        "an ordered frame was refused for overtaking within its patience: {} refused, {} let go",
-        ordered.refused,
-        ordered.let_go
-    );
-    assert!(
-        ordered.refused < plain.refused,
-        "the order kept spared the group nothing: {} refused against {}",
-        ordered.refused,
-        plain.refused
+    assert_eq!(
+        ordered.in_order, 0,
+        "an ordered frame was refused for overtaking within its patience: {} of {} refused, {} let go",
+        ordered.in_order, ordered.refused, ordered.let_go
     );
 }
-/// What the followers did with a burst's appends across a path (the
-/// leader excluded).
+/// What the replicas did, while they followed, with a burst's appends
+/// across a path.
 struct Refusals {
     /// Appends refused for not holding the entry before them.
     refused: u64,
+    /// Of those, the ones the order should have spared
+    /// (`ReplicaProgress::appends_rejected_in_order`).
+    in_order: u64,
     /// Frames held for the one they overtook.
     held: u64,
     /// Frames let go past their patience or their lane.
     let_go: u64,
+}
+/// The actor's connection in `slot` to `replica`, opened where none is
+/// held; none while it cannot be opened, which the caller waits out as a
+/// leader not there.
+async fn actor_connection(
+    fleet: &Fleet,
+    held: &std::sync::Mutex<Vec<Option<QuicRemote>>>,
+    replica: usize,
+    slot: usize,
+) -> Option<QuicRemote> {
+    if let Some(remote) = held.lock().unwrap()[slot].clone() {
+        return Some(remote);
+    }
+    let remote = fleet
+        .actor_connector
+        .connect(
+            fleet.replicas[replica].server.local_addr().unwrap(),
+            &fleet.routes[&(replica as u64 + 1)].server_name,
+        )
+        .await
+        .ok()?;
+    held.lock().unwrap()[slot] = Some(remote.clone());
+    Some(remote)
 }
 /// The appends the followers refused while a burst of entries crossed a
 /// path of 5 ms each way that loses one datagram in fifty, the connectors
@@ -877,26 +911,31 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
     // jittered path completes them in any order. Each request is asked
     // again, exactly, until its commit is answered: an owner that the path
     // keeps waiting past its request time answers that it cannot know yet,
-    // and the exact retry finds the receipt (27 §3.1).
+    // and the exact retry finds the receipt (27 §3.1). Every attempt goes
+    // to the replica that leads at the time, as the client follows a leader
+    // that moved, over eight connections opened to it when it first leads
+    // and again where one is lost: a test that asked the first leader alone
+    // waited out its budget on a follower when leadership moved under load.
     const CONNECTIONS: u128 = 8;
-    let endpoint = fleet.routes[&(leader as u64 + 1)].clone();
-    let mut actors = Vec::new();
-    for _ in 0..CONNECTIONS {
-        actors.push(
-            fleet
-                .actor_connector
-                .connect(
-                    fleet.replicas[leader].server.local_addr().unwrap(),
-                    &endpoint.server_name,
-                )
-                .await
-                .unwrap(),
-        );
-    }
+    let held = std::sync::Mutex::new(vec![
+        None;
+        fleet.replicas.len()
+            * usize::try_from(CONNECTIONS).unwrap()
+    ]);
+    let held = &held;
+    let fleet_ref = &fleet;
     let replicas = &fleet.replicas;
+    // A refused attempt is asked again after the pause the client itself
+    // takes (`RetryPolicy::pause`, the audit's F64): its exponential step
+    // spread by full jitter. A fixed pause kept every refused request in
+    // step with the others: under load a request whose turn fell just
+    // after each slot freed lost every one, refused `Capacity` for its
+    // whole budget while the rest committed (six copies at once, all six).
+    let policy = focal_client::RetryPolicy::default();
+    let policy = &policy;
     let asked: Vec<_> = (1..=BURST)
         .map(|epoch| {
-            let actor = actors[usize::try_from(epoch % CONNECTIONS).unwrap()].clone();
+            let connection = usize::try_from(epoch % CONNECTIONS).unwrap();
             async move {
                 tokio::time::sleep((TICK / 2).saturating_mul(u32::try_from(epoch).unwrap())).await;
                 // Each request opens the principal's epoch under its own
@@ -908,25 +947,56 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                         epoch: RequestEpoch(1),
                     },
                 );
-                // Asked again until committed, charged to the replicas'
-                // own periods: what a minute holds at their tick, however
-                // long a loaded runner takes (a macOS run spent sixty
-                // seconds of the clock on one entry, 2026-10-03). A leader
-                // without the room is asked again a period later, never in
-                // a loop that keeps it busy refusing.
+                // Asked again until committed, the wait charged to what it
+                // waits on — the group committing the entries before it: its
+                // budget, what a minute holds at the replicas' tick, runs
+                // only while no replica's sequence advances. A loaded runner
+                // commits slowly and a request refused for the room waits
+                // for those ahead of it; charged to the periods alone, six
+                // copies at once (a group committing six entries a second)
+                // spent the budget of the earliest requests while the burst
+                // went on committing. Each restart takes a commit, so the
+                // burst's entries bound them. A leader without the room is
+                // asked again after the client's pause, never in a loop that
+                // keeps it busy refusing.
                 let periods = || -> Vec<u64> {
                     replicas.iter().map(|replica| replica.host.periods()).collect()
                 };
-                let mut wait = focal_timing::ProgressDeadline::begin(
-                    &periods(),
-                    focal_timing::ProgressDeadline::periods(Duration::from_secs(60), TICK),
-                    FROZEN,
-                );
+                let committed = || {
+                    replicas
+                        .iter()
+                        .map(|replica| replica.host.progress().sequence)
+                        .max()
+                        .unwrap_or_default()
+                };
+                let budget =
+                    focal_timing::ProgressDeadline::periods(Duration::from_secs(60), TICK);
+                let mut wait = focal_timing::ProgressDeadline::begin(&periods(), budget, FROZEN);
+                let mut seen = committed();
+                let mut backoffs = 0u32;
                 loop {
-                    let answer = match actor.request(&envelope).await {
-                        Ok(answer) => answer.result,
-                        Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
-                        Err(error) => panic!("entry {epoch}: {error:?}"),
+                    let leading = replicas
+                        .iter()
+                        .position(|replica| {
+                            let progress = replica.host.progress();
+                            progress.node == progress.leader
+                        })
+                        .unwrap_or(leader);
+                    let slot = leading * usize::try_from(CONNECTIONS).unwrap() + connection;
+                    let actor = actor_connection(fleet_ref, held, leading, slot).await;
+                    let answer = match actor {
+                        Some(actor) => match actor.request(&envelope).await {
+                            Ok(answer) => answer.result,
+                            Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
+                            // A connection lost is opened again for the next
+                            // attempt, which waits as for a leader not there.
+                            Err(WireError::Connection) => {
+                                held.lock().unwrap()[slot] = None;
+                                Response::Error(AccessError::Unavailable)
+                            }
+                            Err(error) => panic!("entry {epoch}: {error:?}"),
+                        },
+                        None => Response::Error(AccessError::Unavailable),
                     };
                     match answer {
                         Response::Submitted(MutationReply::Committed(receipt)) => return receipt,
@@ -935,28 +1005,56 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                             | AccessError::Unavailable
                             | AccessError::Capacity),
                         ) => {
+                            let now = committed();
+                            if now > seen {
+                                seen = now;
+                                wait = focal_timing::ProgressDeadline::begin(
+                                    &periods(),
+                                    budget,
+                                    FROZEN,
+                                );
+                            }
                             if let Err(spent) = wait.check(&periods()) {
-                                let state: Vec<_> = replicas
-                                    .iter()
-                                    .map(|replica| {
-                                        let progress = replica.host.progress();
-                                        (
-                                            progress.node,
-                                            progress.leader,
-                                            progress.sequence,
-                                            progress.frames_held,
-                                            progress.frames_let_go,
-                                            progress.appends_rejected,
-                                            progress.peers_unreachable,
-                                        )
-                                    })
-                                    .collect();
+                                // Where each replica stood, with what its
+                                // session still waits to commit.
+                                let mut state = Vec::new();
+                                for replica in replicas {
+                                    let progress = replica.host.progress();
+                                    let pending = replica
+                                        .host
+                                        .diagnostics()
+                                        .await
+                                        .map(|reply| {
+                                            let value = reply.value();
+                                            (
+                                                value.pending,
+                                                value.persistence_pending,
+                                                value.checkpoint_pending,
+                                                value.applied_index,
+                                                value.committed_index,
+                                            )
+                                        })
+                                        .ok();
+                                    state.push((
+                                        progress.node,
+                                        progress.leader,
+                                        progress.term,
+                                        progress.role,
+                                        progress.sequence,
+                                        pending,
+                                        progress.frames_held,
+                                        progress.frames_let_go,
+                                        progress.appends_rejected,
+                                        progress.peers_unreachable,
+                                    ));
+                                }
                                 panic!(
-                                    "entry {epoch}: {refused:?} after {spent}; (node, leader, sequence, held, let go, rejected, unreachable): {state:?}"
+                                    "entry {epoch}: {refused:?} after {spent}; (node, leader, term, role, sequence, (pending, persisting, checkpointing, applied, committed), held, let go, rejected, unreachable): {state:?}"
                                 );
                             }
                             if !matches!(refused, AccessError::OutcomeUnknown) {
-                                tokio::time::sleep(TICK).await;
+                                tokio::time::sleep(policy.pause(backoffs)).await;
+                                backoffs = backoffs.saturating_add(1);
                             }
                         }
                         other => panic!("entry {epoch}: {other:?}"),
@@ -972,17 +1070,18 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
         .await;
     let mut refusals = Refusals {
         refused: 0,
+        in_order: 0,
         held: 0,
         let_go: 0,
     };
     let mut lost = 0;
-    for (index, replica) in fleet.replicas.iter().enumerate() {
+    // Every replica's, leadership having possibly moved: what a replica
+    // refused or held it did while it followed.
+    for replica in &fleet.replicas {
         let progress = replica.host.progress();
         lost += progress.peers_unreachable + progress.dropped_replication;
-        if index == leader {
-            continue;
-        }
         refusals.refused += progress.appends_rejected;
+        refusals.in_order += progress.appends_rejected_in_order;
         refusals.held += progress.frames_held;
         refusals.let_go += progress.frames_let_go;
     }
@@ -1101,6 +1200,38 @@ async fn change_on_leader(
         }
     }
 }
+/// Checkpoint every voter, the leader of the moment last; returns which
+/// replica that was. Each compacts its log behind a snapshot of its own,
+/// as the cadence does on every replica: a voter that leads after a
+/// hand-off seeds a late member from its own snapshot, not from a log kept
+/// from the first entry. The leader after a drained one had compacted its
+/// own (macOS CI at 27b0531); the voter these tests handed leadership to
+/// had not, and brought the member up by appends, hiding that its snapshot
+/// would not have named it.
+async fn checkpoint_every_voter(fleet: &Fleet) -> usize {
+    let (leader, view) = membership_on_leader(fleet).await;
+    for voter in view.view().configuration.voters.clone() {
+        let replica = usize::try_from(voter - 1).unwrap();
+        if replica == leader {
+            continue;
+        }
+        let mut moved = 0;
+        loop {
+            match fleet.replicas[replica].host.checkpoint().await {
+                Ok(()) => break,
+                Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                    moved += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!(
+                    "checkpoint of {replica}: {error}; replicas={:?}",
+                    fleet.diagnostics()
+                ),
+            }
+        }
+    }
+    checkpoint_on_leader(fleet).await
+}
 /// Checkpoint on the leader of the moment; returns which replica did.
 async fn checkpoint_on_leader(fleet: &Fleet) -> usize {
     let mut moved = 0;
@@ -1200,38 +1331,6 @@ async fn applied_at_least(fleet: &Fleet, replica: usize, index: u64, native: boo
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-/// Checkpoint every voter, the leader of the moment last; returns which
-/// replica that was. Each compacts its log behind a snapshot of its own,
-/// as the cadence does on every replica: a voter that leads after a
-/// hand-off seeds a late member from its own snapshot, not from a log kept
-/// from the first entry. The leader after a drained one had compacted its
-/// own (macOS CI at 27b0531); the voter these tests handed leadership to
-/// had not, and brought the member up by appends, hiding that its snapshot
-/// would not have named it.
-async fn checkpoint_every_voter(fleet: &Fleet) -> usize {
-    let (leader, view) = membership_on_leader(fleet).await;
-    for voter in view.view().configuration.voters.clone() {
-        let replica = usize::try_from(voter - 1).unwrap();
-        if replica == leader {
-            continue;
-        }
-        let mut moved = 0;
-        loop {
-            match fleet.replicas[replica].host.checkpoint().await {
-                Ok(()) => break,
-                Err(LedgerError::NotReady { .. }) if moved < 40 => {
-                    moved += 1;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(error) => panic!(
-                    "checkpoint of {replica}: {error}; replicas={:?}",
-                    fleet.diagnostics()
-                ),
-            }
-        }
-    }
-    checkpoint_on_leader(fleet).await
-}
     .await
     .unwrap_or_else(|_| {
         panic!(
