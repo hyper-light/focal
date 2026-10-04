@@ -1,6 +1,6 @@
 //! Owned root/partition metadata replicas. Authentication selects the namespace;
 //! durable Raft publication completes writes and quorum barriers complete reads.
-use focal_consensus::{PbMessageExt, StateRole};
+use focal_consensus::StateRole;
 use focal_control::*;
 use focal_directory::AuthorityVerifier;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
@@ -2187,8 +2187,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         node: u64,
     ) -> Result<(), ControlError> {
         for message in messages {
-            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32
-                && message.reject
+            if message.msg_type == focal_consensus::MessageType::MsgAppendResponse && message.reject
             {
                 self.appends_rejected = self.appends_rejected.saturating_add(1);
             }
@@ -2197,11 +2196,14 @@ impl<V: AuthorityVerifier> Owner<V> {
             let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
-                    if message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32 {
+                    if message.msg_type == focal_consensus::MessageType::MsgSnapshot {
                         self.replica.report_snapshot_at(
                             message.to,
                             message.term,
-                            message.get_snapshot().get_metadata().index,
+                            message
+                                .snapshot
+                                .as_deref()
+                                .map_or(0, focal_consensus::snapshot_index),
                             focal_consensus::SnapshotStatus::Failure,
                         )?;
                     }
@@ -2209,10 +2211,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                     continue;
                 }
             };
-            let Some(bytes) = (message.compute_size() as usize)
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(4096))
-            else {
+            // A message the core made that raft-rs's encoding cannot state
+            // is a fault of this replica, as a failed encoding was.
+            let length = focal_consensus::envelope::message_len(&message)
+                .map_err(|_| ControlError::Failed)?;
+            let Some(bytes) = length.checked_mul(2).and_then(|n| n.checked_add(4096)) else {
                 return Err(ControlError::Capacity);
             };
             let Ok(charge) =
@@ -2225,7 +2228,8 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
-            let encoded = message.write_to_bytes().map_err(|_| ControlError::Failed)?;
+            let encoded =
+                focal_consensus::encode_message(&message).map_err(|_| ControlError::Failed)?;
             if encoded
                 .len()
                 .checked_add(256)

@@ -40,7 +40,7 @@
 //! group has not told it again.
 use super::*;
 use focal_log::WalAppend;
-use focal_raft::{LightReady, Ready, proto};
+use hyper_raft::{LightReady, Ready, proto};
 use storage::PreparedUpdate;
 
 pub(super) struct PendingDrain {
@@ -139,7 +139,7 @@ impl DurableNode {
         let Some(pending) = self.persistence.as_mut() else {
             return Ok(None);
         };
-        let snapshot = MessageType::MsgSnapshot as i32;
+        let snapshot = MessageType::MsgSnapshot;
         let count = pending
             .events
             .messages
@@ -292,7 +292,7 @@ impl DurableNode {
                 .fold(0usize, |added, entry| {
                     added.saturating_add(memory::members_added(entry, tracker))
                 })
-                .min(focal_raft::MAX_MEMBERS);
+                .min(hyper_raft::MAX_MEMBERS);
             let bytes = memory::staging_bytes(&self.raw, &self.config, 0, joining)?;
             // Nothing has been taken from Raft yet: a refused staging reservation
             // leaves the replica exactly as it was, so the caller retries once
@@ -433,7 +433,7 @@ impl DurableNode {
                                     "a term or a vote in a ready that asks for no write",
                                 ));
                             }
-                            self.raw.store_mut().hard_state = hs.clone();
+                            self.raw.store_mut().hard_state = *hs;
                             self.commit_unwritten = true;
                         }
                         Self::release(&mut ready, &mut pending.events);
@@ -457,17 +457,17 @@ impl DurableNode {
                     };
                     let hard_state = match (ready.hard_state(), sole_commit) {
                         (Some(hs), sole) => {
-                            let mut hs = hs.clone();
+                            let mut hs = *hs;
                             hs.commit = hs.commit.max(sole.unwrap_or(0));
                             Some(hs)
                         }
                         (None, Some(commit)) => {
-                            let mut hs = self.raw.store().hard_state.clone();
+                            let mut hs = self.raw.store().hard_state;
                             hs.commit = hs.commit.max(commit);
                             Some(hs)
                         }
                         (None, None) if self.commit_unwritten || !held.is_empty() => {
-                            Some(self.raw.store().hard_state.clone())
+                            Some(self.raw.store().hard_state)
                         }
                         (None, None) => None,
                     };
@@ -696,7 +696,7 @@ impl DurableNode {
             self.finish_light(light, events, delivered)?;
             return Ok(Phase::Start);
         }
-        let mut hard_state = self.raw.store().hard_state.clone();
+        let mut hard_state = self.raw.store().hard_state;
         hard_state.commit = hard_state
             .commit
             .max(light.commit_index().unwrap_or(0))
@@ -756,7 +756,7 @@ impl DurableNode {
         if !self.commit_unwritten {
             return Ok(());
         }
-        let hard_state = self.raw.store().hard_state.clone();
+        let hard_state = self.raw.store().hard_state;
         let record = proto_record(
             self.config.group_id,
             RecordKind::HardState,

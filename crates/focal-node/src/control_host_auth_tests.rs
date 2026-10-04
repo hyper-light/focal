@@ -100,13 +100,13 @@ async fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_
     let revoke = revocation(&network);
     let group = network.control.identity().group;
     let mut message = focal_consensus::Message::default();
-    message.set_msg_type(focal_consensus::MessageType::MsgHeartbeatResponse);
+    message.msg_type = focal_consensus::MessageType::MsgHeartbeatResponse;
     message.from = network.directory.identity().node;
     message.to = message.from;
     message.term = network.control.status().term;
     let raft_operation = Operation::Raft {
         group,
-        message: message.write_to_bytes().unwrap(),
+        message: focal_consensus::encode_message(&message).unwrap(),
     };
     // Both requests pass transport verification before revocation. The registry
     // intentionally remains stale: only the owner sees the committed change.

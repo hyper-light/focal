@@ -1,13 +1,13 @@
-//! Accounting for owned Prost/Raft buffers. Retained bytes use actual capacities;
+//! Accounting for owned Raft buffers. Retained bytes use actual capacities;
 //! each mutation first reserves clone/fanout headroom before entering Raft.
 use crate::{ConsensusError, Entry, Message, NodeConfig, NodeEvents, Snapshot, storage::RamLog};
 use focal_memory::{
     ALLOCATOR_OVERHEAD as OVERHEAD, Allocation, BudgetKind, BudgetLane, MemoryBudget,
 };
-use focal_raft::{
+use hyper_raft::{
     MAX_MEMBERS, Outgoing, Raft, RawNode, Storage,
     progress::{Progress, Tracker},
-    proto::{self, ConfState, EntryType, HardState},
+    proto::{self, ConfChangeType, ConfState, HardState},
 };
 use std::mem::size_of;
 
@@ -52,11 +52,11 @@ pub(super) fn member_bytes(window: usize) -> Result<usize, ConsensusError> {
 /// their lists: the Ready (four lists and the light Ready's two), the
 /// events (five), the drain's phase, the records list and the append's
 /// receipt, the hard and soft states.
-const TRANSITION_BYTES: usize = size_of::<focal_raft::Ready>()
+const TRANSITION_BYTES: usize = size_of::<hyper_raft::Ready>()
     + size_of::<NodeEvents>()
     + size_of::<crate::persistence::PendingDrain>()
     + size_of::<HardState>()
-    + size_of::<focal_raft::SoftState>()
+    + size_of::<hyper_raft::SoftState>()
     + 13 * OVERHEAD;
 /// One record a transition appends, beyond its payload: the record and the
 /// bookkeeping of its payload buffer.
@@ -114,7 +114,7 @@ pub(super) fn entry_bytes(entry: &Entry) -> Result<usize, ConsensusError> {
     )
 }
 pub(super) fn snapshot_bytes(snapshot: &Snapshot) -> Result<usize, ConsensusError> {
-    let conf = snapshot.get_metadata().get_conf_state();
+    let conf = crate::conf_of(crate::metadata_of(snapshot));
     let members = [
         conf.voters.capacity(),
         conf.voters_outgoing.capacity(),
@@ -140,8 +140,9 @@ pub(super) fn message_bytes(message: &Message) -> Result<usize, ConsensusError> 
     for entry in &message.entries {
         bytes = add(bytes, entry_bytes(entry)?)?;
     }
-    if !message.get_snapshot().is_empty() {
-        bytes = add(bytes, snapshot_bytes(message.get_snapshot())?)?;
+    // A snapshot rides boxed, held whenever the message carries one.
+    if let Some(snapshot) = message.snapshot.as_deref() {
+        bytes = add(bytes, snapshot_bytes(snapshot)?)?;
     }
     Ok(bytes)
 }
@@ -234,6 +235,9 @@ pub(super) fn initial_bytes(config: &NodeConfig) -> Result<usize, ConsensusError
 /// may be, as many pages as its window admits: its places, and no more
 /// pages than hold the bytes it is bounded by and one page beyond them
 /// (`Inflights::full`: what is sent passes the bound by one entry at most).
+/// A member behind the log is sent the snapshot, or, once its answer says
+/// it holds the snapshot, the pages from the log's first entry: the larger
+/// of the two, and the window beyond the first page as for any member.
 /// Pages are read from the running totals the storage keeps beside its
 /// entries; the entries not yet durable are counted whole when a page
 /// reaches them. Nothing is walked but the members.
@@ -282,13 +286,12 @@ fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
         }
         // A member's answer may reject what was sent and move its next
         // index back to what it is known to hold: the page is priced from
-        // its matched index, the lowest an answer can reset it to; below
-        // the log, the snapshot.
+        // its matched index, the lowest an answer can reset it to. Below
+        // the log, the snapshot; and the answer that it holds the snapshot
+        // moves it to the log's first entry, whose pages may be larger.
         let from = progress.matched.saturating_add(1).min(progress.next_index);
-        if progress.pending_request_snapshot != 0 || from < first {
-            pages = add(pages, snapshot)?;
-            continue;
-        }
+        let behind = progress.pending_request_snapshot != 0 || from < first;
+        let from = if behind { first } else { from };
         // An answer may make the member one that is sent ahead of its
         // answers, with an empty window: priced by the bound, not by what
         // is left of it.
@@ -301,7 +304,7 @@ fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
         let admitted = window.min(usize::try_from(bounded).unwrap_or(usize::MAX));
         let one = pages_from(from, 1)?;
         let all = pages_from(from, admitted)?;
-        pages = add(pages, one)?;
+        pages = add(pages, if behind { one.max(snapshot) } else { one })?;
         window_more = window_more.max(all.saturating_sub(one));
     }
     add(pages, window_more)
@@ -384,65 +387,25 @@ pub(super) fn staging_bytes(
     let records = mul(add(log.unstable().entries().len(), 2)?, RECORD_BYTES)?;
     add(add(bytes, records)?, TRANSITION_BYTES)
 }
-/// Whether a change of `kind` (`ConfChangeType`) names `member` as a new
-/// voter or learner the core does not track.
-fn adds_member(kind: u64, member: u64, tracker: &Tracker) -> bool {
-    const ADD_NODE: u64 = 0;
-    const ADD_LEARNER_NODE: u64 = 2;
-    (kind == ADD_NODE || kind == ADD_LEARNER_NODE) && member != 0 && tracker.get(member).is_none()
-}
-/// The type (`kind_field`) and the member (`member_field`) one encoded
-/// change names.
-fn change_named(
-    bytes: &[u8],
-    kind_field: u64,
-    member_field: u64,
-) -> Result<(u64, u64), ConsensusError> {
-    let (mut kind, mut member) = (0u64, 0u64);
-    fields(bytes, |field, wire, value, _| {
-        if wire == 0 {
-            if field == kind_field {
-                kind = value;
-            }
-            if field == member_field {
-                member = value;
-            }
-        }
-        Ok(())
-    })?;
-    Ok((kind, member))
-}
 /// The members a committed change adds that the core does not track yet,
-/// counted from the change's bytes without decoding it into anything: a
-/// `ConfChangeV2`'s `changes` (field 2), each a `ConfChangeSingle` of type
-/// (field 1) `AddNode` or `AddLearnerNode` and member (field 2); or a
-/// `ConfChange`'s one (type field 2, member field 3). A change that does
-/// not decode adds no one here: the core refuses it when it is applied.
+/// counted from the change's record as the core holds it, read in place
+/// (`hyper_raft::wire::changes_stated`): each change of kind `AddNode` or
+/// `AddLearnerNode` naming a member the tracker lacks. A change that does
+/// not read adds no one here: the core refuses it when it is applied.
 pub(super) fn members_added(entry: &Entry, tracker: &Tracker) -> usize {
-    let mut added = 0usize;
-    let walked = match proto::entry_type(entry) {
-        Some(EntryType::EntryConfChange) => {
-            change_named(&entry.data, 2, 3).map(|(kind, member)| {
-                if adds_member(kind, member, tracker) {
-                    added = 1;
-                }
-            })
-        }
-        Some(EntryType::EntryConfChangeV2) => fields(&entry.data, |field, wire, _, single| {
-            if field == 2 && wire == 2 {
-                let (kind, member) = change_named(single, 1, 2)?;
-                if adds_member(kind, member, tracker) {
-                    added = added.saturating_add(1);
-                }
-            }
-            Ok(())
-        }),
-        _ => Ok(()),
-    };
-    if walked.is_err() {
+    let Ok(changes) = hyper_raft::wire::changes_stated(entry) else {
         return 0;
-    }
-    added.min(MAX_MEMBERS)
+    };
+    changes
+        .filter(|change| {
+            matches!(
+                change.change_type,
+                ConfChangeType::AddNode | ConfChangeType::AddLearnerNode
+            ) && change.node_id != 0
+                && tracker.get(change.node_id).is_none()
+        })
+        .count()
+        .min(MAX_MEMBERS)
 }
 
 fn varint(input: &mut &[u8]) -> Result<u64, ConsensusError> {
@@ -625,7 +588,7 @@ mod tests {
         DurableNode,
         tests::{Cluster, config},
     };
-    use focal_raft::StateRole;
+    use hyper_raft::StateRole;
 
     /// A change naming the most members the core admits — which it then
     /// refuses, the group holding three — is priced by what the transition

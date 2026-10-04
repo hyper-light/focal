@@ -289,14 +289,14 @@ impl Cluster {
                     continue;
                 }
                 if self.hold_appends_to == Some(to)
-                    && (message.msg_type == MessageType::MsgAppend as i32
-                        || message.msg_type == MessageType::MsgSnapshot as i32)
+                    && (message.msg_type == MessageType::MsgAppend
+                        || message.msg_type == MessageType::MsgSnapshot)
                 {
                     self.held.push(message);
                     continue;
                 }
                 delivered = true;
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 match self.node(to).step(message) {
                     Ok(()) => {}
                     Err(LedgerError::NativeUnsupported) => {

@@ -150,7 +150,7 @@ fn transitioned_recovery_requires_the_complete_pair_before_any_participation() {
         term: 99,
         ..Default::default()
     };
-    vote.set_msg_type(MessageType::MsgRequestVote);
+    vote.msg_type = MessageType::MsgRequestVote;
     assert!(matches!(
         node.step(vote),
         Err(ConsensusError::DecoderUnconfirmed)

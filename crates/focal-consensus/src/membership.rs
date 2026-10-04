@@ -149,12 +149,10 @@ impl MembershipChange {
             Self::LeaveJoint => None,
         };
         if let Some((node_id, kind)) = member {
-            let mut member = ConfChangeSingle {
+            change.changes.push(ConfChangeSingle {
+                change_type: kind,
                 node_id,
-                ..Default::default()
-            };
-            member.set_change_type(kind);
-            change.changes.push(member);
+            });
         }
         change
     }

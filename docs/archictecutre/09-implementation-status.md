@@ -13054,3 +13054,34 @@ judgement after the last of them. The judgement names its rule (`GiveUp::{Quiet,
 Withheld}`), the connection counts the bodies given up by each (`QuicRemote::given_up`),
 and the test takes either, a quiet one only where its samples, by their own spacing,
 cannot rule it out.
+
+
+### 2026-10-03 — a member past a small snapshot is staged for what follows it
+
+Found from PR #4's CI, where on macOS and Windows the split test's member seated after the
+split never caught up, and present on this core too. The destination's founder sent the member
+the snapshot, and the member's answer that it held it was refused: the step's reservation could
+not hold what the transition left. The core had queued the entries after the snapshot for the
+member, and the leader stopped itself (`Capacity`, then failed until reopened). The staging
+(`memory::sends_bytes`) priced a member behind the log's start as the snapshot alone. The answer
+that says the member holds the snapshot moves it to the log's first entry, and its page, and
+the window beyond it, are sent in that transition. A one-byte snapshot with pages of entries
+behind it is enough. Now such a member is priced at the larger of the snapshot and the pages
+from the log's first entry, and the window beyond them, as for any member.
+`a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging` fails on 27b0531
+(the leader's step refused) and passes after. PR #4's core made the split test meet it under the
+whole focal-node suite's load: 4 of 7 failed without the fix, none of 6 with it.
+
+### 2026-10-03 — the core is hyper-raft's
+
+focal runs the shared repository's core ([27](27-consensus-roadmap-and-slates-port.md) §14):
+`hyper-raft` and `hyper-timing` vendored under `vendor/` (`SNAPSHOT`), `crates/focal-raft`
+removed, its suites and its differential against raft-rs in the shared repository. No byte focal
+writes changes: `focal-consensus`'s envelope (`src/envelope.rs`) writes the core's values exactly
+as raft-proto's prost codec did and reads what any protocol-buffer reader reads, translating a
+change of configuration's data between raft-rs's encoding and the core's record; no
+protocol-buffer runtime ships, and `raft-proto` is the test oracle (4,096 generated values of each
+type equal to its bytes, every prefix and one-byte mutation read alike). The accounting reads a
+committed change in place through `hyper_raft::wire::changes_stated`. Every crate's suite passes
+on it; the types are the core's (typed kinds), and the tests that sent a kind no message has now
+send it as raft-rs writes it, refused by the envelope.

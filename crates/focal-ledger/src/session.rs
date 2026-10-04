@@ -2123,11 +2123,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.pending_count(), 1);
         assert!(s.memory_stats().used > baseline);
-        let mut heartbeat = Message::default();
-        heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-        heartbeat.from = 2;
-        heartbeat.to = 1;
-        heartbeat.term = s.status().term + 1;
+        let heartbeat = Message {
+            msg_type: focal_consensus::MessageType::MsgHeartbeat,
+            from: 2,
+            to: 1,
+            term: s.status().term + 1,
+            ..Message::default()
+        };
         s.step(heartbeat).unwrap();
         drop(s.poll().unwrap());
         assert_eq!(s.status().role, StateRole::Follower);
