@@ -318,6 +318,7 @@ fn message(rng: &mut Seeded) -> Message {
         request_snapshot: number(rng),
         reject: rng.below(2) == 1,
         lost: false,
+        kept: false,
         reject_hint: number(rng),
         context: bytes(rng),
         priority,
@@ -527,5 +528,11 @@ fn what_no_raft_rs_message_holds_is_refused() {
     assert_eq!(
         encode_message(&lost),
         Err(EnvelopeError::Unstated("a member's mark"))
+    );
+    let mut kept = message(&mut Seeded::new(4));
+    kept.kept = true;
+    assert_eq!(
+        encode_message(&kept),
+        Err(EnvelopeError::Unstated("an append kept ahead of a hole"))
     );
 }

@@ -8,32 +8,79 @@ use super::*;
 /// The core's settings for a member under `config` that applied through `applied`: one set, so
 /// that a member opened over either backend elects, replicates and admits as the other does.
 pub(crate) fn raft_config(config: &NodeConfig, applied: u64) -> Result<Config, ConsensusError> {
+    let page = (config.max_entry_bytes as u64).saturating_add(1024);
     let raft_config = Config {
         election_tick: config.election_tick,
         heartbeat_tick: config.heartbeat_tick,
         applied,
-        max_size_per_msg: (config.max_entry_bytes as u64).saturating_add(1024),
+        max_size_per_msg: page,
         max_inflight_msgs: config.max_inflight_messages,
         // Until its owner says what the path to a member carries
         // (`set_inflight_bytes`), a member is sent one page ahead of its
         // answers: the least that always makes progress.
-        max_inflight_bytes: (config.max_entry_bytes as u64).saturating_add(1024),
+        max_inflight_bytes: page,
         max_uncommitted_size: config.max_uncommitted_bytes,
         max_committed_size_per_ready: COMMITTED_PAGE_BYTES,
         check_quorum: true,
         pre_vote: true,
         fast: config.fast,
+        // A member that kept an append ahead of a hole says so in its refusal (`Message::kept`,
+        // R17), which raft-rs's encoding, the one focal's peers speak until the upgrade fence opens
+        // a successor (18 §1), cannot state. So a member refuses such an append and keeps nothing,
+        // raft-rs's rule, and the envelope refuses a `kept` it is ever given.
+        ahead: hyper_raft::Ahead::Refused,
         seed: election_seed(config),
         limits: Limits {
             // Reads are admitted against the window (`check_read`); the
             // core's own bound is the same and never the first met.
             pending_reads: config.max_inflight_messages.saturating_add(1),
-            ..Limits::default()
+            ..limits(config, page)?
         },
-        ..Config::new(config.node_id)
+        ..Config::new(config.node_id, limits(config, page)?)
     };
     raft_config.validate()?;
     Ok(raft_config)
+}
+
+/// What a member under `config` states to the core (`hyper_raft::Limits::derive`), each input from
+/// focal's own bounds, so that no bound of the core is chosen apart from them:
+/// - its largest message is an append. The core takes entries while their encoding fits a page
+///   and always at least one, and an entry is at most `max_entry_bytes` with its fixed bytes, inside
+///   the record's fixed bytes;
+/// - the members a configuration names are [`MAX_MEMBERS`], focal's bound;
+/// - each queue holds what one ready of these settings holds, counted resident: a leader's
+///   uncommitted bytes or the pages in flight to a member, and one entry past either, as the most
+///   entries they carry, each at least its fixed bytes, at an entry's bytes in memory each. So a
+///   member always holds a leader's message whole;
+/// - one write is out, which the shell raises to its store's depth.
+fn limits(config: &NodeConfig, page: u64) -> Result<Limits, ConsensusError> {
+    use hyper_raft::wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES};
+    let unfit =
+        || ConsensusError::Configuration("capacity limits past what this machine addresses");
+    let entry = config
+        .max_entry_bytes
+        .checked_add(ENTRY_FIXED_BYTES)
+        .ok_or_else(unfit)?;
+    let page = usize::try_from(page).map_err(|_| unfit())?;
+    let message = page
+        .max(entry)
+        .checked_add(MESSAGE_RECORD_FIXED_BYTES)
+        .ok_or_else(unfit)?;
+    let uncommitted = usize::try_from(config.max_uncommitted_bytes).map_err(|_| unfit())?;
+    let memory = config
+        .max_inflight_messages
+        .checked_mul(page)
+        .map(|inflight| inflight.max(uncommitted))
+        .and_then(|bytes| bytes.checked_add(config.max_entry_bytes))
+        .and_then(|bytes| bytes.checked_div(ENTRY_FIXED_BYTES))
+        .and_then(|entries| entries.checked_mul(std::mem::size_of::<proto::Entry>()))
+        .ok_or_else(unfit)?;
+    Ok(Limits::derive(hyper_raft::Stated {
+        message,
+        members: MAX_MEMBERS,
+        memory,
+        depth: 1,
+    })?)
 }
 
 /// Refused while the core's term or its log's last index has nowhere to go.
@@ -320,9 +367,18 @@ pub(crate) fn snapshot_still_pending<S: Storage>(
             .is_some_and(|progress| progress.pending_snapshot == index)
 }
 
-/// Whether the commit is of the member's current term: a leader completes a quorum read only
-/// once it has committed an entry in its term.
+/// Whether the commit is of the member's current term: a leader completes a quorum read only once
+/// it has committed the entry it began its term with; any other member, once the entry committed
+/// is of its term.
 pub(crate) fn committed_in_term<S: Storage>(raw: &RawNode<S>) -> bool {
+    if raw.raft.state() == StateRole::Leader {
+        // A leader of a fast group takes what its voters approved into its log under its own term,
+        // below an index a fast quorum may have committed before its term began. An entry of its
+        // term committed is then no proof that the commit covers what came before the term, so it
+        // waits for the entry it began its term with (Ongaro's thesis §6.4; hyper-raft S-4,
+        // `Raft::commit_to_current_term`).
+        return raw.raft.commit_to_current_term();
+    }
     raw.store()
         .term(raw.raft.log().committed())
         .is_ok_and(|term| term == raw.raft.term())

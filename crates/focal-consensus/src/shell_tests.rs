@@ -36,13 +36,26 @@ fn by_first_byte(data: &[u8]) -> Option<[u8; 32]> {
 
 type Sole = Replica<FloorStore<RamStore>, HandOver<Disk>, Unbounded>;
 
+/// What these tests state of their voter (`hyper_raft::Limits::derive`): a message of the pages
+/// they send and a few entries more, focal's members (`MAX_MEMBERS`, which the learners the tests
+/// add join), and queues of 1 MiB each, past anything a test here holds.
+fn limits() -> hyper_raft::Limits {
+    hyper_raft::Limits::derive(hyper_raft::Stated {
+        message: 1 << 17,
+        members: crate::MAX_MEMBERS,
+        memory: 1 << 20,
+        depth: 1,
+    })
+    .unwrap()
+}
+
 fn settings() -> Settings {
     Settings {
         core: Config {
             max_size_per_msg: 1 << 16,
             max_inflight_msgs: 8,
             max_committed_size_per_ready: 1 << 16,
-            ..Config::new(1)
+            ..Config::new(1, limits())
         },
         elections: Elections::Ticks,
         quiet: Duration::from_millis(50),

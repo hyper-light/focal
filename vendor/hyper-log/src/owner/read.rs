@@ -9,6 +9,7 @@ use hyper_block::buf::Alignment;
 use super::Owner;
 use crate::device::{Job, Reads, Run, Wanted};
 use crate::state::Group;
+use crate::stats::{self, LogStats};
 use crate::ticket::{Answer, Ticket};
 use crate::{Fetched, LogError, Proposal, View};
 
@@ -26,6 +27,8 @@ pub(crate) enum Query {
     },
     Flushed,
     Fenced,
+    /// The log's statistics, into a box an earlier answer gave back, or a new one.
+    Stats(Option<Box<LogStats>>),
 }
 
 /// Entries to fetch, waiting for their read from the file.
@@ -58,8 +61,26 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             Query::Flushed => Ok(Answer::Flushed(self.schedule.frames, self.schedule.updates)),
             Query::Fenced => Ok(Answer::Fenced(self.fenced)),
+            Query::Stats(into) => Ok(Answer::Stats(self.stats(into))),
         };
         ticket.answer(answer);
+    }
+
+    /// The log's statistics as the owner's counts stand.
+    fn stats(&self, into: Option<Box<LogStats>>) -> Box<LogStats> {
+        let at = stats::now();
+        let mut out = into.unwrap_or_else(|| Box::new(LogStats::new(at)));
+        let tally = &self.tally;
+        out.at = at;
+        out.flushing_since = self.flushing_since;
+        out.frames = self.schedule.frames;
+        out.updates = self.schedule.updates;
+        out.bytes = tally.bytes;
+        out.flushes = tally.flushes;
+        out.flush.clone_from(&tally.flush);
+        out.write.clone_from(&tally.write);
+        out.commit_wait.clone_from(&tally.commit_wait);
+        out
     }
 
     fn view(&self, group: u128) -> Result<Option<View>, LogError> {

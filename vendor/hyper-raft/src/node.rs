@@ -417,6 +417,24 @@ pub struct RawNode<S> {
     apply_paused: bool,
 }
 
+impl<S> RawNode<S> {
+    /// Plants `mutant` in this member, or takes the one planted out: a defect the tests show the
+    /// oracles catch (`crate::mutant`; the `mutants` feature, which no consumer enables).
+    #[cfg(feature = "mutants")]
+    pub fn plant(&mut self, mutant: Option<crate::Mutant>) {
+        self.raft.mutant = mutant;
+    }
+
+    /// Whether a `Ready` with `messages` leaves at once for the planted defect that sends a vote
+    /// before it is durable ([`crate::Mutant::VoteBeforeDurable`]).
+    fn vote_leaves_early(&self, messages: &[Message]) -> bool {
+        self.raft.planted(crate::Mutant::VoteBeforeDurable)
+            && messages
+                .iter()
+                .any(|message| message.msg_type == MessageType::MsgRequestVoteResponse)
+    }
+}
+
 impl<S: Storage> RawNode<S> {
     /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
@@ -540,6 +558,11 @@ impl<S: Storage> RawNode<S> {
     /// ([`Raft::set_inflight_bytes`]).
     pub fn set_inflight_bytes(&mut self, member: u64, bytes: u64) -> bool {
         self.raft.set_inflight_bytes(member, bytes)
+    }
+    /// Where catching up the learner `member` stands, for its owner to
+    /// promote it once ready ([`Raft::catch_up`], `crate::CatchUp`).
+    pub fn catch_up(&mut self, member: NodeId) -> Result<crate::CatchUp> {
+        self.operate(|raft| raft.catch_up(member))
     }
     /// One tick of time has passed. True when the member acted on it: it
     /// campaigned, checked its quorum or sent heartbeats.
@@ -703,7 +726,9 @@ impl<S: Storage> RawNode<S> {
         self.tell(message)
     }
     /// Asks at which index a read may be served; the answer comes in a
-    /// `Ready` with the same `context`.
+    /// `Ready` with the same `context`. A leader that has not committed in
+    /// its term holds the read until it has; a member with no leader to ask
+    /// refuses it ([`Error::ReadDropped`]), so the owner answers it at once.
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<()> {
         let mut message = proto::message(0, MessageType::MsgReadIndex);
         message
@@ -714,10 +739,9 @@ impl<S: Storage> RawNode<S> {
             data: context,
             ..Entry::default()
         });
-        match self.operate(|raft| raft.step(message)) {
-            Err(error) if error.is_fatal() || matches!(error, Error::Capacity(_)) => Err(error),
-            _ => Ok(()),
-        }
+        // Every refusal reaches the owner: an `Ok` for a read that went
+        // nowhere left its owner to wait out a deadline.
+        self.operate(|raft| raft.step(message))
     }
 
     /// What there is to apply, and, when `release`, the messages to send:
@@ -959,6 +983,7 @@ impl<S: Storage> RawNode<S> {
         // vote it leads in are durable, which no write out or this one
         // changes.
         ready.after_persisting = self.raft.state() != StateRole::Leader || !self.vote_durable();
+        ready.after_persisting &= !self.vote_leaves_early(ready.light.messages());
         // What leaves with this write is sent once it is durable, when the
         // commit its hard state states is. What leaves at once is a leader's,
         // and holds no answer that states a commit (`state_durable_commit`).

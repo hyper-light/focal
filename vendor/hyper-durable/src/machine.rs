@@ -58,6 +58,13 @@ pub trait StateMachine {
     /// start, for a compaction never passes [`StateMachine::durable`] (I8).
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
 
+    /// The bytes [`StateMachine::image`] would write now, or none for a machine that keeps no
+    /// image. Asked when a member opens on a log never compacted: the compaction rule weighs the
+    /// log against the image it was last compacted to ([`crate::Compaction`]), and before the
+    /// first, against the state the member opened with, which a group formed with state (a range
+    /// split from another) holds already. A machine that keeps none is never due.
+    fn image_bytes(&self) -> Option<u64>;
+
     /// Replaces the machine's state with `image`, which is of `at` under `configuration`, and
     /// makes it durable before returning: the log's start moves to `at` only after (I8).
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal>;

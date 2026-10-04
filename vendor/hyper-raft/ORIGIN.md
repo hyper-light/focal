@@ -111,10 +111,10 @@ Every value is unchanged. These doc comments now state where each value comes fr
 
 Two kinds of value are literals, not derivations, and are marked so:
 
-- `Limits::default`: mantle note 32 §2.10. `Limits::derive` replaces it in R-3.
-- `MAX_MEMBERS`.
+- `Limits::default`: mantle note 32 §2.10. `Limits::derive` replaced it in R-3 (below, "R-3").
+- `MAX_MEMBERS`, replaced by `Limits::members` in R-3.
 
-They are open against the no-arbitrary-numbers rule until R-3.
+They were open against the no-arbitrary-numbers rule until R-3, which derived both.
 
 ### Removed
 
@@ -716,3 +716,292 @@ and a follower that queued more than four answers while its writes were out grew
   After only 50 entries the first 3,000 still grow each circulating queue to its high water once,
   about 18 growths a group of three more than mantle's shell makes, 0.01–0.02 an entry over those
   3,000; they are done by 3,000 entries, after which the counts are mantle's.
+
+## R-3: slates' enhancements
+
+Core step R-3 (`docs/raft.md` §3; mantle note 32 §2.13's ledger, R4–R7, R13, R16, R17, R20–R22).
+slates' core stays in slates until X-1; what it found and fixed comes here as slates' tests run on
+this core, and as rules designed from slates', focal's and the literature where this core lacked
+them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
+
+### R6 and R7: slates' regression tests, and the end of what is counted
+
+- **R6, a term with no successor** (slates `docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`,
+  AUD-29-26: slates saturated a term at `u64::MAX`, and a member that campaigned there led a term a
+  leader held). Here a message naming `u64::MAX` is beyond what is counted (`counts_beyond_bound`),
+  so the last term and index a member reaches are `u64::MAX - 1` (`raft::LAST`). slates' four tests,
+  in this core's terms (`src/tests.rs`), pass on `main` (`9893679`) as expected:
+  `a_term_with_no_successor_cannot_campaign_and_keeps_one_leader` (a campaign asked of a member, run
+  out by its timer or ordered by the leader's hand-over is refused `Capacity("terms")` with term,
+  vote and role unchanged; one leader of the last term), `a_vote_asked_for_a_term_with_no_successor_is_refused`,
+  `an_append_past_the_last_index_is_refused_whole` and `a_leader_at_the_last_index_refuses_new_entries`.
+- **Three siblings that failed on `main`, and the cause of each.**
+  - `a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign`: a member whose log ended
+    at the last index campaigned, was elected, and could not write the entry its term begins with:
+    `Raft::become_leader` returned `Capacity("the log's indexes")`, a refusal, with the member left
+    `Leader` of a new term and no entry of it ("(4, 1, Leader)" where "(3, 1, Follower)" was
+    expected). Cause: the campaign asked whether the term had a successor and not whether the log
+    had an index for the first entry. `Raft::lead_refusal` asks both before a campaign changes
+    anything (`Raft::hup`), and the first entry's append failing for room is now a fatal
+    `Invariant`, since nothing that reaches it may lack room.
+  - `by_suspicion_a_member_with_no_successor_is_due_for_no_campaign`: by suspicion, a follower at
+    the last term (or at the last index) whose leader was suspected armed a campaign
+    (`deadline` was `Some`) that its wake then refused; hyper-durable fences a replica on any error
+    its wake returns, so the member would have been stopped for being at the end of what it may
+    count. `Raft::deadline` and `wake_follower` arm and run no campaign `lead_refusal` refuses
+    (`Raft::may_lead`).
+  - `the_fast_track_proposes_and_holds_nothing_at_the_last_index`: the fast track proposed and held
+    entries at the last index, and a leader that recovered one at its election would have had no
+    index for its own first entry after it (slates' "the fast track refuses its proposal").
+    `track::proposable` and `Raft::propose_fast` stop one index short.
+- **R7, independent election draws** (slates
+  `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`: a jitter of
+  `(id + attempt) mod span` kept two members congruent modulo the span timing out together at
+  every attempt, 19 s on slates' multi-region profile). On ticks each member draws from its own
+  SplitMix64 stream at every reset (`Config::seed`); by suspicion every arming draws anew from
+  hyper-timing's law, which `tests/suspicion.rs` already holds exactly
+  (`every_arming_draws_anew`; `split_votes_resolve_and_split_exactly_when_the_law_says`, each of
+  1,000 crashes' first round split exactly when the law's event holds). The new test,
+  `survivors_whose_timeouts_collide_elect_at_the_first_round_their_draws_differ` (`src/tests.rs`),
+  is slates' case on ticks: two survivors seeded congruently modulo the span (slates' worst case),
+  made to time out together, split; every later round is predicted from the draws each made at its
+  campaign before the round runs (the same draw splits again, the first that differs elects the
+  shorter at exactly its timeout), and the group must elect within 64 rounds. It passes on `main`
+  (the forced split, then elected in round 2). With slates' old draw put into
+  `reset_randomized_election_timeout` it fails: "no round elected: the draws stay together".
+- **Measured** (`docs/benchmarks.md`, "slates' regression tests, R6 and R7 (R-3)"): allocations,
+  reallocations and bytes identical to `main`'s on all 36 cells; every count the schedules print at
+  their default seeds identical. The check first cost an owner's idle scan by suspicion 84
+  instructions a group a period (327 → 411), since `deadline` asked every rule that holds a campaign
+  of every member though only one with a campaign armed uses the answer; asked only there (and in
+  `wake_follower` only once a campaign is due), the scan is 51–54 instructions, a sixth of `main`'s,
+  with every decision as before.
+- **The divergence table.** focal 27 §4.5's table of where this core and raft-rs decide differently
+  had no copy here; `docs/raft.md` §3.3 now carries it, with the ports since (F41, F42, F43), R-2's
+  wire, R6's row, and the test that holds each.
+
+### R4, R5, R20 and R21: slates' tests, and a lease its member's own timer kept
+
+- **R4, a lease lapses at the minimum election timeout whatever the member's own timer does**
+  (slates `docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`: a voter
+  that yielded its timeout to a more central one kept its lost leader's lease until its own
+  campaign, and refused that voter; thesis §4.2.3, etcd's `inLease`). slates' test as this core
+  states priorities, `the_most_central_survivor_wins_its_first_campaign` (the outranked survivor
+  given patience past its timeout, slates' yield), passes on `main`, as does
+  `a_member_that_heard_its_leader_within_the_minimum_timeout_refuses`. Its sibling
+  `a_member_whose_campaign_waits_for_a_change_holds_no_lease` failed on `main`: a member whose
+  timeout ran out while a change it committed was not yet applied did not campaign (`Raft::hup`
+  waits for the change), but `tick_election` had restarted its one counter, which was also its
+  lease's, so it refused the voter that campaigned ("PreCandidate" where "Leader" was expected).
+  An owner whose commit fence holds a change (`RawNode::pause_apply`, R-6) makes that common at a
+  leader's loss. Cause: one counter for the member's own timer and for its silence since its
+  leader. `Raft::silence` counts the latter, reset only by its leader's messages and a new term
+  or role; the lease reads it. By suspicion the lease is the detectors' trust, which no timer
+  touches. raft-rs reads its one counter, so this is a divergence (`docs/raft.md` §3.3): the
+  differential never reaches it (its owner applies every change at once), and of the schedules'
+  500 printed lines one moved, the pipeline mix whose committed pages are 64 bytes, where a change
+  waits longest unapplied (719 → 715 entries committed in 66 terms both).
+- **R5, a member that missed its promotion still votes** (slates
+  `docs/bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md`; thesis
+  §4.1: "servers process incoming RPC requests without consulting their current
+  configurations"). `a_member_that_missed_its_promotion_still_votes_for_a_candidate_that_has_it`
+  (on ticks where C never heard a leader, and where it heard B as a learner and its lease lapses at
+  the minimum election timeout; by suspicion where its lease lapses as its detectors suspect B) and
+  `a_member_outside_its_configuration_never_campaigns_and_its_vote_counts_nowhere_else` pass on
+  `main`: this core, as raft-rs and etcd, lets any member vote and counts only the candidate's own
+  voters (`Tracker::record_vote`).
+- **R20, replication against compaction, with R19's hints** (slates
+  `docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`). slates' five
+  tests pass on `main`: `a_late_append_below_a_compacted_prefix_leaves_the_log_whole` (answered
+  with the member's commit, raft-rs's rule), `an_empty_follower_is_found_in_one_refusal`,
+  `a_stale_terms_run_is_skipped_in_one_refusal` (one refusal each, the conflict hints),
+  `late_replies_never_move_progress_back`, `a_snapshot_reply_credits_what_the_follower_holds`
+  (credited 3, the member's, while the leader compacted to 4, and sent the snapshot at 4).
+- **R21, a proposal's cost at any backlog** (slates
+  `docs/bugs/2026-09-29-a-leaders-commit-rule-scanned-its-backlog.md`: 129 µs a proposal at a
+  backlog of 1,000 and 20 ms at 5,000). slates' measurement tool on this core, `benches/backlog.rs`
+  (a leader of five whose followers answer nothing, `tests/support/backlog.rs`), and the exact
+  test `tests/backlog.rs`: a thousand proposals cost the leader the same allocations,
+  reallocations and bytes at a backlog of 1,000 as at 49,000, counted by `hyper-measure`'s
+  allocator (now a dev-dependency, this repository's crate). This core's commit rule sorts the
+  voters' matches (`Tracker::quorum_index`, raft-rs's) and its configuration is the tracker's, not
+  a scan of the log; it passes on `main`.
+- **Measured** (`docs/benchmarks.md`, "slates' tests for R4, R5, R20 and R21 (R-3)"): allocations
+  identical to `main`'s on all 36 cells; slates' backlog tool on this core 160–330 ns a proposal
+  from a backlog of 1,000 to 50,000, 4 allocations and 160 bytes a proposal at every backlog (load
+  4.7–6.5; slates measured 129 µs at 1,000 and 20 ms at 5,000 before its fix, 61–102 ns after, its
+  `append_command` alone where this is the owner's whole turn).
+
+### R16: the window a member is sent ahead of its answers, one rule
+
+- **Two rules, one.** focal's F41 bounds what a member is sent ahead of its answers by bytes its
+  owner says, and focal's owner said twice the transport's congestion window (focal 27 §11; Linux's
+  `tcp_sndbuf_expand`). slates' drive keeps ⌈2·tail/period⌉ batches ahead
+  (`ElectionTiming::window_budget`, from slates' `timing.rs`), one batch for each period a lost
+  batch takes to repair. Both are what the path carries over the two round trips a lost append
+  takes to repair: a rate-clocked sender's carriage in a round trip is its congestion window, a
+  paced one's is a batch for each period of the round trip. `hyper_timing::inflight_window(carried)`
+  states it; `ElectionTiming::window_budget` is it in whole batches
+  (`slates_window_and_focals_are_what_the_path_carries_over_the_repair`: equal on tails of whole
+  periods, at most a batch more between them); hyper-durable gives the core the rule's window from
+  its owner's measure (`Replica::set_carriage`, `the_window_to_a_member_is_twice_what_its_path_carries`).
+- **The window counts what the path carries.** Each append is charged its record: its fixed bytes
+  (`wire::MESSAGE_RECORD_FIXED_BYTES`, 96) and its entries' bodies, where F41 and slates counted the
+  entries alone, as RFC 9002 §B.2 counts a packet's bytes in flight; a page is cut to the room less
+  the append's fixed bytes (`Progress::page_bytes`, `Progress::sent`).
+- **No count of its own.** `Config::max_inflight_msgs` of `usize::MAX` counts no messages: the
+  bytes bound the window (an append costs at least its fixed bytes and an entry's), and its ring
+  grows as it is used (`Inflights` is a `VecDeque`; a finite count reserves its ring whole at the
+  first message, as before). A window bounded by neither is refused (`Config::validate`), and so is
+  a bound of none set on one that counts no messages (`set_inflight_bytes`).
+- **A window that filled waits for a whole append or half of it** (`Inflights::draining`,
+  `SILLY_WINDOW_DIVISOR`, `a_window_that_filled_waits_for_a_whole_append_or_half_of_it`): found by
+  the timed simulation, where a window of one batch, charged its appends' records, opened by one
+  small answer at a time and drew one small append each time. RFC 1122 §4.2.3.4's sender rules (1)
+  and (3), `Fs` = ½, after Clark's RFC 813; below its bound a window sends at once (no Nagle's
+  rule). raft-rs's forced opening at a heartbeat's answer (`HeartbeatAnswers::Bare`) is kept.
+- **Measured** (`docs/benchmarks.md`, "The window a member is sent ahead of its answers (R16)"):
+  slates' pipelining measurement on this core (`tests/timed.rs`, the harness its timed simulation
+  re-founded here, `tests/support/timed.rs`), on paths that keep order: at 2,000 proposals a
+  second one batch out at a time commits 1,023 a second at a 7,908 ms median (slates 1,029 at
+  7,319 ms) and the rule every proposal at 125 / 127 ms (slates' derived window 172 / 222 ms),
+  202.5 / 328 ms with 1 % loss (slates 201 / 321 ms), and at 4,000 a second 126 / 127 ms; the gate
+  test `a_window_of_two_round_trips_keeps_up_where_one_batch_does_not` holds it exactly. Against
+  commit 2's core (focal's 128 places, entries charged alone) the medians are the same, the p99
+  lower, and the bytes two to four times as many, each proposal going at once as its own append in
+  a harness whose owner proposes one entry a turn. Allocations and reallocations identical on all
+  36 cells, 8 bytes a member more each time a tracker is built; the schedules of
+  `tests/pipeline.rs`, all of which set byte windows, moved, every other suite's lines are
+  `main`'s.
+- **The schedules where a leader applies before its write.** Each append charged its record, a
+  member is sent fewer appends ahead in the schedules' small windows, so its leader's entries reach
+  a quorum later against its own slow write: in 240 schedules by suspicion 22 entries applied ahead
+  against 61 before, and at the default 24, with a campaign that supersedes its own requests
+  (`d254f78`), none, which their coverage check refused. Their leader's disk is now slower in the
+  long schedules, a tenth (`SCHEDULES_SLOW_LEADER`, measured: 15 at the default size, on ticks 8),
+  and stays a quarter in the crashes' and faults' schedules, each of which still holds a change
+  behind the fence there.
+
+### R17: what arrives ahead of a hole is kept, and acknowledged with the write that holds it
+
+- **The rule** (slates `docs/wip/research/consensus-enhancements.md` §3.5, after ParallelRaft-CE,
+  Gu et al., IJSI 2021, and PolarFS's ParallelRaft, Cao et al., VLDB 2018 §5). A member refuses an
+  append that begins past the end of its log, as Raft's consistency check does, and keeps its
+  entries beside its log (`crate::ahead::Early`, `Ahead::Kept`), as many as its log may hold not yet
+  durable (`Limits::unstable_entries`), those nearest the hole first; once an append of the same
+  term fills the hole, the kept entries that continue it are taken into the log with it
+  (`Raft::take_ahead`), and the answer acknowledges them all, with the write that holds them
+  (`docs/durable.md` I2 and §10). A change of term or role or a snapshot forgets what was kept; a
+  marked member (R-5) keeps nothing. raft-rs's rule is `Ahead::Refused`, which the differential and
+  the schedules found under it run.
+- **The leader's half, found by the timed simulation.** With the member's half alone, on paths that
+  reorder, the group collapsed at 1,000 proposals a second (99.5 % of what was sent sent again, 384
+  committed a second): most refusals were older than what the leader knew the member held yet
+  named an append past its match, so raft-rs's staleness rule probed at each, and each probe and the
+  replication after it sent the window again. A leader whose members keep what arrives ahead
+  (`Ahead::Kept`) keeps a scoreboard in its window (RFC 2018, RFC 6675): an append the member
+  refused and kept leaves the window's bytes and keeps its place (`Inflights::delivered`), and every
+  message sent before it and neither answered nor kept goes again, once (`Outbox::repair_before`,
+  `Progress::repaired`), anchored past what the member answered or was sent again, as RFC 6675 sends
+  again what `IsLost` names and counts it in the pipe in the lost segment's place. Where the window
+  holds no record of the refused append, what follows the member's end goes again as far as its
+  start; a resend unanswered for a beat is probed, as an unanswered full window (liveness for a lost
+  resend). Measured and rejected on the way: a hole sent only at refusals, once for each end (a 717
+  ms median at 2,000 a second with 1 % loss against R16's 191), and the next hole sent at the answer
+  filling the first, one hole a round trip (1,574 ms). raft-rs's leader is kept for
+  `Ahead::Refused`.
+- **The member's word** (found by `tests/group.rs`'s group of both cores, whose seed 40 at times did
+  not settle). A leader that took every refusal past a member's end for a kept append marked arrived
+  what a raft-rs follower had dropped and never sent it again; whether it happened turned on
+  raft-rs's own random timeouts, which leader a schedule made. A member's refusal now says it kept
+  the append (`Message::kept`, flag bit 3 of the wire format, its golden vector pinned), and the
+  leader acts on that word: a member that keeps nothing is probed as raft-rs probes it
+  (`a_member_that_keeps_nothing_ahead_is_probed_and_caught_up`, which fails on the leader's own
+  setting). One schedule line moved, a marked member that keeps nothing now probed; the timed sweep
+  and every count are as below.
+- **Designed from both, and the literature.** slates keeps only entries of the leader's own term,
+  behind ParallelRaft-CE's sync rule; this core keeps any of the leader's entries, since a leader
+  never rewrites its log in its term and the append that fills the hole checks the log through its
+  end, and nothing here commits or applies out of order, which is what that rule guards
+  (commitment out of order stays out, note 32 R18). slates bounds what it keeps by its window's
+  bytes; this core by what its log may hold not yet durable, the bound its log already keeps.
+- **Tests**: `a_refusal_sends_the_hole_alone_and_what_was_kept_leaves_the_window`,
+  `a_hole_sent_again_and_unanswered_for_a_beat_is_probed`,
+  `a_refusal_older_than_the_members_progress_sends_what_it_lacks_and_no_more` and
+  `every_hole_before_what_was_kept_goes_again_at_once` for the leader's half (each fails with its rule
+  taken out); slates' `a_follower_buffers_the_leaders_entries_ahead_of_a_hole_and_absorbs_them` and
+  `a_lost_batch_costs_one_resend_and_the_buffered_ones_are_not_sent_again` as this core states them
+  (the second runs raft-rs's rule beside, which sends the kept entries again: the divergence's
+  test), `what_was_kept_is_acknowledged_only_with_the_write_that_holds_it` (I2),
+  `what_is_kept_ahead_of_a_hole_has_a_bound`, `what_was_kept_goes_with_its_term`; the schedules of
+  `tests/pipeline.rs` hold every acknowledgement to the member's disk and now ask that kept entries
+  were taken (`Coverage::ahead`).
+- **Measured** (`docs/benchmarks.md`, "What arrives ahead of a hole (R17)"): on slates' five regions
+  in time, paths that reorder with no loss, the rule's window commits every proposal at 123 / 126 ms
+  at 2,000 and 4,000 a second (R16: 264 / 2,084 ms, and 1,588 a second at 4,000), 38–44 % of entries
+  sent again against 95–96 %; with 1 % loss on paths that keep order 227 / 462 ms at 2,000 a second
+  against 202.5 / 328, 12 % sent again against 31 %, more bytes (each repair a message of its own).
+  The gate test `on_paths_that_reorder_what_arrives_ahead_is_not_sent_again` holds it exactly; under
+  `Ahead::Refused` the core gives R16's numbers exactly. Allocations R16's on 28 of 36 cells; the
+  catch-up cells 40 fewer allocations and a 41 kB higher peak (the returning member's kept entries),
+  the snapshot cells 8 bytes a member more a tracker. The schedules of `tests/pipeline.rs` moved,
+  R17 reached in every setting that keeps; every other suite's lines are R16's.
+
+### R13: a learner caught up in rounds before it votes
+
+- **The rule** (Ongaro's thesis §4.2.1, "Catching up new servers"; slates `RaftNode::catch_up`,
+  `crate::catchup`): `RawNode::catch_up(member)` stages a learner at a leader and judges it.
+  Replication to it goes in rounds, each to what the leader held when the round began; a round
+  that lasts less than an election is the last, and the learner is `Ready`; a longer one begins the
+  next. A learner whose lag did not shrink over a whole election is `Aborted`, said once, and staged
+  afresh when asked again (slates' rule for the thesis's "unavailable, or so slow that it will never
+  catch up", needing no count of rounds where the thesis says "such as 10"). An election is the
+  member's own measure: on ticks the minimum election timeout, by suspicion the time the law
+  expects an election to take (`Timing::election`, `T_E`, a new field the owner gives with the
+  span). Each learner is judged alone (slates
+  `docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`); the rounds are a
+  leader's and end with its term. hyper-durable passes it through (`Replica::catch_up`); promoting
+  is the owner's change to propose.
+- **Tests**: slates' `a_staged_member_counts_toward_no_commit`,
+  `a_member_that_never_answers_is_aborted_and_staged_afresh_after`,
+  `a_round_that_spans_a_window_is_followed_by_one_that_counts`, `staging_ends_with_leadership` and
+  `a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does` as this core states them,
+  the bug's `one_learner_that_cannot_catch_up_holds_back_none_that_has`, and
+  `by_suspicion_a_learners_rounds_are_judged_on_the_owners_clock`; each fails with the rounds taken
+  out, three with the abort; the shell's `the_shell_says_where_catching_up_a_learner_stands`.
+- **Measured** (`docs/benchmarks.md`, "A learner caught up in rounds (R13)"): Figure 4.4(a)
+  replayed, 45 rounds without a commit after the loss with the newcomer added directly against one
+  round trip staged (slates: 21 round trips against one).
+
+### R22: when a log is compacted, the shell's policy
+
+- **The rule** is the shell's (`crates/hyper-durable/ORIGIN.md`, "R22"; `docs/durable.md` §6.1):
+  Ongaro's thesis §5.1.2, a log due once its applied entries exceed the image it was last compacted
+  to times the owner's expansion factor, with slates' wait for a member that lacks what its leader
+  applied while the log holds no more than twice the threshold (slates `fold.rs`). The core is
+  unchanged: the shell reads the members' progress from the tracker.
+- **Measured**: slates' 2026-09-28 finding replayed on the shell, three images against none at the
+  same three compactions (`docs/benchmarks.md`, "When a log is compacted (R22)").
+
+### Limits::derive: every bound from what the owner states
+
+- **What changed** (`docs/raft.md` §3.2): focal's `Limits::default` literals (65,536 messages and
+  unstable entries, 4,096 reads, 16,384 entries a message, 256 proposals and a window of 256,
+  `8 MiB − 64 KiB` of proposals, 64 MiB of votes; mantle note 32 §2.10, "no arbitrary constants")
+  and `MAX_MEMBERS` (1,024) are gone. `Limits::derive(Stated)` gives each from what the owner
+  states: its transport's largest message, the members a configuration of its group names, the
+  bytes one of its queues may hold, and its store's depth; `Config::new` takes the bounds.
+  `Limits::members` replaces the constant wherever the member counts something a member
+  (progress, a read's askers and confirmations, a fast entry's holders, the members suspected); a
+  leader proposes no change past it, and a member given a configuration past it stops.
+- **Each derivation's check** (`src/tests.rs`): a message of `entries_per_message` empty entries
+  fits the stated bytes, and one more does not; a member holding every proposal it may has a vote
+  that fits; each queue is the memory over its least element; a statement that admits nothing is
+  refused (`every_bound_is_derived_from_what_the_owner_states`). The members bound: a change past
+  it is proposed empty (`a_leader_proposes_no_change_past_the_members_a_configuration_names`) and
+  a configuration past it stops the member (`src/progress.rs`); each fails with its check taken
+  out.
+- **Every owner states its own**: the tests' harnesses (a message twice the largest append they
+  send, their groups' members, queues of several messages), the end-to-end members (a message of
+  their measured datagram, their voters, queues of their log's bound), the shell's tests, the
+  comparisons and the liveness bench.

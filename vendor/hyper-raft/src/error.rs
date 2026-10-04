@@ -58,6 +58,10 @@ pub enum Error {
     /// handing over leadership, or the log did not take it.
     #[error("the proposal is dropped")]
     ProposalDropped,
+    /// A refusal: a read is asked of a member that knows no leader to ask
+    /// (a follower that heard none, or a candidate).
+    #[error("the read is dropped: no leader to ask")]
+    ReadDropped,
     /// A refusal: a snapshot is asked for while this member leads, knows no
     /// leader, holds a snapshot or a request already, or has no entry of
     /// its term.

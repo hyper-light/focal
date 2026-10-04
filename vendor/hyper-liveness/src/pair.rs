@@ -408,13 +408,23 @@ impl Pair {
             }
             return Sent::NeedsFlush;
         };
+        // A heartbeat goes out after the one it echoes came. An owner that reads its clock before
+        // its socket, so that every datagram stamped before its poll is read, can take one stamped
+        // after the `now` it then sends at. Sent at that `now`, the echo's hold was negative,
+        // clamped to zero, and the peer's lower bound on the clocks' offset passed what any clock
+        // allows by as much, so its suspicions stated bounds short of the time they measured
+        // (`bound`; 51.6 to 245 µs on Linux CI).
+        let sent_ns = self
+            .received
+            .echo
+            .map_or(now_ns, |(_, _, arrival_ns)| now_ns.max(arrival_ns));
         let echo = self
             .received
             .echo
-            .map(|(sent_ns, late_ns, arrival_ns)| Echo {
-                sent_ns,
+            .map(|(echoed_ns, late_ns, arrival_ns)| Echo {
+                sent_ns: echoed_ns,
                 late_ns,
-                hold_ns: now_ns.saturating_sub(arrival_ns),
+                hold_ns: sent_ns.saturating_sub(arrival_ns),
             });
         let ask_ns = self
             .received
@@ -434,10 +444,10 @@ impl Pair {
             interval_ns: spacing,
             floor_ns: sender.floor.map_or(0, nanos),
             ask_ns,
-            sent_ns: now_ns,
-            late_ns: now_ns.saturating_sub(due),
+            sent_ns,
+            late_ns: sent_ns.saturating_sub(due),
             flushes: sender.durable_count,
-            flush_age_ns: now_ns.saturating_sub(durable_ns),
+            flush_age_ns: sent_ns.saturating_sub(durable_ns),
             echo,
         };
         let length = beat.encode(out).len();
@@ -985,6 +995,62 @@ mod tests {
         let last = suspicion.last.expect("heard from");
         let bound = suspicion.detection.expect("a bound is stated");
         assert!(Duration::from_nanos(suspicion.at_ns - last.due_ns) <= bound);
+    }
+
+    /// A heartbeat goes out no earlier than the heartbeat it echoes came, and the peer's bound on
+    /// the clocks' offset then holds on one clock. Here this node took the peer's heartbeat, sent
+    /// 10 µs after this node's `now` and stamped 30 µs after it, and sent its own at that `now`
+    /// (an owner that reads its clock before its socket). Sent at `now`, the echo's hold was
+    /// negative, clamped to zero, and the peer's suspicions stated bounds 10 µs short of the time
+    /// they measured: 51.6, 95 and 245 µs on Linux CI, where reads take longer.
+    #[test]
+    fn a_heartbeat_is_sent_no_earlier_than_the_one_it_echoes_came() {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let us = 1_000;
+        let now = 10 * MS;
+        let mut node = pair();
+        let mut theirs = beat(7, 0);
+        theirs.sent_ns = now + 10 * us;
+        let arrival = now + 30 * us;
+        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        node.take(2, &theirs, arrival, &context, &mut changes, &mut taken)
+            .unwrap();
+        let sender = Sender {
+            local_run: 1,
+            floor: Some(Duration::from_millis(1)),
+            granularity: Some(granularity),
+            durable_count: 1,
+            durable_ns: Some(now),
+        };
+        let mut out = [0; MAX_BYTES];
+        let Sent::Message(length) = node.send(&sender, now, &mut out) else {
+            panic!("due, and a flush proves it");
+        };
+        let ours = Heartbeat::decode(out.get(..length).unwrap()).unwrap();
+        let echo = ours.echo.expect("it echoes the peer's");
+        assert_eq!(ours.sent_ns, arrival, "after the echoed heartbeat came");
+        assert_eq!(echo.hold_ns, 0);
+        assert_eq!(ours.late_ns, 30 * us, "its schedule was `now`");
+        // The peer takes it 20 µs later, and suspects 15 ms after that.
+        let mut peer = pair();
+        let landed = ours.sent_ns + 20 * us;
+        let (mut changes, mut taken) = ([None, None, None], Taken::default());
+        peer.take(1, &ours, landed, &context, &mut changes, &mut taken)
+            .unwrap();
+        let due = ours.sent_ns - ours.late_ns;
+        let at = landed + 15 * MS;
+        let bound = peer.received.offset.detection(at, due).unwrap();
+        assert!(
+            Duration::from_nanos(at - due) <= bound,
+            "{} ns measured, {bound:?} stated",
+            at - due
+        );
     }
 
     /// A young link whose latest heartbeat came later than the freshness point of the one after it,

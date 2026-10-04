@@ -72,17 +72,20 @@ use crate::{
     log::{copy_entries_of, copy_entry},
     proto::{self, Entry, EntryType, Message},
     quorum,
-    raft::{FastStats, Raft, StateRole},
+    raft::{FastStats, LAST, Raft, StateRole},
     storage::Storage,
 };
 
-/// Whether `entry` may go by the fast track: it states something, and it
-/// is no change of the configuration.
+/// Whether `entry` may go by the fast track: it states something, it is no
+/// change of the configuration, and it lies below the last index a member
+/// reaches ([`crate::raft::LAST`]): a leader that recovers it at its election
+/// writes its own first entry after it, which needs an index of its own
+/// (mantle note 32 R6).
 fn proposable(entry: &Entry) -> bool {
     entry.entry_type == EntryType::EntryNormal
         && !entry.data.is_empty()
         && entry.index != 0
-        && entry.index != u64::MAX
+        && entry.index < LAST
 }
 
 impl<S: Storage> Raft<S> {
@@ -161,7 +164,7 @@ impl<S: Storage> Raft<S> {
             .last_index()?
             .max(self.held.last_index())
             .checked_add(1)
-            .filter(|index| *index != u64::MAX)
+            .filter(|index| *index < LAST)
             .ok_or(Error::Capacity("the log's indexes"))?;
         if index > self.window() {
             return Err(Error::Capacity("indexes open to proposals"));
@@ -395,7 +398,8 @@ impl<S: Storage> Raft<S> {
             .log
             .slice(entry.index, entry.index.saturating_add(1), u64::MAX)?;
         if taken.first().is_some_and(|taken| same(taken, entry)) {
-            self.decided.holds(entry.index, holder)?;
+            self.decided
+                .holds(entry.index, holder, self.config.limits.members)?;
         }
         Ok(())
     }
@@ -484,10 +488,11 @@ impl<S: Storage> Raft<S> {
                     // log is older (module header).
                     let beside = || {
                         decided.binary_search(&member).is_ok()
-                            && self
-                                .log
-                                .term(progress.matched)
-                                .is_ok_and(|term| term == self.term)
+                            && (self.planted(crate::Mutant::FastBesideAnyTerm)
+                                || self
+                                    .log
+                                    .term(progress.matched)
+                                    .is_ok_and(|term| term == self.term))
                     };
                     if progress.matched >= index || beside() {
                         holding.push(member);
@@ -561,6 +566,9 @@ impl<S: Storage> Raft<S> {
                 holding.binary_search(&member).ok().map(|_| true)
             }) == quorum::Tally::Won
         };
+        if self.planted(crate::Mutant::FastAnyConfiguration) {
+            return self.tracker.has_fast_quorum(holding);
+        }
         self.term_known
             && self.tracker.has_fast_quorum(holding)
             && fast(&self.term_voters)
@@ -615,7 +623,7 @@ impl<S: Storage> Raft<S> {
                         .config
                         .limits
                         .proposals
-                        .saturating_mul(crate::MAX_MEMBERS)
+                        .saturating_mul(self.config.limits.members)
             })
             .ok_or(Error::Capacity("indexes held above the log"))?;
         taken.try_reserve_exact(count).map_err(|_| Error::Memory)?;

@@ -52,6 +52,8 @@ pub(crate) struct HandOver<M> {
     /// The point of the group's durable image: none before the group's first checkpoint or
     /// install.
     imaged: Option<Point>,
+    /// The bytes of the group's durable image: none before its first checkpoint or install.
+    image_bytes: Option<u64>,
     /// The configuration the image holds, at its point.
     image_configuration: ConfState,
 }
@@ -67,22 +69,23 @@ impl<M: Medium> HandOver<M> {
         image_bound: usize,
         founding: ConfState,
     ) -> Result<Self, GroupFileError> {
-        let (applied, configuration, imaged, snapshot) =
+        let (applied, configuration, imaged, image_bytes, snapshot) =
             match group_files::read_image(&medium, &dir, image_bound)? {
                 Some((point, data)) => {
                     let at = Point {
                         index: point.index,
                         term: point.term,
                     };
+                    let bytes = u64::try_from(data.len()).ok();
                     let snapshot = AppliedSnapshot {
                         index: at.index,
                         term: at.term,
                         data,
                         configuration: MembershipConfiguration::from_conf(&point.configuration),
                     };
-                    (at, point.configuration, Some(at), Some(snapshot))
+                    (at, point.configuration, Some(at), bytes, Some(snapshot))
                 }
-                None => (Point::default(), founding, None, None),
+                None => (Point::default(), founding, None, None, None),
             };
         Ok(Self {
             medium,
@@ -96,6 +99,7 @@ impl<M: Medium> HandOver<M> {
             image_configuration: configuration.clone(),
             configuration,
             imaged,
+            image_bytes,
         })
     }
 
@@ -142,6 +146,7 @@ impl<M: Medium> HandOver<M> {
         };
         group_files::write_image(&mut self.medium, &self.dir, &point, image, self.image_bound)?;
         self.imaged = Some(at);
+        self.image_bytes = u64::try_from(image.len()).ok();
         self.image_configuration = point.configuration;
         Ok(())
     }
@@ -239,6 +244,12 @@ impl<M: Medium> StateMachine for HandOver<M> {
             term: point.term,
         };
         Ok((at, point.configuration))
+    }
+
+    /// The bytes of the group's durable image, which `image` sends: none before the group's first
+    /// checkpoint, when the log is weighed against nothing (hyper-durable's compaction rule).
+    fn image_bytes(&self) -> Option<u64> {
+        self.image_bytes
     }
 
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {

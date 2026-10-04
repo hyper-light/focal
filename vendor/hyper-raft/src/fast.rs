@@ -256,16 +256,20 @@ pub struct Votes {
     bytes: usize,
     max_slots: usize,
     max_bytes: usize,
+    /// The most members a configuration names: an entry is chosen by one
+    /// member at the least.
+    members: usize,
 }
 impl Votes {
     /// No votes, and room for at most `max_slots` indexes of `max_bytes`
-    /// together.
-    pub fn new(max_slots: usize, max_bytes: usize) -> Self {
+    /// together, from at most `members` members.
+    pub fn new(max_slots: usize, max_bytes: usize, members: usize) -> Self {
         Self {
             slots: Vec::new(),
             bytes: 0,
             max_slots,
             max_bytes,
+            members,
         }
     }
     /// Whether no vote is held.
@@ -308,7 +312,7 @@ impl Votes {
                 position
             }
         };
-        let (max_bytes, held) = (self.max_bytes, self.bytes);
+        let (max_bytes, held, members) = (self.max_bytes, self.bytes, self.members);
         let Some(slot) = self.slots.get_mut(position) else {
             return Err(Error::Invariant("a vote lost its index"));
         };
@@ -323,8 +327,7 @@ impl Votes {
             Some(known) => slot.choices.get_mut(known),
             None => {
                 let size = bytes(entry);
-                if held.saturating_add(size) > max_bytes || slot.choices.len() >= crate::MAX_MEMBERS
-                {
+                if held.saturating_add(size) > max_bytes || slot.choices.len() >= members {
                     return Err(Error::Capacity("entries voted for"));
                 }
                 slot.choices
@@ -472,8 +475,9 @@ impl Decided {
     pub fn knows(&self, index: u64) -> bool {
         self.find(index).is_ok()
     }
-    /// `member` holds what was taken at `index`.
-    pub fn holds(&mut self, index: u64, member: NodeId) -> Result<()> {
+    /// `member` holds what was taken at `index`, of at most `members` that
+    /// a configuration names.
+    pub fn holds(&mut self, index: u64, member: NodeId, members: usize) -> Result<()> {
         let Ok(position) = self.find(index) else {
             return Ok(());
         };
@@ -481,7 +485,7 @@ impl Decided {
             return Ok(());
         };
         if let Err(at) = holders.binary_search(&member) {
-            if holders.len() >= crate::MAX_MEMBERS {
+            if holders.len() >= members {
                 return Err(Error::Capacity("holders of an entry"));
             }
             holders.try_reserve(1).map_err(|_| Error::Memory)?;
@@ -602,7 +606,7 @@ mod tests {
     }
     #[test]
     fn a_voter_has_one_vote_an_index_and_the_most_voted_is_taken() {
-        let mut votes = Votes::new(4, 1 << 20);
+        let mut votes = Votes::new(4, 1 << 20, 3);
         votes.vote(1, &entry(5, b"e")).unwrap();
         votes.vote(2, &entry(5, b"f")).unwrap();
         votes.vote(3, &entry(5, b"f")).unwrap();
@@ -642,7 +646,7 @@ mod tests {
             votes.vote(1, &entry(10, b"h")),
             Err(Error::Capacity("indexes voted at"))
         );
-        let mut votes = Votes::new(4, bytes_of(8));
+        let mut votes = Votes::new(4, bytes_of(8), 3);
         votes.vote(1, &entry(1, &[1; 8])).unwrap();
         votes.vote(2, &entry(1, &[1; 8])).unwrap();
         assert_eq!(
@@ -660,9 +664,9 @@ mod tests {
         assert!(decided.decide(7, &[2], 2).is_err());
         decided.decide(5, &[9], 2).unwrap();
         assert_eq!(decided.holders(5), [1, 3]);
-        decided.holds(5, 2).unwrap();
-        decided.holds(5, 2).unwrap();
-        decided.holds(8, 2).unwrap();
+        decided.holds(5, 2, 3).unwrap();
+        decided.holds(5, 2, 3).unwrap();
+        decided.holds(8, 2, 3).unwrap();
         assert_eq!(decided.holders(5), [1, 2, 3]);
         assert!(decided.holders(8).is_empty() && !decided.knows(8));
         assert!(decided.resident_bytes() > 0);

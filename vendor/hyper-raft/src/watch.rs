@@ -30,6 +30,10 @@
 //!   it is trusted). A leader asked for a vote by a member of its group tells it who leads, by a
 //!   heartbeat: such a member knows no leader, as one that restarted while its group was idle
 //!   does, and nothing else would tell it.
+//! - **A pre-candidate does not hear a leader it suspects**: it keeps the leader's term while it
+//!   asks, so the leader's appends, heartbeats and snapshots would make it a follower again and
+//!   end its asking; a leader that is up answers a pre-vote with a heartbeat, which can come
+//!   before every grant, ask after ask. They are dropped while it asks, as lost messages are.
 //! - **A leader that trusts a member again** sends it a heartbeat, so a member that was cut off
 //!   while the group was idle catches up (CockroachDB wakes a quiesced range when a node becomes
 //!   live again).
@@ -39,7 +43,7 @@
 //! timed at the next wake: the core never reads a clock.
 use std::time::Duration;
 
-use crate::{MAX_MEMBERS, NodeId};
+use crate::NodeId;
 
 /// A protocol fact, not a tunable: two, the vote rounds a leadership transfer takes at most from
 /// the leader's word to the new leader's first append reaching it: the order to campaign reaching
@@ -59,6 +63,11 @@ pub struct Timing {
     /// (`hyper_timing::Ballot::broadcast_tail`): how long a vote round is given before a candidate
     /// draws again, and how often a leader with work in flight beats.
     pub round: Duration,
+    /// The time the group's election is expected to take from a suspicion, on the span
+    /// (`hyper_timing::Span::election`, `T_E`): the gap the group already accepts at its leader's
+    /// loss, against which a learner's catch-up round is judged (thesis §4.2.1,
+    /// `crate::CatchUp`).
+    pub election: Duration,
 }
 
 impl Timing {
@@ -68,6 +77,7 @@ impl Timing {
         Self {
             span: span.span,
             round: ballot.broadcast_tail,
+            election: span.election,
         }
     }
 }
@@ -90,10 +100,14 @@ pub(crate) enum Arm {
 /// What a member that elects by suspicion keeps (the module's documentation).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watch {
-    /// The members the owner's detectors suspect, in order; at most [`MAX_MEMBERS`].
+    /// The members the owner's detectors suspect, in order; at most the members a configuration
+    /// names ([`crate::Limits::members`]).
     suspected: Vec<NodeId>,
-    /// The span and the round tail, nanoseconds, once the owner gave them.
-    pub(crate) timing: Option<(u64, u64)>,
+    /// The span, the round tail and the expected election, nanoseconds, once the owner gave them.
+    pub(crate) timing: Option<(u64, u64, u64)>,
+    /// The owner's clock at the last wake, nanoseconds: what a learner's catch-up round is timed on
+    /// (`crate::CatchUp`).
+    pub(crate) now: u64,
     /// When this member campaigns.
     pub(crate) campaign: Arm,
     /// When this leader beats next.
@@ -132,12 +146,12 @@ impl Watch {
         self.suspected.binary_search(&member).is_ok()
     }
     /// The detectors suspect `member`. False when they already did. Refused past
-    /// [`MAX_MEMBERS`] members, the most a configuration names.
-    pub(crate) fn suspect(&mut self, member: NodeId) -> crate::Result<bool> {
+    /// `members`, the most a configuration names.
+    pub(crate) fn suspect(&mut self, member: NodeId, members: usize) -> crate::Result<bool> {
         match self.suspected.binary_search(&member) {
             Ok(_) => Ok(false),
             Err(position) => {
-                if self.suspected.len() >= MAX_MEMBERS {
+                if self.suspected.len() >= members {
                     return Err(crate::Error::Capacity("members suspected"));
                 }
                 self.suspected
@@ -169,11 +183,15 @@ impl Watch {
     }
     /// The round tail in nanoseconds, once given.
     pub(crate) fn round(&self) -> Option<u64> {
-        self.timing.map(|(_, round)| round)
+        self.timing.map(|(_, round, _)| round)
+    }
+    /// The expected election in nanoseconds, once given.
+    pub(crate) fn election(&self) -> Option<u64> {
+        self.timing.map(|(_, _, election)| election)
     }
     /// The delay before `local`'s next campaign, drawn anew over the span, once given.
     pub(crate) fn draw(&mut self, local: u64) -> Option<u64> {
-        let (span, _) = self.timing?;
+        let (span, _, _) = self.timing?;
         let delay = nanos(hyper_timing::election_delay(
             Duration::from_nanos(span),
             local,

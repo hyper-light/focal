@@ -206,8 +206,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
     /// counts the groups a pair shares). A peer it is given is told to it as the stream believes
     /// it then (`Replica::suspect`, `Replica::trust`): no change the stream reported while it
     /// was not attached reached it. Called when the replica is inserted, after a drive that may
-    /// have changed its configuration, and before it is removed with `gone`. At most
-    /// `hyper_raft::MAX_MEMBERS` peers a replica.
+    /// have changed its configuration, and before it is removed with `gone`. At most the members
+    /// its configuration may name a replica (`hyper_raft::Limits::members`).
     pub fn pairs(
         &mut self,
         handle: Handle,

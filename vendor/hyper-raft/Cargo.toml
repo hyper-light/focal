@@ -8,6 +8,11 @@ rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 
+[features]
+# The planted defects of `src/mutant.rs`, for hyper-raft's tests that show its oracles catch them.
+# focal never enables it.
+mutants = []
+
 [dependencies]
 crc32c = "0.6"
 hyper-timing = { version = "0.1.0", path = "../hyper-timing" }

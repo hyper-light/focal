@@ -22,7 +22,8 @@
 //! empty change is no bytes in raft-rs's encoding, and the core reads no bytes as the empty change
 //! (`hyper_raft::proto::change_of`): a record of it crosses as no bytes and comes back as none. What
 //! the core holds and raft-rs's encoding cannot state is refused, never dropped: a member's mark
-//! (`Message::lost`), which focal's log never sets.
+//! (`Message::lost`), which focal's log never sets, and an append kept ahead of a hole
+//! (`Message::kept`), which focal's members never keep (`Ahead::Refused`).
 
 use hyper_raft::proto::{
     ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
@@ -510,6 +511,9 @@ struct Layout<'a> {
 fn layout(message: &Message) -> Result<Layout<'_>> {
     if message.lost {
         return Err(EnvelopeError::Unstated("a member's mark"));
+    }
+    if message.kept {
+        return Err(EnvelopeError::Unstated("an append kept ahead of a hole"));
     }
     let mut entries = Vec::new();
     entries

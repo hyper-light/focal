@@ -151,6 +151,10 @@ pub struct Message {
     /// rest (core step R-5, `docs/durable.md` §5). `reject_hint` and `log_term` name the last
     /// entry it holds; its leader takes the member's progress back to it and resends from there.
     pub lost: bool,
+    /// On a refused append's answer: the append began past the end of the member's log, and the
+    /// member keeps what arrives ahead of a hole (`Ahead::Kept`, R17): it kept the append's
+    /// entries, and its leader sends what it lacks before them, not them.
+    pub kept: bool,
     /// Where a refused append may resume.
     pub reject_hint: u64,
     /// What the sender attached.
@@ -390,15 +394,11 @@ pub struct Plan {
     pub context: Vec<u8>,
 }
 impl Plan {
-    /// The most changes one entry states.
-    pub const MAX_CHANGES: usize = crate::MAX_MEMBERS;
-
-    /// The change `change` states.
+    /// The change `change` states. Its changes are as many as its entry's
+    /// bytes hold; the configuration they make is held to the member's
+    /// bound where it takes effect ([`crate::Limits::members`]).
     pub fn of(change: &ConfChangeV2) -> Result<Self> {
         let transition = change.transition;
-        if change.changes.len() > Self::MAX_CHANGES {
-            return Err(Error::Capacity("changes in one entry"));
-        }
         let mut changes = Vec::new();
         changes
             .try_reserve_exact(change.changes.len())
@@ -466,11 +466,6 @@ impl Configuration {
     /// The configuration the log or a snapshot states.
     pub fn from_conf_state(state: &ConfState) -> Result<Self> {
         let copy = |members: &[NodeId]| -> Result<Vec<NodeId>> {
-            if members.len() > crate::MAX_MEMBERS {
-                return Err(Error::Configuration(
-                    crate::ConfigurationError::TooManyMembers,
-                ));
-            }
             let mut copied = Vec::new();
             copied
                 .try_reserve_exact(members.len())

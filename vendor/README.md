@@ -31,12 +31,12 @@ targets; a change to it is made there first and taken here by a new snapshot, ne
 
 | Crate | Version | Revision | Taken | Why it is here |
 |---|---|---|---|---|
-| `hyper-block` | 0.1.0 | `1eae0ddf5f9de8a9925b000b9e26e9ef7da92045` | 2026-10-03 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
-| `hyper-durable` | 0.1.0 | `1eae0ddf5f9de8a9925b000b9e26e9ef7da92045` | 2026-10-03 | The durable shell a group's replica becomes (27 §15) |
-| `hyper-liveness` | 0.1.0 | `1eae0ddf5f9de8a9925b000b9e26e9ef7da92045` | 2026-10-03 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
-| `hyper-log` | 0.1.0 | `1eae0ddf5f9de8a9925b000b9e26e9ef7da92045` | 2026-10-03 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
-| `hyper-raft` | 0.1.0 | `1eae0ddf5f9de8a9925b000b9e26e9ef7da92045` | 2026-10-03 | The consensus core every group runs |
-| `hyper-timing` | 0.1.0 | `1eae0ddf5f9de8a9925b000b9e26e9ef7da92045` | 2026-10-03 | The election law's draw the core takes its delays from |
+| `hyper-block` | 0.1.0 | `df54729e36125684811cd9acb09cc404bc93f258` | 2026-10-04 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
+| `hyper-durable` | 0.1.0 | `df54729e36125684811cd9acb09cc404bc93f258` | 2026-10-04 | The durable shell a group's replica becomes (27 §15) |
+| `hyper-liveness` | 0.1.0 | `df54729e36125684811cd9acb09cc404bc93f258` | 2026-10-04 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
+| `hyper-log` | 0.1.0 | `df54729e36125684811cd9acb09cc404bc93f258` | 2026-10-04 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
+| `hyper-raft` | 0.1.0 | `df54729e36125684811cd9acb09cc404bc93f258` | 2026-10-04 | The consensus core every group runs |
+| `hyper-timing` | 0.1.0 | `df54729e36125684811cd9acb09cc404bc93f258` | 2026-10-04 | The election law's draw the core takes its delays from |
 
 A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
 crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to

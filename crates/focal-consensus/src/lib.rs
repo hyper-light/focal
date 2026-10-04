@@ -76,6 +76,12 @@ pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// The most bytes of the application's state a snapshot, a checkpoint or a
 /// restored image holds.
 pub(crate) const IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// The most members a group's configuration names, voters and learners together. It is the bound
+/// focal has held since before its core moved to hyper-raft, and it sizes the group files' records
+/// (`group_files::META_BOUND`), so it is carried unchanged and no file's bounds move. focal states
+/// it to the core as the members its groups name (`hyper_raft::Stated::members`), the same at every
+/// member, as the core requires.
+pub const MAX_MEMBERS: usize = 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: u64,
@@ -907,7 +913,7 @@ impl LogNode {
                 .chain(&conf.learners_next)
                 .filter(|member| tracker.get(**member).is_none())
                 .count()
-                .min(hyper_raft::MAX_MEMBERS)
+                .min(MAX_MEMBERS)
         };
         self.guarded_in(bytes, added, BudgetLane::Completion, |replica| {
             replica.step_inner(message)

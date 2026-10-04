@@ -43,8 +43,8 @@ const TRAILER_BYTES: usize = 4;
 /// bytes (postcard's wire format).
 const VARINT: usize = 10;
 /// The most a list of a configuration's members encodes to: its length and at most
-/// [`hyper_raft::MAX_MEMBERS`] ids.
-const MEMBERS: usize = VARINT + hyper_raft::MAX_MEMBERS * VARINT;
+/// [`crate::MAX_MEMBERS`] ids.
+const MEMBERS: usize = VARINT + crate::MAX_MEMBERS * VARINT;
 /// The most a group's records encode to: the identity's node id, cluster and group ids, its two
 /// ticks and three bounds, its voters and learners; the fast track's flag; and the two optional
 /// decoder records, a hash and a pair of hashes. A larger file was written by no binary.

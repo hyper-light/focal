@@ -292,7 +292,7 @@ impl LogNode {
                 .fold(0usize, |added, entry| {
                     added.saturating_add(memory::members_added(entry, tracker))
                 })
-                .min(hyper_raft::MAX_MEMBERS);
+                .min(crate::MAX_MEMBERS);
             let bytes = memory::staging_bytes(&self.raw, &self.config, 0, joining)?;
             // Nothing has been taken from Raft yet: a refused staging reservation
             // leaves the replica exactly as it was, so the caller retries once

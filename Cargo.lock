@@ -1041,6 +1041,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.4.3",
  "hyper-block",
+ "hyper-timing",
  "thiserror",
 ]
 

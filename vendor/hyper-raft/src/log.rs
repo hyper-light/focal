@@ -312,6 +312,11 @@ impl Unstable {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+    /// How many of the entries not yet held by storage lie at or below `index`: what an append
+    /// after `index` keeps of them.
+    pub(crate) fn count_through(&self, index: u64) -> usize {
+        self.entries.partition_point(|entry| entry.index <= index)
+    }
     /// The snapshot storage does not hold yet.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()

@@ -37,6 +37,7 @@ mod owner;
 mod recover;
 mod room;
 mod state;
+mod stats;
 mod ticket;
 mod writer;
 
@@ -50,6 +51,7 @@ use hyper_block::buf::{Alignment, Pool};
 pub use error::LogError;
 pub use format::{HardState, Start};
 pub use group::GroupLog;
+pub use stats::LogStats;
 pub use ticket::{Fetching, Pending};
 
 use owner::{Message, Owner, Query};
@@ -562,6 +564,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 lens: (0, 0),
                 waits: false,
                 epoch: 0,
+                submitted: stats::now(),
             });
         }
         Ok(Prepared {
@@ -761,6 +764,7 @@ impl<F: BlockFile + 'static> Log<F> {
             lens: (0, 0),
             waits: hears == Hears::Waits,
             epoch: 0,
+            submitted: stats::now(),
         };
         let message = Message::Submit { submission, wait };
         let sent = if wait {
@@ -965,6 +969,17 @@ impl<F: BlockFile + 'static> Log<F> {
         match self.ask(Query::Flushed) {
             Ok(Answer::Flushed(frames, updates)) => (frames, updates),
             _ => (0, 0),
+        }
+    }
+
+    /// What the log measured from its opening to now (`docs/durable.md` §13.1), asked of its
+    /// owner, which answers it as it comes: the owner never waits on I/O, so a flush in progress
+    /// delays no answer and shows as [`LogStats::flushing_since`]. `into`, a box an earlier call
+    /// gave back, is filled again, so a reader that keeps it allocates once.
+    pub fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {
+        match self.ask(Query::Stats(into))? {
+            Answer::Stats(stats) => Ok(stats),
+            _ => Err(LogError::Closed),
         }
     }
 

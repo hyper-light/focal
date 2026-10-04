@@ -1,11 +1,13 @@
 //! Accounting for owned Raft buffers. Retained bytes use actual capacities;
 //! each mutation first reserves clone/fanout headroom before entering Raft.
-use crate::{ConsensusError, Entry, Message, NodeConfig, NodeEvents, Snapshot, storage::RamLog};
+use crate::{
+    ConsensusError, Entry, MAX_MEMBERS, Message, NodeConfig, NodeEvents, Snapshot, storage::RamLog,
+};
 use focal_memory::{
     ALLOCATOR_OVERHEAD as OVERHEAD, Allocation, BudgetKind, BudgetLane, MemoryBudget,
 };
 use hyper_raft::{
-    MAX_MEMBERS, Outgoing, Raft, RawNode, Storage,
+    Outgoing, Raft, RawNode, Storage,
     progress::{Progress, Tracker},
     proto::{self, ConfChangeType, ConfState, HardState},
 };

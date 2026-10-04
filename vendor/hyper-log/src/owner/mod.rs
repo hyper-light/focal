@@ -41,6 +41,7 @@ use crate::device::{Answering, Carrier, Completion, Device, Io, Job, Look, Reque
 use crate::format;
 use crate::room::{Room, Take};
 use crate::state::State;
+use crate::stats::{self, Tally};
 use crate::ticket::{Answer, Reply, Ticket};
 use crate::writer::{Key, Placement, Submission};
 use crate::{LogError, Params};
@@ -236,6 +237,10 @@ pub(crate) struct Owner<F> {
     /// in: the group's writes sent in it or before are refused [`LogError::Behind`]
     /// (`Owner::behind`). At most one entry a claimed group, gone with the claim.
     refused: HashMap<u128, u64>,
+    /// What the log's I/O measured, counted as each job's completion is heard (`stats.rs`).
+    tally: Box<Tally>,
+    /// When the frame or confirmation on the device went to it, while one is there.
+    flushing_since: Option<Instant>,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -289,6 +294,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             watching: false,
             claimed: HashSet::new(),
             refused: HashMap::new(),
+            tally: Tally::new(),
+            flushing_since: None,
         }
     }
 
@@ -338,6 +345,9 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Hands a job and the device to the caller waiting on it, or else to the I/O thread.
     fn start(&mut self, job: Job<F>, doer: Option<SyncSender<Reply>>, device: Device<F>) {
         self.jobs = self.jobs.wrapping_add(1);
+        if matches!(job, Job::Frame(_) | Job::Confirm { .. }) {
+            self.flushing_since = Some(stats::now());
+        }
         let carrier = match self.carrier.take() {
             Some(mut c) => {
                 c.job = Some(job);
@@ -644,16 +654,19 @@ impl<F: BlockFile + 'static> Owner<F> {
                 record,
                 confirm,
                 result,
-                took_ns,
+                timing,
                 confirming,
                 before,
                 these,
             } => {
                 self.buffers.frame = Some(frame);
                 self.buffers.record = Some(record);
+                self.tally.job(&timing, true);
+                // A device that confirms the frame on its own goes on to it as the flush ends.
+                self.flushing_since = timing.flushed_at.filter(|_| confirming);
                 let done = write::Flushed {
                     result,
-                    took_ns,
+                    timing,
                     confirming,
                     confirm,
                     before,
@@ -665,9 +678,12 @@ impl<F: BlockFile + 'static> Owner<F> {
                 record,
                 result,
                 these,
+                timing,
             } => {
                 self.give_confirm(record);
-                self.confirmed(result, these, inbox);
+                self.tally.job(&timing, false);
+                self.flushing_since = None;
+                self.confirmed(result, these, timing.flushed_at, inbox);
             }
             Completion::Read(reads) => self.read(reads),
             Completion::Looked => {

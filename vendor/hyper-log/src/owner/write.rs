@@ -27,6 +27,7 @@ use super::{Message, Owner};
 use crate::codec::Writer as Payload;
 use crate::device::{Answering, Frame, Job, Swept};
 use crate::format::{self, SegmentHeader};
+use crate::stats::Timing;
 use crate::ticket::Answer;
 use crate::writer::{self, Placement, Submission, Sweep, SweepRead, Target};
 use crate::{LogError, Waits};
@@ -60,7 +61,7 @@ pub(super) enum Phase {
 /// What the device says of a frame's flush (`device::Completion::Frame`).
 pub(super) struct Flushed {
     pub(super) result: Result<(), LogError>,
-    pub(super) took_ns: u64,
+    pub(super) timing: Timing,
     /// The device is confirming the frame on its own.
     pub(super) confirming: bool,
     /// The frame's own confirmation, unless the device is writing it.
@@ -717,7 +718,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     pub(super) fn written(&mut self, done: Flushed, inbox: &Receiver<Message<F>>) {
         let Flushed {
             result,
-            took_ns,
+            timing,
             confirming,
             confirm,
             before,
@@ -743,7 +744,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             _ => self.keep_answers(before),
         }
         let published = result.and_then(|()| {
-            self.schedule.anticipation.served(took_ns);
+            self.schedule.anticipation.served(timing.took_ns);
             writer::publish(
                 &mut self.state,
                 &self.p,
@@ -768,7 +769,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         schedule.updates = schedule.updates.saturating_add(updates);
         let backlog = self.backlog_at_answers();
         let confirmed = match self.unconfirmed.take() {
-            Some(before) => self.settle(before, Ok(())),
+            // This frame's flush made the record that confirms the frame before durable.
+            Some(before) => self.settle(before, Ok(()), timing.flushed_at),
             None => 0,
         };
         self.count_fruitless(taken.is_empty());
@@ -884,7 +886,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.answer(s, Err(LogError::Fenced));
         }
         if let Some(before) = self.unconfirmed.take() {
-            self.settle(before, Err(()));
+            self.settle(before, Err(()), None);
         }
         self.schedule.answered = 0;
         self.forget();
@@ -929,7 +931,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// A frame whose confirmation will never come: its updates are answered `Fenced`.
     fn unanswerable(&mut self, frame: Unconfirmed) {
-        self.settle(frame, Err(()));
+        self.settle(frame, Err(()), None);
         self.schedule.answered = 0;
     }
 
@@ -939,6 +941,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         &mut self,
         result: Result<(), LogError>,
         these: Vec<Answering>,
+        durable: Option<Instant>,
         inbox: &Receiver<Message<F>>,
     ) {
         let Phase::Confirming { mut frame, forget } =
@@ -956,10 +959,10 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.end_busy_period();
         }
         self.schedule.answered = match result {
-            Ok(()) => self.settle(frame, Ok(())),
+            Ok(()) => self.settle(frame, Ok(()), durable),
             Err(_) => {
                 self.fence();
-                self.settle(frame, Err(()));
+                self.settle(frame, Err(()), None);
                 0
             }
         };
@@ -972,14 +975,25 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Gives back the room of the updates of a frame whose confirmation is durable, `Ok`, or
     /// will never be, `Fenced`, answering those the device has not: the number settled. Its lists
-    /// are kept for later frames.
-    fn settle(&mut self, frame: Unconfirmed, result: Result<(), ()>) -> u64 {
+    /// are kept for later frames. `durable` is when the flush that made the confirmation durable
+    /// ended, which each update's commit wait runs to.
+    fn settle(
+        &mut self,
+        frame: Unconfirmed,
+        result: Result<(), ()>,
+        durable: Option<Instant>,
+    ) -> u64 {
         let Unconfirmed {
             mut updates,
             answering,
             confirm,
             ..
         } = frame;
+        if let (Ok(()), Some(durable)) = (result, durable) {
+            for (s, _) in &updates {
+                self.tally.waited(s.submitted, durable);
+            }
+        }
         let fenced = || result.map_err(|()| LogError::Fenced);
         self.answer_each(answering, fenced());
         if let Some(buf) = confirm {

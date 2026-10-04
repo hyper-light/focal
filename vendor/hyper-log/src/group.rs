@@ -411,6 +411,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             lens: (0, 0),
             waits,
             epoch: self.epoch,
+            submitted: crate::stats::now(),
         };
         self.inbox
             .send(Message::Submit {

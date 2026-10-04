@@ -6,7 +6,7 @@
 //! two majorities of configurations one voter apart intersect, or **joint**,
 //! which moves any number by passing through a configuration that needs
 //! the majority of both the old voters and the new.
-use crate::{MAX_MEMBERS, NodeId};
+use crate::NodeId;
 
 /// Why a configuration, or a change of one, is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -14,9 +14,6 @@ pub enum ConfigurationError {
     /// A member is named zero, which is no member.
     #[error("a member's identity is zero")]
     ZeroMember,
-    /// More members than [`MAX_MEMBERS`].
-    #[error("a configuration names at most {MAX_MEMBERS} members")]
-    TooManyMembers,
     /// No voter is named.
     #[error("a configuration has no voter")]
     NoVoter,
@@ -144,9 +141,11 @@ impl Configuration {
             auto_leave: self.auto_leave,
         })
     }
-    /// Whether the sets form a configuration: within [`MAX_MEMBERS`], no
-    /// zero, no member named twice or in two roles, a voter at least, and
-    /// the joint-only sets empty when the configuration is not joint.
+    /// Whether the sets form a configuration: no zero, no member named
+    /// twice or in two roles, a voter at least, and the joint-only sets
+    /// empty when the configuration is not joint. How many members it may
+    /// name is the member's bound ([`crate::Limits::members`]), which the
+    /// tracker holds it to.
     pub fn validate(&self) -> Result<(), ConfigurationError> {
         let sets = [
             &self.voters,
@@ -154,12 +153,6 @@ impl Configuration {
             &self.learners,
             &self.learners_next,
         ];
-        let members = sets
-            .iter()
-            .fold(0usize, |sum, set| sum.saturating_add(set.len()));
-        if members > MAX_MEMBERS.saturating_mul(2) || self.members().count() > MAX_MEMBERS {
-            return Err(ConfigurationError::TooManyMembers);
-        }
         if sets.iter().any(|set| set.first() == Some(&0)) {
             return Err(ConfigurationError::ZeroMember);
         }
@@ -405,12 +398,6 @@ mod tests {
         ] {
             assert_eq!(Configuration::new(voters, learners), Err(error));
         }
-        let many: Vec<u64> = (1..=MAX_MEMBERS as u64 + 1).collect();
-        assert_eq!(
-            Configuration::new(many.clone(), vec![]),
-            Err(ConfigurationError::TooManyMembers)
-        );
-        assert!(Configuration::new(many[..MAX_MEMBERS].to_vec(), vec![]).is_ok());
         assert_eq!(
             Configuration::from_parts(vec![1], vec![], vec![], vec![], true),
             Err(ConfigurationError::NotJoint)

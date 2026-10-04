@@ -153,6 +153,12 @@ pub struct Settings {
     /// The fleet's failure history so far, the MTBF's prior evidence ([`Exposure::new`] for a
     /// fleet with none).
     pub history: Exposure,
+    /// The resolution of the clock the owner reads `now`, its waits and the receive stamps on:
+    /// the least step its readings take. A wait read exactly on time was late by less than it, so
+    /// the timer's granularity `G` is never stated below it (`hyper_timing::Lateness`,
+    /// `docs/timing.md` §2.4). hyper-tokio's `Clock::resolution` states the host's monotonic
+    /// clock's; a simulation's stamps are whole nanoseconds, one.
+    pub resolution: Duration,
 }
 
 /// Which write became durable.
@@ -389,7 +395,7 @@ impl Liveness {
             run: settings.run,
             max_peers: settings.max_peers,
             pairs: BTreeMap::new(),
-            timer: Lateness::new(),
+            timer: Lateness::new(settings.resolution),
             asked: None,
             late_most: 0,
             flushes: Flushes::new(),
@@ -702,9 +708,10 @@ impl Liveness {
     }
 
     /// `G`, the mean lateness of the owner's waits for the stream's wakes
-    /// ([`on_wait`](Self::on_wait)), once measured and not zero.
+    /// ([`on_wait`](Self::on_wait)), once one is measured, and never below the clock's resolution
+    /// ([`Settings::resolution`]).
     pub fn granularity(&self) -> Option<Duration> {
-        self.timer.granularity().filter(|g| !g.is_zero())
+        self.timer.granularity()
     }
 
     /// The latest the owner has polled past a wake asked, or is past one at `now_ns`.

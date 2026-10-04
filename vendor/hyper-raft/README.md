@@ -13,8 +13,10 @@ It is Raft as Ongaro's thesis states it, with pre-vote, check-quorum, election p
 learners, joint consensus, leader transfer, an inflight window with conflict hints,
 ReadIndex and snapshots. Reads asked before the member is next asked what there is to do
 share one round of heartbeats (`ReadRounds`). What a member is sent ahead of its
-answers is bounded in messages and in bytes, the bytes by what its owner says the path to
-it carries (`RawNode::set_inflight_bytes`). It keeps the log and speaks the messages of `raft-rs` 0.7
+answers is bounded in bytes, each append charged its record, by what its owner says the path to
+it carries over the two round trips a lost append takes to repair (`RawNode::set_inflight_bytes`,
+`hyper_timing::inflight_window`), and in messages unless the window counts none. What arrives ahead of a hole in a member's log is kept and taken in when the hole is filled
+(`Ahead`). A learner is caught up in rounds before its owner promotes it (`RawNode::catch_up`). It keeps the log and speaks the messages of `raft-rs` 0.7
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in the module header of `src/raft.rs` and in focal's
 `docs/archictecutre/27-consensus-roadmap-and-slates-port.md` §4.5 (focal `a8e95f7`).
@@ -53,7 +55,9 @@ term's committed entries before its own write of them is durable.
 - Nothing unwinds. `Error` says whether an operation was refused and changed nothing,
   whether a peer's message contradicted what the member holds, or whether the member's
   state no longer adds up (`Error::is_fatal`), which alone stops the replica.
-- Everything that grows has a bound (`Limits`, `MAX_MEMBERS`).
+- Everything that grows has a bound, derived from what the owner states: its transport's largest
+  message, the members its group names, the bytes a queue may hold, its store's depth
+  (`Limits::derive`).
 - A run is its seed: election timeouts are drawn from `Config::seed`.
 
 ## Tests
@@ -64,9 +68,12 @@ term's committed entries before its own write of them is durable.
 | `tests/differential.rs` | this core and `raft-rs` on one schedule, compared after every step, with `Ready`s copied and given in place |
 | `tests/group.rs` | groups of this core, and of both cores together, under schedules: safe whatever the schedule, and settled once the network is whole; the decisions of focal 27 §4.5 |
 | `tests/fast.rs` | the fast track: committed by the fast quorum, taken again by the leader that follows, and groups that propose by it under schedules |
+| `tests/backlog.rs` | a proposal costs its leader the same allocations at any backlog (slates' R21) |
+| `tests/timed.rs` | replication across five Azure regions in time (`tests/support/timed.rs`): a window of what the path carries over two round trips keeps up where one batch does not (slates' R16); on paths that reorder, what arrives ahead of a hole is not sent again (R17); and the measurement tool behind `docs/benchmarks.md` |
 | `tests/pipeline.rs` | members that take `Ready`s ahead of their persistence, under schedules that interleave persistence with everything else and crash at every persistence step: held at every step to what their disks hold (`docs/durable.md` §3) |
 | `benches/replicate.rs` | what replication costs with either core |
 | `benches/pipeline.rs` | readies in flight against one at a time, on simulated devices and a simulated network |
+| `benches/backlog.rs` | slates' measurement of a proposal's cost as a leader's backlog grows |
 
 The fast track's TLA+ model is still in focal (`docs/models/FastTrack.tla`). It moves here
 with the fast-track decision (`docs/raft.md`).

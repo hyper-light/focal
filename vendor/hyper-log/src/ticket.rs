@@ -53,6 +53,7 @@ pub(crate) enum Answer {
     Entries(Fetched),
     Flushed(u64, u64),
     Fenced(bool),
+    Stats(Box<crate::LogStats>),
 }
 
 /// A port, both ends.

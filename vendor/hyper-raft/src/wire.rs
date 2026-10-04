@@ -25,6 +25,11 @@ pub const ENTRY_FIXED_BYTES: usize = 1 + 8 + 8 + 4 + 4;
 /// Bytes of a message's body besides its context, entries and snapshot: the kind, the flags,
 /// nine `u64`, the priority, the entry count and the context length.
 pub const MESSAGE_FIXED_BYTES: usize = 1 + 1 + 9 * 8 + 8 + 4 + 4;
+/// Bytes of a message's record besides its context, entries and snapshot: its body's fixed part,
+/// the record's header and its checksum. A leader's append carries no context, so what it costs the
+/// path is this and its entries' bodies, the bytes a member's window is charged
+/// (`progress::Inflights`).
+pub const MESSAGE_RECORD_FIXED_BYTES: usize = HEADER_BYTES + MESSAGE_FIXED_BYTES + CHECKSUM_BYTES;
 
 /// Flag bit of a message: the request is refused.
 const REJECT: u8 = 1;
@@ -33,6 +38,9 @@ const HAS_SNAPSHOT: u8 = 1 << 1;
 /// Flag bit of a message: a refused append's answer from a member whose log lost entries it
 /// acknowledged (core step R-5).
 const LOST: u8 = 1 << 2;
+/// Flag bit of a message: a refused append's answer from a member that kept the append ahead of a
+/// hole in its log (core step R-3's R17).
+const KEPT: u8 = 1 << 3;
 /// Presence bit of a snapshot: its metadata follows.
 const HAS_METADATA: u8 = 1;
 /// Presence bit of a snapshot: the metadata's configuration follows its index and term.
@@ -492,6 +500,9 @@ impl Record for Message {
         if self.lost {
             flags |= LOST;
         }
+        if self.kept {
+            flags |= KEPT;
+        }
         out.push(flags);
         for field in [
             self.to,
@@ -520,7 +531,7 @@ impl Record for Message {
     fn take_body(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let msg_type = take_message_kind(reader.byte()?)?;
         let flags = reader.byte()?;
-        if flags & !(REJECT | HAS_SNAPSHOT | LOST) != 0 {
+        if flags & !(REJECT | HAS_SNAPSHOT | LOST | KEPT) != 0 {
             return Err(DecodeError::Unknown {
                 what: "message flags",
                 value: flags,
@@ -574,6 +585,7 @@ impl Record for Message {
             request_snapshot,
             reject: flags & REJECT != 0,
             lost: flags & LOST != 0,
+            kept: flags & KEPT != 0,
             reject_hint,
             context,
             priority,
@@ -778,6 +790,7 @@ mod tests {
             request_snapshot: 9,
             reject: true,
             lost: false,
+            kept: false,
             reject_hint: 39,
             context: b"read".to_vec(),
             priority: -5,
@@ -797,6 +810,23 @@ mod tests {
             reject: true,
             lost: true,
             reject_hint: 40,
+            ..Message::default()
+        }
+    }
+
+    /// A member's word that it kept an append that arrived ahead of a hole (R17).
+    fn kept() -> Message {
+        Message {
+            msg_type: MessageType::MsgAppendResponse,
+            to: 1,
+            from: 2,
+            term: 7,
+            log_term: 6,
+            index: 45,
+            commit: 38,
+            reject: true,
+            kept: true,
+            reject_hint: 43,
             ..Message::default()
         }
     }
@@ -875,6 +905,16 @@ mod tests {
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(lost().encode_to_vec(), sealed(1, &body));
+
+        // The kept refusal: the answer's kind, the reject and kept flags, the words.
+        let mut body = vec![4, REJECT | KEPT];
+        for field in [1u64, 2, 7, 6, 45, 38, 0, 0, 43] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(kept().encode_to_vec(), sealed(1, &body));
     }
 
     /// A record and whether bytes read back to its value.
@@ -887,6 +927,7 @@ mod tests {
         vec![
             (message().encode_to_vec(), |b| round(b, &message())),
             (lost().encode_to_vec(), |b| round(b, &lost())),
+            (kept().encode_to_vec(), |b| round(b, &kept())),
             (entry().encode_to_vec(), |b| round(b, &entry())),
             (snapshot().encode_to_vec(), |b| round(b, &snapshot())),
             (change().encode_to_vec(), |b| round(b, &change())),
@@ -992,7 +1033,7 @@ mod tests {
             Message::decode(&sealed(1, &body)),
             Err(DecodeError::Unknown { .. })
         ));
-        let mut body = vec![3, 1 << 3];
+        let mut body = vec![3, 1 << 4];
         body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
         assert!(matches!(
             Message::decode(&sealed(1, &body)),

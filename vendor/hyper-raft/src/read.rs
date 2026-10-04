@@ -53,6 +53,9 @@ impl PendingRead {
 pub struct ReadOnly {
     queue: VecDeque<PendingRead>,
     limit: usize,
+    /// The most members a configuration names: each asks a read, and
+    /// confirms one, once.
+    members: usize,
     /// How many of them, from the first, a round that was sent asks for:
     /// its heartbeat carried the context of the last of them, and a quorum
     /// that answers it confirms them all. Those behind were asked after it
@@ -61,10 +64,11 @@ pub struct ReadOnly {
 }
 impl ReadOnly {
     /// No reads, and room for at most `limit`.
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, members: usize) -> Self {
         Self {
             queue: VecDeque::new(),
             limit,
+            members,
             asked: 0,
         }
     }
@@ -109,7 +113,7 @@ impl ReadOnly {
                 return Ok(());
             };
             if !read.origins.contains(&from) {
-                if read.origins.len() >= crate::MAX_MEMBERS {
+                if read.origins.len() >= self.members {
                     return Err(Error::Capacity("members that ask one read"));
                 }
                 read.origins.try_reserve(1).map_err(|_| Error::Memory)?;
@@ -150,7 +154,7 @@ impl ReadOnly {
             return Ok(None);
         };
         if let Err(at) = read.acks.binary_search(&member) {
-            if read.acks.len() >= crate::MAX_MEMBERS {
+            if read.acks.len() >= self.members {
                 return Err(Error::Capacity("members that confirm a read"));
             }
             read.acks.try_reserve(1).map_err(|_| Error::Memory)?;
@@ -209,7 +213,7 @@ mod tests {
 
     #[test]
     fn reads_leave_in_the_order_asked_once_one_is_confirmed() {
-        let mut reads = ReadOnly::new(3);
+        let mut reads = ReadOnly::new(3, 3);
         reads.add(5, b"a".to_vec(), 0, 1).unwrap();
         reads.add(6, b"b".to_vec(), 2, 1).unwrap();
         reads.add(9, b"a".to_vec(), 3, 1).unwrap();

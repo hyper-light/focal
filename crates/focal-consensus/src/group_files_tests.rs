@@ -218,7 +218,7 @@ fn what_exceeds_its_bound_is_refused_written_or_read() {
     ));
     // An identity with more members than any configuration holds encodes past the records' bound.
     let mut many = records(None);
-    many.identity.voters = vec![u64::MAX; 3 * hyper_raft::MAX_MEMBERS];
+    many.identity.voters = vec![u64::MAX; 3 * crate::MAX_MEMBERS];
     assert!(matches!(
         write_records(&mut disk, &dir, &many),
         Err(GroupFileError::Bound { .. })

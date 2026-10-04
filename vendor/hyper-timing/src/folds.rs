@@ -64,16 +64,29 @@ impl std::error::Error for FoldFull {}
 /// On macOS `G` is half of each wait (timer coalescing), so it is a property of the wait length:
 /// a link that changes its interval changes the waits, and the fold is started again
 /// ([`Lateness::new`]) for the new length.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// `G` is never stated below the resolution `r` of the clock the waits are read on: a wait read
+/// exactly on time was late by less than `r`, and a mean below `r` is lateness the clock cannot
+/// tell from none, so `r` bounds both. The floors `G` sets then hold on a clock that reads every
+/// wait as on time, a simulation's, a busy-polling owner's or a coarse counter's, where a mean of
+/// zero floored nothing and configured no detector (`docs/timing.md` §2.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lateness {
     late: Mean,
+    /// `r`, nanoseconds, at least one.
+    resolution_ns: u64,
 }
 
 impl Lateness {
-    /// A fold with no wait.
-    pub const fn new() -> Self {
+    /// A fold with no wait, of waits read on a clock whose resolution is `resolution`, the least
+    /// step its readings take (hyper-tokio's `Clock::resolution` states the host's monotonic
+    /// clock's). Stamps are whole nanoseconds, so a resolution below one is one.
+    pub fn new(resolution: Duration) -> Self {
         Self {
             late: Mean { count: 0, sum: 0 },
+            resolution_ns: u64::try_from(resolution.as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1),
         }
     }
 
@@ -89,10 +102,10 @@ impl Lateness {
         self.late.count
     }
 
-    /// `G`, the mean lateness, or `None` before a wait. A wait that was exactly on time on a clock
-    /// that cannot resolve finer gives zero, which no floor can use; [`Floors::measured`] refuses it.
+    /// `G`, the mean lateness and never below the clock's resolution, or `None` before a wait.
     pub fn granularity(&self) -> Option<Duration> {
-        self.late.mean()
+        let mean = self.late.mean()?;
+        Some(mean.max(Duration::from_nanos(self.resolution_ns)))
     }
 }
 
@@ -107,7 +120,7 @@ impl Lateness {
 /// waits its owner reports instead, each begun before its deadline and ended at or past it,
 /// whatever ended it, a [`Lateness`] of its own (`hyper_liveness::Liveness::on_wait`,
 /// `docs/timing.md` §2.4).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wakes {
     lateness: Lateness,
     asked: Option<u64>,
@@ -115,10 +128,10 @@ pub struct Wakes {
 }
 
 impl Wakes {
-    /// No wake asked or measured.
-    pub const fn new() -> Self {
+    /// No wake asked or measured, on a clock whose resolution is `resolution` ([`Lateness::new`]).
+    pub fn new(resolution: Duration) -> Self {
         Self {
-            lateness: Lateness::new(),
+            lateness: Lateness::new(resolution),
             asked: None,
             latest: 0,
         }
@@ -147,9 +160,9 @@ impl Wakes {
         self.asked
     }
 
-    /// `G`, the mean lateness of the wakes, once measured and not zero.
+    /// `G`, the mean lateness of the wakes, once one is measured ([`Lateness::granularity`]).
     pub fn granularity(&self) -> Option<Duration> {
-        self.lateness.granularity().filter(|g| !g.is_zero())
+        self.lateness.granularity()
     }
 
     /// The fold itself.
@@ -202,13 +215,13 @@ impl Floors {
     /// The floors from what was measured: the receiver's granularity `G`, the sender's mean flush
     /// (its stability floor is `E[flush] + G`, Lindley's condition with the sender's wait in its
     /// service), and the link's correlation time `T_c`, which the traces measure (§2.6). `None`
-    /// while either fold is empty or `G` is zero: no floor is invented.
+    /// while either fold is empty: no floor is invented.
     pub fn measured(
         granularity: &Lateness,
         sender: &Flushes,
         correlation: Duration,
     ) -> Option<Self> {
-        let granularity = granularity.granularity().filter(|g| !g.is_zero())?;
+        let granularity = granularity.granularity()?;
         let flush = sender.mean()?;
         Some(Self {
             granularity,
@@ -287,7 +300,7 @@ mod tests {
 
     #[test]
     fn the_granularity_is_the_mean_lateness_and_never_negative() {
-        let mut late = Lateness::new();
+        let mut late = Lateness::new(Duration::from_nanos(1));
         assert_eq!(late.granularity(), None);
         late.on_wait(1_000, 1_400).unwrap();
         late.on_wait(2_000, 2_200).unwrap();
@@ -298,14 +311,46 @@ mod tests {
     }
 
     #[test]
-    fn the_floors_need_both_folds_and_a_granularity() {
-        let mut late = Lateness::new();
+    fn a_wait_read_on_time_was_late_by_less_than_the_clock_resolution() {
+        // Apple silicon's timebase is 125/3 ns a tick: a reading moves by 41 or 42 ns.
+        let resolution = Duration::from_nanos(42);
+        let mut late = Lateness::new(resolution);
+        assert_eq!(late.granularity(), None, "no wait");
+        late.on_wait(1_000, 1_000).unwrap();
+        assert_eq!(late.granularity(), Some(resolution), "on time: within r");
+        late.on_wait(2_000, 2_020).unwrap();
+        assert_eq!(
+            late.granularity(),
+            Some(resolution),
+            "a mean of 10 ns, below r"
+        );
+        late.on_wait(3_000, 3_400).unwrap();
+        assert_eq!(
+            late.granularity(),
+            Some(Duration::from_nanos(140)),
+            "a mean past r is the mean"
+        );
+        let mut finest = Lateness::new(Duration::ZERO);
+        finest.on_wait(5, 5).unwrap();
+        assert_eq!(
+            finest.granularity(),
+            Some(Duration::from_nanos(1)),
+            "stamps are whole nanoseconds"
+        );
+    }
+
+    #[test]
+    fn the_floors_need_both_folds() {
+        let mut late = Lateness::new(Duration::from_nanos(1));
         let mut flush = Flushes::new();
         let tc = Duration::from_millis(50);
         assert_eq!(Floors::measured(&late, &flush, tc), None);
         late.on_wait(0, 0).unwrap();
+        assert_eq!(Floors::measured(&late, &flush, tc), None, "no flush");
         flush.on_flush(10, 4_010).unwrap();
-        assert_eq!(Floors::measured(&late, &flush, tc), None, "G of zero");
+        let on_time = Floors::measured(&late, &flush, tc).unwrap();
+        assert_eq!(on_time.granularity, Duration::from_nanos(1), "on time: r");
+        assert_eq!(on_time.sender, Duration::from_nanos(4_001));
         late.on_wait(0, 2_000).unwrap();
         let floors = Floors::measured(&late, &flush, tc).unwrap();
         assert_eq!(floors.granularity, Duration::from_nanos(1_000));
@@ -325,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_wake_is_measured_once_and_only_at_or_past_its_ask() {
-        let mut wakes = Wakes::new();
+        let mut wakes = Wakes::new(Duration::from_nanos(1));
         wakes.woke(5);
         assert_eq!(wakes.granularity(), None, "nothing asked");
         wakes.ask(Some(1_000));

@@ -179,3 +179,57 @@ etcd bounds what it hands out and has not seen applied by bytes (`maxApplyingEnt
 in one drive gave it 16 entries, 3,436 bytes, against a page of 512. Now every drive stays within
 the page, or applies one larger entry alone.
 
+## A write made again never starts the log past the state machine (2026-10-03)
+
+A write refused for room is made again as one write of everything the core holds not yet durable
+(`make_again`, `docs/durable.md` §2.4). The core may have taken a leader's snapshot while the
+refused write was out: the store's depth held its `Ready` back, so no `Ready` gave the snapshot
+and the state machine never installed it. Made again with it, the write moved the log's start to
+the snapshot's point with the state machine behind it, against I8 (the log never starts past what
+the state machine holds, mantle's rule), and a member stopped then would not open
+(`a_log_that_starts_past_the_state_machine_does_not_open`). The write made again now leaves out a
+snapshot no `Ready` gave (`Unstable::unissued_snapshot`) and the entries after it, and states no
+commit past what earlier writes hold; the snapshot's own `Ready` installs it and writes it, as
+every other install. Found by the simulation at 1,000 seeds a shape on R-3's core (seed 600 of five
+voters at depth one, `tests/sim.rs`), where the core's out-of-order acknowledgement (R17) changed
+the schedules; `main`'s shell has it, and its 1,000 seeds did not reach it. Test:
+`a_write_made_again_never_starts_the_log_past_the_state_machine` (`tests/shell.rs`), which fails
+before the change: the log started at 8 with the state machine at 0.
+
+## R22: when a log is compacted (2026-10-03)
+
+Core step R-3's last enhancement (mantle note 32 R22, `docs/durable.md` §6.1), the thesis's rule as
+the shell's policy, which no shell had: mantle compacted for room, focal at its checkpoints, and
+slates by the rule inside its own core (`crates/cluster/src/fold.rs`).
+
+- **The rule** (Ongaro's thesis §5.1.2; `src/compaction.rs`): `Replica::compaction_due(rule)` says
+  whether the applied entries the log holds exceed the image it was last compacted to times the
+  owner's expansion factor (`Compaction`). A leader waits while a member lacks what it applied, as
+  long as the log holds no more than twice the threshold (slates' `HELD_FOR_FOLLOWERS`, measured);
+  past it the log is due. The owner compacts with `Replica::compact`.
+- **What is counted** (`Replica::compactable_bytes`): the applied entries past the start, as the
+  core counts an entry's bytes, kept as entries apply and walked again from the log at open and
+  once a compaction's start is durable, not when it is submitted: a start the log refuses changes
+  nothing, and is the owner's to ask again. An install counts from its point as it is written, and
+  a walk while an install is not yet durable starts at the install's point. The image: the one the
+  shell prepared at its last compaction, the one it installed, or at open the one it prepares for a
+  log compacted before, else `StateMachine::image_bytes`, a new method every machine states (none
+  for one that keeps no image, which is never due): a group formed holding state is weighed
+  against it. `prepare` now runs before a compaction's start is submitted and returns the image's
+  bytes, which the write carries until it is durable.
+- **Tests** (`tests/shell.rs`): the rule at its edge, before and after a compaction; a log never
+  compacted weighed against the state it opened with; a member that reopens; a member that
+  installs; a compaction that counts what a leader applied before its write is durable; one the
+  log refused; one behind an install made again; the leader's wait and its bound; slates'
+  measurement replayed (below); and a sole voter's long history. Each fails with the piece it
+  checks taken out: the wait (or `HELD_FOR_FOLLOWERS` at one), the image at open, the count's reset
+  at a compaction or at an install, the walk at open, the core's entries in the walk, and the
+  install's point. `sim.rs` checks the count against a walk of every live member's log after every
+  step; at 1,000 seeds a shape the check found one defect in this change before it landed: a walk
+  made while a refused install waited to be made again asked the store for entries the image holds,
+  and fenced the member (seed 943 of five voters at depth one; now
+  `a_compaction_behind_an_install_made_again_counts_from_the_image`).
+- **Measured** (`docs/benchmarks.md`, "When a log is compacted (R22)"): slates' finding reproduced,
+  a leader of three whose third voter answers a round behind sends it an image at each of the
+  rule's three compactions when it compacts the moment the majority holds the round, and none by
+  the rule; the schedules of `sim.rs` unchanged.

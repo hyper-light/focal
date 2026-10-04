@@ -13604,3 +13604,45 @@ accepted"). Three tests that wrapped focal's own configurations with quinn's `tr
 which requires AES-128-GCM among the negotiated suites, now take `quic_client` /
 `quic_server` as production does. Certificates still sign classically (decision F58 says
 why); at-rest encryption is hyper-seal's, designed in the shared repository.
+
+### 2026-10-04 — R-3: the shared crates at hyper-raft df54729
+
+The six `hyper-*` snapshots move from `1eae0dd` to `df54729`, the shared repository's line, green
+on all six targets. They bring:
+- core step R-3, slates' enhancements: the R16 window rule, R17 kept appends, R13 learner rounds,
+  and every bound of the core derived from what its owner states;
+- hyper-check S-4's two core fixes: a fast leader's reads wait for the entry it began its term
+  with, and a member that lost what it kept ahead of a hole is probed;
+- hyper-durable's compaction by the thesis's rule, which asks a machine its image's bytes;
+- hyper-log's statistics;
+- hyper-timing's freshness and clock-resolution rules.
+
+focal's adaptation:
+- **Bounds stated, not taken.** The core takes `Limits::derive` from what focal states, in place of
+  fixed defaults. `core_state::limits` derives each input from `NodeConfig`:
+  - the largest message is a page or one entry of `max_entry_bytes`, inside the record;
+  - each queue holds one ready's entries counted resident;
+  - one write is out;
+  - the members are `MAX_MEMBERS`, focal's own 1,024, carried unchanged into focal-consensus because
+    the group files' bounds are sized by it.
+- **Kept appends off the wire until the fence.** R17's kept appends say so in a refusal
+  (`Message::kept`), which raft-rs's encoding, the one focal's peers speak until the upgrade fence
+  opens a successor (18 §1), cannot state. So focal's members run `Ahead::Refused`, raft-rs's rule,
+  and the envelope refuses a `kept` it is given, as it refuses a member's mark. The test is
+  `envelope_tests::what_no_raft_rs_message_holds_is_refused`, its new case.
+- **A fast leader's readiness.** focal's readiness (`core_state::committed_in_term`, behind
+  `has_committed_current_term`, which session read barriers, membership changes and control reads
+  wait on) asked whether the entry committed is of the current term. That is the rule S-4 found
+  wrong for a fast group, whose new leader takes what its voters approved into its log under its
+  own term, below a commit made before its term began. A leader now waits for its term-start entry
+  (`Raft::commit_to_current_term`); any other member keeps the old rule, which focal-ledger's
+  follower settling (`NativeSession::settle`) reads.
+  - `a_fast_leader_is_ready_only_once_its_term_start_entry_commits` checks the rule after every
+    message of a fast leader change. It does not fail on the old rule: focal holds no more approved
+    bytes than one message carries, so the recovered entries and the term-start entry travel in one
+    append and commit together. It holds the rule where hyper-raft's judge reached the defect
+    (seed 15,761 of its fast schedules).
+  - `a_member_restarted_under_loss_catches_up_past_its_hole` restarts a member that missed a
+    batch and refused the appends ahead of it, and checks it applies everything committed.
+- **Images weighed by size.** `HandOver` keeps its durable image's bytes for the compaction rule
+  (`StateMachine::image_bytes`).

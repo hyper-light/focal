@@ -35,6 +35,7 @@
 //! records what each needs.
 
 mod budget;
+mod compaction;
 mod held;
 mod hyperlog;
 mod machine;
@@ -44,6 +45,7 @@ mod replica;
 mod store;
 
 pub use budget::{Budget, Bytes, Unbounded};
+pub use compaction::Compaction;
 pub use held::Held;
 pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, decode_entry, encode_entry};
 pub use machine::{Fatal, StateMachine};

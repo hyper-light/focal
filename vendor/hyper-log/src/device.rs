@@ -28,7 +28,6 @@
 
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
-use std::time::Instant;
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment, Pool};
@@ -36,6 +35,7 @@ use hyper_block::buf::{AlignedBuf, Alignment, Pool};
 use crate::format::{self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, Owned};
 use crate::owner::Message;
 use crate::recover::{Found, Reader, Segment};
+use crate::stats::{self, Timing};
 use crate::ticket::{Answer, Ticket};
 use crate::{Entry, LogError};
 
@@ -234,8 +234,8 @@ pub(crate) enum Completion {
         /// The frame's own confirmation, unless the device is writing it.
         confirm: AlignedBuf,
         result: Result<(), LogError>,
-        /// The batch's service time: its writes and its flush.
-        took_ns: u64,
+        /// The frame's writes and flush, timed.
+        timing: Timing,
         confirming: bool,
         /// Answers not given: the frame before's when the frame failed, and this frame's unless
         /// the device is confirming it. Emptied lists come back for later frames.
@@ -246,6 +246,8 @@ pub(crate) enum Completion {
         record: AlignedBuf,
         result: Result<(), LogError>,
         these: Vec<Answering>,
+        /// The confirmation's write and flush, timed.
+        timing: Timing,
     },
     Sweep(Result<Vec<Swept>, LogError>),
     Read(Reads),
@@ -389,7 +391,7 @@ impl<F: BlockFile> Device<F> {
                 record_at,
                 mut these,
             } => {
-                let result = guarded(|| self.flushed(&mut record, record_at));
+                let (result, timing) = self.write_then_flush((&mut record, record_at), None);
                 if result.is_ok() {
                     answers.append(&mut these);
                 }
@@ -397,6 +399,7 @@ impl<F: BlockFile> Device<F> {
                     record,
                     result,
                     these,
+                    timing,
                 }
             }
             Job::Sweep {
@@ -426,17 +429,9 @@ impl<F: BlockFile> Device<F> {
 
     /// A frame, its record and one flush; the frame before answered; this one confirmed and
     /// answered unless another frame follows.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "hyper-log owns its device and times its flushes (CLAUDE.md §1, sans-io's one exception)"
-    )]
     fn frame(&mut self, mut f: Frame, answers: &mut Vec<Answering>) -> Completion {
-        let started = Instant::now();
-        let result = guarded(|| {
-            self.write(&mut f.frame, f.at)?;
-            self.flushed(&mut f.record, f.record_at)
-        });
-        let took_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let (result, timing) =
+            self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
         let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
         if result.is_ok() {
             // This frame's record confirms the frame before.
@@ -448,7 +443,7 @@ impl<F: BlockFile> Device<F> {
                 record: f.record,
                 confirm: f.confirm,
                 result,
-                took_ns,
+                timing,
                 confirming,
                 before: f.before,
                 these: f.these,
@@ -461,7 +456,7 @@ impl<F: BlockFile> Device<F> {
             record: f.record,
             confirm: AlignedBuf::empty(),
             result,
-            took_ns,
+            timing,
             confirming,
             before: f.before,
             these: Vec::new(),
@@ -480,7 +475,7 @@ impl<F: BlockFile> Device<F> {
                 answering.durable();
             }
         }
-        let result = guarded(|| self.flushed(&mut f.confirm, f.record_at));
+        let (result, timing) = self.write_then_flush((&mut f.confirm, f.record_at), None);
         if result.is_ok() {
             answers.append(&mut f.these);
         }
@@ -488,6 +483,7 @@ impl<F: BlockFile> Device<F> {
             record: f.confirm,
             result,
             these: f.these,
+            timing,
         }
     }
 
@@ -503,17 +499,47 @@ impl<F: BlockFile> Device<F> {
         }
     }
 
-    /// Writes `buf` at `at` and flushes the file.
-    fn flushed(&self, buf: &mut AlignedBuf, at: u64) -> Result<(), LogError> {
-        self.write(buf, at)?;
-        self.file.sync_data().map_err(LogError::from)
+    /// Writes `first`, then `second` if there is one, each at its offset, then flushes the file
+    /// once: nothing after a failed write, and a failed flush never retried (mantle
+    /// docs/design/raft-log.md §3). The writes and the flush are timed apart.
+    fn write_then_flush(
+        &self,
+        first: (&mut AlignedBuf, u64),
+        second: Option<(&mut AlignedBuf, u64)>,
+    ) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let mut bytes = 0u64;
+        let wrote = guarded(|| {
+            bytes = self.write(first.0, first.1)?;
+            if let Some((buf, at)) = second {
+                bytes = bytes.saturating_add(self.write(buf, at)?);
+            }
+            Ok(())
+        });
+        let written = stats::now();
+        let mut timing = Timing {
+            took_ns: stats::nanos(started, written),
+            write_ns: stats::nanos(started, written),
+            flush_ns: None,
+            bytes,
+            flushed_at: None,
+        };
+        if wrote.is_err() {
+            return (wrote, timing);
+        }
+        let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.flush_ns = Some(stats::nanos(written, ended));
+        timing.flushed_at = flushed.is_ok().then_some(ended);
+        (flushed, timing)
     }
 
-    /// Writes `buf`, padded with zeros to the file's alignment, at `at`.
-    fn write(&self, buf: &mut AlignedBuf, at: u64) -> Result<(), LogError> {
+    /// Writes `buf`, padded with zeros to the file's alignment, at `at`: the bytes written.
+    fn write(&self, buf: &mut AlignedBuf, at: u64) -> Result<u64, LogError> {
         let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
         self.file.write_all_at(bytes, at)?;
-        Ok(())
+        Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
     }
 
     /// The verified frames of `segment` from `offset` to its end `end`, read through a window of

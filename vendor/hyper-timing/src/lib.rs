@@ -54,6 +54,8 @@ pub use qos::{
 };
 mod folds;
 pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};
+mod histogram;
+pub use histogram::Histogram;
 mod link;
 pub use link::{
     Configuration, EstimateError, Estimates, Event, LinkEstimator, MILLION, PHI_PER_MILLION,
@@ -62,7 +64,7 @@ pub use link::{
 mod election;
 pub use election::{
     Ballot, ElectionPriority, ElectionTimer, ElectionTiming, FollowerStep, PathEstimate,
-    REPAIR_ROUND_TRIPS, election_delay, quorum_priority,
+    REPAIR_ROUND_TRIPS, election_delay, inflight_window, quorum_priority,
 };
 
 use std::time::Duration;
@@ -113,13 +115,31 @@ impl std::error::Error for PathWindowError {}
 ///
 /// Karn's rule is the caller's: only an answered probe is a sample. A path with no sample
 /// contributes nothing to a derivation.
+///
+/// **Fresh, and of one endpoint.** A sample carries when it came and the generation of the peer's
+/// endpoint it measured. A sample of another generation is of another path: the window starts
+/// again, as QUIC resets its round-trip estimator on a new path (RFC 9000 §9.4). A sample older
+/// than the window's span at its probe interval, `window · interval` (about two correlation times,
+/// the time the window is derived to cover), measures a path that may since have moved further
+/// than the window can see, and is dropped as newer ones come or when the owner asks
+/// ([`expire`](Self::expire)); RFC 9040 §8.1 notes the same of cached path state, which "could
+/// also become invalid over time". A sparsely probed path then holds few samples, and its readers
+/// see how many and how old ([`held`](Self::held), [`oldest_ns`](Self::oldest_ns)): fewer than
+/// `k + 1` of a window of `2k + 1`, and one stall can move its median, so an owner asks such a
+/// quorum path for fresh probes first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathRtt {
-    /// The window's samples in arrival order, a ring.
-    window: Vec<u64>,
-    /// Where the next sample goes.
-    next: usize,
+    /// The window's samples and when each came, in arrival order: a ring.
+    window: Vec<(u64, u64)>,
+    /// Where the oldest held sample is.
+    first: usize,
+    /// How many samples the window holds.
+    held: usize,
     samples: u64,
+    /// The probe interval the window was derived at, nanoseconds.
+    interval_ns: u64,
+    /// The generation of the peer's endpoint the held samples measured.
+    generation: u64,
     /// The samples the window holds, in order: the first `held` slots. A sample replaces the one
     /// it evicts by two shifts, so the window is never sorted whole.
     ordered: Vec<u64>,
@@ -150,11 +170,13 @@ impl PathRtt {
             .checked_mul(2)
             .and_then(|twice| twice.checked_add(1))
             .ok_or(PathWindowError::TooLong)?;
-        Self::with_window(usize::try_from(window).map_err(|_| PathWindowError::TooLong)?)
+        let window = usize::try_from(window).map_err(|_| PathWindowError::TooLong)?;
+        Self::with_window(window, interval_ns)
     }
 
-    /// A path whose window holds `window` samples, at most [`WINDOW_LIMIT`].
-    fn with_window(window: usize) -> Result<Self, PathWindowError> {
+    /// A path whose window holds `window` samples, at most [`WINDOW_LIMIT`], probed every
+    /// `interval_ns`.
+    fn with_window(window: usize, interval_ns: u64) -> Result<Self, PathWindowError> {
         if window == 0 {
             return Err(PathWindowError::Empty);
         }
@@ -162,9 +184,12 @@ impl PathRtt {
             return Err(PathWindowError::TooLong);
         }
         Ok(Self {
-            window: vec![0; window],
-            next: 0,
+            window: vec![(0, 0); window],
+            first: 0,
+            held: 0,
             samples: 0,
+            interval_ns,
+            generation: 0,
             ordered: vec![0; window],
             sum: 0,
             median: 0,
@@ -177,47 +202,123 @@ impl PathRtt {
         self.window.len()
     }
 
-    /// Fold one answered round trip in, in place of the oldest of the window.
-    pub fn on_sample(&mut self, round_trip_ns: u64) {
+    /// The time the window is derived to cover, `window · interval`: a sample older than this is
+    /// dropped.
+    pub fn span_ns(&self) -> u64 {
+        u64::try_from(self.window.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(self.interval_ns)
+    }
+
+    /// Fold in one answered round trip of the peer's endpoint `generation`, which came at
+    /// `at_ns`, in place of the oldest of the window. A sample of another generation than the
+    /// window's starts it again; samples past the span at `at_ns` are dropped first.
+    pub fn on_sample(&mut self, round_trip_ns: u64, at_ns: u64, generation: u64) {
+        if generation != self.generation {
+            self.clear();
+            self.generation = generation;
+        }
+        self.drop_older(at_ns);
         let capacity = self.window.len();
-        let mut held = self.held();
-        if held == capacity
-            && let Some(&evicted) = self.window.get(self.next)
-        {
-            self.remove_ordered(evicted, held);
-            self.sum = self.sum.saturating_sub(u128::from(evicted));
-            held = held.saturating_sub(1);
+        if self.held == capacity {
+            self.drop_oldest();
         }
-        self.insert_ordered(round_trip_ns, held);
+        self.insert_ordered(round_trip_ns, self.held);
         self.sum = self.sum.saturating_add(u128::from(round_trip_ns));
-        if let Some(slot) = self.window.get_mut(self.next) {
-            *slot = round_trip_ns;
-        }
-        self.next = self
-            .next
-            .saturating_add(1)
+        let at = self
+            .first
+            .saturating_add(self.held)
             .checked_rem(capacity)
             .unwrap_or(0);
+        if let Some(slot) = self.window.get_mut(at) {
+            *slot = (round_trip_ns, at_ns);
+        }
+        self.held = self.held.saturating_add(1);
         self.samples = self.samples.saturating_add(1);
-        let held = self.held();
+        self.summarize();
+    }
+
+    /// Drops the samples older than the span at `now_ns`: what an owner calls before it reads a
+    /// path probed since long ago. Whether any went.
+    pub fn expire(&mut self, now_ns: u64) -> bool {
+        let dropped = self.drop_older(now_ns);
+        if dropped {
+            self.summarize();
+        }
+        dropped
+    }
+
+    /// Drops the samples older than the span at `now_ns`, without summarizing. Whether any went.
+    fn drop_older(&mut self, now_ns: u64) -> bool {
+        let span = self.span_ns();
+        let mut dropped = false;
+        while let Some(oldest) = self.oldest_ns()
+            && oldest.saturating_add(span) < now_ns
+        {
+            self.drop_oldest();
+            dropped = true;
+        }
+        dropped
+    }
+
+    /// Takes the oldest held sample out of the window.
+    fn drop_oldest(&mut self) {
+        let Some(&(oldest, _)) = self.window.get(self.first).filter(|_| self.held > 0) else {
+            return;
+        };
+        self.remove_ordered(oldest, self.held);
+        self.sum = self.sum.saturating_sub(u128::from(oldest));
+        self.held = self.held.saturating_sub(1);
+        self.first = self
+            .first
+            .saturating_add(1)
+            .checked_rem(self.window.len())
+            .unwrap_or(0);
+    }
+
+    /// Empties the window: a new endpoint's path is measured afresh.
+    fn clear(&mut self) {
+        self.first = 0;
+        self.held = 0;
+        self.sum = 0;
+        self.median = 0;
+        self.deviation = 0;
+    }
+
+    /// The median and the median deviation of the held samples, kept for the reads.
+    fn summarize(&mut self) {
         self.median = self
             .ordered
-            .get(held.checked_div(2).unwrap_or(0))
+            .get(self.held.checked_div(2).unwrap_or(0))
             .copied()
+            .filter(|_| self.held > 0)
             .unwrap_or(0);
-        self.deviation = self.median_deviation(held);
+        self.deviation = self.median_deviation(self.held);
     }
+
     /// How many round trips have been folded in, including those the window no longer holds.
     pub const fn samples(&self) -> u64 {
         self.samples
     }
-    /// How many samples the window holds.
-    fn held(&self) -> usize {
-        let capacity = self.window.len();
-        usize::try_from(self.samples)
-            .unwrap_or(capacity)
-            .min(capacity)
+
+    /// How many samples the window holds: of its endpoint's generation, and within its span as of
+    /// the latest sample or [`expire`](Self::expire).
+    pub const fn held(&self) -> usize {
+        self.held
     }
+
+    /// When the oldest held sample came, or `None` with none held.
+    pub fn oldest_ns(&self) -> Option<u64> {
+        (self.held > 0)
+            .then(|| self.window.get(self.first).map(|&(_, at)| at))
+            .flatten()
+    }
+
+    /// The generation of the peer's endpoint the held samples measured.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Takes `value`, which the first `held` ordered slots hold, out of them.
     fn remove_ordered(&mut self, value: u64, held: usize) {
         if let Some(ordered) = self.ordered.get_mut(..held) {
@@ -280,26 +381,26 @@ impl PathRtt {
         }
         deviation
     }
-    /// The median round trip; zero before a sample.
+    /// The median round trip; zero with none held.
     pub const fn smoothed_ns(&self) -> u64 {
         self.median
     }
-    /// The median absolute deviation from the median; zero before a sample.
+    /// The median absolute deviation from the median; zero with none held.
     pub const fn variation_ns(&self) -> u64 {
         self.deviation
     }
-    /// The mean of the window's round trips; zero before a sample.
+    /// The mean of the window's round trips; zero with none held.
     pub fn mean_ns(&self) -> u64 {
-        let held = u128::try_from(self.held()).unwrap_or(u128::MAX);
+        let held = u128::try_from(self.held).unwrap_or(u128::MAX);
         self.sum
             .checked_div(held)
             .and_then(|mean| u64::try_from(mean).ok())
             .unwrap_or(0)
     }
     /// The bound on this path's round-trip tail, `median + max(4 · deviation, G)` with `G` the
-    /// owner's measured timer granularity ([`Lateness`]), or `None` before a sample.
+    /// owner's measured timer granularity ([`Lateness`]), or `None` with none held.
     pub fn tail_ns(&self, granularity_ns: u64) -> Option<u64> {
-        (self.samples > 0).then(|| {
+        (self.held > 0).then(|| {
             self.smoothed_ns().saturating_add(
                 TAIL_VARIATION_MULTIPLIER
                     .saturating_mul(self.variation_ns())
@@ -448,12 +549,22 @@ mod tests {
     const CEILING: Duration = Duration::from_secs(5);
     const ELECTION_TICK: usize = 10;
 
+    /// The probe interval of the tests' windows: their samples come a millisecond apart, every
+    /// one inside the window's span.
+    const PROBE: u64 = MS;
+
     fn path_of(window: usize, samples_ms: &[u64]) -> PathRtt {
-        let mut path = PathRtt::with_window(window).unwrap();
+        let mut path = PathRtt::with_window(window, PROBE).unwrap();
         for sample in samples_ms {
-            path.on_sample(sample * MS);
+            feed(&mut path, sample * MS);
         }
         path
+    }
+
+    /// One answer of the path's one endpoint, a probe after the previous.
+    fn feed(path: &mut PathRtt, round_trip_ns: u64) {
+        let at = path.samples() * PROBE;
+        path.on_sample(round_trip_ns, at, 0);
     }
 
     fn timing(base_ms: u64, span_ms: u64) -> ElectionTiming {
@@ -501,7 +612,10 @@ mod tests {
             PathRtt::new(Duration::MAX, Duration::from_nanos(1)).err(),
             Some(PathWindowError::TooLong)
         );
-        assert_eq!(PathRtt::with_window(0).err(), Some(PathWindowError::Empty));
+        assert_eq!(
+            PathRtt::with_window(0, PROBE).err(),
+            Some(PathWindowError::Empty)
+        );
     }
 
     proptest! {
@@ -517,12 +631,12 @@ mod tests {
                 values.sort_unstable();
                 values.get(values.len() / 2).copied().unwrap_or(0)
             };
-            let mut path = PathRtt::with_window(window).unwrap();
+            let mut path = PathRtt::with_window(window, PROBE).unwrap();
             let mut latest: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
             for sample in samples {
                 // Few distinct values, so ties are common.
                 let sample = sample * MS;
-                path.on_sample(sample);
+                feed(&mut path, sample);
                 latest.push_back(sample);
                 if latest.len() > window {
                     latest.pop_front();
@@ -539,25 +653,25 @@ mod tests {
         /// where it was; `k + 1` move it.
         #[test]
         fn a_stall_the_window_outvotes_moves_nothing(k in 1usize..20, late in 1u64..10_000) {
-            let mut path = PathRtt::with_window(2 * k + 1).unwrap();
+            let mut path = PathRtt::with_window(2 * k + 1, PROBE).unwrap();
             for _ in 0..2 * k + 1 {
-                path.on_sample(5 * MS);
+                feed(&mut path, 5 * MS);
             }
             for _ in 0..k {
-                path.on_sample((5 + late) * MS);
+                feed(&mut path, (5 + late) * MS);
             }
             prop_assert_eq!(path.smoothed_ns(), 5 * MS);
-            path.on_sample((5 + late) * MS);
+            feed(&mut path, (5 + late) * MS);
             prop_assert_eq!(path.smoothed_ns(), (5 + late) * MS);
         }
     }
 
     #[test]
     fn a_path_is_the_median_of_its_latest_answers_and_their_deviation() {
-        let mut path = PathRtt::with_window(5).unwrap();
+        let mut path = PathRtt::with_window(5, PROBE).unwrap();
         assert_eq!(path.tail_ns(G), None, "no sample, no tail");
         assert_eq!((path.smoothed_ns(), path.variation_ns()), (0, 0));
-        path.on_sample(80 * MS);
+        feed(&mut path, 80 * MS);
         assert_eq!(path.smoothed_ns(), 80 * MS);
         assert_eq!(path.variation_ns(), 0);
         assert_eq!(
@@ -566,7 +680,7 @@ mod tests {
             "the granularity at least"
         );
         for sample in [100, 60, 90, 70] {
-            path.on_sample(sample * MS);
+            feed(&mut path, sample * MS);
         }
         // 60 70 80 90 100: the median 80, the deviations 0 10 10 20 20.
         assert_eq!(path.smoothed_ns(), 80 * MS);
@@ -579,13 +693,13 @@ mod tests {
     #[test]
     fn a_path_that_became_slow_is_followed_within_half_its_window() {
         let window = 11;
-        let mut path = PathRtt::with_window(window).unwrap();
+        let mut path = PathRtt::with_window(window, PROBE).unwrap();
         for _ in 0..window {
-            path.on_sample(5 * MS);
+            feed(&mut path, 5 * MS);
         }
         let mut followed = None;
         for sample in 1..=window {
-            path.on_sample(160 * MS);
+            feed(&mut path, 160 * MS);
             if followed.is_none() && path.smoothed_ns() == 160 * MS {
                 followed = Some(sample);
             }
@@ -593,6 +707,95 @@ mod tests {
         assert_eq!(followed, Some(window / 2 + 1), "past half of the window");
         assert_eq!(path.tail_ns(G), Some(160 * MS + G));
         assert_eq!(path.samples(), 2 * window as u64);
+    }
+
+    /// A sample of a new endpoint is of a new path: the window starts again with it, as QUIC
+    /// resets its round-trip estimator on a new path (RFC 9000 §9.4).
+    #[test]
+    fn a_new_endpoint_starts_the_window_again() {
+        let mut path = path_of(5, &[80, 90, 70, 85, 75]);
+        assert_eq!((path.held(), path.smoothed_ns()), (5, 80 * MS));
+        path.on_sample(300 * MS, 5 * PROBE, 1);
+        assert_eq!(path.generation(), 1);
+        assert_eq!(path.held(), 1, "the old endpoint's samples are gone");
+        assert_eq!(
+            path.smoothed_ns(),
+            300 * MS,
+            "at once, not after half a window"
+        );
+        assert_eq!(path.variation_ns(), 0);
+        assert_eq!(path.mean_ns(), 300 * MS);
+        assert_eq!(path.oldest_ns(), Some(5 * PROBE));
+        assert_eq!(path.samples(), 6, "every sample folded in is counted");
+    }
+
+    /// A sample older than the window's span at its probe interval is dropped, as newer ones come
+    /// or when the owner asks: a sparsely probed path holds what is fresh, and says how much and
+    /// how old.
+    #[test]
+    fn a_sample_older_than_the_span_is_dropped() {
+        // A window of three at a 1 ms probe: a span of 3 ms.
+        let mut path = path_of(3, &[]);
+        assert_eq!(path.span_ns(), 3 * PROBE);
+        path.on_sample(10 * MS, 0, 0);
+        path.on_sample(20 * MS, PROBE, 0);
+        assert_eq!((path.held(), path.oldest_ns()), (2, Some(0)));
+        // At 4 ms the first is past the span; the second, at the span's edge, is not.
+        assert!(path.expire(4 * PROBE));
+        assert_eq!((path.held(), path.oldest_ns()), (1, Some(PROBE)));
+        assert_eq!(path.smoothed_ns(), 20 * MS);
+        assert!(!path.expire(4 * PROBE), "nothing more to drop");
+        assert!(path.expire(5 * PROBE));
+        assert_eq!(path.held(), 0);
+        assert_eq!((path.smoothed_ns(), path.mean_ns()), (0, 0));
+        assert_eq!(path.tail_ns(G), None, "a path aged out has no tail");
+        // A sample long after the last drops what aged before it is folded in.
+        path.on_sample(30 * MS, 6 * PROBE, 0);
+        path.on_sample(40 * MS, 7 * PROBE, 0);
+        path.on_sample(50 * MS, 20 * PROBE, 0);
+        assert_eq!((path.held(), path.smoothed_ns()), (1, 50 * MS));
+        assert_eq!(path.oldest_ns(), Some(20 * PROBE));
+    }
+
+    proptest! {
+        /// Whatever the spacing of the answers and the endpoint's changes, the path is the median
+        /// and deviation of exactly the samples of the latest endpoint within the span of the
+        /// latest answer, at most a window of them.
+        #[test]
+        fn the_path_is_its_fresh_samples_of_its_endpoint(
+            k in 1usize..6,
+            answers in prop::collection::vec((1u64..8, 0u64..4, 0u64..20), 1..80),
+        ) {
+            let window = 2 * k + 1;
+            let mut path = PathRtt::with_window(window, PROBE).unwrap();
+            let span = path.span_ns();
+            let (mut at, mut generation) = (0u64, 0u64);
+            let mut kept: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+            let middle = |values: &mut Vec<u64>| {
+                values.sort_unstable();
+                values.get(values.len() / 2).copied().unwrap_or(0)
+            };
+            for (rtt, gap, change) in answers {
+                at += gap * PROBE;
+                if change == 0 {
+                    generation += 1;
+                    kept.clear();
+                }
+                let sample = rtt * MS;
+                path.on_sample(sample, at, generation);
+                kept.retain(|(_, came)| came + span >= at);
+                kept.push_back((sample, at));
+                if kept.len() > window {
+                    kept.pop_front();
+                }
+                let values: Vec<u64> = kept.iter().map(|(sample, _)| *sample).collect();
+                let median = middle(&mut values.clone());
+                let deviation = middle(&mut values.iter().map(|s| s.abs_diff(median)).collect());
+                prop_assert_eq!(path.held(), kept.len());
+                prop_assert_eq!(path.oldest_ns(), kept.front().map(|(_, came)| *came));
+                prop_assert_eq!((path.smoothed_ns(), path.variation_ns()), (median, deviation));
+            }
+        }
     }
 
     #[test]
@@ -617,7 +820,7 @@ mod tests {
         let mut path = path_of(3, &[]);
         let mut exchange = ExchangeRtt::new();
         for _ in 0..200 {
-            path.on_sample(20 * MS);
+            feed(&mut path, 20 * MS);
             exchange.on_sample(20 * MS);
         }
         assert_eq!(path.smoothed_ns(), 20 * MS);
@@ -675,8 +878,8 @@ mod tests {
     #[test]
     fn extreme_inputs_saturate() {
         let mut path = path_of(3, &[]);
-        path.on_sample(u64::MAX);
-        path.on_sample(u64::MAX);
+        feed(&mut path, u64::MAX);
+        feed(&mut path, u64::MAX);
         assert_eq!(path.mean_ns(), u64::MAX);
         assert_eq!(path.tail_ns(u64::MAX), Some(u64::MAX));
         let mut timing = timing(0, 0);

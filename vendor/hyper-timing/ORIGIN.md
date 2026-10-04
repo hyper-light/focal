@@ -98,6 +98,12 @@
      range (property) and uniformity, the base lapsing at the period the link estimator suspects,
      the priority unmoved by a stall, slates' timer tests on the derived timing; and the allocation
      law over every operation of the law (`tests/alloc.rs`).
+10. **The window a leader keeps in flight** (mantle note 32 R16, hyper-raft's R-3,
+    `docs/raft.md` §3.2). `inflight_window(carried)` is what a path carries over the
+    `REPAIR_ROUND_TRIPS` round trips of a lost append's repair; `ElectionTiming::window_budget` is
+    it in whole batches for a sender that sends a batch a period, and focal's twice the transport's
+    congestion window is it for a sender the transport clocks
+    (`slates_window_and_focals_are_what_the_path_carries_over_the_repair`).
 
 ## Planned
 

@@ -16,6 +16,8 @@
 //! - what is queued has a bound ([`Limits`]).
 use crate::{
     Configuration, NodeId, Tally,
+    ahead::Early,
+    catchup::{CatchUp, Staging, Stagings},
     error::{Error, Result, StorageError},
     fast::{self, Decided, Proposals, Votes},
     log::Log,
@@ -24,9 +26,10 @@ use crate::{
         self, CAMPAIGN_TRANSFER, ConfState, Entry, EntryType, HardState, Message, MessageType,
         Plan, Snapshot,
     },
-    read::{ReadOnly, ReadState},
+    read::{PendingRead, ReadOnly, ReadState},
     storage::Storage,
     watch::{Arm, TRANSFER_ROUNDS, Timing, Watch, nanos},
+    wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES},
 };
 
 /// What grows only to a bound.
@@ -60,23 +63,81 @@ pub struct Limits {
     /// sets the store's depth: hyper-durable sets `LogStore::depth`, which
     /// for hyper-log is its pipeline frames (`docs/durable.md` §6).
     pub readies_in_flight: usize,
+    /// The most members a configuration names, voters and learners
+    /// together: what the member counts for each member (its progress, the
+    /// confirmations of a read, the holders of a fast entry, the members its
+    /// detectors suspect). A leader proposes no change past it, and a member
+    /// given a configuration past it stops.
+    pub members: usize,
 }
-/// focal's bounds, carried unchanged. They are literals, not derivations
-/// (mantle note 32 §2.10); `Limits::derive` replaces them in R-3
-/// (`docs/raft.md`).
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            pending_messages: 65_536,
-            pending_reads: 4_096,
-            unstable_entries: 65_536,
-            entries_per_message: 16_384,
-            proposals: 256,
-            proposal_bytes: 8 * 1024 * 1024 - 64 * 1024,
-            fast_window: 256,
-            vote_bytes: 64 * 1024 * 1024,
-            readies_in_flight: 1,
-        }
+
+/// What an owner states of the member it opens, from which every bound of
+/// [`Limits`] is derived ([`Limits::derive`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stated {
+    /// The bytes of the largest message the member's transport carries, its
+    /// record as the wire writes it ([`MESSAGE_RECORD_FIXED_BYTES`] and its
+    /// entries): a leader's append is no larger, nor a vote that carries a
+    /// member's proposals ([`crate::fast`]).
+    pub message: usize,
+    /// The most members a configuration of the group names, voters and
+    /// learners together. Every member of a group states the same, as it
+    /// opens with the same fast track: a change one refuses and another
+    /// applies would leave them in different configurations.
+    pub members: usize,
+    /// The bytes one of the member's queues may hold, each element counted
+    /// at the least it holds: the entries not yet durable, the messages not
+    /// yet taken, the reads that wait. What their buffers hold is bounded
+    /// besides: the window to each member, the bytes a leader holds
+    /// uncommitted, the owner's budget.
+    pub memory: usize,
+    /// The `Ready`s whose writes may be out at once: the store's depth.
+    pub depth: usize,
+}
+
+impl Limits {
+    /// The bounds `stated` gives, each derived from it:
+    /// - a message carries no more entries than its bytes past its fixed
+    ///   record hold at an entry's fixed bytes each ([`ENTRY_FIXED_BYTES`]);
+    /// - a member holds proposals of no more bytes than a message carries
+    ///   past its fixed record, so that a vote carries every one; they are
+    ///   counted resident ([`crate::fast`]), each at least an entry, so that
+    ///   no more of them are held than those bytes hold entries, and none is
+    ///   proposed further above the commit, where no vote could carry it;
+    /// - a leader is told what each member holds, a message's bytes from
+    ///   each at the most;
+    /// - each queue holds what `memory` holds of its least element: an
+    ///   entry, a message's allowance ([`proto::MESSAGE_ALLOWANCE`]), a read;
+    /// - the members and the readies in flight are as stated.
+    ///
+    /// Refused where a message carries no entry; [`Config::validate`] refuses
+    /// bounds that admit nothing or disagree.
+    pub fn derive(stated: Stated) -> Result<Self> {
+        let payload = stated
+            .message
+            .checked_sub(MESSAGE_RECORD_FIXED_BYTES)
+            .filter(|payload| *payload >= ENTRY_FIXED_BYTES)
+            .ok_or(Error::Settings("a message that carries no entry"))?;
+        let entries_per_message = payload.checked_div(ENTRY_FIXED_BYTES).unwrap_or(0);
+        let proposals = payload
+            .checked_div(std::mem::size_of::<Entry>())
+            .unwrap_or(0);
+        let vote_bytes = payload.checked_mul(stated.members).ok_or(Error::Settings(
+            "the bytes of a quorum's votes beyond what is counted",
+        ))?;
+        let within = |least: usize| stated.memory.checked_div(least).unwrap_or(0);
+        Ok(Self {
+            pending_messages: within(proto::MESSAGE_ALLOWANCE),
+            pending_reads: within(std::mem::size_of::<PendingRead>()),
+            unstable_entries: within(std::mem::size_of::<Entry>()),
+            entries_per_message,
+            proposals,
+            proposal_bytes: payload,
+            fast_window: u64::try_from(proposals).unwrap_or(u64::MAX),
+            vote_bytes,
+            readies_in_flight: stated.depth,
+            members: stated.members,
+        })
     }
 }
 
@@ -153,6 +214,25 @@ pub enum HeartbeatAnswers {
     Bare,
 }
 
+/// What a member does with a leader's append that begins past the end of
+/// its log: entries that arrived ahead of a hole, one of the leader's
+/// appends before them lost or late (mantle note 32 R17, `crate::ahead`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ahead {
+    /// It refuses the append as Raft does, and keeps its entries beside its
+    /// log, as many as its log may hold not yet durable
+    /// ([`Limits::unstable_entries`]); once an append of the same term fills
+    /// the hole it takes them into its log with it, and acknowledges them
+    /// with it. One lost append costs its own resend, not the window's (slates
+    /// `docs/wip/research/consensus-enhancements.md` §3.5).
+    #[default]
+    Kept,
+    /// It refuses the append and keeps nothing: the rule of `raft-rs`, whose
+    /// leader sends every entry after the hole again. Kept to compare the two
+    /// cores under one rule.
+    Refused,
+}
+
 /// What starts a member's elections and ends a leader's term for want of
 /// a quorum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -188,12 +268,17 @@ pub struct Config {
     pub applied: u64,
     /// The bytes of entries one message carries, and one entry at least.
     pub max_size_per_msg: u64,
-    /// Messages sent to a member ahead of its answers.
+    /// Messages sent to a member ahead of its answers; `usize::MAX` for no
+    /// count of their own, the window's bytes bounding it (mantle note 32
+    /// R16: the window is what the path carries, and a fixed count, focal's
+    /// 128 or raft-rs's 256, is no measure of a path).
     pub max_inflight_msgs: usize,
-    /// The bytes of entries sent to a member ahead of its answers, until
-    /// its owner says what the path to it carries
+    /// The bytes sent to a member ahead of its answers, each append's
+    /// record ([`crate::wire::MESSAGE_RECORD_FIXED_BYTES`] and its entries),
+    /// until its owner says what the path to it carries
     /// ([`crate::RawNode::set_inflight_bytes`]); `u64::MAX` for no bound of
-    /// its own. One entry larger than the bound is still sent, alone.
+    /// its own, where the messages are counted. One entry larger than the
+    /// bound is still sent, alone.
     pub max_inflight_bytes: u64,
     /// The bytes of proposals a leader holds uncommitted; `u64::MAX` for no
     /// bound of its own.
@@ -217,6 +302,9 @@ pub struct Config {
     /// What a member says when it answers a heartbeat, and what its leader
     /// makes of a full window.
     pub heartbeat_answers: HeartbeatAnswers,
+    /// What a member does with a leader's entries that arrive ahead of a
+    /// hole in its log.
+    pub ahead: Ahead,
     /// Whether the group has the fast track ([`crate::fast`]). It is part
     /// of what the group is: every member is opened with the same.
     pub fast: bool,
@@ -247,8 +335,9 @@ pub struct Config {
 impl Config {
     /// The member `id` with `raft-rs` 0.7's defaults (its `Config::default`:
     /// an election after twenty ticks, a heartbeat every two, a window of
-    /// 256 messages, no byte bounds) and the bounds of [`Limits::default`].
-    pub fn new(id: NodeId) -> Self {
+    /// 256 messages, no byte bounds) and the bounds its owner's statement
+    /// gives ([`Limits::derive`]).
+    pub fn new(id: NodeId, limits: Limits) -> Self {
         Self {
             id,
             election_tick: 20,
@@ -265,13 +354,14 @@ impl Config {
             precedence: Precedence::Log,
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
+            ahead: Ahead::Kept,
             fast: false,
             skip_bcast_commit: false,
             apply_unpersisted: false,
             elections: Elections::Ticks,
             lost: None,
             seed: id,
-            limits: Limits::default(),
+            limits,
         }
     }
     /// Whether the settings describe a member that can run: an identity, an
@@ -297,6 +387,11 @@ impl Config {
         if self.max_inflight_msgs == 0 || self.max_inflight_bytes == 0 {
             return Err(Error::Settings("a window that admits nothing"));
         }
+        if self.max_inflight_msgs == usize::MAX && self.max_inflight_bytes == u64::MAX {
+            return Err(Error::Settings(
+                "a window bounded by neither its messages nor its bytes",
+            ));
+        }
         if self.max_uncommitted_size < self.max_size_per_msg {
             return Err(Error::Settings(
                 "a message larger than all that may be uncommitted",
@@ -311,6 +406,7 @@ impl Config {
             || self.limits.fast_window == 0
             || self.limits.vote_bytes == 0
             || self.limits.readies_in_flight == 0
+            || self.limits.members == 0
         {
             return Err(Error::Settings("a bound that admits nothing"));
         }
@@ -409,6 +505,9 @@ enum Campaign {
 /// One member: its term and vote, its role, its log and what it knows of
 /// the others.
 pub struct Raft<S> {
+    /// The defect planted in this member, if any (`crate::mutant`).
+    #[cfg(feature = "mutants")]
+    pub(crate) mutant: Option<crate::Mutant>,
     pub(crate) id: NodeId,
     pub(crate) term: u64,
     pub(crate) vote: NodeId,
@@ -421,6 +520,13 @@ pub struct Raft<S> {
     /// The index this member asked a snapshot to reach; zero for none.
     pub(crate) pending_request_snapshot: u64,
     pub(crate) election_elapsed: usize,
+    /// Ticks since this member last heard its leader: what its lease counts (Ongaro's thesis
+    /// §4.2.3, etcd's `inLease`: a vote is refused only within the minimum election timeout of
+    /// hearing a current leader). Apart from [`Raft::election_elapsed`], its own election timer,
+    /// which its own campaigns restart: one counter for both let a member whose campaign waited
+    /// for a change to apply keep its lease, and refuse the voter that campaigned (mantle note 32
+    /// R4; slates `docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`).
+    silence: usize,
     heartbeat_elapsed: usize,
     randomized_election_timeout: usize,
     /// Ticks this member waits beyond its election timeout before it
@@ -431,6 +537,17 @@ pub struct Raft<S> {
     /// ticks and not by a longer tick, so nothing else the member counts
     /// in ticks grows with it.
     patience: usize,
+    /// What this member keeps of its leader's appends that arrived ahead of
+    /// a hole in its log ([`Ahead::Kept`]).
+    early: Early,
+    /// The learners this leader catches up, in rounds ([`CatchUp`]).
+    stagings: Stagings,
+    /// The ticks this member has led through: the clock its learners' rounds
+    /// count on ticks.
+    ticks: u64,
+    /// Entries this member took into its log from what it kept ahead of a
+    /// hole.
+    taken_ahead: u64,
     /// What this member approved by itself.
     pub(crate) held: Proposals,
     /// What the voters hold above this member's log, as it was told.
@@ -476,11 +593,19 @@ pub struct Raft<S> {
     pub(crate) tracker: Tracker,
     pub(crate) read_only: ReadOnly,
     pub(crate) read_states: Vec<ReadState>,
+    /// Reads asked of this leader before it committed an entry of its term, in the order asked:
+    /// who asked, and the read's context. They wait for that commit, as the thesis's §6.4 step 1
+    /// has a leader wait and etcd's `pendingReadIndexMessages` hold them; they count against the
+    /// bound of reads with those that wait for their quorum or to be taken, and die with the term.
+    deferred_reads: Vec<(NodeId, Vec<u8>)>,
     pub(crate) msgs: Outgoing,
     uncommitted_bytes: usize,
     /// The last index when this member last became leader: entries at or
     /// below are no proposals of its own.
     leader_tail: u64,
+    /// The index of the blank entry this member appended on taking its term, after what it
+    /// recovered of the fast track; 0 when it does not lead.
+    term_start: u64,
     random: u64,
     /// What a member keeps that elects by suspicion ([`Elections::Suspicion`]);
     /// none on ticks, where it would be eight bytes and a branch.
@@ -857,6 +982,95 @@ impl<S: Storage> Outbox<'_, S> {
         }
         Ok(true)
     }
+    /// What `message`, a refusal of an append that began past the end of the
+    /// refuser's log, asks of this leader ([`Ahead::Kept`]): the append
+    /// arrived and is held there, so it leaves the window, and each message
+    /// sent before it and neither answered nor kept is a hole, lost or late,
+    /// and goes again, once (RFC 6675's `IsLost`: data sent after it
+    /// arrived). Where the window holds no message that began there (it was
+    /// emptied since, or the append carried nothing), what follows the
+    /// member's end goes again as far as that append's start, once: from
+    /// its hint where its log `agrees` with this one there, else from what it
+    /// answered. False when the log no longer holds what goes again.
+    fn repair(&mut self, message: &Message, progress: &mut Progress, agrees: bool) -> Result<bool> {
+        let matched = progress.matched;
+        if let Some(held) = progress.inflights.delivered(message.index, matched) {
+            return self.repair_before(message.from, progress, held);
+        }
+        let end = if agrees && message.reject_hint >= matched {
+            message.reject_hint
+        } else {
+            matched
+        };
+        let after = end.max(progress.repaired);
+        if after >= message.index {
+            return Ok(true);
+        }
+        if !self.resend(message.from, after, message.index)? {
+            return Ok(false);
+        }
+        progress.repaired = message.index;
+        Ok(true)
+    }
+    /// Sends `to` again each message out before the one that ended at
+    /// `kept`, which `to` kept ahead of a hole ([`Ahead::Kept`]), that it has
+    /// neither answered nor been sent again: what it lacks before what it
+    /// kept, as RFC 6675 sends again every segment `IsLost` names once later
+    /// data arrived (RFC 2018). Each goes from past what `to` answered or was
+    /// sent again, anchored there, so that `to` keeps one that arrives ahead
+    /// of an earlier hole too. False when the log no longer holds one.
+    fn repair_before(&mut self, to: NodeId, progress: &mut Progress, kept: u64) -> Result<bool> {
+        let mut before = progress.matched;
+        let mut position = 0usize;
+        while let Some(last) = progress.inflights.last_at(position) {
+            if last >= kept {
+                break;
+            }
+            let delivered = progress.inflights.delivered_at(position);
+            position = position.saturating_add(1);
+            let after = before.max(progress.matched).max(progress.repaired);
+            before = last;
+            if last <= after || delivered {
+                continue;
+            }
+            if !self.resend(to, after, last)? {
+                return Ok(false);
+            }
+            progress.repaired = last;
+        }
+        Ok(true)
+    }
+    /// Sends `to` again the entries after `after` through `through`, a page
+    /// of them at most, its progress and window as they were: the window
+    /// still counts their first sending, as RFC 6675's pipe counts a
+    /// retransmission in place of the lost segment. False when the log no
+    /// longer holds them.
+    fn resend(&mut self, to: NodeId, after: u64, through: u64) -> Result<bool> {
+        let held = usize::try_from(through.saturating_sub(after)).unwrap_or(usize::MAX);
+        let page = self.log.page(
+            after.saturating_add(1),
+            self.max_bytes,
+            self.max_entries.min(held),
+        );
+        let term = self.log.term(after);
+        let (Ok(term), Ok(page)) = (term, page) else {
+            return Ok(false);
+        };
+        if page.entries.is_empty() {
+            return Ok(false);
+        }
+        let message = Message {
+            to,
+            msg_type: MessageType::MsgAppend,
+            index: after,
+            log_term: term,
+            commit: self.log.committed(),
+            entries: page.entries,
+            ..Message::default()
+        };
+        self.send_page(message, page.payload)?;
+        Ok(true)
+    }
     /// As many messages as the window admits, and none that is empty.
     fn append_all(&mut self, to: NodeId, progress: &mut Progress, window: usize) -> Result<()> {
         // Each message sent takes a place in the window, so the window
@@ -892,6 +1106,14 @@ enum TermChecked {
     Done,
 }
 
+/// The last term, and the last index, a member reaches: a message that names `u64::MAX` is beyond
+/// what is counted ([`counts_beyond_bound`]), so `u64::MAX` is never a term or an index, and the
+/// step past this one has no successor and is refused before anything changes (slates
+/// `docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`, mantle note 32 R6: a term
+/// saturated at its last value let two leaders share it, and an index saturated there gave two
+/// entries one index).
+pub(crate) const LAST: u64 = u64::MAX - 1;
+
 /// Whether a message carries a term or an index at the end of what is
 /// counted, past which the next could not be named.
 fn counts_beyond_bound(message: &Message) -> bool {
@@ -911,6 +1133,19 @@ fn counts_beyond_bound(message: &Message) -> bool {
             .any(|entry| entry.index == u64::MAX || entry.term == u64::MAX)
 }
 
+impl<S> Raft<S> {
+    /// Whether `mutant` is planted in this member.
+    #[cfg(feature = "mutants")]
+    pub(crate) fn planted(&self, mutant: crate::Mutant) -> bool {
+        self.mutant == Some(mutant)
+    }
+    /// Whether `mutant` is planted in this member: never, without the `mutants` feature.
+    #[cfg(not(feature = "mutants"))]
+    pub(crate) fn planted(&self, _mutant: crate::Mutant) -> bool {
+        false
+    }
+}
+
 impl<S: Storage> Raft<S> {
     /// The member `config` names, opened on what `store` holds.
     pub fn new(config: &Config, store: S) -> Result<Self> {
@@ -918,12 +1153,14 @@ impl<S: Storage> Raft<S> {
         let initial = store.initial_state()?;
         let configuration = Configuration::from_conf_state(&initial.configuration)?;
         let log = Log::new(store, config.limits.unstable_entries)?;
-        let tracker = Tracker::new(
+        let mut tracker = Tracker::new(
             configuration,
             log.last_index()?,
             config.max_inflight_msgs,
             config.max_inflight_bytes,
+            config.limits.members,
         )?;
+        tracker.set_page(config.max_size_per_msg);
         let mut raft = Self {
             id: config.id,
             term: 0,
@@ -934,13 +1171,19 @@ impl<S: Storage> Raft<S> {
             pending_conf_index: 0,
             pending_request_snapshot: 0,
             election_elapsed: 0,
+            silence: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick,
             patience: 0,
+            early: Early::default(),
+            stagings: Stagings::default(),
+            ticks: 0,
+            taken_ahead: 0,
             held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
             votes: Votes::new(
                 usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
                 config.limits.vote_bytes,
+                config.limits.members,
             ),
             decided: Decided::default(),
             displaced: Vec::new(),
@@ -956,13 +1199,17 @@ impl<S: Storage> Raft<S> {
             durable_commit: 0,
             lost: config.lost,
             told_to_campaign: false,
+            #[cfg(feature = "mutants")]
+            mutant: None,
             log,
             tracker,
-            read_only: ReadOnly::new(config.limits.pending_reads),
+            read_only: ReadOnly::new(config.limits.pending_reads, config.limits.members),
             read_states: Vec::new(),
+            deferred_reads: Vec::new(),
             msgs: Outgoing::default(),
             uncommitted_bytes: 0,
             leader_tail: 0,
+            term_start: 0,
             random: config.seed,
             watch: match config.elections {
                 Elections::Ticks => None,
@@ -1087,9 +1334,18 @@ impl<S: Storage> Raft<S> {
     pub fn ready_read_count(&self) -> usize {
         self.read_states.len()
     }
+    /// How many reads wait for this leader's first commit of its term.
+    pub fn deferred_read_count(&self) -> usize {
+        self.deferred_reads.len()
+    }
     /// Ticks since this member last heard its leader, or last campaigned.
     pub fn election_elapsed(&self) -> usize {
         self.election_elapsed
+    }
+    /// Ticks since this member last heard its leader, whatever its own timer did: what its lease
+    /// counts.
+    pub fn silence(&self) -> usize {
+        self.silence
     }
     /// The ticks this member waits, in this term, before it campaigns:
     /// drawn from `[election_tick, 2 election_tick)` by [`Config::seed`].
@@ -1139,6 +1395,24 @@ impl<S: Storage> Raft<S> {
         }
         let id = self.id;
         !self.config.fast && self.tracker.quorum_of(|member| member != id)
+    }
+    /// Why this member could not lead a term it campaigned for, if it could not (mantle note 32
+    /// R6): its term has no successor a message may name, or its log has no index for the entry
+    /// a leader's term begins with. Asked before a campaign changes anything, so that the refusal
+    /// is one; and by suspicion before a campaign is armed, so that none is due that cannot be
+    /// made.
+    fn lead_refusal(&self) -> Result<Option<Error>> {
+        if self.term >= LAST {
+            return Ok(Some(Error::Capacity("terms")));
+        }
+        if self.log.last_index()? >= LAST {
+            return Ok(Some(Error::Capacity("the log's indexes")));
+        }
+        Ok(None)
+    }
+    /// Whether this member could lead a term it campaigned for ([`Raft::lead_refusal`]).
+    fn may_lead(&self) -> bool {
+        matches!(self.lead_refusal(), Ok(None))
     }
     /// The last entry this member answers for in an election, `(index, term)`: its log's last,
     /// or what it marks lost, which is later (`docs/durable.md` §5). It may have acknowledged
@@ -1190,12 +1464,14 @@ impl<S: Storage> Raft<S> {
     pub fn has_pending_conf(&self) -> bool {
         self.pending_conf_index > self.log.applied()
     }
-    /// Whether the committed entry is of this member's term: a leader
-    /// serves reads only once it is.
+    /// Whether this leader committed the blank entry it began its term with: it serves reads only
+    /// once it has, as then it knows every entry committed before its term (the thesis's §6.4: a
+    /// leader "commit[s] a blank no-op entry into the log at the start of its term"). An entry of
+    /// its term below that one is not enough: what it recovered of the fast track bears its term
+    /// and may lie below an index a fast quorum committed in an earlier term.
     pub fn commit_to_current_term(&self) -> bool {
-        self.log
-            .term(self.log.committed())
-            .is_ok_and(|term| term == self.term)
+        // Every entry from that one on is of its term: no term need be read from the log.
+        self.term_start != 0 && self.log.committed() >= self.term_start
     }
     /// The priority the owner gave.
     pub fn priority(&self) -> i64 {
@@ -1210,18 +1486,22 @@ impl<S: Storage> Raft<S> {
         self.priority = priority;
         self.settle_priority();
     }
-    /// The path to `member` carries `bytes` before it answers: no more of
-    /// entries is sent to it ahead of its answers, but for one entry that
-    /// is larger. False for a member the configuration does not name. What
-    /// is out stays counted; a bound that rose admits more with the
-    /// member's next answer, or the leader's next append.
+    /// The path to `member` carries `bytes` before it answers: no more is
+    /// sent to it ahead of its answers, each append counted at its record,
+    /// but for one entry that is larger. An owner says twice what the path
+    /// carries in a round trip (`hyper_timing::inflight_window`, mantle note
+    /// 32 R16). False, and nothing changed, for a member the configuration
+    /// does not name, and for no bound at all where the window counts no
+    /// messages of its own. What is out stays counted; a bound that rose
+    /// admits more with the member's next answer, or the leader's next
+    /// append.
     pub fn set_inflight_bytes(&mut self, member: NodeId, bytes: u64) -> bool {
         match self.tracker.get_mut(member) {
-            Some(progress) => {
+            Some(progress) if bytes != u64::MAX || progress.inflights.counts_messages() => {
                 progress.inflights.set_byte_cap(bytes);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
     /// A member that has no term has no log to defend, and every candidate
@@ -1281,6 +1561,8 @@ impl<S: Storage> Raft<S> {
             .saturating_add(reads)
             .saturating_add(self.read_only.resident_bytes())
             .saturating_add(self.held.resident_bytes())
+            .saturating_add(self.early.resident_bytes())
+            .saturating_add(self.stagings.resident_bytes())
             .saturating_add(self.votes.resident_bytes())
             .saturating_add(self.decided.resident_bytes())
             .saturating_add(
@@ -1313,6 +1595,7 @@ impl<S: Storage> Raft<S> {
         }
         self.msgs.check()?;
         self.log.unstable().check()?;
+        self.early.check()?;
         self.held.check()?;
         self.votes.check()
     }
@@ -1441,7 +1724,12 @@ impl<S: Storage> Raft<S> {
     /// Commits what the quorum holds, if it is of this term.
     pub fn maybe_commit(&mut self) -> Result<bool> {
         let index = self.tracker.quorum_index();
-        let classic = self.log.maybe_commit(index, self.term)?;
+        let term = if self.planted(crate::Mutant::OlderTermCommit) {
+            self.log.term(index).unwrap_or(self.term)
+        } else {
+            self.term
+        };
+        let classic = self.log.maybe_commit(index, term)?;
         // What the classic quorum committed may open the next index to the
         // fast one.
         let fast = self.fast_commit()?;
@@ -1453,6 +1741,7 @@ impl<S: Storage> Raft<S> {
         if let Some(progress) = self.tracker.get_mut(self.id) {
             progress.update_committed(committed);
         }
+        self.release_deferred_reads()?;
         Ok(true)
     }
     /// The application applied through `applied`.
@@ -1505,8 +1794,10 @@ impl<S: Storage> Raft<S> {
             self.vote = 0;
         }
         self.leader_id = 0;
+        self.term_start = 0;
         self.reset_randomized_election_timeout();
         self.election_elapsed = 0;
+        self.silence = 0;
         self.heartbeat_elapsed = 0;
         if let Some(watch) = self.watch.as_mut() {
             // A new role or term: the member trusts no leader until it hears
@@ -1520,11 +1811,16 @@ impl<S: Storage> Raft<S> {
         }
         self.lead_transferee = None;
         self.told_to_campaign = false;
+        // What was kept ahead of a hole was one leader's, in one term; a
+        // learner's rounds are one leader's too.
+        self.early.clear();
+        self.stagings.clear();
         self.votes.clear();
         self.decided.clear();
         self.tracker.reset_votes();
         self.pending_conf_index = 0;
         self.read_only.clear();
+        self.deferred_reads.clear();
         self.pending_request_snapshot = 0;
         // Only a leader applies before its own write is durable.
         self.log.unpersisted_after = u64::MAX;
@@ -1599,7 +1895,7 @@ impl<S: Storage> Raft<S> {
     ) -> Result<bool> {
         let last = self.log.last_index()?;
         let count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
-        if last.checked_add(count).is_none_or(|end| end == u64::MAX) {
+        if last.checked_add(count).is_none_or(|end| end > LAST) {
             return Err(Error::Capacity("the log's indexes"));
         }
         let bytes = entries.iter().fold(0usize, |bytes, entry| {
@@ -1673,6 +1969,7 @@ impl<S: Storage> Raft<S> {
     }
     fn tick_election(&mut self) -> Result<bool> {
         self.election_elapsed = self.election_elapsed.saturating_add(1);
+        self.silence = self.silence.saturating_add(1);
         if self.election_elapsed
             < self
                 .randomized_election_timeout
@@ -1686,6 +1983,7 @@ impl<S: Storage> Raft<S> {
         Ok(true)
     }
     fn tick_heartbeat(&mut self) -> Result<bool> {
+        self.ticks = self.ticks.saturating_add(1);
         self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
         self.election_elapsed = self.election_elapsed.saturating_add(1);
         let mut ready = false;
@@ -1741,8 +2039,9 @@ impl<S: Storage> Raft<S> {
     /// given up. A member never suspects itself.
     pub fn suspect(&mut self, member: NodeId) -> Result<()> {
         let (id, leader, state) = (self.id, self.leader_id, self.state);
+        let members = self.config.limits.members;
         let watch = self.watch_mut()?;
-        if member == id || !watch.suspect(member)? {
+        if member == id || !watch.suspect(member, members)? {
             return Ok(());
         }
         if state != StateRole::Leader {
@@ -1850,15 +2149,20 @@ impl<S: Storage> Raft<S> {
     /// it, as hyper-timing's law chooses no span before a quorum's paths
     /// are measured (`docs/timing.md` §2.3).
     pub fn set_timing(&mut self, timing: Timing) -> Result<()> {
-        self.watch_mut()?.timing = Some((nanos(timing.span), nanos(timing.round)));
+        self.watch_mut()?.timing = Some((
+            nanos(timing.span),
+            nanos(timing.round),
+            nanos(timing.election),
+        ));
         Ok(())
     }
     /// The timing the owner last gave, if any.
     pub fn timing(&self) -> Option<Timing> {
-        let (span, round) = self.watch.as_ref()?.timing?;
+        let (span, round, election) = self.watch.as_ref()?.timing?;
         Some(Timing {
             span: std::time::Duration::from_nanos(span),
             round: std::time::Duration::from_nanos(round),
+            election: std::time::Duration::from_nanos(election),
         })
     }
     /// The owner holds this member's campaigns, or lets them go: it is
@@ -1939,13 +2243,16 @@ impl<S: Storage> Raft<S> {
     /// detectors leave it no quorum, or on ticks.
     pub fn deadline(&self) -> Option<u64> {
         let watch = self.watch.as_ref()?;
-        let campaigns =
-            self.promotable && !watch.held && self.may_campaign() && self.trusted_quorum();
-        let campaign = if campaigns || (watch.led == self.term && self.term != 0) {
-            Watch::due(watch.campaign)
-        } else {
-            None
-        };
+        // The rules that hold a campaign are asked only of one that is armed: an owner that scans
+        // its idle groups asks each member, and a follower that trusts its leader has none.
+        let campaign = Watch::due(watch.campaign).filter(|_| {
+            (watch.led == self.term && self.term != 0)
+                || (self.promotable
+                    && !watch.held
+                    && self.may_campaign()
+                    && self.may_lead()
+                    && self.trusted_quorum())
+        });
         [campaign, Watch::due(watch.beat), Watch::due(watch.transfer)]
             .into_iter()
             .flatten()
@@ -1956,9 +2263,10 @@ impl<S: Storage> Raft<S> {
     /// the member acted: it campaigned, stepped down, beat or gave up a
     /// transfer. Nothing on ticks.
     pub fn wake(&mut self, now: u64) -> Result<bool> {
-        if self.watch.is_none() {
+        let Some(watch) = self.watch.as_mut() else {
             return Ok(false);
-        }
+        };
+        watch.now = watch.now.max(now);
         let mut acted = false;
         if self.state == StateRole::Leader {
             if self.trusted_quorum() {
@@ -2044,9 +2352,7 @@ impl<S: Storage> Raft<S> {
     }
     fn wake_follower(&mut self, now: u64) -> Result<bool> {
         let (promotable, local, term) = (self.promotable, self.config.seed, self.term);
-        let may = self.may_campaign();
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
-        let quorum = self.trusted_quorum();
         let trusts = self
             .watch
             .as_deref()
@@ -2088,7 +2394,11 @@ impl<S: Storage> Raft<S> {
         if !due {
             return Ok(false);
         }
-        let campaigns = promotable && quorum && may && !watch.held;
+        // The rules that hold a campaign are asked only of one that is due: the owner wakes a
+        // member after every call it makes (`Raft::deadline` likewise).
+        let held = watch.held;
+        let campaigns =
+            promotable && !held && self.trusted_quorum() && self.may_campaign() && self.may_lead();
         if !campaigns {
             if !led {
                 return Ok(false);
@@ -2096,6 +2406,7 @@ impl<S: Storage> Raft<S> {
             // It cannot campaign, and its followers trust it: it hands over
             // again, a round and a draw after the last, as a candidate asks
             // again, for the order may have been lost.
+            let watch = self.watch_mut()?;
             watch.campaign = match (watch.round(), watch.draw(local)) {
                 (Some(tail), Some(delay)) => {
                     Arm::At(now.saturating_add(tail).saturating_add(delay))
@@ -2139,7 +2450,7 @@ impl<S: Storage> Raft<S> {
         let term = self
             .term
             .checked_add(1)
-            .filter(|term| *term != u64::MAX)
+            .filter(|term| *term <= LAST)
             .ok_or(Error::Capacity("terms"))?;
         self.reset(term)?;
         self.vote = self.id;
@@ -2150,7 +2461,7 @@ impl<S: Storage> Raft<S> {
         if self.state == StateRole::Leader {
             return Err(Error::Invariant("a leader that campaigns"));
         }
-        if self.term.checked_add(1).is_none_or(|term| term == u64::MAX) {
+        if self.term.checked_add(1).is_none_or(|term| term > LAST) {
             return Err(Error::Capacity("terms"));
         }
         // Asking changes neither the term nor the vote.
@@ -2170,6 +2481,7 @@ impl<S: Storage> Raft<S> {
             Votes::new(
                 usize::try_from(self.config.limits.fast_window).unwrap_or(usize::MAX),
                 self.config.limits.vote_bytes,
+                self.config.limits.members,
             ),
         );
         self.reset(term)?;
@@ -2203,10 +2515,20 @@ impl<S: Storage> Raft<S> {
         let mut first = self.recover(reports, last)?;
         first.try_reserve(1).map_err(|_| Error::Memory)?;
         first.push(Entry::default());
-        if !self.append_entries(first, true)? {
+        // A member campaigns only with an index for this entry (`Raft::lead_refusal`), and what it
+        // recovers lies below the last index (`track::proposable`): no index here is a state that
+        // no longer adds up, never a refusal of something that changed nothing.
+        let appended = self
+            .append_entries(first, true)
+            .map_err(|error| match error {
+                Error::Capacity(_) => Error::Invariant("a leader's first entry has no index"),
+                other => other,
+            });
+        if !appended? {
             return Err(Error::Invariant("a leader's first entry was refused"));
         }
         let last = self.log.last_index()?;
+        self.term_start = last;
         self.release_proposals(last)
     }
 
@@ -2286,6 +2608,9 @@ impl<S: Storage> Raft<S> {
         // a group it is no member of.
         if !self.promotable {
             return Err(Error::NotPromotable);
+        }
+        if let Some(refusal) = self.lead_refusal()? {
+            return Err(refusal);
         }
         if !self.may_campaign() {
             // Its leader is gone, or it would not be asked: it holds no
@@ -2373,7 +2698,7 @@ impl<S: Storage> Raft<S> {
                 None => {
                     self.config.check_quorum
                         && self.leader_id != 0
-                        && self.election_elapsed < self.config.election_tick
+                        && self.silence < self.config.election_tick
                 }
                 // While it leads, or trusts the leader it knows (Ongaro
                 // §9.6) and the request is not that leader's own. A member
@@ -2621,10 +2946,17 @@ impl<S: Storage> Raft<S> {
             };
             let joint = self.tracker.configuration().is_joint();
             let leaves = plan.stated == 0;
-            if pending > self.log.applied() || joint != leaves {
-                // One change at a time, and out of a joint configuration
-                // before into another: the entry keeps its place and
-                // states nothing.
+            // A change past the members a configuration of the group names
+            // would stop every member it reached.
+            let past = plan
+                .apply(self.tracker.configuration())
+                .is_ok_and(|changed| {
+                    changed.configuration.members().count() > self.config.limits.members
+                });
+            if pending > self.log.applied() || joint != leaves || past {
+                // One change at a time, out of a joint configuration before
+                // into another, and within the group's members: the entry
+                // keeps its place and states nothing.
                 *entry = Entry::default();
             } else {
                 pending = index;
@@ -2638,17 +2970,55 @@ impl<S: Storage> Raft<S> {
         self.bcast_append()
     }
     fn read_index(&mut self, mut message: Message) -> Result<()> {
-        // A leader knows what is committed once it committed in its term.
-        if !self.commit_to_current_term() {
-            return Ok(());
-        }
         let Some(entry) = message.entries.first_mut() else {
-            return Ok(());
+            return Err(Error::Violation("a read without its context"));
         };
         let context = std::mem::take(&mut entry.data);
+        // A leader knows what is committed once it committed in its term: until then the read
+        // waits for that commit (the thesis's §6.4 step 1), where it was dropped and its asker
+        // left to its deadline.
+        if !self.commit_to_current_term() && !self.planted(crate::Mutant::ReadBeforeFirstCommit) {
+            if self.reads_held() >= self.config.limits.pending_reads {
+                return Err(Error::Capacity(
+                    "reads that wait for the term's first commit",
+                ));
+            }
+            self.deferred_reads
+                .try_reserve(1)
+                .map_err(|_| Error::Memory)?;
+            self.deferred_reads.push((message.from, context));
+            return Ok(());
+        }
+        self.serve_read(message.from, context)
+    }
+    /// Every read this leader holds: waiting for its term's first commit, for its quorum, or to
+    /// be taken.
+    fn reads_held(&self) -> usize {
+        self.read_only
+            .len()
+            .saturating_add(self.read_states.len())
+            .saturating_add(self.deferred_reads.len())
+    }
+    /// The reads that waited for this leader's first commit of its term, in the order asked, once
+    /// that commit is made.
+    fn release_deferred_reads(&mut self) -> Result<()> {
+        if self.deferred_reads.is_empty() || !self.commit_to_current_term() {
+            return Ok(());
+        }
+        // Taken and put back, so the queue keeps its room for the next term.
+        let mut deferred = std::mem::take(&mut self.deferred_reads);
+        let served = deferred
+            .drain(..)
+            .try_for_each(|(from, context)| self.serve_read(from, context));
+        self.deferred_reads = deferred;
+        served
+    }
+    /// A read asked of a leader that committed in its term: answered at once by a member alone,
+    /// or confirmed by a round.
+    fn serve_read(&mut self, from: NodeId, context: Vec<u8>) -> Result<()> {
         let committed = self.log.committed();
         if self.tracker.is_singleton() {
-            return self.answer_read(message.from, committed, context);
+            return self.answer_read(from, committed, context);
         }
         if self.read_only.len().saturating_add(self.read_states.len())
             >= self.config.limits.pending_reads
@@ -2659,17 +3029,14 @@ impl<S: Storage> Raft<S> {
             // No round is sent for it here. One leaves when the member is
             // next asked what there is to do (`ask_reads`), carrying the
             // last read asked by then.
-            ReadRounds::Shared => self
-                .read_only
-                .add(committed, context, message.from, self.id),
+            ReadRounds::Shared => self.read_only.add(committed, context, from, self.id),
             ReadRounds::Each => {
                 let mut heartbeat = Vec::new();
                 heartbeat
                     .try_reserve_exact(context.len())
                     .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
                 heartbeat.extend_from_slice(&context);
-                self.read_only
-                    .add(committed, context, message.from, self.id)?;
+                self.read_only.add(committed, context, from, self.id)?;
                 self.bcast_heartbeat_with(Some(&heartbeat))?;
                 self.read_only.asked();
                 Ok(())
@@ -2759,23 +3126,8 @@ impl<S: Storage> Raft<S> {
         Ok(true)
     }
     fn handle_append_response(&mut self, message: &Message) -> Result<()> {
-        let mut next_probe = message.reject_hint;
         if message.reject {
-            // Asked for on a refusal only: an acknowledgement checks nothing
-            // more than before.
-            if message.lost && self.take_lost(message)? {
-                return Ok(());
-            }
-            if message.log_term > 0 {
-                // The member holds `log_term` at its hint. No index of this
-                // log at or below the hint with a higher term can match it,
-                // for terms only rise along a log: probe at the last one
-                // that may.
-                next_probe = self
-                    .log
-                    .find_conflict_by_term(message.reject_hint, message.log_term)?
-                    .0;
-            }
+            return self.handle_append_refusal(message);
         }
         let last = self.log.last_index()?;
         let Some(progress) = self.tracker.get_mut(message.from) else {
@@ -2783,15 +3135,6 @@ impl<S: Storage> Raft<S> {
         };
         progress.recent_active = true;
         progress.update_committed(message.commit);
-        if message.reject {
-            if progress.maybe_decrease_to(message.index, next_probe, message.request_snapshot) {
-                if progress.state == ProgressState::Replicate {
-                    progress.become_probe();
-                }
-                self.send_append(message.from)?;
-            }
-            return Ok(());
-        }
         let paused = progress.is_paused();
         if !progress.maybe_update(message.index) {
             return Ok(());
@@ -2805,6 +3148,7 @@ impl<S: Storage> Raft<S> {
             }
             ProgressState::Replicate => progress.inflights.free_to(message.index),
         }
+        self.note_progress(message.from)?;
         if self.maybe_commit()? {
             if self.should_bcast_commit() {
                 self.bcast_append()?;
@@ -2821,6 +3165,58 @@ impl<S: Storage> Raft<S> {
                 .is_some_and(|progress| progress.matched == last)
         {
             self.send(proto::message(message.from, MessageType::MsgTimeoutNow))?;
+        }
+        Ok(())
+    }
+    /// A member refused an append.
+    fn handle_append_refusal(&mut self, message: &Message) -> Result<()> {
+        // Asked for on a refusal only: an acknowledgement checks nothing
+        // more than before.
+        if message.lost && self.take_lost(message)? {
+            return Ok(());
+        }
+        let mut next_probe = message.reject_hint;
+        if message.log_term > 0 {
+            // The member holds `log_term` at its hint. No index of this log
+            // at or below the hint with a higher term can match it, for terms
+            // only rise along a log: probe at the last one that may.
+            next_probe = self
+                .log
+                .find_conflict_by_term(message.reject_hint, message.log_term)?
+                .0;
+        }
+        // The member refused an append that began past the end of its log
+        // (`message.index`, after its hint), and says it kept it (R17): it
+        // holds entries past it. Not a conflict inside its log, nor a member
+        // that keeps nothing ahead (raft-rs's, or one of `Ahead::Refused`),
+        // which the probe below serves.
+        let ahead =
+            message.kept && message.request_snapshot == 0 && message.index > message.reject_hint;
+        // Its log ends at the hint and holds this log's entry there.
+        let agrees = ahead
+            && self
+                .log
+                .term(message.reject_hint)
+                .is_ok_and(|term| term == message.log_term);
+        let (mut outbox, tracker) = self.outbox();
+        let Some(progress) = tracker.get_mut(message.from) else {
+            return Ok(());
+        };
+        progress.recent_active = true;
+        progress.update_committed(message.commit);
+        if ahead
+            && progress.state == ProgressState::Replicate
+            && outbox.repair(message, progress, agrees)?
+        {
+            return Ok(());
+        }
+        // A conflict, a member that keeps nothing ahead, or a hole the log no
+        // longer holds: probed (raft-rs's rule), for a snapshot where needed.
+        if progress.maybe_decrease_to(message.index, next_probe, message.request_snapshot) {
+            if progress.state == ProgressState::Replicate {
+                progress.become_probe();
+            }
+            self.send_append(message.from)?;
         }
         Ok(())
     }
@@ -2925,9 +3321,29 @@ impl<S: Storage> Raft<S> {
         }
     }
 
+    /// A read with no leader to ask: refused when asked here, so its owner answers it now; one a
+    /// peer forwarded is dropped, and that peer's owner answers its own.
+    fn drop_read(message: &Message) -> Result<()> {
+        if message.from == 0 {
+            return Err(Error::ReadDropped);
+        }
+        Ok(())
+    }
+
     fn step_candidate(&mut self, kind: MessageType, message: Message) -> Result<()> {
         match kind {
             MessageType::MsgPropose => Err(Error::ProposalDropped),
+            MessageType::MsgReadIndex => Self::drop_read(&message),
+            MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
+                if self.state == StateRole::PreCandidate && self.suspects(message.from) =>
+            {
+                // A pre-candidate keeps its leader's term, so what that leader sends would make it
+                // a follower again and end the asking its detectors began: a leader that is up
+                // answers a pre-vote with a heartbeat, which can reach the asker before any grant.
+                // While it asks it does not hear a leader it suspects; the message is dropped, as
+                // a lost one.
+                Ok(())
+            }
             MessageType::MsgAppend => {
                 self.become_follower(message.term, message.from)?;
                 self.handle_append_entries(message)
@@ -2986,6 +3402,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgAppend => {
                 self.election_elapsed = 0;
+                self.silence = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
                 self.followed(message.from);
@@ -2994,6 +3411,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgHeartbeat => {
                 self.election_elapsed = 0;
+                self.silence = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
                 self.followed(message.from);
@@ -3002,15 +3420,22 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgSnapshot => {
                 self.election_elapsed = 0;
+                self.silence = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
                 self.followed(message.from);
                 self.handle_snapshot(message)?;
                 self.heard_leader()
             }
-            MessageType::MsgTransferLeader | MessageType::MsgReadIndex => {
+            MessageType::MsgTransferLeader => {
                 if self.leader_id == 0 {
                     return Ok(());
+                }
+                self.forward(message)
+            }
+            MessageType::MsgReadIndex => {
+                if self.leader_id == 0 {
+                    return Self::drop_read(&message);
                 }
                 self.forward(message)
             }
@@ -3024,7 +3449,7 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgReadIndexResp => {
                 if message.entries.len() != 1 {
-                    return Ok(());
+                    return Err(Error::Violation("a read's answer without its one context"));
                 }
                 if self.read_states.len() >= self.config.limits.pending_reads {
                     return Err(Error::Capacity("reads that wait to be taken"));
@@ -3087,6 +3512,19 @@ impl<S: Storage> Raft<S> {
         // leader to send again: the answer names the last entry taken.
         let mut taken = std::mem::take(&mut message.entries);
         taken.truncate(self.config.limits.unstable_entries);
+        let end = self.log.last_index()?;
+        let kept = message.index > end && self.config.ahead == Ahead::Kept && self.lost.is_none();
+        answer.kept = kept;
+        if kept {
+            // Past the end of the log: the append is refused below, and its
+            // entries, this term's leader's, are kept to take in once the
+            // hole is filled (`crate::ahead`), as many as the log may hold
+            // not yet durable.
+            let ahead = std::mem::take(&mut taken);
+            let bound = self.config.limits.unstable_entries;
+            self.early
+                .keep(self.term, message.index, end, ahead, bound)?;
+        }
         // The leader's entries move into the log uncopied.
         match self.log.append_after_owned(
             message.index,
@@ -3096,6 +3534,7 @@ impl<S: Storage> Raft<S> {
             self.config.fast,
         )? {
             Some((_, last)) => {
+                let last = self.take_ahead(last, message.commit)?;
                 answer.index = last;
                 let held = self.log.last_index()?;
                 self.release_proposals(held)?;
@@ -3121,6 +3560,48 @@ impl<S: Storage> Raft<S> {
         answer.commit = self.log.committed();
         self.send(answer)
     }
+    /// Takes into the log what this member kept ahead of a hole that now
+    /// continues the entries an append of this term placed through `last`,
+    /// as the leader's next append would have, to what the log may hold not
+    /// yet durable; the last index it then holds of the leader's log. The
+    /// answer that says so leaves with the write that holds them (I2).
+    fn take_ahead(&mut self, last: u64, commit: u64) -> Result<u64> {
+        if self.early.is_empty() {
+            return Ok(last);
+        }
+        let room = self
+            .config
+            .limits
+            .unstable_entries
+            .saturating_sub(self.log.unstable().count_through(last));
+        let run = self.early.take_after(last, room);
+        if run.is_empty() {
+            return Ok(last);
+        }
+        let term = self.log.term(last)?;
+        match self
+            .log
+            .append_after_owned(last, term, commit, run, self.config.fast)?
+        {
+            Some((_, taken)) => {
+                self.taken_ahead = self.taken_ahead.saturating_add(taken.saturating_sub(last));
+                Ok(taken)
+            }
+            None => Err(Error::Invariant(
+                "the log does not hold what an append just placed in it",
+            )),
+        }
+    }
+    /// The indexes of what this member keeps ahead of a hole in its log, in
+    /// order ([`Ahead::Kept`]).
+    pub fn kept_ahead(&self) -> impl Iterator<Item = u64> + '_ {
+        self.early.indexes()
+    }
+    /// The entries this member took into its log from what it kept ahead of
+    /// a hole, since it opened.
+    pub fn taken_ahead(&self) -> u64 {
+        self.taken_ahead
+    }
     /// A member whose log lost entries it acknowledged refuses `index`
     /// and says it lost them, naming the last entry it holds: a leader
     /// that counts them takes its progress back there and resends them
@@ -3136,6 +3617,126 @@ impl<S: Storage> Raft<S> {
         answer.log_term = self.log.last_term()?;
         answer.commit = self.log.committed();
         self.send(answer)
+    }
+    /// The member's clock for its learners' rounds: its own ticks; by
+    /// suspicion, the owner's clock at its last wake.
+    fn clock(&self) -> u64 {
+        match self.watch.as_ref() {
+            None => self.ticks,
+            Some(watch) => watch.now,
+        }
+    }
+    /// An election on that clock ([`CatchUp`]): the minimum election timeout
+    /// on ticks (thesis §4.2.1's "an election timeout"); by suspicion, the
+    /// election the law expects, once the owner gave it.
+    fn election_on_clock(&self) -> Option<u64> {
+        match self.watch.as_ref() {
+            None => u64::try_from(self.config.election_tick).ok(),
+            Some(watch) => watch.election(),
+        }
+    }
+    /// Where catching up `member` stands (Ongaro's thesis §4.2.1,
+    /// `crate::catchup`). Asked first while this member leads, it stages the
+    /// learner, its first round replicating what the leader holds now; asked
+    /// again, it judges the learner as an election passes, and gives it up
+    /// once its lag did not shrink over one (said once; asked again, it is
+    /// staged afresh). Its rounds end as its answers arrive. A voter is ready.
+    pub fn catch_up(&mut self, member: NodeId) -> Result<CatchUp> {
+        if self.state != StateRole::Leader {
+            return Ok(CatchUp::NotLeader);
+        }
+        let configuration = self.tracker.configuration();
+        if !configuration.contains(member) {
+            return Ok(CatchUp::NotMember);
+        }
+        if configuration.votes(member) {
+            return Ok(CatchUp::Ready);
+        }
+        let (last, clock, election) = (
+            self.log.last_index()?,
+            self.clock(),
+            self.election_on_clock(),
+        );
+        let matched = self
+            .tracker
+            .get(member)
+            .map_or(0, |progress| progress.matched);
+        let lag = last.saturating_sub(matched);
+        let Some(staging) = self.stagings.get_mut(member) else {
+            let ready = matched >= last;
+            self.stagings.put(
+                member,
+                Staging {
+                    round_end: last,
+                    began: clock,
+                    lag,
+                    judged: clock,
+                    ready,
+                },
+            )?;
+            return Ok(if ready {
+                CatchUp::Ready
+            } else {
+                CatchUp::Pending
+            });
+        };
+        if staging.ready {
+            return Ok(CatchUp::Ready);
+        }
+        if matched >= staging.round_end {
+            // The round ended with no answer since to note it (`note_progress`): a
+            // round that began holding what it replicates.
+            if election.is_some_and(|election| clock.saturating_sub(staging.began) < election) {
+                staging.ready = true;
+                return Ok(CatchUp::Ready);
+            }
+            staging.round_end = last;
+            staging.began = clock;
+        }
+        let due = election.is_some_and(|election| clock.saturating_sub(staging.judged) >= election);
+        if !due {
+            return Ok(CatchUp::Pending);
+        }
+        if lag >= staging.lag {
+            // Unavailable, or slower than the leader appends: "the leader should
+            // also abort the change" (§4.2.1).
+            self.stagings.remove(member);
+            return Ok(CatchUp::Aborted);
+        }
+        staging.lag = lag;
+        staging.judged = clock;
+        Ok(CatchUp::Pending)
+    }
+    /// An answer moved `member`'s progress: a round of its catch-up ends once
+    /// it holds the round's end. One that lasted less than an election is the
+    /// last; a longer one begins the next with what this leader holds now.
+    fn note_progress(&mut self, member: NodeId) -> Result<()> {
+        if self.stagings.is_empty() {
+            return Ok(());
+        }
+        let (last, clock, election) = (
+            self.log.last_index()?,
+            self.clock(),
+            self.election_on_clock(),
+        );
+        let matched = self
+            .tracker
+            .get(member)
+            .map_or(0, |progress| progress.matched);
+        let Some(staging) = self.stagings.get_mut(member) else {
+            return Ok(());
+        };
+        if staging.ready || matched < staging.round_end {
+            return Ok(());
+        }
+        let lasted = clock.saturating_sub(staging.began);
+        if election.is_some_and(|election| lasted < election) {
+            staging.ready = true;
+        } else {
+            staging.round_end = last;
+            staging.began = clock;
+        }
+        Ok(())
     }
     fn handle_heartbeat(&mut self, mut message: Message) -> Result<()> {
         if let Some(lost) = self.lost
@@ -3204,6 +3805,9 @@ impl<S: Storage> Raft<S> {
             return Ok(false);
         }
         self.log.restore(snapshot)?;
+        // What was kept ahead of the old log's end follows a log no longer
+        // held.
+        self.early.clear();
         let last = self.log.last_index()?;
         self.release_proposals(last)?;
         self.tracker = Tracker::new(
@@ -3211,7 +3815,9 @@ impl<S: Storage> Raft<S> {
             last,
             self.config.max_inflight_msgs,
             self.config.max_inflight_bytes,
+            self.config.limits.members,
         )?;
+        self.tracker.set_page(self.config.max_size_per_msg);
         self.post_conf_change()?;
         if let Some(progress) = self.tracker.get_mut(self.id) {
             let held = progress.next_index.saturating_sub(1);
@@ -3238,6 +3844,13 @@ impl<S: Storage> Raft<S> {
     fn post_conf_change(&mut self) -> Result<ConfState> {
         let stated = self.tracker.configuration().to_conf_state()?;
         self.forget_unnamed();
+        // Only a learner is caught up: one promoted, or no member any more, is
+        // staged no more.
+        let Self {
+            stagings, tracker, ..
+        } = self;
+        let configuration = tracker.configuration();
+        stagings.retain(|member| configuration.contains(member) && !configuration.votes(member));
         let votes = self.tracker.configuration().votes(self.id);
         self.promotable = votes;
         if self.state != StateRole::Leader {

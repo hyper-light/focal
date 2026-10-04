@@ -23,6 +23,7 @@
 //! how the log never runs out of room to free room.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use crate::codec::Writer as Payload;
 use crate::format::{self, Owned, Placed, Record};
@@ -61,6 +62,9 @@ pub(crate) struct Submission {
     /// (`GroupLog`): a write sent before its handle heard of a refusal is refused
     /// [`LogError::Behind`], so the group's writes stay in the order submitted. Zero otherwise.
     pub(crate) epoch: u64,
+    /// When it was submitted, which its commit wait is timed from (`stats::Tally::waited`); a
+    /// restore's, when the log opened.
+    pub(crate) submitted: Instant,
 }
 
 /// Where the writer's fair queue placed a submission (mantle docs/design/raft-log.md §3).
