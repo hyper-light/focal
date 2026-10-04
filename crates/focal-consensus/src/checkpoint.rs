@@ -24,7 +24,7 @@ struct FundedCheckpointInput {
     allocation: Allocation,
 }
 
-impl DurableNode {
+impl LogNode {
     pub fn checkpoint_pending(&self) -> bool {
         self.checkpoint.is_some()
     }

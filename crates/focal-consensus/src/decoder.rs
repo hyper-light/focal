@@ -34,7 +34,7 @@ impl PendingDecoderFloor {
         self.receipt.is_some()
     }
 }
-impl DurableNode {
+impl LogNode {
     /// Register the actual compiled application decoder before replay or Raft
     /// participation. This never persists or advertises a capability. A single
     /// hash cannot confirm recovery containing a decoder transition, even when

@@ -26,6 +26,7 @@ pub use membership::*;
 mod checkpoint;
 mod decoder;
 pub mod envelope;
+mod facade;
 pub mod group_files;
 mod persistence;
 mod storage;
@@ -247,7 +248,7 @@ pub type PersistedSignal = Box<dyn Fn() -> focal_log::Persisted + Send>;
 /// The write is queued, not waited for; the log finishes what it was given
 /// before it closes. Nothing is written for a member that failed or still
 /// persists something: its log answers for itself.
-impl Drop for DurableNode {
+impl Drop for LogNode {
     fn drop(&mut self) {
         if !self.failed
             && self.persistence.is_none()
@@ -330,7 +331,50 @@ impl MembershipView<'_> {
     }
 }
 
+/// One member of one Raft group, as focal's owners drive it: the replica, its log and what it
+/// keeps durable, over the backend it opened on ([27] §15.7, option (B)). Every method is the
+/// backend's own; the owners' API is one whichever answers.
+///
+/// [27]: ../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
 pub struct DurableNode {
+    backend: Backend,
+}
+
+/// What a [`DurableNode`] runs over.
+enum Backend {
+    /// focal-log and the core driven by focal's own persistence (`LogNode`).
+    Log(LogNode),
+}
+
+/// Calls the backend's method of the same name.
+macro_rules! dispatch {
+    ($node:ident = $backend:expr => $call:expr) => {
+        match $backend {
+            Backend::Log($node) => $call,
+        }
+    };
+}
+use dispatch;
+
+#[cfg(test)]
+impl DurableNode {
+    /// The focal-log backend, for the crate's tests that read or drive its own state.
+    pub(crate) fn log(&self) -> &LogNode {
+        match &self.backend {
+            Backend::Log(node) => node,
+        }
+    }
+    /// As [`DurableNode::log`], to change.
+    pub(crate) fn log_mut(&mut self) -> &mut LogNode {
+        match &mut self.backend {
+            Backend::Log(node) => node,
+        }
+    }
+}
+
+/// The focal-log backend of a [`DurableNode`]: the core over focal-log's write-ahead log, its
+/// persistence and checkpoints, decoder records and wakes its own.
+pub(crate) struct LogNode {
     config: NodeConfig,
     raw: RawNode<RamLog>,
     wal: WalLease,
@@ -379,7 +423,7 @@ pub struct DurableNode {
     active_allocation: Option<Allocation>,
 }
 
-impl DurableNode {
+impl LogNode {
     pub fn group_id(&self) -> [u8; 16] {
         self.config.group_id
     }

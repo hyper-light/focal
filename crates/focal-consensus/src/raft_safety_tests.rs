@@ -26,7 +26,8 @@ fn leaders(cluster: &Cluster) -> Vec<(u64, u64)> {
 /// One randomized election-timer tick on every node, then deliver.
 fn randomize_and_tick(cluster: &mut Cluster, isolated: Option<u64>) {
     for (i, node) in cluster.nodes.iter_mut().enumerate() {
-        node.raw
+        node.log_mut()
+            .raw
             .raft
             .set_randomized_election_timeout(10 + i * 3)
             .unwrap();
@@ -285,6 +286,7 @@ fn a_joint_change_commits_only_with_both_configurations() {
     );
     assert!(
         !cluster.nodes[0]
+            .log()
             .raw
             .store()
             .conf_state
@@ -324,6 +326,7 @@ fn a_joint_change_commits_only_with_both_configurations() {
     assert_eq!(status.voters, vec![1, 2]);
     assert!(
         cluster.nodes[0]
+            .log()
             .raw
             .store()
             .conf_state
@@ -356,7 +359,8 @@ fn run_until(
             if i as u64 + 1 == isolated {
                 continue;
             }
-            node.raw
+            node.log_mut()
+                .raw
                 .raft
                 .set_randomized_election_timeout(timeouts[i])
                 .unwrap();
@@ -661,6 +665,7 @@ fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
         for _ in 0..ROUNDS {
             for (node, timeout) in [(1usize, 10usize), (2, 19)] {
                 cluster.nodes[node]
+                    .log_mut()
                     .raw
                     .raft
                     .set_randomized_election_timeout(timeout)

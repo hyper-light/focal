@@ -166,7 +166,7 @@ pub struct AppliedMembership {
     pub before: MembershipConfiguration,
     pub after: MembershipConfiguration,
 }
-impl DurableNode {
+impl LogNode {
     pub fn membership_configuration(&self) -> MembershipConfiguration {
         MembershipConfiguration::from_conf(&self.raw.store().conf_state)
     }
