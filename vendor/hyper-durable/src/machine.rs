@@ -1,5 +1,5 @@
 //! What the shell asks of the state machine a group applies to (`docs/durable.md` §9).
-use hyper_raft::proto::ConfState;
+use hyper_raft::proto::{ConfChangeV2, ConfState};
 
 use crate::store::{EntryRef, Point};
 
@@ -24,10 +24,18 @@ pub trait StateMachine {
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Self::Answer>)
     -> Result<(), Fatal>;
 
-    /// A committed change of configuration at `at` left the group with `configuration`, which
-    /// the machine keeps with its state from this index on. A change the core refused, alike on
-    /// every member, leaves the configuration it had.
-    fn apply_change(&mut self, at: Point, configuration: &ConfState) -> Result<(), Fatal>;
+    /// A committed change of configuration at `at`, as its entry stated it (`change`, its
+    /// context among it), left the group with `configuration`, which the machine keeps with its
+    /// state from this index on; the configuration before is the machine's own
+    /// ([`StateMachine::configuration`]). A change the core refused, alike on every member,
+    /// leaves the configuration it had. An owner that reports each change with what it carried,
+    /// as focal's does, reads it here.
+    fn apply_change(
+        &mut self,
+        at: Point,
+        change: &ConfChangeV2,
+        configuration: &ConfState,
+    ) -> Result<(), Fatal>;
 
     /// The last entry a restart opens with applied, and its term.
     fn durable(&self) -> Point;
@@ -41,9 +49,14 @@ pub trait StateMachine {
     /// groups) says so for every entry.
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool;
 
-    /// An image of everything applied, written into `into`, and the point it is of: what a
-    /// leader sends a member that lacks entries its log no longer holds.
-    fn image(&mut self, into: &mut Vec<u8>) -> Result<Point, Fatal>;
+    /// An image of the machine's state at a point it applied, written into `into`, with the
+    /// point and the configuration the group held there, which a snapshot carries with it
+    /// (Ongaro and Ousterhout 2014, §7): what a leader sends a member that lacks entries
+    /// its log no longer holds. A machine that images on demand gives everything applied, under
+    /// [`StateMachine::configuration`]; one that keeps its owner's checkpoints, as focal's does,
+    /// gives the latest, which may be behind what it applied and is never behind the log's
+    /// start, for a compaction never passes [`StateMachine::durable`] (I8).
+    fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal>;
 
     /// Replaces the machine's state with `image`, which is of `at` under `configuration`, and
     /// makes it durable before returning: the log's start moves to `at` only after (I8).

@@ -3,11 +3,11 @@
 use std::time::Duration;
 
 use hyper_timing::{
-    Configuration, Costs, Event, ExchangeRtt, Exposure, Floors, LinkBehaviour, LinkEstimator,
-    Trust, detector_at, mistake_bound,
+    Arrivals, Configuration, Costs, Event, ExchangeRtt, Exposure, LinkEstimator, Trust,
+    arrival_detector_at, configure_arrivals, lateness_bound,
 };
 
-use crate::bound::Sums;
+use crate::bound::Offset;
 use crate::codec::{Echo, Heartbeat, MAX_BYTES};
 use crate::{Change, Last, PairReport, PeerId, Refusal, Suspicion};
 
@@ -33,7 +33,7 @@ pub(crate) struct Context<'a> {
     pub(crate) exposure: &'a Exposure,
     /// What the node measured of its links (`Liveness::renew_evidence`), read only while this pair
     /// has no configuration of its own (`docs/timing.md` §3, item 10).
-    pub(crate) evidence: Option<&'a LinkBehaviour>,
+    pub(crate) evidence: Option<&'a Arrivals>,
 }
 
 /// What a heartbeat taken did, for the node.
@@ -41,42 +41,44 @@ pub(crate) struct Context<'a> {
 pub(crate) struct Taken {
     /// It began a new run of the peer: the peer restarted.
     pub(crate) restarted: bool,
-    /// Its prediction error, nanoseconds, and the heartbeats its number says were due since the
-    /// latest taken (one, or more where some were lost): what the node's pool is fed, while the
-    /// pool or this pair needs it.
-    pub(crate) error: Option<(u64, i64)>,
+    /// Its lateness past the expected arrival its predecessor's freshness point was set from,
+    /// nanoseconds: what the node's pool is fed, while the pool or this pair needs it.
+    pub(crate) lateness: Option<i64>,
     /// Whether the pair judges by a configuration of its own.
     pub(crate) own: bool,
     /// Whether it configured the pair's detector anew.
     pub(crate) configured: bool,
 }
 
-/// The wider of two behaviours, each measure the larger: an upper bound on both. Theorem 7's `β`
-/// grows with the loss and with the variance at every margin (each factor `(V + p·x²)/(V + x²)`
-/// has derivative `x²/(V + x²)` in `p` and `x²(1 − p)/(V + x²)²` in `V`, neither negative), so a
-/// margin configured from the wider promises no less than one from either would.
-pub(crate) fn wider(a: Option<LinkBehaviour>, b: Option<LinkBehaviour>) -> Option<LinkBehaviour> {
+/// The wider of two behaviours, each measure the larger: an upper bound on both. The bound on a
+/// lateness past a margin, `u + (1 − u)·V/(V + (α − μ)²)`, grows with the unseen share `u`, with
+/// the variance `V` and with the mean `μ` at every margin (its derivatives are
+/// `1 − V/(V + x²)`, `(1 − u)x²/(V + x²)²` and `(1 − u)·2Vx/(V + x²)²` in them, `x = α − μ`, none
+/// negative), so a margin configured from the wider promises no less than one from either would.
+pub(crate) fn wider(a: Option<Arrivals>, b: Option<Arrivals>) -> Option<Arrivals> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(LinkBehaviour {
-            loss: a.loss.max(b.loss),
+        (Some(a), Some(b)) => Some(Arrivals {
+            unseen: a.unseen.max(b.unseen),
+            lateness: a.lateness.max(b.lateness),
+            deviation: a.deviation.max(b.deviation),
             mean_delay: a.mean_delay.max(b.mean_delay),
-            delay_deviation: a.delay_deviation.max(b.delay_deviation),
         }),
         (one, None) | (None, one) => one,
     }
 }
 
-/// The behaviour the node measured of its links, for a link whose prediction errors are over a
-/// window of `window` heartbeats: the deviation scaled by `√(1 + 1/n)`. For independent delays the
-/// prediction errors' variance at a window of `n` is `V(D)(1 + 1/n)`, and the variance of the
-/// errors the node measured, the pool's or a configured link's, is at least `V(D)`: so the scaled
-/// deviation bounds the link's from above, which is the side Cantelli's inequality may err on (a
-/// larger variance only loosens the bound).
-pub(crate) fn scaled(pool: &LinkBehaviour, window: u64) -> LinkBehaviour {
+/// The arrivals the node measured of its links, for a link whose expected arrival is averaged over
+/// a window of `window` heartbeats: the deviation scaled by `√(1 + 1/n)`. A lateness is measured
+/// against the expected arrival, whose error for independent delays adds `V(D)/n` to the delay's
+/// own `V(D)`, and the latenesses the node measured, the pool's or a configured link's, carry their
+/// own windows' error on top of `V(D)`, so their variance is at least `V(D)`: the scaled deviation
+/// bounds the link's from above, which is the side Cantelli's inequality may err on (a larger
+/// variance only loosens the bound).
+pub(crate) fn scaled(pool: &Arrivals, window: u64) -> Arrivals {
     // u64 → f64 rounds only past 2⁵³, far past any window (`hyper_timing::WINDOW_LIMIT`).
     let n = window.max(1) as f64;
-    LinkBehaviour {
-        delay_deviation: pool.delay_deviation.mul_f64((1.0 + 1.0 / n).sqrt()),
+    Arrivals {
+        deviation: pool.deviation.mul_f64((1.0 + 1.0 / n).sqrt()),
         ..*pool
     }
 }
@@ -102,6 +104,8 @@ struct Stream {
     asked_ns: u64,
     /// The durable count the latest heartbeat carried: the next must carry more.
     proof: u64,
+    /// The latest heartbeat's number sent.
+    sent: Option<u64>,
 }
 
 /// How a peer from which no heartbeat has come is judged: from when the node first attached the
@@ -112,16 +116,17 @@ struct Unheard {
     since_ns: Option<u64>,
     /// The freshness point of the first heartbeat, once the pool can give a margin.
     until_ns: Option<u64>,
+    /// The bound the node's evidence put on the first heartbeat's coming past it: what the
+    /// allowance is charged when it comes.
+    bound: Option<f64>,
     suspected: bool,
 }
 
-/// The estimator of the peer's stream and the ring of its delay sums, boxed together: the
-/// estimator's Allan levels are most of a kilobyte, and the pair's other fields are read every
-/// poll.
+/// The estimator of the peer's stream, boxed: its Allan levels are most of a kilobyte, and the
+/// pair's other fields are read every poll.
 #[derive(Debug)]
 struct Link {
     estimator: LinkEstimator,
-    sums: Sums,
     granularity_ns: u64,
 }
 
@@ -148,22 +153,33 @@ struct Received {
     /// The latest heartbeat to echo back: its send and lateness on the peer's clock, and its
     /// arrival on this node's.
     echo: Option<(u64, u64, u64)>,
+    /// The clocks' offset, bounded by the echoes the run's heartbeats carried (the `bound`
+    /// module): what a suspicion states its bound from.
+    offset: Offset,
     configuration: Option<Configuration>,
-    /// The latest heartbeat number whose freshness point the allowance counts.
-    accounted: Option<u64>,
-    /// When the detector was last configured: the heartbeats taken then, and `β` at its margin.
-    renewed: Option<(u64, f64)>,
+    /// The interval the link was at when the configuration was made: a link that moved since is
+    /// configured again at its new interval.
+    configured_interval: Option<Duration>,
     round_trip: ExchangeRtt,
-    /// The interval the link's own evidence needs, nanoseconds: the longest its estimator has
-    /// said its heartbeats would be independent at, at an interval too correlated to measure
-    /// (`LinkEstimator::independent_interval`); zero while it has said none. Asked of the peer,
-    /// whatever the configuration's best, so the link is never asked back to an interval its
-    /// estimator showed it cannot measure.
+    /// The interval the link's own evidence needs before its first configuration, nanoseconds: the
+    /// longest its estimator has said its heartbeats would be independent at, at an interval too
+    /// correlated to measure (`LinkEstimator::independent_interval`); zero while it has said none,
+    /// and from the first configuration on. Asked of the peer while it stands, so a link with no
+    /// configuration moves to where its history can measure itself (`docs/timing.md` §2.8). A
+    /// configured link keeps its configuration through a refusal and follows its best: held past
+    /// the first configuration, the longest estimate every later refusal drew, a maximum of noisy
+    /// estimates that grows with the refusals sampled, held a link at 31 s against its best of
+    /// 0.57 s in a simulated world whose host freezes begin once its links configure
+    /// (`docs/benchmarks.md`, "The detector model, at its causes").
     evidence_ns: u64,
-    /// While the pair has no configuration of its own: the behaviour its margin was imposed from,
+    /// While the pair has no configuration of its own: the arrivals its margin was imposed from,
     /// the node's evidence scaled to the link's window and widened by the link's own, and the
     /// heartbeats taken then.
-    pooled: Option<(LinkBehaviour, u64)>,
+    pooled: Option<(Arrivals, u64)>,
+    /// The interval asked of the peer for the margin of the node's evidence, nanoseconds, where at
+    /// the link's own interval that margin promised nothing (`pool_margin`); zero otherwise, and
+    /// from the link's first configuration on.
+    pooled_ask_ns: u64,
 }
 
 /// What a pair counts: the counters of its [`PairReport`], the rest of which is read from the
@@ -173,6 +189,7 @@ struct Received {
 #[derive(Clone, Copy, Debug, Default)]
 struct Counts {
     sent: u64,
+    skipped: u64,
     taken: u64,
     unproven: u64,
     configurations: u64,
@@ -245,7 +262,7 @@ impl Pair {
     /// at it for a window of one.
     pub(crate) fn judge_unheard(
         &mut self,
-        pool: &LinkBehaviour,
+        pool: &Arrivals,
         floor: Duration,
         granularity: Duration,
         mtbf: Option<Duration>,
@@ -255,18 +272,16 @@ impl Pair {
         else {
             return;
         };
-        let floors = Floors {
-            granularity,
-            sender: floor.max(granularity),
-            correlation: Duration::MAX,
-        };
+        let interval = floor.max(granularity);
         let costs = Costs { election, mtbf };
-        if let Some(detector) = detector_at(&scaled(pool, 1), &costs, &floors, floors.sender) {
+        let behaviour = scaled(pool, 1);
+        if let Some(detector) = arrival_detector_at(&behaviour, &costs, granularity, interval) {
             self.unheard.until_ns = Some(
                 since
-                    .saturating_add(nanos(floors.sender))
+                    .saturating_add(nanos(interval))
                     .saturating_add(nanos(detector.margin)),
             );
+            self.unheard.bound = Some(lateness_bound(&behaviour, detector.margin));
         }
     }
 
@@ -283,6 +298,7 @@ impl Pair {
         PairReport {
             groups: self.groups,
             sent: counts.sent,
+            skipped: counts.skipped,
             taken: counts.taken,
             unproven: counts.unproven,
             configured: self.received.configuration.is_some(),
@@ -347,8 +363,8 @@ impl Pair {
 
     /// Sends the heartbeat due, if a flush proves it: one made durable after the previous
     /// heartbeat was due, and newer than the one the previous heartbeat carried. A sender behind
-    /// its schedule sends the latest heartbeat due; the ones it skipped are lost to the peer, which
-    /// is what they are.
+    /// its schedule sends the latest heartbeat due; the ones it skipped are never sent, and the
+    /// peer takes them as that heartbeat's lateness, the stall's delay (`docs/timing.md` §2.2).
     pub(crate) fn send(&mut self, sender: &Sender, now_ns: u64, out: &mut [u8; MAX_BYTES]) -> Sent {
         if self.groups == 0 {
             return Sent::Nothing;
@@ -404,7 +420,8 @@ impl Pair {
             .received
             .configuration
             .map_or(0, |configured| nanos(configured.best.interval))
-            .max(self.received.evidence_ns);
+            .max(self.received.evidence_ns)
+            .max(self.received.pooled_ask_ns);
         if let Some(link) = self.received.link.as_mut() {
             // The peer moves to what this heartbeat asks, never below its floor, from its next
             // heartbeat on: this node expects it so, not suspecting it for the move.
@@ -424,6 +441,14 @@ impl Pair {
             echo,
         };
         let length = beat.encode(out).len();
+        // The slots between the latest heartbeat sent and this one were due while this node was
+        // behind and are never sent: the peer takes them as this one's lateness.
+        let skipped = self
+            .stream
+            .sent
+            .map_or(0, |previous| seq.saturating_sub(previous).saturating_sub(1));
+        self.counts.skipped = self.counts.skipped.saturating_add(skipped);
+        self.stream.sent = Some(seq);
         self.stream.proof = sender.durable_count;
         self.stream.interval_ns = interval;
         self.stream.next = Some((seq.saturating_add(1), due.saturating_add(interval)));
@@ -458,11 +483,6 @@ impl Pair {
             }
             None => return None,
         };
-        // The freshness point of the heartbeat after the latest passed: one more point judged.
-        if let Some(next) = self.received.last_mapped.map(|seq| seq.saturating_add(1)) {
-            let beta = self.beta_now();
-            self.account(next, beta);
-        }
         self.tell_suspected(peer, until, now_ns)
     }
 
@@ -499,14 +519,8 @@ impl Pair {
             .filter(|_| self.received.link.is_none())
             .map(|since| Duration::from_nanos(at_ns.saturating_sub(since)));
         let detection = unheard.or_else(|| {
-            self.received.link.as_ref().and_then(|link| {
-                let margin = link.estimator.margin()?;
-                link.sums.detection(
-                    link.estimator.estimates().window.length,
-                    link.estimator.next_interval(),
-                    margin,
-                )
-            })
+            let last = self.received.last?;
+            self.received.offset.detection(at_ns, last.due_ns)
         });
         Suspicion {
             peer,
@@ -521,43 +535,25 @@ impl Pair {
         }
     }
 
-    /// Theorem 7's `β` at the margin and interval in force, from the estimates as they stand: the
-    /// bound on a mistake at each freshness point now, whatever the configuration assumed. `None`
-    /// before a margin is configured.
-    fn beta_now(&self) -> Option<f64> {
+    /// The bound the freshness point in force put on the next heartbeat's coming past it, from the
+    /// arrivals as they stand: the margin in force, on the link's own arrivals where it has a
+    /// configuration (as they stand, or as configured while they are refused, a moved link's levels
+    /// being started again), and on the behaviour the margin was imposed from where the node's
+    /// evidence judges it. `None` while no margin judges. Charged to the allowance
+    /// once a heartbeat taken ends the gap it judged: each heartbeat taken is the one mistake its
+    /// predecessor's freshness point can make (`docs/timing.md` §2.2), so the allowance is the
+    /// bound the detector keeps as it runs, whatever the configuration assumed.
+    fn promise(&self) -> Option<f64> {
         let link = self.received.link.as_ref()?;
         let margin = link.estimator.margin()?;
         let behaviour = match self.received.pooled {
-            // Judged by the node's evidence: the bound its margin promised, from that behaviour.
             Some((pooled, _)) if self.received.configuration.is_none() => pooled,
-            _ => link.estimator.behaviour().ok().or(self
+            _ => link.estimator.arrivals().ok().or(self
                 .received
                 .configuration
                 .map(|configured| configured.link))?,
         };
-        let variance = behaviour.delay_deviation.as_secs_f64().powi(2);
-        Some(mistake_bound(
-            behaviour.loss,
-            variance,
-            link.estimator.interval().as_secs_f64(),
-            margin.as_secs_f64(),
-        ))
-    }
-
-    /// Counts the freshness points through the estimator's heartbeat `seq` into the allowance, each
-    /// at `β` (`beta_now`), while a margin is in force: the allowance is the bound the detector
-    /// keeps as it runs, so a configuration older than the estimates does not understate it.
-    fn account(&mut self, seq: u64, beta: Option<f64>) {
-        let points = match self.received.accounted {
-            Some(accounted) if seq > accounted => seq.saturating_sub(accounted),
-            Some(_) => return,
-            None => 1,
-        };
-        if let Some(beta) = beta {
-            // u64 → f64 rounds only past 2⁵³ heartbeats.
-            self.counts.allowance += beta.clamp(0.0, 1.0) * points as f64;
-        }
-        self.received.accounted = Some(seq);
+        Some(lateness_bound(&behaviour, margin))
     }
 
     /// Where a heartbeat of run `run` stands against the latest run taken from the peer: the same
@@ -572,6 +568,9 @@ impl Pair {
             _ => {}
         }
         let restarted = self.received.run.is_some();
+        if restarted && let Some(link) = self.received.link.as_mut() {
+            link.estimator.forget_expected();
+        }
         self.received.run = Some(run);
         self.received.base = self
             .received
@@ -580,6 +579,8 @@ impl Pair {
         self.received.flushes = 0;
         self.received.last = None;
         self.received.echo = None;
+        // A new run's clock is its host's, which a restart may have changed.
+        self.received.offset = Offset::default();
         self.received.reanchor = restarted;
         Ok(restarted)
     }
@@ -619,20 +620,33 @@ impl Pair {
         self.received.floor_ns = beat.floor_ns;
         self.stream.asked_ns = beat.ask_ns;
         self.received.echo = Some((beat.sent_ns, beat.late_ns, arrival_ns));
-        let sum = self.round_trip_sum(beat, arrival_ns);
+        if let Some(sum) = self.round_trip_sum(beat, arrival_ns) {
+            self.received
+                .offset
+                .echoed(arrival_ns, beat.sent_ns.saturating_sub(beat.late_ns), sum);
+        }
         let granularity = context.granularity.ok_or(Refusal::Unmeasured)?;
         let mapped = self
             .received
             .base
             .checked_add(beat.seq)
             .ok_or(Refusal::OutOfRange)?;
-        let previous = self.received.last_mapped;
+        // The bound the freshness point in force put on this heartbeat's coming past it, as the
+        // evidence stood before it came: a peer's first heartbeat is the end of the gap its
+        // judgment from the attach judged.
+        let first = self.received.link.is_none();
+        let promise = if first {
+            self.unheard
+                .bound
+                .filter(|_| self.unheard.until_ns.is_some())
+        } else {
+            self.promise()
+        };
         let link = self.link(beat.interval_ns, granularity)?;
         link.estimator
             .on_heartbeat(mapped, arrival_ns)
             .map_err(|_| Refusal::OutOfRange)?;
-        link.sums.push(sum);
-        let error = link.estimator.latest_error();
+        let lateness = link.estimator.latest_lateness();
         self.received.last = Some(Last {
             seq: beat.seq,
             arrival_ns,
@@ -641,9 +655,12 @@ impl Pair {
         });
         self.received.last_mapped = Some(mapped);
         self.counts.taken = self.counts.taken.saturating_add(1);
-        let beta = self.beta_now();
-        self.account(mapped, beta);
-        if self.renewal_due(beta) {
+        // A heartbeat that ends a gap a freshness point judged is the one mistake that point can
+        // make: its bound is charged, once. A peer's restart ends no gap a live peer left.
+        if let Some(promise) = promise.filter(|_| first || lateness.is_some()) {
+            self.counts.allowance += promise.clamp(0.0, 1.0);
+        }
+        if self.renewal_due() {
             taken.configured = self.configure(context, granularity);
         }
         // The MTBF is a float division: read only where the margin is renewed.
@@ -653,8 +670,7 @@ impl Pair {
         {
             self.pool_margin(evidence, granularity, context.exposure.mtbf());
         }
-        let due = previous.map_or(1, |previous| mapped.saturating_sub(previous).max(1));
-        taken.error = error.map(|error| (due, error));
+        taken.lateness = lateness;
         taken.own = self.received.configuration.is_some();
         changes[2] = self.settle(peer, arrival_ns);
         Ok(())
@@ -671,12 +687,17 @@ impl Pair {
     /// While the pair has no configuration of its own, the margin the node's evidence configures
     /// for it, imposed on its estimator (`docs/timing.md` §3, item 10): what the node measured of
     /// its links (`Liveness::renew_evidence`) scaled to the link's window (`scaled`), widened by what the
-    /// link's own prediction errors and losses show so far, at the link's interval, its costs and
-    /// its floors, as its own configuration would be. Renewed on the configuration's doubling
-    /// schedule: at the first, and once the heartbeats taken have doubled since.
+    /// link's own latenesses show so far, at its costs and its floors, put in force as its own
+    /// configuration would be (`LinkEstimator::configure`): the best at the link's interval while
+    /// its unavailability is below one; where it is one or more, which promises nothing, the best
+    /// over every interval the floors allow, that interval asked of the peer; none where that is
+    /// one or more too. Imposed at the link's interval alone, one in about a thousand of the
+    /// simulation's margins (8 of 6,786) had an unavailability past one. Renewed on the
+    /// configuration's doubling schedule: at the first, and once the heartbeats taken have doubled
+    /// since.
     pub(crate) fn pool_margin(
         &mut self,
-        pool: &LinkBehaviour,
+        pool: &Arrivals,
         granularity: Duration,
         mtbf: Option<Duration>,
     ) {
@@ -687,32 +708,36 @@ impl Pair {
             return;
         }
         let taken = self.counts.taken;
-        let floor_ns = self.received.floor_ns;
+        // The floors the link's own configuration would be searched over: the peer's floor and
+        // this node's `G` (`configure`).
+        let floor = Duration::from_nanos(self.received.floor_ns).max(granularity);
         let Some(link) = self.received.link.as_mut() else {
             return;
         };
-        let own = link.estimator.estimates();
-        // Its own errors are at its own window already, and its loss is Jeffreys' over what it
-        // was sent: before its `τ_int` is measured, the unseen term has no count to stand on.
-        let shown = own.delay_deviation.map(|delay_deviation| LinkBehaviour {
-            loss: own.loss,
-            mean_delay: own.mean_delay.unwrap_or(Duration::ZERO),
-            delay_deviation,
-        });
-        let Some(behaviour) = wider(Some(scaled(pool, own.window.length)), shown) else {
+        // Its own latenesses are at its own window already; before its `τ_int` is measured they
+        // have no count for an unseen share to stand on, which the node's evidence carries.
+        let shown = link.estimator.arrivals_seen();
+        let window = link.estimator.estimates().window.length;
+        let Some(behaviour) = wider(Some(scaled(pool, window)), shown) else {
             return;
         };
-        let floors = Floors {
-            granularity,
-            sender: Duration::from_nanos(floor_ns).max(granularity),
-            correlation: Duration::MAX,
-        };
         let costs = Costs { election, mtbf };
-        if let Some(detector) = detector_at(&behaviour, &costs, &floors, link.estimator.interval())
-        {
-            link.estimator.impose(detector.margin);
-            self.received.pooled = Some((behaviour, taken));
-        }
+        let Some(at) =
+            arrival_detector_at(&behaviour, &costs, granularity, link.estimator.interval())
+        else {
+            return;
+        };
+        let (detector, ask_ns) = if at.unavailability < 1.0 {
+            (at, 0)
+        } else {
+            match configure_arrivals(&behaviour, &costs, granularity, floor) {
+                Some(best) if best.unavailability < 1.0 => (best, nanos(best.interval)),
+                _ => return,
+            }
+        };
+        link.estimator.impose(detector.margin);
+        self.received.pooled = Some((behaviour, taken));
+        self.received.pooled_ask_ns = ask_ns;
     }
 
     /// The delay sum of `beat`'s echo (the `bound` module): the round trip on this node's clock,
@@ -737,10 +762,8 @@ impl Pair {
             None => {
                 let estimator = LinkEstimator::new(interval, granularity, None)
                     .map_err(|_| Refusal::Malformed)?;
-                let sums = Sums::new(estimator.estimates().window.drift);
                 self.received.link = Some(Box::new(Link {
                     estimator,
-                    sums,
                     granularity_ns: nanos(granularity),
                 }));
             }
@@ -753,7 +776,6 @@ impl Pair {
                     link.estimator
                         .retime(interval, None)
                         .map_err(|_| Refusal::Malformed)?;
-                    link.sums.restart(link.estimator.estimates().window.drift);
                 }
             }
         }
@@ -762,47 +784,27 @@ impl Pair {
 
     /// Whether the detector is to be configured again (Chen et al.'s adaptive detector, which
     /// reconfigures as its estimates move, §6): never configured; at an interval the configuration
-    /// was not made for (the peer moved to the one asked); once the configuration is as stale as
-    /// the estimates are uncertain; or once `β` at the margin in force has doubled past the
-    /// configured one, the link having got worse.
-    ///
-    /// Staleness: the inputs are estimated over the link's whole history (the prediction errors'
-    /// variance, the loss, `τ_int`'s levels, the exposure the MTBF is), and an estimate over `n`
-    /// heartbeats that the one over the first `n_k` is nested in has moved since by a variance of
-    /// `σ²(1/n_k − 1/n)` (`σ²` its variance from one heartbeat, `τ_int` folded in alike), while its
-    /// own is `σ²/n`. The two meet at `n = 2·n_k`: renewed sooner, a configuration follows moves
-    /// smaller than the estimates' own error; later, it lags the evidence by more than that error.
-    /// The rule asks nothing of the delays' distribution, so a link is configured
-    /// `O(log heartbeats)` times, where the estimator's window cadence configured every few
-    /// heartbeats and spent five times the stream's own work on the configurator
-    /// (`docs/benchmarks.md`, "hyper-liveness"). The second rule's factor is not derived: a link
-    /// that changes is `docs/timing.md` §3, item 11.
-    fn renewal_due(&self, beta: Option<f64>) -> bool {
-        let Some(configured) = self.received.configuration else {
-            return true;
+    /// was not made at (the peer moved to the one asked); or once the latenesses have doubled since
+    /// the configurator last ran on them (`LinkEstimator::reconfigure_due`), when the estimate has
+    /// moved by as much as it is uncertain (`docs/research/timing.md`, "When to renew an
+    /// estimate's configuration"). No rule on `β` is kept beside it: the one before (`β` doubled
+    /// past the configured) had no derivation, and in the simulation's worlds that change the
+    /// detectors kept their allowance without it (`docs/timing.md` §3, item 11). A configurator
+    /// that found no availability at all is asked again on the same schedule.
+    fn renewal_due(&self) -> bool {
+        let Some(link) = self.received.link.as_ref() else {
+            return false;
         };
-        let interval = self
-            .received
-            .link
-            .as_ref()
-            .map(|link| link.estimator.interval());
-        let Some((taken, renewed_beta)) = self.received.renewed else {
-            return true;
-        };
-        interval != Some(configured.current.interval)
-            || self.counts.taken >= taken.saturating_mul(2)
-            || beta.is_some_and(|now| now >= 2.0 * renewed_beta)
+        (self.received.configuration.is_some()
+            && self.received.configured_interval != Some(link.estimator.interval()))
+            || link.estimator.reconfigure_due()
     }
 
-    /// Configures the detector: the configurator over this node's `G`, the peer's floor and the
-    /// costs, with one heartbeat in the margin (`α < η`), whose Theorem 7 bound is a single
-    /// Cantelli factor and assumes no independence between heartbeats. The traces' correlation
-    /// time `T_c` is the spacing past the longest stall a run saw (`docs/timing.md` §2.6, item 6),
-    /// which a young link has not seen: taking it as `τ_int·η` from the link's own history let the
-    /// product of a many-heartbeat margin promise a mistake rate that six runs in ten broke under a
-    /// one-CPU throttle, whose stalls the history had not yet held (`docs/benchmarks.md`,
-    /// "hyper-liveness"). hyper-swim judges each probe on its own for the same reason (§2.7). A
-    /// refusal leaves the detector in force (`LinkEstimator::configure`). Whether it configured.
+    /// Configures the detector: the configurator over the link's arrivals, this node's `G`, the
+    /// peer's floor and the costs, any margin admitted, the bound one Cantelli factor on an
+    /// arrival's lateness, which assumes no independence between heartbeats (`docs/timing.md`
+    /// §2.2). A refusal leaves the detector in force (`LinkEstimator::configure`). Whether it
+    /// configured.
     fn configure(&mut self, context: &Context<'_>, granularity: Duration) -> bool {
         let floor_ns = self.received.floor_ns;
         let Some(link) = self.received.link.as_mut() else {
@@ -812,10 +814,13 @@ impl Pair {
         // cost to configure by yet. The estimator says what it wants before any cost is read, as
         // its `configure` would refuse: a link that moved is configured again at each heartbeat
         // until its levels measure `τ_int` at the new interval, and the costs and floors were
-        // built for every one of those refusals.
-        match link.estimator.behaviour() {
+        // built for every one of those refusals. Only a link with no configuration is moved for
+        // its evidence (`evidence_ns`); a configured one is judged by its configuration meanwhile.
+        match link.estimator.arrivals() {
             Err(hyper_timing::Refusal::CorrelationUnmeasured) => {
-                if let Some(next) = link.estimator.independent_interval() {
+                if self.received.configuration.is_none()
+                    && let Some(next) = link.estimator.independent_interval()
+                {
                     self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
                 }
                 return false;
@@ -831,19 +836,18 @@ impl Pair {
         else {
             return false;
         };
-        let floors = Floors {
-            granularity,
-            sender: Duration::from_nanos(floor_ns).max(granularity),
-            correlation: Duration::MAX,
-        };
-        let Ok(configured) = link.estimator.configure(&costs, &floors) else {
-            return false;
-        };
-        self.received.configuration = Some(configured);
-        self.counts.configurations = self.counts.configurations.saturating_add(1);
-        let beta = self.beta_now().unwrap_or(1.0);
-        self.received.renewed = Some((self.counts.taken, beta));
-        true
+        let floor = Duration::from_nanos(floor_ns).max(granularity);
+        match link.estimator.configure(&costs, granularity, floor) {
+            Ok(configured) => {
+                self.received.evidence_ns = 0;
+                self.received.pooled_ask_ns = 0;
+                self.received.configuration = Some(configured);
+                self.received.configured_interval = Some(link.estimator.interval());
+                self.counts.configurations = self.counts.configurations.saturating_add(1);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -854,13 +858,14 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
-    /// The node's evidence a test judges by: a link of a millisecond's deviation that loses
-    /// one heartbeat in a thousand.
-    fn evidence() -> LinkBehaviour {
-        LinkBehaviour {
-            loss: 0.001,
+    /// The node's evidence a test judges by: arrivals of a millisecond's deviation, one in a
+    /// thousand past every one seen.
+    fn evidence() -> Arrivals {
+        Arrivals {
+            unseen: 0.001,
+            lateness: Duration::ZERO,
+            deviation: Duration::from_millis(1),
             mean_delay: Duration::ZERO,
-            delay_deviation: Duration::from_millis(1),
         }
     }
 
@@ -936,6 +941,52 @@ mod tests {
         );
     }
 
+    /// A suspicion states its bound once any heartbeat of the run has carried an echo, whatever the
+    /// rest carried: here a peer whose first heartbeats came before it had heard from this node
+    /// (no echo), then one echoing a heartbeat of this node's, then nothing. The suspicion at the
+    /// next freshness point states the time from the peer's last schedule plus the echo's slack and
+    /// the drift, on one clock never below the time itself. Bounded by the mean of the echoed sums
+    /// over the expected arrival's window, it stated none while a heartbeat in the window had no
+    /// echo: a survivor's suspicion of a stalled member, once in twenty runs at one CPU.
+    #[test]
+    fn a_suspicion_states_its_bound_once_any_heartbeat_was_echoed() {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let mut pair = pair();
+        let mut latest = 0;
+        for seq in 0..6 {
+            let mut heartbeat = beat(7, seq);
+            // Delays of 1 ms on one clock; the last heartbeat, sent at 50 ms, echoes one this node
+            // sent at 20 ms, 1 ms late, which reached the peer at 21 ms.
+            let arrival = seq * 10 * MS + MS;
+            if seq == 5 {
+                heartbeat.echo = Some(Echo {
+                    sent_ns: 20 * MS,
+                    late_ns: MS,
+                    hold_ns: 50 * MS - 21 * MS,
+                });
+            }
+            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            pair.take(2, &heartbeat, arrival, &context, &mut changes, &mut taken)
+                .unwrap();
+            latest = arrival;
+        }
+        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
+        let until = pair.deadline().expect("judged by the node's evidence");
+        assert!(until > latest);
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, until) else {
+            panic!("suspected at the freshness point");
+        };
+        let last = suspicion.last.expect("heard from");
+        let bound = suspicion.detection.expect("a bound is stated");
+        assert!(Duration::from_nanos(suspicion.at_ns - last.due_ns) <= bound);
+    }
+
     /// A young link whose latest heartbeat came later than the freshness point of the one after it,
     /// judged at a poll by the margin of the node's evidence once the node has some, is suspected,
     /// and the owner is told so, from that freshness point. Untold, the detector held the peer
@@ -951,9 +1002,11 @@ mod tests {
         };
         let mut pair = pair();
         let mut latest = 0;
-        // Ten heartbeats on their schedule, and the eleventh 50 ms late at a 10 ms interval.
-        for seq in 0..=10 {
-            let arrival = seq * 10 * MS + if seq == 10 { 50 * MS } else { 0 };
+        // A heartbeat on its schedule and the next half a second late at a 10 ms interval: one
+        // lateness, too few for the link's own to widen the node's evidence, which needs two, and
+        // past the margin that evidence gives (a millisecond's deviation, an hour's exposure).
+        for seq in 0..=1 {
+            let arrival = seq * 10 * MS + if seq == 1 { 500 * MS } else { 0 };
             let (mut changes, mut taken) = ([None, None, None], Taken::default());
             pair.take(
                 2,
@@ -978,7 +1031,59 @@ mod tests {
             suspicion.at_ns <= latest,
             "from the point before the late heartbeat"
         );
-        assert_eq!(suspicion.last.map(|last| last.seq), Some(10));
+        assert_eq!(suspicion.last.map(|last| last.seq), Some(1));
         assert_eq!(pair.judge(2, latest + 2 * MS), None, "told once");
+    }
+
+    /// The node's evidence's margin is put in force as a configuration of the link's own is: where
+    /// at the link's interval it promises nothing (an unavailability of one or more), the best over
+    /// every interval the floors allow, that interval asked of the peer. Here elections cost a
+    /// second and the node's evidence leaves one lateness in fifty unseen, so at the link's 10 ms
+    /// every margin's mistakes cost more election than there is time (`T_E·β/η ≥ 1·0.02/0.01`).
+    /// Imposed at the link's interval alone, that margin was in force and no interval was asked.
+    #[test]
+    fn a_margin_of_the_nodes_evidence_that_promises_nothing_at_the_links_interval_is_not_its_margin()
+     {
+        let exposure = exposure();
+        let granularity = Duration::from_micros(50);
+        let context = Context {
+            granularity: Some(granularity),
+            exposure: &exposure,
+            evidence: None,
+        };
+        let mut pair = pair();
+        pair.election = Some(Duration::from_secs(1));
+        for seq in 0..2 {
+            let (mut changes, mut taken) = ([None, None, None], Taken::default());
+            pair.take(
+                2,
+                &beat(7, seq),
+                seq * 10 * MS,
+                &context,
+                &mut changes,
+                &mut taken,
+            )
+            .unwrap();
+        }
+        let evidence = Arrivals {
+            unseen: 0.02,
+            ..evidence()
+        };
+        pair.pool_margin(&evidence, granularity, exposure.mtbf());
+        let (behaviour, _) = pair.received.pooled.expect("a margin is in force");
+        let costs = Costs {
+            election: Duration::from_secs(1),
+            mtbf: exposure.mtbf().unwrap(),
+        };
+        let at = arrival_detector_at(&behaviour, &costs, granularity, Duration::from_millis(10))
+            .unwrap();
+        assert!(at.unavailability >= 1.0, "{at:?}");
+        let floor = Duration::from_millis(1).max(granularity);
+        let best = configure_arrivals(&behaviour, &costs, granularity, floor).unwrap();
+        assert!(best.unavailability < 1.0, "{best:?}");
+        let link = pair.received.link.as_ref().unwrap();
+        assert_eq!(link.estimator.margin(), Some(best.margin));
+        assert_eq!(pair.received.pooled_ask_ns, nanos(best.interval));
+        assert!(best.interval > Duration::from_millis(10));
     }
 }

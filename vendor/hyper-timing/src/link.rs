@@ -9,33 +9,49 @@
 //! - the delay's mean and variance (§2.6, item 7: mean and variance, never the median and MAD);
 //! - the loss `p_L` from the sequence numbers, the Jeffreys posterior mean `(k + ½)/(m + 1)`;
 //! - the window `n = min(n_G, n_A)` at the link's interval (§2.6, item 2), computed online;
+//! - each heartbeat's lateness past the expected arrival its predecessor's freshness point was set
+//!   from, its mean and variance over the link's history (§2.2): what the configurator is fed;
 //! - the trust NFD-E gives: trusted while the latest heartbeat `h` is fresh, until `τ_{h+1}`.
 //!
 //! **The delay's variance.** What the detector compares with its margin is a heartbeat's arrival
-//! less its expected arrival, `A_i − EA_i`; Theorem 7 bounds the probability that it passes `α`
-//! through Cantelli's inequality on that quantity. Its variance is `V(D)(1 + 1/n)` for independent
+//! less its expected arrival, `A_i − EA_i`. Its variance is `V(D)(1 + 1/n)` for independent
 //! delays with a window of `n`, and it holds no offset or drift between the two hosts' clocks,
 //! which `EA` follows and a plain variance of `A_i − iη` would count as delay: two oscillators
 //! apart by RFC 5905's 15 ppm drift 54 ms an hour, more than any delay the traces saw. The
 //! estimator's `V(D)` is the variance of those prediction errors over the link's whole history,
-//! not the window's (§2.6, item 3: the variance lives in stalls a short window has not seen).
+//! not the window's (§2.6, item 3: the variance lives in stalls a short window has not seen); it
+//! places the window (`n_G`) and measures `τ_int`.
+//!
+//! **What the configurator is fed** (§2.2). NFD-E suspects a live sender at a freshness point
+//! exactly when the next heartbeat taken comes past it: the heartbeat after `h` is due at
+//! `EA_{h+1}`, and a heartbeat the sender skipped while it stalled, or the network lost, is not
+//! taken, so the next one taken comes later past `EA_{h+1}` by the stall or by an interval a slot
+//! lost. Each heartbeat taken thus ends exactly one gap a freshness point judged, and its lateness
+//! `ℓ = A − EA_{h+1}`, against the expected arrival as it stood (with any move of the sender's
+//! interval expected), is the one quantity the detector compares with `α`: a mistake is `ℓ > α`,
+//! once a heartbeat taken. A sender's stall is delay, as Chen, Toueg and Aguilera's model has it,
+//! not a run of losses. The latenesses are kept over the link's whole history, and a configuration
+//! is renewed once they have doubled since it was made ([`LinkEstimator::reconfigure_due`]); a
+//! window sliding at the Allan horizon was measured against it and not kept (`docs/timing.md` §3,
+//! item 11).
 //!
 //! **What the history has not yet seen** (§3, item 3). A link with little history underestimates
-//! `V(D)` until it has seen a stall. No prior is invented for it. Instead the estimator counts the
-//! chance that the next heartbeat is later than every one it has seen, which for exchangeable
-//! samples is exactly `1/(m + 1)` after `m` of them whatever their distribution (the probability
-//! that the last of `m + 1` is the largest, the first record indicator's law: Rényi 1962; Arnold,
-//! Balakrishnan and Nagaraja, *Records*, 1998, ch. 2), with `m` the history's independent
-//! heartbeats, `m = count / τ_int`. A heartbeat that late is, to Theorem 7, as good as lost:
-//! `Pr(lost or later than x) ≤ p + (1 − p)·V/(V + x²)` with `p = 1 − (1 − p_L)(1 − 1/(m + 1))` and
-//! `V` the variance of the delays within the range seen, which is exactly Theorem 7's factor with
-//! `p` for `p_L`. What this leaves open is the sampling error of `V` within that range, which a
-//! heavy tail skews low (`docs/timing.md` §3, item 3). So
-//! the configurator is fed `p` as the loss: early, a margin of one heartbeat cannot promise
-//! better than `1/(m + 1)`, and the configurator spreads the margin over more heartbeats until the
-//! history has shown more. The estimator refuses to configure until it has the evidence `m` needs:
-//! two prediction errors (a variance) and an integrated autocorrelation time it has measured
-//! ([`Refusal`]).
+//! the lateness's variance until it has seen a stall. No prior is invented for it. Instead the
+//! estimator counts the chance that the next lateness is past every one it has seen, which for
+//! exchangeable samples is exactly `1/(m + 1)` after `m` of them whatever their distribution (the
+//! probability that the last of `m + 1` is the largest, the first record indicator's law: Rényi
+//! 1962; Arnold, Balakrishnan and Nagaraja, *Records*, 1998, ch. 2), with `m` the history's
+//! independent arrivals, `m = count / τ_int`. Within the range seen, Cantelli's inequality bounds a
+//! lateness past the margin, so `Pr(ℓ > α) ≤ u + (1 − u)·V/(V + (α − μ)²)`, `u = 1/(m + 1)`, the
+//! bound the configurator minimizes over (`qos::lateness_bound`). What this leaves open is the
+//! sampling error of `V` within that range, which a heavy tail skews low (`docs/timing.md` §3,
+//! item 3). The estimator refuses to configure until it has the evidence `m` needs: two latenesses
+//! (a variance) and an integrated autocorrelation time it has measured ([`Refusal`]).
+//!
+//! [`LinkEstimator::behaviour`] gives Theorem 7's inputs instead, the loss and the prediction
+//! errors' variance over the history, with the unseen share folded into the loss,
+//! `p = 1 − (1 − p_L)(1 − 1/(m + 1))` over the history's `m`: what a SWIM member's probe detector
+//! is configured from (`docs/timing.md` §2.7), whose margin holds one probe.
 //!
 //! **The window** (§2.6, item 2), at the interval the link sends at:
 //! - `n_A`: the window at which the Allan deviation of the window means stops falling (Allan 1966),
@@ -67,13 +83,15 @@
 
 use std::time::Duration;
 
-use crate::qos::{Costs, Detector, Floors, LinkBehaviour, configure, detector_at};
+use crate::qos::{
+    Arrivals, Costs, Detector, LinkBehaviour, arrival_detector_at, configure_arrivals,
+};
 
 /// RFC 5905 §7.2, `PHI`: the frequency tolerance NTP assumes of a clock, 15 ppm, in parts per
 /// [`MILLION`].
-const PHI_PER_MILLION: u64 = 15;
+pub const PHI_PER_MILLION: u64 = 15;
 /// The unit of [`PHI_PER_MILLION`].
-const MILLION: u64 = 1_000_000;
+pub const MILLION: u64 = 1_000_000;
 /// The longest window any link's estimator can hold: `n + 1 ≤ G/(PHI·η)` and `η ≥ G`, so
 /// `n ≤ 1/PHI − 1` (the module's derivation).
 pub const WINDOW_LIMIT: u64 = (MILLION / PHI_PER_MILLION).saturating_sub(1);
@@ -141,8 +159,13 @@ pub enum Refusal {
     /// itself; at the correlation-time floor (§2.6, item 6) its heartbeats are independent and
     /// `τ_int` is measured within a few dozen of them.
     CorrelationUnmeasured,
-    /// The configurator found no detector ([`configure`]).
+    /// The configurator found no detector ([`configure_arrivals`](crate::configure_arrivals)).
     Unconfigurable,
+    /// No interval the floors allow has a detector whose unavailability is below one: by Little's
+    /// law that unavailability is the mean number of elections in progress and bounds the share of
+    /// time one is, so at one or more the evidence promises no availability, and no detector is
+    /// configured from it (`docs/timing.md` §2.2).
+    Unavailable,
 }
 
 /// A change in what the detector believes of the sender.
@@ -201,17 +224,22 @@ pub struct Estimates {
     pub correlation: Option<f64>,
     /// The window.
     pub window: Window,
+    /// The latenesses taken ([`LinkEstimator::arrivals`]).
+    pub arrivals: u64,
 }
 
-/// A configured detector: the one to run now and the one to move to.
+/// A configured detector: the one in force and the one to move to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Configuration {
-    /// What the configurator was fed.
-    pub link: LinkBehaviour,
-    /// The detector at the link's current interval: its margin is the one in force.
+    /// What the configurator was fed: the arrivals as they stood.
+    pub link: Arrivals,
+    /// The detector in force: the one minimizing unavailability at the interval the link is at,
+    /// where its unavailability is below one; where it is not, no detector at that interval is a
+    /// configuration, and the one in force is `best`, the move to its interval expected.
     pub current: Detector,
     /// The detector minimizing unavailability over every interval the floors allow: where its
-    /// interval differs, the link should move to it ([`LinkEstimator::retime`]).
+    /// interval differs, the link should move to it ([`LinkEstimator::retime`]). Its
+    /// unavailability is below one ([`Refusal::Unavailable`]).
     pub best: Detector,
 }
 
@@ -374,11 +402,10 @@ pub struct LinkEstimator {
     margin_ns: Option<u64>,
     trust: Trust,
     last_arrival_ns: Option<u64>,
-    configured_at: u64,
-    /// The latest heartbeat's prediction error, `A − EA` in nanoseconds against the expected
-    /// arrival as the freshness test takes it (its mean truncated to the nanosecond): what a
-    /// node's pool of its links is fed (`docs/timing.md` §3, item 10).
-    latest_error: Option<i64>,
+    /// The latenesses taken when the configurator last ran on them, a configuration made or
+    /// refused for want of availability: what [`reconfigure_due`](Self::reconfigure_due) measures
+    /// the renewal from.
+    configured_from: Option<u64>,
     /// A longer interval the sender may move to from its next heartbeat on, nanoseconds; zero for
     /// none ([`expect_interval`](Self::expect_interval)).
     next_interval_ns: u64,
@@ -392,6 +419,15 @@ pub struct LinkEstimator {
     /// walk was the most of a placement, and a placement a quarter of a node's time at bootstrap
     /// (`docs/benchmarks.md`, "The node's evidence, kept").
     allan_found: Option<(u64, u32, Option<u64>)>,
+    /// The expected arrival of the slot after the latest heartbeat taken, with any move the sender
+    /// may make (`expect_interval`), nanoseconds on the receiver's clock: what the freshness point
+    /// in force is its margin past. `None` before a heartbeat and after a restart of the sender.
+    expected_next: Option<i128>,
+    /// The latest heartbeat's lateness past `expected_next` as it stood, nanoseconds.
+    latest_lateness: Option<i64>,
+    /// The latenesses of every heartbeat taken, over the link's history (`docs/timing.md` §2.2,
+    /// §3 item 11): their count, mean and squares.
+    arrivals: Moments,
 }
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
@@ -479,20 +515,24 @@ impl LinkEstimator {
             margin_ns: None,
             trust: Trust::Unconfigured,
             last_arrival_ns: None,
-            configured_at: 0,
-            latest_error: None,
+            configured_from: None,
             next_interval_ns: 0,
             ring_granularity_ns: granularity_ns,
             allan_found: None,
+            expected_next: None,
+            latest_lateness: None,
+            arrivals: Moments::default(),
         })
     }
 
     /// The heartbeats now come every `interval`, from the next one taken, with the sender's new
     /// schedule where it is known. The window and the Allan levels start again, since both are at
-    /// the interval; the loss, the history of prediction errors and the margin in force carry over
-    /// until the next [`configure`](Self::configure). The ring is resized for the new interval, in
-    /// place where it holds the new capacity already (a longer interval needs fewer slots, the
-    /// drift bound): an allocation only for a shorter interval than any it held.
+    /// the interval; the loss, the history of prediction errors and of latenesses, and the
+    /// margin in force carry over until the next [`configure`](Self::configure), and the next
+    /// heartbeat's lateness is measured against the freshness point in force when it came. The ring
+    /// is resized for the new interval, in place where it holds the new capacity already (a longer
+    /// interval needs fewer slots, the drift bound): an allocation only for a shorter interval than
+    /// any it held.
     pub fn retime(
         &mut self,
         interval: Duration,
@@ -524,7 +564,6 @@ impl LinkEstimator {
             drift: capacity,
         };
         self.correlation = None;
-        self.configured_at = self.received;
         self.next_interval_ns = 0;
         Ok(())
     }
@@ -546,10 +585,19 @@ impl LinkEstimator {
         };
         if next != self.next_interval_ns {
             self.next_interval_ns = next;
+            if self.expected_next.is_some() {
+                self.expected_next = self.expected();
+            }
             if let (Trust::Trusted { .. }, Some(until_ns)) = (self.trust, self.fresh_until()) {
                 self.trust = Trust::Trusted { until_ns };
             }
         }
+    }
+
+    /// The sender restarted: the time since its last heartbeat was its absence, not a lateness of a
+    /// live sender, so the next heartbeat's is not measured.
+    pub fn forget_expected(&mut self) {
+        self.expected_next = None;
     }
 
     /// The longest the next heartbeat may be spaced from the latest: the interval in force, or a
@@ -588,37 +636,55 @@ impl LinkEstimator {
             at_ns: arrival_ns,
         });
         let offset = Self::offset(anchor, self.interval_ns, seq, arrival_ns)?;
+        // Past the expected arrival the freshness point in force was set from: whatever slots the
+        // sender skipped or the network lost since the latest heartbeat taken lengthen it.
+        let lateness = self
+            .expected_next
+            .and_then(|expected| i64::try_from(i128::from(arrival_ns).checked_sub(expected)?).ok());
         self.last_arrival_ns = Some(arrival_ns);
         self.count(seq, offset);
+        self.take_lateness(lateness);
+        self.expected_next = self.expected();
         Ok(self.refresh(arrival_ns))
     }
 
-    /// Heartbeat `seq`'s offset from its schedule, `offset_ns`, given rather than measured: what a
-    /// node's pool takes of each of its links, their prediction errors, which carry no clock of
-    /// their own (`docs/timing.md` §3, item 10). The estimates move as for a heartbeat; the trust
-    /// does not, since the offsets are no sender's. A heartbeat no newer than the latest is not
-    /// taken, as with [`on_heartbeat`](Self::on_heartbeat).
-    pub fn on_offset(&mut self, seq: u64, offset_ns: i64) -> Result<(), EstimateError> {
+    /// A lateness `lateness_ns` given rather than measured, as arrival `seq`: what a node's pool
+    /// takes of each of its links (`docs/timing.md` §3, item 10). The latenesses carry no clock of
+    /// their own, so they are folded as offsets too, for their Allan levels (the window and
+    /// `τ_int` of the pool's series), and the trust does not move, since they are no sender's. One
+    /// no newer than the latest is not taken, as with [`on_heartbeat`](Self::on_heartbeat).
+    pub fn on_lateness(&mut self, seq: u64, lateness_ns: i64) -> Result<(), EstimateError> {
         if self.highest.is_some_and(|highest| seq <= highest) {
             return Ok(());
         }
-        if offset_ns.unsigned_abs() > OFFSET_LIMIT {
+        if lateness_ns.unsigned_abs() > OFFSET_LIMIT {
             return Err(EstimateError::OutOfRange);
         }
         self.anchor.get_or_insert(Schedule { seq, at_ns: 0 });
-        self.count(seq, offset_ns);
+        self.count(seq, lateness_ns);
+        self.take_lateness(Some(lateness_ns));
         Ok(())
+    }
+
+    /// Folds a lateness into the arrivals.
+    fn take_lateness(&mut self, lateness: Option<i64>) {
+        self.latest_lateness = lateness;
+        if let Some(lateness) = lateness {
+            // i64 → f64 rounds past 2⁵³ ns, 104 days of lateness.
+            self.arrivals.add(lateness as f64);
+        }
+    }
+
+    /// The latest heartbeat's lateness past the expected arrival its predecessor's freshness point
+    /// was set from, nanoseconds: `None` for the first, and for the first after a restart.
+    pub fn latest_lateness(&self) -> Option<i64> {
+        self.latest_lateness
     }
 
     /// Folds heartbeat `seq`'s `offset` into the prediction errors, the ring, the levels and the
     /// loss.
     fn count(&mut self, seq: u64, offset: i64) {
-        let window = self.window_sum();
-        self.latest_error = window.and_then(|(length, sum)| {
-            let mean = sum.checked_div(i64::try_from(length).ok()?)?;
-            offset.checked_sub(mean)
-        });
-        if let Some((length, sum)) = window {
+        if let Some((length, sum)) = self.window_sum() {
             // The window's mean, as `window_mean` gives it.
             self.errors.add(offset as f64 - sum as f64 / length as f64);
         }
@@ -626,12 +692,6 @@ impl LinkEstimator {
         self.first_seq.get_or_insert(seq);
         self.highest = Some(seq);
         self.received = self.received.saturating_add(1);
-    }
-
-    /// The latest heartbeat's prediction error `A − EA`, nanoseconds: `None` for the first at an
-    /// interval, which has no window to be predicted from.
-    pub fn latest_error(&self) -> Option<i64> {
-        self.latest_error
     }
 
     /// `A − σ`: the arrival less its schedule, from `anchor`, in nanoseconds.
@@ -759,13 +819,15 @@ impl LinkEstimator {
     /// a longer interval the sender may have moved to ([`expect_interval`](Self::expect_interval)).
     fn fresh_until(&self) -> Option<u64> {
         let margin = self.margin_ns?;
+        Some(clock(self.expected()?.checked_add(i128::from(margin))?))
+    }
+
+    /// The expected arrival of the slot after the latest heartbeat, `EA_{h+1}`, put back by a longer
+    /// interval the sender may have moved to: what the freshness point is the margin past.
+    fn expected(&self) -> Option<i128> {
         let next = self.highest?.checked_add(1)?;
         let moved = self.next_interval_ns.saturating_sub(self.interval_ns);
-        let until = self
-            .expected_arrival(next)?
-            .checked_add(i128::from(margin))?
-            .checked_add(i128::from(moved))?;
-        Some(clock(until))
+        self.expected_arrival(next)?.checked_add(i128::from(moved))
     }
 
     /// The trust after a heartbeat stamped `arrival_ns`: trusted while it arrived before the next
@@ -897,13 +959,14 @@ impl LinkEstimator {
         self.trust = self.retrusted();
     }
 
-    /// Whether the estimates have renewed since the last configuration: a window's worth of
-    /// heartbeats taken, the span over which the expected arrival is renewed once, or never
-    /// configured. Chen et al.'s adaptive detector reconfigures as its estimates move (§6); the
-    /// window is how far they move between independent readings.
+    /// Whether the latenesses have doubled since the configurator last ran on them, or it never
+    /// has. Chen et al.'s adaptive detector reconfigures as its estimates move (§6); an estimate
+    /// over a growing history has moved by as much as it is uncertain once the history has doubled
+    /// (`docs/research/timing.md`, "When to renew an estimate's configuration"), so a
+    /// configuration renewed sooner follows noise and one renewed later lags the link.
     pub fn reconfigure_due(&self) -> bool {
-        self.margin_ns.is_none()
-            || self.received.saturating_sub(self.configured_at) >= self.window.length
+        self.configured_from
+            .is_none_or(|count| self.arrivals.count >= count.saturating_mul(2))
     }
 
     /// `p_L`, the Jeffreys posterior mean `(k + ½)/(m + 1)` after `k` lost of `m` sent, the sent
@@ -947,13 +1010,15 @@ impl LinkEstimator {
                 .and_then(|v| Duration::try_from_secs_f64(v.sqrt() / 1e9).ok()),
             correlation: self.correlation,
             window: self.window,
+            arrivals: self.arrivals.count,
         }
     }
 
-    /// What the configurator is fed: the loss `p = 1 − (1 − p_L)(1 − 1/(m + 1))`, the mean delay
-    /// (zero where the sender's schedule is unknown: Chen et al.'s NFD-E bound on detection is then
-    /// past `E(D)`, and the configured interval and margin do not depend on it) and the deviation of
-    /// the prediction errors.
+    /// What a probe detector's configurator is fed (Theorem 7's product, `qos::detector_at`;
+    /// hyper-swim's): the loss `p = 1 − (1 − p_L)(1 − 1/(m + 1))` over the history's `m`
+    /// independent heartbeats, the mean delay (zero where the sender's schedule is unknown: Chen et
+    /// al.'s NFD-E bound on detection is then past `E(D)`, and the configured interval and margin do
+    /// not depend on it) and the deviation of the prediction errors.
     pub fn behaviour(&self) -> Result<LinkBehaviour, Refusal> {
         let variance = self.errors.variance().ok_or(Refusal::TooFewHeartbeats)?;
         let unseen = self.unseen().ok_or(Refusal::CorrelationUnmeasured)?;
@@ -966,17 +1031,68 @@ impl LinkEstimator {
         })
     }
 
-    /// Configures the detector from the estimates as they stand, within the measured `floors` and
-    /// for an election and node failures costing `costs`. The margin for the current interval takes
-    /// force at once; the best interval is returned for the caller to move the link to. The
-    /// configurator's search allocates nothing.
-    pub fn configure(&mut self, costs: &Costs, floors: &Floors) -> Result<Configuration, Refusal> {
-        let link = self.behaviour()?;
-        let current =
-            detector_at(&link, costs, floors, self.interval()).ok_or(Refusal::Unconfigurable)?;
-        let best = configure(&link, costs, floors).ok_or(Refusal::Unconfigurable)?;
+    /// What the arrivals show (`docs/timing.md` §2.2): the latenesses of the heartbeats taken, their
+    /// mean and deviation; the chance the next is later than all of them, `1/(m + 1)` over their
+    /// `m = count/τ_int` independent arrivals; and `E(D)` where the sender's schedule is known.
+    /// Refused without a variance (two latenesses) or a measured `τ_int`, the evidence the unseen
+    /// share needs.
+    pub fn arrivals(&self) -> Result<Arrivals, Refusal> {
+        let moments = &self.arrivals;
+        let variance = moments.variance().ok_or(Refusal::TooFewHeartbeats)?;
+        let tau = self.correlation.ok_or(Refusal::CorrelationUnmeasured)?;
+        // u64 → f64 rounds only past 2⁵³ arrivals.
+        let independent = moments.count as f64 / tau;
+        let seconds = |ns: f64| Duration::try_from_secs_f64(ns / 1e9);
+        Ok(Arrivals {
+            unseen: 1.0 / (independent + 1.0),
+            lateness: seconds(moments.mean.max(0.0)).map_err(|_| Refusal::Unconfigurable)?,
+            deviation: seconds(variance.sqrt()).map_err(|_| Refusal::Unconfigurable)?,
+            mean_delay: self.mean_delay().unwrap_or(Duration::ZERO),
+        })
+    }
+
+    /// The latenesses as they stand before their `τ_int` is measured: their mean and deviation,
+    /// with no unseen share, which needs it (a young link's own, which widens what its node
+    /// measured: `docs/timing.md` §3, item 10). `None` before two.
+    pub fn arrivals_seen(&self) -> Option<Arrivals> {
+        let moments = &self.arrivals;
+        let variance = moments.variance()?;
+        let seconds = |ns: f64| Duration::try_from_secs_f64(ns / 1e9).ok();
+        Some(Arrivals {
+            unseen: 0.0,
+            lateness: seconds(moments.mean.max(0.0))?,
+            deviation: seconds(variance.sqrt())?,
+            mean_delay: self.mean_delay().unwrap_or(Duration::ZERO),
+        })
+    }
+
+    /// Configures the detector from the arrivals, for an election and node failures costing
+    /// `costs`, on the receiver's timer `granularity` (the search's resolution) and above the
+    /// sender's stability `floor`. The detector in force takes force at once: the one minimizing
+    /// unavailability at the interval the link is at, where its unavailability is below one; where
+    /// it is not, no margin at that interval promises any availability, and the detector in force
+    /// is the best's, the move to its interval expected (`expect_interval`), as the peer makes it at
+    /// the ask. Refused, the margin in force left, where even the best's unavailability is one or
+    /// more ([`Refusal::Unavailable`]). The configurator's search allocates nothing.
+    pub fn configure(
+        &mut self,
+        costs: &Costs,
+        granularity: Duration,
+        floor: Duration,
+    ) -> Result<Configuration, Refusal> {
+        let link = self.arrivals()?;
+        let at = arrival_detector_at(&link, costs, granularity, self.interval())
+            .ok_or(Refusal::Unconfigurable)?;
+        let best =
+            configure_arrivals(&link, costs, granularity, floor).ok_or(Refusal::Unconfigurable)?;
+        self.configured_from = Some(self.arrivals.count);
+        if best.unavailability.is_nan() || best.unavailability >= 1.0 {
+            return Err(Refusal::Unavailable);
+        }
+        let current = if at.unavailability < 1.0 { at } else { best };
         self.margin_ns = Some(nanos(current.margin));
-        self.configured_at = self.received;
+        // A move already expected to a longer interval stays expected.
+        self.expect_interval(current.interval.max(self.next_interval()));
         self.trust = self.retrusted();
         Ok(Configuration {
             link,
@@ -1163,13 +1279,8 @@ mod tests {
         }
     }
 
-    fn floors(interval: Duration) -> Floors {
-        Floors {
-            granularity: Duration::from_micros(50),
-            sender: Duration::from_micros(50),
-            correlation: interval,
-        }
-    }
+    /// The receiver's granularity and the sender's floor the tests configure with.
+    const GRANULARITY: Duration = Duration::from_micros(50);
 
     /// A xorshift stream (Marsaglia 2003): deterministic test noise.
     fn noise(state: &mut u64) -> u64 {
@@ -1292,28 +1403,29 @@ mod tests {
         let interval = Duration::from_millis(50);
         let mut link = LinkEstimator::new(interval, Duration::from_micros(50), None).unwrap();
         assert_eq!(
-            link.configure(&costs(), &floors(interval)),
+            link.configure(&costs(), GRANULARITY, GRANULARITY),
             Err(Refusal::TooFewHeartbeats)
         );
         let mut state = 0x2545_F491_4F6C_DD1D;
         white(&mut link, 4, MS, MS, &mut state);
         assert_eq!(
-            link.configure(&costs(), &floors(interval)),
+            link.configure(&costs(), GRANULARITY, GRANULARITY),
             Err(Refusal::CorrelationUnmeasured),
             "no Allan level has its seven windows"
         );
         assert_eq!(link.trust(), Trust::Unconfigured);
         white(&mut link, 200, MS, MS, &mut state);
-        let configured = link.configure(&costs(), &floors(interval)).unwrap();
+        let configured = link.configure(&costs(), GRANULARITY, GRANULARITY).unwrap();
         let estimates = link.estimates();
         // Independent delays: τ_int near one, and the unseen chance one in the history's count.
         let tau = estimates.correlation.unwrap();
         assert!(tau < 2.0, "τ_int {tau}");
         let unseen = estimates.unseen.unwrap();
         assert!((unseen - 1.0 / (203.0 / tau + 1.0)).abs() < 1e-12);
-        // The configurator was fed the loss with the unseen chance in it.
-        let fed = 1.0 - (1.0 - estimates.loss) * (1.0 - unseen);
-        assert!((configured.link.loss - fed).abs() < 1e-15);
+        // The configurator was fed every lateness: every heartbeat but the first has one.
+        assert_eq!(estimates.arrivals, 203);
+        let fed = 1.0 / (203.0 / tau + 1.0);
+        assert!((configured.link.unseen - fed).abs() < 1e-15);
         assert_eq!(configured.current.interval, interval);
         assert_eq!(link.margin(), Some(configured.current.margin));
         assert!(matches!(
@@ -1361,7 +1473,7 @@ mod tests {
                     stuck.on_heartbeat(seq, (t as i64 + delay) as u64).unwrap();
                 }
                 assert_eq!(
-                    stuck.configure(&costs(), &floors(Duration::from_millis(1))),
+                    stuck.configure(&costs(), GRANULARITY, GRANULARITY),
                     Err(Refusal::CorrelationUnmeasured)
                 );
                 assert!(stuck.independent_interval().unwrap() > Duration::from_millis(1));
@@ -1381,7 +1493,7 @@ mod tests {
                 seq += 1;
                 taken += 1;
                 let interval = link.interval();
-                match link.configure(&costs(), &floors(interval)) {
+                match link.configure(&costs(), GRANULARITY, GRANULARITY) {
                     Ok(_) => break,
                     Err(Refusal::CorrelationUnmeasured) => {
                         if let Some(next) = link.independent_interval() {
@@ -1393,7 +1505,9 @@ mod tests {
                         }
                     }
                     Err(Refusal::TooFewHeartbeats) => {}
-                    Err(Refusal::Unconfigurable) => panic!("unconfigurable"),
+                    Err(refusal @ (Refusal::Unconfigurable | Refusal::Unavailable)) => {
+                        panic!("{refusal:?}")
+                    }
                 }
                 assert!(
                     taken < 1_000,
@@ -1404,10 +1518,11 @@ mod tests {
         }
     }
 
-    /// Offsets given are estimated as the same offsets measured: a pool of links' prediction
-    /// errors is a link's history like any other, signed, with no trust of its own.
+    /// Latenesses given are folded as the same offsets measured would be, for their levels, their
+    /// window and their `τ_int`, and taken into the arrivals as they are: a pool of links'
+    /// latenesses is a series like any other, signed, with no trust of its own.
     #[test]
-    fn offsets_given_are_estimated_as_offsets_measured() {
+    fn latenesses_given_are_folded_as_offsets_and_taken_as_they_are() {
         let interval = Duration::from_millis(5);
         let mut measured = LinkEstimator::new(
             interval,
@@ -1417,13 +1532,16 @@ mod tests {
         .unwrap();
         let mut given = LinkEstimator::new(interval, Duration::from_micros(50), None).unwrap();
         let mut state = 0xC0FF_EE00_1234_5678;
+        let mut values = Moments::default();
         for seq in 0..400u64 {
             let offset = (noise(&mut state) % (2 * MS)) as i64 - MS as i64;
+            let value = offset + 10 * MS as i64;
             measured
-                .on_heartbeat(seq, seq * 5 * MS + (offset + 10 * MS as i64) as u64)
+                .on_heartbeat(seq, seq * 5 * MS + value as u64)
                 .unwrap();
-            given.on_offset(seq, offset + 10 * MS as i64).unwrap();
-            assert_eq!(measured.latest_error(), given.latest_error());
+            given.on_lateness(seq, value).unwrap();
+            values.add(value as f64);
+            assert_eq!(given.latest_lateness(), Some(value));
         }
         let (a, b) = (measured.estimates(), given.estimates());
         assert_eq!(a.received, b.received);
@@ -1431,8 +1549,10 @@ mod tests {
         assert_eq!(a.correlation, b.correlation);
         assert_eq!(a.window, b.window);
         assert_eq!(given.trust(), Trust::Unconfigured);
+        // The arrivals hold every value given.
+        assert_eq!(given.arrivals, values);
         assert_eq!(
-            given.on_offset(400, OFFSET_LIMIT as i64 + 1),
+            given.on_lateness(400, OFFSET_LIMIT as i64 + 1),
             Err(EstimateError::OutOfRange)
         );
     }
@@ -1450,7 +1570,7 @@ mod tests {
         link.on_heartbeat(0, 2 * MS).unwrap();
         link.on_heartbeat(1, 50 * MS + 2 * MS).unwrap();
         assert_eq!(
-            link.configure(&costs(), &floors(interval)),
+            link.configure(&costs(), GRANULARITY, GRANULARITY),
             Err(Refusal::TooFewHeartbeats)
         );
         link.impose(Duration::from_millis(10));
@@ -1464,7 +1584,7 @@ mod tests {
         assert_eq!(link.on_heartbeat(2, until + MS), Ok(Some(Event::Trusted)));
         let mut state = 5;
         white(&mut link, 300, 2 * MS, MS, &mut state);
-        let own = link.configure(&costs(), &floors(interval)).unwrap();
+        let own = link.configure(&costs(), GRANULARITY, GRANULARITY).unwrap();
         assert_eq!(link.margin(), Some(own.current.margin));
     }
 
@@ -1506,7 +1626,7 @@ mod tests {
         .unwrap();
         let mut state = 0x9E37_79B9_7F4A_7C15;
         white(&mut link, 300, 2 * MS, MS, &mut state);
-        link.configure(&costs(), &floors(interval)).unwrap();
+        link.configure(&costs(), GRANULARITY, GRANULARITY).unwrap();
         let mean = link.estimates().mean_delay.unwrap();
         assert!(mean >= Duration::from_millis(2) && mean <= Duration::from_millis(3));
         let alpha = link.margin().unwrap();
@@ -1537,7 +1657,7 @@ mod tests {
         let mut link = LinkEstimator::new(interval, Duration::from_micros(50), None).unwrap();
         let mut state = 7;
         white(&mut link, 300, MS, MS, &mut state);
-        link.configure(&costs(), &floors(interval)).unwrap();
+        link.configure(&costs(), GRANULARITY, GRANULARITY).unwrap();
         let before = link.estimates();
         link.retime(Duration::from_millis(100), None).unwrap();
         let after = link.estimates();

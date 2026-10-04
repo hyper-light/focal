@@ -518,7 +518,7 @@ mod tests {
     //! [`ExchangeRtt`], the RFC 9002 estimator they were written against; the ballot, the span and
     //! the base from a configured detector; and the unified round budget.
     use super::*;
-    use crate::{Costs, Floors, LinkEstimator, RoundAnchors, RoundBudget, Schedule, configure};
+    use crate::{Costs, LinkEstimator, RoundAnchors, RoundBudget, Schedule, configure_arrivals};
     use proptest::prelude::*;
 
     /// A millisecond in nanoseconds, so the samples read as round times.
@@ -702,19 +702,58 @@ mod tests {
         }
     }
 
-    /// The delays of many nodes spread uniformly over the span: the model `election_span` assumes.
+    /// `x` from `x ^ (x >> shift)`: each pass recovers `shift` more of the high bits.
+    fn unshift(word: u64, shift: u32) -> u64 {
+        (0..64u32.div_ceil(shift)).fold(word, |x, _| word ^ (x >> shift))
+    }
+
+    /// The inverse of an odd multiplier modulo 2^64, by Newton's iteration `x' = x(2 − ax)`, which
+    /// doubles the correct low bits each step: an odd number is its own inverse modulo 8, so from
+    /// three bits five steps reach 96, past 64.
+    fn odd_inverse(odd: u64) -> u64 {
+        (0..5).fold(odd, |inverse, _| {
+            inverse.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inverse)))
+        })
+    }
+
+    /// splitmix64 undone, step by step from its last.
+    fn unmix(word: u64) -> u64 {
+        let z = unshift(word, 31).wrapping_mul(odd_inverse(MIX_TWO));
+        let z = unshift(z, 27).wrapping_mul(odd_inverse(MIX_ONE));
+        unshift(z, 30).wrapping_sub(GOLDEN_GAMMA)
+    }
+
+    /// The draw is uniform over the span exactly as far as its parts are: the finalizer is a
+    /// bijection of the 64-bit words (each step is invertible, and inverting it returns every
+    /// word), so a uniform input word gives a uniform draw; and the scaling `⌊span·w / 2^64⌋` gives
+    /// every nanosecond of the span `⌈(d + 1)2^64/span⌉ − ⌈d·2^64/span⌉` words, which is
+    /// `⌊2^64/span⌋` or one more. The delay is always inside the span.
     #[test]
-    fn the_delays_are_uniform_over_the_span() {
-        let timing = wan_timing();
-        let span = nanos(timing.span);
-        let mut bins = [0u32; 10];
-        for local in 0..20_000u64 {
-            let delay = nanos(timing.delay(local.wrapping_mul(0x2545_f491_4f6c_dd1d), 0));
-            bins[usize::try_from(delay * 10 / span).unwrap()] += 1;
+    fn the_draw_is_a_bijection_scaled_without_bias() {
+        let mut word = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..100_000 {
+            word = word.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            assert_eq!(unmix(splitmix64(word)), word);
         }
-        // 2,000 a bin; a bin past 2,000 ± 5σ (σ ≈ 42) is not uniform.
-        for bin in bins {
-            assert!((1_790..=2_210).contains(&bin), "{bins:?}");
+        for edge in [0, 1, u64::MAX, 1 << 63, GOLDEN_GAMMA.wrapping_neg()] {
+            assert_eq!(unmix(splitmix64(edge)), edge);
+        }
+        let words = 1u128 << 64;
+        for span in [1u128, 2, 3, 7, 1_000, 65_537, 99_991] {
+            let least = words / span;
+            let ceiling = |d: u128| (d * words).div_ceil(span);
+            for d in 0..span {
+                let count = ceiling(d + 1) - ceiling(d);
+                assert!(
+                    count == least || count == least + 1,
+                    "span {span}, {d}: {count}"
+                );
+            }
+        }
+        let timing = wan_timing();
+        for local in 0..20_000u64 {
+            let delay = timing.delay(local.wrapping_mul(0x2545_f491_4f6c_dd1d), 0);
+            assert!(delay < timing.span);
         }
     }
 
@@ -725,11 +764,6 @@ mod tests {
     fn the_base_lapses_where_the_link_suspects() {
         let interval = ms(50);
         let granularity = ms(1);
-        let floors = Floors {
-            granularity,
-            sender: granularity,
-            correlation: interval,
-        };
         let mut link =
             LinkEstimator::new(interval, granularity, Some(Schedule { seq: 0, at_ns: 0 })).unwrap();
         let delay = 2 * MS;
@@ -745,7 +779,7 @@ mod tests {
             election: span.election,
             mtbf: Duration::from_secs(30 * 86_400),
         };
-        let configured = link.configure(&costs, &floors).unwrap();
+        let configured = link.configure(&costs, granularity, granularity).unwrap();
         let timing = ElectionTiming::derive(granularity, &configured.current, &span, &ballot);
         // The latest heartbeat arrived at `last`; the link trusts its sender until the next one's
         // freshness point, `η + α` later on a link whose delays do not vary.
@@ -766,7 +800,7 @@ mod tests {
         assert_eq!(link.poll(until), Some(crate::Event::Suspected));
         // And the configurator was charged the election this timing runs.
         assert_eq!(timing.election, costs.election);
-        let best = configure(&configured.link, &costs, &floors).unwrap();
+        let best = configure_arrivals(&configured.link, &costs, granularity, granularity).unwrap();
         assert_eq!(best, configured.best);
     }
 
@@ -886,45 +920,30 @@ mod tests {
         );
     }
 
-    /// Over every pair of 32 ids and every attempt offset, independent draws collide about once in
-    /// `span` shared attempts, as slates derived for a span of ten: here the span is the WAN
-    /// group's, in 1 ms periods, and the expected collisions in 64 attempts `64 / span`.
+    /// No two nodes draw the same word for any attempts: over 32 ids, small and spread, and every
+    /// attempt a node makes in 72 rounds, each pair of a node and an attempt has a word of its own,
+    /// so no node's campaigns follow another's, at the same attempt or shifted (the finalizer is a
+    /// bijection, `the_draw_is_a_bijection_scaled_without_bias`, and the input words here are
+    /// distinct). Two nodes can still land in one period by chance, as Ongaro's independent
+    /// timeouts do: that is the split `election_span` prices.
     #[test]
-    fn two_nodes_draws_stay_independent_across_shared_attempts() {
-        let timing = wan_timing();
-        let span = timing.span_periods;
-        assert!(span > 10, "the WAN span resolves in 1 ms periods: {span}");
+    fn distinct_nodes_and_attempts_draw_distinct_words() {
         let ids: Vec<u64> = (1..=16)
             .chain((1..=16).map(|seed: u64| seed.wrapping_mul(0x2545_f491_4f6c_dd1d)))
             .collect();
-        let mut worst = 0;
-        let mut total = 0u64;
-        let mut trials = 0u64;
-        for (index, left) in ids.iter().enumerate() {
-            for right in ids.iter().skip(index + 1) {
-                for offset in 0..8 {
-                    let collisions = (0..64u32)
-                        .filter(|attempt| {
-                            timing.timeout_periods(*left, *attempt)
-                                == timing.timeout_periods(*right, attempt + offset)
-                        })
-                        .count();
-                    worst = worst.max(collisions);
-                    total += collisions as u64;
-                    trials += 1;
-                }
-            }
-        }
-        // Binomial(64, 1/span): a pair that collides on more than eight is not independent.
+        let mut words: Vec<u64> = ids
+            .iter()
+            .flat_map(|id| (0..72u32).map(move |attempt| draw(*id, attempt)))
+            .collect();
+        let all = words.len();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), all);
+        let timing = wan_timing();
         assert!(
-            worst <= 8,
-            "a pair collided on {worst} of 64 shared attempts"
-        );
-        let expected = 64.0 / f64::from(span);
-        let mean = total as f64 / trials as f64;
-        assert!(
-            (mean - expected).abs() < expected / 2.0,
-            "{mean} against {expected}"
+            timing.span_periods > 10,
+            "the WAN span resolves in 1 ms periods: {}",
+            timing.span_periods
         );
     }
 

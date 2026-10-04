@@ -135,3 +135,47 @@ mantle's D-1 where its owner cannot yet carry the node-pair stream.
   - `a_member_stopped_between_release_and_the_write_made_again_reopens_without_it`;
   - `a_replica_on_ticks_elects_by_its_owners_ticks_and_hears_no_detector`;
   - `a_replica_by_suspicion_takes_no_ticks`.
+
+## A machine sees the change it applies (2026-10-03)
+
+focal's owners report each change of configuration with the context its entry carried and the
+configurations before and after it (focal-consensus's `AppliedMembership`). Over the shell, focal's
+hand-over machine produces that report (focal 27 §15.7, option (B)), and it was given only the
+point and the configuration the change left. `StateMachine::apply_change` now takes the change as
+its entry stated it, decoded once by the replica as before; the configuration before is the
+machine's own. mantle's range machine gains the same view. Test:
+`a_machine_is_given_the_change_it_applies` (`tests/shell.rs`), the context of an added learner's
+change read by the machine.
+
+## An image carries the configuration held at its point (2026-10-03)
+
+The replica prepared the snapshot it serves to members behind the log's start from the state
+machine's image and the machine's current configuration, which holds only for a machine that
+images everything it applied. focal's hand-over machine images its owner's latest checkpoint,
+behind what it applied (focal 27 §15.7), and a change applied since would have ridden the
+snapshot at the image's point, to be applied again from the log by the member that installed it.
+The Raft paper's snapshot carries "the latest configuration in the log as of last included index"
+(Ongaro and Ousterhout 2014, §7; `docs/research/durable.md` §1). `StateMachine::image` now
+returns the configuration held at its point with the point. The tests' machine images what it
+persisted when it keeps checkpoints. Test: `a_snapshot_carries_the_configuration_held_at_its_images_point`
+(`tests/shell.rs`): before the change, its first snapshot named a learner added after the image;
+now it does not, and the learner, served once its leader checkpointed past the addition, ends
+holding what its leader holds.
+
+## One page applied a drive (2026-10-03)
+
+A drive took the answers of every write the log had made durable, and each answer's notice gave
+a committed page to apply; the fence's page and the `Ready`'s followed. One drive could hand the
+state machine a page for each write out and two more. An owner that reserves before a transition
+what it hands on (focal's R28, which its hand-over machine keeps, focal 27 §15.7 contract (g))
+would have to reserve all of them before every drive. A drive now applies one page at most: the
+core's `max_committed_size_per_ready`, entries counted as the core counts them, or one entry
+larger than it. This is the quantum the owner already gives a replica (one `Ready`, mantle's
+`DRIVE_BUDGET`), applied to what it applies. What is past the page waits with the core's apply
+paused, as entries behind the fence do, for the next drive only, and the drive says it is due.
+etcd bounds what it hands out and has not seen applied by bytes (`maxApplyingEntsSize`,
+`docs/research/durable.md` §3); here the shell bounds a drive's share. Test:
+`a_drive_applies_one_page_and_the_next_drive_the_next` (`tests/shell.rs`). Four writes answered
+in one drive gave it 16 entries, 3,436 bytes, against a page of 512. Now every drive stays within
+the page, or applies one larger entry alone.
+
