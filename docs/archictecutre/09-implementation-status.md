@@ -13668,3 +13668,26 @@ focal's adaptation:
     batch and refused the appends ahead of it, and checks it applies everything committed.
 - **Images weighed by size.** `HandOver` keeps its durable image's bytes for the compaction rule
   (`StateMachine::image_bytes`).
+### 2026-10-04 — A liveness probe is never refused for a dial cooldown
+
+The zone stage failed on macOS CI (c885aac). The host in zone a3 had come back after its
+pause, been seen alive and restored the guarantee, and was then committed dead again while
+it ran: its fresh incarnation was declared dead and `DeadNode` blocked the guarantee. The
+CI log says it was declared at its own incarnation. That record had been open since
+457395c's run, and 18 local copies at a load of 56 to 75 on 18 cores did not repeat it.
+
+The cause was in the peer pool, not the detector's rules. A dial that fails puts its peer
+in a cooldown (2 s, the contact-heal fix of 2026-09-13), in which every send fails at once
+as `Lost` without a dial, so dead peers do not hold Raft's send capacity. Liveness probes
+went through the same refusal. The detector reads `Lost` as a probe sent and not answered,
+which is SWIM's failure. The peers' last dials to the paused host had failed, so as it
+came back their probes to it were refused locally, never sent, counted as failures, and
+the host was suspected and declared dead while it answered everything that reached it.
+
+A probe now dials through the cooldown (`PeerConnectionPool::connection`, `probe`). It
+takes nothing the cooldown protects, because probes have lanes of their own and one probe
+at a time per peer. A dial that connects ends the cooldown, so replication resumes on the
+probe's connection. `a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it`
+dials an address nothing answers at, starts the peer there, and asserts that replication
+is still spared its dial within the cooldown while a probe dials and is answered and
+replication then goes at once. Without the change the probe returns `Err(Lost)`.

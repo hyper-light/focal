@@ -358,6 +358,17 @@ async fn server(
     Arc<QuicServer>,
     tokio::task::JoinHandle<Result<(), WireError>>,
 ) {
+    server_at(pki, registry, handler, "127.0.0.1:0".parse().unwrap()).await
+}
+async fn server_at(
+    pki: &Pki,
+    registry: PeerRegistry,
+    handler: Arc<dyn RequestHandler>,
+    address: std::net::SocketAddr,
+) -> (
+    Arc<QuicServer>,
+    tokio::task::JoinHandle<Result<(), WireError>>,
+) {
     let (certificate, key) = pki.issue(true);
     let tls = server_tls(
         TlsIdentity::from_pkcs8(vec![certificate], key),
@@ -365,16 +376,7 @@ async fn server(
         &limits(),
     )
     .unwrap();
-    let server = Arc::new(
-        QuicServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            tls,
-            registry,
-            limits(),
-            budget(),
-        )
-        .unwrap(),
-    );
+    let server = Arc::new(QuicServer::bind(address, tls, registry, limits(), budget()).unwrap());
     let running = server.clone();
     let task = tokio::spawn(async move { running.serve(handler).await });
     (server, task)
@@ -3193,6 +3195,100 @@ async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_res
     );
     assert_eq!(pool.stats().connections_opened, 0);
     pool.close();
+}
+
+/// A liveness probe is never refused for a dial cooldown, and a peer that
+/// answers ends its cooldown. A send refused in the cooldown never reached
+/// the peer, so for the failure detector it is no probe at all: the detector
+/// read the instant `Lost` as a probe unanswered, and a node that came back
+/// from a pause, dialed in vain while it was gone, was suspected and
+/// declared dead again while it ran (the zone stage on macOS CI). The probe
+/// dials; its connection then carries replication at once.
+#[tokio::test]
+async fn a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    // An address nothing answers at yet: a UDP socket bound and dropped.
+    let address = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    // A cooldown longer than the test: only an answer can end it.
+    let pool = PeerConnectionPool::new(
+        connector(&pki, certificate.clone(), key),
+        PeerPoolLimits {
+            attempts: 1,
+            retry_backoff: Duration::ZERO,
+            timeout: Duration::from_secs(10),
+            unreachable_cooldown: Duration::from_secs(60),
+            ..PeerPoolLimits::default()
+        },
+    )
+    .unwrap();
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address,
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let mut packet = request(85);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(
+        pool.stats().dials,
+        1,
+        "the peer was dialed and did not answer"
+    );
+    // The peer comes back where it was.
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(|verified: VerifiedRequest| async move {
+        let answer = if matches!(verified.request().operation, Operation::Probe { .. }) {
+            Response::Probe(vec![1])
+        } else {
+            Response::PeerAccepted
+        };
+        verified.request().reply(answer)
+    });
+    let (server, task) = server_at(&pki, registry, handler, address).await;
+    // Replication within the cooldown is still spared its dial...
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(pool.stats().refused_unreachable, 1);
+    assert_eq!(pool.stats().dials, 1);
+    // ...but a probe dials, and is answered.
+    let mut probe = request(86);
+    probe.operation = Operation::Probe {
+        request: vec![1, 2, 3],
+    };
+    assert_eq!(pool.send_probe(2, &probe).await, Ok(vec![1]));
+    assert_eq!(
+        pool.stats().dials,
+        2,
+        "the probe dialed through the cooldown"
+    );
+    // The peer answered: replication goes at once on the probe's connection.
+    let mut after = request(87);
+    after.operation = packet.operation.clone();
+    pool.send(2, &after).await.unwrap();
+    assert_eq!(pool.stats().refused_unreachable, 1, "the cooldown ended");
+    assert_eq!(pool.stats().connections_opened, 1);
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
 }
 
 /// What an exchange with a peer is expected to take (27 §3.1 P1): measured

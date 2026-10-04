@@ -44,7 +44,8 @@ pub struct PeerPoolLimits {
     pub timeout: Duration,
     pub retry_backoff: Duration,
     /// How long a peer whose dial failed is left alone before a send dials
-    /// it again. Sends within the cooldown fail at once as `Lost` instead of
+    /// it again (a liveness probe excepted, see `connection`). Sends within
+    /// the cooldown fail at once as `Lost` instead of
     /// each running a dial to its deadline, so an unreachable peer holds at
     /// most one dial's worth of send capacity per cooldown and never the
     /// capacity live peers need; zero disables it.
@@ -201,6 +202,11 @@ impl Slot {
             .ok()
             .and_then(|until| *until)
             .is_some_and(|until| std::time::Instant::now() < until)
+    }
+    fn clear_unreachable(&self) {
+        if let Ok(mut until) = self.unreachable_until.lock() {
+            *until = None;
+        }
     }
     fn mark_unreachable(&self, cooldown: Duration) {
         if cooldown.is_zero() {
@@ -544,7 +550,7 @@ impl PeerConnectionPool {
     /// answer.
     pub async fn negotiated_with(&self, target: u64) -> Result<u16, PeerSendError> {
         let slot = self.slot(target)?;
-        let (_, remote) = tokio::time::timeout(self.limits.timeout, self.connection(&slot))
+        let (_, remote) = tokio::time::timeout(self.limits.timeout, self.connection(&slot, false))
             .await
             .map_err(|_| PeerSendError::Lost)??;
         Ok(remote.negotiated().protocol)
@@ -1004,7 +1010,9 @@ impl PeerConnectionPool {
                     Some(slot.bulk.try_acquire().map_err(|_| PeerSendError::Busy)?)
                 };
                 let connected =
-                    match tokio::time::timeout(self.limits.timeout, self.connection(&slot)).await {
+                    match tokio::time::timeout(self.limits.timeout, self.connection(&slot, probe))
+                        .await
+                    {
                         Ok(connected) => connected,
                         // A group's exchange has waited its time for a
                         // connection, and is not made to wait it again: the
@@ -1221,12 +1229,23 @@ impl PeerConnectionPool {
         );
         Ok(slot)
     }
-    async fn connection(&self, slot: &Arc<Slot>) -> Result<(u64, QuicRemote), PeerSendError> {
+    /// The connection to `slot`'s peer, dialed where there is none. A
+    /// liveness probe (`probe`) is never refused for a cooldown: a send
+    /// refused here never reached the peer, so for a failure detector it is
+    /// no probe at all (SWIM's failure is a probe sent and not answered in
+    /// time), and the probe is how a peer that came back is found again.
+    /// Probes have lanes of their own, so dialing for one takes nothing
+    /// from the capacity the cooldown protects.
+    async fn connection(
+        &self,
+        slot: &Arc<Slot>,
+        probe: bool,
+    ) -> Result<(u64, QuicRemote), PeerSendError> {
         // A peer whose dial just failed is not dialed again until its cooldown
         // passes: the send fails at once rather than holding its permits for
         // another dial deadline, so unreachable peers never consume the
         // capacity reachable ones need.
-        if slot.unreachable() {
+        if !probe && slot.unreachable() {
             increment(&self.counters.unreachable);
             return Err(PeerSendError::Lost);
         }
@@ -1307,6 +1326,9 @@ impl PeerConnectionPool {
                         Ok(generation) => match task_slot.connection.lock() {
                             Ok(mut cached) if !task_slot.retired.load(Ordering::Acquire) => {
                                 *cached = Some(Connected { generation, remote });
+                                // The peer answered: what the failed dial
+                                // said about it no longer holds.
+                                task_slot.clear_unreachable();
                                 increment(&counters.opened);
                                 DialState::Connected
                             }
