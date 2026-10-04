@@ -1,7 +1,8 @@
 //! One bounded disk owner per node, shared by every installed session policy.
 //! Async calls require a Tokio runtime with IO and time drivers enabled.
 use crate::custody::{
-    Accounted, CustodyConfig, CustodyPolicy, CustodyScope, CustodyStore, content_error,
+    Accounted, CustodyConfig, CustodyPolicy, CustodyScope, CustodyStore, Pass, RestoreAsk, Step,
+    content_error,
 };
 use crate::custody_prefix::{CustodyVerification, CustodyVerificationProgress, VerifiedCustody};
 use focal_evidence::{ContentError, ContentStore, TransferManifest, UploadId};
@@ -18,6 +19,13 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+/// The slices a pass over a whole object takes at most (the audit's F51): a
+/// chunk each of as many as a manifest names — thirty-three bytes a chunk at
+/// least — and the answer's.
+const PASS_SLICES: usize = match focal_evidence::MAX_TRANSFER_MANIFEST_BYTES.checked_div(33) {
+    Some(chunks) => chunks.saturating_add(2),
+    None => 2,
+};
 #[derive(Clone)]
 pub struct ContentHost {
     sender: mpsc::SyncSender<Work>,
@@ -72,8 +80,23 @@ enum Command {
     ),
     /// The volume envelope's statistics and what the store has staged.
     DiskStats,
+    /// One slice of a custody request's pass over a whole object (the
+    /// audit's F51).
+    Advance(Box<PendingPass>),
+    /// One slice of a backup's content restore under way (the audit's F51),
+    /// named by its directory and its checkpoint's hash and creation time: a
+    /// restore of another backup is not carried on by it.
+    RestoreAdvance(std::path::PathBuf, (focal_model::ContentHash, u64)),
     Stop,
 }
+/// A custody request whose answer waits on a pass over a whole object (the
+/// audit's F51): the pass, which the store keeps, and the reply it answers
+/// under once the pass is done.
+struct PendingPass {
+    pass: Pass,
+    header: ResponseEnvelope,
+}
+
 /// One native artifact to seal and verify under the exclusive content writer.
 pub(crate) struct NativeVerification {
     pub scope: CustodyScope,
@@ -96,6 +119,11 @@ enum Output {
     Restored(bool),
     Imported(u64),
     Disk(focal_memory::DiskStats, usize, u64),
+    Pending(Box<PendingPass>),
+    /// An upload's seal or a restore not done yet: the store keeps it, and
+    /// the next ask carries it on (the audit's F51).
+    SealPending,
+    RestorePending,
 }
 struct Work {
     command: Command,
@@ -159,6 +187,19 @@ impl ContentHost {
             .commit();
         let (chunk_bytes, max_manifest_bytes) =
             (store.upload_chunk_bytes(), store.max_manifest_bytes());
+        // The one buffer every slice of a pass over a whole object reads a
+        // chunk into (the audit's F51): a chunk long, charged for the owner's
+        // life.
+        let scratch_bytes = store.max_chunk_bytes();
+        let scratch_charge = budget
+            .reserve(BudgetKind::Payload, BudgetLane::Completion, scratch_bytes)
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(scratch_bytes)
+            .map_err(|_| AccessError::Capacity)?;
+        scratch.resize(scratch_bytes, 0);
         let owner = CustodyStore::new(store, config, budget.clone())?;
         let (sender, receiver) = mpsc::sync_channel::<Work>(queue_items);
         let timeout = limits.request_timeout;
@@ -168,6 +209,8 @@ impl ContentHost {
             .name("focal-content".into())
             .spawn(move || {
                 let _queue = queue_charge;
+                let _scratch = scratch_charge;
+                let mut scratch = scratch;
                 let mut owner = owner;
                 let mut next_expiry = Instant::now();
                 loop {
@@ -188,7 +231,8 @@ impl ContentHost {
                                 _allocation: allocation,
                             } = work;
                             let stop = matches!(command, Command::Stop);
-                            let outcome = execute(&mut owner, command, &limits, &worker_budget);
+                            let outcome =
+                                execute(&mut owner, command, &limits, &worker_budget, &mut scratch);
                             // Requests and decode staging are gone before the
                             // caller observes completion. Output carries its
                             // separate owned permit through the handoff.
@@ -333,17 +377,28 @@ impl ContentHost {
                     | CustodyRequest::Cancel { .. }
             )
         );
-        match self
+        let mut output = self
             .call(
                 Command::Request(Box::new(request)),
                 bytes.checked_mul(4).ok_or(AccessError::Capacity)?,
                 control,
             )
-            .await?
-        {
-            Output::Response(response) => Ok(*response),
-            _ => Err(AccessError::Unavailable),
+            .await?;
+        // A pass over a whole object — an open's inventory, a seal, a
+        // verification — is advanced a slice, a chunk, at a time, each slice
+        // its own turn in the owner's queue, behind whatever was asked
+        // before it (the audit's F51). The store keeps the pass: a request
+        // that gives up leaves it to the next ask of the same transfer.
+        for _ in 0..PASS_SLICES {
+            match output {
+                Output::Response(response) => return Ok(*response),
+                Output::Pending(pending) => {
+                    output = self.call(Command::Advance(pending), 0, control).await?;
+                }
+                _ => return Err(AccessError::Unavailable),
+            }
         }
+        Err(AccessError::Unavailable)
     }
     pub async fn export_manifest(
         &self,
@@ -398,13 +453,20 @@ impl ContentHost {
         ) {
             return Err(AccessError::InvalidRequest);
         }
-        match self
-            .call(Command::Seal(scope, Box::new(request)), 0, true)
-            .await?
-        {
-            Output::LocalSeal(value) => Ok(value),
-            _ => Err(AccessError::Unavailable),
+        // The seal goes a chunk a slice, each ask its own turn in the
+        // owner's queue, and the store keeps it between asks (the audit's
+        // F51): an ask that fails leaves it to the next seal asked.
+        for _ in 0..PASS_SLICES {
+            match self
+                .call(Command::Seal(scope, Box::new(request.clone())), 0, true)
+                .await?
+            {
+                Output::LocalSeal(value) => return Ok(value),
+                Output::SealPending => {}
+                _ => return Err(AccessError::Unavailable),
+            }
         }
+        Err(AccessError::Unavailable)
     }
     /// The store's chunk size and manifest bound: the parameters an import
     /// proposal records so every replica seals legacy payloads identically.
@@ -547,17 +609,50 @@ impl ContentHost {
         root: std::path::PathBuf,
         manifest: focal_ledger::backup::BackupManifest,
     ) -> Result<u64, AccessError> {
-        match self
+        // A slice for each object's manifest, each of its chunks twice (read
+        // in, read back) — a chunk holds a byte at least — and its
+        // publication; one to end.
+        let slices = manifest
+            .content
+            .iter()
+            .try_fold(1u64, |sum, object| {
+                object
+                    .length
+                    .checked_mul(2)
+                    .and_then(|chunks| chunks.checked_add(2))
+                    .and_then(|slices| sum.checked_add(slices))
+            })
+            .ok_or(AccessError::Capacity)?;
+        // The manifest is charged for its decoded size while the command
+        // carries it to the owner, and by the store while the restore holds
+        // it.
+        let carried = manifest.resident_bytes().ok_or(AccessError::Capacity)?;
+        let backup = (manifest.checkpoint_hash, manifest.created_ms);
+        let mut output = self
             .call(
-                Command::RestoreContent(root, Box::new(manifest)),
-                4 * 1024 * 1024,
+                Command::RestoreContent(root.clone(), Box::new(manifest)),
+                carried,
                 true,
             )
-            .await?
-        {
-            Output::Imported(imported) => Ok(imported),
-            _ => Err(AccessError::Unavailable),
+            .await?;
+        // A chunk a slice, each its own turn in the owner's queue, and the
+        // store keeps the restore between asks (the audit's F51): asked
+        // again for the same backup, it is carried on. Each ask names the
+        // backup, so that it carries on no other.
+        let mut taken = 0u64;
+        while taken < slices {
+            match output {
+                Output::Imported(imported) => return Ok(imported),
+                Output::RestorePending => {
+                    output = self
+                        .call(Command::RestoreAdvance(root.clone(), backup), 0, true)
+                        .await?;
+                }
+                _ => return Err(AccessError::Unavailable),
+            }
+            taken = taken.saturating_add(1);
         }
+        Err(AccessError::Unavailable)
     }
     pub async fn announce_pending(
         &self,
@@ -627,6 +722,7 @@ fn execute(
     command: Command,
     limits: &WireLimits,
     budget: &MemoryBudget,
+    scratch: &mut [u8],
 ) -> Result<Output, AccessError> {
     match command {
         Command::Install(policy) => {
@@ -657,22 +753,20 @@ fn execute(
             let (uploads, bytes) = owner.content().staged();
             Ok(Output::Disk(owner.content().disk_stats(), uploads, bytes))
         }
-        Command::RestoreContent(root, manifest) => {
-            let imported = focal_ledger::backup::import_content(
-                &focal_ledger::backup::FileMedium,
-                &root,
-                &manifest,
-                owner.content_mut(),
-                budget,
-            )
-            .map_err(|error| match error {
-                focal_ledger::backup::BackupError::Content(error) => content_error(error),
-                focal_ledger::backup::BackupError::Capacity
-                | focal_ledger::backup::BackupError::Memory(_) => AccessError::Capacity,
-                _ => AccessError::InvalidRequest,
-            })?;
-            Ok(Output::Imported(imported))
-        }
+        // A restore goes a slice at a time, the store keeping it between
+        // asks (`ContentHost::restore_content`, the audit's F51).
+        Command::RestoreContent(root, manifest) => Ok(
+            match owner.restore_slice(RestoreAsk::Begin(root, manifest), budget, scratch)? {
+                Some(imported) => Output::Imported(imported),
+                None => Output::RestorePending,
+            },
+        ),
+        Command::RestoreAdvance(root, backup) => Ok(
+            match owner.restore_slice(RestoreAsk::Continue(root, backup), budget, scratch)? {
+                Some(imported) => Output::Imported(imported),
+                None => Output::RestorePending,
+            },
+        ),
         Command::AnnouncePending(ledger, pending) => {
             owner.announce_pending(ledger, pending)?;
             Ok(Output::Done)
@@ -737,27 +831,12 @@ fn execute(
                 request.request().ledger,
                 *upload,
             ));
-            let amount = owner
-                .content()
-                .max_manifest_bytes()
-                .checked_mul(4)
-                .and_then(|n| {
-                    owner
-                        .content()
-                        .max_chunk_bytes()
-                        .checked_mul(2)
-                        .and_then(|c| n.checked_add(c))
-                })
-                .and_then(|n| n.checked_add(4096))
-                .ok_or(AccessError::Capacity)?;
-            let _scan = budget
-                .reserve(BudgetKind::Payload, BudgetLane::Completion, amount)
-                .map_err(|_| AccessError::Capacity)?;
-            owner
-                .content_mut()
-                .seal(id)
-                .map(Output::LocalSeal)
-                .map_err(content_error)
+            // A chunk a slice, the store keeping the seal between asks (the
+            // audit's F51).
+            Ok(match owner.seal_slice(id, scratch)? {
+                Some(reference) => Output::LocalSeal(reference),
+                None => Output::SealPending,
+            })
         }
         Command::SealImport(domain, bytes, chunk_bytes) => {
             let amount = bytes
@@ -779,9 +858,49 @@ fn execute(
         Command::Verify(verification) => verification
             .advance(owner, budget)
             .map(Output::Verification),
-        Command::Request(request) => handle_request(owner, &request, limits, budget)
-            .map(|reply| Output::Response(Box::new(reply))),
+        Command::Request(request) => {
+            if matches!(request.request().operation, Operation::Custody(_)) {
+                return custody_request(owner, &request);
+            }
+            handle_request(owner, &request, limits, budget)
+                .map(|reply| Output::Response(Box::new(reply)))
+        }
+        Command::Advance(mut pending) => match owner.advance(pending.pass, scratch)? {
+            Step::Done(value) => {
+                let header = pending.header;
+                Ok(Output::Response(Box::new(value.map(|reply| {
+                    ResponseEnvelope {
+                        result: Response::Custody(reply),
+                        ..header
+                    }
+                }))))
+            }
+            Step::Pending(pass) => {
+                pending.pass = pass;
+                Ok(Output::Pending(pending))
+            }
+        },
     }
+}
+/// A custody request answered, or the pass over a whole object it began, to
+/// be advanced a slice at a time (`Command::Advance`, the audit's F51).
+/// Custody requests authorize inside the store: a seed read admits the peers
+/// of an announced pending placement at that placement's route (25 §5);
+/// everything else binds the installed route.
+fn custody_request(
+    owner: &mut CustodyStore,
+    verified: &VerifiedRequest,
+) -> Result<Output, AccessError> {
+    let request = verified.request();
+    Ok(match owner.request(verified)? {
+        Step::Done(value) => Output::Response(Box::new(
+            value.map(|reply| request.reply(Response::Custody(reply))),
+        )),
+        Step::Pending(pass) => Output::Pending(Box::new(PendingPass {
+            pass,
+            header: request.reply(Response::Error(AccessError::Unavailable)),
+        })),
+    })
 }
 fn handle_request(
     owner: &mut CustodyStore,
@@ -790,14 +909,6 @@ fn handle_request(
     budget: &MemoryBudget,
 ) -> Result<Accounted<ResponseEnvelope>, AccessError> {
     let request = verified.request();
-    if matches!(request.operation, Operation::Custody(_)) {
-        // Custody requests authorize inside the store: a seed read admits the
-        // peers of an announced pending placement at that placement's route
-        // (25 §5); everything else binds the installed route.
-        return owner
-            .request(verified)
-            .map(|value| value.map(|reply| request.reply(Response::Custody(reply))));
-    }
     let scope = owner.authorize(verified)?;
     if matches!(
         request.operation,

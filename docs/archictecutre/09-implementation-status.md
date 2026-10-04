@@ -13237,3 +13237,41 @@ without it; the trusted membership test passes 10 runs of 10. Recorded open, wit
 shared core: a read asked before the term's first commit is dropped by the core and
 answered only at its deadline.
 
+
+### 2026-10-04 — F51: a node's content owner passes over a whole object a chunk at a time
+
+A node's content owner took each command whole, and five passed over whole objects in
+one command: a custody seal, an open's inventory, a verification, an upload's seal and a
+backup's restore. Every other request waited behind the pass, up to a gibibyte of reads
+under default custody admission. Each pass now goes a chunk a slice, one queued command a
+slice, behind whatever was asked before it:
+- focal-evidence: `ImportCompletion`, `ObjectVerification`, `UploadSealing` and
+  `holds_chunk`, each slice reading into a buffer its caller lends;
+- the content owner: one chunk-long scratch buffer for its life.
+
+**The store keeps each pass between asks** (`CustodyStore`, `Pass`, `Step`). A retried
+or second ask joins the pass under way, and one that meets a full queue only pauses it.
+A pass that is done keeps only its answer until its lease ends:
+- a verification asked afresh reads the object again;
+- a seal's reference stands;
+- a restore's count answers its backup.
+
+**Found in review, before the first build, and fixed in the batch:**
+- a joined verification was refused `Unavailable` once another ask finished it;
+- a restore's manifest was held uncharged across commands;
+- a restore's continuing ask could carry on another backup's restore.
+
+**Tests.** focal-evidence: `a_seal_in_slices_installs_what_a_seal_at_once_does`,
+`a_verification_in_slices_reads_every_chunk_and_finds_a_corrupt_one`. Six under
+`content_host::tests`. The three review findings' tests each fail with their defect put
+back.
+
+**Measured** (debug, macOS arm64, three runs each way, alternating, at a load of 2.9 to
+6.7 with another project's builds), with
+`content_host::tests::measure_small_request_waits_while_a_large_upload_seals`. A small
+request asked while a 256 MiB upload sealed at 1 MiB chunks:
+- before: waited the whole seal, 7.2–8.5 s;
+- after: waited a slice, p50 25–28 ms, p99 27–117 ms, max 32–181 ms (the tail in the
+  run at load 5.4–6.7).
+
+The seal took 7.2–8.5 s before and 7.1–8.5 s after.

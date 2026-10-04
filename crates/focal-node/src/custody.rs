@@ -1,6 +1,9 @@
 //! One node-owned store with installed session custody policy. Only local file
 //! and directory sync is claimed here; aggregate custody belongs to the session.
-use focal_evidence::{ContentError, ContentStore, TransferManifest};
+use focal_evidence::{
+    ContentError, ContentStore, ImportCompletion, ObjectVerification, TransferManifest, UploadId,
+    UploadSealing,
+};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
@@ -113,9 +116,144 @@ struct Transfer {
     /// order. None for a manifest that is sent from.
     taken: Vec<u64>,
     expires: Instant,
+    /// The inventory of what this copy holds, under way: the next chunk to
+    /// read back, until every chunk has been (the audit's F51). An open is
+    /// answered once it is done.
+    inventory: Option<usize>,
+    /// The seal under way, a chunk a call (the audit's F51), and what it
+    /// installed — answered again to a seal asked after it, a lost reply's
+    /// retry, while the transfer is held.
+    sealing: Option<ImportCompletion>,
+    sealed: Option<ContentRef>,
     _allocation: Allocation,
 }
 type TransferKey = (CustodyScope, u64, [u8; 16]);
+/// An object's verification for a scope that asked it (the audit's F51),
+/// given up when no ask has come for a transfer's lease. Under way it goes a
+/// chunk a call, held and charged. Done, it keeps only its answer, for the
+/// asks that joined it while it ran: an ask that gave up and asked again
+/// joins the pass under way, and one that found the pass gone with its
+/// answer would begin it again from the first chunk, where a pass longer
+/// than the asker's patience never ends. A request that comes after the
+/// pass is done verifies afresh: the answer was of the object then.
+struct Verifying {
+    state: Verification,
+    expires: Instant,
+}
+/// A pass under way holds its state on the heap, charged with it
+/// (`ObjectVerification::resident_bytes` counts its own size): what is
+/// done keeps only its answer, and its entry is no larger than that.
+enum Verification {
+    Running {
+        verification: Box<ObjectVerification>,
+        _allocation: Allocation,
+    },
+    Done(ContentRef),
+}
+/// An upload's seal, kept by the store between slices (the audit's F51), as
+/// a transfer's is: an ask that meets a full queue, or a caller that gives
+/// up, leaves it to the next ask, which carries it on from where it stands.
+/// Under way it is charged; done, it keeps only the reference it installed,
+/// which answers every later ask: an upload's id is never staged again
+/// once finished, and its bytes never change, so a seal's reference stands.
+/// Given up, done or not, when no ask came for a transfer's lease.
+struct Sealing {
+    state: Seal,
+    expires: Instant,
+}
+/// As a verification's (`Verification`): the state under way on the heap,
+/// charged with it (`UploadSealing::resident_bytes`).
+enum Seal {
+    Running {
+        sealing: Box<UploadSealing>,
+        _charge: Allocation,
+    },
+    Done(ContentRef),
+}
+/// A backup's content restore (the audit's F51), one at a time, kept
+/// between slices as a seal is. Under way it holds the backup's manifest,
+/// charged; done, the objects it imported, which answer an ask of the same
+/// backup — its directory and its checkpoint's hash and creation time —
+/// until no ask came for a transfer's lease.
+struct Restoring {
+    root: std::path::PathBuf,
+    backup: (ContentHash, u64),
+    state: Restore,
+    expires: Instant,
+}
+/// As a verification's (`Verification`): the manifest and the import
+/// under way on the heap, charged with them.
+enum Restore {
+    Running {
+        manifest: Box<focal_ledger::backup::BackupManifest>,
+        import: Box<focal_ledger::backup::ContentImport>,
+        _charge: Allocation,
+    },
+    Done(u64),
+}
+/// An ask of a backup's content restore (`CustodyStore::restore_slice`).
+pub(crate) enum RestoreAsk {
+    /// Begin the restore of the backup in a directory, or carry it on.
+    Begin(
+        std::path::PathBuf,
+        Box<focal_ledger::backup::BackupManifest>,
+    ),
+    /// Carry on the restore of the backup in a directory, named by its
+    /// checkpoint's hash and creation time: the restore of any other
+    /// backup is not carried on by it.
+    Continue(std::path::PathBuf, (ContentHash, u64)),
+}
+/// A pass over a whole object that a request began and has not finished
+/// (the audit's F51): a transfer's inventory or seal, or an object's
+/// verification. The store keeps the pass's state between slices; the host
+/// asks [`CustodyStore::advance`] for one slice — one chunk read back — at
+/// a time, and each ask takes its own turn in the content owner's queue, so
+/// other work is served between them. Every request for the same transfer
+/// or object advances the same pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Pass {
+    /// An open, answered with what the copy holds (`held`: by a bit for
+    /// each chunk) once the inventory is done.
+    Inventory {
+        key: TransferKey,
+        held: bool,
+    },
+    Seal {
+        key: TransferKey,
+    },
+    Verify {
+        scope: CustodyScope,
+        root: ContentHash,
+    },
+}
+/// A request answered, or a pass it began to be advanced.
+pub(crate) enum Step<T> {
+    Done(T),
+    Pending(Pass),
+}
+/// Room in `entries` for `key` within `bound`. An entry that is `done` only
+/// answers the asks that came for it, so at the bound the done one whose
+/// lease ends first gives its place up; with none done, the place is
+/// refused (`Capacity`).
+fn make_room<K: Ord + Clone, V>(
+    entries: &mut BTreeMap<K, V>,
+    key: &K,
+    bound: usize,
+    done: impl Fn(&V) -> bool,
+    expires: impl Fn(&V) -> Instant,
+) -> Result<(), AccessError> {
+    if entries.contains_key(key) || entries.len() < bound {
+        return Ok(());
+    }
+    let finished = entries
+        .iter()
+        .filter(|(_, entry)| done(entry))
+        .min_by_key(|(_, entry)| expires(entry))
+        .map(|(finished, _)| finished.clone())
+        .ok_or(AccessError::Capacity)?;
+    entries.remove(&finished);
+    Ok(())
+}
 pub struct CustodyStore {
     store: ContentStore,
     config: CustodyConfig,
@@ -124,6 +262,11 @@ pub struct CustodyStore {
     pending: BTreeMap<LedgerId, PendingPeers>,
     transfers: BTreeMap<TransferKey, Transfer>,
     exports: BTreeMap<(CustodyScope, ContentHash), Transfer>,
+    /// As many as transfers at most (`max_transfers`).
+    verifications: BTreeMap<(CustodyScope, ContentHash), Verifying>,
+    /// As many as the store stages uploads at most.
+    seals: BTreeMap<UploadId, Sealing>,
+    restore: Option<Restoring>,
     transfer_bytes: u64,
     /// What the collector may not touch, installed per pass (26 §5).
     protection: Option<focal_evidence::ProtectionSet>,
@@ -151,6 +294,9 @@ impl CustodyStore {
             pending: BTreeMap::new(),
             transfers: BTreeMap::new(),
             exports: BTreeMap::new(),
+            verifications: BTreeMap::new(),
+            seals: BTreeMap::new(),
+            restore: None,
             transfer_bytes: 0,
             protection: None,
         })
@@ -367,6 +513,15 @@ impl CustodyStore {
         scope: CustodyScope,
         content: &ContentRef,
     ) -> Result<(), AccessError> {
+        self.check_read_policy(scope)?;
+        if content.domain != ContentDomainId(scope.ledger.tenant.0) {
+            return Err(AccessError::Unauthorized);
+        }
+        Ok(())
+    }
+    /// A read's scope is still the installed policy's or the announced
+    /// pending placement's.
+    fn check_read_policy(&self, scope: CustodyScope) -> Result<(), AccessError> {
         let installed = self
             .installed(scope.ledger)
             .is_some_and(|policy| policy.scope() == scope);
@@ -376,9 +531,6 @@ impl CustodyStore {
             .is_some_and(|pending| pending.scope == scope);
         if !installed && !pending {
             return Err(AccessError::Unavailable);
-        }
-        if content.domain != ContentDomainId(scope.ledger.tenant.0) {
-            return Err(AccessError::Unauthorized);
         }
         Ok(())
     }
@@ -460,6 +612,9 @@ impl CustodyStore {
             next_missing,
             taken,
             expires: self.deadline()?,
+            inventory: None,
+            sealing: None,
+            sealed: None,
             _allocation: allocation,
         })
     }
@@ -468,8 +623,9 @@ impl CustodyStore {
     /// verified is noted as taken, so the first chunk lacked is the first
     /// the copy lacks and a sender is told what it holds (the audit's F50).
     /// A chunk that fails its hash is lacked: the import installs verified
-    /// bytes over it (24 §20). The scan reads and hashes every chunk held,
-    /// what the scan of a prefix cost when the prefix was the object.
+    /// bytes over it (24 §20). The scan reads and hashes every chunk held, a
+    /// chunk a slice ([`Pass::Inventory`], the audit's F51): an open is
+    /// answered once it is done.
     fn open_transfer(
         &mut self,
         scope: CustodyScope,
@@ -520,11 +676,14 @@ impl CustodyStore {
             .div_ceil(8)
             .checked_add(size_of::<u64>())
             .ok_or(AccessError::Capacity)?;
+        // The descriptor, the bitmap, and the seal's state the transfer
+        // retains while it is sealed (the audit's F51).
         let amount = manifest
             .len()
             .checked_mul(4)
             .and_then(|n| n.checked_add(4096))
             .and_then(|n| n.checked_add(bits))
+            .and_then(|n| n.checked_add(size_of::<ImportCompletion>()))
             .ok_or(AccessError::Capacity)?;
         let allocation = self.reserve(BudgetKind::Control, BudgetLane::Ordinary, amount)?;
         let descriptor = self
@@ -544,30 +703,18 @@ impl CustodyStore {
             .map_err(|_| AccessError::Capacity)?;
         taken.resize(words, 0);
         let mut retained = self.descriptor(descriptor, 0, taken, allocation)?;
-        let _scan = self.reserve(
-            BudgetKind::Payload,
-            BudgetLane::Ordinary,
-            self.store.max_chunk_bytes(),
-        )?;
-        for index in 0..retained.manifest.chunks() {
-            match self.store.read_transfer_chunk(&retained.manifest, index) {
-                Ok(_) => note(&mut retained, index)?,
-                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                // A chunk that fails its hash is missing too: the import
-                // installs verified bytes over it (24 §20).
-                Err(ContentError::Corrupt) => {}
-                Err(error) => return Err(content_error(error)),
-            }
-        }
-        advance(&mut retained)?;
+        // Read back a chunk a slice from the first (`CustodyStore::advance`).
+        retained.inventory = Some(0);
         self.transfers.insert(key, retained);
         self.transfer_bytes = total;
         Ok(())
     }
-    pub fn request(
+    /// A custody request answered, or the pass over a whole object it began
+    /// (`Step::Pending`), which [`Self::advance`] carries on a slice at a time.
+    pub(crate) fn request(
         &mut self,
         verified: &VerifiedRequest,
-    ) -> Result<Accounted<CustodyReply>, AccessError> {
+    ) -> Result<Step<Accounted<CustodyReply>>, AccessError> {
         self.expire(Instant::now())?;
         // Reads — a seed, an object's manifest, the transfer that describes
         // it, its chunks, a verification — are open to the nodes of the
@@ -653,6 +800,12 @@ impl CustodyStore {
                     content,
                     manifest,
                 )?;
+                if retained.inventory.is_some() {
+                    return Ok(Step::Pending(Pass::Inventory {
+                        key: (scope, node_id, *transfer),
+                        held: false,
+                    }));
+                }
                 opened(retained)?
             }
             CustodyRequest::OpenHeld {
@@ -669,6 +822,12 @@ impl CustodyStore {
                     content,
                     manifest,
                 )?;
+                if retained.inventory.is_some() {
+                    return Ok(Step::Pending(Pass::Inventory {
+                        key: (scope, node_id, *transfer),
+                        held: true,
+                    }));
+                }
                 opened_held(retained)?
             }
             CustodyRequest::Chunk {
@@ -772,52 +931,99 @@ impl CustodyStore {
                 }
             }
             CustodyRequest::Seal { transfer } => {
+                let key = (scope, node_id, *transfer);
                 let deadline = self.deadline()?;
-                let _scan = self.reserve(
-                    BudgetKind::Payload,
-                    BudgetLane::Completion,
-                    self.store.max_chunk_bytes(),
-                )?;
                 let retained = self
                     .transfers
-                    .get_mut(&(scope, node_id, *transfer))
+                    .get_mut(&key)
                     .ok_or(AccessError::Unavailable)?;
-                if retained.next_missing != retained.manifest.chunks() {
-                    return Err(AccessError::InvalidRequest);
-                }
-                let content = self
-                    .store
-                    .complete_import(&retained.manifest)
-                    .map_err(content_error)?;
                 retained.expires = deadline;
+                // Sealed already: a lost reply's retry is answered again.
+                let Some(content) = &retained.sealed else {
+                    if retained.inventory.is_some()
+                        || retained.next_missing != retained.manifest.chunks()
+                    {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    // Every chunk read back and the stream verified, a chunk
+                    // a slice, before the manifest is installed (the
+                    // audit's F51).
+                    return Ok(Step::Pending(Pass::Seal { key }));
+                };
                 CustodyReply::Durable {
                     policy_revision: scope.policy_revision,
-                    content,
+                    content: content.clone(),
                 }
             }
             CustodyRequest::Verify {
                 policy_revision,
                 content,
             } => {
-                self.check_read_scope(
-                    CustodyScope {
-                        policy_revision: *policy_revision,
-                        ..scope
-                    },
-                    content,
-                )?;
-                let _scan = self.reserve(
-                    BudgetKind::Payload,
-                    BudgetLane::Completion,
-                    self.manifest_allowance()?
-                        .checked_add(self.store.max_chunk_bytes())
-                        .ok_or(AccessError::Capacity)?,
-                )?;
-                self.store.verify(content).map_err(content_error)?;
-                CustodyReply::Durable {
+                let read = CustodyScope {
                     policy_revision: *policy_revision,
-                    content: content.clone(),
+                    ..scope
+                };
+                self.check_read_scope(read, content)?;
+                let key = (read, content.root);
+                let deadline = self.deadline()?;
+                // A verification under way is joined. One that is done, or
+                // none, begins afresh: an answer was of the object when it
+                // was given.
+                let joined = match self.verifications.get_mut(&key) {
+                    Some(Verifying {
+                        state: Verification::Running { verification, .. },
+                        expires,
+                    }) => {
+                        if verification.reference() != content {
+                            return Err(AccessError::InvalidRequest);
+                        }
+                        *expires = deadline;
+                        true
+                    }
+                    Some(Verifying {
+                        state: Verification::Done(_),
+                        ..
+                    })
+                    | None => false,
+                };
+                if !joined {
+                    make_room(
+                        &mut self.verifications,
+                        &key,
+                        self.config.max_transfers,
+                        |entry| matches!(entry.state, Verification::Done(_)),
+                        |entry| entry.expires,
+                    )?;
+                    // The object's chunk list, decoded from its manifest, is
+                    // held while the verification runs.
+                    let allocation = self.reserve(
+                        BudgetKind::Payload,
+                        BudgetLane::Completion,
+                        self.manifest_allowance()?,
+                    )?;
+                    let verification = self.store.begin_verify(content).map_err(content_error)?;
+                    if verification.resident_bytes().map_err(content_error)?
+                        > self.manifest_allowance()?
+                    {
+                        return Err(AccessError::Capacity);
+                    }
+                    self.verifications.insert(
+                        key,
+                        Verifying {
+                            state: Verification::Running {
+                                verification: Box::new(verification),
+                                _allocation: allocation,
+                            },
+                            expires: deadline,
+                        },
+                    );
                 }
+                // Every chunk read back and the stream verified, a chunk a
+                // slice (the audit's F51).
+                return Ok(Step::Pending(Pass::Verify {
+                    scope: read,
+                    root: content.root,
+                }));
             }
             CustodyRequest::Manifest {
                 policy_revision,
@@ -907,10 +1113,356 @@ impl CustodyStore {
                 CustodyReply::SeedChunk { hash: *hash, bytes }
             }
         };
-        Ok(Accounted {
+        Ok(Step::Done(Accounted {
             value,
             _allocation: response,
-        })
+        }))
+    }
+    /// One slice of upload `id`'s seal (the audit's F51): the first ask
+    /// begins it — the volume promised, its chunk list reserved and charged
+    /// — and each ask after carries it a chunk on, the store keeping it
+    /// between asks; the reference once the manifest is installed, and to
+    /// every ask after (`Sealing`). A seal that fails is given up, and the
+    /// next ask begins it again, the chunks already installed found in place.
+    pub(crate) fn seal_slice(
+        &mut self,
+        id: UploadId,
+        scratch: &mut [u8],
+    ) -> Result<Option<ContentRef>, AccessError> {
+        self.expire(Instant::now())?;
+        let deadline = self.deadline()?;
+        if !self.seals.contains_key(&id) {
+            make_room(
+                &mut self.seals,
+                &id,
+                self.store.max_uploads(),
+                |entry| matches!(entry.state, Seal::Done(_)),
+                |entry| entry.expires,
+            )?;
+            // The seal's chunk list and its manifest's encoding, held while
+            // it goes a chunk a slice; the chunks are read into the owner's
+            // scratch.
+            let amount = self
+                .store
+                .max_manifest_bytes()
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(AccessError::Capacity)?;
+            let charge = self.reserve(BudgetKind::Payload, BudgetLane::Completion, amount)?;
+            let sealing = self.store.begin_seal(id).map_err(content_error)?;
+            if sealing.resident_bytes().map_err(content_error)? > amount {
+                return Err(AccessError::Capacity);
+            }
+            self.seals.insert(
+                id,
+                Sealing {
+                    state: Seal::Running {
+                        sealing: Box::new(sealing),
+                        _charge: charge,
+                    },
+                    expires: deadline,
+                },
+            );
+            return Ok(None);
+        }
+        let entry = self.seals.get_mut(&id).ok_or(AccessError::Unavailable)?;
+        entry.expires = deadline;
+        let advanced = match &mut entry.state {
+            Seal::Done(reference) => return Ok(Some(reference.clone())),
+            Seal::Running { sealing, .. } => self.store.advance_seal(sealing, scratch),
+        };
+        match advanced {
+            Ok(None) => Ok(None),
+            Ok(Some(reference)) => {
+                // What the seal held is released; its reference stays.
+                entry.state = Seal::Done(reference.clone());
+                Ok(Some(reference))
+            }
+            Err(error) => {
+                self.seals.remove(&id);
+                Err(content_error(error))
+            }
+        }
+    }
+    /// One slice of a backup's content restore (the audit's F51). A
+    /// restore of the backup asked is carried on a chunk, or answered once
+    /// done. One begun for another backup is refused while it is under way,
+    /// and gives its place up to a new one once done. The objects imported,
+    /// once every one is.
+    pub(crate) fn restore_slice(
+        &mut self,
+        ask: RestoreAsk,
+        budget: &MemoryBudget,
+        scratch: &mut [u8],
+    ) -> Result<Option<u64>, AccessError> {
+        self.expire(Instant::now())?;
+        let deadline = self.deadline()?;
+        let (root, backup) = match ask {
+            RestoreAsk::Continue(root, backup) => (root, backup),
+            RestoreAsk::Begin(root, manifest) => {
+                let backup = (manifest.checkpoint_hash, manifest.created_ms);
+                match &self.restore {
+                    Some(restore) if restore.root == root && restore.backup == backup => {
+                        (root, backup)
+                    }
+                    Some(Restoring {
+                        state: Restore::Running { .. },
+                        ..
+                    }) => return Err(AccessError::Unavailable),
+                    Some(_) | None => {
+                        // The place of a restore that is done is given up
+                        // before the next is charged.
+                        self.restore = None;
+                        // The manifest and the import's own state, each on
+                        // the heap while the restore runs.
+                        let charge = self.reserve(
+                            BudgetKind::Recovery,
+                            BudgetLane::Completion,
+                            manifest
+                                .resident_bytes()
+                                .and_then(|bytes| {
+                                    bytes.checked_add(
+                                        size_of::<focal_ledger::backup::ContentImport>(),
+                                    )
+                                })
+                                .ok_or(AccessError::Capacity)?,
+                        )?;
+                        self.restore = Some(Restoring {
+                            root,
+                            backup,
+                            state: Restore::Running {
+                                manifest,
+                                import: Box::new(focal_ledger::backup::ContentImport::new()),
+                                _charge: charge,
+                            },
+                            expires: deadline,
+                        });
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        // Only the restore of the backup asked is carried on.
+        let restore = self
+            .restore
+            .as_mut()
+            .filter(|restore| restore.root == root && restore.backup == backup)
+            .ok_or(AccessError::Unavailable)?;
+        restore.expires = deadline;
+        let advanced = match &mut restore.state {
+            Restore::Done(imported) => return Ok(Some(*imported)),
+            Restore::Running {
+                manifest, import, ..
+            } => import.advance(
+                &focal_ledger::backup::FileMedium,
+                &restore.root,
+                manifest,
+                &mut self.store,
+                budget,
+                scratch,
+            ),
+        };
+        match advanced {
+            Ok(None) => Ok(None),
+            Ok(Some(imported)) => {
+                // What the restore held is released; its count stays.
+                restore.state = Restore::Done(imported);
+                Ok(Some(imported))
+            }
+            Err(error) => {
+                self.restore = None;
+                Err(match error {
+                    focal_ledger::backup::BackupError::Content(error) => content_error(error),
+                    focal_ledger::backup::BackupError::Capacity
+                    | focal_ledger::backup::BackupError::Memory(_) => AccessError::Capacity,
+                    _ => AccessError::InvalidRequest,
+                })
+            }
+        }
+    }
+    /// One slice of a pass a request began (the audit's F51): the next chunk
+    /// of a transfer's inventory or seal, or of an object's verification,
+    /// read back into `scratch` — the content owner's one buffer, a chunk
+    /// long. The request's answer once the pass is done, the pass again
+    /// while it is not. The scope is checked at every slice, as every
+    /// operation on a transfer checks it, and the transfer or verification
+    /// must still be held: a cancel, an expiry or a policy that moved on ends
+    /// the pass, with nothing installed.
+    pub(crate) fn advance(
+        &mut self,
+        pass: Pass,
+        scratch: &mut [u8],
+    ) -> Result<Step<Accounted<CustodyReply>>, AccessError> {
+        self.expire(Instant::now())?;
+        let deadline = self.deadline()?;
+        let (reply, output): (CustodyReply, usize) = match pass {
+            Pass::Inventory { key, held } => {
+                self.check_read_policy(key.0)?;
+                let retained = self
+                    .transfers
+                    .get_mut(&key)
+                    .ok_or(AccessError::Unavailable)?;
+                retained.expires = deadline;
+                if let Some(next) = retained.inventory {
+                    if next < retained.manifest.chunks() {
+                        if self
+                            .store
+                            .holds_chunk(&retained.manifest, next, scratch)
+                            .map_err(content_error)?
+                        {
+                            note(retained, next)?;
+                        }
+                        retained.inventory =
+                            Some(next.checked_add(1).ok_or(AccessError::Capacity)?);
+                        return Ok(Step::Pending(pass));
+                    }
+                    advance(retained)?;
+                    retained.inventory = None;
+                }
+                if held {
+                    // The inventory answered: a word for every sixty-four
+                    // chunks, charged before it is copied into the reply.
+                    let output = retained
+                        .taken
+                        .len()
+                        .checked_mul(size_of::<u64>())
+                        .and_then(|n| n.checked_mul(3))
+                        .and_then(|n| n.checked_add(4096))
+                        .ok_or(AccessError::Capacity)?;
+                    let response = self
+                        .budget
+                        .reserve(BudgetKind::Control, BudgetLane::Completion, output)
+                        .map(|reservation| reservation.commit())
+                        .map_err(|_| AccessError::Capacity)?;
+                    return Ok(Step::Done(Accounted {
+                        value: opened_held(retained)?,
+                        _allocation: response,
+                    }));
+                }
+                (opened(retained)?, 0)
+            }
+            Pass::Seal { key } => {
+                self.check_policy(key.0)?;
+                let retained = self
+                    .transfers
+                    .get_mut(&key)
+                    .ok_or(AccessError::Unavailable)?;
+                retained.expires = deadline;
+                if let Some(content) = &retained.sealed {
+                    let content = content.clone();
+                    (
+                        CustodyReply::Durable {
+                            policy_revision: key.0.policy_revision,
+                            content,
+                        },
+                        0,
+                    )
+                } else {
+                    if retained.inventory.is_some()
+                        || retained.next_missing != retained.manifest.chunks()
+                    {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    if retained.sealing.is_none() {
+                        retained.sealing = Some(
+                            self.store
+                                .begin_completion(&retained.manifest)
+                                .map_err(content_error)?,
+                        );
+                    }
+                    let completion = retained.sealing.as_mut().ok_or(AccessError::Unavailable)?;
+                    match self
+                        .store
+                        .advance_completion(&retained.manifest, completion, scratch)
+                    {
+                        Ok(None) => return Ok(Step::Pending(pass)),
+                        Ok(Some(content)) => {
+                            retained.sealing = None;
+                            retained.sealed = Some(content.clone());
+                            (
+                                CustodyReply::Durable {
+                                    policy_revision: key.0.policy_revision,
+                                    content,
+                                },
+                                0,
+                            )
+                        }
+                        Err(error) => {
+                            // Begun again by the next ask, from the first
+                            // chunk; nothing was installed.
+                            retained.sealing = None;
+                            return Err(content_error(error));
+                        }
+                    }
+                }
+            }
+            Pass::Verify { scope, root } => {
+                self.check_read_policy(scope)?;
+                let key = (scope, root);
+                let entry = self
+                    .verifications
+                    .get_mut(&key)
+                    .ok_or(AccessError::Unavailable)?;
+                entry.expires = deadline;
+                // An ask that joined a pass another ask finished is answered
+                // by it (`Verifying`).
+                let advanced = match &mut entry.state {
+                    Verification::Done(content) => Ok(Some(content.clone())),
+                    Verification::Running { verification, .. } => self
+                        .store
+                        .advance_verify(verification, scratch)
+                        .map(|done| done.then(|| verification.reference().clone())),
+                };
+                match advanced {
+                    Ok(None) => return Ok(Step::Pending(pass)),
+                    Ok(Some(content)) => {
+                        // What the pass held is released; its answer stays.
+                        entry.state = Verification::Done(content.clone());
+                        (
+                            CustodyReply::Durable {
+                                policy_revision: scope.policy_revision,
+                                content,
+                            },
+                            0,
+                        )
+                    }
+                    Err(error) => {
+                        self.verifications.remove(&key);
+                        return Err(content_error(error));
+                    }
+                }
+            }
+        };
+        // The value, encoded frame and transport buffer can coexist until ACK.
+        let response = self.reserve(
+            BudgetKind::Control,
+            BudgetLane::Completion,
+            output
+                .checked_mul(3)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(AccessError::Capacity)?,
+        )?;
+        Ok(Step::Done(Accounted {
+            value: reply,
+            _allocation: response,
+        }))
+    }
+    /// A request answered whole: the pass it begins advanced a slice at a
+    /// time to its end, as the content owner advances it.
+    #[cfg(test)]
+    pub(crate) fn request_whole(
+        &mut self,
+        verified: &VerifiedRequest,
+    ) -> Result<Accounted<CustodyReply>, AccessError> {
+        let mut scratch = vec![0u8; self.store.max_chunk_bytes()];
+        let mut step = self.request(verified)?;
+        for _ in 0..1_000_000 {
+            match step {
+                Step::Done(reply) => return Ok(reply),
+                Step::Pending(pass) => step = self.advance(pass, &mut scratch)?,
+            }
+        }
+        panic!("a pass that never ended")
     }
     /// Caches the parsed tree once per installed scope/root. Chunk reads below
     /// use that descriptor until expiry; they never parse the manifest per chunk.
@@ -1047,6 +1599,18 @@ impl CustodyStore {
             }
         }
         self.exports.retain(|_, transfer| transfer.expires > now);
+        // A verification, a seal or a restore no ask advanced for a lease is
+        // given up, what it held released (the audit's F51); nothing of it
+        // was published.
+        self.verifications.retain(|_, entry| entry.expires > now);
+        self.seals.retain(|_, entry| entry.expires > now);
+        if self
+            .restore
+            .as_ref()
+            .is_some_and(|restore| restore.expires <= now)
+        {
+            self.restore = None;
+        }
         self.recount()
     }
     fn recount(&mut self) -> Result<(), AccessError> {

@@ -125,6 +125,32 @@ pub mod backup {
         pub retired_families: u64,
     }
     impl BackupManifest {
+        /// The heap and value storage the decoded manifest holds — its
+        /// objects and their chunk lists, its seeds, its membership — which a
+        /// holder charges for as long as it keeps it (the audit's F51).
+        pub fn resident_bytes(&self) -> Option<usize> {
+            let chunk = std::mem::size_of::<BackupChunk>();
+            let objects = self.content.iter().try_fold(
+                self.content
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<BackupObject>())?,
+                |sum, object| sum.checked_add(object.chunks.capacity().checked_mul(chunk)?),
+            )?;
+            let configuration = [
+                &self.configuration.voters,
+                &self.configuration.learners,
+                &self.configuration.voters_outgoing,
+                &self.configuration.learners_next,
+            ]
+            .iter()
+            .try_fold(0usize, |sum, ids| {
+                sum.checked_add(ids.capacity().checked_mul(std::mem::size_of::<u64>())?)
+            })?;
+            std::mem::size_of::<Self>()
+                .checked_add(self.seeds.capacity().checked_mul(chunk)?)?
+                .checked_add(objects)?
+                .checked_add(configuration)
+        }
         pub fn encode(&self) -> Result<Vec<u8>, BackupError> {
             let body = postcard::to_stdvec(self).map_err(|_| BackupError::Capacity)?;
             let length = body
@@ -742,44 +768,95 @@ pub mod backup {
         })
     }
 
-    /// Import every object a backup lists into `store`, chunk by chunk,
-    /// exactly as a custody transfer installs them (each chunk verified,
-    /// the manifest published only once every chunk is local). Objects the
-    /// store already holds are verified in place.
-    pub fn import_content<M: BackupMedium>(
-        medium: &M,
-        root: &Path,
-        manifest: &BackupManifest,
-        store: &mut focal_evidence::ContentStore,
-        budget: &MemoryBudget,
-    ) -> Result<u64, BackupError> {
-        let content = BackupContent::new(medium, root);
-        let mut imported = 0u64;
-        for object in &manifest.content {
-            let reference = ContentRef {
-                domain: manifest.domain,
-                root: object.root,
-                length: object.length,
-                class: object.class,
-            };
-            let encoded = medium
-                .read(
-                    &root.join(CONTENT_DIR).join(format!("{}.manifest", object.root)),
-                    1024 * 1024,
-                )
-                .map_err(ContentError::Io)?;
-            let _scratch = budget.reserve(
-                BudgetKind::Recovery,
-                BudgetLane::Completion,
-                encoded
-                    .len()
-                    .checked_mul(4)
-                    .and_then(|n| n.checked_add(4096))
-                    .ok_or(BackupError::Capacity)?,
-            )?;
-            let transfer = store.prepare_import(reference, encoded)?;
-            for index in 0..transfer.chunks() {
-                let (_, length) = transfer.chunk(index)?;
+    /// A backup's content imported a slice at a time (the audit's F51): what
+    /// [`import_content`] does at once — each object's manifest read from the
+    /// backup and prepared, each of its chunks read and installed as a
+    /// custody transfer installs it, then its completion (every chunk read
+    /// back and the stream verified) before its manifest is published — one
+    /// chunk a call ([`ContentImport::advance`]), so a node's one content
+    /// owner serves other work between chunks. Held by its one caller with
+    /// what it charges; dropped, nothing of an unfinished object is
+    /// published.
+    pub struct ContentImport {
+        object: usize,
+        current: Option<ImportingObject>,
+        imported: u64,
+    }
+    struct ImportingObject {
+        transfer: TransferManifest,
+        next: usize,
+        completion: Option<focal_evidence::ImportCompletion>,
+        _descriptor: focal_memory::Allocation,
+    }
+    impl Default for ContentImport {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl ContentImport {
+        pub fn new() -> Self {
+            Self {
+                object: 0,
+                current: None,
+                imported: 0,
+            }
+        }
+        /// The objects imported so far.
+        pub fn imported(&self) -> u64 {
+            self.imported
+        }
+        /// One slice: the next object's manifest prepared, one of its chunks
+        /// read from the backup into the store, or one chunk of its
+        /// completion read back into `scratch`. The objects imported, once
+        /// every object the backup lists is.
+        pub fn advance<M: BackupMedium>(
+            &mut self,
+            medium: &M,
+            root: &Path,
+            manifest: &BackupManifest,
+            store: &mut focal_evidence::ContentStore,
+            budget: &MemoryBudget,
+            scratch: &mut [u8],
+        ) -> Result<Option<u64>, BackupError> {
+            if self.current.is_none() {
+                let Some(object) = manifest.content.get(self.object) else {
+                    return Ok(Some(self.imported));
+                };
+                let reference = ContentRef {
+                    domain: manifest.domain,
+                    root: object.root,
+                    length: object.length,
+                    class: object.class,
+                };
+                let encoded = medium
+                    .read(
+                        &root.join(CONTENT_DIR).join(format!("{}.manifest", object.root)),
+                        1024 * 1024,
+                    )
+                    .map_err(ContentError::Io)?;
+                let descriptor = budget
+                    .reserve(
+                        BudgetKind::Recovery,
+                        BudgetLane::Completion,
+                        encoded
+                            .len()
+                            .checked_mul(4)
+                            .and_then(|n| n.checked_add(4096))
+                            .ok_or(BackupError::Capacity)?,
+                    )?
+                    .commit();
+                let transfer = store.prepare_import(reference, encoded)?;
+                self.current = Some(ImportingObject {
+                    transfer,
+                    next: 0,
+                    completion: None,
+                    _descriptor: descriptor,
+                });
+                return Ok(None);
+            }
+            let current = self.current.as_mut().ok_or(BackupError::Capacity)?;
+            if current.next < current.transfer.chunks() {
+                let (_, length) = current.transfer.chunk(current.next)?;
                 let _chunk = budget.reserve(
                     BudgetKind::Recovery,
                     BudgetLane::Completion,
@@ -787,16 +864,76 @@ pub mod backup {
                         .checked_mul(2)
                         .ok_or(BackupError::Capacity)?,
                 )?;
-                let bytes = content.chunk(&transfer, index)?;
-                store.import_chunk(&transfer, index, &bytes)?;
+                let bytes = BackupContent::new(medium, root).chunk(&current.transfer, current.next)?;
+                store.import_chunk(&current.transfer, current.next, &bytes)?;
+                current.next = current.next.checked_add(1).ok_or(BackupError::Capacity)?;
+                return Ok(None);
             }
-            let installed = store.complete_import(&transfer)?;
-            if installed != *transfer.reference() {
+            if current.completion.is_none() {
+                current.completion = Some(store.begin_completion(&current.transfer)?);
+            }
+            let completion = current.completion.as_mut().ok_or(BackupError::Capacity)?;
+            let Some(installed) = store.advance_completion(&current.transfer, completion, scratch)?
+            else {
+                return Ok(None);
+            };
+            if installed != *current.transfer.reference() {
                 return Err(BackupError::Corrupt("imported object"));
             }
-            imported = imported.saturating_add(1);
+            self.current = None;
+            self.object = self.object.checked_add(1).ok_or(BackupError::Capacity)?;
+            self.imported = self.imported.saturating_add(1);
+            Ok(None)
         }
-        Ok(imported)
+    }
+
+    /// Import every object a backup lists into `store`, chunk by chunk,
+    /// exactly as a custody transfer installs them (each chunk verified,
+    /// the manifest published only once every chunk is local). Objects the
+    /// store already holds are verified in place. At once: a
+    /// [`ContentImport`] to its end, for a caller that holds the store alone.
+    pub fn import_content<M: BackupMedium>(
+        medium: &M,
+        root: &Path,
+        manifest: &BackupManifest,
+        store: &mut focal_evidence::ContentStore,
+        budget: &MemoryBudget,
+    ) -> Result<u64, BackupError> {
+        let _scratch = budget.reserve(
+            BudgetKind::Recovery,
+            BudgetLane::Completion,
+            store.max_chunk_bytes(),
+        )?;
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(store.max_chunk_bytes())
+            .map_err(|_| BackupError::Capacity)?;
+        scratch.resize(store.max_chunk_bytes(), 0);
+        // A slice for each object's manifest, each of its chunks twice (read
+        // in, read back) — a chunk holds a byte at least, so an object has as
+        // many chunks as bytes at most — and its publication; one to end.
+        let slices = manifest
+            .content
+            .iter()
+            .try_fold(1u64, |sum, object| {
+                object
+                    .length
+                    .checked_mul(2)
+                    .and_then(|chunks| chunks.checked_add(2))
+                    .and_then(|slices| sum.checked_add(slices))
+            })
+            .ok_or(BackupError::Capacity)?;
+        let mut import = ContentImport::new();
+        let mut taken = 0u64;
+        while taken < slices {
+            if let Some(imported) =
+                import.advance(medium, root, manifest, store, budget, &mut scratch)?
+            {
+                return Ok(imported);
+            }
+            taken = taken.saturating_add(1);
+        }
+        Err(BackupError::Capacity)
     }
     /// Install every seed chunk a backup lists into `sink`.
     pub fn import_seeds<M: BackupMedium>(

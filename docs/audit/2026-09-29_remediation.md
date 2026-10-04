@@ -64,7 +64,7 @@ hyper-raft and its siblings — at the stage named; see below).
 | F48 | P1 | in tree | 9 | [F48](#f48) |
 | F49 | P1 | in tree | 9 | [F49](#f49) |
 | F50 | P2 | in tree | 11 | [F50](#f50) |
-| F51 | P2 | open | 11 | — |
+| F51 | P2 | in tree | 11 | [F51](#f51) |
 | F52 | P2 | in tree (encode); the WAL's encoder shared (hyper-log, step 1) | 11 | [F52](#f52) |
 | F53 | P2 | in tree | 10 | [F53](#f53) |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
@@ -3692,7 +3692,7 @@ unfinished outlives its lease. The receiver tells the sender how much of the chu
 holds, so a lost reply is resumed from the truth.
 
 **Tests.** `focal-evidence`: `a_chunk_imported_in_parts_is_the_chunk_once_whole`.
-`focal-node`: `custody::tests::a_chunk_in_parts_renews_the_lease_and_is_the_chunk_once_whole`
+`focal-node`: `content_host::tests::a_chunk_in_parts_renews_the_lease_and_is_the_chunk_once_whole`
 (parts in order, a retry, a gap; the lease renewed by a part; a last part that is not the
 chunk's discarded whole; parts gone with an expired transfer, the whole chunk kept; a
 cancelled transfer's parts gone; sealed durable) and
@@ -3979,3 +3979,64 @@ stride grid half, as recorded.
   oscillate and empty.
 - *At 100 Mbit/s, 20 ms under CoDel Copa yields*: about 32% beside NewReno or CUBIC,
   which carry 1.45 and 1.54 of their bars.
+
+## F51
+
+**Cause.** A node's content owner is one thread (`ContentHost`, `focal-content`) taking its
+work from a 32-item queue, each command run to completion. Five commands each passed over
+whole objects in one command:
+- the custody seal (`complete_import`): every chunk read back and hashed, then the stream, before the manifest;
+- an open's inventory (`take_inventory`): every chunk the copy holds read and hashed — a resume's prefix scan;
+- a verification (`ContentStore::verify`);
+- an upload's seal (`ContentStore::seal`): the staged bytes read, hashed and installed chunk by chunk, then the manifest;
+- a backup's content restore (`import_content`): every object of the backup.
+
+Every other request waited behind the whole pass — reads, chunk imports, seeds, custody
+readiness, receipts, the collector, a stop — under default custody admission for up to a
+gibibyte.
+
+**Fix.** Each pass goes a chunk a slice, one slice a command, each command its own turn in
+the owner's queue behind whatever was asked before it. This is the design of the prefix
+custody verification the audit names (`CustodyVerification`, a by-value continuation advanced
+by its caller).
+- **focal-evidence: the passes in slices** (each charged by its holder).
+  - `ImportCompletion` (`begin_completion`, `advance_completion`).
+  - `ObjectVerification` (`begin_verify`, `advance_verify`).
+  - `UploadSealing` (`begin_seal`, `advance_seal`; the manifest bound is checked before anything is synced, promised or read).
+  - `holds_chunk`, an inventory's slice.
+  - Each slice reads its chunk into a buffer its caller lends (`verify_chunk_into`). A chunk file of another length is corrupt, not the volume's failure.
+  - The one-call forms remain as bounded loops over the slices, for callers that hold the store alone.
+- **The custody passes are retained, not held by their caller.**
+  - A custody request comes from a remote peer that asks again after its own timeout. A pass held by a request that gave up would begin again from the first chunk, and one longer than the timeout would never end.
+  - The store keeps each pass with its transfer: the inventory as the transfer's next chunk to read back, the seal's `ImportCompletion` and then its result. A verification is kept by scope and object, as many as transfers at most, expiring with a transfer's lease.
+  - Every ask of the same transfer or object, first or retried, advances the same pass (`Step::Pending`, `Command::Advance`), and the answer is given to whichever asks when it is done.
+  - A seal asked after it ends is answered at once; a cancel, an expiry or a policy that moved on ends a pass with nothing installed. The scope is checked at every slice, as every operation on a transfer checks it.
+  - A pass that is done keeps only its answer, for the asks that joined it, until no ask came for a lease. What it held is released when it is done. An ask that gave up and asked again joins the pass under way. One that found the pass gone with its answer would begin it again from the first chunk, and a pass longer than the asker's patience would never end; under review, a verification removed itself when done, so a joined ask was refused `Unavailable`. A verification asked after one is done reads the object afresh, since its answer was of the object then. An upload seal's reference answers every later ask, because an upload's id is never staged again once finished and its bytes never change. A restore's count answers an ask of the same backup.
+  - At its bound — as many verifications as transfers, as many seals as the store stages uploads — a done entry gives its place up, the one whose lease ends first; with none done, the place is refused `Capacity`.
+- **The upload seal and the restore are retained too,** each by its key (an upload's seal by its id, as many as the store stages uploads; one restore at a time, carried on when the same backup — its directory, its checkpoint's hash and creation time — is asked again), charged, and given up after a lease without an ask. A restore under way holds the backup's manifest, charged at its decoded size (`BackupManifest::resident_bytes`): it was charged only for the command that brought it, then held across commands uncharged (found in review). The command that carries the manifest to the owner is charged the same size; before, a flat 4 MiB. Every ask that carries a restore on names its backup (`RestoreAsk::Continue`). An ask that carried on "the restore under way" would, once a done restore was replaced by another backup's, carry the other on, and could answer its asker with the other's count (found in review).
+  - Each slice is its own enqueue on the owner's queue of 32, so under a sustained load some slice of a long pass meets a full queue and is refused `Capacity`.
+  - A pass its caller held would lose its progress there, and a large seal under such a load could begin again for ever.
+  - Kept by the store, a refusal only pauses it: the next ask carries it on.
+- **The owner's one scratch buffer**, a chunk long and charged for its life, is lent to every slice: no buffer is allocated per chunk.
+
+**Tests.**
+- `content_host::tests::a_seal_goes_a_chunk_a_slice_and_other_requests_are_answered_between` (the custody tests run under the content host's module): sixteen chunks in seventeen slices, a chunk read answered between two of them, no manifest before the last, a retry answered at once.
+- `a_seal_that_meets_a_corrupt_chunk_or_a_cancel_installs_nothing`: a chunk overwritten mid-pass ends the seal with nothing installed, and the recopy and next seal install it; a cancel mid-pass ends it, and the budget returns to zero.
+- `an_inventory_and_a_verification_go_a_chunk_a_slice`: an open asked again during its inventory advances the same one. A verify asked while one runs joins it, and is answered by it once another ask finished it. A verify asked after it is done reads afresh.
+- `an_upload_seal_is_kept_between_asks_and_answers_once_done`: four chunks, then the manifest, an ask each. A retry is answered at once. At the bound, a done seal gives its place up, and one under way never does.
+- `a_restore_is_kept_between_asks_and_answers_once_done`: the manifest held is charged. Another backup is refused while the first is under way. Eleven slices, then the count. Done, everything held is released, and a retry is answered at once. Another backup then takes the place.
+- focal-evidence `a_seal_in_slices_installs_what_a_seal_at_once_does`: the same reference; the manifest bound is refused before anything is written.
+- `a_verification_in_slices_reads_every_chunk_and_finds_a_corrupt_one`.
+- `a_seal_and_a_verification_go_through_the_owner_a_slice_at_a_time`: through the content owner's queue, a seal and a verification of an object of a hundred chunks (as many as the store's manifest bound names at those limits) each reach their answer, one queued command a slice.
+
+**Measured** (2026-10-04, macOS arm64, debug build).
+- **Method.** `content_host::tests::measure_small_request_waits_while_a_large_upload_seals` (ignored; run by name). A 256 MiB upload at 1 MiB chunks is sealed through the content owner, while a small request (`disk_stats`) is asked every millisecond until the seal ends. The same harness ran over focal-node's source of 8d4f322 (before) and of this batch (after), three runs each, alternating, at a host load of 2.9 to 6.7: another project's builds shared the machine.
+- **Before**, the seal was one command, and a request asked during it waited for all of it: the longest waits were 8.49, 7.69 and 7.18 s, each the whole seal, of 2 requests a run.
+- **After**, a request waits for the slice under way: of 259 a run, p50 27.8, 26.2 and 25.2 ms; p99 41.1, 117 and 26.9 ms; max 65.3, 181 and 31.7 ms. The 117 and 181 ms are the run at load 5.4–6.7.
+- **The seal's own time** was 8.50, 7.69 and 7.18 s before and 7.82, 8.51 and 7.11 s after: slicing costs nothing measurable.
+- The WAL's group-commit latency on the same device is not measured: slicing changes how the seal's reads and writes interleave with the owner's other work, not what the seal reads, writes and syncs.
+
+**Considered, not in this batch.**
+- Grouped fences (one directory fence over several chunks): only with explicit covering receipts, so that no chunk's `ChunkStored` is answered before its fence.
+- Source selection in `ensure_local` by measured health, with bounded hedging for immutable reads.
+- Both are recorded as what each would need.
