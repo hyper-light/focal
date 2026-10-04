@@ -36,7 +36,7 @@ use focal_client::{Client, ClientError, RetryPolicy, UnixTransport, input::*, pe
 use focal_model::*;
 use focal_node::{config::Settings, embedded::decode_identity};
 use focal_wire::*;
-pub(super) use mcp::serve;
+pub(super) use mcp::{CodeCommand, code, serve};
 use std::{io::Write, path::PathBuf};
 
 type Result<T> = std::result::Result<T, CliError>;
@@ -69,6 +69,10 @@ pub(super) enum CliError {
     Io(#[from] std::io::Error),
     #[error("object not found at the observed ledger prefix")]
     NotFound,
+    /// A code-mode program ended without returning (19 §Code mode): it threw
+    /// or met a bound; its result, with every call it made, is on stdout.
+    #[error("the program ended {0}; its result and calls were written to stdout")]
+    Program(String),
     #[error("more than one claim matches; use list claims or an exact ID")]
     Ambiguous,
     #[error("singular claim selection is incomplete; narrow the filters or use list claims")]

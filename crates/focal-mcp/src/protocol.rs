@@ -56,6 +56,23 @@ pub struct ToolCall {
     pub arguments: Map<String, Value>,
     _allocation: Allocation,
 }
+impl ToolCall {
+    /// A call a code-mode program makes (19 §Code mode): it is dispatched by
+    /// the worker and answered to the program, never to the protocol, so it
+    /// takes no token of the protocol's.
+    pub(crate) fn nested(
+        tool: String,
+        arguments: Map<String, Value>,
+        allocation: Allocation,
+    ) -> Self {
+        Self {
+            token: CallToken(0),
+            tool,
+            arguments,
+            _allocation: allocation,
+        }
+    }
+}
 impl std::fmt::Debug for ToolCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolCall")

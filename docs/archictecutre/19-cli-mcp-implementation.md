@@ -616,6 +616,82 @@ by the dispatcher as well as by the protocol layer; the command-tree test
 resolves every `cli_path` to a leaf of the clap tree. The operator surfaces
 R9 adds (`deployment.*`, `backup.*`, `upgrade.*`) extend this registry.
 
+## Code mode
+
+An agent that calls focal one tool at a time pays a model turn per call, carries every
+tool schema it might use in its context, and passes every intermediate result through
+that context to reach the next call. Code mode (decision F59) gives the agent the whole
+operation registry as a program interface instead: it writes one short JavaScript
+program, focal runs it in a bounded sandbox inside the same binary, and only the value
+the program returns enters the model's context. Anthropic measured a Drive-to-Salesforce
+workflow fall from 150,000 tokens to 2,000 this way ("Code execution with MCP", 2025);
+Cloudflare's Code Mode runs the same pattern over its whole API with two tools, `search`
+and `execute`, the API's schema never leaving the sandbox unless a search returns it.
+
+**Two tools, one registry.** `code.search` and `code.run`, offered beside the ordinary
+tools (a profile that offers them alone follows with tool profiles).
+
+- `code.search { program }` runs a program over the registry as data: every descriptor
+  `{name, description, input, output, read_only, destructive}` the caller's standing may use (the skills join it when they are
+  served over MCP, the next batch). The program returns the subset it needs —
+  `registry.filter(d => d.name.startsWith("validation.")).map(d => d.input)` — and
+  nothing else of the registry is sent.
+- `code.run { run, program, arguments? }` runs a program with one host object,
+  `focal`, whose methods are the descriptors: `focal.call(name, input)` and the
+  generated `focal.claim.submit(input)` spellings of it. Each call is a `ToolCall`
+  dispatched through `Backend::execute` exactly as a direct tool call is, so the
+  server-side capability check, the surface dispatch, the operation journal and every
+  operation's own limits are unchanged; a name the caller's standing does not list is
+  refused there, in the program, as an exception carrying the typed condition.
+
+**Exactly once across a retried run.** `run` is the caller's identity for the program
+(1–64 bytes). Every mutation the program makes without naming its own reference takes
+`n1:` + the first 16 bytes of BLAKE3 keyed-derived from (`run`, the call's ordinal) — the
+agent-chosen reference the native journal already binds to one input (a V1 ledger takes
+the same 32 hex digits as its permanently bound legacy id). A lost reply is answered by
+sending the same `run` and program again, which replays the calls in order: each
+mutation already journaled resumes its saved outcome, and the first not yet sent is
+sent. A replay that reaches a reference with different input is refused, as any
+reference bound to other input is, so a program that does not replay identically cannot
+double its effects. This is the durable-execution model of Temporal and Azure Durable
+Functions (deterministic replay against a recorded history) over focal's existing
+journal. Replay needs determinism, so the sandbox has none of the sources that break it:
+no clock (`Date.now()` is the run's fixed logical time), no entropy (`Math.random` is
+seeded from `run`), no timers, no I/O but `focal`.
+
+**Bounds, each a typed refusal.** The engine is QuickJS-NG through `rquickjs`: of the
+maintained JavaScript engines small enough to embed in one binary, the one with all
+three hard runtime bounds — a heap
+limit (`JS_SetMemoryLimit`, exceeding it throws), an interrupt hook called on function
+calls and backward jumps (counted here, never timed), and a stack limit. Per run:
+
+| Bound | Rule |
+|---|---|
+| Program bytes | at most the MCP frame bound |
+| Heap | twice the response bound (32 MiB: one call's largest result as text and as its parsed value), reserved with the text crossing the boundary from the adapter's `MemoryBudget` before the runtime exists, so a run that cannot be funded is refused before it starts |
+| Work | 214,410 interrupt-hook calls (each 10,000 of the engine's polls): no longer than one `claim.wait` may hold the worker (30 s) at the slowest rate measured, 7,147 calls a second for a loop of built-in sorts (release, Apple M-series); an empty loop spends it in about 0.5 s |
+| Stack | half the worker thread's stack (512 KiB), the rest for the frames beneath the engine |
+| Calls | a quarter of the protocol's tree bound (4,096), so the listing of calls fits it |
+| Result | an eighth of the response bound (2 MiB of JSON text) and the protocol's tree bound: the response carries the value twice, once escaped at up to six bytes a byte |
+| Concurrency | one runtime per active call, within `max_active_calls` |
+
+A heap exhausted, a budget spent, a stack overflowed or a result too large ends the
+program with `isError` and `outcome.code` naming the bound (`heap`, `work`, `stack`,
+`calls`, `result`, `unsettled`, `cancelled`, `program`, `exception`), never a partial result; the
+calls it made before that are durable and named in the result, so a retry with the same
+`run` resumes them. Cancellation interrupts the program at its next hook call. The
+engine is C, and is called behind the unwind boundary like every dependency that can
+panic; its bindings are fed only from focal's own schema-validated values.
+
+**Why JavaScript and not a language of focal's own.** Agents write JavaScript and
+TypeScript well because those are what they were trained on, which is the reason both
+published designs chose them; a smaller language of focal's own would be bounded the
+same way but read worse to every model. Boa, the pure-Rust engine, has per-loop
+iteration and recursion limits but no heap limit, so a single `"x".repeat(n)` is
+unbounded growth; Starlark (Meta's `starlark-rust`) is deterministic and hermetic but
+has no heap limit either. The CLI runs the same programs (`focal code run --run ID
+--file P`, `focal code search --file P`), one binary, one registry.
+
 ## Remaining independent work
 
 The complete plan remains the completion checklist. Interface implementation

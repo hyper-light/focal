@@ -66,85 +66,19 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     reader: R,
     writer: W,
 ) -> Result<(), ServeError> {
-    // 80 MiB of ordinary headroom: the catalogue's construction admission
-    // (half a mebibyte per tool) and its measured resident tree (about 7.5
-    // MiB for the 47-tool native catalogue) are held together before the
-    // admission is released, beside the frame decoder and the journals.
-    let budget = MemoryBudget::new(160 * MIB, 80 * MIB)?;
-    // The worker's runtime is created here so the engine probe, which may bind
-    // a remote endpoint to it, and every later call share one runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let Adapter {
+        limits,
+        code_limits,
+        budget,
+        runtime,
+    } = Adapter::new()?;
     backend.detect(&runtime).map_err(ServeError::Probe)?;
-    let limits = Limits {
-        max_frame_bytes: 278_528,
-        max_response_bytes: 16 * MIB,
-        max_active_calls: 1,
-        ..Limits::default()
-    };
-    // Reserve before constructing serde schema trees. Protocol takes its own
-    // measured resident charge before this temporary admission is released.
-    let application = match backend.native_standing() {
-        Some(standing) => {
-            crate::catalog_native::tool_count(standing)?.checked_add(if backend.has_watches() {
-                crate::catalog_watch::TOOL_COUNT
-            } else {
-                0
-            })
-        }
-        None => focal_client::operations::application(focal_client::operations::WireProfile::V1)
-            .len()
-            .checked_add(6)
-            .and_then(|n| {
-                n.checked_add(if backend.has_uploads() {
-                    crate::catalog_transfer::TOOL_COUNT
-                } else {
-                    0
-                })
-            })
-            .and_then(|n| {
-                n.checked_add(if backend.has_watches() {
-                    crate::catalog_watch::TOOL_COUNT
-                } else {
-                    0
-                })
-            }),
-    }
-    .ok_or(ProtocolError::Capacity)?;
-    let tool_count = application
-        .checked_add(if backend.has_admin() {
-            crate::catalog_admin::TOOL_COUNT
-        } else {
-            0
-        })
-        .ok_or(ProtocolError::Capacity)?;
-    // Covers each retained pruned input/output tree and one temporary shared
-    // definition tree. The composition test measures the complete catalogue.
-    let construction_bytes = tool_count
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(512 * 1024))
-        .ok_or(ProtocolError::Capacity)?;
-    let catalog_admission = budget
-        .reserve(
-            BudgetKind::Control,
-            BudgetLane::Ordinary,
-            construction_bytes,
-        )?
-        .commit();
-    let mut tools = match backend.native_standing() {
-        Some(standing) => crate::catalog_native::catalog(standing)?,
-        None => crate::catalog::catalog()?,
-    };
-    if backend.has_admin() {
-        crate::catalog_admin::append(&mut tools)?;
-    }
-    if !backend.has_native() && backend.has_uploads() {
-        crate::catalog_transfer::append(&mut tools)?;
-    }
-    if backend.has_watches() {
-        crate::catalog_watch::append(&mut tools)?;
-    }
+    let Catalogue {
+        tools,
+        registry,
+        admission: catalog_admission,
+        _registry: _registry_charge,
+    } = Catalogue::new(&backend, &budget, code_limits)?;
     let mut protocol = Protocol::new(
         limits,
         budget.clone(),
@@ -164,8 +98,13 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     let (events, receive) = mpsc::sync_channel(8);
     let (jobs, work) = mpsc::sync_channel(1);
     let (frames, output) = mpsc::sync_channel(2);
+    let code = Code {
+        budget: budget.clone(),
+        registry,
+        limits: code_limits,
+    };
     let worker = owner("focal-mcp-ledger", &budget, events.clone(), move |events| {
-        worker(backend, runtime, work, events)
+        worker(backend, runtime, code, work, events)
     })?;
     let writer = owner("focal-mcp-output", &budget, events.clone(), move |events| {
         write_output(writer, output, events)
@@ -323,6 +262,197 @@ fn coordinate(
         }
     }
 }
+/// The adapter's bounds, budget and worker runtime, the same for a served
+/// connection and for one program run from the CLI.
+struct Adapter {
+    limits: Limits,
+    code_limits: crate::code::CodeLimits,
+    budget: MemoryBudget,
+    runtime: tokio::runtime::Runtime,
+}
+impl Adapter {
+    fn new() -> Result<Self, ServeError> {
+        let limits = Limits {
+            max_frame_bytes: 278_528,
+            max_response_bytes: 16 * MIB,
+            max_active_calls: 1,
+            ..Limits::default()
+        };
+        // One code-mode run at a time (the worker is one owner): its sandbox
+        // and the text it hands across are added to the budget. Of the rest,
+        // 80 MiB of ordinary headroom: the catalogue's construction admission
+        // (half a mebibyte per tool) and its measured resident tree (about
+        // 7.5 MiB for the 47-tool native catalogue) are held together before
+        // the admission is released, beside the frame decoder and journals.
+        let code_limits = crate::code::CodeLimits::for_adapter(limits, THREAD_STACK)?;
+        let budget = MemoryBudget::new(
+            (160 * MIB)
+                .checked_add(code_limits.reservation()?)
+                .ok_or(ProtocolError::Capacity)?,
+            80 * MIB,
+        )?;
+        // The worker's runtime is created here so the engine probe, which may
+        // bind a remote endpoint to it, and every later call share one runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            limits,
+            code_limits,
+            budget,
+            runtime,
+        })
+    }
+}
+
+/// The served tools, what code mode may call among them, and their charges:
+/// the construction admission (released once the protocol holds its own)
+/// and the registry's, held for the adapter's life.
+struct Catalogue {
+    tools: Vec<crate::Tool>,
+    registry: crate::code::Registry,
+    admission: Allocation,
+    _registry: Allocation,
+}
+impl Catalogue {
+    fn new<T: ClientTransport>(
+        backend: &Backend<T>,
+        budget: &MemoryBudget,
+        code_limits: crate::code::CodeLimits,
+    ) -> Result<Self, ServeError> {
+        // Reserve before constructing serde schema trees. Protocol takes its
+        // own measured resident charge before this admission is released.
+        let application = match backend.native_standing() {
+            Some(standing) => {
+                crate::catalog_native::tool_count(standing)?.checked_add(if backend.has_watches() {
+                    crate::catalog_watch::TOOL_COUNT
+                } else {
+                    0
+                })
+            }
+            None => {
+                focal_client::operations::application(focal_client::operations::WireProfile::V1)
+                    .len()
+                    .checked_add(6)
+                    .and_then(|n| {
+                        n.checked_add(if backend.has_uploads() {
+                            crate::catalog_transfer::TOOL_COUNT
+                        } else {
+                            0
+                        })
+                    })
+                    .and_then(|n| {
+                        n.checked_add(if backend.has_watches() {
+                            crate::catalog_watch::TOOL_COUNT
+                        } else {
+                            0
+                        })
+                    })
+            }
+        }
+        .ok_or(ProtocolError::Capacity)?;
+        let tool_count = application
+            .checked_add(if backend.has_admin() {
+                crate::catalog_admin::TOOL_COUNT
+            } else {
+                0
+            })
+            .and_then(|n| n.checked_add(2))
+            .ok_or(ProtocolError::Capacity)?;
+        // Covers each retained pruned input/output tree and one temporary
+        // shared definition tree. The composition test measures the whole.
+        let construction_bytes = tool_count
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(512 * 1024))
+            .ok_or(ProtocolError::Capacity)?;
+        let admission = budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Ordinary,
+                construction_bytes,
+            )?
+            .commit();
+        let mut tools = match backend.native_standing() {
+            Some(standing) => crate::catalog_native::catalog(standing)?,
+            None => crate::catalog::catalog()?,
+        };
+        if backend.has_admin() {
+            crate::catalog_admin::append(&mut tools)?;
+        }
+        if !backend.has_native() && backend.has_uploads() {
+            crate::catalog_transfer::append(&mut tools)?;
+        }
+        if backend.has_watches() {
+            crate::catalog_watch::append(&mut tools)?;
+        }
+        // What code mode may call is what is served, less its own two tools.
+        let registry = crate::code::Registry::new(&tools)?;
+        let registry_charge = budget
+            .reserve(BudgetKind::Control, BudgetLane::Ordinary, registry.bytes())?
+            .commit();
+        tools
+            .try_reserve_exact(2)
+            .map_err(|_| ProtocolError::Capacity)?;
+        tools.extend(crate::code::tools(code_limits)?);
+        Ok(Self {
+            tools,
+            registry,
+            admission,
+            _registry: registry_charge,
+        })
+    }
+}
+
+/// Run one code-mode program (`code.run` or `code.search`) against the
+/// backend outside a served connection: the CLI's `focal code`. The program
+/// sees and calls exactly what `serve` would offer the same backend, through
+/// the same journal, so a run begun over MCP resumes here and the reverse.
+pub fn run_code<T: ClientTransport>(
+    mut backend: Backend<T>,
+    tool: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> Result<ApplicationResult, ServeError> {
+    if !crate::code::is_code(tool) {
+        return Err(ServeError::Protocol(ProtocolError::Limits));
+    }
+    let Adapter {
+        limits,
+        code_limits,
+        budget,
+        runtime,
+    } = Adapter::new()?;
+    backend.detect(&runtime).map_err(ServeError::Probe)?;
+    let Catalogue {
+        tools: _,
+        registry,
+        admission,
+        _registry,
+    } = Catalogue::new(&backend, &budget, code_limits)?;
+    drop(admission);
+    let allocation = budget
+        .reserve(
+            BudgetKind::Pending,
+            BudgetLane::Ordinary,
+            limits.workspace()?,
+        )?
+        .commit();
+    let mut call = crate::ToolCall::nested(tool.into(), arguments, allocation);
+    let (_signal, mut cancel) = oneshot::channel();
+    let result = crate::code::execute(
+        crate::code::Host {
+            backend: &mut backend,
+            runtime: &runtime,
+            budget: &budget,
+            registry: &registry,
+            limits: code_limits,
+        },
+        &mut call,
+        &mut cancel,
+    );
+    runtime.shutdown_background();
+    Ok(result)
+}
+
 fn send_frame(
     sender: &Option<SyncSender<EncodedFrame>>,
     frame: EncodedFrame,
@@ -358,14 +488,35 @@ fn owner(
             }
         })?)
 }
+/// What the worker needs to run code mode.
+struct Code {
+    budget: MemoryBudget,
+    registry: crate::code::Registry,
+    limits: crate::code::CodeLimits,
+}
 fn worker<T: ClientTransport>(
     mut backend: Backend<T>,
     runtime: tokio::runtime::Runtime,
+    code: Code,
     jobs: Receiver<Job>,
     events: &SyncSender<Event>,
 ) -> Result<(), ServeError> {
     while let Ok(mut job) = jobs.recv() {
-        let result = backend.execute(&runtime, &mut job.call, &mut job.cancel);
+        let result = if crate::code::is_code(&job.call.tool) {
+            crate::code::execute(
+                crate::code::Host {
+                    backend: &mut backend,
+                    runtime: &runtime,
+                    budget: &code.budget,
+                    registry: &code.registry,
+                    limits: code.limits,
+                },
+                &mut job.call,
+                &mut job.cancel,
+            )
+        } else {
+            backend.execute(&runtime, &mut job.call, &mut job.cancel)
+        };
         events
             .send(Event::Complete(Box::new(Completion {
                 call: job.call,

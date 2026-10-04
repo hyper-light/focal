@@ -239,6 +239,8 @@ fn the_probe_selects_the_native_catalogue_and_frames_are_journaled_and_acknowled
                 "request.retry",
                 "request.pending",
                 "request.acknowledge",
+                "code.run",
+                "code.search",
             ]
             .map(String::from),
         )

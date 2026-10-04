@@ -18,6 +18,103 @@ const MAGIC: &[u8; 8] = b"FCLMCP01";
 const MARKER_BYTES: u64 = 104;
 
 pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> {
+    let backend = backend(settings, selection)?;
+    focal_mcp::serve(backend, std::io::stdin(), std::io::stdout())
+        .map_err(|error| CliError::Other(Box::new(error)))
+}
+
+/// Code mode from the CLI (19 §Code mode): one program, run against the same
+/// backend and journal `mcp serve` offers, so a run begun over MCP resumes
+/// here with the same `--run`, and the reverse.
+#[derive(clap::Subcommand)]
+pub(crate) enum CodeCommand {
+    /// Run a JavaScript program that calls focal's tools; print what it returns.
+    Run {
+        /// Your identity for the program; reuse it only to retry the same program.
+        #[arg(long)]
+        run: String,
+        /// The program: the body of an async function.
+        #[arg(long)]
+        file: PathBuf,
+        /// A JSON object the program reads as `input`.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// What `Date.now()` returns; give the same value on a retry.
+        #[arg(long)]
+        now_ms: Option<u64>,
+    },
+    /// Run a program over the tools you may call (`registry`); print what it selects.
+    Search {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+pub(crate) fn code(
+    settings: &Settings,
+    selection: Option<&str>,
+    command: CodeCommand,
+) -> Result<()> {
+    let mut arguments = serde_json::Map::new();
+    let (tool, file) = match command {
+        CodeCommand::Run {
+            run,
+            file,
+            input,
+            now_ms,
+        } => {
+            arguments.insert("run".into(), run.into());
+            if let Some(input) = input {
+                let text = bounded_text(&input, focal_client::input::MAX_INPUT_BYTES)?;
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|error| CliError::Input(format!("--input: {error}")))?;
+                arguments.insert("input".into(), value);
+            }
+            if let Some(now_ms) = now_ms {
+                arguments.insert("now_ms".into(), now_ms.into());
+            }
+            ("code.run", file)
+        }
+        CodeCommand::Search { file } => ("code.search", file),
+    };
+    // The adapter refuses a program longer than its frame bound; reading
+    // stops one byte past it.
+    arguments.insert("program".into(), bounded_text(&file, 278_528)?.into());
+    let backend = backend(settings, selection)?;
+    let result = focal_mcp::run_code(backend, tool, arguments)
+        .map_err(|error| CliError::Other(Box::new(error)))?;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, &result)
+        .map_err(|error| CliError::Other(Box::new(error)))?;
+    stdout.write_all(b"\n")?;
+    match &result.result {
+        focal_client::operations::OperationOutput::Code {
+            outcome: focal_client::operations::CodeOutcome::Failed { code, detail },
+            ..
+        } => Err(CliError::Program(format!("{code}: {detail}"))),
+        _ => Ok(()),
+    }
+}
+
+fn bounded_text(path: &Path, limit: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(u64::try_from(limit).map_or(u64::MAX, |n| n.saturating_add(1)))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(CliError::Input(format!(
+            "{} is longer than {limit} bytes",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| CliError::Input(format!("{} is not UTF-8", path.display())))
+}
+
+fn backend(
+    settings: &Settings,
+    selection: Option<&str>,
+) -> Result<focal_mcp::Backend<impl focal_client::ClientTransport + 'static>> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(CliError::Input(
             "MCP foreground startup requires a blocking process owner".into(),
@@ -69,8 +166,7 @@ pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> 
             backend = backend.with_admin(Box::new(admin));
         }
     }
-    focal_mcp::serve(backend, std::io::stdin(), std::io::stdout())
-        .map_err(|error| CliError::Other(Box::new(error)))
+    Ok(backend)
 }
 
 /// The MCP adapter's `n1:` journal, beside the human CLI's under the context

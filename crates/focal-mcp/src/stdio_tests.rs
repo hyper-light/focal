@@ -432,3 +432,6 @@ fn a_withheld_tool_invoked_directly_is_refused_and_never_dispatched() {
     );
     runner.stop();
 }
+
+#[path = "code_stdio_tests.rs"]
+mod code;

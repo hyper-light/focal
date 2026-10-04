@@ -658,6 +658,25 @@ back as `--cursor` in hexadecimal with the same flags. A cursor is bound to
 the ledger, principal, route and exact filter and to the node incarnation
 that issued it: a tampered, reused or stale cursor is refused.
 
+## Run a program against your tools (code mode)
+
+`focal code` runs a JavaScript program the way the MCP server's `code.run` and
+`code.search` do ([docs/mcp.md](mcp.md#code-mode-one-program-instead-of-many-calls)),
+through the same backend and the same journal as `focal mcp serve`, so a run begun
+over MCP resumes here and the reverse.
+
+```sh
+focal code search --file find.js        # find.js sees `registry`, every tool you may call
+focal code run --run standup-1 --file standup.js --input me.json [--now-ms N]
+```
+
+The program is the body of an async function: `await focal.claim.list({...})` calls a
+tool and resolves to its structured result, `input` is the `--input` object, and the
+command prints `{schema_version, condition, result: {kind: "code", outcome, calls}}`.
+A program that ends at a bound or throws prints the same with `outcome.end: "failed"`
+and exits 10. Sending the same `--run`, program and input again after an interruption
+resumes each mutation it made exactly once.
+
 ## Output and recovery
 
 The default output is a compact table. `--format json` and `--format yaml` emit the same versioned structured results with readable top-level IDs, complete typed object/receipt data, read tokens and cursors. YAML is serialized directly to the output sink without making a second whole-result tree. Nested model values retain their frozen wire representation: IDs are byte arrays and vocabularies are numeric codes. `focal schema get domain-registry` provides those codes. Authored input uses readable string IDs and snake-case vocabulary names.
@@ -763,6 +782,7 @@ Clap's standard help text; authored JSON/YAML errors use the selected format.
 | 7 | Unknown mutation outcome; recover the original saved operation |
 | 8 | Expired read snapshot or retention gap; explicitly start a new query or resynchronize |
 | 9 | Offline placement cannot satisfy the requested durability guarantee |
+| 10 | A code-mode program ended without returning: it threw or met a bound; its result and every call it made are on stdout |
 | 130 | Interrupted client wait or a canceled upload |
 
 The code describes the current failure; it does not prove noncommit of an earlier

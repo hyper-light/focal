@@ -343,6 +343,49 @@ deltas; the CLI manual's
 [native engine verbs](manual-cli.md#native-engine-verbs) section shows the
 same cycle, the remaining verbs and lists through flags.
 
+## Code mode: one program instead of many calls
+
+Beside the tools above the server offers two that take a program
+([19 §Code mode](archictecutre/19-cli-mcp-implementation.md)). Use them when a task
+needs several calls, or a large result filtered down: each program is one model turn,
+and only what it returns enters your context.
+
+- `code.search {program}`: the program sees `registry`, every tool you may call as
+  `{name, description, input, output, read_only, destructive}`, and returns what you
+  need — `return registry.filter(t => t.name.startsWith("validation.")).map(t => ({name: t.name, input: t.input}))`.
+- `code.run {run, program, input?, now_ms?}`: the program is the body of an async
+  function. `await focal.claim.submit({...})` (or `focal.call("claim.submit", {...})`)
+  calls a tool and resolves to its structured result; a refused or failed call throws
+  an `Error` carrying `condition` and `result`.
+
+```json
+{"name": "code.run", "arguments": {"run": "standup-2026-10-04", "program":
+  "const counts = {};\nfor (const status of [\"generated\", \"posted\", \"received\"]) {\n  const r = await focal.claim.list({subject: input.me, status, limit: 256});\n  counts[status] = r.result.page.objects.length;\n}\nreturn counts;",
+  "input": {"me": "00000000000000000000000000000007"}}}
+```
+
+On a native ledger `claim.list` resolves to `{kind: "native_list", page: {objects, next,
+visited, …}}` under `result`; ask `code.search` for a tool's `output` schema before
+reading deeper into it.
+
+A mutation the program makes without an `operation_id` gets one derived from `run` and
+the call's position, so after a lost reply you send the same `run`, program and input
+again: calls already journaled resume their saved outcomes and the rest are sent, each
+exactly once. A replay that reaches a reference with different input is refused, so
+keep the program deterministic; the sandbox helps: `Date.now()` is `now_ms` (0 unless
+given), `Math.random` is seeded from `run`, and there are no timers and no I/O but
+`focal`. The result lists every call the program made, with its condition and
+operation id.
+
+Each run is bounded, and meeting a bound ends it with `isError` and the bound's name in
+`outcome.code`: `heap` (twice the response bound), `work` (a counted budget of the
+engine's polls, never a clock), `stack`, `calls`, `result` (the returned JSON, an eighth
+of the response bound and the protocol's tree bound), `unsettled` (awaiting what never
+settles), `cancelled`, `program` (does not parse) or `exception`. Calls made before the
+end are durable and listed. The CLI runs the same programs against the same journal:
+`focal code run --run ID --file program.js [--input input.json] [--now-ms N]` and
+`focal code search --file program.js`.
+
 ## Operator-only administration
 
 Every tool the adapter lists comes from one registry in the client crate: the application descriptors of the active engine, the four recovery tools, and the shared watch, transfer and administration descriptors (`focal_client::operations::{watch_descriptors, transfer_descriptors, admin_descriptors}`), each naming its capability, surface and the CLI path that performs the same operation. `tools/list` is one pass over that registry filtered by what the adapter can prove (engine, uploads, watches, local node ownership); a tool the adapter did not list is refused when called directly, both at the protocol layer and by the dispatcher.

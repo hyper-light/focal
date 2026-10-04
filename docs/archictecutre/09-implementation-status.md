@@ -13691,3 +13691,38 @@ probe's connection. `a_probe_dials_through_a_cooldown_and_a_peer_that_answers_en
 dials an address nothing answers at, starts the peer there, and asserts that replication
 is still spared its dial within the cooldown while a probe dials and is answered and
 replication then goes at once. Without the change the probe returns `Err(Lost)`.
+### 2026-10-04 — F59: code mode, one program instead of many calls
+
+The MCP adapter offers `code.search` and `code.run` beside its tools, and the CLI runs
+the same programs (`focal code search|run`) through the same backend and journal
+(19 §Code mode). A program runs in QuickJS-NG 0.16.2 through `rquickjs` 0.14, whose
+pre-generated bindings cover all eight release targets. Its calls queue inside the
+sandbox's own heap and the driver dispatches each one as a direct tool call through
+`Backend::execute`, so authorization, the journal and every operation's own limits are
+unchanged. A program that names a tool its caller may not list, or code mode itself, is
+refused `Unlisted` in the program.
+
+- **Bounds, each derived and each a typed end.** Heap: 32 MiB, twice the response bound,
+  reserved from the adapter's budget before the engine exists. Stack: 512 KiB, half the
+  worker thread. Calls: 4,096. Result: 2 MiB of JSON within the protocol's tree bound.
+  Work: 214,410 interrupt-hook calls. The hook fires once per 10,000 polls, at function
+  calls, loop back-edges, long built-in loops and regex backtracking (verified in the
+  vendored source and measured). That count is 30 s, the longest `claim.wait` may
+  already hold the worker, at the slowest rate measured: 7,147 hook calls a second for
+  a loop of built-in sorts, against 13,723 for property writes (release, Apple
+  M-series). Debug builds measured 966 to 1,809. An empty loop spends it in 0.5 s.
+- **Adversarial suite (stdio server).** Each bound ends with its own name, and the
+  server keeps serving after every one: work, heap ("out of memory"), stack (QuickJS-NG
+  raises a `RangeError`, not the `InternalError` first assumed), result (oversized,
+  BigInt, cyclic), unsettled, program, exception. Reassigning a driver entry point is
+  refused (read-only), and forged queue entries cannot choose a reference because the
+  driver counts ordinals itself. Date and Math.random replay identically under one run
+  and differ under another. A cancelled program's answer is suppressed and the slot
+  frees.
+- **Exactly once.** A V1 claim submitted by a program and replayed under the same run
+  commits once (core at sequence 2), and the same run with other input is refused.
+- **Real binary** (`cli_code_mode`, 9 s). On a native ledger, a program submits, posts
+  and reads a claim; the node is SIGKILLed and restarted; the same `focal code run`
+  replays to the same claim with the same `n1:` reference; the same run with other
+  input exits 10 (`program_failed`, a new row in the exit table); and a counting
+  program finds one claim.

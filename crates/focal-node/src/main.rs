@@ -69,6 +69,11 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Run a program against focal's tools, as the MCP server's code mode does.
+    Code {
+        #[command(subcommand)]
+        command: cli::CodeCommand,
+    },
     /// Run the durable service, using saved network settings on restart.
     Start {
         #[arg(long)]
@@ -177,9 +182,15 @@ fn execute(args: Args) -> Result<()> {
         }) => return cli::check_request_file(&file).map_err(Into::into),
         _ => args,
     };
-    if matches!(&args.command, Commands::Mcp { .. }) {
+    // Code mode, like the MCP adapter, owns its own worker runtime.
+    if matches!(&args.command, Commands::Mcp { .. } | Commands::Code { .. }) {
         let settings = load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-        return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
+        return match args.command {
+            Commands::Code { command } => {
+                cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
+            }
+            _ => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
+        };
     }
     let service = matches!(&args.command, Commands::Start { .. });
     // Tokio's fallible builder can still unwind when an OS worker cannot be
@@ -284,6 +295,9 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Mcp {
             command: McpCommand::Serve,
         } => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
+        Commands::Code { command } => {
+            cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
+        }
         Commands::Context { command } => {
             cli::context::run(runtime, &settings, command).map_err(Into::into)
         }

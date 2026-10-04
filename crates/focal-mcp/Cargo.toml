@@ -17,6 +17,7 @@ blake3.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
+rquickjs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

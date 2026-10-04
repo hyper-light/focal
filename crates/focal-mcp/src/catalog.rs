@@ -199,6 +199,7 @@ pub(crate) fn output_schema(name: &str) -> Result<Value, ProtocolError> {
                 "ledger.summary" => &["summary", "error"],
                 "monitor.get" => &["monitor", "error"],
                 "ledger.traverse" => &["traversal", "error"],
+                "code.run" | "code.search" => &["code"],
                 _ => match operations::find(name)
                     .ok_or(ProtocolError::Limits)?
                     .result_kind

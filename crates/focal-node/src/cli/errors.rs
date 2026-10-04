@@ -12,6 +12,11 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
             CliError::Pending(error) => failure::pending(error),
             CliError::Managed(error) => failure::managed_store(error),
             CliError::NotFound => Failure::error("not_found", 4),
+            CliError::Program(_) => Failure {
+                condition: "Failed",
+                code: "program_failed",
+                exit_code: 10,
+            },
             CliError::Ambiguous => Failure::error("ambiguous", 5),
             CliError::WaitUnfinished(condition) => Failure {
                 condition: condition.as_str(),
