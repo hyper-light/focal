@@ -13223,3 +13223,17 @@ the tests' own.
   the connection's own state.
 - **`fleet_group`'s quorum test** now charges its two waits to the replicas' periods.
 
+### 2026-10-04 — a leader answers a read only once it is authoritative in its term
+
+The gate on 9b4c6bd failed `fleet_quic`'s trusted membership test (3 runs of 6 alone).
+A read leaves with its round as soon as it is asked. The readiness barrier, which makes
+the leader authoritative, is asked at the end of the delivery that finds the term's
+first entry committed. So a read asked before that delivery was answered a round ahead
+of the readiness, and the membership read that followed was refused `NotReady`. A
+leader's read barrier now waits, parked under the existing bound, until the term's
+readiness is answered, and is answered in that delivery (`Session::read_waits`).
+`session::tests::a_leader_answers_a_read_only_once_it_is_ready_in_its_term` fails
+without it; the trusted membership test passes 10 runs of 10. Recorded open, with the
+shared core: a read asked before the term's first commit is dropped by the core and
+answered only at its deadline.
+

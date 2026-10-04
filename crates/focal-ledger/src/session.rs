@@ -1499,30 +1499,20 @@ impl Session {
         if let Some(engine) = self.native.as_deref_mut() {
             engine.finish_entries(applied_index)?;
         }
-        // Barriers parked by an earlier delivery whose index this one
-        // reached, in the order they were parked, each removed only once it
-        // is answered: a retryable refusal leaves it parked.
-        while let Some(position) = self
-            .parked_reads
-            .iter()
-            .position(|barrier| barrier.index <= self.applied_raft)
-        {
-            let barrier = self
-                .parked_reads
-                .get(position)
-                .cloned()
-                .ok_or(LedgerError::Corrupt)?;
-            self.complete_read(&barrier, leader, &status, delivery)?;
-            self.parked_reads.remove(position);
-        }
+        // Barriers parked by an earlier delivery that may be answered now,
+        // in the order they were parked, each removed only once it is
+        // answered: a retryable refusal leaves it parked.
+        self.release_parked_reads(leader, &status, delivery)?;
         let bound = self.consensus.pending_reads();
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
-            if barrier.index > self.applied_raft {
+            if self.read_waits(barrier, leader, &status) {
                 // Answered by a leader ahead of this copy (27 §5, F55):
                 // replication lag, never corruption. The read waits for
                 // the entries it names; the delivery goes on so they can
-                // arrive. A parked set that is full drops the barrier,
-                // counted, rather than hold back this delivery.
+                // arrive. Or answered to a leader before its readiness of
+                // the term: it waits for that (`Session::read_waits`). A
+                // parked set that is full drops the barrier, counted,
+                // rather than hold back this delivery.
                 self.park_read(barrier, bound)?;
                 delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
                 continue;
@@ -1531,6 +1521,9 @@ impl Session {
             self.complete_read(&barrier, leader, &status, delivery)?;
             delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
         }
+        // The readiness of the term, answered in this delivery, releases
+        // the reads it held, parked above or before it.
+        self.release_parked_reads(leader, &status, delivery)?;
         if leader
             && self.consensus.has_committed_current_term()
             && self.ready_term != Some(status.term)
@@ -1567,6 +1560,54 @@ impl Session {
         Ok(())
     }
 
+    /// Whether a read barrier waits before it is answered: until this copy
+    /// has applied the entries it names (27 §5, F55), and, at a leader,
+    /// until the leader's readiness of its term is answered. A leader
+    /// answers a read only once it is authoritative (`is_authoritative`), so
+    /// that what the read promises — this leader leads this term, with
+    /// everything committed before it applied — holds for what is asked of
+    /// it next. The readiness barrier is asked once the term's first entry
+    /// is committed, at the end of the delivery that finds it so, while a
+    /// read asked before that delivery leaves with its round: answered a
+    /// round ahead of the readiness, it was answered by a leader whose
+    /// membership read, asked next, was refused `NotReady` (the gate on
+    /// 9b4c6bd). A read held here is answered no later than in the
+    /// delivery that answers the readiness, at a prefix no older than its
+    /// barrier.
+    fn read_waits(
+        &self,
+        barrier: &focal_consensus::ReadBarrier,
+        leader: bool,
+        status: &focal_consensus::NodeScalars,
+    ) -> bool {
+        barrier.index > self.applied_raft
+            || (leader
+                && self.ready_term != Some(status.term)
+                && readiness_term(&barrier.context) != Some(status.term))
+    }
+    /// Answer the parked barriers that wait no longer, in the order they
+    /// were parked.
+    fn release_parked_reads(
+        &mut self,
+        leader: bool,
+        status: &focal_consensus::NodeScalars,
+        delivery: &mut PendingDelivery,
+    ) -> Result<(), LedgerError> {
+        while let Some(position) = self
+            .parked_reads
+            .iter()
+            .position(|barrier| !self.read_waits(barrier, leader, status))
+        {
+            let barrier = self
+                .parked_reads
+                .get(position)
+                .cloned()
+                .ok_or(LedgerError::Corrupt)?;
+            self.complete_read(&barrier, leader, status, delivery)?;
+            self.parked_reads.remove(position);
+        }
+        Ok(())
+    }
     /// Answer one read barrier this copy has applied up to: the readiness
     /// barrier of this term, a native correlated read, or a legacy read.
     fn complete_read(
@@ -1642,8 +1683,10 @@ impl Session {
         }
         Ok(())
     }
-    /// Read barriers answered above this copy's applied index and held until
-    /// it caught up, since this session opened (27 §5, follower reads).
+    /// Read barriers held before they were answered, since this session
+    /// opened: answered above this copy's applied index and held until it
+    /// caught up (27 §5, follower reads), or answered to a leader before
+    /// its readiness of the term and held for it (`Session::read_waits`).
     pub fn reads_parked(&self) -> u64 {
         self.reads_parked
     }
@@ -1800,6 +1843,108 @@ mod tests {
         assert_eq!(readiness_term(shorter), None);
         assert_eq!(readiness_term(&[7; 16]), None);
         assert_eq!(readiness_term(&[]), None);
+    }
+    /// A leader answers a read only once it is authoritative in its term.
+    /// A read asked between the commit of the term's first entry and the
+    /// poll that delivers it leaves with that poll's round, a round ahead
+    /// of the readiness barrier asked at the delivery's end: its barrier is
+    /// held until the readiness is answered and then answered in the same
+    /// delivery. Before, it was answered by a leader not yet authoritative,
+    /// and a membership read asked next was refused `NotReady` (fleet_quic's
+    /// trusted membership test, the gate on 9b4c6bd).
+    #[test]
+    fn a_leader_answers_a_read_only_once_it_is_ready_in_its_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions: Vec<Session> = (1..=3)
+            .map(|id| {
+                let mut cfg = config();
+                cfg.node_id = id;
+                cfg.voters = vec![1, 2, 3];
+                Session::open(
+                    dir.path().join(id.to_string()),
+                    identity(),
+                    cfg,
+                    SessionLimits::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        // One poll of every session, its messages carried, but those `held`
+        // keeps: what the leader is sent, held back, is returned.
+        fn carry(sessions: &mut [Session], held: impl Fn(&Message) -> bool) -> Vec<Message> {
+            let mut messages = Vec::new();
+            for session in sessions.iter_mut() {
+                messages.extend(session.poll().unwrap().messages);
+            }
+            let mut kept = Vec::new();
+            for message in messages {
+                if held(&message) {
+                    kept.push(message);
+                } else {
+                    sessions[message.to as usize - 1].step(message).unwrap();
+                }
+            }
+            kept
+        }
+        sessions[0].campaign().unwrap();
+        for _ in 0..40 {
+            if sessions[0].status().role == StateRole::Leader {
+                break;
+            }
+            carry(&mut sessions, |_| false);
+        }
+        assert_eq!(sessions[0].status().role, StateRole::Leader);
+        // The followers' answers to the leader's first entry, held back.
+        let mut answers = Vec::new();
+        for _ in 0..40 {
+            answers = carry(&mut sessions, |message| {
+                message.to == 1
+                    && message.msg_type == focal_consensus::MessageType::MsgAppendResponse
+            });
+            if !answers.is_empty() {
+                break;
+            }
+        }
+        assert!(!answers.is_empty(), "the first entry's answers");
+        // The answers commit the term's first entry; a read is asked before
+        // the leader polls.
+        for answer in answers {
+            sessions[0].step(answer).unwrap();
+        }
+        sessions[0]
+            .read_index(b"a participant's read".to_vec())
+            .unwrap();
+        let mut answered = None;
+        for round in 0..40 {
+            let events = sessions[0].poll().unwrap();
+            if events
+                .read_barriers
+                .iter()
+                .any(|(context, _)| context.as_slice() == b"a participant's read")
+            {
+                assert!(
+                    sessions[0].is_authoritative(),
+                    "the read was answered by a leader not yet authoritative in its term"
+                );
+                answered = Some(round);
+                break;
+            }
+            for message in events.messages {
+                sessions[message.to as usize - 1].step(message).unwrap();
+            }
+            let mut back = Vec::new();
+            for session in &mut sessions[1..] {
+                back.extend(session.poll().unwrap().messages);
+            }
+            for message in back {
+                sessions[message.to as usize - 1].step(message).unwrap();
+            }
+        }
+        assert!(answered.is_some(), "the read was answered");
+        assert!(
+            sessions[0].reads_parked() > 0,
+            "the read waited for readiness"
+        );
     }
     fn identity() -> LedgerId {
         LedgerId {

@@ -3584,6 +3584,50 @@ a defect of batching** (2026-10-04).
   replicas' periods, and each names every replica's state when it is spent. That is
   how the defect above was found.
 
+**A leader answered a read before it was authoritative in its term** (the gate on
+9b4c6bd, 2026-10-04).
+- **Symptom.** `fleet_quic`'s
+  `trusted_membership_commits_catchup_promotion_and_exact_failover_retry` failed with
+  `NotReady { leader: 2 }` from a membership request. The node had just answered the
+  test's probe, a linearizable read. Alone, it failed 3 runs of 6 (and 2 of 8 in a
+  second set): at its first leader, or after the fleet's restart.
+- **Cause.**
+  - A read is answered once its barrier's round is confirmed in the leader's term.
+    Authority (`is_authoritative`: the term's readiness barrier answered) is asked
+    separately, at the end of the delivery that finds the term's first entry
+    committed.
+  - A read asked before that delivery leaves with its round, one round ahead of the
+    readiness barrier. With batching, the frame that commits the term's first entry
+    and the probe's read can be taken in one batch.
+  - So a leader that had answered a read refused, as not yet authoritative, the
+    membership read asked of it next. Monitor and request-stream reads, which require
+    authority when their barrier is answered, were left unanswered until their deadline
+    on the same race.
+  - On focal-node's source of 96c61ad, before batching, the test passed 8 runs of 8.
+- **Fix.** A leader answers a read only once it is authoritative in its term
+  (`Session::read_waits`).
+  - A barrier answered before the term's readiness is parked with those answered
+    above the applied index, under the same bound and charge.
+  - It is released by the delivery that answers the readiness, after its read states
+    (`release_parked_reads`), at a prefix no older than its barrier.
+  - Followers' reads are unchanged.
+- **Tests.**
+  - `session::tests::a_leader_answers_a_read_only_once_it_is_ready_in_its_term` holds
+    back the followers' answers to the leader's first entry, delivers them, asks a read
+    before the leader polls, and requires the leader to be authoritative when the read
+    is answered. With the wait removed, it fails there.
+  - The trusted membership test passes 10 runs of 10.
+- **Open, handed to the shared core.** A read asked of a leader before its term's first
+  commit is dropped by the core: hyper-raft's `read_index` returns `Ok(())`, as raft-rs
+  does. The read is answered only at its deadline, and a follower's forwarded read the
+  same way. etcd holds such reads (`pendingReadIndexMessages`) and releases them at the
+  first commit. Reported to the peer integrating hyper-raft, who takes the deferral into
+  the core; reads the core holds die with the term.
+- **Open, in focal.** The owner gives up a waiting read at once when the term changes,
+  but not when its leader steps down within the term (check-quorum). The role guard
+  keeps such a read from being answered, and it waits for its deadline. The next batch
+  gives up the waits a leader answers at the role change too.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms
