@@ -3506,6 +3506,27 @@ now, for the founder and the seated host, each hosted group's state and its owne
 progress — term, leader, applied index, frames held, let go and found stale, the failure
 it stopped on — and whether each service ended, so the next run names the cause. Open.
 
+**An answer of the log that found the owner's signals full was left to the session's
+tick** (PR #4's macOS run on 96c61ad, `fleet::async_tests::a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits`:
+"1 of 1000 sessions were not woken by the log's answer: [1000]"; F45's test). One write of
+the log answers every session that wrote with it, and each answer's call queues a signal
+for the owner that shares its thread among them; the queue holds 1,024 signals, an owner
+up to 4,096 sessions, and inputs' signals share the queue. A thousand sessions answered
+at once filled it, and the signal that found it full was dropped — its session, its
+write answered, waited for its tick, up to its owner's stretched period (ten seconds in
+the test). The design took that for a bound (27 §9: "made good at the session's tick"); it
+is a lost wakeup under a load at which an owner is most needed. *Fix.* An answer's signal
+that finds the queue full arms a token of one (`OwnerQueue::persisted`): a second drop
+while it is pending is covered by it. The owner takes the token with its signals, then
+makes every session with a write out due, each looked at once (`GroupOwner::sweep`,
+`ReplicaProgress::waits_swept`): which answer was lost is not known, and a look reads the
+write's own answer. Taken first and swept after, a drop during the sweep arms it again. An
+input's signal that finds the queue full is still dropped: the queue being full wakes the
+owner, which takes its input at every pass. *Tests.*
+`fleet::grouped::tests::an_answer_that_finds_the_signals_full_arms_the_sweep` (the queue
+filled, one token for two drops, taken, armed again); the held log's test takes a session
+woken by its signal or by a sweep, and prints how many sweeps looked.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

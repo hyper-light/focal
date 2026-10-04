@@ -13187,3 +13187,14 @@ what is queued, up to what it admits at once, and drains once. Three grouped rep
 under sixteen clients, on hyper-raft (96c61ad), wrote 5.25 to 6.10 entries a write and
 committed 31 to 38 a second, against one entry a write and 17 a second before (on
 focal-raft: 5.0 to 5.6 entries a write, 32 to 38 a second, against 15 to 18).
+
+### 2026-10-04 — an answer of the log that finds the owner's signals full is not lost
+
+PR #4's macOS run left one of a thousand sessions, answered by one write of the log, to
+its tick: the owner's signals hold 1,024, an owner up to 4,096 sessions, and the signal
+that found the queue full was dropped. Such a signal arms a token of one now
+(`OwnerQueue::persisted`), and the owner, having taken it, makes every session with a
+write out due (`GroupOwner::sweep`, counted in `ReplicaProgress::waits_swept`).
+`fleet::grouped::tests::an_answer_that_finds_the_signals_full_arms_the_sweep`; the held
+log's test counts a sweep's look as a wake.
+

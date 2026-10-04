@@ -457,7 +457,9 @@ async fn stopping_last_session_on_a_stalled_writer_does_not_join_it_on_the_fleet
 /// write out:
 /// the owner asks about each write as it queues it and not again; and when
 /// the log answers, its answer wakes every session that waited on it — each
-/// one's count of the log's answers grows — and every write is committed.
+/// one's count of the log's answers grows, or the sweep an answer's signal
+/// that found the owner's signals full asked for looks at it — and every
+/// write is committed.
 /// The owners' ticks are stretched to ten seconds here, the longest an
 /// owner's may be, so that a wake the log's answer failed to deliver is
 /// left to a tick. A first statement held the commits to five seconds of
@@ -537,9 +539,13 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
         let waiting: Vec<bool> = writes.iter().map(|write| !write.is_finished()).collect();
         let unanswered = waiting.iter().filter(|waits| **waits).count();
         assert_eq!(unanswered as u128, sessions);
-        // What each session had heard from the log before it answers.
-        let answered_before: Vec<u64> = (1..=sessions)
-            .map(|index| fixture.hosts[&ledger(index)].progress().waits_answered)
+        // What each session had heard from the log before it answers, and
+        // how often a sweep had looked at it.
+        let answered_before: Vec<(u64, u64)> = (1..=sessions)
+            .map(|index| {
+                let progress = fixture.hosts[&ledger(index)].progress();
+                (progress.waits_answered, progress.waits_swept)
+            })
             .collect();
         resume.send(()).unwrap();
         drop(disk.join().unwrap());
@@ -590,13 +596,23 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
                 .result;
             }
         }
-        // The log's answer woke every session that waited on it.
+        // The log's answer woke every session that waited on it: its signal,
+        // or — where a write answered more sessions than the owner's signals
+        // hold and an answer's signal found them full — the sweep that
+        // signal's loss asked for. Before the sweep, such a session waited for
+        // its tick (PR #4's macOS run: one of a thousand).
+        let mut swept = 0;
         let unwoken: Vec<u128> = (1..=sessions)
             .filter(|index| {
-                fixture.hosts[&ledger(*index)].progress().waits_answered
-                    <= answered_before[usize::try_from(*index - 1).unwrap()]
+                let progress = fixture.hosts[&ledger(*index)].progress();
+                let (answered, looked) = answered_before[usize::try_from(*index - 1).unwrap()];
+                if progress.waits_swept > looked {
+                    swept += 1;
+                }
+                progress.waits_answered <= answered && progress.waits_swept <= looked
             })
             .collect();
+        println!("{sessions} sessions: {swept} looked at by a sweep");
         shutdown(fixture).await;
         assert!(
             unwoken.is_empty(),

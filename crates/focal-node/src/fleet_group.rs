@@ -62,9 +62,14 @@ pub(super) enum FleetInput {
 }
 /// What the shared owner waits on: something was queued for it, or a write
 /// of one of its sessions was answered by the log. A signal says there is
-/// something to take, nothing more: one that finds the queue of signals
-/// full is dropped, since the owner is then about to take what the queued
-/// ones say and looks at its input and its sessions after each of them.
+/// something to take, nothing more. An input's signal that finds the queue
+/// full is dropped: the owner takes its input at every pass. An answer's is
+/// not lost: it finds the queue full when one write of the log answers more
+/// sessions than the queue holds (an owner holds up to 4,096 sessions, the
+/// queue 1,024 signals — the gate of PR #4 met a thousand sessions answered
+/// at once, one of them left to its tick), and then the owner is told that
+/// one was not queued, and looks at every session with a write out
+/// (`GroupOwner::sweep`).
 pub(super) enum Signal {
     Input,
     Persisted(LedgerId),
@@ -75,13 +80,32 @@ pub(super) enum Signal {
 pub(super) struct OwnerQueue {
     input: mpsc::SyncSender<FleetInput>,
     signal: mpsc::SyncSender<Signal>,
+    /// That an answer's signal found the queue full: one token at most,
+    /// pending until the owner takes it — a second drop while one is pending
+    /// is covered by it.
+    overflow: mpsc::SyncSender<()>,
 }
+/// The owner's ends of its queue: its input, its signals, and the token
+/// that says an answer's signal was not queued.
+type OwnerEnds = (
+    mpsc::Receiver<FleetInput>,
+    mpsc::Receiver<Signal>,
+    mpsc::Receiver<()>,
+);
 impl OwnerQueue {
     /// The owner's input and signal queues, and this handle on them.
-    fn new() -> (Self, mpsc::Receiver<FleetInput>, mpsc::Receiver<Signal>) {
+    fn new() -> (Self, OwnerEnds) {
         let (input, inputs) = mpsc::sync_channel(QUEUED);
         let (signal, signals) = mpsc::sync_channel(QUEUED);
-        (Self { input, signal }, inputs, signals)
+        let (overflow, overflows) = mpsc::sync_channel(1);
+        (
+            Self {
+                input,
+                signal,
+                overflow,
+            },
+            (inputs, signals, overflows),
+        )
     }
     /// The refusal carries the work back, as the queue's own does; it is
     /// boxed, the work being large and a refusal rare.
@@ -98,10 +122,17 @@ impl OwnerQueue {
     /// then, instead of asking the log at intervals (27 §9).
     pub(super) fn persisted(&self, ledger: LedgerId) -> focal_consensus::PersistedSignal {
         let signal = self.signal.clone();
+        let overflow = self.overflow.clone();
         Box::new(move || {
             let signal = signal.clone();
+            let overflow = overflow.clone();
             Box::new(move || {
-                let _ = signal.try_send(Signal::Persisted(ledger));
+                // A full queue does not lose the answer: the owner is told
+                // one was not queued, and sweeps (`GroupOwner::sweep`).
+                if let Err(mpsc::TrySendError::Full(_)) = signal.try_send(Signal::Persisted(ledger))
+                {
+                    let _ = overflow.try_send(());
+                }
             })
         })
     }
@@ -234,7 +265,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, receiver, signals) = OwnerQueue::new();
+        let (sender, (receiver, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let mut sessions = BTreeMap::new();
         let mut wal_owners = Vec::new();
@@ -308,6 +339,7 @@ impl ReplicaFleet {
             deadlines,
             scheduler,
             signals,
+            overflows,
             unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: None,
@@ -336,6 +368,8 @@ struct GroupOwner {
     scheduler: FairScheduler<Option<Routed>>,
     /// What wakes this owner when it has nothing due (`Signal`).
     signals: mpsc::Receiver<Signal>,
+    /// That an answer's signal found the signals full (`OwnerQueue::persisted`).
+    overflows: mpsc::Receiver<()>,
     /// The sessions that wait to persist and that the log will not tell
     /// this owner of: it had no room for their write. One is asked again
     /// for each write of this owner's the log answers — a write answered is
@@ -421,6 +455,29 @@ impl GroupOwner {
             match self.signals.try_recv() {
                 Ok(signal) => self.signalled(signal),
                 Err(_) => break,
+            }
+        }
+        if self.overflows.try_recv().is_ok() {
+            self.sweep();
+        }
+    }
+    /// An answer's signal found the signals full and was not queued
+    /// (`OwnerQueue::persisted`): which session's write it answered is not
+    /// known, so every session with a write out is due now — one look each,
+    /// its drain reading its write's own answer — and none is left to its
+    /// tick. Rare: a write of the log answering more sessions than the
+    /// signals hold.
+    fn sweep(&mut self) {
+        let now = Instant::now();
+        for (ledger, owner) in &mut self.sessions {
+            if !owner.session.persistence_pending() {
+                continue;
+            }
+            owner.waits_swept = owner.waits_swept.saturating_add(1);
+            if owner.wake_at > now {
+                self.deadlines.remove(&(owner.wake_at, *ledger));
+                owner.wake_at = now;
+                self.deadlines.insert((now, *ledger), ());
             }
         }
     }
@@ -615,5 +672,47 @@ impl GroupOwner {
         if let Some(waiting) = self.unwoken.pop_first() {
             self.due(waiting);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer's signal that finds the owner's signals full is not lost:
+    /// the token says one was not queued, a second drop while it is pending
+    /// is covered by it, and once it is taken a drop arms it again. Before,
+    /// such a signal was dropped and its session left to its tick (PR #4's
+    /// macOS run: one of a thousand sessions answered by one write).
+    #[test]
+    fn an_answer_that_finds_the_signals_full_arms_the_sweep() {
+        let (queue, (_inputs, signals, overflows)) = OwnerQueue::new();
+        let ledger = LedgerId {
+            tenant: focal_model::TenantId::from_u128(1),
+            session: focal_model::SessionId::from_u128(1),
+        };
+        let wake = queue.persisted(ledger);
+        for _ in 0..QUEUED {
+            (wake())();
+        }
+        assert!(overflows.try_recv().is_err(), "nothing dropped yet");
+        (wake())();
+        (wake())();
+        assert!(overflows.try_recv().is_ok(), "a drop armed the token");
+        assert!(overflows.try_recv().is_err(), "one token covers both drops");
+        let mut taken = 0;
+        while signals.try_recv().is_ok() {
+            taken += 1;
+        }
+        assert_eq!(taken, QUEUED);
+        // Room again: the next answer is queued, and nothing is armed.
+        (wake())();
+        assert!(overflows.try_recv().is_err());
+        assert!(matches!(signals.try_recv(), Ok(Signal::Persisted(at)) if at == ledger));
+        // Full again after the token was taken: armed again.
+        for _ in 0..=QUEUED {
+            (wake())();
+        }
+        assert!(overflows.try_recv().is_ok());
     }
 }

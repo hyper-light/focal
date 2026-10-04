@@ -964,7 +964,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, receiver, signals) = OwnerQueue::new();
+        let (sender, (receiver, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
@@ -1003,6 +1003,7 @@ impl ReplicaFleet {
             deadlines: BTreeMap::new(),
             scheduler,
             signals,
+            overflows,
             unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: Some(management),
