@@ -1611,6 +1611,22 @@ hyper-transport carries the core's own encoding under a negotiated version. Swit
 profile now, only for hyper-transport to replace focal-wire after, would build the switch twice.
 §14's wire profile moves to the transport step.
 
+**What the frozen encoding keeps off until then.** raft-rs's messages have no field for what
+hyper-raft's core may say, so the envelope refuses it and focal configures the core never to say
+it:
+- **A member's mark** (`Message::lost`, R-5). focal's log never sets one.
+- **An append kept ahead of a hole** (`Message::kept`, R17). focal's members run
+  `Ahead::Refused`, raft-rs's rule, since hyper-raft `df54729`. The cost is the tail on paths that
+  reorder. hyper-raft's measurement of slates' five regions (`docs/benchmarks.md`, "What arrives
+  ahead of a hole (R17)", 2026-10-03, load 3.9–10.3): at 4,000 proposals a second under the window
+  rule, raft-rs's rule gives a p99 of 18,542 ms at 1,588 commits a second, and R17 gives 126 ms at
+  4,000. At 2,000 a second, 2,083.5 ms against 126 ms. On paths that keep order with 1% loss, R17
+  is no better (four batches: 402 ms against 260.5 ms p99).
+
+When the transport step negotiates the core's encoding, both turn on, and with R17 the test of
+hyper-check S-4's probe of a member that lost what it kept ahead
+(`a_member_that_lost_what_it_kept_ahead_is_probed`, run at focal's level) joins focal's suites.
+
 ### 15.10 Evidence (the gate)
 
 - A crash cut at every new ordering edge:

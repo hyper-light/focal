@@ -367,21 +367,70 @@ pub(crate) fn snapshot_still_pending<S: Storage>(
             .is_some_and(|progress| progress.pending_snapshot == index)
 }
 
-/// Whether the commit is of the member's current term: a leader completes a quorum read only once
-/// it has committed the entry it began its term with; any other member, once the entry committed
-/// is of its term.
+/// Whether the commit covers the entry the member's current term began with: a leader completes a
+/// quorum read, changes its configuration and is ready only once it has, and a follower resolves
+/// what a former leader proposed by it (focal-ledger's `settle`).
+///
+/// The commit holding an entry of the term is not enough. A leader of a fast group takes what its
+/// voters approved into its log under its own term, below an index a fast quorum may have
+/// committed before its term began, and its term-start entry after them (Ongaro's thesis §6.4;
+/// hyper-raft S-4). A leader knows that entry (`Raft::commit_to_current_term`). A follower of a
+/// fast group finds it in its log: the term's first entries are those its leader recovered and
+/// then the empty entry the leader began with, so it is among the first `Limits::proposals` and
+/// one more of the term. A follower that cannot find it, its log compacted past the term's start
+/// or not yet holding the entry, says no, and what waits on it waits. Without the fast track no
+/// entry is restamped and every entry of the term follows the one it began with, so a follower
+/// there asks only that the entry committed be of its term.
 pub(crate) fn committed_in_term<S: Storage>(raw: &RawNode<S>) -> bool {
     if raw.raft.state() == StateRole::Leader {
-        // A leader of a fast group takes what its voters approved into its log under its own term,
-        // below an index a fast quorum may have committed before its term began. An entry of its
-        // term committed is then no proof that the commit covers what came before the term, so it
-        // waits for the entry it began its term with (Ongaro's thesis §6.4; hyper-raft S-4,
-        // `Raft::commit_to_current_term`).
         return raw.raft.commit_to_current_term();
+    }
+    if raw.raft.config().fast {
+        return term_start(raw).is_some_and(|start| raw.raft.log().committed() >= start);
     }
     raw.store()
         .term(raw.raft.log().committed())
         .is_ok_and(|term| term == raw.raft.term())
+}
+
+/// The index of the empty entry a follower's current term began with, where its log shows it.
+fn term_start<S: Storage>(raw: &RawNode<S>) -> Option<u64> {
+    let term = raw.raft.term();
+    let store = raw.store();
+    let first = store.first_index().ok()?;
+    let last = store.last_index().ok()?;
+    // A term's entries are one run of the log: the first index of `term` is found by halving.
+    // The snapshot's own term (the index before the first) must be older, or the term may have
+    // begun inside what was compacted.
+    if store.term(first.checked_sub(1)?).ok()? >= term {
+        return None;
+    }
+    let (mut low, mut high) = (first, last.checked_add(1)?);
+    while low < high {
+        let mid = low.checked_add(high.checked_sub(low)? / 2)?;
+        if store.term(mid).ok()? < term {
+            low = mid.checked_add(1)?;
+        } else {
+            high = mid;
+        }
+    }
+    let span = u64::try_from(raw.raft.config().limits.proposals)
+        .ok()?
+        .checked_add(1)?;
+    let end = low.checked_add(span)?.min(last.checked_add(1)?);
+    let mut found = None;
+    store
+        .any_entry(low, end, &mut |entry| {
+            let start = entry.term == term
+                && entry.entry_type == proto::EntryType::EntryNormal
+                && entry.data.is_empty();
+            if start {
+                found = Some(entry.index);
+            }
+            start
+        })
+        .ok()?;
+    found
 }
 
 /// Whether the configuration a snapshot states, `stated`, names every member of `current`, the

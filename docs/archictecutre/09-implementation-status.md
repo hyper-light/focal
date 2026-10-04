@@ -13625,7 +13625,8 @@ focal's adaptation:
   - one write is out;
   - the members are `MAX_MEMBERS`, focal's own 1,024, carried unchanged into focal-consensus because
     the group files' bounds are sized by it.
-- **Kept appends off the wire until the fence.** R17's kept appends say so in a refusal
+- **Kept appends off the wire until the fence** (27 §15.9 states what this costs and when it
+  ends). R17's kept appends say so in a refusal
   (`Message::kept`), which raft-rs's encoding, the one focal's peers speak until the upgrade fence
   opens a successor (18 §1), cannot state. So focal's members run `Ahead::Refused`, raft-rs's rule,
   and the envelope refuses a `kept` it is given, as it refuses a member's mark. The test is
@@ -13635,13 +13636,27 @@ focal's adaptation:
   wait on) asked whether the entry committed is of the current term. That is the rule S-4 found
   wrong for a fast group, whose new leader takes what its voters approved into its log under its
   own term, below a commit made before its term began. A leader now waits for its term-start entry
-  (`Raft::commit_to_current_term`); any other member keeps the old rule, which focal-ledger's
-  follower settling (`NativeSession::settle`) reads.
-  - `a_fast_leader_is_ready_only_once_its_term_start_entry_commits` checks the rule after every
-    message of a fast leader change. It does not fail on the old rule: focal holds no more approved
-    bytes than one message carries, so the recovered entries and the term-start entry travel in one
-    append and commit together. It holds the rule where hyper-raft's judge reached the defect
-    (seed 15,761 of its fast schedules).
+  (`Raft::commit_to_current_term`).
+  - A follower of a fast group does the same. focal-ledger's `NativeSession::settle` discards a
+    former leader's older-term proposals once the follower's commit holds an entry of the new
+    term. Under the old rule, a follower that applied the first restamped entry discarded
+    proposals whose restamped copies came later in the same log and did commit.
+  - The follower finds the term-start entry in its log: halving over the terms to the term's
+    first index, then the empty entry among the next `Limits::proposals` and one. Where its log
+    cannot show it, compacted past the term's start, it says no and disposition waits.
+  - A follower of a classic group keeps the old rule. Nothing is restamped there.
+  - `a_fast_leader_is_ready_only_once_its_term_start_entry_commits` checks the rule at the leader
+    and at a follower after every message of a fast leader change. It cannot fail on the old rule
+    in focal's bounds, and no setting of a test can make it:
+    - the bytes a member holds approved are not a bound of their own, they are derived
+      (`Limits::derive`): one message's payload, counted resident at more than an entry's bytes
+      on the wire;
+    - an append carries a page, which is that payload;
+    - so whatever focal's settings, the recovered entries and the empty term-start entry fit one
+      append and commit together.
+
+    It holds the rule where hyper-raft's judge reached the defect (seed 15,761 of its fast
+    schedules).
   - `a_member_restarted_under_loss_catches_up_past_its_hole` restarts a member that missed a
     batch and refused the appends ahead of it, and checks it applies everything committed.
 - **Images weighed by size.** `HandOver` keeps its durable image's bytes for the compaction rule

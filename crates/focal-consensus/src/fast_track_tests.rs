@@ -403,8 +403,8 @@ fn term_start(group: &Group, node: usize) -> Option<u64> {
 /// entry it began its term with (hyper-raft S-4; Ongaro's thesis §6.4). The leader of term 1
 /// commits a proposal by the fast quorum and leaves before its members learn the commit; the member
 /// elected after it takes what its voters approved into its log under its own term, below that
-/// commit, and its term-start entry after it. Readiness is checked after every message delivered:
-/// it never holds while the commit is below the term-start entry. (focal's members hold no more
+/// commit, and its term-start entry after it. Readiness is checked after every message delivered,
+/// at the leader and at a follower: it never holds while the commit is below the term-start entry. (focal's members hold no more
 /// approved bytes than one message carries, so today the recovered entries and the term-start
 /// entry travel in one append and commit together; hyper-raft's judge reached the commit between
 /// them at seed 15,761 of its fast schedules, and this holds focal's rule at that boundary.)
@@ -437,6 +437,18 @@ fn a_fast_leader_is_ready_only_once_its_term_start_entry_commits() {
         let Some(at) = at else { break };
         let message = group.net.remove(at);
         group.deliver(message);
+        // Member 3, a follower, resolves a former leader's proposals only past the same entry
+        // (focal-ledger's `settle`).
+        let follower = &group.nodes[2];
+        if follower.status().role == StateRole::Follower && follower.has_committed_current_term() {
+            let start =
+                term_start(&group, 2).expect("the follower's term-start entry is in its log");
+            let commit = follower.status().committed_index;
+            assert!(
+                commit >= start,
+                "follower ready at {commit}, its term began at {start}"
+            );
+        }
         let node = &group.nodes[1];
         if node.status().role != StateRole::Leader {
             continue;
@@ -455,6 +467,7 @@ fn a_fast_leader_is_ready_only_once_its_term_start_entry_commits() {
     assert!(became);
     assert!(group.nodes[1].status().committed_index > committed);
     assert!(group.nodes[1].has_committed_current_term());
+    assert!(group.nodes[2].has_committed_current_term());
 }
 
 /// A group of three on the classic track.
