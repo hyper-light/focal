@@ -191,10 +191,10 @@ fn the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss() {
         );
     }
     // The zone survival still holds and the demo still reads.
-    assert_eq!(
-        guarantee(&placement(&founder).unwrap(), &ledger),
-        (Some(1), 0)
-    );
+    let after = placement(&founder).unwrap();
+    // The whole view on a failure: which member a blocker names, and what
+    // the registry holds of its liveness (verdict, incarnation, witness).
+    assert_eq!(guarantee(&after, &ledger), (Some(1), 0), "{after:#}");
     journey.same(&founder, &before);
     journey.assert_redacted(&[&token]);
     journey.not_executed(

@@ -109,9 +109,6 @@ impl ControlHost {
                     || -> Result<(), DirectoryBootstrapError> {
                         let opened = permit.open(wal, &budget, image)?;
                         let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
-                        let mut epoch = [0u8; 8];
-                        getrandom::fill(&mut epoch)
-                            .map_err(|_| DirectoryBootstrapError::Unavailable)?;
                         let owner = Owner {
                             replica: opened.into_replica(),
                             initial: None,
@@ -133,7 +130,6 @@ impl ControlHost {
                             progress: progress.clone(),
                             nonce: 0,
                             dropped: 0,
-                            epoch: u64::from_le_bytes(epoch),
                             ordered: std::collections::BTreeMap::new(),
                             resequencer: crate::resequence::Resequencer::new(
                                 focal_consensus::DEFAULT_INFLIGHT_WINDOW,

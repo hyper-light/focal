@@ -3389,6 +3389,44 @@ retained more than was reserved, the step was refused for capacity, and the node
 This core priced it the same way. It is priced at the larger of the snapshot and the page
 from the first entry, plus the window beyond the first page (doc 09 has the account).
 
+**An append given up at its sender left no gap in the order** (a peer session's gate of
+PR #4 on 19c6f82, the core switched to hyper-raft: the lossy path counted 3 of 7
+refusals in order, 4 let go; its prints on ten copies at once: follower 2 refused the
+appends naming entries 487 to 489 in order, its log ending at 486, with no frame let go
+since the loss that set its mark at 30). The fleet owner's `send` gave a frame up — no
+room for its charge, or no encoding — before it gave the frame its sequence, so the
+order showed no gap where the append carrying 487 should have been, and the appends
+pipelined after it were refused in an order that showed none: refusals of a loss,
+counted as the order's. The core was told the frame was lost and probed, as before.
+hyper-raft queues more appends a `Ready`, which the peer reads as meeting the sender's
+bound more often; the runs with the classic core here showed none. *Fix.* A bulk frame takes its
+sequence before anything can give it up, so a frame given up leaves its gap, its peer
+lets the frames behind it go past their patience as for one the path lost, and takes the
+refusals after for the loss's (`Owner::send`, `ControlHost`'s owner the same).
+*Found on the way:* the epoch of the order was the owner's incarnation, drawn at random
+when it started, and a receiver takes a smaller epoch for an older one: a sender that
+restarted drew a smaller one as often as not, and every frame of it was then stepped as
+stale, its order lost, until the lane was pruned. The epoch is the term of the frames
+now: only a leader sends bulk frames and a node leads again only in a later term, so a
+source's epochs only grow; a new term begins its own sequence. *Test.*
+`fleet::list_tests::append_order_tests::an_append_given_up_before_it_leaves_keeps_its_place_in_the_order`
+(the owner's budget held so a frame's charge is refused: the frame after carries the
+sequence after the one given up; a later term's appends begin again at 1 under the new
+epoch).
+
+**The zone stage's guarantee read once after the zone's return** (macOS CI, 457395c's
+push run, `deployment_zones`'s `the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss`:
+the guarantee `(Some(0), 2)` where `(Some(1), 0)` was asserted, read the moment after a
+region plan's dry run, the wait before it having seen the zone's host alive and the
+guarantee restored). A dry run journals and commits nothing (`answer_plan_request`), so
+it moved nothing. No failure survivable with two blockers is one member read not alive —
+counted as a voter and as a copy — or a stale generation: the zone's host, just resumed,
+suspected again by the partition leader's detector while it caught up, or a verdict
+reached on a peer's stale view. Not reproduced: 22 copies here, ten at once and six at
+background priority. The assertion now prints the whole placement view — which member
+each blocker names, and the liveness verdict, incarnation and witness the registry holds
+— so the next run says which. Open.
+
 ## F48
 
 **Cause.** `managed_support::support` gave each of the three parts of a discovery 250 ms

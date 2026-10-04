@@ -206,7 +206,6 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         progress,
         nonce: 0,
         dropped: 0,
-        epoch: 0,
         ordered: std::collections::BTreeMap::new(),
         resequencer: crate::resequence::Resequencer::new(
             focal_consensus::DEFAULT_INFLIGHT_WINDOW,

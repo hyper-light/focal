@@ -783,9 +783,13 @@ struct Owner {
     incarnation: u64,
     nonce: u64,
     /// The order this owner's bulk frames to each peer leave in (27 §12):
-    /// the next sequence for the peer within this owner's incarnation,
-    /// pruned to the configuration's members each pass.
-    ordered: std::collections::BTreeMap<u64, u64>,
+    /// the term they belong to and the last sequence given within it,
+    /// pruned to the configuration's members each pass. A term, not the
+    /// owner's incarnation: only a leader sends bulk frames, and a node
+    /// leads again only in a later term, so a source's epochs only grow —
+    /// an incarnation drawn at random at a restart was smaller than the
+    /// one before as often as not, and its frames were taken for stale.
+    ordered: std::collections::BTreeMap<u64, (u64, u64)>,
     /// A peer's bulk frames held for the ones they overtook, stepped in
     /// their order (`crate::resequence`).
     resequencer: crate::resequence::Resequencer<HeldFrame>,
@@ -3706,6 +3710,31 @@ impl Owner {
             if message.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32 {
                 self.judge_append_answer(message);
             }
+            // A bulk frame carries the order it leaves in (27 §12): the
+            // next sequence to its peer within its term, for as many peers
+            // as a configuration names; the driver finishes it for the
+            // peer's profile. Given before any frame is given up here, so
+            // a frame given up leaves its gap in the order: its peer lets
+            // the frames behind it go past their patience, as for one the
+            // path lost, and takes what it refuses after for the loss's. A
+            // frame given up before it had a sequence left no gap, and the
+            // appends sent after it were refused in an order that showed
+            // none (a peer's runs of the lossy path, its core queueing more
+            // appends a Ready).
+            let urgent = urgent(message);
+            let sequence = if urgent {
+                None
+            } else {
+                match self.ordered.get(&message.to) {
+                    Some((term, last)) if *term == message.term => last.checked_add(1),
+                    Some(_) => Some(1),
+                    None if self.ordered.len() < LOST_PEERS => Some(1),
+                    None => None,
+                }
+            };
+            if let Some(sequence) = sequence {
+                self.ordered.insert(message.to, (message.term, sequence));
+            }
             let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
@@ -3756,30 +3785,13 @@ impl Owner {
             let id = ((u128::from(self.session.scalars().node_id) << 64) | u128::from(self.nonce))
                 .to_be_bytes();
             let group = self.session.group_id();
-            let urgent = urgent(message);
-            // A bulk frame carries the order it leaves in (27 §12): the
-            // next sequence to its peer within this owner's incarnation,
-            // for as many peers as a configuration names; the driver
-            // finishes it for the peer's profile.
-            let sequence = if urgent {
-                None
-            } else {
-                match self.ordered.get(&message.to) {
-                    Some(last) => last.checked_add(1),
-                    None if self.ordered.len() < LOST_PEERS => Some(1),
-                    None => None,
-                }
-            };
             let operation = match sequence {
-                Some(sequence) => {
-                    self.ordered.insert(message.to, sequence);
-                    Operation::RaftOrdered {
-                        group,
-                        epoch: self.incarnation,
-                        sequence,
-                        message: message_bytes,
-                    }
-                }
+                Some(sequence) => Operation::RaftOrdered {
+                    group,
+                    epoch: message.term,
+                    sequence,
+                    message: message_bytes,
+                },
                 None => Operation::Raft {
                     group,
                     message: message_bytes,

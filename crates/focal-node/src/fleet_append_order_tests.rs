@@ -127,3 +127,67 @@ fn a_leader_that_sends_its_appends_plain_is_spared_nothing_by_the_order() {
     deliver(&mut fixture, 3, plain(&second));
     assert_eq!(refused(&mut fixture, 3), (1, 0));
 }
+
+/// An append the leader gives up before it leaves — no room for its frame
+/// here — still takes its place in the order, so its peer sees the gap and
+/// takes the refusals behind it for the loss's (27 §12): one given up
+/// before it had a sequence left no gap, and the appends after it were
+/// refused in an order that showed none (a peer's runs of the lossy path,
+/// its core queueing more appends a Ready). And the order is the term's:
+/// a later term begins its own.
+#[test]
+fn an_append_given_up_before_it_leaves_keeps_its_place_in_the_order() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::open(root.path());
+    let owner = &mut fixture.owners[0];
+    let term = owner.session.scalars().term;
+    let append = |term: u64| {
+        let mut message = focal_consensus::Message::default();
+        message.set_msg_type(focal_consensus::MessageType::MsgAppend);
+        message.from = 1;
+        message.to = 2;
+        message.term = term;
+        message
+    };
+    owner.send(&[append(term)]).unwrap();
+    let first = owner.ordered.get(&2).copied().unwrap();
+    // No room for the next frame: it is given up, its sequence spent.
+    let stats = owner.budget.stats();
+    let hog = owner
+        .budget
+        .reserve(
+            BudgetKind::Control,
+            BudgetLane::Completion,
+            stats.limit - stats.used,
+        )
+        .unwrap()
+        .commit();
+    let dropped = owner.dropped;
+    owner.send(&[append(term)]).unwrap();
+    assert_eq!(owner.dropped, dropped + 1, "the frame was given up");
+    drop(hog);
+    owner.send(&[append(term)]).unwrap();
+    let mut sequences = Vec::new();
+    while let Ok(frame) = fixture.outgoing[0].try_recv() {
+        if let Operation::RaftOrdered {
+            epoch, sequence, ..
+        } = frame.request.operation
+            && frame.target == 2
+        {
+            sequences.push((epoch, sequence));
+        }
+    }
+    assert_eq!(
+        sequences,
+        [(term, first.1), (term, first.1 + 2)],
+        "the frame given up left its gap"
+    );
+    // A later term's appends begin an order of their own.
+    let owner = &mut fixture.owners[0];
+    owner.send(&[append(term + 1)]).unwrap();
+    let frame = fixture.outgoing[0].try_recv().unwrap();
+    assert!(matches!(
+        frame.request.operation,
+        Operation::RaftOrdered { epoch, sequence: 1, .. } if epoch == term + 1
+    ));
+}

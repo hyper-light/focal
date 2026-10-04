@@ -364,12 +364,13 @@ struct Owner<V> {
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
-    /// This owner's incarnation, the epoch of the order its bulk frames
-    /// leave in (27 §12); drawn when it started.
-    epoch: u64,
-    /// The next sequence of a bulk frame to each peer, pruned to the
-    /// members the replica accepts.
-    ordered: std::collections::BTreeMap<u64, u64>,
+    /// The order this owner's bulk frames to each peer leave in (27 §12):
+    /// the term they belong to and the last sequence given within it,
+    /// pruned to the members the replica accepts. A term is the epoch: only
+    /// a leader sends bulk frames and a node leads again only in a later
+    /// term, where an incarnation drawn at random at a restart was smaller
+    /// than the one before as often as not.
+    ordered: std::collections::BTreeMap<u64, (u64, u64)>,
     /// A peer's bulk frames held for the ones they overtook, stepped in
     /// their order (`crate::resequence`).
     resequencer: crate::resequence::Resequencer<HeldControlFrame>,
@@ -681,9 +682,6 @@ impl ControlHost {
             _allocation: None,
         });
         let (lost_sender, lost) = mpsc::sync_channel(crate::fleet::LOST_PEERS);
-        let mut epoch = [0u8; 8];
-        getrandom::fill(&mut epoch).map_err(|_| ControlError::Capacity)?;
-        let epoch = u64::from_le_bytes(epoch);
         let owner = Owner {
             replica,
             initial,
@@ -705,7 +703,6 @@ impl ControlHost {
             progress,
             nonce: 0,
             dropped: 0,
-            epoch,
             ordered: std::collections::BTreeMap::new(),
             resequencer: crate::resequence::Resequencer::new(
                 focal_consensus::DEFAULT_INFLIGHT_WINDOW,
@@ -2192,6 +2189,28 @@ impl<V: AuthorityVerifier> Owner<V> {
             {
                 self.appends_rejected = self.appends_rejected.saturating_add(1);
             }
+            // A bulk frame carries the order it leaves in (27 §12): the next
+            // sequence to its peer within its term, for as many peers as a
+            // configuration names; the driver finishes it for the peer's
+            // profile. Given before any frame is given up here, so a frame
+            // given up leaves its gap in the order and its peer lets the
+            // frames behind it go past their patience, as for one the path
+            // lost; one given up before it had a sequence left no gap, and
+            // the appends after it were refused in an order that showed none.
+            let urgent = crate::fleet::urgent(&message);
+            let sequence = if urgent {
+                None
+            } else {
+                match self.ordered.get(&message.to) {
+                    Some((term, last)) if *term == message.term => last.checked_add(1),
+                    Some(_) => Some(1),
+                    None if self.ordered.len() < crate::fleet::LOST_PEERS => Some(1),
+                    None => None,
+                }
+            };
+            if let Some(sequence) = sequence {
+                self.ordered.insert(message.to, (message.term, sequence));
+            }
             // Register the exact current flight before any local operation can
             // drop it. Replacing a prior receiver fences late transport results.
             let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
@@ -2236,32 +2255,15 @@ impl<V: AuthorityVerifier> Owner<V> {
                 continue;
             }
             self.nonce = self.nonce.checked_add(1).ok_or(ControlError::Capacity)?;
-            let urgent = crate::fleet::urgent(&message);
             let target = message.to;
             let group = self.replica.identity().group;
-            // A bulk frame carries the order it leaves in (27 §12): the
-            // next sequence to its peer within this owner's epoch, for as
-            // many peers as a configuration names; the driver finishes it
-            // for the peer's profile.
-            let sequence = if urgent {
-                None
-            } else {
-                match self.ordered.get(&target) {
-                    Some(last) => last.checked_add(1),
-                    None if self.ordered.len() < crate::fleet::LOST_PEERS => Some(1),
-                    None => None,
-                }
-            };
             let operation = match sequence {
-                Some(sequence) => {
-                    self.ordered.insert(target, sequence);
-                    Operation::RaftOrdered {
-                        group,
-                        epoch: self.epoch,
-                        sequence,
-                        message: encoded,
-                    }
-                }
+                Some(sequence) => Operation::RaftOrdered {
+                    group,
+                    epoch: message.term,
+                    sequence,
+                    message: encoded,
+                },
                 None => Operation::Raft {
                     group,
                     message: encoded,

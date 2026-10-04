@@ -13147,3 +13147,17 @@ back (a delivery under way and the rare membership, placement, evidence and acti
 records still do). The same load now keeps 31 at most. A ledger test checkpoints under a
 candidate held from its quorum, commits it after and replays it once from a restart; the
 follower checkpoint of the QUIC schedules waits out a native follower's `CheckpointIndex`.
+
+### 2026-10-03 — an append given up at its sender leaves its gap in the order
+
+From a peer's gate of PR #4 on hyper-raft: the lossy path counted refusals in order
+where the leader had given an append up for want of room before it had a sequence, so
+its follower saw no gap and refused the appends after it in an order that showed none.
+A bulk frame takes its sequence before anything can give it up now, in the fleet's
+owner and the control host's, and the order's epoch is the term of its frames instead of
+an incarnation drawn at random — which a restarted sender drew smaller than the one
+before as often as not, its frames then taken for stale. An owner test gives a frame up
+with the budget held and finds the next one a sequence on, and a new term beginning
+again. Also from CI (457395c's macOS push run): the zone stage read its guarantee once
+after the zone's return and found one member not alive; not reproduced in 22 local
+copies, the assertion now prints the whole placement view. Open.
