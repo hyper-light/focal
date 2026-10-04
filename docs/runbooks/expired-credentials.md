@@ -6,7 +6,7 @@ its connections.
 **Symptoms.** `cluster placement` on any node shows the node's `credential: retired`
 (the registry no longer authorizes it; `active` for every other node); the founder's
 `cluster credentials get --invitation ID` shows `expires_at` in the past or the invitation
-revoked; the node's own `cluster node health` shows the placement agent's `last_error`
+revoked; the node's own `diagnose node --health` shows the placement agent's `last_error`
 naming `unauthorized`; `focal_credential_expires_at_seconds` in its metrics is past. Its
 peers close its connections and admit no new ones, so it learns nothing more: `cluster
 node readiness` on it shows `catching_up: false` and `authoritative: false`, and a node
@@ -21,7 +21,7 @@ probes for a while, so `alive` can lag: the credential field, not liveness, is t
 ```sh
 focal --data-dir FOUNDER cluster invitations list
 focal --data-dir FOUNDER cluster credentials get --invitation ID
-focal --data-dir NODE cluster node health
+focal --data-dir NODE diagnose node --health
 ```
 
 **Preconditions.** A node renews its own credential in the last third of its lifetime

@@ -177,7 +177,7 @@ fn sequence(root: &Path) -> u64 {
         .unwrap()
 }
 fn seals_proposed(root: &Path) -> u64 {
-    let shown = admin(root, None, &["cluster", "storage", "show"]);
+    let shown = admin(root, None, &["diagnose", "node", "--storage"]);
     assert_eq!(shown["result"]["kind"], "storage", "{shown}");
     shown["result"]["storage"]["retire"]["seals_proposed"]
         .as_u64()

@@ -42,7 +42,13 @@ pub fn observed() -> Vec<PathBuf> {
 /// it does not answer.
 pub fn periods(root: &Path) -> Option<u64> {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.to_str()?, "cluster", "node", "metrics"])
+        .args([
+            "--data-dir",
+            root.to_str()?,
+            "diagnose",
+            "node",
+            "--metrics",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

@@ -178,7 +178,7 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    let health = command(root, &["cluster", "node", "health"]);
+    let health = command(root, &["diagnose", "node", "--health"]);
     panic!(
         "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -238,7 +238,7 @@ fn eventually(root: &Path, args: &[&str]) -> Value {
 /// One series of the node's metrics by session: what the replica of each
 /// session this node hosts says.
 fn series(root: &Path, name: &str) -> Option<BTreeMap<String, u64>> {
-    let output = command(root, &["cluster", "node", "metrics"]);
+    let output = command(root, &["diagnose", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }

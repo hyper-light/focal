@@ -79,7 +79,7 @@ fn runbook_disk_exhaustion() {
         &["--advertise", &address],
         limit_bytes.div_ceil(512),
     );
-    let storage = admin(&founder, &["cluster", "storage", "show"]);
+    let storage = admin(&founder, &["diagnose", "node", "--storage"]);
     assert_eq!(storage["result"]["kind"], "storage", "{storage}");
     // A write that needs more than the volume gives is refused, never
     // acknowledged: the claim carries a description larger than the room.
@@ -615,7 +615,7 @@ fn runbook_expired_credentials() {
             break;
         }
         if restarted.is_some()
-            && run(&hosts[1], None, &["cluster", "node", "readiness"])
+            && run(&hosts[1], None, &["diagnose", "node", "--readiness"])
                 .status
                 .success()
         {

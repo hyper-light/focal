@@ -155,7 +155,7 @@ fn created(result: &Value, kind: &str) -> Vec<String> {
         .collect()
 }
 fn gc_status(root: &Path) -> Value {
-    let shown = admin(root, &["cluster", "gc", "show"]);
+    let shown = admin(root, &["diagnose", "node", "--gc"]);
     assert_eq!(shown["result"]["kind"], "gc", "{shown}");
     shown["result"]["gc"].clone()
 }
@@ -209,7 +209,7 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let invitation = client.path().join("alice.invite");
     admin(

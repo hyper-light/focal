@@ -109,7 +109,7 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
                 "focal-peers" => 2,
                 "focal-evidence" => 9,
                 "focal-validation" => 4,
-                "focal-cluster" => 20,
+                "focal-cluster" => 21,
                 _ => 2,
             }
         );
@@ -205,7 +205,7 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
                 tool.version,
                 manifest.adapter.administration_contract_version
             );
-            assert!(tool.name.starts_with("cluster."));
+            assert!(tool.name.starts_with("cluster.") || tool.name.starts_with("diagnose."));
             assert!(administration.insert(tool.name.clone()));
             assert!(content.contains(&format!("`{}`", tool.name)));
         }

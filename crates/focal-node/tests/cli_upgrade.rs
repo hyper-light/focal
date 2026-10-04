@@ -183,7 +183,7 @@ fn wait_for_upgrade(root: &Path, what: &str, condition: impl Fn(&Value) -> bool)
     // before for 90 s with the founder's health alone, 2026-10-03).
     let mut health = String::new();
     for observed in deadline::observed() {
-        let output = run(&observed, &["cluster", "node", "health"]);
+        let output = run(&observed, &["diagnose", "node", "--health"]);
         health.push_str(&format!(
             "\n{}: {}{}",
             observed.display(),

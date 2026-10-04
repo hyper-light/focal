@@ -139,7 +139,7 @@ domain candidate, a managed or cursor command or a cursor maintenance
 changes nothing a checkpoint holds until it applies — a session that
 waited for its proposals to drain checkpointed under a steady load only
 at a period that found none. The bound is the log's retirement boundary
-(instruction 4); `cluster replicas diagnostics` shows
+(instruction 4); `diagnose cluster --replicas` shows
 `log_entries_since_checkpoint`.
 
 **The retention floor.** `RetentionReport` names, per native session, the
@@ -390,8 +390,8 @@ a family whose copies have not all answered waits for a later tick with
 its bundle already sealed. The agent holds nothing the records do not: a
 restart resumes the walk from the index.
 
-**The operator's view.** `cluster retention show [--session]`
-(`cluster.retention.show`) reads the floor of §3 with the families retired
+**The operator's view.** `diagnose cluster --retention [--session]`
+(`diagnose.cluster.retention`) reads the floor of §3 with the families retired
 through the applied prefix and whether a retirement is in flight
 (`retention.retired`, `retention.retiring`, also in replica diagnostics);
 `cluster archive show --claim ID [--session]` (`cluster.archive.show`)
@@ -625,7 +625,7 @@ the pass. Settings: `FOCAL_GC_GRACE_MS` (one day), `FOCAL_GC_QUARANTINE_MS`
 (seven days), `FOCAL_GC_TERMINAL_MS` (seven days); the newest four records
 of each kind stay; 1,048,576 chunk marks per domain.
 
-**The operator.** `cluster gc show` (`cluster.gc.show`) reports the
+**The operator.** `diagnose node --gc` (`diagnose.node.gc`) reports the
 settings, whether a pass is in progress, how many completed and the last
 pass: replicas walked, objects protected, opaque domains, bundles this node
 could not read, and the content store's counts (visited, uploads expired,
@@ -816,7 +816,7 @@ decided by revocation alone; a member that is merely dead is not fenced.
 
 ## 7. The operator's storage view and R8's close (2026-09-10)
 
-**The view.** `cluster storage show` (`cluster.storage.show`) is one read
+**The view.** `diagnose node --storage` (`diagnose.node.storage`) is one read
 that answers instruction 9 of R8 for a node: the volume envelope every
 durable owner of the data directory promises its bytes to
 ([24](24-placement-execution-and-fleet-control.md) §10) — free bytes at

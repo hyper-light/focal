@@ -3,7 +3,7 @@
 **Failure.** A host is gone for good: the machine, or its disk.
 
 **Symptoms.** `cluster placement` shows the node `alive: false` and every session that
-named it `blocked_by` it; `cluster node readiness` on any node reports `policy_satisfied:
+named it `blocked_by` it; `diagnose node --readiness` on any node reports `policy_satisfied:
 false` for those sessions. Writes continue while each session keeps a majority.
 
 **Read-only diagnostics.**
@@ -11,7 +11,7 @@ false` for those sessions. Writes continue while each session keeps a majority.
 ```sh
 focal --data-dir DIR cluster placement
 focal --data-dir DIR cluster nodes list
-focal --data-dir DIR cluster node readiness
+focal --data-dir DIR diagnose node --readiness
 ```
 
 **Preconditions.** Every session that named the node keeps a majority of voters; a spare host

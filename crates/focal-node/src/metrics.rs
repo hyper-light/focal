@@ -1,7 +1,7 @@
 //! Metrics (doc 08 §9; 24 §23): one bounded snapshot of what this node
 //! knows about itself, sampled by the service on a fixed cadence and
 //! rendered as Prometheus text over the kernel-authenticated admin socket
-//! (`cluster node metrics`) and, when the operator configures
+//! (`diagnose node --metrics`) and, when the operator configures
 //! `node.metrics_listen`, over a read-only loopback HTTP/1.0 endpoint. Every
 //! series carries the node's fixed labels; nothing here is a quorum read
 //! and nothing here authorizes a change.

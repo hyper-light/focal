@@ -40,7 +40,7 @@ impl Drop for Server {
 /// (`progress`). None while the node does not answer.
 fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
     move || {
-        let output = command(root, &["cluster", "node", "metrics"]);
+        let output = command(root, &["diagnose", "node", "--metrics"]);
         if !output.status.success() {
             return None;
         }
@@ -248,7 +248,7 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     );
     assert!(peer.path().join("focal-admin.sock").exists());
     assert_eq!(
-        success(peer.path(), &["cluster", "node", "identity"]).0["result"]["identity"]["node"],
+        success(peer.path(), &["diagnose", "node", "--identity"]).0["result"]["identity"]["node"],
         joined["node"]
     );
     let refused = command(

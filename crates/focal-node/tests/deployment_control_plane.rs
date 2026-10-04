@@ -141,7 +141,7 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
         // its allowance (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 360 s).
         let view = placement(&founder);
-        let health = admin(&founder, &["cluster", "node", "health"]);
+        let health = admin(&founder, &["diagnose", "node", "--health"]);
         panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
     }
     let mut voters = ids(&configuration(&founder)["voters"]);

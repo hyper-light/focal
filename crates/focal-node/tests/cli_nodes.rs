@@ -176,7 +176,7 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    let health = command(root, &["cluster", "node", "health"]);
+    let health = command(root, &["diagnose", "node", "--health"]);
     panic!(
         "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -248,7 +248,7 @@ fn partition_change(founder: &Path, verb: &str, partition: &str, node: u64) -> V
             "{verb} of {node}: {stderr}"
         );
         if !deadline.open() {
-            let health = command(founder, &["cluster", "node", "health"]);
+            let health = command(founder, &["diagnose", "node", "--health"]);
             let shown = command(
                 founder,
                 &["cluster", "partitions", "show", "--partition", partition],
@@ -451,7 +451,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         let drained_dir = dirs[all.iter().position(|id| *id == drained).unwrap()].path();
         let founder_view = command(founder, &["cluster", "placement"]);
         let drained_view = command(drained_dir, &["cluster", "placement"]);
-        let drained_health = command(drained_dir, &["cluster", "node", "health"]);
+        let drained_health = command(drained_dir, &["diagnose", "node", "--health"]);
         panic!(
             "{report}\nfounder placement: {}\ndrained placement: {}\ndrained health: {}",
             String::from_utf8_lossy(&founder_view.stdout),

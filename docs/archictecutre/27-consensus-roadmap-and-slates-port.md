@@ -486,7 +486,7 @@ bound:
 
 A refusal where the hand-over is asked is counted as a failure and rested on. The
 replica says how often it asked and how often that did not hold
-(`leader_returns`, `leader_returns_failed` in `cluster replicas diagnostics`;
+(`leader_returns`, `leader_returns_failed` in `diagnose cluster --replicas`;
 `focal_session_leader_returns_total`, `focal_session_leader_returns_failed_total`,
 `focal_session_preferred_leader` in the node's metrics).
 

@@ -60,7 +60,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 fn periods(root: &Path) -> Option<u64> {
-    let output = command(root, &["cluster", "node", "metrics"]);
+    let output = command(root, &["diagnose", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -382,7 +382,7 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
         output.status.success(),
         "status after activation: {}; founder replicas {}",
         String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&command(founder, &["cluster", "replicas", "diagnostics"]).stdout),
+        String::from_utf8_lossy(&command(founder, &["diagnose", "cluster", "--replicas"]).stdout),
     );
     // Losing one host keeps a quorum: the founder still answers a quorum read
     // of its session, and the directory measures the weaker guarantee.
@@ -403,10 +403,10 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
             "the session lost its quorum after one host loss: {}; founder replicas {}; host-a replicas {}; founder view {:#?}",
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(
-                &command(founder, &["cluster", "replicas", "diagnostics"]).stdout
+                &command(founder, &["diagnose", "cluster", "--replicas"]).stdout
             ),
             String::from_utf8_lossy(
-                &command(dirs[1].path(), &["cluster", "replicas", "diagnostics"]).stdout
+                &command(dirs[1].path(), &["diagnose", "cluster", "--replicas"]).stdout
             ),
             placement(founder).and_then(|view| session(&view).cloned())
         );
@@ -550,9 +550,9 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
             let diagnostics: Vec<String> = dirs
                 .iter()
                 .map(|dir| {
-                    let output = command(dir.path(), &["cluster", "replicas", "diagnostics"]);
+                    let output = command(dir.path(), &["diagnose", "cluster", "--replicas"]);
                     let membership = command(dir.path(), &["cluster", "replicas", "show"]);
-                    let health = command(dir.path(), &["cluster", "node", "health"]);
+                    let health = command(dir.path(), &["diagnose", "node", "--health"]);
                     format!(
                         "{}: seeds {:?}; {}{}{}{}{}{}",
                         dir.path().display(),
@@ -748,7 +748,7 @@ fn wait_cut(
                     let text = |args: &[&str]| {
                         String::from_utf8_lossy(&command(root, args).stdout).into_owned()
                     };
-                    let metrics = text(&["cluster", "node", "metrics"]);
+                    let metrics = text(&["diagnose", "node", "--metrics"]);
                     let session: Vec<&str> = metrics
                         .lines()
                         .filter(|line| {
@@ -769,7 +769,7 @@ fn wait_cut(
                     format!(
                         "{}: {session:?}; health {}; ranges {:?}",
                         root.display(),
-                        text(&["cluster", "node", "health"]),
+                        text(&["diagnose", "node", "--health"]),
                         ranges(root)
                     )
                 })

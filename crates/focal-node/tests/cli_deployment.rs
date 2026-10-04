@@ -519,7 +519,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         // node's health (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 300 s).
         let view = placement(founder);
-        let health = command(founder, None, &["cluster", "node", "health"]);
+        let health = command(founder, None, &["diagnose", "node", "--health"]);
         panic!(
             "apply not complete: {applied}\nplacement: {view:?}\nhealth: {}",
             String::from_utf8_lossy(&health.stdout)
@@ -570,7 +570,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         // node's health (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 300 s).
         let view = placement(founder);
-        let health = command(founder, None, &["cluster", "node", "health"]);
+        let health = command(founder, None, &["diagnose", "node", "--health"]);
         panic!(
             "apply not complete: {applied}\nplacement: {view:?}\nhealth: {}",
             String::from_utf8_lossy(&health.stdout)
@@ -707,10 +707,10 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         explained["condition"],
         "PlanValid",
         "{explained}; founder health {}; placement {}; nodes {}; routes {}",
-        String::from_utf8_lossy(&command(founder, None, &["cluster", "node", "health"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["diagnose", "node", "--health"]).stdout),
         String::from_utf8_lossy(&command(founder, None, &["cluster", "placement"]).stdout),
         String::from_utf8_lossy(&command(founder, None, &["cluster", "nodes", "list"]).stdout),
-        String::from_utf8_lossy(&command(founder, None, &["cluster", "node", "metrics"]).stdout)
+        String::from_utf8_lossy(&command(founder, None, &["diagnose", "node", "--metrics"]).stdout)
             .lines()
             .filter(|line| line.contains("route") || line.contains("peer"))
             .collect::<Vec<_>>()

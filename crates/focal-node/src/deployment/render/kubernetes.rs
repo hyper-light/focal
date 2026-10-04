@@ -339,7 +339,7 @@ pub fn render(
         "Apply the founder first (`kubectl apply -k .` applies everything; host pods wait for their invitation), run invitations.sh once focal-founder-0 is Ready to issue and install the invitations, then the hosts enroll and start.".into(),
     );
     assets.notes.push(
-        "Probes ask the node: startup and liveness are `cluster node probe --check alive` (the process answers); readiness is `--check serving` (its owners run — never a quorum, which peers need this pod's endpoint to re-form: the Service publishes not-ready addresses); `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
+        "Probes ask the node: startup and liveness are `diagnose node --probe alive` (the process answers); readiness is `--probe serving` (its owners run — never a quorum, which peers need this pod's endpoint to re-form: the Service publishes not-ready addresses); `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
     );
     assets.notes.push(format!(
         "Every pod starts at single-node durability (survive: node, max_failures: 0), the only first start a lone node can satisfy; the requested policy ({} survival, max_failures {}) is mounted as {TARGET_DIR}/{TARGET_FILE}. Once every host pod is Ready, commit it from the founder: `kubectl -n {ns} exec focal-founder-0 -c focal -- /focal --data-dir {DATA_DIR} deployment plan --config {TARGET_DIR}/{TARGET_FILE} --output {DATA_DIR}/target.plan` then `... deployment apply --plan-file {DATA_DIR}/target.plan`. The committed policy then carries every restart; the configmap never has to follow it (08 §2).",
@@ -417,10 +417,10 @@ fn stateful_set(
     // peers need this pod's endpoint to re-form (the Service publishes
     // not-ready addresses for that).
     let probe = format!(
-        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"cluster\", \"node\", \"probe\", \"--check\", \"alive\"]\n"
+        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"diagnose\", \"node\", \"--probe\", \"alive\"]\n"
     );
     let serving = format!(
-        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"cluster\", \"node\", \"probe\", \"--check\", \"serving\"]\n"
+        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"diagnose\", \"node\", \"--probe\", \"serving\"]\n"
     );
     let _ = write!(
         out,

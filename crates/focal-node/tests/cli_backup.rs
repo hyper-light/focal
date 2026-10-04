@@ -201,7 +201,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     let session = identity["session"].as_str().unwrap().to_owned();
     let invitation = client.path().join("alice.invite");
     admin(
@@ -297,7 +297,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     assert_eq!(verified["inventory_matches"], true);
     // The storage view names the volume's pressure, the agents and the
     // session's floor.
-    let storage = admin(root, &["cluster", "storage", "show"]);
+    let storage = admin(root, &["diagnose", "node", "--storage"]);
     assert_eq!(storage["result"]["kind"], "storage", "{storage}");
     let storage = &storage["result"]["storage"];
     assert_eq!(storage["node"], identity["node"]);

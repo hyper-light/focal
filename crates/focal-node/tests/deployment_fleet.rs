@@ -206,7 +206,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         // its allowance (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 300 s).
         let view = placement(&founder);
-        let health = admin(&founder, &["cluster", "node", "health"]);
+        let health = admin(&founder, &["diagnose", "node", "--health"]);
         panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
     }
     let view = wait_for(
@@ -303,7 +303,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         // its allowance (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 300 s).
         let view = placement(&founder);
-        let health = admin(&founder, &["cluster", "node", "health"]);
+        let health = admin(&founder, &["diagnose", "node", "--health"]);
         panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
     }
     let explained = journey.admin(&founder, "explain", &[], &["deployment", "explain"]);

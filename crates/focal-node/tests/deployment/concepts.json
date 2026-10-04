@@ -390,9 +390,9 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "cluster",
+          "diagnose",
           "node",
-          "identity"
+          "--identity"
         ]
       },
       {
@@ -2439,9 +2439,9 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
+          "diagnose",
           "node",
-          "metrics"
+          "--metrics"
         ]
       },
       {
@@ -3634,9 +3634,9 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
+          "diagnose",
           "node",
-          "metrics"
+          "--metrics"
         ]
       }
     ]

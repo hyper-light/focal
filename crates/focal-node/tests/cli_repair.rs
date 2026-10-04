@@ -265,7 +265,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     assert_eq!(activation["activated"], true, "{activation}");
     let (_founder_server, status) = start(founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let identity = admin(founder, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity =
+        admin(founder, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     let founder_node = identity["node"].as_u64().unwrap();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let ledger = identity["session"].as_str().unwrap().to_owned();

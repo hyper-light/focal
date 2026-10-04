@@ -121,7 +121,7 @@ pub use deadline::progress;
 /// The periods a node's root owner has run since it started, from its
 /// metrics; none while the node does not answer.
 pub fn periods(node: &Node) -> Option<u64> {
-    let output = run(node, None, &["cluster", "node", "metrics"]);
+    let output = run(node, None, &["diagnose", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -266,7 +266,7 @@ pub fn join_start(founder: &Node, host: &Node, name: &str, advertise: &str) -> (
 }
 /// (node, tenant, session) of a running node.
 pub fn identity(node: &Node) -> (u64, String, String) {
-    let identity = admin(node, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(node, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     (
         identity["node"].as_u64().unwrap(),
         identity["tenant"].as_str().unwrap().to_owned(),
@@ -336,7 +336,7 @@ pub fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let health = run(node, None, &["cluster", "node", "health"]);
+    let health = run(node, None, &["diagnose", "node", "--health"]);
     panic!(
         "{what} did not happen ({spent}; allowance {timeout:?}); health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -524,7 +524,7 @@ pub fn repair(node: &Node, tenant: &str, ledger: &str) -> Value {
     report["result"]["repair"].clone()
 }
 pub fn readiness(node: &Node) -> Value {
-    admin(node, &["cluster", "node", "readiness"])["result"]["readiness"].clone()
+    admin(node, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone()
 }
 /// Start under a file-size limit (`ulimit -f`, in 512-byte blocks) with
 /// `SIGXFSZ` ignored, so an oversized write returns `EFBIG` instead of

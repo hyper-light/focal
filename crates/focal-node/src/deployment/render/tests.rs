@@ -63,14 +63,14 @@ fn node_survival_renders_a_founder_and_a_host_set_and_names_what_is_missing() {
     assert!(!founder.contains("--invite-file"));
     assert!(founder.contains("\"$(POD_NAME).focal.$(POD_NAMESPACE).svc.cluster.local:7443\""));
     assert!(founder.contains("prepare-volume"));
-    assert!(founder.contains("\"--check\", \"alive\""));
+    assert!(founder.contains("\"--probe\", \"alive\""));
     // Readiness asks whether the owners serve; startup and liveness whether
     // the process answers.
     assert!(founder.contains(
-        "readinessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"cluster\", \"node\", \"probe\", \"--check\", \"serving\"]"
+        "readinessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"diagnose\", \"node\", \"--probe\", \"serving\"]"
     ));
     assert!(founder.contains(
-        "livenessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"cluster\", \"node\", \"probe\", \"--check\", \"alive\"]"
+        "livenessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"diagnose\", \"node\", \"--probe\", \"alive\"]"
     ));
     assert!(file(&assets, "pdb.yaml").contains("maxUnavailable: 1"));
     // The namespace is an object of the kustomization, listed first, so a

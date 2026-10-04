@@ -17,6 +17,6 @@ Focal {{ .Chart.AppVersion }} in namespace {{ .Release.Namespace }}.
        /focal --data-dir /var/lib/focal deployment apply --plan-file /var/lib/focal/target.plan
    The committed policy then carries every restart; the configmap never has to follow it.
 
-Probes ask the node (`cluster node probe --check alive`); `authoritative` and
+Probes ask the node (`diagnose node --probe alive`); `authoritative` and
 `policy` are for inspection, never for restarts. Resource and volume requests
 are an unqualified bootstrap allocation (doc 08 §5).

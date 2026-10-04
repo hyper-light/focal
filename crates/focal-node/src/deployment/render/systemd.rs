@@ -130,7 +130,7 @@ pub fn render(
         request.config_path
     ));
     assets.notes.push(
-        "Readiness is `focal cluster node probe --check alive|catching-up|authoritative|policy` over the data directory's admin socket; a listening process is not authoritative because it listens.".into(),
+        "Readiness is `focal diagnose node --probe alive|catching-up|authoritative|policy` over the data directory's admin socket; a listening process is not authoritative because it listens.".into(),
     );
     Ok(assets)
 }

@@ -10,7 +10,7 @@
 
 ```sh
 focal --data-dir DIR cluster placement          # nodes with region/zone, sessions' achieved level
-focal --data-dir DIR cluster node readiness
+focal --data-dir DIR diagnose node --readiness
 ```
 
 **Preconditions.** The durability policy was `survive: zone` with `max_failures` at least the

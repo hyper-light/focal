@@ -1262,8 +1262,8 @@ import pending and none stopped, while it leads none of them;
 committed prefix (`ReplicaHost::diagnostics().authoritative`);
 `policy_satisfied` when every session it hosts is listed by the directory
 with its desired durability achieved and nothing blocking it (a bounded
-report that leaves sessions out does not satisfy). `cluster node readiness`
-prints the report; `cluster node probe --check …` exits 0 when one probe
+report that leaves sessions out does not satisfy). `diagnose node --readiness`
+prints the report; `diagnose node --probe …` exits 0 when one probe
 holds and 1 (`probe_failed`) otherwise, for a supervisor. Nothing here is a
 quorum read, and a process that merely listens is never authoritative.
 
@@ -1781,8 +1781,8 @@ placement agent's intents and admission (§7, §10), the directory's route
 and placement epochs and achieved durability per session (§15), and the
 upgrade fence (§21) — and publishes through a `watch` the admin socket
 reads (`OperatorRead::Metrics` → `AdminResult::Metrics { text }`, CLI
-`cluster node metrics` printing the text as it is, MCP
-`cluster.node.metrics`). Rendering is Prometheus text exposition (version
+`diagnose node --metrics` printing the text as it is, MCP
+`diagnose.node.metrics`). Rendering is Prometheus text exposition (version
 0.0.4) with `# HELP`/`# TYPE` per series and fixed labels on every sample
 (`node`, `cluster`; `focal_node_info` carries `role`, `region`, `zone` and
 `capability`); label values are escaped. Nothing is sampled on a caller's
@@ -1937,7 +1937,7 @@ zone; `2f+1` zones are required and otherwise reported as missing), each
 pod with its own volume claim and its own enrollment, a ConfigMap with one
 configuration per set, disruption budgets (the founder never voluntarily
 disrupted, hosts at most `max_failures` at once), probes that ask the node
-(`cluster node probe --check alive` for startup, liveness and readiness;
+(`diagnose node --probe alive` for startup, liveness and readiness;
 `authoritative` and `policy` are inspection, so a healthy node is not
 restarted for a missing quorum), an init step that gives the volume to
 the node's user, and an invitation script that issues one invitation per

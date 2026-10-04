@@ -343,41 +343,41 @@ pub(crate) fn parse(
 ) -> Result<AdminAction, InputError> {
     let value = serde_json::Value::Object(arguments);
     let action = match name {
-        "cluster.node.identity"
-        | "cluster.node.health"
-        | "cluster.node.config"
-        | "cluster.node.readiness"
-        | "cluster.node.metrics" => {
+        "diagnose.node.identity"
+        | "diagnose.node.health"
+        | "diagnose.node.listener"
+        | "diagnose.node.readiness"
+        | "diagnose.node.metrics" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("node inspection"))?;
             match name {
-                "cluster.node.identity" => AdminAction::NodeIdentity,
-                "cluster.node.health" => AdminAction::NodeHealth,
-                "cluster.node.readiness" => AdminAction::NodeReadiness,
-                "cluster.node.metrics" => AdminAction::NodeMetrics,
+                "diagnose.node.identity" => AdminAction::NodeIdentity,
+                "diagnose.node.health" => AdminAction::NodeHealth,
+                "diagnose.node.readiness" => AdminAction::NodeReadiness,
+                "diagnose.node.metrics" => AdminAction::NodeMetrics,
                 _ => AdminAction::NodeConfiguration,
             }
         }
-        "cluster.replicas.diagnostics" => {
+        "diagnose.cluster.replicas" => {
             let args: ReplicaSession = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("replica diagnostics"))?;
             AdminAction::ReplicaDiagnostics {
                 session: parse_session(args.session)?,
             }
         }
-        "cluster.retention.show" => {
+        "diagnose.cluster.retention" => {
             let args: ReplicaSession = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("retention session"))?;
             AdminAction::RetentionShow {
                 session: parse_session(args.session)?,
             }
         }
-        "cluster.gc.show" => {
+        "diagnose.node.gc" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("collector inspection"))?;
             AdminAction::GcShow
         }
-        "cluster.storage.show" => {
+        "diagnose.node.storage" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("storage inspection"))?;
             AdminAction::StorageShow

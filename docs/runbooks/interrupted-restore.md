@@ -12,7 +12,7 @@ already holds the ledger.
 ```sh
 focal --data-dir DIR cluster backup verify --input BACKUP     # runs anywhere the binary does
 focal --data-dir DIR cluster placement
-focal --data-dir DIR cluster replicas diagnostics --session ID
+focal --data-dir DIR diagnose cluster --replicas --session ID
 ```
 
 **Preconditions.** The backup verifies ([26 §6](../archictecutre/26-custody-archive-retention-and-restore.md));

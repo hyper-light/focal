@@ -12,21 +12,21 @@ context supplies ordinary ledger operations; it does not grant node ownership.
 
 ## Determine the serving owner and requested scope
 
-1. Inspect `cluster.node.identity`, `cluster.node.config` and `cluster.node.health`.
+1. Inspect `diagnose.node.identity`, `diagnose.node.listener` and `diagnose.node.health`.
    Completion: identify the physical node, saved network coordinates and observed
    progress. Local health does not establish quorum or multi-region protection.
 2. Use `cluster.status`, `cluster.nodes.list` and `cluster.membership.show` for
    the root metadata group. Use `cluster.replicas.list`, `cluster.replicas.show`
-   and `cluster.replicas.diagnostics` for application replicas. Completion:
+   and `diagnose.cluster.replicas` for application replicas. Completion:
    select the actual session/group and committed configuration before proposing
    a change. Root membership and application placement are distinct facts.
-3. Use `cluster.retention.show` for a native session's retention floor (what
+3. Use `diagnose.cluster.retention` for a native session's retention floor (what
    registered consumers still need, what the archive holds, the families
    retired) and `cluster.archive.show` with a retired claim's id to verify the
    bundle this node holds and which copies hold a receipt for it. Completion:
    a retired claim answers reads with its continuation; its rows live in the
    bundle, and nothing here restores them into the core.
-4. Use `cluster.gc.show` for the collector's settings and its last pass
+4. Use `diagnose.node.gc` for the collector's settings and its last pass
    (what it protected, expired, quarantined and deleted), and
    `cluster.gc.restore` with an object's domain and root to bring a
    quarantined object back before its round expires. Completion: quarantine
@@ -56,7 +56,7 @@ context supplies ordinary ledger operations; it does not grant node ownership.
    with `after` set to `next_after`. `restore_required` true means no
    required copy can supply an object: use a verified backup, never a fresh
    object.
-8. Use `cluster.storage.show` for this node's storage pressure (the volume
+8. Use `diagnose.node.storage` for this node's storage pressure (the volume
    envelope by kind, its headroom and completion reserve, what uploads
    have staged), the archive agent's and the collector's settings and
    progress, and every hosted session's retention floor. Completion: the
@@ -128,14 +128,14 @@ Tenants are admitted, never removed.
 
 ## Read a node's readiness
 
-`cluster.node.readiness` reports the four probes a supervisor asks with the
+`diagnose.node.readiness` reports the four probes a supervisor asks with the
 facts they derive from: `alive` (the node answers), `catching_up` (its root
 replica and every replica it hosts follow a known leader with nothing
 pending, but it leads none), `authoritative` (it leads the root or a hosted
 session's log at a committed prefix) and `policy_satisfied` (every session
 it hosts has its desired durability achieved in the directory with nothing
 blocking). It is a local read, never a quorum; a listening process is not
-authoritative because it listens. `cluster.node.metrics` returns the same
+authoritative because it listens. `diagnose.node.metrics` returns the same
 node's metrics as Prometheus text (`text`), sampled every five seconds:
 memory and volume envelopes, WAL counters, each hosted replica's indices,
 apply and cursor lag, retention floor and pending seeds or objects, peer
@@ -235,7 +235,7 @@ a successful command from another scope.
 
 ## Native engine
 
-`cluster.node.health` and `cluster.status` report each hosted ledger's engine
+`diagnose.node.health` and `cluster.status` report each hosted ledger's engine
 (the active storage format, its effective guarantee and decoder floor).
 Activating the native engine is an offline operator command of the CLI
 (`focal cluster replicas activate-native`, run before the node listens) and

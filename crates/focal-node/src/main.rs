@@ -81,6 +81,13 @@ enum Commands {
         #[arg(long)]
         invite_file: Option<PathBuf>,
     },
+    /// What the selected node and the replicas it hosts report about
+    /// themselves, read through its local socket; nothing here changes
+    /// anything.
+    Diagnose {
+        #[command(subcommand)]
+        command: cli::cluster::DiagnoseCommand,
+    },
     /// Inspect and administer the selected physical node through its local socket.
     Cluster {
         #[command(subcommand)]
@@ -302,6 +309,10 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             runtime.block_on(start(settings))
         }
         Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
+        Commands::Diagnose { command } => {
+            let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
+            cli::cluster::diagnose(runtime, &selected, command)
+        }
         Commands::Cluster { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
             cli::cluster::run(runtime, &selected, command)

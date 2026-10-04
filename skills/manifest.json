@@ -616,9 +616,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 20,
+      "version": 21,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "593290f3cd58bf4b85a403f2200356f87dfae6bbbc3c2429c334f879cc6b2dce",
+      "blake3": "114ff5264c2ac7d19b6f568c67ce7297591fb4ecbfe3ec47a83443b96964863b",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -672,7 +672,7 @@
           "version": 1
         },
         {
-          "name": "cluster.gc.show",
+          "name": "diagnose.node.gc",
           "version": 1
         },
         {
@@ -716,23 +716,23 @@
           "version": 1
         },
         {
-          "name": "cluster.node.config",
+          "name": "diagnose.node.listener",
           "version": 1
         },
         {
-          "name": "cluster.node.health",
+          "name": "diagnose.node.health",
           "version": 1
         },
         {
-          "name": "cluster.node.readiness",
+          "name": "diagnose.node.readiness",
           "version": 1
         },
         {
-          "name": "cluster.node.metrics",
+          "name": "diagnose.node.metrics",
           "version": 1
         },
         {
-          "name": "cluster.node.identity",
+          "name": "diagnose.node.identity",
           "version": 1
         },
         {
@@ -788,7 +788,7 @@
           "version": 1
         },
         {
-          "name": "cluster.replicas.diagnostics",
+          "name": "diagnose.cluster.replicas",
           "version": 1
         },
         {
@@ -848,7 +848,7 @@
           "version": 1
         },
         {
-          "name": "cluster.retention.show",
+          "name": "diagnose.cluster.retention",
           "version": 1
         },
         {
@@ -864,7 +864,7 @@
           "version": 1
         },
         {
-          "name": "cluster.storage.show",
+          "name": "diagnose.node.storage",
           "version": 1
         },
         {

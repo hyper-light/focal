@@ -194,6 +194,17 @@ fn every_surface_descriptor_cli_path_resolves_in_the_command_tree() {
         named += 1;
         let mut current = &root;
         for word in path.split(' ') {
+            // A read chosen by a flag of its leaf: the flag must be the leaf's.
+            if let Some(flag) = word.strip_prefix("--") {
+                assert!(
+                    current
+                        .get_arguments()
+                        .any(|arg| arg.get_long() == Some(flag)),
+                    "{}: `focal {path}` has no `{word}`",
+                    descriptor.name
+                );
+                continue;
+            }
             current = current
                 .find_subcommand(word)
                 .unwrap_or_else(|| panic!("{}: `focal {path}` has no `{word}`", descriptor.name));

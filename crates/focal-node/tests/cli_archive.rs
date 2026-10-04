@@ -203,7 +203,7 @@ fn retired(root: &Path, claim: &str) -> Value {
             json!({"stderr": String::from_utf8_lossy(&output.stderr), "stdout": String::from_utf8_lossy(&output.stdout)})
         };
         if !deadline.open() {
-            let retention = admin(root, None, &["cluster", "retention", "show"]);
+            let retention = admin(root, None, &["diagnose", "cluster", "--retention"]);
             panic!("claim {claim} never retired: {retention}\n{last}");
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -483,7 +483,7 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
     // Custody this node does not hold, or holds corrupt, is unavailable —
     // a typed refusal, never a missing object.
     let identity =
-        admin(root, None, &["cluster", "node", "identity"])["result"]["identity"].clone();
+        admin(root, None, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
     let bundle_hex = hex_hash(&continuation["bundle"]);
     let objects_dir = root.join("content").join("objects").join(&tenant_hex);

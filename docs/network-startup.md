@@ -65,12 +65,12 @@ From another terminal, inspect the saved identities or the founder's published a
 focal --data-dir /tmp/focal-founder identity
 focal --data-dir /tmp/focal-worker-2 identity
 focal --data-dir /tmp/focal-founder status
-focal --data-dir /tmp/focal-worker-2 cluster node health
+focal --data-dir /tmp/focal-worker-2 diagnose node --health
 focal --data-dir /tmp/focal-worker-2 cluster status
 focal --data-dir /tmp/focal-worker-2 cluster replicas list
 ```
 
-Top-level `status` queries the application ledger, so a joined node without that assignment cannot serve it. `cluster node health` observes the live local owner; `cluster status` performs a root quorum read. An empty `cluster replicas list` is the expected initial joined-node application inventory. None of these observations assigns placement or changes durability.
+Top-level `status` queries the application ledger, so a joined node without that assignment cannot serve it. `diagnose node --health` observes the live local owner; `cluster status` performs a root quorum read. An empty `cluster replicas list` is the expected initial joined-node application inventory. None of these observations assigns placement or changes durability.
 
 ## Nodes on different hosts
 

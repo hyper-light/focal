@@ -91,7 +91,7 @@ fn run(root: &Path, context: Option<&str>, args: &[&str]) -> Output {
 /// node does not answer.
 fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
     move || {
-        let output = run(root, None, &["cluster", "node", "metrics"]);
+        let output = run(root, None, &["diagnose", "node", "--metrics"]);
         if !output.status.success() {
             return None;
         }
