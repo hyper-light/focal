@@ -170,6 +170,17 @@ pub fn adopt_issuer(directory: &Path, adopted: &focal_wire::Adopted) -> Result<b
     focal_platform::fs::atomic_replace(&temporary, &directory.join(ADOPTED_FILE))?;
     Ok(true)
 }
+/// An enrolled client's way to the cluster ([`PendingClientJoin::remote_client`]).
+pub struct EnrolledClient {
+    pub tls: quinn::ClientConfig,
+    /// The endorsed issuers the verifier found and the context does not hold
+    /// yet, to record once a request succeeded.
+    pub adopted: focal_wire::AdoptedRoots,
+    pub initial: focal_wire::RouteHint,
+    pub build: focal_client::input::BuildContext,
+    pub operation: focal_client::pending::OperationContext,
+}
+
 impl PendingClientJoin {
     pub fn open(path: impl AsRef<Path>, bundle: ClientInvitation) -> Result<Self, JoinError> {
         Self::build(path.as_ref(), Some(bundle), false)
@@ -306,6 +317,50 @@ impl PendingClientJoin {
     }
     pub fn invitation(&self) -> &ClientInvitation {
         &self.bundle
+    }
+    /// What a client needs to reach the cluster as this enrolled identity:
+    /// the TLS configuration whose verifier holds [`Self::trust_roots`] and
+    /// adopts an endorsed successor issuer (24 §11), the invitation's
+    /// endpoint as the first route, and the identity's build and operation
+    /// contexts on the founder's ledger. The CLI's enrolled contexts and the
+    /// measurement tools open a remote client through this one path.
+    pub fn remote_client(
+        &self,
+        now: i64,
+        limits: &focal_wire::WireLimits,
+    ) -> Result<EnrolledClient, JoinError> {
+        let receipt = self.enrollment()?.ok_or(JoinError::Pending)?;
+        let credentials = self.credentials(now)?;
+        let founder = &self.bundle.genesis().founder;
+        let (tls, adopted) = focal_wire::client_tls_adopting(
+            focal_wire::TlsIdentity::from_pkcs8(
+                credentials.certificate_chain().to_vec(),
+                credentials.private_key_der().to_vec(),
+            ),
+            self.trust_roots()?,
+            limits,
+        )?;
+        let actor = focal_model::ParticipantId(receipt.identity.principal);
+        Ok(EnrolledClient {
+            tls,
+            adopted,
+            initial: focal_wire::RouteHint {
+                epoch: RouteEpoch(1),
+                endpoint: self.bundle.invitation().trust().endpoint.clone(),
+                server_name: self.bundle.data_server_name()?,
+            },
+            build: focal_client::input::BuildContext {
+                ledger: founder.ledger,
+                actor,
+                root: founder.root,
+                policy_revision: 1,
+            },
+            operation: focal_client::pending::OperationContext {
+                cluster: founder.cluster,
+                ledger: founder.ledger,
+                principal: actor,
+            },
+        })
     }
     pub fn request_id(&self) -> [u8; 16] {
         self.key.request_id()

@@ -32,7 +32,9 @@ const MAGIC: &[u8; 8] = b"FCLINV01";
 const CLIENT_MAGIC: &[u8; 8] = b"FCLCLI01";
 #[path = "client_join.rs"]
 mod client;
-pub use client::{ClientInvitation, PendingClientJoin, adopt_issuer, adopted_issuers};
+pub use client::{
+    ClientInvitation, EnrolledClient, PendingClientJoin, adopt_issuer, adopted_issuers,
+};
 #[path = "joined_context.rs"]
 mod joined_context;
 pub use joined_context::{joined_unix_principal, local_unix_principal};

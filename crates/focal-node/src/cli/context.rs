@@ -650,56 +650,41 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
         } => {
             let pending = focal_node::network_join::PendingClientJoin::resume_shared(enrollment)
                 .map_err(other)?;
-            let receipt = pending.enrollment().map_err(other)?.ok_or(InputError::Invalid("client enrollment is pending; retry context enroll with its original invitation"))?;
-            let credentials = pending.credentials(now()?).map_err(other)?;
-            let founder = &pending.invitation().genesis().founder;
-            let trust = pending.invitation().invitation().trust();
+            if pending.enrollment().map_err(other)?.is_none() {
+                return Err(InputError::Invalid(
+                    "client enrollment is pending; retry context enroll with its original invitation",
+                )
+                .into());
+            }
             let limits = WireLimits::default();
             // The roots are the invitation's issuers and the ones this
             // context adopted since; an issuer a verified chain carries
             // endorsed by one of them is adopted after the connection, so
             // a later succession still verifies (24 §11).
-            let (tls, adopted) = focal_wire::client_tls_adopting(
-                TlsIdentity::from_pkcs8(
-                    credentials.certificate_chain().to_vec(),
-                    credentials.private_key_der().to_vec(),
-                ),
-                pending.trust_roots().map_err(other)?,
-                &limits,
-            )
-            .map_err(other)?;
+            let focal_node::network_join::EnrolledClient {
+                tls,
+                adopted,
+                initial,
+                mut build,
+                mut operation,
+            } = pending.remote_client(now()?, &limits).map_err(other)?;
             let adoption = Adoption {
                 roots: Mutex::new(adopted),
                 directory: pending.directory().to_path_buf(),
             };
-            let actor = ParticipantId(receipt.identity.principal);
             // The enrolled identity may address another session of its
             // tenant: one the operator created or restored.
-            let ledger = match session {
-                Some(session) => LedgerId {
-                    tenant: founder.ledger.tenant,
+            if let Some(session) = session {
+                let ledger = LedgerId {
+                    tenant: build.ledger.tenant,
                     session: SessionId(parse_id(&session)?),
-                },
-                None => founder.ledger,
-            };
-            let build = BuildContext {
-                ledger,
-                actor,
-                root: founder.root,
-                policy_revision: 1,
-            };
-            let operation = OperationContext {
-                cluster: founder.cluster,
-                ledger,
-                principal: actor,
-            };
+                };
+                build.ledger = ledger;
+                operation.ledger = ledger;
+            }
             let transport = Transport::Quic(Box::new(Remote {
                 tls,
-                initial: RouteHint {
-                    epoch: RouteEpoch(1),
-                    endpoint: trust.endpoint.clone(),
-                    server_name: pending.invitation().data_server_name().map_err(other)?,
-                },
+                initial,
                 limits: limits.clone(),
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),

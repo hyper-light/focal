@@ -90,6 +90,18 @@ the harness and the host, not about any system's tail:
 Planned 2026-10-04. The generator (`tools/compare`) has run against all three
 competitors: Kafka through librdkafka (`acks=all`, idempotence on, librdkafka's default
 batching), NATS through async-nats, Redis through a pool of redis-rs connections. Each
-report carries its drain time. Remaining before the measured runs: focal's target (three
-`focal:bench` containers on the same network), the generator in a container on the bench
-network, and a Linux host with real disks.
+report carries its drain time. Remaining before the measured runs:
+
+- **focal's arm.** focal is driven as a remote enrolled client over QUIC, like every
+  competitor. `PendingClientJoin::remote_client` (focal-node's library) now opens that
+  client, and the CLI's enrolled contexts use the same path. The writes are
+  `focal-load`'s authored creations, whose request generations (epochs minted and
+  floors advanced) that tool's driver already manages. So `focal-load` gains the
+  enrolled transport and an open-loop mode, timed from each request's intended send
+  into an HdrHistogram and reported in this generator's schema. Its present
+  closed-loop driver times from the actual send, which is not comparable.
+- **The cluster.** Three `focal:bench` containers on the bench network (the image
+  builds: 62.6 MB, static), founded with native activation, hosts joined by invitation,
+  one session placed on all three, and a client enrolled for the generator.
+- **The generator in a container** on the bench network, and a Linux host with real
+  disks.
