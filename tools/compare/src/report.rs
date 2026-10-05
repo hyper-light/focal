@@ -17,6 +17,9 @@ pub struct Report {
     failed: u64,
     clamped_above_120s: u64,
     first_error: Option<String>,
+    /// Seconds from the schedule's close to the last answer.
+    drain_seconds: f64,
+    /// Acknowledgements over the measured window plus the drain.
     achieved_per_second: f64,
     p50_us: f64,
     p99_us: f64,
@@ -41,7 +44,9 @@ impl Report {
             failed: tally.failed,
             clamped_above_120s: tally.clamped,
             first_error: tally.first_error.clone(),
-            achieved_per_second: acknowledged as f64 / args.seconds as f64,
+            drain_seconds: tally.drain.as_secs_f64(),
+            achieved_per_second: acknowledged as f64
+                / (args.seconds as f64 + tally.drain.as_secs_f64()),
             p50_us: micros(histogram.value_at_quantile(0.50)),
             p99_us: micros(histogram.value_at_quantile(0.99)),
             p999_us: micros(histogram.value_at_quantile(0.999)),

@@ -12,7 +12,7 @@ const SETUP: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub enum Target {
     Nats(async_nats::jetstream::Context),
-    Kafka(std::sync::Arc<rskafka::client::partition::PartitionClient>),
+    Kafka(rdkafka::producer::FutureProducer),
     Redis {
         /// One connection a lane: WAITAOF blocks the connection it is sent
         /// on until the replicas answer, so a durable client spreads its
@@ -70,27 +70,40 @@ impl Target {
                 Ok(Self::Nats(context))
             }
             System::Kafka => {
-                // acks=all is rskafka's only produce mode; the brokers'
-                // `log.flush.interval.messages` decides the fsync.
-                let client = rskafka::client::ClientBuilder::new(endpoints.to_vec())
-                    .build()
-                    .await
-                    .map_err(|error| fail(error.to_string()))?;
-                let controller = client
-                    .controller_client()
-                    .map_err(|error| fail(error.to_string()))?;
-                let millis = i32::try_from(SETUP.as_millis()).unwrap_or(i32::MAX);
+                use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+                use rdkafka::client::DefaultClientContext;
+                let servers = endpoints.join(",");
+                let mut config = rdkafka::ClientConfig::new();
+                config
+                    .set("bootstrap.servers", &servers)
+                    // Every in-sync replica before the answer, and no
+                    // duplicate from a retry (Kafka's own safe-producer
+                    // defaults since 3.0); the brokers'
+                    // `log.flush.interval.messages` decides the fsync.
+                    .set("acks", "all")
+                    .set("enable.idempotence", "true")
+                    // The client's own deadline is the histogram's highest
+                    // value, so a slow acknowledgement is recorded.
+                    .set(
+                        "message.timeout.ms",
+                        crate::HIGHEST_NS
+                            .checked_div(1_000_000)
+                            .unwrap_or(0)
+                            .to_string(),
+                    );
+                let admin: AdminClient<DefaultClientContext> =
+                    config.create().map_err(|error| fail(error.to_string()))?;
+                let topic = NewTopic::new(NAME, 1, TopicReplication::Fixed(3))
+                    .set("min.insync.replicas", "2");
                 // A topic that exists already is the topic to use.
-                let _ = controller.create_topic(NAME, 1, 3, millis).await;
-                let partition = client
-                    .partition_client(
-                        NAME,
-                        0,
-                        rskafka::client::partition::UnknownTopicHandling::Retry,
-                    )
-                    .await
-                    .map_err(|error| fail(error.to_string()))?;
-                Ok(Self::Kafka(std::sync::Arc::new(partition)))
+                let _ = tokio::time::timeout(
+                    SETUP,
+                    admin.create_topics([&topic], &AdminOptions::new()),
+                )
+                .await;
+                let producer: rdkafka::producer::FutureProducer =
+                    config.create().map_err(|error| fail(error.to_string()))?;
+                Ok(Self::Kafka(producer))
             }
             System::Redis => {
                 let primary = endpoints
@@ -184,21 +197,16 @@ impl Target {
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
-            Self::Kafka(partition) => {
-                let record = rskafka::record::Record {
-                    key: Some(sequence.to_be_bytes().to_vec()),
-                    value: Some(payload),
-                    headers: Default::default(),
-                    timestamp: chrono_now(),
-                };
-                partition
-                    .produce(
-                        vec![record],
-                        rskafka::client::partition::Compression::NoCompression,
-                    )
+            Self::Kafka(producer) => {
+                let key = sequence.to_be_bytes();
+                let record = rdkafka::producer::FutureRecord::to(NAME)
+                    .key(&key[..])
+                    .payload(&payload[..]);
+                producer
+                    .send(record, rdkafka::util::Timeout::Never)
                     .await
                     .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|(error, _)| error.to_string())
             }
             Self::RedisLane {
                 mut connection,
@@ -239,15 +247,4 @@ impl Target {
             }
         }
     }
-}
-
-/// The record's timestamp: now, to the millisecond (the epoch if the clock
-/// reads before it).
-fn chrono_now() -> rskafka::chrono::DateTime<rskafka::chrono::Utc> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-        .unwrap_or(0);
-    rskafka::chrono::DateTime::from_timestamp_millis(millis).unwrap_or_default()
 }

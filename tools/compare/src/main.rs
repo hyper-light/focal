@@ -100,8 +100,15 @@ async fn main() -> Result<(), CompareError> {
     let mut flying = JoinSet::new();
     let started = Instant::now();
     let mut next = started;
+    // When the schedule closed and when its last answer came: a system that
+    // answers long after the window is charged the time it took.
+    let mut closed = None;
+    let mut last_answer = started;
     loop {
         let open = next.saturating_duration_since(started) < total;
+        if !open && closed.is_none() {
+            closed = Some(Instant::now());
+        }
         if !open && flying.is_empty() {
             break;
         }
@@ -128,12 +135,16 @@ async fn main() -> Result<(), CompareError> {
             Some(joined) = flying.join_next() => {
                 let (latency, measured, result) =
                     joined.map_err(|error| CompareError::Target(error.to_string()))?;
+                last_answer = Instant::now();
                 if measured {
                     tally.record(&mut histogram, latency, result)?;
                 }
             }
         }
     }
+    tally.drain = closed.map_or(Duration::ZERO, |closed| {
+        last_answer.saturating_duration_since(closed)
+    });
     report::Report::new(&args, &histogram, &tally).write(&args.out)
 }
 
@@ -145,6 +156,8 @@ pub struct Tally {
     pub failed: u64,
     pub clamped: u64,
     pub first_error: Option<String>,
+    /// From the schedule's close to the last answer.
+    pub drain: Duration,
 }
 impl Tally {
     fn record(

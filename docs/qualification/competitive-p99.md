@@ -87,7 +87,9 @@ the harness and the host, not about any system's tail:
 
 ## Status
 
-Planned 2026-10-04. The generator (`tools/compare`) has run against NATS and Redis.
-Remaining before the measured runs: Kafka moves to librdkafka, the report gains its drain
-time, the generator runs in a container on the bench network, and the measured runs
-happen on a Linux host with real disks.
+Planned 2026-10-04. The generator (`tools/compare`) has run against all three
+competitors: Kafka through librdkafka (`acks=all`, idempotence on, librdkafka's default
+batching), NATS through async-nats, Redis through a pool of redis-rs connections. Each
+report carries its drain time. Remaining before the measured runs: focal's target (three
+`focal:bench` containers on the same network), the generator in a container on the bench
+network, and a Linux host with real disks.
