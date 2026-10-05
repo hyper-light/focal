@@ -7,6 +7,7 @@ use focal_directory::{
     WorkClass, WorkId, WorkKey, WorkMetadata,
 };
 use std::collections::BTreeMap;
+use tokio::sync::watch;
 #[path = "fleet_management.rs"]
 pub(super) mod management;
 
@@ -343,6 +344,7 @@ impl ReplicaFleet {
             unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: None,
+            wire: None,
             _wal_owners: wal_owners,
             _allocation: allocation,
             _backing: backing.clone(),
@@ -377,6 +379,11 @@ struct GroupOwner {
     unwoken: std::collections::BTreeSet<LedgerId>,
     nonce: u128,
     management: Option<management::ManagementOwner>,
+    /// The fields beyond raft-rs's this node's groups carry (`Wire`), as the
+    /// committed upgrade fence opens them (`upgrade::RAFT_KEPT_LEVEL`): every
+    /// session of the group follows it, and one installed later starts on
+    /// it. A group composed without a fence to follow keeps `Wire::Frozen`.
+    wire: Option<watch::Receiver<focal_consensus::Wire>>,
     // Physical writers outlive every logical-session removal. A final handle
     // may join its disk thread only after the entire fleet has stopped; one
     // stalled session cannot block another by dropping the last writer handle.
@@ -544,8 +551,32 @@ impl GroupOwner {
             }
         }
     }
+    /// The wire the group's sessions are to carry now.
+    pub(super) fn current_wire(&self) -> focal_consensus::Wire {
+        self.wire
+            .as_ref()
+            .map_or(focal_consensus::Wire::Frozen, |wire| *wire.borrow())
+    }
+    /// Raise every session to the wire the fence opened, once it changes. A
+    /// session that cannot take it has failed and is stopped by its own
+    /// next poll, as any failed session is.
+    fn follow_wire(&mut self) {
+        let Some(receiver) = self.wire.as_mut() else {
+            return;
+        };
+        if !receiver.has_changed().unwrap_or(false) {
+            return;
+        }
+        let wire = *receiver.borrow_and_update();
+        for owner in self.sessions.values_mut() {
+            if owner.session.wire() != wire {
+                let _ = owner.session.set_raft_wire(wire);
+            }
+        }
+    }
     fn run_inner(&mut self, receiver: mpsc::Receiver<FleetInput>) -> Result<(), LedgerError> {
         loop {
+            self.follow_wire();
             if self
                 .management
                 .as_ref()

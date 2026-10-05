@@ -668,6 +668,12 @@ impl NetworkService {
         } = prepared;
         owners.hold(directory, wal.clone())?;
         let founder = identity.node == state.genesis.founder.node;
+        // The wire every group this node hosts carries, from the fence its
+        // root replica has applied, before any of them sends (24 §21, 27
+        // §15.9); the controller raises it as the root advances.
+        let (wire_sender, wire) = tokio::sync::watch::channel(crate::upgrade::raft_wire(
+            control.enrollment().ok_or(NodeError::Identity)?.fence(),
+        ));
         let (directory, directory_startup) = DirectoryStartup::new(
             identity.node,
             state.genesis.founder.cluster,
@@ -675,6 +681,7 @@ impl NetworkService {
             wal.clone(),
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
             root.clone(),
+            wire.clone(),
         )?;
         let authority = FounderControlAuthority::from_genesis(&state.genesis)?;
         let registry = PeerRegistry::new(4096)?;
@@ -786,6 +793,7 @@ impl NetworkService {
         });
         let local = UnixServer::bind_watched(&socket, local_grant_watch, WireLimits::default())?;
         controller.follow_local_grant(local_grant);
+        controller.follow_wire(wire_sender);
         let mut admin = if let Some(handler) = admin_handler {
             let path = root.join(ADMIN_SOCKET);
             clean_socket(&path, &root)?;
@@ -998,6 +1006,7 @@ impl NetworkService {
         }
         let mut control_config = ControlHostConfig::new(state.genesis.root_namespace);
         control_config.enrollment_authority = Some(authority.clone());
+        control_config.wire = Some(wire.clone());
         let (control, control_owner, control_output) = ControlHost::spawn_recovered(
             control,
             NoDirectoryAuthority,
@@ -1055,6 +1064,7 @@ impl NetworkService {
             budget.clone(),
             ReplicaHost::wire_limits(),
             ManagedFleetConfig::default(),
+            wire,
         )?;
         owners.register(PhysicalOwner::Ledger(owner))?;
         let ledger = if let Some(session) = session {

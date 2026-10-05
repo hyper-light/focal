@@ -1678,7 +1678,7 @@ the copy holds crosses the path only where it differs: over relays of 2 ms at 10
 Upgrades roll one binary at a time and activate incompatible behaviour only
 behind a committed fence ([08](08-stepped-complexity-and-deployment.md)
 §10). Each binary implements a capability level (`upgrade::CAPABILITY_LEVEL`,
-2 for this release) and announces it — the compiled level, or a lower one
+3 for this release) and announces it — the compiled level, or a lower one
 the operator sets through `FOCAL_CAPABILITY_LEVEL` for a staged rollout or
 a rehearsal; the variable never raises it — in every load report
 (`NodeLoad::capability`; the frozen V1 row codec restores it as zero,

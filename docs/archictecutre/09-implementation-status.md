@@ -13979,3 +13979,28 @@ focal's side of taking the shared crates at b5e372d (the vendoring commit before
     `PlacementAgent::collect` now treats a local refusal as one voter that does not sign, as a
     remote refusal already was, and reports it only if no majority signs. The test passes in 87 s,
     where it stalled to its 240 s bound.
+
+### 2026-10-05 — R17's `kept` and `lost` on the wire behind the fence: the node's half
+
+The consensus half (fields 17 and 18, `Wire`, `set_raft_wire`, `encode_message_in`) landed with
+hyper-raft 4c4a199. This is the node's half, as 27 §15.9 and 24 §21 state it:
+
+- **The level.** `CAPABILITY_LEVEL` is now 3, so the founder can raise the fence to
+  `RAFT_KEPT_LEVEL` once every enrolled node reports it (`cli_upgrade` rehearses the rollout to the
+  compiled level and activates it). `upgrade::raft_wire(fence)` is `Wire::Kept` at or above the
+  level and `Wire::Frozen` below it.
+- **One wire a node.** The service starts a watch at the wire its root replica's applied fence
+  opens, before any group of the node is spawned. The network controller raises it on each
+  registry it observes (the fence never lowers).
+- **Every group follows it.** The root's and each hosted partition's control owners take it in
+  their config and apply it before their first drain and at every turn of their loop. The session
+  fleet's group owner applies a change to every session it holds, and sets a session it installs
+  before assembling it. Both encoders write under the group's own wire (`encode_message_in`).
+  `ReplicaProgress` and `ControlProgress` say which wire each group carries.
+- **Tests.**
+  - `the_wire_carries_kept_and_lost_only_from_their_level` checks the mapping.
+  - `a_control_group_carries_the_wire_its_fence_opened_and_follows_it` opens a control group
+    under an open fence and below one that opens later, and both carry `Kept`.
+  - `an_installed_session_follows_the_wire_its_fence_opens` raises a fleet's wire after a
+    session is installed, and the session carries `Kept` without being reinstalled, as does one
+    installed after. With the group's `follow_wire` disabled it fails.

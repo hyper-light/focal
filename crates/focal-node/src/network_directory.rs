@@ -207,6 +207,8 @@ pub(super) struct DirectoryStartup {
     wal: SharedWal,
     budget: MemoryBudget,
     root: PathBuf,
+    /// The wire every partition group this node hosts carries (`Wire`).
+    wire: watch::Receiver<focal_consensus::Wire>,
 }
 impl DirectoryStartup {
     pub(super) fn new(
@@ -216,6 +218,7 @@ impl DirectoryStartup {
         wal: SharedWal,
         budget: MemoryBudget,
         root: PathBuf,
+        wire: watch::Receiver<focal_consensus::Wire>,
     ) -> Result<(DirectoryHandle, Self), DirectoryBootstrapError> {
         let plan = PartitionPlan::derive(cluster, founder)?;
         let (state, receiver) = watch::channel(None);
@@ -244,6 +247,7 @@ impl DirectoryStartup {
             wal,
             budget,
             root,
+            wire,
         };
         Ok((handle, startup))
     }
@@ -266,8 +270,13 @@ impl DirectoryStartup {
             // Cancellation cannot strand an untracked disk owner between awaits.
             let installed_index = permit.root_index();
             let expires_at = permit.expires_at();
-            let (host, owner, output) =
-                ControlHost::spawn_directory(permit, self.wal.clone(), self.budget.clone(), None)?;
+            let (host, owner, output) = ControlHost::spawn_directory(
+                permit,
+                self.wal.clone(),
+                self.budget.clone(),
+                None,
+                self.wire.clone(),
+            )?;
             owners.register(PhysicalOwner::Control(owner))?;
             self.state.send_replace(Some(host.clone()));
             let plan = self.plan;
@@ -296,14 +305,14 @@ impl DirectoryStartup {
         let records = load_records(&self.root, self.plan, self.node)?;
         let hosted = &self.hosted;
         let pending = &self.pending;
-        let (wal, budget, plan_root) = (&self.wal, &self.budget, &self.root);
+        let (wal, budget, plan_root, wire) = (&self.wal, &self.budget, &self.root, &self.wire);
         // Every partition whose drive began, hosted or still being
         // permitted: a request repeated meanwhile starts no second one.
         let mut driving = std::collections::BTreeSet::new();
         for (plan, image) in records {
             driving.insert(plan.partition());
             extras.push(Box::pin(drive_hosted(
-                plan, image, root, pool, owners, wal, budget, hosted, pending, plan_root,
+                plan, image, root, pool, owners, wal, budget, hosted, pending, plan_root, wire,
             )));
         }
         loop {
@@ -336,7 +345,7 @@ impl DirectoryStartup {
                             driving.insert(plan.partition());
                             extras.push(Box::pin(drive_hosted(
                                 *plan, image, root, pool, owners, wal, budget, hosted, pending,
-                                plan_root,
+                                plan_root, wire,
                             )));
                         }
                         HostRequest::Retire { partition } => {
@@ -420,12 +429,13 @@ async fn drive_hosted(
     hosted: &watch::Sender<BTreeMap<PartitionId, HostedPartition>>,
     pending: &watch::Sender<BTreeMap<PartitionId, HostingAttempt>>,
     records: &Path,
+    wire: &watch::Receiver<focal_consensus::Wire>,
 ) -> Result<(), ServiceError> {
     let permit = permit(root, plan, Some(2_400), Some(pending)).await?;
     let installed_index = permit.root_index();
     let expires_at = permit.expires_at();
     let (host, owner, output) =
-        ControlHost::spawn_directory(permit, wal.clone(), budget.clone(), image)?;
+        ControlHost::spawn_directory(permit, wal.clone(), budget.clone(), image, wire.clone())?;
     owners.register(PhysicalOwner::Control(owner))?;
     pending.send_modify(|map| {
         map.remove(&plan.partition());

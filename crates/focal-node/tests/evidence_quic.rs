@@ -430,6 +430,7 @@ impl Fleet {
                         max_sessions: 4,
                         management_queue: 8,
                     },
+                    tokio::sync::watch::channel(focal_consensus::Wire::Frozen).1,
                 )
                 .unwrap();
                 let host = manager

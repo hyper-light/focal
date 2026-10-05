@@ -218,6 +218,9 @@ pub struct StopHandOff {
 }
 #[derive(Clone, Debug)]
 pub struct ReplicaProgress {
+    /// The fields beyond raft-rs's this replica's messages carry, as the
+    /// committed upgrade fence opened them (`upgrade::raft_wire`).
+    pub wire: focal_consensus::Wire,
     pub node: u64,
     pub leader: u64,
     pub term: u64,
@@ -963,6 +966,7 @@ impl ReplicaHost {
         let (lost_sender, lost) = mpsc::sync_channel(LOST_PEERS);
         let (progress, changes) = watch::channel(ProgressState {
             value: ReplicaProgress {
+                wire: session.wire(),
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
@@ -2587,6 +2591,7 @@ impl Owner {
         let status = self.session.status();
         self.progress.send_modify(|state| {
             state.value = ReplicaProgress {
+                wire: self.session.wire(),
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
@@ -3883,7 +3888,9 @@ impl Owner {
                 let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
-            let Ok(message_bytes) = focal_consensus::encode_message(message) else {
+            let Ok(message_bytes) =
+                focal_consensus::encode_message_in(message, self.session.wire())
+            else {
                 drop(snapshot);
                 self.dropped = self.dropped.saturating_add(1);
                 let _ = self.lost_sender.try_send(message.to);

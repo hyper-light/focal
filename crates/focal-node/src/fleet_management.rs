@@ -737,6 +737,13 @@ impl ManagementOwner {
             slots,
             _backing: state._backing.clone(),
         };
+        // A session installed under an open fence carries its fields before
+        // it sends anything, and says so from its first progress.
+        let mut replica = replica;
+        replica
+            .session
+            .set_raft_wire(group.current_wire())
+            .map_err(|_| FleetError::Capacity)?;
         let (host, mut session) = ReplicaHost::assemble(
             replica.session,
             replica.config,
@@ -904,6 +911,10 @@ impl ReplicaFleet {
     /// Creates one initially empty worker. Physical writers are retained for its
     /// entire lifetime, and only sessions built with those exact writers may be
     /// admitted. Construct this trusted owner outside a latency-sensitive worker.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the one composition of the node's fleet, from what the service owns"
+    )]
     pub fn spawn_managed(
         node: u64,
         cluster: [u8; 16],
@@ -912,6 +923,7 @@ impl ReplicaFleet {
         budget: MemoryBudget,
         limits: WireLimits,
         config: ManagedFleetConfig,
+        wire: watch::Receiver<focal_consensus::Wire>,
     ) -> Result<(FleetManager, ReplicaOwner, FleetReplication), LedgerError> {
         if node == 0
             || cluster == [0; 16]
@@ -1040,6 +1052,7 @@ impl ReplicaFleet {
             unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: Some(management),
+            wire: Some(wire),
             _wal_owners: writers,
             _allocation: allocation,
             _backing: backing.clone(),

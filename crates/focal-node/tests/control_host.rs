@@ -908,6 +908,56 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
     rig.stop().await;
 }
 
+/// A group opened under a fence that opened R17's fields carries them before
+/// it sends anything, and one opened below it follows the fence as it opens.
+#[tokio::test]
+async fn a_control_group_carries_the_wire_its_fence_opened_and_follows_it() {
+    for opened in [true, false] {
+        let data = tempfile::tempdir().unwrap();
+        let authority = BootstrapAuthority::open_or_create(
+            data.path().join("ca"),
+            CLUSTER,
+            vec!["localhost".into()],
+            now(),
+        )
+        .unwrap();
+        let memory = budget();
+        let replica = ControlReplica::open(
+            ControlOptions::new(NodeConfig::single(1, CLUSTER, GROUP)),
+            root_bootstrap(&authority),
+            memory.clone(),
+            data.path().join("log"),
+        )
+        .unwrap();
+        let initial = if opened {
+            focal_consensus::Wire::Kept
+        } else {
+            focal_consensus::Wire::Frozen
+        };
+        let (fence, wire) = tokio::sync::watch::channel(initial);
+        let mut config = ControlHostConfig::new(namespace());
+        config.wire = Some(wire);
+        let (host, owner, _outgoing) =
+            ControlHost::spawn(replica, RejectUnverifiedEvidence, config, memory.clone()).unwrap();
+        host.campaign().await.unwrap();
+        if !opened {
+            fence.send_replace(focal_consensus::Wire::Kept);
+        }
+        let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 100, FROZEN);
+        while host.progress().wire != focal_consensus::Wire::Kept {
+            if let Err(spent) = wait.check(&[host.periods()]) {
+                panic!(
+                    "the group never carried Kept: {spent}; {:?}",
+                    host.progress()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn owned_control_response_retains_input_and_export_budgets_until_delivery_drop() {
     let data = tempfile::tempdir().unwrap();

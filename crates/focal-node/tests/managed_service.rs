@@ -112,6 +112,7 @@ async fn one_handler_routes_live_installations_without_management_round_trips_an
             max_sessions: 2,
             management_queue: 1,
         },
+        tokio::sync::watch::channel(focal_consensus::Wire::Frozen).1,
     )
     .unwrap();
     let (content, content_owner) = ContentHost::spawn(

@@ -38,6 +38,19 @@ struct Fixture {
     budget: MemoryBudget,
 }
 fn fixture(path: &std::path::Path, max_sessions: usize, management_queue: usize) -> Fixture {
+    fixture_on(
+        path,
+        max_sessions,
+        management_queue,
+        tokio::sync::watch::channel(focal_consensus::Wire::Frozen).1,
+    )
+}
+fn fixture_on(
+    path: &std::path::Path,
+    max_sessions: usize,
+    management_queue: usize,
+    wire: tokio::sync::watch::Receiver<focal_consensus::Wire>,
+) -> Fixture {
     let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
     let tenant = budget.child(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
     let wal = SharedWal::open_with_budget(
@@ -66,6 +79,7 @@ fn fixture(path: &std::path::Path, max_sessions: usize, management_queue: usize)
             max_sessions,
             management_queue,
         },
+        wire,
     )
     .unwrap();
     Fixture {
@@ -125,6 +139,45 @@ async fn stopped(host: &ReplicaHost) {
     owners::within(&[host], Duration::from_secs(2), TICK, host.closed())
         .await
         .expect("the stopped host closed");
+}
+
+/// Every session of the fleet carries the wire the committed fence opened:
+/// one installed below it carries `Frozen`, and once the fence opens R17's
+/// fields the session carries `Kept` without being reinstalled.
+#[tokio::test]
+async fn an_installed_session_follows_the_wire_its_fence_opens() {
+    let directory = tempfile::tempdir().unwrap();
+    let (fence, wire) = tokio::sync::watch::channel(focal_consensus::Wire::Frozen);
+    let fleet = fixture_on(directory.path(), 2, 8, wire);
+    let installed = fleet
+        .manager
+        .install(1, candidate(&fleet.wal, &fleet.tenant, 1))
+        .await
+        .unwrap();
+    let host = installed.value().host().clone();
+    assert_eq!(host.progress().wire, focal_consensus::Wire::Frozen);
+    fence.send_replace(focal_consensus::Wire::Kept);
+    let mut wait =
+        focal_timing::ProgressDeadline::begin(&[host.periods()], 200, Duration::from_secs(60));
+    while host.progress().wire != focal_consensus::Wire::Kept {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the session never carried Kept: {spent}; {:?}",
+                host.progress()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A session installed once the fence is open starts on it.
+    let second = fleet
+        .manager
+        .install(2, candidate(&fleet.wal, &fleet.tenant, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.value().host().progress().wire,
+        focal_consensus::Wire::Kept
+    );
 }
 
 #[tokio::test]
@@ -552,6 +605,7 @@ async fn removing_final_session_on_stalled_writer_does_not_block_live_installati
             max_sessions: 1,
             management_queue: 8,
         },
+        tokio::sync::watch::channel(focal_consensus::Wire::Frozen).1,
     )
     .unwrap();
     let installed = {

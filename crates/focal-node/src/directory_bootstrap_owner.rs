@@ -36,10 +36,12 @@ impl ControlHost {
         wal: SharedWal,
         budget: MemoryBudget,
         image: Option<PartitionCheckpoint>,
+        wire: watch::Receiver<focal_consensus::Wire>,
     ) -> Result<(Self, ControlOwner, DirectoryReplication), DirectoryBootstrapError> {
         let plan = permit.plan();
         let identity = plan.identity()?;
-        let config = ControlHostConfig::new(plan.namespace());
+        let mut config = ControlHostConfig::new(plan.namespace());
+        config.wire = Some(wire);
         config.validate()?;
         let limits = Self::wire_limits();
         let queue_items = config
@@ -69,6 +71,7 @@ impl ControlHost {
         let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
+                wire: focal_consensus::Wire::Frozen,
                 identity,
                 node: plan.host(),
                 leader: 0,

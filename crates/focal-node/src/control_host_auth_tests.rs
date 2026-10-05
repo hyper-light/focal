@@ -168,6 +168,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
     let (outbound, _outgoing) = async_mpsc::channel(32);
     let (progress, _progress) = watch::channel(ControlProgressState {
         value: ControlProgress {
+            wire: focal_consensus::Wire::Frozen,
             identity: network.control.identity(),
             node: status.node_id,
             leader: status.leader_id,
