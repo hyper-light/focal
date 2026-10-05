@@ -159,7 +159,13 @@ fn parse_frontmatter(skill: &str, bytes: &[u8]) -> Result<Map<String, Value>, Pr
         .and_then(|rest| rest.split_once("\n---\n"))
         .map(|(header, _)| header)
         .ok_or(ProtocolError::Limits)?;
-    let value: Value = serde_saphyr::from_str(header).map_err(|_| ProtocolError::Limits)?;
+    // The skills are compiled in, but their frontmatter is parsed as any
+    // YAML focal reads: no aliases or anchors, within the header's bytes.
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {max_depth:8,max_events:1024,max_nodes:512,max_total_scalar_bytes:header.len(),max_aliases:0,max_anchors:0,max_documents:1},
+    };
+    let value: Value =
+        serde_saphyr::from_str_with_options(header, options).map_err(|_| ProtocolError::Limits)?;
     let Value::Object(frontmatter) = value else {
         return Err(ProtocolError::Limits);
     };

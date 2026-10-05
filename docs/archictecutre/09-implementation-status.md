@@ -13916,3 +13916,26 @@ depend on it:
   `PersistencePending`, `Busy`, `NotReady`), within startup's 16 rounds. Any other refusal still
   ends startup, now by its name. The directory bootstrap's admission map answers `LeaderLeaving`
   as not ready, as the control RPC already did.
+
+### 2026-10-05 — Every YAML document under a stated budget, held by a contract rule
+
+Condition 6's sweep for expansion bombs. focal compresses nothing (no compression crate is in
+the [inventory](../dependencies/inventory.tsv)), so the decompression-bomb surface is what its
+decoders expand. The wire, record and input codecs already refuse declared lengths before
+allocating (R11 §3), and client inputs, deployment configuration and its schema parse YAML with
+no aliases or anchors and bounded depth, events, nodes and scalar bytes. Two sites took
+serde-saphyr's default budget, which admits 50,000 aliases and 250,000 nodes:
+
+- `focal-load`'s shape file. It also read its file with an unbounded `read_to_string` after
+  checking its length, so a file that grew in between was read whole. It now reads through the
+  bound and refuses a file that grew.
+- The MCP server's skill frontmatter. The skills are compiled in, but they are parsed as any
+  YAML focal reads.
+
+Both now parse under the shared budget. `a_shape_that_expands_by_aliases_is_refused` and
+`frontmatter_that_expands_by_aliases_is_refused` refuse a five-level alias expansion (9^5
+nodes from a few hundred bytes, the "billion laughs" shape). The shape test also shows that the
+default budget admits an anchor and alias that the stated one refuses, and the skills test fails
+without the budget. `scripts/check-contracts.py` now refuses `serde_saphyr::from_str`,
+`from_slice` and `from_reader` in production sources (an inline test module may compare against
+them), so a new site cannot take the default.
