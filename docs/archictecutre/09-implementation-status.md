@@ -6359,7 +6359,7 @@ the prefix until R8; an unfiltered testament watch seeds the claims.
 The four packaged skills (`skills/focal-claims`, `focal-evidence`,
 `focal-validation`, `focal-cluster`) now carry an "On a native ledger" branch
 and the shared contract a "Native engine" section
-([workflow-contract.md](../../skills/references/workflow-contract.md)):
+([workflow-contract.md](../../skills/focal-claims/references/workflow-contract.md)):
 `ledger.standing` selects the branch; native identity is minted per call and
 resumed through `operation_id` (no reservation or seal), recovery is the
 four `request.*` tools, refusals are typed and a `capacity` refusal leaves
@@ -13726,3 +13726,28 @@ refused `Unlisted` in the program.
   replays to the same claim with the same `n1:` reference; the same run with other
   input exits 10 (`program_failed`, a new row in the exit table); and a counting
   program finds one claim.
+
+### 2026-10-04 — Skills over MCP, and each skill self-contained
+
+The five skills now follow the Agent Skills layout: each directory holds its `SKILL.md`
+and a `references/` folder with every file it links, so one directory copied alone still
+resolves. Before, every skill linked `../references/*.md` and `../manifest.json`, which
+break once a skill leaves the repository, and which a host of the MCP skills extension
+must refuse because it reads only within a skill's manifest. Copies of a shared
+reference are byte-identical, and the contract test refuses drift and any `../` in a
+skill. Skills linked to each other by path, which became links by name. Each skill's
+version rose by one: claims 11, evidence 10, validation 5, peers 3, cluster 22.
+
+The adapter serves the skills with `io.modelcontextprotocol/skills` (SEP-2640, final
+2026-09-13, on revision 2026-07-28). `server/discover` declares `resources` and the
+extension, with no directory reads since every file is in its skill's manifest.
+`skills/list` returns each skill's frontmatter, parsed with the parser the CLI uses, and
+a manifest of each file's `skill://` URI, SHA-256 digest (aws-lc-rs, the one provider)
+and size, computed from the bytes served. `skills/get` looks a skill up by URI, and
+`resources/read` returns a file. A 2025-11-25 client reads the same files through
+`resources/list` and `resources/read`. The files are compiled into the binary
+(`skills.rs`), and a test holds that list to the `skills/` directory byte for byte;
+`code.search` sees them as `skills`. Unknown skills and files, paths leaving a skill, a
+cursor never issued, and a directory read never offered are refused (-32602, or -32601
+for the directory read). Tests: 2 unit and 2 stdio in focal-mcp (43 in all), the
+reshaped client contract test, and focal-evidence's 57.

@@ -144,7 +144,7 @@ fn total_byte_preflight_preserves_original_test_report_whitespace_acceptance() {
 fn packaged_mcp_only_diagnostic_contract_pins_the_real_hash_and_valid_example() {
     let instructions = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../skills/references/workflow-contract.md"
+        "/../../skills/focal-claims/references/workflow-contract.md"
     ));
     let section = instructions
         .split_once("### Built-in error-report v1\n")

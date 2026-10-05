@@ -24,6 +24,7 @@ mod json;
 mod protocol;
 #[cfg(test)]
 mod skill_contract_tests;
+mod skills;
 mod stdio;
 #[cfg(all(test, unix))]
 mod stdio_tests;

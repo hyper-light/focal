@@ -97,13 +97,18 @@ const WORK: u64 = 30 * 7_147;
 /// other than code mode's own, as JSON text the sandbox parses.
 pub(crate) struct Registry {
     listing: String,
+    /// The served skills as the search sees them (`skills`).
+    skills: String,
     names: Vec<String>,
     /// The mutations that take an `operation_id`, which a program's call
     /// gets derived when it names none.
     referenced: Vec<String>,
 }
 impl Registry {
-    pub(crate) fn new(tools: &[Tool]) -> Result<Self, ProtocolError> {
+    pub(crate) fn new(
+        tools: &[Tool],
+        skills: &crate::skills::Skills,
+    ) -> Result<Self, ProtocolError> {
         let mut names = Vec::new();
         names
             .try_reserve_exact(tools.len())
@@ -139,6 +144,7 @@ impl Registry {
         let listing = serde_json::to_string(&entries).map_err(|_| ProtocolError::Encode)?;
         Ok(Self {
             listing,
+            skills: skills.search_listing()?,
             names,
             referenced,
         })
@@ -149,7 +155,12 @@ impl Registry {
             .iter()
             .chain(self.referenced.iter())
             .map(String::capacity)
-            .fold(self.listing.capacity(), usize::saturating_add)
+            .fold(
+                self.listing
+                    .capacity()
+                    .saturating_add(self.skills.capacity()),
+                usize::saturating_add,
+            )
     }
     fn listed(&self, name: &str) -> bool {
         self.names.iter().any(|listed| listed == name)
@@ -166,7 +177,7 @@ pub(crate) fn tools(limits: CodeLimits) -> Result<[Tool; 2], ProtocolError> {
     Ok([
         Tool {
             name: SEARCH.into(),
-            description: "Search focal's tools with code. The program sees `registry`, an array of {name, description, input, output, read_only, destructive} for every tool you may call, and returns only what you need, e.g. `return registry.filter(t => t.name.startsWith(\"claim.\")).map(t => ({name: t.name, input: t.input}))`. Makes no calls.".into(),
+            description: "Search focal's tools and skills with code. The program sees `registry`, an array of {name, description, input, output, read_only, destructive} for every tool you may call, and `skills`, an array of {uri, name, description, files: [{uri, text}]} for every skill served, and returns only what you need, e.g. `return registry.filter(t => t.name.startsWith(\"claim.\")).map(t => ({name: t.name, input: t.input}))`. Makes no calls.".into(),
             input_schema: serde_json::json!({"type":"object","additionalProperties":false,"required":["program"],
                 "properties":{"program":program}}),
             output_schema: crate::catalog::output_schema(SEARCH)?,
@@ -409,8 +420,8 @@ impl<T: ClientTransport> Driver<'_, T> {
                 )
             }
             Mode::Search => format!(
-                "{PRELUDE}\n__focal_fix(0, [1,2,3,4], {{}});\nconst registry = {};",
-                self.host.registry.listing
+                "{PRELUDE}\n__focal_fix(0, [1,2,3,4], {{}});\nconst registry = {};\nconst skills = {};",
+                self.host.registry.listing, self.host.registry.skills
             ),
         };
         let source = format!(

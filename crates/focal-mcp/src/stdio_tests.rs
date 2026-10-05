@@ -435,3 +435,6 @@ fn a_withheld_tool_invoked_directly_is_refused_and_never_dispatched() {
 
 #[path = "code_stdio_tests.rs"]
 mod code;
+
+#[path = "skills_stdio_tests.rs"]
+mod skills;

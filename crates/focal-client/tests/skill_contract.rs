@@ -93,9 +93,21 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
     assert_eq!(manifest.skills.len(), 5);
     let mut resources = BTreeSet::new();
     let mut reference_content = String::new();
+    // Each skill holds its own copy of every reference it links (a skill
+    // directory is self-contained: Agent Skills, and the MCP skills
+    // extension, which reads only within a skill's manifest); copies of one
+    // reference are the same bytes, so they cannot drift.
+    let mut copies = std::collections::BTreeMap::new();
     for item in &manifest.resources {
         assert!(resources.insert(item.path.clone()), "duplicate resource");
         reference_content.push_str(&resource(&item.path, &item.blake3));
+        let name = Path::new(&item.path).file_name().unwrap().to_owned();
+        let first = copies.entry(name).or_insert_with(|| item.blake3.clone());
+        assert_eq!(
+            *first, item.blake3,
+            "copies of one reference differ: {}",
+            item.path
+        );
     }
     let mut all_operations = BTreeSet::new();
     let mut all_native = BTreeSet::new();
@@ -105,11 +117,11 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
         assert_eq!(
             skill.version,
             match skill.name.as_str() {
-                "focal-claims" => 10,
-                "focal-peers" => 2,
-                "focal-evidence" => 9,
-                "focal-validation" => 4,
-                "focal-cluster" => 21,
+                "focal-claims" => 11,
+                "focal-peers" => 3,
+                "focal-evidence" => 10,
+                "focal-validation" => 5,
+                "focal-cluster" => 22,
                 _ => 2,
             }
         );
@@ -124,10 +136,25 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
         let frontmatter: Frontmatter = serde_saphyr::from_str(header).unwrap();
         assert_eq!(frontmatter.name, skill.name);
         assert!(!frontmatter.description.is_empty());
-        assert!(content.contains("../manifest.json"));
+        // Nothing a skill links leaves its directory.
+        assert!(
+            !content.contains("../"),
+            "{} links outside itself",
+            skill.name
+        );
         for reference in skill.references {
-            assert!(resources.contains(&reference));
-            assert!(content.contains(&format!("../{reference}")));
+            assert!(resources.contains(&format!("{}/{reference}", skill.name)));
+            assert!(content.contains(&format!("({reference}")));
+            let copy = resource(
+                &format!("{}/{reference}", skill.name),
+                &manifest
+                    .resources
+                    .iter()
+                    .find(|item| item.path == format!("{}/{reference}", skill.name))
+                    .unwrap()
+                    .blake3,
+            );
+            assert!(!copy.contains("../"), "{reference} links outside its skill");
         }
         let mut required = BTreeSet::new();
         for operation in skill.required_operations {

@@ -68,11 +68,11 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
         assert_eq!(
             skill.version,
             match skill.name.as_str() {
-                "focal-claims" => 10,
-                "focal-evidence" => 9,
-                "focal-validation" => 4,
-                "focal-peers" => 2,
-                "focal-cluster" => 21,
+                "focal-claims" => 11,
+                "focal-evidence" => 10,
+                "focal-validation" => 5,
+                "focal-peers" => 3,
+                "focal-cluster" => 22,
                 _ => 2,
             }
         );

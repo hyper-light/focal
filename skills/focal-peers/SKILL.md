@@ -7,7 +7,7 @@ description: >-
   consultations, read a claim's lineage and wait for a claim predicate.
 ---
 
-Use the connected Focal MCP server. Read [the shared workflow contract](../references/workflow-contract.md) and [the peer workflow reference](../references/peer-workflows.md) before the first call. Every tool here is a version-2 native tool: read `ledger.standing` first and follow the [native branch](../references/workflow-contract.md#native-engine) of the contract (no reservation, an `n1:` `operation_id` returned by each mutation, `request.pending`/`request.inspect`/`request.retry`/`request.acknowledge` for recovery). The required operation versions are pinned in [the skill manifest](../manifest.json). The peer tools are authored shapes of `claim.submit`: they compile to the same frame, identity and receipt as a hand-written claim, so nothing here creates a second workflow engine.
+Use the connected Focal MCP server. Read [the shared workflow contract](references/workflow-contract.md) and [the peer workflow reference](references/peer-workflows.md) before the first call. Every tool here is a version-2 native tool: read `ledger.standing` first and follow the [native branch](references/workflow-contract.md#native-engine) of the contract (no reservation, an `n1:` `operation_id` returned by each mutation, `request.pending`/`request.inspect`/`request.retry`/`request.acknowledge` for recovery). The required operation versions are pinned in Focal's skill manifest (`skills/manifest.json`; over MCP, `skills/list`). The peer tools are authored shapes of `claim.submit`: they compile to the same frame, identity and receipt as a hand-written claim, so nothing here creates a second workflow engine.
 
 ## Challenge
 

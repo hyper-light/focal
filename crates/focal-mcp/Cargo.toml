@@ -18,6 +18,8 @@ thiserror.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
 rquickjs.workspace = true
+serde_saphyr.workspace = true
+aws-lc-rs = "1.18"
 
 [dev-dependencies]
 tempfile.workspace = true

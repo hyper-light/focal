@@ -11,24 +11,36 @@
   },
   "resources": [
     {
-      "path": "references/workflow-contract.md",
+      "path": "focal-claims/references/workflow-contract.md",
       "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
     },
     {
-      "path": "references/admin-workflow.md",
+      "path": "focal-evidence/references/workflow-contract.md",
+      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+    },
+    {
+      "path": "focal-validation/references/workflow-contract.md",
+      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+    },
+    {
+      "path": "focal-cluster/references/admin-workflow.md",
       "blake3": "9243a3fbc9108b5bc989083c0a2565432f319a31b7c351a73c7810f7485b5305"
     },
     {
-      "path": "references/peer-workflows.md",
+      "path": "focal-peers/references/workflow-contract.md",
+      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+    },
+    {
+      "path": "focal-peers/references/peer-workflows.md",
       "blake3": "cc114556dc3cfea5e54141b202eb11f4da37ff0a71e440b57f6d7b2acf95c662"
     }
   ],
   "skills": [
     {
       "name": "focal-claims",
-      "version": 10,
+      "version": 11,
       "path": "focal-claims/SKILL.md",
-      "blake3": "ceef116a30d9d22f1f6f9d26ac5321bfd5e33ab710f355bda9612b198f10616c",
+      "blake3": "4bb8018e8e87fb054ca304cdee9de1c36c828a866354679eebc6d92c4bc7261a",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -229,9 +241,9 @@
     },
     {
       "name": "focal-evidence",
-      "version": 9,
+      "version": 10,
       "path": "focal-evidence/SKILL.md",
-      "blake3": "e1bcb388496179874974eb05d69987c27686463fc06260c9890e860d2a963f3b",
+      "blake3": "ad71fdb73c5ffe661e0ba928225a8989e971a8bb10860f370206614f0c7b4a29",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -453,9 +465,9 @@
     },
     {
       "name": "focal-validation",
-      "version": 4,
+      "version": 5,
       "path": "focal-validation/SKILL.md",
-      "blake3": "687fe803704dcf897184bbd86490734a4179576a25a351b892c96eac07987363",
+      "blake3": "7914f076436ef9fa7fe657aafc1721d7f473c9236353674fc278f0ce9b1e7105",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -616,9 +628,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 21,
+      "version": 22,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "114ff5264c2ac7d19b6f568c67ce7297591fb4ecbfe3ec47a83443b96964863b",
+      "blake3": "328e2dd0d7c15c6acf39eed10ef2b0ebe2bb78388919bb4a17875806e1b37c0b",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -888,9 +900,9 @@
     },
     {
       "name": "focal-peers",
-      "version": 2,
+      "version": 3,
       "path": "focal-peers/SKILL.md",
-      "blake3": "71dc328c9aa266b88255087ef9e90994df3a854c09af94feec517d8eeb91e3e9",
+      "blake3": "1398b643a98c17858eb26a5d4feac8032d190eb3c9fb18b01a173101460df353",
       "references": [
         "references/workflow-contract.md",
         "references/peer-workflows.md"

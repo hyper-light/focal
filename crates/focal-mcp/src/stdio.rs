@@ -76,10 +76,11 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     let Catalogue {
         tools,
         registry,
+        skills,
         admission: catalog_admission,
         _registry: _registry_charge,
     } = Catalogue::new(&backend, &budget, code_limits)?;
-    let mut protocol = Protocol::new(
+    let protocol = Protocol::new(
         limits,
         budget.clone(),
         ServerInfo {
@@ -88,6 +89,7 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
         },
         tools,
     )?;
+    let mut protocol = protocol.with_skills(skills)?;
     drop(catalog_admission);
     let decoder = FrameDecoder::new(limits.max_frame_bytes, budget.clone())?;
     // Includes bounded channel slots, synchronization bookkeeping, owner
@@ -311,6 +313,7 @@ impl Adapter {
 struct Catalogue {
     tools: Vec<crate::Tool>,
     registry: crate::code::Registry,
+    skills: crate::skills::Skills,
     admission: Allocation,
     _registry: Allocation,
 }
@@ -385,8 +388,10 @@ impl Catalogue {
         if backend.has_watches() {
             crate::catalog_watch::append(&mut tools)?;
         }
-        // What code mode may call is what is served, less its own two tools.
-        let registry = crate::code::Registry::new(&tools)?;
+        // What code mode may call is what is served, less its own two tools;
+        // its search sees the served skills beside them.
+        let skills = crate::skills::Skills::embedded()?;
+        let registry = crate::code::Registry::new(&tools, &skills)?;
         let registry_charge = budget
             .reserve(BudgetKind::Control, BudgetLane::Ordinary, registry.bytes())?
             .commit();
@@ -397,6 +402,7 @@ impl Catalogue {
         Ok(Self {
             tools,
             registry,
+            skills,
             admission,
             _registry: registry_charge,
         })
@@ -425,6 +431,7 @@ pub fn run_code<T: ClientTransport>(
     let Catalogue {
         tools: _,
         registry,
+        skills: _,
         admission,
         _registry,
     } = Catalogue::new(&backend, &budget, code_limits)?;

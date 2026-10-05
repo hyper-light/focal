@@ -5,8 +5,8 @@ description: >-
   membership changes with exact administrative recovery.
 ---
 
-Use the versions in [the skill manifest](../manifest.json). Discover all tool
-pages and read [the administration workflow](../references/admin-workflow.md).
+Use the versions in Focal's skill manifest (`skills/manifest.json`; over MCP, `skills/list`). Discover all tool
+pages and read [the administration workflow](references/admin-workflow.md).
 The connected local Unix owner supplies administration. A remote participant
 context supplies ordinary ledger operations; it does not grant node ownership.
 

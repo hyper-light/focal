@@ -176,11 +176,26 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    let health = command(root, &["diagnose", "node", "--health"]);
-    panic!(
-        "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
-        String::from_utf8_lossy(&health.stdout)
-    );
+    // Every node this test started: its health (placement refusals,
+    // authority refusals) and its metrics (consensus progress, budget and
+    // queue refusals), so a stall names the member and the refusal.
+    let mut report = String::new();
+    for observed in deadline::observed() {
+        for read in [
+            ["diagnose", "node", "--health"],
+            ["diagnose", "node", "--metrics"],
+        ] {
+            let output = command(&observed, &read);
+            report.push_str(&format!(
+                "\n== {} {}\n{}{}",
+                observed.display(),
+                read[2],
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    panic!("{what} did not happen within {timeout:?}; nodes:{report}\nlast view: {last:#?}");
 }
 fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     let invitation = founder.join(format!("{name}.invite"));
