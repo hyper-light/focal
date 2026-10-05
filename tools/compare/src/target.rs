@@ -173,7 +173,10 @@ impl Target {
                 connections,
                 durable,
             } => {
-                let index = usize::try_from(sequence).unwrap_or(0) % connections.len().max(1);
+                let index = usize::try_from(sequence)
+                    .unwrap_or(0)
+                    .checked_rem(connections.len())
+                    .unwrap_or(0);
                 match connections.get(index) {
                     Some(connection) => Self::RedisLane {
                         connection: connection.clone(),
