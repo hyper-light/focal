@@ -13797,3 +13797,12 @@ fence reaching every hosted group, follows in focal-node.
   commits a second, load, seeds), and the S-4 kept-hole probe test at focal's level, with the node
   half.
 
+
+### 2026-10-04 — The shared crates at hyper-raft 4c4a199
+
+The six `hyper-*` snapshots move to `4c4a199`, the shared repository's line once its six targets
+are green on it. `hyper-raft` and `hyper-durable` had been taken from `fc61b65`, the branch that
+carried `set_ahead` before it reached line; their sources are byte-identical at `4c4a199`, and the
+other four are unchanged from `df54729`. Line also carries hyper-quic's second overhead round and
+the e2e harness's flush bound, neither of which focal vendors. `vendor/README.md` and
+`docs/dependencies/inventory.tsv` name the new revision.
