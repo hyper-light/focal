@@ -14,7 +14,9 @@ use crate::generations::{Finished, Generations};
 use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Profile, Transport, WorkloadShape};
-use focal_client::{Client, ClientError, EmbeddedTransport, RetryPolicy, UnixTransport};
+use focal_client::{
+    Client, ClientError, EmbeddedTransport, QuicTransport, RetryPolicy, UnixTransport,
+};
 use focal_ledger::NativeContentProfile;
 use focal_model::{
     ClaimId, LedgerId, ParticipantId, RequestEpoch, RequestId, RequestKey, RootCommandId,
@@ -28,12 +30,13 @@ use focal_node::{
 use focal_wire::{
     AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply, NativeObject,
     NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant, PeerRole,
-    ReadConsistency, RequestEnvelope, Response, ResponseEnvelope, WireLimits,
+    QuicConnector, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope, RouteHint,
+    WireLimits,
 };
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// The seed sits above this bit of every identity the run uses.
@@ -67,6 +70,12 @@ const MAX_WALK_DEPTH: usize = 16;
 enum Connector {
     Embedded(LocalHost),
     Unix(PathBuf),
+    /// An enrolled client's TLS and first route; each worker dials its own
+    /// QUIC connection with them.
+    Enrolled {
+        tls: quinn::ClientConfig,
+        initial: RouteHint,
+    },
 }
 
 /// The identities every frame names.
@@ -83,6 +92,7 @@ struct Names {
 enum Conn {
     Embedded(Client<EmbeddedTransport<LocalHost>>),
     Unix(Client<UnixTransport>),
+    Enrolled(Client<QuicTransport>),
 }
 impl Conn {
     fn open(connector: &Connector, names: &Names, limits: &WireLimits) -> Result<Self, LoadError> {
@@ -111,12 +121,32 @@ impl Conn {
                     1,
                 )?))
             }
+            Connector::Enrolled { tls, initial } => {
+                let address = if initial.endpoint.starts_with('[') {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                }
+                .parse()
+                .map_err(|_| LoadError::Shape("local address".into()))?;
+                let connector = QuicConnector::bind(address, tls.clone(), limits.clone())?;
+                // One route, one connection: the transport's bound is the
+                // routes a client may hold, as the CLI's enrolled context.
+                let transport = QuicTransport::new(connector, initial.clone(), 16)?;
+                Ok(Self::Enrolled(Client::new(
+                    transport,
+                    RetryPolicy::default(),
+                    limits.clone(),
+                    1,
+                )?))
+            }
         }
     }
     async fn request(&self, envelope: RequestEnvelope) -> Result<ResponseEnvelope, ClientError> {
         match self {
             Self::Embedded(client) => client.request(envelope).await,
             Self::Unix(client) => client.request(envelope).await,
+            Self::Enrolled(client) => client.request(envelope).await,
         }
     }
 }
@@ -133,6 +163,9 @@ struct Job {
     limits: WireLimits,
     /// Read phase: the claims this worker created, cycled through.
     created: Vec<u128>,
+    /// Write phase, paced (the shape's `rate`): the interval between this
+    /// worker's intended starts.
+    pace: Option<Duration>,
 }
 
 #[derive(Clone, Copy)]
@@ -378,7 +411,11 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let conn = Conn::open(&job.connector, &job.names, &job.limits)?;
+    // A QUIC endpoint binds to the runtime it is made in.
+    let conn = {
+        let _entered = runtime.enter();
+        Conn::open(&job.connector, &job.names, &job.limits)?
+    };
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
     let mut outcome = Outcome {
         samples: Vec::with_capacity(count),
@@ -416,7 +453,23 @@ fn worker(
                         id: RequestId::from_u128(request),
                     };
                     let (envelope, claim) = build(&job, offset, key)?;
-                    let started = Instant::now();
+                    // Paced, a request starts at its place on the schedule
+                    // and its latency counts from there, however late the
+                    // worker reached it (wrk2); unpaced, from its send.
+                    let started = match job.pace {
+                        Some(interval) => {
+                            let place = u32::try_from(i)
+                                .ok()
+                                .and_then(|i| interval.checked_mul(i))
+                                .and_then(|offset| run_start.checked_add(offset))
+                                .ok_or(LoadError::Bound("schedule"))?;
+                            if let Some(wait) = place.checked_duration_since(Instant::now()) {
+                                std::thread::sleep(wait);
+                            }
+                            place
+                        }
+                        None => Instant::now(),
+                    };
                     let reply = classify(caller.send(envelope));
                     outcome.samples.push((
                         started.saturating_duration_since(run_start).as_nanos(),
@@ -691,6 +744,60 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             };
             (Connector::Unix(root.join("focal.sock")), names, None)
         }
+        Transport::Enrolled => {
+            let enrollment = shape
+                .enrollment
+                .clone()
+                .ok_or_else(|| LoadError::Shape("transport enrolled needs enrollment".into()))?;
+            let worker = shape
+                .worker
+                .as_deref()
+                .ok_or_else(|| LoadError::Shape("transport enrolled needs worker".into()))
+                .and_then(|text| {
+                    focal_client::input::parse_id(text)
+                        .map_err(|_| LoadError::Shape("worker is 32 hex digits".into()))
+                })?;
+            let now = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| LoadError::Clock)?
+                    .as_secs(),
+            )
+            .map_err(|_| LoadError::Clock)?;
+            let pending = focal_node::network_join::PendingClientJoin::resume_shared(&enrollment)?;
+            let client = pending.remote_client(now, &limits)?;
+            let names = Names {
+                ledger: client.build.ledger,
+                issuer: client.build.actor,
+                worker: ParticipantId(worker),
+                root: client.build.root,
+                profile,
+            };
+            (
+                Connector::Enrolled {
+                    tls: client.tls,
+                    initial: client.initial,
+                },
+                names,
+                None,
+            )
+        }
+    };
+    // Paced writes: each worker's share of the offered rate, as a fixed
+    // interval between its intended starts.
+    let pace = match shape.rate {
+        Some(rate) => {
+            let per_worker = rate
+                .checked_div(u64::from(shape.concurrency))
+                .filter(|share| *share > 0)
+                .ok_or(LoadError::Bound("rate below one a second per worker"))?;
+            Some(
+                Duration::from_secs(1)
+                    .checked_div(u32::try_from(per_worker).map_err(|_| LoadError::Bound("rate"))?)
+                    .ok_or(LoadError::Bound("rate"))?,
+            )
+        }
+        None => None,
     };
 
     // Writes: every worker its share of the claims, in its own id space.
@@ -704,6 +811,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             names,
             limits: limits.clone(),
             created: Vec::new(),
+            pace,
         });
     }
     // One journal's generations for every caller, as N processes of one
@@ -739,6 +847,8 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 names,
                 limits: limits.clone(),
                 created: outcome.created.clone(),
+                // Reads are not paced: they measure the read path closed-loop.
+                pace: None,
             });
         }
         let (read_outcomes, read_nanos) = run_phase(jobs, Phase::Read, &generations)?;

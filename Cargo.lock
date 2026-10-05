@@ -794,6 +794,7 @@ dependencies = [
  "focal-node",
  "focal-wire",
  "getrandom 0.3.4",
+ "quinn",
  "serde",
  "serde-saphyr",
  "serde_json",

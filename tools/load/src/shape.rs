@@ -25,6 +25,11 @@ pub enum Transport {
     /// as that node's own local participant (what the CLI does without a
     /// `--client-context`).
     Unix,
+    /// A remote cluster over QUIC, as the client a `focal context enroll`
+    /// left in `enrollment` (`PendingClientJoin::remote_client`): what an
+    /// agent on another machine is, and what the comparison drives
+    /// (`docs/qualification/competitive-p99.md`).
+    Enrolled,
 }
 
 /// The native content profile the request frames are encoded for. It must be
@@ -66,6 +71,21 @@ pub struct WorkloadShape {
     /// reads are split evenly among them; each caller has its own client.
     #[serde(default = "default_concurrency")]
     pub concurrency: u16,
+    /// `enrolled`: the enrolled client's directory (its join journal, key and
+    /// adopted issuers).
+    #[serde(default)]
+    pub enrollment: Option<PathBuf>,
+    /// `enrolled`: the participant every claim targets, as 32 hex digits (a
+    /// remote client cannot read the node's `IDENTITY`).
+    #[serde(default)]
+    pub worker: Option<String>,
+    /// Offered creations a second over all callers. Set, the writes are
+    /// paced on a fixed schedule and each latency counts from its request's
+    /// intended start (wrk2's constant-throughput method), so a stall is
+    /// charged to every request it delays; unset, each caller sends as fast
+    /// as it is answered (closed loop).
+    #[serde(default)]
+    pub rate: Option<u64>,
     /// `embedded` only: after the run, close the node and reopen the same
     /// directory, timing exec-to-serving and the first linearizable read —
     /// single-node recovery at exactly this run's retained size.
@@ -105,10 +125,19 @@ impl WorkloadShape {
                     "transport unix needs data_dir (the running node's directory)".to_string(),
                 );
             }
-            Transport::Unix if self.reopen => {
+            Transport::Unix | Transport::Enrolled if self.reopen => {
                 return Err("reopen applies to the embedded transport only".to_string());
             }
+            Transport::Enrolled if self.enrollment.is_none() || self.worker.is_none() => {
+                return Err(
+                    "transport enrolled needs enrollment (the client's directory) and worker"
+                        .to_string(),
+                );
+            }
             _ => {}
+        }
+        if self.rate == Some(0) {
+            return Err("rate must be greater than zero".to_string());
         }
         Ok(())
     }
@@ -117,7 +146,7 @@ impl WorkloadShape {
     pub fn profile(&self) -> Profile {
         self.profile.unwrap_or(match self.transport {
             Transport::Embedded => Profile::ProjectionOnly,
-            Transport::Unix => Profile::AuthoredV1,
+            Transport::Unix | Transport::Enrolled => Profile::AuthoredV1,
         })
     }
 }

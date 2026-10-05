@@ -58,6 +58,7 @@ pub struct Latency {
     pub p50: u128,
     pub p95: u128,
     pub p99: u128,
+    pub p999: u128,
     pub max: u128,
 }
 
@@ -72,11 +73,12 @@ pub fn latency(samples: &mut [u128]) -> Result<Latency, LoadError> {
         .len()
         .checked_sub(1)
         .ok_or(LoadError::Bound("percentile of no samples"))?;
-    let pick = |percent: usize| -> Result<u128, LoadError> {
+    // Ranks in per-mille, so p99.9 is as exact as the samples.
+    let pick = |per_mille: usize| -> Result<u128, LoadError> {
         let index = last
-            .checked_mul(percent)
-            .and_then(|scaled| scaled.checked_add(50))
-            .and_then(|scaled| scaled.checked_div(100))
+            .checked_mul(per_mille)
+            .and_then(|scaled| scaled.checked_add(500))
+            .and_then(|scaled| scaled.checked_div(1000))
             .ok_or(LoadError::Bound("percentile rank"))?;
         samples
             .get(index.min(last))
@@ -84,9 +86,10 @@ pub fn latency(samples: &mut [u128]) -> Result<Latency, LoadError> {
             .ok_or(LoadError::Bound("percentile rank"))
     };
     Ok(Latency {
-        p50: pick(50)?,
-        p95: pick(95)?,
-        p99: pick(99)?,
+        p50: pick(500)?,
+        p95: pick(950)?,
+        p99: pick(990)?,
+        p999: pick(999)?,
         max: samples.last().copied().unwrap_or(0),
     })
 }
