@@ -91,7 +91,13 @@ impl CodeLimits {
 /// 7,147 calls a second for a loop of built-in sorts, against 13,723 for a
 /// loop of property writes. Faster hosts end sooner; the count, not a clock,
 /// is the bound.
+#[cfg(not(test))]
 const WORK: u64 = 30 * 7_147;
+/// The adapter's own tests check that the counted bound ends a program with
+/// `work`, not its magnitude: a count small enough that any runner reaches
+/// it within the harness's read deadline.
+#[cfg(test)]
+const WORK: u64 = 2_000;
 
 /// What `code.search` searches and `code.run` may call: the served tools
 /// other than code mode's own, as JSON text the sandbox parses.

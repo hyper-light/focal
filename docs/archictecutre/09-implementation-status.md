@@ -13751,3 +13751,19 @@ and size, computed from the bytes served. `skills/get` looks a skill up by URI, 
 cursor never issued, and a directory read never offered are refused (-32602, or -32601
 for the directory read). Tests: 2 unit and 2 stdio in focal-mcp (43 in all), the
 reshaped client contract test, and focal-evidence's 57.
+
+### 2026-10-04 — Two CI failures of b9b78cb, closed at their causes
+
+- **Windows: `mcp serve` exited at start** (`mcp_native_a1`, the reader saw `Disconnected`).
+  The Windows runners check text out with CRLF, so the binary embedded each `SKILL.md`
+  as `---\r\n…`, the frontmatter parse refused it, and the adapter, which refuses to
+  serve skills it cannot describe, did not start. The skills are content-addressed (the
+  manifest pins BLAKE3 digests, the MCP manifests SHA-256), so their bytes must be the
+  same on every platform. `.gitattributes` now checks `skills/**` out with LF everywhere.
+  The parser stays strict: a CRLF skill would also carry different digests than the
+  ones pinned.
+- **Ubuntu and macOS: code mode's bounds test** waited past the stdio harness's read
+  deadline on the `work` case. Its production bound, 214,410 hook calls, takes 0.5 s on
+  the development host and longer on a runner. The test checks that the counted bound
+  ends a program with `work`, not its magnitude, so under `cfg(test)` the bound is 2,000
+  calls; the production derivation is unchanged.
