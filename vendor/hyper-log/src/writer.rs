@@ -144,6 +144,9 @@ pub(crate) struct Placement {
     proposals: Option<usize>,
     uncertain: Option<usize>,
     damaged: Option<usize>,
+    /// The tag after each entry's and proposal's bytes in a sealed log: what an entry's or
+    /// proposal's stride counts beside its header and bytes.
+    tag: usize,
 }
 
 /// A live piece of the tail copied into the payload.
@@ -178,6 +181,9 @@ pub(crate) struct Target {
     pub(crate) frame_len: u64,
     /// Whether the frame opens its segment, whose header it writes first.
     pub(crate) opens: bool,
+    /// Bytes laid before the payload: a sealed log's key record, when the frame begins a writer
+    /// session in a segment it continues ([`format::KEY_RECORD_LEN`]), or none.
+    pub(crate) prefix: u64,
 }
 
 pub(crate) fn block(p: &Params) -> Result<u64, LogError> {
@@ -211,13 +217,21 @@ pub(crate) fn persisted(s: &Submission) -> format::Persisted {
 }
 
 /// Bytes a submission's records take in a payload: its update's and its marks'.
-pub(crate) fn submission_len(group: u128, update: &Update, marks: Marks) -> Option<usize> {
+pub(crate) fn submission_len(
+    group: u128,
+    update: &Update,
+    marks: Marks,
+    tag: usize,
+) -> Option<usize> {
     if marks.damaged {
-        return format::encoded_len(&Record::Damaged { group });
+        return format::encoded_len(&Record::Damaged { group }, tag);
     }
-    let len = update_len(group, update)?;
+    let len = update_len(group, update, tag)?;
     match marks.uncertain {
-        Some(mark) => len.checked_add(format::encoded_len(&Record::Uncertain { group, mark })?),
+        Some(mark) => len.checked_add(format::encoded_len(
+            &Record::Uncertain { group, mark },
+            tag,
+        )?),
         None => Some(len),
     }
 }
@@ -291,11 +305,14 @@ pub(crate) fn sweepable(state: &State, p: &Params) -> Result<bool, LogError> {
     // The copies' bytes at most: every live piece, and a relocated record's header for
     // each, as if no two entries ran together.
     let (count, live_bytes) = state.live.of(tail);
-    let run = format::encoded_len(&Record::Relocated {
-        group: 0,
-        first: 0,
-        entries: &[],
-    })
+    let run = format::encoded_len(
+        &Record::Relocated {
+            group: 0,
+            first: 0,
+            entries: &[],
+        },
+        p.tag,
+    )
     .and_then(|len| u64::try_from(len).ok())
     .ok_or(LogError::Config("a relocated record's header"))?;
     let copies = count
@@ -384,7 +401,7 @@ pub(crate) fn sweep(
     for frame in frames {
         let copies = live_copies(state, read.slot, frame.base, &frame.records);
         for copy in &copies {
-            let placed = format::put(payload, &copy.record())
+            let placed = format::put(payload, &copy.record(), p.tag)
                 .ok_or(LogError::Damaged("a copy does not encode"))?;
             *records = records.saturating_add(1);
             copy.moved(placed, &mut moved);
@@ -412,11 +429,7 @@ pub(crate) fn target(
     makes_room: bool,
 ) -> Result<Option<Target>, LogError> {
     let block = block(p)?;
-    let frame_len = format::FRAME_HEADER_LEN
-        .checked_add(payload_len)
-        .and_then(|len| u64::try_from(len).ok())
-        .and_then(|len| p.align.up_u64(len))
-        .ok_or(LogError::TooLarge(payload_len))?;
+    let frame_len = frame_len(p, payload_len)?;
     let head = state.head;
     let head_end = slot_start(&p.config, head.slot)?
         .checked_add(p.config.segment_bytes)
@@ -435,6 +448,7 @@ pub(crate) fn target(
             offset: head.offset,
             frame_len,
             opens: false,
+            prefix: 0,
         }));
     }
     if usable == 0 || (usable == 1 && !makes_room) {
@@ -461,7 +475,18 @@ pub(crate) fn target(
         offset,
         frame_len,
         opens: true,
+        prefix: 0,
     }))
+}
+
+/// Bytes of a frame whose header is followed by `payload_len` bytes (a sealed log's MAC
+/// counted among them), padded to the block.
+pub(crate) fn frame_len(p: &Params, payload_len: usize) -> Result<u64, LogError> {
+    format::FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|len| u64::try_from(len).ok())
+        .and_then(|len| p.align.up_u64(len))
+        .ok_or(LogError::TooLarge(payload_len))
 }
 
 /// A run of live entries being gathered: its first index and its entries' terms and bytes.
@@ -681,7 +706,12 @@ fn piece_copy<'a>(
         Owned::Damaged { at: offset, group } => (state.damaged.get(group)
             == Some(&Some(at(*offset))))
         .then_some(Copy::Damaged { group: *group }),
-        Owned::Entries { .. } | Owned::Relocated { .. } | Owned::Removed { .. } => None,
+        // A key record keys its own session's records and is not a piece of any group: a sweep
+        // reseals what it copies under the session that writes the copy.
+        Owned::Entries { .. }
+        | Owned::Relocated { .. }
+        | Owned::Removed { .. }
+        | Owned::Key { .. } => None,
     }
 }
 
@@ -863,28 +893,32 @@ pub(crate) fn validate(
 }
 
 /// Bytes an update's records take in a payload.
-pub(crate) fn update_len(group: u128, update: &Update) -> Option<usize> {
+pub(crate) fn update_len(group: u128, update: &Update, tag: usize) -> Option<usize> {
     let mut len = 0usize;
     if update.remove {
-        return format::encoded_len(&Record::Removed { group });
+        return format::encoded_len(&Record::Removed { group }, tag);
     }
     if let Some(start) = update.start {
-        len = len.checked_add(format::encoded_len(&Record::Start { group, start })?)?;
+        len = len.checked_add(format::encoded_len(&Record::Start { group, start }, tag)?)?;
     }
     if let Some(e) = &update.entries {
         let lens = e.entries.iter().map(|x| x.bytes.len());
-        len = len.checked_add(format::entries_len(lens)?)?;
+        len = len.checked_add(format::entries_len(lens, tag)?)?;
     }
     if let Some(state) = update.hard_state {
-        len = len.checked_add(format::encoded_len(&Record::HardState { group, state })?)?;
+        len = len.checked_add(format::encoded_len(
+            &Record::HardState { group, state },
+            tag,
+        )?)?;
     }
     for p in &update.proposals {
-        len = len.checked_add(format::encoded_len(&Record::Proposal {
+        let proposal = Record::Proposal {
             group,
             index: p.index,
             term: p.term,
             bytes: &p.bytes,
-        })?)?;
+        };
+        len = len.checked_add(format::encoded_len(&proposal, tag)?)?;
     }
     Some(len)
 }
@@ -897,12 +931,18 @@ pub(crate) fn encode(
     group: u128,
     update: &Update,
     marks: Marks,
+    tag: usize,
 ) -> Option<Placement> {
-    let mut lay = Lay { payload, records };
+    let mut lay = Lay {
+        payload,
+        records,
+        tag,
+    };
     if marks.damaged {
         let damaged = lay.put(&Record::Damaged { group })?;
         return Some(Placement {
             damaged: Some(damaged),
+            tag,
             ..Placement::default()
         });
     }
@@ -934,6 +974,7 @@ pub(crate) fn encode(
         proposals,
         uncertain,
         damaged: None,
+        tag,
     })
 }
 
@@ -941,13 +982,14 @@ pub(crate) fn encode(
 struct Lay<'a> {
     payload: &'a mut Payload,
     records: &'a mut u32,
+    tag: usize,
 }
 
 impl Lay<'_> {
     /// Appends a record placed whole, and says where `put` placed it.
     fn put(&mut self, record: &Record<'_>) -> Option<usize> {
         *self.records = self.records.checked_add(1)?;
-        match format::put(self.payload, record)? {
+        match format::put(self.payload, record, self.tag)? {
             Placed::Record(at) => Some(at),
             Placed::Entries(_) => None,
         }
@@ -957,7 +999,7 @@ impl Lay<'_> {
     fn entries(&mut self, group: u128, e: &crate::Entries) -> Option<usize> {
         *self.records = self.records.checked_add(1)?;
         let entries = e.entries.iter().map(|x| (x.term, x.bytes.as_slice()));
-        format::put_entries(self.payload, false, group, e.first, entries)
+        format::put_entries(self.payload, false, group, e.first, entries, self.tag)
     }
 
     /// Appends a record for each proposal, and says where the first record starts: `put`
@@ -992,6 +1034,7 @@ pub(crate) fn publish(
     let base = target
         .offset
         .checked_add(format::FRAME_HEADER_BYTES)
+        .and_then(|base| base.checked_add(target.prefix))
         .ok_or(LogError::Damaged("an offset past u64"))?;
     let place = |at: usize| -> Result<Place, LogError> {
         Ok(Place {
@@ -1192,7 +1235,8 @@ fn apply_entries(
         let here = at.ok_or(LogError::Damaged("an offset past usize"))?;
         at = here
             .checked_add(format::ENTRY_HEADER_LEN)
-            .and_then(|a| a.checked_add(usize::try_from(len).ok()?));
+            .and_then(|a| a.checked_add(usize::try_from(len).ok()?))
+            .and_then(|a| a.checked_add(placement.tag));
         let slot = Slot {
             term,
             place: place(here)?,
@@ -1280,7 +1324,8 @@ fn apply_proposals(
         record = start
             .checked_add(format::RECORD_HEADER_LEN)
             .and_then(|a| a.checked_add(format::PROPOSAL_FIELDS_LEN))
-            .and_then(|a| a.checked_add(p.bytes.len()));
+            .and_then(|a| a.checked_add(p.bytes.len()))
+            .and_then(|a| a.checked_add(placement.tag));
         let at = start
             .checked_add(format::RECORD_HEADER_LEN)
             .ok_or(LogError::Damaged("an offset past usize"))?;

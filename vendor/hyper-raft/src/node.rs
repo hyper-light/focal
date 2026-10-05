@@ -373,7 +373,7 @@ struct Mark {
 }
 
 /// A `Ready` whose write is out.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Given {
     mark: Mark,
     /// What this member approved by itself and gave, moved from the `Ready`
@@ -393,6 +393,7 @@ struct Stable {
 
 /// A member as its owner drives it: operations in, [`Ready`]s out, and
 /// notices of what became durable in.
+#[derive(Clone)]
 pub struct RawNode<S> {
     /// The state machine itself.
     pub raft: Raft<S>,

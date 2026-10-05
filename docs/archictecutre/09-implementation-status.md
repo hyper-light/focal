@@ -13916,3 +13916,20 @@ depend on it:
   `PersistencePending`, `Busy`, `NotReady`), within startup's 16 rounds. Any other refusal still
   ends startup, now by its name. The directory bootstrap's admission map answers `LeaderLeaving`
   as not ready, as the control RPC already did.
+
+
+### 2026-10-05 — The shared crates at hyper-raft b5e372d, and hyper-seal
+
+The six `hyper-*` snapshots move to `b5e372d`, the shared repository's line with its six targets
+green. The core changes what focal sees:
+- elections and commitment count by the newest configuration in a member's log (`Raft::configuration`;
+  `Raft::applied_configuration` is what the owner applied), and a campaign by a member that
+  configuration does not make a voter is `Error::NotPromotable`;
+- a dropped proposal names its cause (`Error::ProposalDropped(Dropped)`).
+
+`hyper-log` now seals a log at rest when asked (format 4), so `hyper-seal` is vendored beside it as
+a seventh crate: its dependencies (aws-lc-rs through focal's vendored copy, getrandom, thiserror,
+rustix or windows-sys) are all ones focal already carries. A log created unsealed is the format it
+was. `vendor/README.md` and `docs/dependencies/inventory.tsv` name the new revision; focal's own
+adoption of the typed drop, the newest-configuration count and `NotPromotable` follows in the next
+commit.

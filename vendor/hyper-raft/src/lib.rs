@@ -50,7 +50,7 @@ pub mod wire;
 
 pub use catchup::CatchUp;
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
-pub use error::{Error, Result, StorageError};
+pub use error::{Dropped, Error, Result, StorageError};
 pub use mutant::Mutant;
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};

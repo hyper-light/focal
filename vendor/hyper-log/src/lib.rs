@@ -36,6 +36,7 @@ mod group;
 mod owner;
 mod recover;
 mod room;
+mod seal;
 mod state;
 mod stats;
 mod ticket;
@@ -51,6 +52,7 @@ use hyper_block::buf::{Alignment, Pool};
 pub use error::LogError;
 pub use format::{HardState, Start};
 pub use group::GroupLog;
+pub use seal::Sealing;
 pub use stats::LogStats;
 pub use ticket::{Fetching, Pending};
 
@@ -242,6 +244,31 @@ impl Fetched {
         self.entries.len().saturating_sub(1)
     }
 
+    /// Rewrites the entries `open` says to: each entry's place and bytes in, its new bytes out,
+    /// or `None` to keep it (a sealed log's entries opened as the owner finishes a read).
+    fn open_each(
+        &mut self,
+        mut open: impl FnMut(usize, &[u8]) -> Result<Option<Vec<u8>>, LogError>,
+    ) -> Result<(), LogError> {
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (at, &(term, start, len)) in self.entries.iter().enumerate() {
+            let stored = start
+                .checked_add(len)
+                .and_then(|end| self.bytes.get(start..end))
+                .ok_or(LogError::Damaged("a fetched entry"))?;
+            let from = bytes.len();
+            match open(at, stored)? {
+                Some(plain) => bytes.extend_from_slice(&plain),
+                None => bytes.extend_from_slice(stored),
+            }
+            entries.push((term, from, bytes.len().saturating_sub(from)));
+        }
+        self.bytes = bytes;
+        self.entries = entries;
+        Ok(())
+    }
+
     /// Fills the place `at` with an entry read from the file.
     fn fill(&mut self, at: usize, payload: &[u8]) {
         let start = self.bytes.len();
@@ -278,17 +305,26 @@ pub(crate) struct Params {
     pub(crate) frame_room: usize,
     /// Charged bytes the queue holds at most (`PIPELINE_FRAMES`).
     pub(crate) queue_bytes: u64,
+    /// Bytes of the tag after each entry's and proposal's bytes: [`format::TAG_LEN`] in a sealed
+    /// log, 0 in an unsealed one.
+    pub(crate) tag: usize,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
 /// (`Log::parts`, `GroupLog::parts`).
-pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-    let len_of = |u: &Update| writer::update_len(group, u).ok_or(LogError::TooLarge(usize::MAX));
+pub(crate) fn parts(
+    room: usize,
+    group: u128,
+    update: Update,
+    tag: usize,
+) -> Result<Vec<Update>, LogError> {
+    let len_of =
+        |u: &Update| writer::update_len(group, u, tag).ok_or(LogError::TooLarge(usize::MAX));
     if update.remove || len_of(&update)? <= room {
         return Ok(vec![update]);
     }
     let record =
-        |r: &format::Record<'_>| format::encoded_len(r).ok_or(LogError::TooLarge(usize::MAX));
+        |r: &format::Record<'_>| format::encoded_len(r, tag).ok_or(LogError::TooLarge(usize::MAX));
     let Update {
         start,
         entries,
@@ -377,13 +413,27 @@ pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Upda
 }
 
 /// Payload bytes one frame holds: a segment less its header block and the frame's header.
-pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, LogError> {
+/// In a sealed log a frame also holds its MAC, and may begin with a key record, so its room for
+/// submissions is less by both.
+pub(crate) fn frame_room(
+    config: &Config,
+    align: Alignment,
+    sealed: bool,
+) -> Result<usize, LogError> {
     let block = u64::try_from(align.get()).map_err(|_| LogError::Config("block"))?;
+    let sealing = if sealed {
+        format::MAC_LEN
+            .checked_add(format::KEY_RECORD_LEN)
+            .ok_or(LogError::Config("a key record"))?
+    } else {
+        0
+    };
     config
         .segment_bytes
         .checked_sub(block)
         .and_then(|room| usize::try_from(room).ok())
         .and_then(|room| room.checked_sub(format::FRAME_HEADER_LEN))
+        .and_then(|room| room.checked_sub(sealing))
         .ok_or(LogError::Config("a segment holds no frame"))
 }
 
@@ -454,11 +504,46 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Formats a new log as [`Log::create`] does, giving the file back with a refusal.
     pub fn try_create(file: F, config: Config, id: u128) -> Result<Self, Refused<F>> {
-        let state = match recover::create(&file, &config, id) {
+        Self::make(file, config, id, None)
+    }
+
+    /// Formats a new sealed log `id` in `file`, which must be empty (hyper-raft docs/seal.md §5):
+    /// every entry's and proposal's bytes sealed, every frame, header and persist record under a
+    /// MAC. It opens only with [`Log::open_sealed`] and the same keys.
+    pub fn create_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<Self, LogError> {
+        Self::try_create_sealed(file, config, id, sealing).map_err(|r| r.error)
+    }
+
+    /// Formats a new sealed log as [`Log::create_sealed`] does, giving the file back with a refusal.
+    pub fn try_create_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<Self, Refused<F>> {
+        let sealer = match seal::Sealer::new(sealing, id) {
+            Ok(sealer) => sealer,
+            Err(error) => return Err(Refused::with(error, file)),
+        };
+        Self::make(file, config, id, Some(sealer))
+    }
+
+    fn make(
+        file: F,
+        config: Config,
+        id: u128,
+        mut sealer: Option<seal::Sealer>,
+    ) -> Result<Self, Refused<F>> {
+        let state = match recover::create(&file, &config, id, sealer.as_mut()) {
             Ok(state) => state,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        let (log, _) = Self::start(file, config, id, state, Vec::new())?;
+        let (log, _) = Self::start(file, config, id, state, Vec::new(), sealer)?;
         Ok(log)
     }
 
@@ -472,11 +557,49 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Opens a log as [`Log::open`] does, giving the file back with a refusal: what recovery
     /// found damaged stays for whoever repairs or replaces it.
     pub fn try_open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), Refused<F>> {
-        let (state, recovery, restores) = match recover::open(&file, &config, id) {
+        Self::reopen(file, config, id, None)
+    }
+
+    /// Opens sealed log `id` in `file` with the keys it was created with, and recovers it as
+    /// [`Log::open`] does. Framing whose MAC fails, or a record that does not open, is
+    /// [`LogError::Tampered`]: the log serves nothing from such a file.
+    pub fn open_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<(Self, Recovery), LogError> {
+        Self::try_open_sealed(file, config, id, sealing).map_err(|r| r.error)
+    }
+
+    /// Opens a sealed log as [`Log::open_sealed`] does, giving the file back with a refusal.
+    pub fn try_open_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<(Self, Recovery), Refused<F>> {
+        let sealer = match seal::Sealer::new(sealing, id) {
+            Ok(sealer) => sealer,
+            Err(error) => return Err(Refused::with(error, file)),
+        };
+        Self::reopen(file, config, id, Some(sealer))
+    }
+
+    fn reopen(
+        file: F,
+        config: Config,
+        id: u128,
+        mut sealer: Option<seal::Sealer>,
+    ) -> Result<(Self, Recovery), Refused<F>> {
+        let (state, recovery, restores) = match recover::open(&file, &config, id, sealer.as_mut()) {
             Ok(opened) => opened,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        let (mut log, pending) = Self::start(file, config, id, state, restores)?;
+        if let Some(sealer) = sealer.as_mut() {
+            sealer.retain(|inc| state.is_live(inc));
+        }
+        let (mut log, pending) = Self::start(file, config, id, state, restores, sealer)?;
         for p in pending {
             if let Err(error) = p.wait() {
                 return Err(Refused {
@@ -496,10 +619,18 @@ impl<F: BlockFile + 'static> Log<F> {
         id: u128,
         state: state::State,
         restores: Vec<recover::Restore>,
+        sealer: Option<seal::Sealer>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
-        match Self::prepare(file.alignment(), config, id, restores) {
+        match Self::prepare(file.alignment(), config, id, restores, sealer.is_some()) {
             Ok(prepared) => {
-                let log = Self::spawn(file, prepared.p, state, prepared.room, prepared.first)?;
+                let log = Self::spawn(
+                    file,
+                    prepared.p,
+                    state,
+                    prepared.room,
+                    prepared.first,
+                    sealer,
+                )?;
                 Ok((log, prepared.pending))
             }
             Err(error) => Err(Refused::with(error, file)),
@@ -513,8 +644,9 @@ impl<F: BlockFile + 'static> Log<F> {
         config: Config,
         id: u128,
         restores: Vec<recover::Restore>,
+        sealed: bool,
     ) -> Result<Prepared, LogError> {
-        let room_bytes = frame_room(&config, align)?;
+        let room_bytes = frame_room(&config, align, sealed)?;
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
@@ -524,6 +656,7 @@ impl<F: BlockFile + 'static> Log<F> {
             align,
             frame_room: room_bytes,
             queue_bytes,
+            tag: if sealed { format::TAG_LEN } else { 0 },
         };
         let waiters = config
             .max_groups
@@ -545,7 +678,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 uncertain: r.uncertain,
                 damaged: r.damaged,
             };
-            let bytes = writer::submission_len(r.group, &r.update, marks)
+            let bytes = writer::submission_len(r.group, &r.update, marks, p.tag)
                 .and_then(writer::charge)
                 .ok_or(LogError::TooLarge(usize::MAX))?;
             room.hold(r.group, bytes)?;
@@ -587,6 +720,7 @@ impl<F: BlockFile + 'static> Log<F> {
         state: state::State,
         room: room::Room,
         first: Vec<Submission>,
+        sealer: Option<seal::Sealer>,
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
@@ -642,7 +776,8 @@ impl<F: BlockFile + 'static> Log<F> {
                 returns: back,
                 tokens: token,
             },
-        );
+        )
+        .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
         let wiring = owner::Wiring {
             device,
             more,
@@ -652,7 +787,7 @@ impl<F: BlockFile + 'static> Log<F> {
             tokens,
             requests,
         };
-        let owner = Box::new(Owner::new(p, state, room, first, wiring));
+        let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer));
         // The owner's thread waits with room for the owner. Should the send fail, the owner, and
         // the file in it, ended with the thread.
         if to_owner.send(owner).is_err() {
@@ -743,7 +878,7 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Pending, LogError> {
         // Refused before it holds any room: no frame could take it, and every admitted
         // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
-        let len = writer::submission_len(group, &update, Marks::default())
+        let len = writer::submission_len(group, &update, Marks::default(), self.p.tag)
             .ok_or(LogError::TooLarge(usize::MAX))?;
         if len > self.p.frame_room {
             return Err(LogError::TooLarge(len));
@@ -812,11 +947,14 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// The most bytes one entry may hold and still fit a frame alone.
     pub fn entry_room(&self) -> Result<usize, LogError> {
-        let one = format::encoded_len(&format::Record::Entries {
-            group: 0,
-            first: 0,
-            entries: &[(0, &[])],
-        })
+        let one = format::encoded_len(
+            &format::Record::Entries {
+                group: 0,
+                first: 0,
+                entries: &[(0, &[])],
+            },
+            self.p.tag,
+        )
         .ok_or(LogError::Config("an entry's record"))?;
         self.frame_room()?
             .checked_sub(one)
@@ -831,7 +969,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// never done, so never acknowledged. `TooLarge` when one entry or proposal alone is
     /// more than a frame holds.
     pub fn parts(&self, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-        parts(self.p.frame_room, group, update)
+        parts(self.p.frame_room, group, update, self.p.tag)
     }
 
     /// Submits `update` and waits until it is durable; refused at once when the queue is

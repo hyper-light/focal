@@ -1,0 +1,27 @@
+[package]
+name = "hyper-seal"
+description = "Sealing at rest for mantle, focal and slates: a hierarchy of random keys wrapped with AES-256-KW, files sealed by STREAM, the shared log sealed record by record under a key per writer session, keys to another machine by ML-KEM-1024, names keyed per tenant"
+version = "0.1.0"
+edition = "2024"
+# focal's toolchain (rust-toolchain.toml); this snapshot builds on it, which focal's gates show.
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+
+[dependencies]
+# focal's vendored aws-lc-rs ([patch.crates-io] in focal's manifest).
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+getrandom = "0.4"
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+# mlock(2) and madvise(2) for the key region, and the page size.
+rustix = { version = "1.1", features = ["mm", "param"] }
+
+[target.'cfg(windows)'.dependencies]
+# VirtualLock for the key region; GetSecurityInfo and the ACL walk for a key file's owner-only check.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
+# suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
+[workspace]

@@ -340,7 +340,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// `Log::parts` gives them for the group: a pure function of the update and the frame's
     /// room, which the handle holds, so it is answered here with no message to the log's owner.
     pub fn parts(&self, update: Update) -> Result<Vec<Update>, LogError> {
-        crate::parts(self.p.frame_room, self.group, update)
+        crate::parts(self.p.frame_room, self.group, update, self.p.tag)
     }
 
     /// Submits `update`, which waits in the log for room rather than being refused, as
@@ -384,7 +384,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         if self.out.len() >= OUT {
             return Err(LogError::Busy);
         }
-        let len = writer::submission_len(self.group, &update, Marks::default())
+        let len = writer::submission_len(self.group, &update, Marks::default(), self.p.tag)
             .ok_or(LogError::TooLarge(usize::MAX))?;
         if len > self.p.frame_room {
             return Err(LogError::TooLarge(len));

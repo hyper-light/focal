@@ -1818,32 +1818,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.applied = at;
         self.conf_index = at.index;
         self.node.store_mut().configuration = configuration;
-        if self.snapshot_misses_a_member() {
-            self.prepare()?;
-        }
         Ok(())
-    }
-
-    /// Whether the snapshot prepared for lagging members leaves out a member of the
-    /// configuration, which refuses a snapshot that does not name it.
-    fn snapshot_misses_a_member(&self) -> bool {
-        let held = self.node.store();
-        let Some(named) = held
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.metadata.as_ref())
-            .and_then(|m| m.conf_state.as_ref())
-        else {
-            return false;
-        };
-        let configuration = &held.configuration;
-        configuration
-            .voters
-            .iter()
-            .chain(&configuration.learners)
-            .chain(&configuration.voters_outgoing)
-            .chain(&configuration.learners_next)
-            .any(|&member| !names(named, member))
     }
 
     /// Tells the core how far the state machine applied.

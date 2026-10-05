@@ -1235,6 +1235,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.4.3",
  "hyper-block",
+ "hyper-seal",
  "hyper-timing",
  "thiserror",
 ]
@@ -1246,6 +1247,17 @@ dependencies = [
  "crc32c",
  "hyper-timing",
  "thiserror",
+]
+
+[[package]]
+name = "hyper-seal"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "getrandom 0.4.3",
+ "rustix 1.1.4",
+ "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

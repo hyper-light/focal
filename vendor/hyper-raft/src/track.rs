@@ -47,18 +47,17 @@
 //! not applied and the configuration is not joint.
 //!
 //! **And it is a fast quorum of every configuration a member may count
-//! by.** A member campaigns by the configuration it has applied, which can
-//! be older than the leader's: one that has not heard the change
-//! committed. Raft's classic argument holds across one change because any
-//! two majorities of configurations one change apart meet; a fast quorum
-//! of the new configuration need not be a fast quorum of the old, and a
-//! member counting by the old was elected by voters most of whom held
-//! another entry (`fast.rs`,
+//! by.** A member counts by the newest configuration its log states
+//! (`docs/raft.md` §3.4), which can be older than the leader's: one whose
+//! log lacks the change. Raft's classic argument holds across one change
+//! because any two majorities of configurations one change apart meet; a
+//! fast quorum of the new configuration need not be a fast quorum of the
+//! old, and a member counting by the old was elected by voters most of
+//! whom held another entry (`fast.rs`,
 //! `a_member_that_counts_by_the_configuration_before_commits_no_second_entry`).
-//! A member that took an entry of this leader's term took with it this
-//! leader's commit, which covers the configuration the leader was elected
-//! under, and it campaigns only once it has applied what it committed: it
-//! counts by that configuration or by one the leader applied since. One
+//! A member that took an entry of this leader's term holds this leader's
+//! log through it: it counts by the configuration the leader was elected
+//! under or by one the leader wrote since. One
 //! that took no entry of the term has an older last term than every member
 //! of the fast quorum, which refuse it, and no majority of a configuration
 //! near this one is without them. So the leader notes the voters it was
@@ -67,7 +66,7 @@
 //! commits by the classic quorum until the next term.
 use crate::{
     NodeId,
-    error::{Error, Result},
+    error::{Dropped, Error, Result},
     fast::{self, Votes, same},
     log::{copy_entries_of, copy_entry},
     proto::{self, Entry, EntryType, Message},
@@ -130,7 +129,7 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Settings("the group has no fast track"));
         }
         if data.is_empty() {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::Empty));
         }
         if self.msgs.len() >= self.config.limits.pending_messages {
             return Err(Error::Capacity("messages that wait to be taken"));
@@ -154,7 +153,7 @@ impl<S: Storage> Raft<S> {
         }
         // One that knows no leader proposes to no one who could decide.
         if self.leader_id == 0 {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::NoLeader));
         }
         if self.displaced.len() >= self.config.limits.proposals {
             return Err(Error::Capacity("proposals whose end was not taken"));
@@ -531,7 +530,7 @@ impl<S: Storage> Raft<S> {
         self.term_voters.extend_from_slice(voters);
         Ok(())
     }
-    /// A leader applied a change: its sets of voters join those of its
+    /// A leader wrote a change: its sets of voters join those of its
     /// term. A third set leaves what a member counts by not known here
     /// until the next term.
     pub(crate) fn note_term_change(&mut self) -> Result<()> {

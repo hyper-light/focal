@@ -257,10 +257,6 @@ use crate::{
 /// other's.
 pub const CAMPAIGN_TRANSFER: &[u8] = b"CampaignTransfer";
 
-/// Whether the entry changes the configuration, by either encoding.
-pub fn changes_configuration(entry: &Entry) -> bool {
-    entry.entry_type != EntryType::EntryNormal
-}
 /// The bytes the entry takes in a message (`docs/raft.md` §3.1): what the core's byte bounds
 /// count, so a message's bytes are the sum of its entries' and its fixed part.
 pub fn encoded_bytes(entry: &Entry) -> u64 {
@@ -567,7 +563,6 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(Plan::of_entry(&entry), Err(Error::Violation(_))));
-        assert!(changes_configuration(&entry));
     }
     #[test]
     fn both_encodings_of_a_change_read_alike() {

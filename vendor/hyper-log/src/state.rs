@@ -248,6 +248,16 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// Whether the segment of `incarnation` is live: in a slot the log still reads.
+    pub(crate) fn is_live(&self, incarnation: u64) -> bool {
+        self.segments.live.iter().any(|&slot| {
+            usize::try_from(slot)
+                .ok()
+                .and_then(|i| self.segments.incarnation.get(i))
+                .is_some_and(|&inc| inc == incarnation)
+        })
+    }
+
     pub(crate) fn tail_incarnation(&self) -> u64 {
         self.segments
             .live

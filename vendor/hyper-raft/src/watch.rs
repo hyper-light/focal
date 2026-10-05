@@ -92,9 +92,6 @@ pub(crate) enum Arm {
     Unset { round: bool },
     /// Due at this time, nanoseconds on the owner's clock.
     At(u64),
-    /// Due, and held until every committed change of the configuration is applied: a member does
-    /// not campaign on a configuration it has not applied.
-    Apply,
 }
 
 /// What a member that elects by suspicion keeps (the module's documentation).
@@ -204,7 +201,7 @@ impl Watch {
     pub(crate) fn due(arm: Arm) -> Option<u64> {
         match arm {
             Arm::At(at) => Some(at),
-            Arm::Off | Arm::Unset { .. } | Arm::Apply => None,
+            Arm::Off | Arm::Unset { .. } => None,
         }
     }
     /// The bytes held beyond the member's own.
