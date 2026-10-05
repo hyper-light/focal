@@ -181,6 +181,15 @@ impl NodeConfig {
                 "invalid membership, tick, or capacity limits",
             ));
         }
+        // The shared crates' fast track releases a held fast vote before the entry it covers is
+        // safe from a later leader's truncation (09, 2026-10-05). Until the snapshot that fixes
+        // it, only this crate's own tests run it; the rule goes with that snapshot.
+        #[cfg(not(test))]
+        if self.fast {
+            return Err(ConsensusError::Configuration(
+                "the fast track is withheld until the shared crates' release fix is taken",
+            ));
+        }
         Ok(())
     }
 }

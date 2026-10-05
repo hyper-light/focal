@@ -13806,3 +13806,18 @@ carried `set_ahead` before it reached line; their sources are byte-identical at 
 other four are unchanged from `df54729`. Line also carries hyper-quic's second overhead round and
 the e2e harness's flush bound, neither of which focal vendors. `vendor/README.md` and
 `docs/dependencies/inventory.tsv` name the new revision.
+
+### 2026-10-05 — The fast track is withheld until the shared crates' release fix
+
+hyper-check's swarm search, with no mutant planted, found a Leader Completeness violation in the
+shared crates' fast track. A member releases a held fast vote once its log covers the vote's
+index; a later leader cuts that log back below the index; recovery then picks another value.
+FastTrack.tla's `Release` has the same flaw, which is why the model passed. The fix is made in the
+shared repository, at the release rule, with a directed test from the counterexample, the model
+changed so TLC finds the old rule's violation, and the campaigns replayed.
+
+No focal group runs the fast track today: `NodeConfig::fast` defaults to false, and no source
+outside this crate's tests sets it. `NodeConfig::validate` now refuses `fast: true` outside the
+crate's own tests, so that holds by rule rather than by convention until the snapshot with the fix
+is taken, which removes the rule. `tests/fast_withheld.rs` opens a member configured for the fast
+track and asserts the refusal, then opens the same member without it.
