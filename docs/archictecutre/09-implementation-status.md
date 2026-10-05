@@ -13821,3 +13821,40 @@ outside this crate's tests sets it. `NodeConfig::validate` now refuses `fast: tr
 crate's own tests, so that holds by rule rather than by convention until the snapshot with the fix
 is taken, which removes the rule. `tests/fast_withheld.rs` opens a member configured for the fast
 track and asserts the refusal, then opens the same member without it.
+### 2026-10-05 — A ledger stopped for good at about 4,200 claims; what admission takes, a checkpoint holds
+
+A single-node ledger driven over QUIC by `focal-load` stopped permanently at about 4,200
+native claims: "native session checkpoint: native Core checkpoint: native codec capacity
+exceeded". Every restart stopped it again, and every request to it was answered
+`unavailable`. Measured (`measure_the_checkpoint_of_a_ledger_of_thousands_of_claims`,
+release), the bound that fired was the checkpoint plan's work: 4,500 claims are 54,002
+rows and 7.6 MB, but cost 248,714,968 of the 268,435,456 visits allowed, about 4,600 a
+row and linear in the ledger (500 claims 27.7 M, 1,000 55.3 M, 2,000 110.5 M). Three
+defects, each fixed at its cause:
+
+- **A seek per row.** The root frame charged every row `iteration_work()`, a whole
+  directory seek (65 × 64 visits), but an in-order walk seeks once into each member and
+  at most once more per page. It now charges each seek once (`store_seeks`: pages,
+  members and the terminating probe) and each row one in-page step (`ROW_STEP`, 64). The
+  same ledger costs 30,738,456 visits, with byte-identical output.
+- **Admission did not check what a checkpoint could hold.** Rows were admitted past
+  bounds only a checkpoint enforced, so the session reached a state it could not
+  checkpoint and stopped. `NativeOwner::checkpoint_projection` bounds the next checkpoint
+  from above: the committed rows plus every pending candidate's writes, and the encoded
+  bytes as rows at their widest inline encoding plus the rows' heap (the pages' charge
+  less their entries' inline size, plus pending) at the codec's expansion.
+  `checkpointable` refuses a fresh candidate past the checkpoint's rows or assembled
+  bytes with typed, retryable `Capacity`. Exact retries are never refused and the
+  session keeps serving. `a_checkpoint_projection_bounds_the_checkpoint_it_projects`
+  proves the projection is never below the encoding; the first, coarser bound (4× the
+  whole budget) refused a parallel-materialization test's legitimate work and was
+  replaced by the per-kind one.
+- **A fixed 100,000-row bound below what memory holds.** The checkpoint's row bound is
+  now the session's memory over a row's resident size (`NATIVE_ENTRY_BYTES`, 344 bytes):
+  390,167 rows at 128 MiB.
+
+`a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints` fills a
+session to a 200-row bound: the next creation is refused typed and retryable, the
+checkpoint succeeds, and an exact retry is answered. Without the admission check, 200
+rows never refuse. The ledger that had stopped opens Ready on the fixed binary,
+checkpoints, and commits new claims (sequence 4,622).

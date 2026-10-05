@@ -129,7 +129,18 @@ impl NativeSessionLimits {
             attempts: 64,
             slot_bytes: 4096,
         };
-        let checkpoint = crate::native_checkpoint::Limits::default();
+        // A session's root is charged to its memory budget, so it never holds
+        // more rows than that budget can keep resident; its checkpoint carries
+        // that many, and admission refuses what would outgrow either bound
+        // (`checkpointable`). The fixed 100,000 rows was stricter than memory:
+        // a ledger was admitted past it, its checkpoint failed, and it stopped.
+        let memory_bytes: usize = 128 << 20;
+        let checkpoint = crate::native_checkpoint::Limits {
+            rows: memory_bytes
+                .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+                .unwrap_or(0),
+            ..crate::native_checkpoint::Limits::default()
+        };
         Self {
             recovery: recovery::Limits {
                 // Bounded owner shapes: every completion-class admission funds
@@ -219,7 +230,7 @@ impl NativeSessionLimits {
                 acceptance: 1 << 28,
                 native: 1 << 28,
             },
-            memory_bytes: 128 << 20,
+            memory_bytes,
             completion_reserve_bytes: 16 << 20,
             content_domain,
             disk_headroom_bytes: 64 << 20,

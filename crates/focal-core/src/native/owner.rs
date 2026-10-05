@@ -427,6 +427,13 @@ struct Pending {
 /// protects bounded RAM/report slots; disk capacity and durable reconstruction
 /// still require the enclosing log/custody owner.
 /// A durable owner must retain it while append/commit status is unresolved.
+/// [`NativeOwner::checkpoint_projection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointProjection {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
 pub struct NativeOwner {
     // Drop buffers and retained pages before releasing their queue allowance.
     pending: VecDeque<Pending>,
@@ -938,6 +945,54 @@ impl NativeOwner {
     /// Pending rows remain isolated; this borrow prevents concurrent mutation.
     pub fn committed_core(&self) -> &Core<NativeState> {
         &self.core
+    }
+
+    /// The most a checkpoint of the committed root, with every pending
+    /// candidate published, could take: its rows (the committed rows and
+    /// every pending candidate's writes, each at most one new row) and an
+    /// upper bound of its encoded bytes (a frame header, every row at its
+    /// widest inline encoding, and the rows' heap at the codec's expansion). A session refuses fresh work whose
+    /// projection its checkpoint could not hold, typed at admission, so that
+    /// what it admitted it can always checkpoint (rule 2) instead of failing
+    /// that checkpoint and stopping.
+    pub fn checkpoint_projection(&self) -> Result<CheckpointProjection, NativeOwnerError> {
+        let capacity =
+            |_: ()| NativeOwnerError::Native(NativeError::Capacity("checkpoint projection"));
+        let rows = self
+            .pending
+            .iter()
+            .try_fold(self.core.state.rows.len(), |rows, pending| {
+                rows.checked_add(pending.prepared.mutation_count())
+            })
+            .ok_or_else(|| capacity(()))?;
+        // The rows' variable bodies: a page is charged its entries inline and
+        // their heap (`RangeStore`'s page charge), so the pages' charge less
+        // the committed rows' inline size bounds the committed heap from
+        // above; a pending candidate's rows are charged as pending. Neither
+        // counts the indexes, recovery or allocator bookkeeping a root also
+        // charges, which a checkpoint does not carry.
+        let stats = self.core.native_budget();
+        let committed_inline = self
+            .core
+            .state
+            .rows
+            .len()
+            .checked_mul(super::NATIVE_ENTRY_BYTES)
+            .ok_or_else(|| capacity(()))?;
+        let heap = stats
+            .used_by(focal_memory::BudgetKind::Pages)
+            .saturating_sub(committed_inline)
+            .checked_add(stats.used_by(focal_memory::BudgetKind::Pending))
+            .ok_or_else(|| capacity(()))?;
+        let bytes = rows
+            .checked_mul(record_codec::row_fixed_bytes())
+            .and_then(|fixed| {
+                heap.checked_mul(record_codec::HEAP_EXPANSION)
+                    .and_then(|heap| fixed.checked_add(heap))
+            })
+            .and_then(|body| body.checked_add(record_codec::header_fixed_bytes()))
+            .ok_or_else(|| capacity(()))?;
+        Ok(CheckpointProjection { rows, bytes })
     }
 
     /// The range layout the committed rows are held in (25 §4).

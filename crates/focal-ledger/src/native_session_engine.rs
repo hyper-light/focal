@@ -918,12 +918,26 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     return Err(error);
                 }
             };
-            if full || !headroom {
+            if full || !headroom || !self.checkpointable()? {
                 self.discard_candidate(candidate)?;
                 return Err(NativeSessionError::Capacity);
             }
         }
         self.submit_staged(consensus, staged, status.term)
+    }
+    /// Whether the committed root, with every pending candidate published,
+    /// still fits a checkpoint (rule 2): what this session admits it must be
+    /// able to checkpoint. A fresh candidate past the checkpoint's rows or
+    /// assembled bytes is refused typed at admission, and the session keeps
+    /// serving; never admitted and then a checkpoint failed and the session
+    /// stopped (a ledger did, at 4,200 claims, before this check).
+    fn checkpointable(&self) -> Result<bool, NativeSessionError> {
+        let Some(Domain::Active(owner, _)) = self.domain.as_ref() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let projection = owner.checkpoint_projection()?;
+        let limits = self.limits.checkpoint;
+        Ok(projection.rows <= limits.rows && projection.bytes <= limits.assembled_bytes)
     }
     /// Discard a prepared candidate, re-borrowing the active owner. Used when a
     /// refusal is decided after a `&mut self` call has ended the owner borrow.

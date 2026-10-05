@@ -1235,3 +1235,122 @@ fn the_standard_recovery_work_is_derived_from_the_checkpoint_bounds() {
     );
     assert!(limits.recovery.work.model > 1 << 30);
 }
+
+/// What a session admits it can always checkpoint (rule 2). A ledger whose
+/// rows reach its checkpoint's bound refuses the next fresh creation, typed and
+/// retryable, and still checkpoints and serves. Before the admission check a
+/// ledger was admitted past the bound, its checkpoint failed with the codec's
+/// Capacity, and the session stopped for good (a node did at 4,200 claims).
+#[test]
+fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    let mut last = None;
+    let mut request = 0u128;
+    let refused = loop {
+        request += 1;
+        assert!(request < 1_000, "200 rows never refused a creation");
+        match session.propose(context(), create(request, 1_000 + request)) {
+            Ok(NativeSubmission::Pending { outcome, .. }) => {
+                let committed = (0..16).any(|_| {
+                    session
+                        .poll()
+                        .unwrap()
+                        .committed
+                        .iter()
+                        .any(|commit| commit.outcome == outcome)
+                });
+                assert!(committed, "creation {request} never committed");
+                last = Some((request, outcome));
+            }
+            Ok(other) => panic!("a fresh creation was {other:?}"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(refused, NativeSessionError::Capacity),
+        "{refused:?}"
+    );
+    assert_eq!(refused.class(), FailureClass::Retryable);
+    assert!(request > 2, "the bound refused before any claim fit");
+    // What it admitted, it checkpoints.
+    session.begin_checkpoint().unwrap();
+    for _ in 0..16 {
+        if !session.checkpoint_pending() {
+            break;
+        }
+        let _ = session.poll().unwrap();
+    }
+    assert!(
+        !session.checkpoint_pending(),
+        "the checkpoint did not finish"
+    );
+    // And it still answers: an exact retry of committed work is never refused.
+    let (retried, outcome) = last.unwrap();
+    assert_eq!(
+        session
+            .propose(context(), create(retried, 1_000 + retried))
+            .unwrap(),
+        NativeSubmission::Committed(outcome)
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(1 << 30, 64 << 20).unwrap();
+    let standard = NativeSessionLimits::standard(focal_model::ContentDomainId([7; 16]));
+    let mut session = open_with(dir.path(), &parent, standard).unwrap();
+    lead(&mut session);
+    let mut request = 0u128;
+    let target: u128 = std::env::var("CLAIMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_500);
+    while request < target {
+        request += 1;
+        match session.propose(context(), create(request, 1_000_000 + request)) {
+            Ok(NativeSubmission::Pending { .. }) => {
+                let _ = session.poll().unwrap();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("refused at {request}: {error:?}\n"),
+                )
+                .unwrap();
+                break;
+            }
+        }
+    }
+    for _ in 0..64 {
+        let _ = session.poll().unwrap();
+    }
+    let core = session.committed_core().unwrap();
+    let rows = core.native_stats().entries;
+    let quote = focal_core::native::record_codec::checkpoint::EncodingPlan::prepare(
+        core,
+        focal_core::native::record_codec::EncodingLimits {
+            bytes: usize::MAX,
+            visits: usize::MAX,
+            rows: usize::MAX,
+        },
+    )
+    .map(|plan| plan.quote());
+    std::io::Write::write_fmt(
+        &mut std::io::stderr(),
+        format_args!(
+            "entry bytes {} derived rows {} | ledger rows {rows} | quote {quote:?} | limits {:?}\n",
+            focal_core::native::NATIVE_ENTRY_BYTES,
+            standard.checkpoint.rows,
+            standard.checkpoint
+        ),
+    )
+    .unwrap();
+}

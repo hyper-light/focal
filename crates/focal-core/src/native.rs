@@ -151,10 +151,15 @@ use owned::{
     OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent, OwnedLegacy,
 };
 pub use owner::{
-    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeOwnerIntoCoreError,
-    NativeStaging, NativeView,
+    CheckpointProjection, NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError,
+    NativeOwnerIntoCoreError, NativeStaging, NativeView,
 };
 pub use projection_quote::NativeProjectionQuote;
+/// The least memory one row of a native root holds resident: its key and its
+/// row, inline. A root charged to a budget of `n` bytes holds at most
+/// `n / NATIVE_ENTRY_BYTES` rows, which is the most a session's checkpoint
+/// must be able to carry.
+pub const NATIVE_ENTRY_BYTES: usize = size_of::<(Key, Row)>();
 pub use response_input::{
     NativeMonitorSource, NativeMonitorSourcePlan, NativeResponseInput, NativeResponsePlan,
     NativeResponseSource, NativeResponseSourcePlan, NativeResponseSpec, NativeSourceQuote,

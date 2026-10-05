@@ -374,6 +374,21 @@ impl<'a> inspect::RowFrame<'a> for StructuralCheckpoint<'a> {
     }
 }
 
+/// The work of one row of an in-order walk inside a page: the advance and its
+/// key comparison, one level of a seek's walk (`iteration_work`'s step).
+const ROW_STEP: usize = 64;
+
+/// The seeks an in-order walk of `state`'s rows can take: one into each
+/// member, one per page it steps to, and the terminating probe.
+fn store_seeks(state: &NativeState) -> Result<usize, CodecError> {
+    let stats = state.rows.stats();
+    stats
+        .pages
+        .checked_add(state.rows.layout().members().len())
+        .and_then(|seeks| seeks.checked_add(1))
+        .ok_or(CodecError::Capacity)
+}
+
 fn iteration_work() -> Result<usize, CodecError> {
     // A next/initial seek may walk the bounded persistent directory height.
     // Include key comparisons and the terminating probe without a root pin or
@@ -397,6 +412,7 @@ fn frame(sink: &mut impl Sink, core: &Core<NativeState>) -> Result<ContentHash, 
             count: state.rows.len(),
             layout: state.rows.layout().members(),
             layout_epoch: state.rows.layout().epoch(),
+            seeks: store_seeks(state)?,
         },
         state.rows.entries().map(|entry| (entry.key, &entry.value)),
     )
@@ -428,6 +444,7 @@ pub fn rows_digest(
                 start: None,
             }],
             layout_epoch: 0,
+            seeks: store_seeks(state)?,
         },
         state.rows.entries().map(|entry| (entry.key, &entry.value)),
     )
@@ -476,6 +493,8 @@ pub fn member_digest(
                 start: None,
             }],
             layout_epoch: 0,
+            // One member's pages are among the store's.
+            seeks: store_seeks(state)?,
         },
         entries.map(|entry| (entry.key, &entry.value)),
     )
@@ -492,6 +511,10 @@ pub(in crate::native) struct RootFrame<'l> {
     /// The members of the range layout in key order and its epoch (25 §4).
     pub(in crate::native) layout: &'l [ranges::RangeBoundary],
     pub(in crate::native) layout_epoch: u64,
+    /// The directory seeks the rows' iterator can take: a store's in-order
+    /// walk seeks once into each member and at most once more per page; a
+    /// slice seeks once.
+    pub(in crate::native) seeks: usize,
 }
 
 /// The work of parsing or writing a layout of `members`: each member's fixed
@@ -957,13 +980,21 @@ fn frame_entries<'a>(
     write_u64(&mut hashed, prefix)?;
     write_u64(&mut hashed, count_u64)?;
     write_layout(&mut hashed, frame.layout_epoch, frame.layout)?;
+    // A walk's seeks are charged once each and its in-page steps once a row.
+    // Charging every row a whole seek counted about a hundredfold more work
+    // than a walk does, and a ledger past 4,800 claims could not be
+    // checkpointed.
     let iteration = iteration_work()?;
-    hashed.visit(iteration)?;
+    hashed.visit(
+        iteration
+            .checked_mul(frame.seeks)
+            .ok_or(CodecError::Capacity)?,
+    )?;
     let mut previous = None;
     let mut meta = false;
     let mut outcome = false;
     for _ in 0..count {
-        hashed.visit(iteration)?;
+        hashed.visit(ROW_STEP)?;
         let (key, value) = entries
             .next()
             .ok_or(CodecError::InvalidTag("checkpoint row count"))?;
