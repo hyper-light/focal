@@ -10,6 +10,11 @@ unmaintained = "all"
 [licenses]
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense"]
 confidence-threshold = 0.93
+# One exception, scoped to one crate: `xxhash-rust` (BSL-1.0, OSI approved,
+# no notice required in binaries) is an unconditional dependency of `redis`,
+# which only the never-shipped comparison generator `tools/compare` uses
+# (docs/qualification/competitive-p99.md). No focal executable contains it.
+exceptions = [{ crate = "xxhash-rust", allow = ["BSL-1.0"] }]
 
 [bans]
 multiple-versions = "warn"
