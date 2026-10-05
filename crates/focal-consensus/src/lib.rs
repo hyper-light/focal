@@ -314,6 +314,34 @@ pub struct PeerProgress {
     pub paused: bool,
     pub pending_snapshot: u64,
 }
+/// The bounds a member's core holds its queues to, derived from what focal states of the member
+/// (`core_state::limits`, hyper-raft `Limits::derive`): what an operator reads to see what a group
+/// may hold, and what a memory budget is weighed against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreLimits {
+    /// Messages that wait to be taken.
+    pub pending_messages: usize,
+    /// Entries not yet durable.
+    pub unstable_entries: usize,
+    /// Entries one message carries.
+    pub entries_per_message: usize,
+    /// Entries a member holds approved by itself (the fast track).
+    pub proposals: usize,
+    /// Reads that wait for their quorum or to be taken.
+    pub pending_reads: usize,
+}
+
+impl CoreLimits {
+    fn of(limits: &Limits) -> Self {
+        Self {
+            pending_messages: limits.pending_messages,
+            unstable_entries: limits.unstable_entries,
+            entries_per_message: limits.entries_per_message,
+            proposals: limits.proposals,
+            pending_reads: limits.pending_reads,
+        }
+    }
+}
 pub const PEER_PROBE: u8 = 0;
 pub const PEER_REPLICATE: u8 = 1;
 pub const PEER_SNAPSHOT: u8 = 2;
@@ -980,6 +1008,10 @@ impl LogNode {
     /// messages are encoded under (`encode_message_in`).
     pub fn wire(&self) -> Wire {
         self.wire
+    }
+    /// The bounds this member's core holds its queues to ([`CoreLimits`]).
+    pub fn limits(&self) -> CoreLimits {
+        CoreLimits::of(&self.raw.raft.config().limits)
     }
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
         self.check()?;

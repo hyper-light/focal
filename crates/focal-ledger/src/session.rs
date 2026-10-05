@@ -524,6 +524,10 @@ impl Session {
     pub fn wire(&self) -> focal_consensus::Wire {
         self.consensus.wire()
     }
+    /// The bounds this group's core holds its queues to (`focal_consensus::CoreLimits`).
+    pub fn limits(&self) -> focal_consensus::CoreLimits {
+        self.consensus.limits()
+    }
     pub fn transfer_leader(&mut self, target: u64) -> Result<(), LedgerError> {
         self.check()?;
         if target == 0 || !self.members().voters.contains(&target) {

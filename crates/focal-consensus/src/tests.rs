@@ -1253,3 +1253,28 @@ fn protobuf_preflight_accounts_repeated_structs_without_bulk_payload_multiplier(
         Err(ConsensusError::Capacity)
     ));
 }
+
+/// A member's core bounds are what focal states of it (`core_state::limits`), read back through
+/// `limits()`: a message of a page or one entry of the largest, inside its record; each queue one
+/// ready's entries counted resident.
+#[test]
+fn a_members_core_bounds_are_derived_from_its_settings() {
+    use hyper_raft::wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES};
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(1);
+    let node = DurableNode::open(config.clone(), dir.path()).unwrap();
+    let limits = node.limits();
+    let page = config.max_entry_bytes + 1024;
+    let message = page.max(config.max_entry_bytes + ENTRY_FIXED_BYTES) + MESSAGE_RECORD_FIXED_BYTES;
+    let payload = message - MESSAGE_RECORD_FIXED_BYTES;
+    assert_eq!(limits.entries_per_message, payload / ENTRY_FIXED_BYTES);
+    let ready = (config.max_inflight_messages * page).max(config.max_uncommitted_bytes as usize)
+        + config.max_entry_bytes;
+    let memory = ready / ENTRY_FIXED_BYTES * std::mem::size_of::<Entry>();
+    assert_eq!(
+        limits.unstable_entries,
+        memory / std::mem::size_of::<Entry>()
+    );
+    assert_eq!(limits.proposals, payload / std::mem::size_of::<Entry>());
+    assert_eq!(limits.pending_reads, config.max_inflight_messages + 1);
+}

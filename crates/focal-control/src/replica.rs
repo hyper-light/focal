@@ -301,6 +301,10 @@ impl ControlReplica {
     pub fn wire(&self) -> focal_consensus::Wire {
         self.node.wire()
     }
+    /// The bounds this group's core holds its queues to (`focal_consensus::CoreLimits`).
+    pub fn core_limits(&self) -> focal_consensus::CoreLimits {
+        self.node.limits()
+    }
     pub fn status(&self) -> NodeStatus {
         self.node.status()
     }

@@ -907,6 +907,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn wire(&self) -> focal_consensus::Wire {
         self.consensus.wire()
     }
+    /// The bounds this group's core holds its queues to (`focal_consensus::CoreLimits`).
+    pub fn limits(&self) -> focal_consensus::CoreLimits {
+        self.consensus.limits()
+    }
     /// Planned handover: the current authority asks `node` to campaign at once.
     /// Authority moves only through the committed readiness barrier of the new
     /// term; until then admission is refused on both nodes.

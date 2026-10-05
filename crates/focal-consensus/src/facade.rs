@@ -200,6 +200,11 @@ impl DurableNode {
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.set_priority(priority))
     }
+    /// The bounds this member's core holds its queues to, derived from what focal states of it
+    /// ([`crate::CoreLimits`]).
+    pub fn limits(&self) -> crate::CoreLimits {
+        dispatch!(inner = &self.backend => inner.limits())
+    }
     /// The fields beyond raft-rs's this member's peers carry, from now on (`Wire`): raised by
     /// focal-node once the upgrade fence opens `RAFT_KEPT_LEVEL`, before a member opened under
     /// that fence sends. Under `Wire::Kept` the member reads a refusal's `kept` and `lost` and

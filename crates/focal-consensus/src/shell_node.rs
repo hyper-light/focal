@@ -518,6 +518,10 @@ impl ShellNode {
     pub fn wire(&self) -> Wire {
         self.wire
     }
+    /// As focal-log's backend's: the bounds this member's core holds its queues to.
+    pub fn limits(&self) -> CoreLimits {
+        CoreLimits::of(&self.replica.core().raft.config().limits)
+    }
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
         self.check()?;
         if priority < 0 {
