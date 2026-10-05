@@ -929,14 +929,28 @@ impl PartitionBootstrapPermit {
                 .checked_add(1)
                 .ok_or(DirectoryBootstrapError::Capacity)?,
         };
-        replica.submit(
-            ControlRequest {
-                id,
-                acknowledged_through: previous_sequence,
-                command,
-            },
-            &crate::cluster::NoDirectoryAuthority,
-        )?;
+        let request = ControlRequest {
+            id,
+            acknowledged_through: previous_sequence,
+            command,
+        };
+        // A refusal that changes nothing (its log's room, a write still to
+        // persist) is asked again after the next drain, within the rounds
+        // startup has; any other refusal ends startup, by its name.
+        let mut submitted = false;
+        for _ in 0..STARTUP_ROUNDS {
+            match replica.submit(request.clone(), &crate::cluster::NoDirectoryAuthority) {
+                Ok(_) => {
+                    submitted = true;
+                    break;
+                }
+                Err(error) if transient(&error) => drain_single(&mut replica, plan)?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !submitted {
+            return Err(DirectoryBootstrapError::NotReady);
+        }
         for _ in 0..STARTUP_ROUNDS {
             drain_single(&mut replica, plan)?;
             if replica.receipt(id)?.is_some() {
@@ -948,6 +962,19 @@ impl PartitionBootstrapPermit {
     }
 }
 
+/// A refusal of a submission that changed nothing and passes as the log
+/// drains: its uncommitted room, a write still to persist, its queue.
+fn transient(error: &ControlError) -> bool {
+    matches!(
+        error,
+        ControlError::NotReady
+            | ControlError::Busy
+            | ControlError::Consensus(
+                focal_consensus::ConsensusError::Capacity
+                    | focal_consensus::ConsensusError::PersistencePending
+            )
+    )
+}
 fn drain_single(
     replica: &mut ControlReplica,
     plan: FirstDirectoryPlan,

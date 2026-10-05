@@ -893,7 +893,10 @@ impl LogNode {
         }
         core_state::check_entry(&self.config, data.len())?;
         self.guarded_in(data.capacity(), 0, lane, |replica| {
-            Ok(replica.raw.propose_fast(Vec::new(), data)?)
+            replica
+                .raw
+                .propose_fast(Vec::new(), data)
+                .map_err(|error| core_state::proposal_refused(&replica.raw, error))
         })
     }
     /// Whether the group has the fast track.
@@ -1219,8 +1222,9 @@ impl LogNode {
     fn propose_inner(&mut self, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.check_leader()?;
         core_state::check_entry(&self.config, data.len())?;
-        self.raw.propose(Vec::new(), data)?;
-        Ok(())
+        self.raw
+            .propose(Vec::new(), data)
+            .map_err(|error| core_state::proposal_refused(&self.raw, error))
     }
     /// The authenticated transport envelope must bind cluster/group identity.
     fn step_inner(&mut self, message: Message) -> Result<(), ConsensusError> {
@@ -1274,8 +1278,9 @@ impl LogNode {
         self.check()?;
         let conf = &self.raw.store().conf_state;
         core_state::check_conf_change(&self.config, &self.raw, conf, &change)?;
-        self.raw.propose_conf_change(Vec::new(), &change)?;
-        Ok(())
+        self.raw
+            .propose_conf_change(Vec::new(), &change)
+            .map_err(|error| core_state::proposal_refused(&self.raw, error))
     }
     /// On the leader, hand leadership to another current voter. On a
     /// follower, only leadership for this node itself may be asked for: raft

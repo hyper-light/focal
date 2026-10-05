@@ -13890,3 +13890,29 @@ commits/s (6.9×), p50 15.7 ms, p99 16.9–17.7 ms.
 `proposals_taken_before_one_poll_share_its_flush` dispatches 8 fresh frames on one
 owner, settles them, and asserts all 8 commit in exactly one group commit; before, each
 dispatch polled its own.
+
+### 2026-10-05 — A dropped proposal ended a node's service; the core's refusal now says why
+
+CI on 3113638 (Linux, push run) failed `a_crowded_partition_splits_survives_a_restart_and_merges_back`
+waiting for the merge back to one delegation. One node's service had ended with
+`Directory(Control(Consensus(Raft(ProposalDropped))))`. hyper-raft answers one
+`ProposalDropped` for several causes: a member that does not lead, a leader handing over its
+leadership or no longer a member of what it leads, a leader whose uncommitted entries fill its
+bound. focal passed it through as an untyped `Raft` error. The control RPC answers those as
+`Failed`, and the directory's startup, which runs fail-stop in its owner's thread, ended the
+owner and then the service. The pull-request run of the same commit passed, and 30 runs,
+three at a time, did not reproduce it, so which cause fired here is not known. The fix does not
+depend on it:
+
+- `core_state::proposal_refused` names the cause from the core's own state: `NotLeader { leader }`,
+  `LeaderLeaving` or `Capacity`. `DurableNode`'s proposals (plain, fast track, configuration
+  change) and the shell's answers use it, so every owner gets a refusal it already retries, and
+  the next occurrence names its cause. `a_dropped_proposal_is_refused_by_its_cause` fills a
+  leader's smallest legal bound (three 512-byte entries in 1,536 bytes) and asserts `Capacity`, then
+  `LeaderLeaving` during a handover and `NotLeader` at a follower. Without the classification it
+  fails at the first.
+- The founder's re-activation in `DirectoryBootstrapPermit::open` asks again after a drain when its
+  submission is refused for something that passes as the log drains (`Capacity`,
+  `PersistencePending`, `Busy`, `NotReady`), within startup's 16 rounds. Any other refusal still
+  ends startup, now by its name. The directory bootstrap's admission map answers `LeaderLeaving`
+  as not ready, as the control RPC already did.
