@@ -28,3 +28,9 @@ redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
 # vendored source): no TLS, no SASL, no compression codecs; plaintext on the
 # bench network.
 rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+
+# On Windows librdkafka builds with CMake (installed on the CI runners): its
+# autotools `./configure` is a shell script Windows cannot run. Elsewhere the
+# autotools build needs no tool beyond a C compiler.
+[target.'cfg(windows)'.dependencies]
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build"] }
