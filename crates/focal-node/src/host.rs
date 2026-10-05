@@ -6,6 +6,7 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::mpsc,
@@ -21,6 +22,92 @@ enum Work {
         Allocation,
     ),
     Stop(oneshot::Sender<Result<(), NodeError>>),
+}
+/// Requests the ingress queue holds, and native proposals the owner holds
+/// unanswered: holding that many, it waits for the log before it takes
+/// another request, so a slow disk slows callers rather than growing a queue.
+const INGRESS: usize = 32;
+/// What the owner made of one request: its reply, and for a native frame
+/// it proposed, the proposal whose commit the reply waits for.
+pub(crate) struct Dispatched {
+    pub(crate) reply: ResponseEnvelope,
+    pub(crate) proposal: Option<crate::native_ingress::Proposal>,
+}
+#[cfg(test)]
+impl Dispatched {
+    /// The answer of a request that is not a native proposal.
+    pub(crate) fn answered(self) -> ResponseEnvelope {
+        if let Some(proposal) = self.proposal {
+            panic!("parked proposal {proposal:?}");
+        }
+        self.reply
+    }
+}
+/// A native proposal waiting for its commit, with its reply's header, the
+/// caller's answer channel and the request's charge.
+pub(crate) struct Waiting {
+    pub(crate) header: ResponseEnvelope,
+    pub(crate) proposal: crate::native_ingress::Proposal,
+    /// Owner polls since the proposal; at `COMMIT_POLLS` it is answered
+    /// with its ticket.
+    pub(crate) polls: usize,
+    pub(crate) response: oneshot::Sender<OwnedResponse>,
+    pub(crate) charge: Allocation,
+}
+impl Waiting {
+    fn finish(self, result: Response, limits: &WireLimits) {
+        let mut header = self.header;
+        header.result = result;
+        let _ = self
+            .response
+            .send(finish_response(bounded(header, limits), self.charge));
+    }
+}
+/// One poll of the session serves every parked proposal: the frames
+/// proposed while the last flush was in flight go to the log in one append
+/// (group commit), and each is answered once its outcome is the session's,
+/// or with its ticket after `COMMIT_POLLS` polls, as a lone proposal is.
+pub(crate) fn settle(
+    node: &mut EmbeddedNode,
+    waiting: &mut VecDeque<Waiting>,
+    limits: &WireLimits,
+) {
+    let polled = node.session.poll().map(|_| ()).map_err(access);
+    let count = waiting.len();
+    for _ in 0..count {
+        let Some(mut entry) = waiting.pop_front() else {
+            break;
+        };
+        let result = match &polled {
+            Err(error) => Some(Response::Error(error.clone())),
+            Ok(()) => match crate::native_ingress::settled(&node.session, entry.proposal) {
+                Ok(Some(response)) => Some(response),
+                Ok(None) => {
+                    entry.polls = entry.polls.saturating_add(1);
+                    (entry.polls >= crate::native_ingress::COMMIT_POLLS)
+                        .then(|| crate::native_ingress::ticket(entry.proposal))
+                }
+                Err(error) => Some(Response::Error(error)),
+            },
+        };
+        match result {
+            Some(response) => entry.finish(response, limits),
+            None => waiting.push_back(entry),
+        }
+    }
+}
+/// Answer every parked proposal: each takes at most `COMMIT_POLLS` polls.
+pub(crate) fn settle_all(
+    node: &mut EmbeddedNode,
+    waiting: &mut VecDeque<Waiting>,
+    limits: &WireLimits,
+) {
+    for _ in 0..crate::native_ingress::COMMIT_POLLS {
+        if waiting.is_empty() {
+            return;
+        }
+        settle(node, waiting, limits);
+    }
 }
 #[derive(Clone)]
 pub struct LocalHost {
@@ -49,7 +136,11 @@ impl LocalHost {
         let host_limits = limits.clone();
         let host_budget = budget.clone();
         let native = node.session.activation().is_native();
-        let (sender, receiver) = mpsc::sync_channel(32);
+        let (sender, receiver) = mpsc::sync_channel(INGRESS);
+        let mut waiting = VecDeque::new();
+        waiting
+            .try_reserve_exact(INGRESS)
+            .map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
         let (liveness, ended) = watch::channel(());
         let mut views = crate::reads::ReadViews::new();
         let mut streams =
@@ -78,17 +169,37 @@ impl LocalHost {
                         };
                         next_tick = deadline;
                     }
-                    let work = match receiver
-                        .recv_timeout(next_tick.saturating_duration_since(Instant::now()))
-                    {
-                        Ok(work) => work,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    // Every queued request is taken before the owner waits
+                    // on the log; it blocks for a request only when no
+                    // proposal waits for its commit.
+                    let work = if waiting.is_empty() {
+                        match receiver
+                            .recv_timeout(next_tick.saturating_duration_since(Instant::now()))
+                        {
+                            Ok(work) => work,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else if waiting.len() < INGRESS {
+                        match receiver.try_recv() {
+                            Ok(work) => work,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                settle(&mut node, &mut waiting, &limits);
+                                continue;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                settle_all(&mut node, &mut waiting, &limits);
+                                break;
+                            }
+                        }
+                    } else {
+                        settle(&mut node, &mut waiting, &limits);
+                        continue;
                     };
                     match work {
                         Work::Request(request, response, charge) => {
                             // A vanished caller cannot cancel an already admitted mutation.
-                            let reply = dispatch(
+                            let dispatched = dispatch(
                                 &mut node,
                                 &mut views,
                                 &mut streams,
@@ -96,9 +207,22 @@ impl LocalHost {
                                 &limits,
                                 &host_budget,
                             );
-                            let _ = response.send(finish_response(reply, charge));
+                            match dispatched.proposal {
+                                None => {
+                                    let _ =
+                                        response.send(finish_response(dispatched.reply, charge));
+                                }
+                                Some(proposal) => waiting.push_back(Waiting {
+                                    header: dispatched.reply,
+                                    proposal,
+                                    polls: 0,
+                                    response,
+                                    charge,
+                                }),
+                            }
                         }
                         Work::Stop(response) => {
+                            settle_all(&mut node, &mut waiting, &limits);
                             let _ = response.send(node.checkpoint());
                             break;
                         }
@@ -442,14 +566,14 @@ fn maintain(
     archive.maintain(node, budget)?;
     Ok(())
 }
-fn dispatch(
+pub(crate) fn dispatch(
     node: &mut EmbeddedNode,
     views: &mut crate::reads::ReadViews,
     streams: &mut crate::streams::Streams,
     verified: VerifiedRequest,
     limits: &WireLimits,
     budget: &MemoryBudget,
-) -> ResponseEnvelope {
+) -> Dispatched {
     let principal = verified.peer().principal();
     let peer = verified.peer();
     let request = verified.request();
@@ -457,8 +581,12 @@ fn dispatch(
     // remain borrowed until mutation authentication consumes their ownership.
     let mut response = request.reply(Response::Error(AccessError::OutcomeUnknown));
     if let Err(error) = views.advance(&mut node.session) {
-        return request.reply(Response::Error(error));
+        return Dispatched {
+            reply: request.reply(Response::Error(error)),
+            proposal: None,
+        };
     }
+    let mut proposal = None;
     let result = if request.ledger != node.identity.ledger {
         Err(AccessError::Unauthorized)
     } else if request.route_epoch != RouteEpoch(1)
@@ -529,7 +657,7 @@ fn dispatch(
             }
             Operation::ManagedSupport { .. } => Err(AccessError::UnsupportedOperation),
             Operation::Native { frame } => {
-                crate::native_ingress::admit_local(node, peer, request, frame)
+                crate::native_ingress::admit_local(node, peer, request, frame, &mut proposal)
             }
             // An archived object is read from the node's own custody (the
             // audit's F11); every other read from the session's core.
@@ -715,7 +843,13 @@ fn dispatch(
         }
     };
     response.result = result.unwrap_or_else(Response::Error);
-    // The limit alone decides: the reply is encoded once, by the transport.
+    Dispatched {
+        reply: bounded(response, limits),
+        proposal,
+    }
+}
+/// The limit alone decides: the reply is encoded once, by the transport.
+fn bounded(mut response: ResponseEnvelope, limits: &WireLimits) -> ResponseEnvelope {
     if payload_len(&response, limits.max_frame_bytes).is_err() {
         response.result = Response::Error(AccessError::Capacity);
     }

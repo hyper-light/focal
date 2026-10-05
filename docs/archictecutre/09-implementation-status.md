@@ -13858,3 +13858,35 @@ session to a 200-row bound: the next creation is refused typed and retryable, th
 checkpoint succeeds, and an exact retry is answered. Without the admission check, 200
 rows never refuse. The ledger that had stopped opens Ready on the fixed binary,
 checkpoints, and commits new claims (sequence 4,622).
+
+### 2026-10-05 — Group commit on the single-node owner: 8 callers no longer wait in line for 8 flushes
+
+Measured with `focal-load` (release, embedded, `authored_v1`, 2,000 creations, seeds
+1–3, macOS arm64 with the host otherwise busy), 8 concurrent callers committed no more
+than 1 did: about 73 commits a second either way, with the 8 callers' p50 at 105 ms
+(p99 119–476 ms) against 12.8 ms for 1. Sampling the run showed the cause. The
+session-owner thread spent 97% of its time in `admit_local` → `Session::poll` →
+`WalAppend::wait_blocking`: each native admission proposed its frame and then waited
+for that frame's own flush before the owner took the next request. The WAL writer
+already groups every batch queued with it into one fence (up to 64), but it was never
+given more than one. Each flush is the segment's `fsync` plus the fence's install
+(write, `fsync`, rename, directory `fsync`), about 13 ms here.
+
+The replicated owner (`fleet.rs`) already parks a request with a deadline and answers it
+when its commit arrives. The single-node owner (`LocalHost`, which `focal start` and the
+embedded transport use) now does the same for native mutations. A fresh proposal is
+parked with its reply header, answer channel and charge. The owner takes every queued
+request before it waits on the log, so the frames that arrive during one flush are
+proposed before the next and share it: group commit (DeWitt et al., *Implementation
+Techniques for Main Memory Database Systems*, SIGMOD 1984; Raft thesis §10.2.1 on
+batching). Each parked proposal is answered on its commit, or with its ticket after
+`COMMIT_POLLS` (8) owner polls, the budget a lone proposal had before. Parked proposals
+are bounded by the ingress queue's own bound (`INGRESS`, 32). With that many parked, the
+owner waits on the log before it takes another request, so a slow disk slows callers and
+grows no queue. Stop and a closed ingress answer every parked proposal first.
+
+After, same runs: 1 caller 75 commits/s (p50 12.8 ms, unchanged), 8 callers 503–512
+commits/s (6.9×), p50 15.7 ms, p99 16.9–17.7 ms.
+`proposals_taken_before_one_poll_share_its_flush` dispatches 8 fresh frames on one
+owner, settles them, and asserts all 8 commit in exactly one group commit; before, each
+dispatch polled its own.
