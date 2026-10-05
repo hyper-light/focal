@@ -620,13 +620,18 @@ fn route(cluster: &mut Cluster, carried: impl Fn(&crate::Message) -> bool) {
     panic!("message delivery failed to quiesce");
 }
 
-/// A leader does not propose its own leaving, and a change that removes a
-/// member can still come to be applied by that member as leader: proposed by
-/// the one that led before it. It then hands the group to a voter that holds
-/// the whole log and follows (27 §5). The core focal ran on before left it
-/// leading a group it was no member of.
+/// A leader does not propose its own leaving. A change that removes a member
+/// counts by the configuration it states from the moment it is logged
+/// (Ongaro's thesis §4.1; hyper-raft `docs/raft.md` §3.4): the leader sends
+/// the member it removes nothing more, so that member never holds its own
+/// removal and never leads a group it left. A leader cut off before the
+/// removal commits leaves the members it can no longer reach to elect among
+/// themselves, and the removal, never committed, is discarded. Before hyper-
+/// raft's configuration safety the removed member held its removal, could be
+/// elected, and had to hand the group over (27 §5); the core focal ran on
+/// before that left it leading a group it was no member of.
 #[test]
-fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
+fn a_member_whose_removal_is_logged_is_sent_nothing_and_never_leads_a_group_it_left() {
     use crate::{ConfChangeSingle, ConfChangeType, ConfChangeV2, ConsensusError, MembershipChange};
     let mut cluster = Cluster::new();
     elect(&mut cluster, 0);
@@ -646,8 +651,8 @@ fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
             Err(ConsensusError::LeaderLeaving)
         ));
     }
-    // Node 1 proposes that node 2 leaves. Node 2 holds the entry, and its
-    // answer is lost with node 1.
+    // Node 1 proposes that node 2 leaves: what it sends goes to node 3
+    // alone, and is lost with node 1.
     let expected = cluster.nodes[0].membership_configuration();
     let committed = cluster.nodes[0].status().committed_index;
     cluster.nodes[0]
@@ -657,69 +662,79 @@ fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
             b"leave".to_vec(),
         )
         .unwrap();
-    route(&mut cluster, |message| message.from == 1 && message.to == 2);
+    let sent = cluster.nodes[0].drain().unwrap().messages;
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(|message| message.to == 3));
     assert_eq!(cluster.nodes[0].status().committed_index, committed);
-    // Node 2 is elected by node 3: its log is the longer.
-    let elected = {
-        let mut elected = false;
-        for _ in 0..ROUNDS {
-            for (node, timeout) in [(1usize, 10usize), (2, 19)] {
-                cluster.nodes[node]
-                    .log_mut()
-                    .raw
-                    .raft
-                    .set_randomized_election_timeout(timeout)
-                    .unwrap();
-                cluster.nodes[node].tick().unwrap();
-            }
-            route(&mut cluster, |message| message.from != 1 && message.to != 1);
-            let status = cluster.nodes[1].status();
-            // It led, committed its own removal with node 3, applied it and
-            // follows: no tick passed in between.
-            if status.term > 1 && !status.voters.contains(&2) {
-                elected = true;
-                break;
-            }
-            assert_ne!(
-                (status.role, status.voters.contains(&2)),
-                (StateRole::Leader, false),
-                "node 2 leads a group it is not in"
+    // Nodes 2 and 3 elect without node 1; none leads a group it is not in.
+    let no_stranger = |cluster: &Cluster| {
+        for node in &cluster.nodes {
+            let status = node.status();
+            assert!(
+                status.role != StateRole::Leader || status.voters.contains(&status.node_id),
+                "node {} leads a group it is not in",
+                status.node_id
             );
         }
-        elected
     };
-    assert!(elected, "node 2 never led");
-    let status = cluster.nodes[1].status();
-    assert_eq!(status.role, StateRole::Follower);
-    assert_eq!(status.voters, vec![1, 3]);
-    assert!(!cluster.nodes[1].failed());
-    // Node 3 was told to campaign and needs node 1, which is back.
-    let term = cluster.nodes[2].status().term;
-    assert!(term > status.term, "node 3 was not told to campaign");
-    let led = run_until(
-        &mut cluster,
-        0,
-        [10, 10, 10],
-        |cluster| leads(cluster, 3, 0),
-        |cluster| {
-            for node in &cluster.nodes {
-                let status = node.status();
-                assert!(
-                    status.role != StateRole::Leader || status.voters.contains(&status.node_id),
-                    "node {} leads a group it is not in",
-                    status.node_id
-                );
-            }
-        },
-    );
-    assert!(led, "the group has no leader: {:?}", leaders(&cluster));
-    cluster.nodes[2].propose(b"after".to_vec()).unwrap();
-    route(&mut cluster, |_| true);
-    for applied in [&cluster.applied[0], &cluster.applied[2]] {
-        assert!(applied.iter().any(|entry| entry == b"before"));
-        assert!(applied.iter().any(|entry| entry == b"after"));
+    let mut elected = None;
+    for _ in 0..ROUNDS {
+        for (node, timeout) in [(1usize, 10usize), (2, 19)] {
+            cluster.nodes[node]
+                .log_mut()
+                .raw
+                .raft
+                .set_randomized_election_timeout(timeout)
+                .unwrap();
+            cluster.nodes[node].tick().unwrap();
+        }
+        route(&mut cluster, |message| message.from != 1 && message.to != 1);
+        no_stranger(&cluster);
+        elected = [1usize, 2]
+            .into_iter()
+            .find(|node| cluster.nodes[*node].status().role == StateRole::Leader);
+        if elected.is_some() {
+            break;
+        }
     }
-    assert!(!cluster.applied[1].iter().any(|entry| entry == b"after"));
+    let leader = elected.expect("nodes 2 and 3 elect without node 1");
+    assert!(cluster.nodes[leader].status().term > 1);
+    assert_eq!(cluster.nodes[leader].status().voters, vec![1, 2, 3]);
+    // Node 1 returns and follows; the removal it never committed is gone.
+    cluster.nodes[leader].propose(b"after".to_vec()).unwrap();
+    for _ in 0..ROUNDS {
+        for node in &mut cluster.nodes {
+            node.tick().unwrap();
+        }
+        route(&mut cluster, |_| true);
+        no_stranger(&cluster);
+        if cluster
+            .applied
+            .iter()
+            .all(|applied| applied.iter().any(|entry| entry == b"after"))
+        {
+            break;
+        }
+    }
+    for (node, applied) in cluster.applied.iter().enumerate() {
+        assert!(
+            applied.iter().any(|entry| entry == b"before"),
+            "node {}",
+            node + 1
+        );
+        assert!(
+            applied.iter().any(|entry| entry == b"after"),
+            "node {}",
+            node + 1
+        );
+        assert!(
+            !applied.iter().any(|entry| entry == b"leave"),
+            "node {}",
+            node + 1
+        );
+        assert_eq!(cluster.nodes[node].status().voters, vec![1, 2, 3]);
+        assert!(!cluster.nodes[node].failed());
+    }
 }
 
 /// A peer chooses the numbers in its messages. One that names a kind of

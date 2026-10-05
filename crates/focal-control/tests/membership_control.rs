@@ -87,10 +87,12 @@ impl Cluster {
             bootstrap,
         };
         value.pump(None);
+        // A learner is no voter of the newest configuration: its campaign
+        // is refused, typed.
         assert!(matches!(
             value.nodes[3].campaign(),
             Err(ControlError::Consensus(
-                focal_consensus::ConsensusError::Configuration(_)
+                focal_consensus::ConsensusError::NotPromotable
             ))
         ));
         value.pump(None);

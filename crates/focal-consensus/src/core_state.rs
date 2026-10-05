@@ -103,30 +103,31 @@ pub(crate) fn check_leader<S: Storage>(raw: &RawNode<S>) -> Result<(), Consensus
     }
 }
 
-/// The core's refusal of a proposal as the owners' error. hyper-raft answers
-/// one `ProposalDropped` for several causes; each is told apart here by the
-/// state the core is in, so a caller retries what is retryable and never
-/// takes an ordinary refusal for a failure (a dropped proposal ended a
-/// directory owner and its node's service, CI on 3113638): a member that does
-/// not lead is `NotLeader`; a leader handing over its leadership, or no longer
-/// a member of what it leads, is `LeaderLeaving`; a leader whose uncommitted
-/// entries fill its bound is `Capacity`. Any other error is the core's own.
+/// The core's refusal of a proposal as the owners' error, by the reason the
+/// core gives (`hyper_raft::Dropped`), so a caller retries what is retryable
+/// and never takes an ordinary refusal for a failure (a dropped proposal ended
+/// a directory owner and its node's service, CI on 3113638). A member that
+/// knows no leader is `NotLeader` naming none; a leader handing over its
+/// leadership, or leading a configuration that names it no member, is
+/// `LeaderLeaving`; a leader at its uncommitted bound is `Capacity`; a
+/// campaign by a member the newest configuration makes no voter is
+/// `NotPromotable`. An empty
+/// or undecodable proposal is the caller's bug and stays the core's error.
 pub(crate) fn proposal_refused<S: Storage>(
     raw: &RawNode<S>,
     error: hyper_raft::Error,
 ) -> ConsensusError {
-    if error != hyper_raft::Error::ProposalDropped {
-        return ConsensusError::Raft(error);
-    }
-    let raft = &raw.raft;
-    if raft.state() != StateRole::Leader {
-        ConsensusError::NotLeader {
-            leader: raft.leader_id(),
+    use hyper_raft::Dropped;
+    match error {
+        hyper_raft::Error::ProposalDropped(Dropped::NoLeader) => ConsensusError::NotLeader {
+            leader: raw.raft.leader_id(),
+        },
+        hyper_raft::Error::ProposalDropped(Dropped::Transferring | Dropped::NotMember) => {
+            ConsensusError::LeaderLeaving
         }
-    } else if raft.lead_transferee().is_some() || raft.tracker().get(raft.id()).is_none() {
-        ConsensusError::LeaderLeaving
-    } else {
-        ConsensusError::Capacity
+        hyper_raft::Error::ProposalDropped(Dropped::Uncommitted) => ConsensusError::Capacity,
+        hyper_raft::Error::NotPromotable => ConsensusError::NotPromotable,
+        error => ConsensusError::Raft(error),
     }
 }
 
@@ -139,14 +140,14 @@ pub(crate) fn check_entry(config: &NodeConfig, len: usize) -> Result<(), Consens
     }
 }
 
-/// Only an applied voter campaigns.
+/// Only a voter of the newest configuration in the log campaigns, or one of
+/// the configuration before it while that change is uncommitted
+/// (`Raft::promotable`); any other member is refused, typed and retryable.
 pub(crate) fn check_campaign<S: Storage>(raw: &RawNode<S>) -> Result<(), ConsensusError> {
     if raw.raft.promotable() {
         Ok(())
     } else {
-        Err(ConsensusError::Configuration(
-            "only an applied voter can campaign",
-        ))
+        Err(ConsensusError::NotPromotable)
     }
 }
 

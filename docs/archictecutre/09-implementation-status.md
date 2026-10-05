@@ -13933,3 +13933,49 @@ rustix or windows-sys) are all ones focal already carries. A log created unseale
 was. `vendor/README.md` and `docs/dependencies/inventory.tsv` name the new revision; focal's own
 adoption of the typed drop, the newest-configuration count and `NotPromotable` follows in the next
 commit.
+
+### 2026-10-05 — focal on hyper-raft b5e372d: drop reasons, the newest configuration, typed NotPromotable
+
+focal's side of taking the shared crates at b5e372d (the vendoring commit before this one):
+
+- **Drop reasons.** The core now names why it dropped a proposal (`ProposalDropped(Dropped)`).
+  `core_state::proposal_refused`, which inferred the cause from the core's state since 3d45055, is
+  now a plain match: `NoLeader` to `NotLeader` (naming no leader), `Transferring` and `NotMember`
+  to `LeaderLeaving`, and `Uncommitted`, which fires only where the leader's uncommitted bytes are
+  at their bound, to `Capacity`. `Empty` and `Malformed` are the caller's bugs and stay the core's
+  error. `a_dropped_proposal_is_refused_by_its_cause` is unchanged and passes.
+- **The newest configuration.** Elections and commitment count by the newest configuration in
+  the log, committed or not (Ongaro's thesis §4.1; hyper-raft `docs/raft.md` §3.4). `sole_commit`
+  names `Raft::configuration()` and decides alone only while that configuration, not joint, has
+  this member as its one voter. `a_logged_change_adding_a_voter_ends_the_sole_voters_commit` logs
+  an `AddNode` on a sole voter and drains it alone, and nothing after the change commits until the
+  new voter holds it. Counting by `applied_configuration()` instead, the test fails: the leader
+  commits alone a change its new voter never heard of. `proto::changes_configuration` is gone from
+  the core. Its two uses, the staging for members committed changes add and the commit fence, test
+  `entry_type != EntryNormal` in place.
+- **NotPromotable.** A campaign by a member the newest configuration makes no voter is refused by
+  the core, from `campaign` and from a leader's `MsgTimeoutNow`. focal's own check
+  (`check_campaign`) and a stepped `MsgTimeoutNow` now give the typed `ConsensusError::NotPromotable`
+  where `campaign` gave an untyped `Configuration` error. The control RPC, the replica admin
+  protocol and session control answer it as not ready: the member may become a voter once the
+  change commits.
+- **What the newest-configuration rule changed in focal's tests, and one defect it exposed.** The
+  first full gate on this tree failed four tests.
+  - Three assumed the old core and are restated, not weakened:
+    - The removal fence test used two voters, where the removal of the other now commits on the
+      leader's own write (`{1}` is its own majority) and the same write states the commit. It now
+      uses three voters, so the second voter's answer commits the removal in the core while the
+      leader's disk is held. With `fenced` disabled it fails.
+    - A leader no longer sends the member it removes anything once the removal is logged, so that
+      member never holds, applies or leads with its own removal.
+      `a_member_whose_removal_is_logged_is_sent_nothing_and_never_leads_a_group_it_left` asserts
+      that: with the leader cut off before the commit, the other two elect, no node leads a group it
+      is not in, and the uncommitted removal is discarded.
+    - A learner's campaign is refused `NotPromotable`, not an untyped `Configuration` error.
+  - The fourth was a real-process stall. `cli_nodes`'s drained host never retired: its session copy
+    had heard nothing since its removal was logged. As a grant voter it collected the session-fact
+    proof itself, and its own replica, which never held the removal's commit, refused to attest it.
+    `collect` ended on that local refusal although the other three voters were a majority.
+    `PlacementAgent::collect` now treats a local refusal as one voter that does not sign, as a
+    remote refusal already was, and reports it only if no majority signs. The test passes in 87 s,
+    where it stalled to its 240 s bound.

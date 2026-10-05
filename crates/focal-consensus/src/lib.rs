@@ -232,6 +232,11 @@ pub enum ConsensusError {
     MalformedMessage(&'static str),
     #[error("a leader does not remove itself; transfer leadership first")]
     LeaderLeaving,
+    /// A campaign, asked for or a leader's `MsgTimeoutNow`, by a member the
+    /// newest configuration in its log makes no voter (hyper-raft's
+    /// configuration safety, `docs/raft.md` §3.4). A refusal: nothing changed.
+    #[error("this member is no voter of the newest configuration it holds")]
+    NotPromotable,
 }
 
 impl From<hyper_raft::StorageError> for ConsensusError {
@@ -1230,8 +1235,10 @@ impl LogNode {
     fn step_inner(&mut self, message: Message) -> Result<(), ConsensusError> {
         self.check()?;
         core_state::check_message(&self.config, &message)?;
-        self.raw.step(message)?;
-        Ok(())
+        self.raw.step(message).map_err(|error| match error {
+            hyper_raft::Error::NotPromotable => ConsensusError::NotPromotable,
+            error => ConsensusError::Raft(error),
+        })
     }
 
     /// Decode through the bounded prost codec and bind the Raft sender to the

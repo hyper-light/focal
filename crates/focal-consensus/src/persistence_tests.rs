@@ -490,17 +490,27 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
 }
 
 /// A change of membership is the one thing not applied on a commit the log
-/// does not hold. Two voters; the leader removes the other. Whoever is told
-/// the removal committed may stop the removed member; a leader that then
-/// restarted without the commit would still count it, and could never elect
-/// itself. So the removal is applied, and given, only once the write that
-/// states its commit is durable — and the leader opened again alone leads.
+/// does not hold. Three voters; the leader removes the third. The removal
+/// counts by the configuration it states (Ongaro's thesis §4.1), `{1, 2}`,
+/// so it commits on the second voter's answer, in the core, while the
+/// leader's own disk is held. Whoever is told the removal committed may stop
+/// the removed member, so the removal is applied, and given, only once the
+/// write that states its commit is durable; and the leader opened again
+/// holds it.
+///
+/// With two voters the removal of the other commits on the leader's own
+/// write alone (`{1}` is its own majority), and the same write states the
+/// commit (`sole_commit`): there is no window to test there.
 #[test]
 fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
-    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let dirs = [
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    ];
     let config = |node: u64| {
         let mut config = NodeConfig::single(node, [1; 16], [1; 16]);
-        config.voters = vec![1, 2];
+        config.voters = vec![1, 2, 3];
         config
     };
     let mut nodes: Vec<DurableNode> = dirs
@@ -522,20 +532,27 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
                 nodes[to].step(message).unwrap();
             }
         }
-        panic!("the two members did not settle");
+        panic!("the three members did not settle");
+    };
+    // Each append the leader sent is stepped by its member, and that
+    // member's answers are what it returns.
+    let answer = |nodes: &mut Vec<DurableNode>, appends: Vec<Message>| {
+        let mut answers = Vec::new();
+        for message in appends {
+            let to = message.to as usize - 1;
+            nodes[to].step(message).unwrap();
+            answers.extend(nodes[to].drain().unwrap().messages);
+        }
+        answers
     };
     nodes[0].campaign().unwrap();
     carry(&mut nodes);
     assert_eq!(nodes[0].status().role, StateRole::Leader);
     // An entry's commit waits for no write: the leader's disk is held and
-    // the entry is given all the same, on its follower's answer.
+    // the entry is given all the same, on its followers' answers.
     nodes[0].propose(b"entry".to_vec()).unwrap();
     let appends = nodes[0].drain().unwrap().messages;
-    let mut answers = Vec::new();
-    for message in appends {
-        nodes[1].step(message).unwrap();
-        answers.extend(nodes[1].drain().unwrap().messages);
-    }
+    let answers = answer(&mut nodes, appends);
     let wal = nodes[0].shared_wal().unwrap();
     let (resume, worker) = pause(blocker(&wal));
     for message in answers {
@@ -543,57 +560,45 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
     }
     let events = nodes[0].try_drain().unwrap().unwrap();
     assert_eq!(events.committed.len(), 1);
-    for message in events.messages {
-        nodes[1].step(message).unwrap();
-    }
-    drop(nodes[1].drain().unwrap());
     resume.send(()).unwrap();
     drop(worker.join().unwrap());
-    // The removal: proposed and persisted by both.
+    carry(&mut nodes);
+    // The removal of the third: proposed, and sent only to the member the
+    // configuration it states keeps.
     let mut remove = ConfChangeV2::default();
     let mut member = ConfChangeSingle {
-        node_id: 2,
+        node_id: 3,
         ..Default::default()
     };
     member.change_type = ConfChangeType::RemoveNode;
     remove.changes.push(member);
     nodes[0].propose_conf_change(remove).unwrap();
     let appends = nodes[0].drain().unwrap().messages;
-    let mut answers = Vec::new();
-    for message in appends {
-        nodes[1].step(message).unwrap();
-        answers.extend(nodes[1].drain().unwrap().messages);
-    }
-    // The leader's disk is held. The follower's answer commits the removal
-    // in the core; it is not applied, and nothing says it committed, until
-    // the commit is in the log.
+    assert!(appends.iter().all(|message| message.to == 2));
+    let answers = answer(&mut nodes, appends);
+    // The leader's disk is held. The second voter's answer commits the
+    // removal in the core; it is not applied, and nothing says it
+    // committed, until the commit is in the log.
     let (resume, worker) = pause(blocker(&wal));
     for message in answers {
         nodes[0].step(message).unwrap();
     }
     assert!(nodes[0].try_drain().unwrap().is_none());
     assert!(nodes[0].persistence_pending());
-    assert_eq!(nodes[0].status().voters, vec![1, 2]);
+    assert_eq!(nodes[0].status().voters, vec![1, 2, 3]);
     assert!(nodes[0].try_drain().unwrap().is_none());
     resume.send(()).unwrap();
     drop(worker.join().unwrap());
     assert!(nodes[0].wait_persisted().unwrap());
     let events = nodes[0].try_drain().unwrap().unwrap();
     assert_eq!(events.membership.len(), 1);
-    assert_eq!(nodes[0].status().voters, vec![1]);
-    // The removed member is stopped, and the leader with it. Opened again
-    // alone, the leader's log says the removal committed: it is the one
-    // voter, and leads.
+    assert_eq!(nodes[0].status().voters, vec![1, 2]);
+    // Opened again, the leader's log holds the removal and its commit.
     drop(events);
     drop(wal);
     drop(nodes);
-    let mut alone = DurableNode::open(config(1), dirs[0].path()).unwrap();
-    assert_eq!(alone.status().voters, vec![1]);
-    alone.campaign().unwrap();
-    drop(alone.drain().unwrap());
-    assert_eq!(alone.status().role, StateRole::Leader);
-    alone.propose(b"alone".to_vec()).unwrap();
-    assert_eq!(alone.drain().unwrap().committed[0].data, b"alone");
+    let reopened = DurableNode::open(config(1), dirs[0].path()).unwrap();
+    assert_eq!(reopened.status().voters, vec![1, 2]);
 }
 
 fn image(from: &std::path::Path, to: &std::path::Path) {
