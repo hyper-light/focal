@@ -1481,6 +1481,14 @@ impl<S: Storage> Raft<S> {
     pub fn priority_in_force(&self) -> i64 {
         self.priority_in_force
     }
+    /// What the member does with an append that arrives ahead of a hole ([`Ahead`]), from the next
+    /// append on. An owner whose peers could not read a kept refusal runs `Ahead::Refused` and
+    /// turns `Ahead::Kept` on once every peer can (focal's upgrade fence). Either change is safe at
+    /// any point: what was kept is taken in when the hole fills whatever the rule, and the rule
+    /// decides only whether a new append is kept and said so.
+    pub fn set_ahead(&mut self, ahead: Ahead) {
+        self.config.ahead = ahead;
+    }
     /// The priority the owner gives, in force once the member has a term.
     pub fn set_priority(&mut self, priority: i64) {
         self.priority = priority;

@@ -48,7 +48,7 @@ use std::{
 use storage::RamLog;
 use thiserror::Error;
 
-pub use envelope::{EnvelopeError, encode_message};
+pub use envelope::{EnvelopeError, Wire, encode_message, encode_message_in};
 pub use focal_log::{FaultPoint, SharedWal};
 use hyper_raft::progress::ProgressState;
 pub use hyper_raft::proto::{
@@ -458,6 +458,9 @@ pub(crate) struct LogNode {
     persisted: Option<PersistedSignal>,
     /// The election priority the owner configured; see `set_priority`.
     priority: i64,
+    /// Which fields beyond raft-rs's this member's peers carry (`Wire`): what it reads of their
+    /// messages and whether it keeps what arrives ahead of a hole.
+    wire: Wire,
     // Drop after any pending Ready/output payloads, including owner cancellation.
     active_allocation: Option<Allocation>,
 }
@@ -798,6 +801,7 @@ impl LogNode {
             commit_waiting: None,
             persisted: None,
             priority: 0,
+            wire: Wire::Frozen,
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
@@ -958,6 +962,25 @@ impl LogNode {
     /// (`hyper_raft::Precedence::Log`): a voter that refuses for priority
     /// could then have been elected itself, so priority never leaves a group
     /// that can elect without a leader.
+    /// The fields beyond raft-rs's this member's peers carry, from now on (`Wire`): under
+    /// `Wire::Kept` it reads a refusal's `kept` and `lost` and keeps what arrives ahead of a hole
+    /// (R17); under `Wire::Frozen` it does neither. focal-node raises it once the upgrade fence
+    /// opens `RAFT_KEPT_LEVEL`, before a member opened under that fence sends.
+    pub fn set_raft_wire(&mut self, wire: Wire) -> Result<(), ConsensusError> {
+        self.check()?;
+        self.wire = wire;
+        let ahead = match wire {
+            Wire::Frozen => hyper_raft::Ahead::Refused,
+            Wire::Kept => hyper_raft::Ahead::Kept,
+        };
+        self.raw.set_ahead(ahead);
+        Ok(())
+    }
+    /// The fields beyond raft-rs's this member's peers carry (`set_raft_wire`): what its
+    /// messages are encoded under (`encode_message_in`).
+    pub fn wire(&self) -> Wire {
+        self.wire
+    }
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
         self.check()?;
         if priority < 0 {
@@ -1184,7 +1207,7 @@ impl LogNode {
             BudgetLane::Completion,
             scratch,
         )?;
-        let message = decode_message(encoded)?;
+        let message = decode_message_in(encoded, self.wire)?;
         if peer_node_id == 0 || message.from != peer_node_id {
             return Err(ConsensusError::MalformedMessage(
                 "Raft sender does not match authenticated peer",
@@ -1759,10 +1782,15 @@ pub fn decode_message_charge(bytes: &[u8]) -> Result<usize, ConsensusError> {
 /// Maximum admitted serialized peer message. QUIC ingress separately enforces
 /// its negotiated stream/frame limits before allocating these bytes.
 pub fn decode_message(bytes: &[u8]) -> Result<Message, ConsensusError> {
+    decode_message_in(bytes, Wire::Frozen)
+}
+
+/// A peer's message read under `wire` ([`Wire`]): what the receiving group's member takes of it.
+pub fn decode_message_in(bytes: &[u8], wire: Wire) -> Result<Message, ConsensusError> {
     if bytes.len() > 9 * 1024 * 1024 {
         return Err(ConsensusError::Capacity);
     }
-    envelope::decode_message(bytes).map_err(|error| match error {
+    envelope::decode_message_in(bytes, wire).map_err(|error| match error {
         EnvelopeError::Memory => ConsensusError::Capacity,
         error => ConsensusError::MalformedMessage(error.reason()),
     })
@@ -1784,6 +1812,8 @@ mod sim_election_tests;
 mod sim_fast_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;
 
 #[cfg(test)]
 mod persistence_tests;

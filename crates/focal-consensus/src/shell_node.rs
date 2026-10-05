@@ -171,6 +171,9 @@ pub(crate) struct ShellNode {
     /// What opening replayed and installed, kept for the owner's first drain.
     recovered: Option<NodeEvents>,
     priority: i64,
+    /// Which fields beyond raft-rs's this member's peers carry (`Wire`), as focal-log's
+    /// backend's.
+    wire: Wire,
     failed: bool,
     /// The group's own directory: its records and its image.
     dir: PathBuf,
@@ -358,6 +361,7 @@ impl ShellNode {
             rebuild_pending,
             recovered: None,
             priority: 0,
+            wire: Wire::Frozen,
             failed: false,
             dir,
             disk,
@@ -498,6 +502,21 @@ impl ShellNode {
         self.replica.budget_mut().lane = BudgetLane::Completion;
         let proposed = self.replica.change(Vec::new(), &change);
         self.heard(proposed)
+    }
+    /// As focal-log's backend's: the fields beyond raft-rs's this member's peers carry, from
+    /// now on, and whether it keeps what arrives ahead of a hole.
+    pub fn set_raft_wire(&mut self, wire: Wire) -> Result<(), ConsensusError> {
+        self.check()?;
+        self.wire = wire;
+        self.replica.set_ahead(match wire {
+            Wire::Frozen => hyper_raft::Ahead::Refused,
+            Wire::Kept => hyper_raft::Ahead::Kept,
+        });
+        Ok(())
+    }
+    /// The fields beyond raft-rs's this member's peers carry (`set_raft_wire`).
+    pub fn wire(&self) -> Wire {
+        self.wire
     }
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
         self.check()?;
@@ -651,7 +670,7 @@ impl ShellNode {
             BudgetLane::Completion,
             scratch,
         )?;
-        let message = decode_message(encoded)?;
+        let message = decode_message_in(encoded, self.wire)?;
         if peer_node_id == 0 || message.from != peer_node_id {
             return Err(ConsensusError::MalformedMessage(
                 "Raft sender does not match authenticated peer",

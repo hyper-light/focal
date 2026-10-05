@@ -549,6 +549,11 @@ impl<S: Storage> RawNode<S> {
         self.raft.settle_priority();
         outcome
     }
+    /// What this member does with an append ahead of a hole, from the next
+    /// append on ([`Raft::set_ahead`]).
+    pub fn set_ahead(&mut self, ahead: crate::Ahead) {
+        self.raft.set_ahead(ahead);
+    }
     /// The priority this member's elections are judged by from the next
     /// operation on ([`Config::priority`]).
     pub fn set_priority(&mut self, priority: i64) {

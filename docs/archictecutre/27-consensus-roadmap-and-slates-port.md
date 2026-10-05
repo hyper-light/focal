@@ -1611,21 +1611,57 @@ hyper-transport carries the core's own encoding under a negotiated version. Swit
 profile now, only for hyper-transport to replace focal-wire after, would build the switch twice.
 §14's wire profile moves to the transport step.
 
-**What the frozen encoding keeps off until then.** raft-rs's messages have no field for what
-hyper-raft's core may say, so the envelope refuses it and focal configures the core never to say
-it:
-- **A member's mark** (`Message::lost`, R-5). focal's log never sets one.
-- **An append kept ahead of a hole** (`Message::kept`, R17). focal's members run
-  `Ahead::Refused`, raft-rs's rule, since hyper-raft `df54729`. The cost is the tail on paths that
-  reorder. hyper-raft's measurement of slates' five regions (`docs/benchmarks.md`, "What arrives
-  ahead of a hole (R17)", 2026-10-03, load 3.9–10.3): at 4,000 proposals a second under the window
-  rule, raft-rs's rule gives a p99 of 18,542 ms at 1,588 commits a second, and R17 gives 126 ms at
-  4,000. At 2,000 a second, 2,083.5 ms against 126 ms. On paths that keep order with 1% loss, R17
-  is no better (four batches: 402 ms against 260.5 ms p99).
+**Fields beyond raft-rs's, behind the fence.** raft-rs's messages have no field for two things
+hyper-raft's core may say: a refusal's `kept` (R17: the member kept an append that arrived ahead of
+a hole) and `lost` (R-5: the member's log lacks entries it acknowledged). The envelope carries them
+as fields of focal's own, 17 and 18, after eraftpb's 1 to 16 (raft-rs `8e4cef1`). They open with the
+upgrade fence at `upgrade::RAFT_KEPT_LEVEL`, 3 (24 §21), not with the transport step. The cost of
+waiting decided it: under raft-rs's rule (`Ahead::Refused`), hyper-raft's measurement of slates'
+five regions on reordering paths (`docs/benchmarks.md`, "What arrives ahead of a hole (R17)",
+2026-10-03, load 3.9–10.3) gives a p99 of 18,542 ms at 4,000 proposals a second under the window
+rule, at 1,588 commits a second, against 126 ms at the full 4,000 with R17. At 2,000 a second it is
+2,083.5 ms against 126 ms. On paths that keep order with 1% loss, R17 is no better (402 ms against
+260.5 ms).
 
-When the transport step negotiates the core's encoding, both turn on, and with R17 the test of
-hyper-check S-4's probe of a member that lost what it kept ahead
-(`a_member_that_lost_what_it_kept_ahead_is_probed`, run at focal's level) joins focal's suites.
+- **Below the fence** no node writes either field. Its groups run `Wire::Frozen`: `Ahead::Refused`,
+  and the envelope refuses to encode a message that holds either.
+- **At or above it** a node raises every group it hosts to `Wire::Kept` (`set_raft_wire`) when the
+  activation applies, and opens a group there before it sends. Under `Wire::Kept` a member keeps
+  what arrives ahead of a hole and says so, and reads both fields.
+- **Nodes apply the activation at different moments**, so a raised member sends `kept` to one not
+  yet raised. That member reads field 17 as raft-rs reads a field it does not know, skipped. The
+  refusal is then exactly raft-rs's own for an append past the end of a log: `reject`, the append's
+  index, `reject_hint` and `log_term` naming the member's last matching entry (hyper-raft
+  `handle_append_entries`; `kept` only adds the flag). Its leader answers as raft-rs does: its
+  progress steps back to the hint (`maybe_decr_to`) and it sends the hole and what follows again.
+  The member takes those entries into its log. What it had kept for the same indexes is the same
+  leader's same entries, since a leader never rewrites its log within its term (hyper-raft
+  `crate::ahead`), and `take_ahead` drops what the log now holds. So a member raised early costs
+  its peers one resend, never a loss, a duplicate or a stall. Refusing the field instead would
+  stall: the leader would drop every kept refusal, its progress would stay past the hole, and the
+  group would wait on the leader's root learning the fence.
+- **A change of term between the keeping and the resend** cannot carry what was kept into the new
+  leader's log. Every change of term or role forgets it (hyper-raft `Raft::reset`, "What was kept
+  ahead of a hole was one leader's, in one term"), as a snapshot does (`Raft::restore`). The store
+  holds one term (`Early::keep`), and what it releases goes through `append_after_owned`'s
+  consistency check at an index the same term's append placed.
+- **`lost` is refused below the fence.** Read without its flag, a refusal for lost entries would let
+  a leader count acknowledgements the member no longer holds. focal writes none: it keeps no
+  hyper-log marks.
+
+Evidence (`focal-consensus/src/wire_tests.rs`):
+- the fields' golden bytes;
+- raft-proto `8e4cef1`, the real crate, reading a kept refusal as its own;
+- the reader below the fence skipping 17 and refusing 18;
+- a member raised before its leader, converging with nothing lost or applied twice;
+- a leader change between keeping and resend, after which nothing of the former term the new
+  leader lacked survives;
+- the fence raised during traffic, member by member, every proposal applied once and in order on
+  every member.
+
+With R17 on, hyper-check S-4's probe of a member that lost what it kept ahead
+(`a_member_that_lost_what_it_kept_ahead_is_probed`) applies to focal, and joins focal's suites with
+R17's timed measurement at focal's level.
 
 ### 15.10 Evidence (the gate)
 

@@ -200,6 +200,17 @@ impl DurableNode {
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.set_priority(priority))
     }
+    /// The fields beyond raft-rs's this member's peers carry, from now on (`Wire`): raised by
+    /// focal-node once the upgrade fence opens `RAFT_KEPT_LEVEL`, before a member opened under
+    /// that fence sends. Under `Wire::Kept` the member reads a refusal's `kept` and `lost` and
+    /// keeps what arrives ahead of a hole (R17).
+    pub fn set_raft_wire(&mut self, wire: Wire) -> Result<(), ConsensusError> {
+        dispatch!(inner = &mut self.backend => inner.set_raft_wire(wire))
+    }
+    /// What this member's messages are encoded under (`encode_message_in`).
+    pub fn wire(&self) -> Wire {
+        dispatch!(inner = &self.backend => inner.wire())
+    }
     /// While this member leads, `peer` is sent no more than `bytes` of
     /// entries ahead of its answers: what its owner learned the path to it
     /// carries ([27 §11]). One entry that is larger is still sent, alone,

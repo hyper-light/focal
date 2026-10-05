@@ -3074,6 +3074,57 @@ fn a_follower_keeps_the_leaders_entries_ahead_of_a_hole_and_takes_them_in() {
 /// two with it and acknowledges all three; and nothing is sent again. Under raft-rs's rule
 /// (`Ahead::Refused`, the differential's) the two are sent again after the hole is filled: the
 /// divergence of `docs/raft.md` §3.3.
+/// The rule for what arrives ahead of a hole changes on a running member (`RawNode::set_ahead`),
+/// as an owner turns R17 on once every peer can read a kept refusal: opened under raft-rs's rule a
+/// member keeps nothing ahead of a hole; switched to `Ahead::Kept` it keeps the next append that
+/// arrives so, says so, and takes it in when the hole fills.
+#[test]
+fn the_rule_for_what_arrives_ahead_changes_on_a_running_member() {
+    let config_of = |id: u64| Config {
+        max_size_per_msg: 1,
+        max_inflight_msgs: 3,
+        ahead: crate::Ahead::Refused,
+        ..config(id)
+    };
+    let (mut leader, mut follower, sent) = ahead_of(config_of, 3);
+    let hole = carried(&sent)[0];
+    let mut ahead = sent.into_iter().skip(1);
+    follower.step(ahead.next().unwrap()).unwrap();
+    let answers = drain(&mut follower);
+    assert!(answers.iter().all(|answer| answer.reject && !answer.kept));
+    assert_eq!(
+        follower.raft.kept_ahead().count(),
+        0,
+        "raft-rs's rule keeps nothing"
+    );
+    follower.set_ahead(crate::Ahead::Kept);
+    follower.step(ahead.next().unwrap()).unwrap();
+    let answers = drain(&mut follower);
+    assert!(answers.iter().all(|answer| answer.reject && answer.kept));
+    assert_eq!(
+        follower.raft.kept_ahead().collect::<Vec<_>>(),
+        vec![hole + 2]
+    );
+    for answer in answers {
+        leader.step(answer).unwrap();
+    }
+    // The leader sends the hole again; once it fills, what was kept joins the log.
+    for _ in 0..4 {
+        let messages: Vec<Message> = drain(&mut leader)
+            .into_iter()
+            .filter(|message| message.to == 2)
+            .collect();
+        for message in messages {
+            follower.step(message).unwrap();
+        }
+        for answer in drain(&mut follower) {
+            leader.step(answer).unwrap();
+        }
+    }
+    assert_eq!(follower.raft.kept_ahead().count(), 0);
+    assert!(follower.raft.log().last_index().unwrap() >= hole + 2);
+}
+
 #[test]
 fn a_lost_append_costs_its_own_resend_and_what_was_kept_is_not_sent_again() {
     for refused in [false, true] {

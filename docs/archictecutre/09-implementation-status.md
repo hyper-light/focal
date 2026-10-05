@@ -13767,3 +13767,33 @@ reshaped client contract test, and focal-evidence's 57.
   the development host and longer on a runner. The test checks that the counted bound
   ends a program with `work`, not its magnitude, so under `cfg(test)` the bound is 2,000
   calls; the production derivation is unchanged.
+
+### 2026-10-04 — R17 behind the fence: `kept` and `lost` on focal's wire at level 3
+
+The consensus half of carrying hyper-raft's fields beyond raft-rs's (27 §15.9). The node half, the
+fence reaching every hosted group, follows in focal-node.
+- **Envelope.** `Wire::Frozen` and `Wire::Kept`; fields 17 (`kept`) and 18 (`lost`). Below the fence
+  neither is written. A reader below the fence skips 17, reading raft-rs's own refusal, and refuses
+  18. At or above it both are read and written.
+- **Members.** `set_raft_wire` and `wire()` on both consensus backends, the facade, focal-ledger's
+  `Session` and `NativeSession`, and focal-control's `Replica`. Raising one sets hyper-raft's
+  `Ahead::Kept` on the running group (hyper-raft `RawNode::set_ahead`, hyper-durable
+  `Replica::set_ahead`, taken here by a new snapshot). Peer messages decode under the member's
+  wire; focal-node encodes each send under its sender's (`encode_message_in`).
+- **Fence.** `RAFT_KEPT_LEVEL` 3 beside `ISSUER_SUCCESSION_LEVEL` 2 (24 §21). The binary's
+  `CAPABILITY_LEVEL` stays 2 until the node half raises every group, so the level a binary claims
+  and the behaviour it gates land together.
+- **Accounting.** A message's length for accounting counts every field it holds (`message_len`): a
+  raised member holding a kept refusal is charged for it, not refused.
+- **Tests** (`wire_tests.rs`, six):
+  - the fields' golden bytes;
+  - raft-proto `8e4cef1` reading a kept refusal as its own;
+  - the reader below the fence;
+  - a member raised before its leader converging;
+  - a leader change between keeping and resend, after which nothing of the former term the new
+    leader lacked survives;
+  - the fence raised during traffic, member by member, every proposal applied once and in order.
+- **Still to come.** R17's timed measurement at focal's level, before and after (p50 and p99,
+  commits a second, load, seeds), and the S-4 kept-hole probe test at focal's level, with the node
+  half.
+

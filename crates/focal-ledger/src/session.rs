@@ -511,6 +511,19 @@ impl Session {
     }
     /// Requests a transfer to an existing voter. Success means the request was
     /// accepted locally; callers observe status to learn whether it completed.
+    /// The fields beyond raft-rs's this group's member reads and writes from now on
+    /// (`focal_consensus::Wire`): raised by focal-node once the upgrade fence opens
+    /// `RAFT_KEPT_LEVEL`, before a member opened under that fence sends. Under `Wire::Kept` the
+    /// member reads a refusal's `kept` and `lost` and keeps what arrives ahead of a hole (R17).
+    pub fn set_raft_wire(&mut self, wire: focal_consensus::Wire) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_raft_wire(wire)?;
+        Ok(())
+    }
+    /// What this group's messages are encoded under (`focal_consensus::encode_message_in`).
+    pub fn wire(&self) -> focal_consensus::Wire {
+        self.consensus.wire()
+    }
     pub fn transfer_leader(&mut self, target: u64) -> Result<(), LedgerError> {
         self.check()?;
         if target == 0 || !self.members().voters.contains(&target) {

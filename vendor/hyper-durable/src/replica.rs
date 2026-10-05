@@ -1014,6 +1014,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.node.raft.set_patience(ticks);
     }
 
+    /// What the member does with an append that arrives ahead of a hole
+    /// (`hyper_raft::RawNode::set_ahead`): policy its owner sets once every peer can read a kept
+    /// refusal, never part of what is durable.
+    pub fn set_ahead(&mut self, ahead: hyper_raft::Ahead) {
+        self.node.set_ahead(ahead);
+    }
+
     /// The member's election priority (`hyper_raft::RawNode::set_priority`): policy its owner
     /// sets, never part of what is durable.
     pub fn set_priority(&mut self, priority: i64) {

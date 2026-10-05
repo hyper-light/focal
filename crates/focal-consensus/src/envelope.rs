@@ -22,8 +22,8 @@
 //! empty change is no bytes in raft-rs's encoding, and the core reads no bytes as the empty change
 //! (`hyper_raft::proto::change_of`): a record of it crosses as no bytes and comes back as none. What
 //! the core holds and raft-rs's encoding cannot state is refused, never dropped: a member's mark
-//! (`Message::lost`), which focal's log never sets, and an append kept ahead of a hole
-//! (`Message::kept`), which focal's members never keep (`Ahead::Refused`).
+//! (`Message::lost`), and an append kept ahead of a hole (`Message::kept`), until the cluster's
+//! upgrade fence opens fields of focal's own for them ([`Wire`]).
 
 use hyper_raft::proto::{
     ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
@@ -508,12 +508,41 @@ struct Layout<'a> {
     length: usize,
 }
 
-fn layout(message: &Message) -> Result<Layout<'_>> {
-    if message.lost {
-        return Err(EnvelopeError::Unstated("a member's mark"));
-    }
-    if message.kept {
-        return Err(EnvelopeError::Unstated("an append kept ahead of a hole"));
+/// Which of the core's messages' fields focal's peers carry beyond raft-rs's: none until the
+/// cluster's upgrade fence opens `RAFT_KEPT_LEVEL` (focal-node `upgrade`, 24 §21), then a refusal's
+/// `kept` (field 17, R17) and `lost` (field 18, R-5). eraftpb at raft-rs `8e4cef1` numbers its
+/// fields 1 to 16.
+///
+/// Members apply the fence at different moments, so a member already raised sends `kept` to one
+/// that is not. That member reads field 17 as raft-rs reads a field it does not know, skipped: the
+/// refusal is then raft-rs's own (the append's index, a hint at the member's last matching entry),
+/// whose answer is to step back to the hint and send again, so a member raised early costs its
+/// peers one resend and never a stall (27 §15.9). `lost` is refused below the fence: read without
+/// its flag, a refusal for lost entries would let a leader count acknowledgements the member no
+/// longer holds, and focal never writes one before the fence, nor after it without hyper-log's
+/// marks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Wire {
+    /// raft-rs's fields alone: what a member writes and reads below the fence.
+    #[default]
+    Frozen,
+    /// raft-rs's fields, `kept` and `lost`: at or above the fence.
+    Kept,
+}
+
+/// Field 17 of a message: an append kept ahead of a hole (`Message::kept`).
+const KEPT_FIELD: u64 = 17;
+/// Field 18 of a message: a refusal for entries lost at rest (`Message::lost`).
+const LOST_FIELD: u64 = 18;
+
+fn layout(message: &Message, wire: Wire) -> Result<Layout<'_>> {
+    if wire == Wire::Frozen {
+        if message.lost {
+            return Err(EnvelopeError::Unstated("a member's mark"));
+        }
+        if message.kept {
+            return Err(EnvelopeError::Unstated("an append kept ahead of a hole"));
+        }
     }
     let mut entries = Vec::new();
     entries
@@ -548,6 +577,14 @@ fn layout(message: &Message) -> Result<Layout<'_>> {
     length = add(length, varint_field_len(14, deprecated_priority(message)))?;
     length = add(length, varint_field_len(15, message.commit_term))?;
     length = add(length, varint_field_len(16, int64(message.priority)))?;
+    length = add(
+        length,
+        varint_field_len(KEPT_FIELD, u64::from(message.kept)),
+    )?;
+    length = add(
+        length,
+        varint_field_len(LOST_FIELD, u64::from(message.lost)),
+    )?;
     Ok(Layout {
         entries,
         snapshot,
@@ -555,14 +592,20 @@ fn layout(message: &Message) -> Result<Layout<'_>> {
     })
 }
 
-/// The bytes `message` takes as it goes to a peer.
+/// The bytes `message` takes as it goes to a peer, counting every field it holds: what a member
+/// charges for a message it holds, whichever wire it later goes under.
 pub fn message_len(message: &Message) -> Result<usize> {
-    Ok(layout(message)?.length)
+    Ok(layout(message, Wire::Kept)?.length)
 }
 
-/// `message` as it goes to a peer.
+/// `message` as it goes to a peer below the fence ([`Wire::Frozen`]).
 pub fn encode_message(message: &Message) -> Result<Vec<u8>> {
-    let layout = layout(message)?;
+    encode_message_in(message, Wire::Frozen)
+}
+
+/// `message` as it goes to a peer under `wire`.
+pub fn encode_message_in(message: &Message, wire: Wire) -> Result<Vec<u8>> {
+    let layout = layout(message, wire)?;
     let mut out = Vec::new();
     out.try_reserve_exact(layout.length)
         .map_err(|_| EnvelopeError::Memory)?;
@@ -588,6 +631,8 @@ pub fn encode_message(message: &Message) -> Result<Vec<u8>> {
     put_varint_field(&mut out, 14, deprecated_priority(message));
     put_varint_field(&mut out, 15, message.commit_term);
     put_varint_field(&mut out, 16, int64(message.priority));
+    put_varint_field(&mut out, KEPT_FIELD, u64::from(message.kept));
+    put_varint_field(&mut out, LOST_FIELD, u64::from(message.lost));
     Ok(out)
 }
 
@@ -978,8 +1023,13 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     Ok(snapshot)
 }
 
-/// The message a peer sent.
+/// The message a peer sent, read below the fence ([`Wire::Frozen`]).
 pub fn decode_message(bytes: &[u8]) -> Result<Message> {
+    decode_message_in(bytes, Wire::Frozen)
+}
+
+/// The message a peer sent, read under `wire`.
+pub fn decode_message_in(bytes: &[u8], wire: Wire) -> Result<Message> {
     let mut message = Message::default();
     let mut kind = 0i32;
     let mut deprecated_priority = 0u64;
@@ -1010,6 +1060,18 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message> {
             14 => deprecated_priority = varint_of("Message", field, value)?,
             15 => message.commit_term = varint_of("Message", field, value)?,
             16 => message.priority = as_int64(varint_of("Message", field, value)?),
+            KEPT_FIELD => {
+                let kept = varint_of("Message", field, value)? != 0;
+                // Below the fence, skipped as raft-rs skips a field it does not know (`Wire`).
+                message.kept = kept && wire == Wire::Kept;
+            }
+            LOST_FIELD => {
+                let lost = varint_of("Message", field, value)? != 0;
+                if lost && wire == Wire::Frozen {
+                    return Err(EnvelopeError::Unstated("a member's mark"));
+                }
+                message.lost = lost;
+            }
             _ => {}
         }
     }

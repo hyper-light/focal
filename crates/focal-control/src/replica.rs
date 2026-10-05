@@ -289,6 +289,18 @@ impl ControlReplica {
     pub fn identity(&self) -> ControlIdentity {
         self.identity
     }
+    /// The fields beyond raft-rs's this group's member reads and writes from now on
+    /// (`focal_consensus::Wire`): raised by focal-node once the upgrade fence opens
+    /// `RAFT_KEPT_LEVEL`, before a member opened under that fence sends. Under `Wire::Kept` the
+    /// member reads a refusal's `kept` and `lost` and keeps what arrives ahead of a hole (R17).
+    pub fn set_raft_wire(&mut self, wire: focal_consensus::Wire) -> Result<(), ControlError> {
+        self.node.set_raft_wire(wire)?;
+        Ok(())
+    }
+    /// What this group's messages are encoded under (`focal_consensus::encode_message_in`).
+    pub fn wire(&self) -> focal_consensus::Wire {
+        self.node.wire()
+    }
     pub fn status(&self) -> NodeStatus {
         self.node.status()
     }
