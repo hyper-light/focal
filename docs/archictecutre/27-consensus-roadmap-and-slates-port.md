@@ -1686,6 +1686,14 @@ R17's timed measurement at focal's level.
 - `cargo bench -p focal-consensus --bench commits` against `DurableNode` at its last commit,
   loaded, with the load recorded. The shell replaces focal's only where it is at least as fast and
   allocates no more (hyper-raft `docs/durable.md` §13).
+- The flush a commit costs, measured (2026-10-05, [09](09-implementation-status.md), the
+  single-node owner's group commit): on macOS and APFS, a focal-log group commit is three full
+  flushes. They are the segment's `F_FULLFSYNC`, then `CURRENT.tmp`'s write and `F_FULLFSYNC`,
+  its rename and the directory's `F_FULLFSYNC`, about 13 ms in all, and the fence costs 2.5× the
+  data flush. hyper-log's is one `F_FULLFSYNC` for the frame and its persist record (4.33 ms
+  median on the same class of machine, mantle's 2026-09-29 persist-record measurement). The bar
+  is about 3× on a lone caller, with the owner's group commit kept: N proposals made before one
+  drive take one frame and one flush (hyper-durable's test, sent with the next revision).
 - The group files at scale: thousands of groups a node, each checkpointing, and a checkpoint storm
   in which every group checkpoints together after a restart. The shared WAL paid one flush a batch
   across groups; a checkpoint here pays a file flush and a directory flush. The measurement records
