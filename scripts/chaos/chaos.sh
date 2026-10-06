@@ -5,9 +5,12 @@
 # founder while every node's interface loses and delays packets, and one
 # voter is SIGKILLed and later restarted. Afterwards every acknowledged
 # claim must read back on two nodes. Every loop and wait is counted.
-# Usage: chaos.sh IMAGE CLAIMS LOSS% DELAYms
+# Usage: chaos.sh IMAGE CLAIMS LOSS% DELAYms [kill|partition]
+#   kill:      SIGKILL fc-host-a for the middle third, then restart it.
+#   partition: cut fc-host-b off both ways (100% loss) for the middle third,
+#              then reconnect it; the node stays up throughout.
 set -uo pipefail
-IMAGE=${1:?image}; CLAIMS=${2:-120}; LOSS=${3:-5}; DELAY=${4:-50}
+IMAGE=${1:?image}; CLAIMS=${2:-120}; LOSS=${3:-5}; DELAY=${4:-50}; MODE=${5:-kill}
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-$(mktemp -d)}; mkdir -p "$OUT"; export OUT
 NODES=(fc-founder fc-host-a fc-host-b)
@@ -48,18 +51,30 @@ focal fc-founder cluster replicas activate-native >/dev/null 2>&1 || true
 echo "session placed on three voters"
 
 # Faults: loss and delay on every node, from a sidecar in its namespace.
+# The sidecar image holds tc already: a node cut off cannot fetch packages,
+# and its reconnection must not depend on its own network.
+docker image inspect focal-chaos-tc >/dev/null 2>&1 || \
+  docker build -q -t focal-chaos-tc -f "$HERE/tc.Dockerfile" "$HERE" >/dev/null
+netem() { # node rule: replace the node's root qdisc with this netem rule
+  # shellcheck disable=SC2086
+  docker run --rm --net "container:$1" --cap-add NET_ADMIN focal-chaos-tc \
+    qdisc replace dev eth0 root netem $2 || echo "netem on $1 failed"
+}
 for node in "${NODES[@]}"; do
-  docker run --rm --net "container:$node" --cap-add NET_ADMIN alpine:3.20 sh -c \
-    "apk add -q iproute2 >/dev/null 2>&1 && tc qdisc add dev eth0 root netem delay ${DELAY}ms $((DELAY/2))ms loss ${LOSS}%" \
-    || echo "netem on $node failed"
+  netem "$node" "delay ${DELAY}ms $((DELAY/2))ms loss ${LOSS}%"
 done
 echo "netem: ${LOSS}% loss, ${DELAY}ms ± $((DELAY/2))ms on every node"
 
 KILL_AT=$((CLAIMS/3)); START_AT=$((2*CLAIMS/3))
 : > "$OUT/acked"; : > "$OUT/failed"; : > "$OUT/latency"
 for i in $(seq 1 "$CLAIMS"); do
-  [ "$i" -eq "$KILL_AT" ] && { docker kill -s KILL fc-host-a >/dev/null; echo "claim $i: SIGKILL fc-host-a"; }
-  [ "$i" -eq "$START_AT" ] && { docker start fc-host-a >/dev/null; echo "claim $i: restarted fc-host-a"; }
+  if [ "$MODE" = kill ]; then
+    [ "$i" -eq "$KILL_AT" ] && { docker kill -s KILL fc-host-a >/dev/null; echo "claim $i: SIGKILL fc-host-a"; }
+    [ "$i" -eq "$START_AT" ] && { docker start fc-host-a >/dev/null; echo "claim $i: restarted fc-host-a"; }
+  else
+    [ "$i" -eq "$KILL_AT" ] && { netem fc-host-b "loss 100%"; echo "claim $i: fc-host-b cut off"; }
+    [ "$i" -eq "$START_AT" ] && { netem fc-host-b "delay ${DELAY}ms $((DELAY/2))ms loss ${LOSS}%"; echo "claim $i: fc-host-b reconnected"; }
+  fi
   doc="{\"target\":\"self\",\"action\":\"handoff\",\"description\":\"chaos $i\",\"validations\":[{\"kind\":\"receipt\",\"description\":\"Receive the report testament\",\"deadline\":{\"at\":$FAR}}]}"
   t0=$(now_ms)
   out=$(focal fc-founder submit claim --json "$doc" 2>&1); code=$?
@@ -74,11 +89,11 @@ for i in $(seq 1 "$CLAIMS"); do
   fi
 done
 
-# Verdict: every acknowledged claim reads back on the founder and on the
-# node that was never killed; none is duplicated.
+# Verdict: every acknowledged claim reads back on every node, the one that
+# was killed or cut off included; none is duplicated.
 missing=0
 for claim in $(cat "$OUT/acked"); do
-  for node in fc-founder fc-host-b; do
+  for node in "${NODES[@]}"; do
     focal "$node" get claim "$claim" >/dev/null 2>&1 || { missing=$((missing+1)); echo "missing $claim on $node"; }
   done
 done

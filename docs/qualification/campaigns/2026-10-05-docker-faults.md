@@ -59,6 +59,24 @@ recorded to bound the run, not to compare. The measured comparison is the
 | duplicates | 0 |
 | end-to-end per claim | p50 1,543 ms, p99 2,291 ms, max 2,351 ms |
 
+### Partition: a voter cut off both ways, then reconnected
+
+`bash scripts/chaos/chaos.sh focal:chaos-6c56b29 120 5 50 partition`: `fc-host-b` loses every
+packet in and out from claim 40 to claim 80 while it keeps running, then returns to the run's 5%
+loss. The node is alive throughout, so its timers fire while it hears nothing.
+
+| | |
+|---|---|
+| acknowledged | 120 of 120 |
+| refused or outcome unknown | 0 |
+| missing on any of the three nodes, the reconnected one included | 0 |
+| duplicates | 0 |
+| end-to-end per claim | p50 1,238 ms, p99 1,515 ms, max 1,584 ms |
+
+The fault sidecar is a local image with `tc` already installed (`scripts/chaos/tc.Dockerfile`).
+A sidecar that installed it at run time would fetch over the node's own network, and a node cut
+off could never be reconnected.
+
 ## What the first two runs taught (harness, not focal)
 
 - A claim targeting the node itself with the action `work` is refused at creation
@@ -71,7 +89,7 @@ recorded to bound the run, not to compare. The measured comparison is the
 
 - Killing the founder, through which the CLI writes. A client enrolled at the cluster, writing to
   whichever node leads, is the next step (`focal-load` over QUIC, 19d1c27).
-- Partitions (one node cut off both ways), heavier loss (20%) and a kill of the session's leader
-  while it is not the founder.
+- A partition that isolates the session's leader, and a kill of the leader while it is not the
+  founder.
 - Artifacts, testaments and validations under the same faults.
 - Dozens of nodes. This host's Docker VM holds three comfortably.
