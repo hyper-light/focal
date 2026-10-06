@@ -145,13 +145,9 @@ impl LogNode {
                     entry,
                 )?);
             }
-            for (proposal, _) in self
-                .raw
-                .store()
-                .proposals
-                .iter()
-                .filter(|(proposal, _)| proposal.index > index)
-            {
+            // Every proposal storage holds is written again: a checkpoint
+            // drops none (hyper-raft `Ready::released`).
+            for (proposal, _) in self.raw.store().proposals.iter() {
                 records.push(proto_record(
                     self.config.group_id,
                     RecordKind::Proposal,

@@ -9,7 +9,7 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 2;
+pub const CAPABILITY_LEVEL: u32 = 3;
 /// The level at which the issuer succeeds itself (24 §11): a credential
 /// issued under a successor issuer is presented with the predecessor's
 /// endorsement, which a binary below this level cannot verify.
@@ -39,6 +39,17 @@ pub fn admits(fence: UpgradeFence, announced: u32) -> bool {
 pub fn opened(fence: UpgradeFence, level: u32) -> bool {
     fence.level >= level
 }
+/// The fields beyond raft-rs's every group of this node carries under the
+/// committed fence: `Wire::Kept` (R17's `kept` and `lost`) once it opens
+/// `RAFT_KEPT_LEVEL`, which it does only when every enrolled node runs a
+/// binary that reads them; `Wire::Frozen` before.
+pub fn raft_wire(fence: UpgradeFence) -> focal_consensus::Wire {
+    if opened(fence, RAFT_KEPT_LEVEL) {
+        focal_consensus::Wire::Kept
+    } else {
+        focal_consensus::Wire::Frozen
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -58,5 +69,25 @@ mod tests {
         assert!(!opened(fence, 3));
         assert!(admits(UpgradeFence::default(), 0));
         assert!(announced_level() <= CAPABILITY_LEVEL);
+    }
+    /// R17's fields go on the wire only once the fence opens their level,
+    /// which it does only when every enrolled node reads them.
+    #[test]
+    fn the_wire_carries_kept_and_lost_only_from_their_level() {
+        let fence = |level| UpgradeFence {
+            level,
+            activated_at: 1,
+            revision: 1,
+        };
+        assert_eq!(
+            raft_wire(UpgradeFence::default()),
+            focal_consensus::Wire::Frozen
+        );
+        assert_eq!(raft_wire(fence(2)), focal_consensus::Wire::Frozen);
+        assert_eq!(
+            raft_wire(fence(RAFT_KEPT_LEVEL)),
+            focal_consensus::Wire::Kept
+        );
+        const { assert!(CAPABILITY_LEVEL >= RAFT_KEPT_LEVEL) };
     }
 }

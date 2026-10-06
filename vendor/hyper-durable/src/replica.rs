@@ -149,6 +149,11 @@ pub struct Output<A> {
     /// Reads a quorum confirmed and the replica has applied far enough to serve: each read's
     /// context and the index it was confirmed at.
     pub reads: Vec<(Vec<u8>, u64)>,
+    /// What this member proposed by the fast track and another entry took the index of, in
+    /// order (`hyper_raft::Ready::displaced`): no member applies it, so its proposer proposes it
+    /// again or answers that it was not taken. The core gives at most its bound on proposals in
+    /// one `Ready` (`Limits::proposals`).
+    pub displaced: Vec<Entry>,
 }
 
 impl<A> Default for Output<A> {
@@ -157,6 +162,7 @@ impl<A> Default for Output<A> {
             messages: Vec::new(),
             answers: Vec::new(),
             reads: Vec::new(),
+            displaced: Vec::new(),
         }
     }
 }
@@ -167,6 +173,7 @@ impl<A> Output<A> {
         self.messages.clear();
         self.answers.clear();
         self.reads.clear();
+        self.displaced.clear();
     }
 }
 
@@ -1341,11 +1348,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         // keeps are the refused ones'. Fenced here before, a full log cost a fast group its
         // replica.
         let proposals: Vec<Entry> = self.node.issued_proposals().cloned().collect();
+        // And what the core released through: written again with them, the release ends no
+        // proposal they give.
+        let released = Some(self.node.released()).filter(|through| *through > 0);
         let write = Write {
             start,
             entries: entries_of(&held, start),
             hard_state: Some(hard),
             proposals: &proposals,
+            released,
         };
         let submitted = self.node.store_mut().log.submit(&write, waker);
         let state = self.submitted_state(submitted)?;
@@ -1480,6 +1491,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         } else {
             self.writes_made.readies = self.writes_made.readies.saturating_add(1);
         }
+        out.displaced.append(&mut ready.take_displaced());
         let issued = self.node.advance_issued(ready);
         self.must(issued)?;
         if let Some(hard) = hard {
@@ -1571,6 +1583,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             entries: entries_of(persist.entries, start),
             hard_state: hard,
             proposals: ready.proposals(),
+            released: ready.released(),
         };
         if write.is_empty() {
             return Ok(State::Empty);
@@ -1818,32 +1831,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.applied = at;
         self.conf_index = at.index;
         self.node.store_mut().configuration = configuration;
-        if self.snapshot_misses_a_member() {
-            self.prepare()?;
-        }
         Ok(())
-    }
-
-    /// Whether the snapshot prepared for lagging members leaves out a member of the
-    /// configuration, which refuses a snapshot that does not name it.
-    fn snapshot_misses_a_member(&self) -> bool {
-        let held = self.node.store();
-        let Some(named) = held
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.metadata.as_ref())
-            .and_then(|m| m.conf_state.as_ref())
-        else {
-            return false;
-        };
-        let configuration = &held.configuration;
-        configuration
-            .voters
-            .iter()
-            .chain(&configuration.learners)
-            .chain(&configuration.voters_outgoing)
-            .chain(&configuration.learners_next)
-            .any(|&member| !names(named, member))
     }
 
     /// Tells the core how far the state machine applied.
@@ -2094,6 +2082,7 @@ fn repair_at_open<L: LogStore>(log: &mut L, durable: Point) -> Result<crate::Sto
                 ..hard
             }),
             proposals: &[],
+            released: None,
         }
     } else if durable.index > hard.commit {
         Write {

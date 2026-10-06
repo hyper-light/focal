@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment, MAX_BUFFER};
 
-use crate::format::{self, FRAME_HEADER_BYTES, FrameHeader, Owned, SegmentHeader};
+use hyper_seal::log::FrameMac;
+
+use crate::format::{self, FRAME_HEADER_BYTES, FrameHeader, MAC_LEN, Owned, SegmentHeader};
+use crate::seal::Sealer;
 use crate::state::{self, Live, Place, Replayed, Slot};
 use crate::state::{Head, Segments, State};
 use crate::{Config, LogError, Recovery};
@@ -44,11 +47,19 @@ pub(crate) struct Reader<'a, F> {
     /// The file offset of the window's first byte, and the bytes it holds.
     start: u64,
     held: u64,
+    /// A sealed log's framing MAC: every frame it reads is checked against it once its CRC holds.
+    mac: Option<FrameMac>,
 }
 
 impl<'a, F: BlockFile> Reader<'a, F> {
-    /// A reader of `file` whose window holds `segment_bytes`.
-    pub(crate) fn new(file: &'a F, align: Alignment, segment_bytes: u64) -> Result<Self, LogError> {
+    /// A reader of `file` whose window holds `segment_bytes`, checking a sealed log's frames
+    /// against `mac`.
+    pub(crate) fn new(
+        file: &'a F,
+        align: Alignment,
+        segment_bytes: u64,
+        mac: Option<FrameMac>,
+    ) -> Result<Self, LogError> {
         let size = usize::try_from(segment_bytes).map_err(|_| LogError::Config("segment"))?;
         Ok(Self {
             file,
@@ -57,6 +68,7 @@ impl<'a, F: BlockFile> Reader<'a, F> {
             window: AlignedBuf::zeroed(size, align).map_err(|e| LogError::Disk(e.into()))?,
             start: 0,
             held: 0,
+            mac,
         })
     }
 
@@ -117,6 +129,9 @@ impl<'a, F: BlockFile> Reader<'a, F> {
         {
             return Ok(Found::End);
         }
+        if !self.ours(&header)? {
+            return Ok(Found::End);
+        }
         let Some(frame_len) = header.frame_len().and_then(|l| u64::try_from(l).ok()) else {
             return Ok(Found::Invalid);
         };
@@ -129,9 +144,26 @@ impl<'a, F: BlockFile> Reader<'a, F> {
         if !fits {
             return Ok(Found::Invalid);
         }
+        let mac = self.mac.clone();
         match self.bytes(offset, padded)? {
-            Some(bytes) if header.verifies(bytes) => Ok(Found::Frame(header, bytes, padded)),
+            Some(bytes) if header.verifies(bytes) => {
+                if let Some(mac) = &mac {
+                    check_frame_mac(mac, &header, bytes)?;
+                }
+                Ok(Found::Frame(header, bytes, padded))
+            }
             _ => Ok(Found::Invalid),
+        }
+    }
+
+    /// Whether a frame of this log's ID is of its kind. A sealed log writes no frame of format 3:
+    /// one of its own there was put there by someone else. An unsealed log reads a sealed frame as
+    /// no frame of its own.
+    fn ours(&self, header: &FrameHeader) -> Result<bool, LogError> {
+        match (self.mac.is_some(), header.sealed) {
+            (true, false) => Err(LogError::Tampered("an unsealed frame in a sealed log")),
+            (false, true) => Ok(false),
+            _ => Ok(true),
         }
     }
 
@@ -198,11 +230,57 @@ impl<'a, F: BlockFile> Reader<'a, F> {
     }
 }
 
+/// Whether a persist record read whole is its log's: in a sealed log, sealed and its MAC holding
+/// (checked once its CRC held, so a mismatch is tampering); in an unsealed one, unsealed.
+fn check_record(
+    record: &format::Persist,
+    bytes: &[u8],
+    sealer: Option<&Sealer>,
+) -> Result<(), LogError> {
+    match (sealer, record.sealed) {
+        (Some(sealer), true) => {
+            let len = record
+                .encoded_len()
+                .ok_or(LogError::Tampered("a persist record's length"))?;
+            let end = len
+                .checked_add(MAC_LEN)
+                .ok_or(LogError::Tampered("a persist record's length"))?;
+            let (Some(covered), Some(mac)) = (bytes.get(..len), bytes.get(len..end)) else {
+                return Err(LogError::Tampered("a persist record cut short of its MAC"));
+            };
+            sealer.verify(covered, mac)
+        }
+        (Some(_), false) => Err(LogError::Tampered(
+            "an unsealed persist record in a sealed log",
+        )),
+        (None, true) => Err(LogError::Foreign(
+            "a sealed persist record in an unsealed log",
+        )),
+        (None, false) => Ok(()),
+    }
+}
+
+/// Whether a sealed frame's MAC holds over its header and payload: checked once its CRC holds, so
+/// a mismatch is tampering, never a torn write.
+fn check_frame_mac(mac: &FrameMac, header: &FrameHeader, bytes: &[u8]) -> Result<(), LogError> {
+    let at = header
+        .mac_at()
+        .ok_or(LogError::Tampered("a frame's length"))?;
+    let end = at
+        .checked_add(MAC_LEN)
+        .ok_or(LogError::Tampered("a frame's length"))?;
+    let (Some(covered), Some(tag)) = (bytes.get(..at), bytes.get(at..end)) else {
+        return Err(LogError::Tampered("a frame cut short of its MAC"));
+    };
+    let expected = crate::seal::frame_mac(mac, covered, header.records)?;
+    crate::seal::same_mac(&expected, tag)
+}
+
 fn block_of(align: Alignment) -> Result<u64, LogError> {
     u64::try_from(align.get()).map_err(|_| LogError::Config("block"))
 }
 
-pub(crate) fn check(config: &Config, align: Alignment) -> Result<(), LogError> {
+pub(crate) fn check(config: &Config, align: Alignment, sealed: bool) -> Result<(), LogError> {
     let block = block_of(align)?;
     let blocks = config.segment_bytes.checked_div(block).unwrap_or(0);
     if !align.is_aligned_u64(config.segment_bytes) || blocks < 4 {
@@ -226,7 +304,7 @@ pub(crate) fn check(config: &Config, align: Alignment) -> Result<(), LogError> {
             "room for one group and one submission at least",
         ));
     }
-    let slot = persist_slot(config, align)?;
+    let slot = persist_slot(config, align, sealed)?;
     if slot
         .checked_mul(2)
         .is_none_or(|area| area > config.segment_bytes)
@@ -244,11 +322,16 @@ pub(crate) fn persist_area(config: &Config) -> u64 {
     config.segment_bytes
 }
 
-/// Bytes of one persist slot: a record of the most groups a frame can carry, padded to the
-/// block. The record of the frame of sequence `s` goes in slot `s mod 2`, so the record of
-/// the frame before it survives a torn write of this one.
-pub(crate) fn persist_slot(config: &Config, align: Alignment) -> Result<u64, LogError> {
+/// Bytes of one persist slot: a record of the most groups a frame can carry, and a sealed log's
+/// MAC after it, padded to the block. The record of the frame of sequence `s` goes in slot
+/// `s mod 2`, so the record of the frame before it survives a torn write of this one.
+pub(crate) fn persist_slot(
+    config: &Config,
+    align: Alignment,
+    sealed: bool,
+) -> Result<u64, LogError> {
     format::persist_len(config.max_groups)
+        .and_then(|len| len.checked_add(if sealed { MAC_LEN } else { 0 }))
         .and_then(|len| u64::try_from(len).ok())
         .and_then(|len| align.up_u64(len))
         .ok_or(LogError::Config("persist records past u64"))
@@ -259,15 +342,21 @@ pub(crate) fn persist_at(slot: u64, sequence: u64) -> u64 {
     if sequence.is_multiple_of(2) { 0 } else { slot }
 }
 
-/// Writes `record` at `at`, the start of a persist slot, padded to the block.
+/// Writes `record` at `at`, the start of a persist slot, padded to the block, a sealed log's MAC
+/// after it.
 pub(crate) fn write_record<F: BlockFile>(
     file: &F,
     record: &format::Persist,
     at: u64,
+    sealer: Option<&Sealer>,
 ) -> Result<(), LogError> {
-    let bytes = record
+    let mut bytes = record
         .encode()
         .ok_or(LogError::TooLarge(record.groups.len()))?;
+    if let Some(sealer) = sealer {
+        let mac = sealer.mac(&bytes)?;
+        bytes.extend_from_slice(&mac);
+    }
     let mut buf =
         AlignedBuf::zeroed(bytes.len(), file.alignment()).map_err(|e| LogError::Disk(e.into()))?;
     buf.extend_from_slice(&bytes)
@@ -292,27 +381,61 @@ pub(crate) struct Restore {
     pub(crate) damaged: bool,
 }
 
-/// Writes segment 0, incarnation 1: its header and an empty first frame.
-pub(crate) fn create<F: BlockFile>(file: &F, config: &Config, id: u128) -> Result<State, LogError> {
+/// Writes segment 0, incarnation 1: its header and an empty first frame. A sealed log's header
+/// carries its first session's key frame, and both end with their MACs.
+pub(crate) fn create<F: BlockFile>(
+    file: &F,
+    config: &Config,
+    id: u128,
+    mut sealer: Option<&mut Sealer>,
+) -> Result<State, LogError> {
     let align = file.alignment();
-    check(config, align)?;
+    check(config, align, sealer.is_some())?;
     if !file.is_empty()? {
         return Err(LogError::Foreign("a new log needs an empty file"));
     }
     let block = align.get();
     let nonce = random_nonce()?;
+    let at = persist_area(config);
+    let first_frame = at
+        .checked_add(u64::try_from(block).map_err(|_| LogError::Config("block"))?)
+        .ok_or(LogError::Config("frame"))?;
+    let key = match sealer.as_deref_mut() {
+        Some(sealer) => Some(sealer.begin(1, first_frame)?),
+        None => None,
+    };
     let header = SegmentHeader {
         log: id,
         incarnation: 1,
         nonce,
         segment_bytes: config.segment_bytes,
+        key,
     };
-    let frame = FrameHeader::frame(id, 1, nonce, 0, 1, 0, &[]).ok_or(LogError::Config("frame"))?;
+    let frame = format::Frame {
+        log: id,
+        incarnation: 1,
+        nonce,
+        sequence: 0,
+        tail: 1,
+        records: 0,
+        sealed: sealer.is_some(),
+    };
+    let mut frame = frame.header(&[]).ok_or(LogError::Config("frame"))?.to_vec();
+    let mut header = header.encode();
+    if let Some(sealer) = sealer.as_deref() {
+        let mac = sealer.mac(&header)?;
+        header.extend_from_slice(&mac);
+        let mac = sealer.mac_frame(&frame, 0)?;
+        frame.extend_from_slice(&mac);
+    }
+    if header.len() > block {
+        return Err(LogError::Config("a segment header past its block"));
+    }
     let total = block
         .checked_add(frame.len())
         .ok_or(LogError::Config("frame"))?;
     let mut buf = AlignedBuf::zeroed(total, align).map_err(|e| LogError::Disk(e.into()))?;
-    buf.extend_from_slice(&header.encode())
+    buf.extend_from_slice(&header)
         .map_err(|e| LogError::Disk(e.into()))?;
     buf.extend_zeros(block.saturating_sub(buf.len()))
         .map_err(|e| LogError::Disk(e.into()))?;
@@ -320,7 +443,6 @@ pub(crate) fn create<F: BlockFile>(file: &F, config: &Config, id: u128) -> Resul
         .map_err(|e| LogError::Disk(e.into()))?;
     let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
     let written = u64::try_from(bytes.len()).map_err(|_| LogError::Config("frame"))?;
-    let at = persist_area(config);
     file.write_all_at(bytes, at)?;
     file.sync_data()?;
     Ok(State {
@@ -469,8 +591,13 @@ impl Headers {
     }
 }
 
-/// 1. Every segment header.
-fn headers<F: BlockFile>(file: &F, shape: &Shape) -> Result<Headers, LogError> {
+/// Step 1: every segment header. In a sealed log each header's MAC is checked once its CRC holds,
+/// and the session it opened is known from its first frame on.
+fn headers<F: BlockFile>(
+    file: &F,
+    shape: &Shape,
+    mut sealer: Option<&mut Sealer>,
+) -> Result<Headers, LogError> {
     let align = file.alignment();
     let count = usize::try_from(shape.slots).unwrap_or(0);
     let mut heads = Headers {
@@ -497,6 +624,26 @@ fn headers<F: BlockFile>(file: &F, shape: &Shape) -> Result<Headers, LogError> {
         };
         if h.log != shape.id || h.segment_bytes != shape.segment || h.incarnation == 0 {
             continue;
+        }
+        match (sealer.as_deref_mut(), h.key) {
+            (Some(sealer), Some(key)) => {
+                let end = format::SEALED_SEGMENT_HEADER_LEN.saturating_add(MAC_LEN);
+                let (Some(covered), Some(mac)) = (
+                    block.as_slice().get(..format::SEALED_SEGMENT_HEADER_LEN),
+                    block.as_slice().get(format::SEALED_SEGMENT_HEADER_LEN..end),
+                ) else {
+                    return Err(LogError::Tampered("a segment header cut short of its MAC"));
+                };
+                sealer.verify(covered, mac)?;
+                sealer.found(h.incarnation, shape.first_frame(slot)?, &key)?;
+            }
+            (Some(_), None) => {
+                return Err(LogError::Tampered(
+                    "an unsealed segment header in a sealed log",
+                ));
+            }
+            (None, Some(_)) => continue,
+            (None, None) => {}
         }
         if heads.by_incarnation.insert(h.incarnation, slot).is_some() {
             return Err(LogError::Damaged("two segments share an incarnation"));
@@ -627,6 +774,7 @@ fn replay_live<F: BlockFile>(
     shape: &Shape,
     heads: &Headers,
     last: &Last,
+    mut sealer: Option<&mut Sealer>,
 ) -> Result<Replay, LogError> {
     let mut replay = Replay {
         groups: HashMap::new(),
@@ -648,7 +796,13 @@ fn replay_live<F: BlockFile>(
                 }
                 expected = header.sequence.checked_add(1);
                 held = held.saturating_add(1);
-                replay_frame(&mut replay, slot, offset, header, bytes, padded)
+                let at = Frame {
+                    slot,
+                    incarnation: inc,
+                    offset,
+                    padded,
+                };
+                replay_frame(&mut replay, at, header, bytes, sealer.as_deref_mut())
             },
         )?;
         // A segment's header is flushed with its first frame, so a live segment before the
@@ -672,27 +826,83 @@ fn replay_live<F: BlockFile>(
     Ok(replay)
 }
 
-/// Replays one verified frame of segment slot `slot` at `offset`.
+/// Where a frame being replayed lies: its segment's slot and incarnation, its offset, and its
+/// padded length.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    slot: u32,
+    incarnation: u64,
+    offset: u64,
+    padded: u64,
+}
+
+/// Replays one verified frame. In a sealed log its key records are known first, in order, then
+/// its proposals are opened, which the state keeps, and its entries' lengths are their
+/// plaintexts': the log reads an entry's bytes back when asked, and opens them then.
 fn replay_frame(
     replay: &mut Replay,
-    slot: u32,
-    offset: u64,
+    at: Frame,
     header: &FrameHeader,
     bytes: &[u8],
-    padded: u64,
+    sealer: Option<&mut Sealer>,
 ) -> Result<(), LogError> {
     replay.frames = replay.frames.saturating_add(1);
     let payload = bytes
-        .get(format::FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
+        .get(format::FRAME_HEADER_LEN..header.mac_at().unwrap_or(0))
         .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
-    let records = format::records(payload, header.records)
+    let mut records = format::records(payload, header.records)
         .ok_or(LogError::Damaged("a verified frame does not decode"))?;
-    let base = offset
+    let base = at
+        .offset
         .checked_add(FRAME_HEADER_BYTES)
         .ok_or(LogError::Damaged("an offset past u64"))?;
-    let used = replay.used.entry(slot).or_insert(0);
-    *used = used.saturating_add(padded);
-    replay_records(&mut replay.groups, slot, base, records)
+    let used = replay.used.entry(at.slot).or_insert(0);
+    *used = used.saturating_add(at.padded);
+    let tag = match sealer {
+        Some(sealer) => {
+            open_records(sealer, at.incarnation, base, &mut records)?;
+            format::TAG_LEN
+        }
+        None => 0,
+    };
+    replay_records(&mut replay.groups, at.slot, base, records, tag)
+}
+
+/// A sealed frame's records made plain where the state keeps them: each key record's session known
+/// from its offset on, then each proposal opened.
+fn open_records(
+    sealer: &mut Sealer,
+    incarnation: u64,
+    base: u64,
+    records: &mut [Owned],
+) -> Result<(), LogError> {
+    let offset = |at: usize, past: usize| {
+        u64::try_from(at.checked_add(past)?)
+            .ok()
+            .and_then(|at| base.checked_add(at))
+    };
+    for record in records.iter_mut() {
+        match record {
+            Owned::Key { at, frame } => {
+                let from = offset(*at, 0).ok_or(LogError::Damaged("an offset past u64"))?;
+                sealer.found(incarnation, from, frame)?;
+            }
+            Owned::Proposal { group, proposal } => {
+                let from = offset(proposal.at, format::PROPOSAL_FIELDS_LEN)
+                    .ok_or(LogError::Damaged("an offset past u64"))?;
+                proposal.bytes = sealer.open(
+                    incarnation,
+                    from,
+                    *group,
+                    proposal.index,
+                    proposal.term,
+                    &proposal.bytes,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The groups replay rebuilt, as they run: those whose records run unbroken, those with a
@@ -762,10 +972,11 @@ fn erase<F: BlockFile>(
     heads: &Headers,
     last: &Last,
     copy: Option<RecordCopy>,
+    sealer: Option<&Sealer>,
 ) -> Result<u64, LogError> {
     let mut flush = false;
     if let Some((at, record)) = copy {
-        write_record(file, &record, at)?;
+        write_record(file, &record, at, sealer)?;
         flush = true;
     }
     let head_slot = heads.slot(heads.highest)?;
@@ -804,11 +1015,13 @@ pub(crate) fn open<F: BlockFile>(
     file: &F,
     config: &Config,
     id: u128,
+    mut sealer: Option<&mut Sealer>,
 ) -> Result<(State, Recovery, Vec<Restore>), LogError> {
-    check(config, file.alignment())?;
+    check(config, file.alignment(), sealer.is_some())?;
     let shape = Shape::of(file, config, id)?;
-    let heads = headers(file, &shape)?;
-    let mut reader = Reader::new(file, file.alignment(), shape.segment)?;
+    let heads = headers(file, &shape, sealer.as_deref_mut())?;
+    let mac = sealer.as_deref().map(Sealer::frame_mac);
+    let mut reader = Reader::new(file, file.alignment(), shape.segment, mac)?;
     let last = last_frame(&mut reader, &shape, &heads)?;
     lost_headers(&mut reader, &shape, &heads)?;
     if last.tail > last.incarnation {
@@ -816,7 +1029,7 @@ pub(crate) fn open<F: BlockFile>(
             "a frame names a tail after its own segment",
         ));
     }
-    let replay = replay_live(&mut reader, &shape, &heads, &last)?;
+    let replay = replay_live(&mut reader, &shape, &heads, &last, sealer.as_deref_mut())?;
     let (groups, mut damaged, fenced) = finish(replay.groups);
     // 4b. A frame after the last valid one may have been flushed and damaged since: its
     // persist record, written in the same flush, says what it held (AGL+18 §3.3.3).
@@ -825,9 +1038,9 @@ pub(crate) fn open<F: BlockFile>(
         config,
         id,
         last.sequence,
-        &groups,
-        &fenced,
+        (&groups, &fenced),
         &mut damaged,
+        sealer.as_deref(),
     )?;
     damaged.sort_unstable();
     damaged.dedup();
@@ -842,7 +1055,7 @@ pub(crate) fn open<F: BlockFile>(
     }));
     let live = live_of(heads.incarnation.len(), &groups, &fenced, &replay.used);
     let copy = copy.filter(|_| !restores.is_empty());
-    let head_offset = erase(file, &shape, &heads, &last, copy)?;
+    let head_offset = erase(file, &shape, &heads, &last, copy, sealer.as_deref())?;
     let opened = Opened {
         groups,
         damaged,
@@ -970,15 +1183,15 @@ fn restores<F: BlockFile>(
     config: &Config,
     id: u128,
     last: u64,
-    groups: &HashMap<u128, state::Group>,
-    fenced: &HashMap<u128, Place>,
+    (groups, fenced): (&HashMap<u128, state::Group>, &HashMap<u128, Place>),
     damaged: &mut Vec<u128>,
+    sealer: Option<&Sealer>,
 ) -> Result<(Vec<Restore>, Option<RecordCopy>), LogError> {
     let Some(sequence) = last.checked_add(1) else {
         return Ok((Vec::new(), None));
     };
     let align = file.alignment();
-    let slot = persist_slot(config, align)?;
+    let slot = persist_slot(config, align, sealer.is_some())?;
     let size = usize::try_from(slot).map_err(|_| LogError::Config("a persist slot"))?;
     let mut records = Vec::with_capacity(2);
     for at in [0, slot] {
@@ -986,6 +1199,7 @@ fn restores<F: BlockFile>(
         bytes.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
         file.read_exact_at(bytes.as_mut_slice(), at)?;
         if let Some(p) = format::Persist::decode(bytes.as_slice()).filter(|p| p.log == id) {
+            check_record(&p, bytes.as_slice(), sealer)?;
             records.push((at, p));
         }
     }
@@ -1154,6 +1368,7 @@ fn replay_records(
     slot: u32,
     base: u64,
     records: Vec<Owned>,
+    tag: usize,
 ) -> Result<(), LogError> {
     let place = |at: usize| -> Result<Place, LogError> {
         Ok(Place {
@@ -1178,11 +1393,11 @@ fn replay_records(
                     .checked_add(held)
                     .and_then(|end| end.checked_sub(1))
                     .ok_or(LogError::Damaged("an index past u64"))?;
-                insert(g, entries, &place)?;
+                insert(g, entries, &place, tag)?;
                 g.reach(last);
             }
             Owned::Relocated { group, entries, .. } => {
-                insert(groups.entry(group).or_default(), entries, &place)?;
+                insert(groups.entry(group).or_default(), entries, &place, tag)?;
             }
             Owned::HardState { at, group, state } => {
                 groups.entry(group).or_default().hard = Some((state, place(at)?));
@@ -1194,6 +1409,8 @@ fn replay_records(
                 let last = g.last.max(start.index);
                 g.reach(last);
             }
+            // A sealed log's session key: what opens the records after it, not a group's piece.
+            Owned::Key { .. } => {}
             Owned::Proposal { group, proposal } => {
                 groups.entry(group).or_default().proposals.insert(
                     proposal.index,
@@ -1210,6 +1427,12 @@ fn replay_records(
             Owned::Uncertain { at, group, mark } => {
                 groups.entry(group).or_default().uncertain = Some((mark, place(at)?));
             }
+            Owned::Released { at, group, through } => {
+                groups
+                    .entry(group)
+                    .or_default()
+                    .release(through, place(at)?);
+            }
             Owned::Damaged { at, group } => {
                 *groups.entry(group).or_default() = Replayed {
                     damaged: Some(place(at)?),
@@ -1225,10 +1448,15 @@ fn insert(
     g: &mut Replayed,
     entries: Vec<format::Decoded>,
     place: &impl Fn(usize) -> Result<Place, LogError>,
+    tag: usize,
 ) -> Result<(), LogError> {
     for e in entries {
-        let len =
-            u32::try_from(e.bytes.len()).map_err(|_| LogError::Damaged("an entry past u32"))?;
+        let plain = e
+            .bytes
+            .len()
+            .checked_sub(tag)
+            .ok_or(LogError::Damaged("a sealed entry shorter than its tag"))?;
+        let len = u32::try_from(plain).map_err(|_| LogError::Damaged("an entry past u32"))?;
         g.entries.insert(
             e.index,
             Slot {

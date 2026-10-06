@@ -18,7 +18,7 @@ use crate::{
     Configuration, NodeId, Tally,
     ahead::Early,
     catchup::{CatchUp, Staging, Stagings},
-    error::{Error, Result, StorageError},
+    error::{Dropped, Error, Result, StorageError},
     fast::{self, Decided, Proposals, Votes},
     log::Log,
     progress::{Progress, ProgressState, Tracker},
@@ -139,29 +139,6 @@ impl Limits {
             members: stated.members,
         })
     }
-}
-
-/// What a candidate of lower priority must hold to be voted for all the
-/// same.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Precedence {
-    /// A log more current than the voter's: a later last term, or the same
-    /// and more entries. A voter that refuses for priority could then have
-    /// been elected itself, so the refusal never leaves a group that can
-    /// elect without a leader.
-    #[default]
-    Log,
-    /// More entries than the voter, whatever their terms: the rule of
-    /// `raft-rs`. Two voters whose logs are equally long and end in
-    /// different terms refuse each other, the one for priority and the
-    /// other for the log, and with the third away the group elects no one.
-    /// With a marked member (core step R-7) no member need be away: the
-    /// voter of the longest log, of an older term, refuses the candidate of
-    /// the later term for priority while the marked voter refuses it for its
-    /// mark, and neither of them can be elected. A marked member's election
-    /// is argued by [`Precedence::Log`] (`docs/durable.md` §5.2). Kept to
-    /// compare the two cores under one rule.
-    Length,
 }
 
 /// When a leader asks its quorum for the reads that wait (Ongaro's thesis
@@ -291,11 +268,19 @@ pub struct Config {
     /// An election is asked about before a term is spent on it.
     pub pre_vote: bool,
     /// This member's rank in elections: a voter of higher priority votes
-    /// for a candidate of lower only when the candidate's log is ahead of
-    /// its own by [`Config::precedence`]. It never judges a transfer.
+    /// for a candidate of lower only when the candidate's log is more
+    /// current than its own, a later last term or the same and more
+    /// entries. A voter that refuses for priority could then have been
+    /// elected itself, so the refusal never leaves a group that can elect
+    /// without a leader. It never judges a transfer.
     pub priority: i64,
-    /// What a candidate of lower priority must hold to be voted for.
-    pub precedence: Precedence,
+    /// raft-rs's rule in place of the above, for the differential tests
+    /// alone (`docs/raft.md` §3.3): a candidate of lower priority must hold
+    /// more entries than the voter, whatever their terms. It can leave a
+    /// group that could elect without a leader, so no build but the tests'
+    /// has it.
+    #[cfg(feature = "raft-rs-precedence")]
+    pub raft_rs_precedence: bool,
     /// When a leader sends the round of heartbeats that confirms the reads
     /// that wait.
     pub read_rounds: ReadRounds,
@@ -351,7 +336,8 @@ impl Config {
             check_quorum: false,
             pre_vote: false,
             priority: 0,
-            precedence: Precedence::Log,
+            #[cfg(feature = "raft-rs-precedence")]
+            raft_rs_precedence: false,
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
             ahead: Ahead::Kept,
@@ -504,6 +490,7 @@ enum Campaign {
 
 /// One member: its term and vote, its role, its log and what it knows of
 /// the others.
+#[derive(Clone)]
 pub struct Raft<S> {
     /// The defect planted in this member, if any (`crate::mutant`).
     #[cfg(feature = "mutants")]
@@ -548,8 +535,16 @@ pub struct Raft<S> {
     /// Entries this member took into its log from what it kept ahead of a
     /// hole.
     taken_ahead: u64,
-    /// What this member approved by itself.
+    /// What this member approved by itself, held until it knows the index committed by a
+    /// classic quorum (`docs/raft.md` §3.5).
     pub(crate) held: Proposals,
+    /// The index through which this member knows its log committed by a classic quorum: a
+    /// leader by its own count (`Raft::maybe_commit`), another member from what a leader of its
+    /// term says with what its log then matches (`Message::classic`). Every later leader's log
+    /// holds the entries through it; a fast quorum's commit puts an entry in no majority's logs,
+    /// so it never moves this. Not kept across a restart: a member that opens knows nothing
+    /// committed so, and releases nothing until a leader says.
+    pub(crate) classic: u64,
     /// What the voters hold above this member's log, as it was told.
     pub(crate) votes: Votes,
     /// Who holds what this leader took from the fast track.
@@ -562,10 +557,10 @@ pub struct Raft<S> {
     pub(crate) fast_stats: FastStats,
     pub(crate) holders: Vec<NodeId>,
     /// In a fast group that this member leads: the voters of the
-    /// configuration it had applied when it was elected, by which a member
+    /// configuration it counted by when it was elected, by which a member
     /// that holds entries of this term may still count ([`crate::track`]).
     pub(crate) term_voters: Vec<NodeId>,
-    /// The one other set of voters a configuration it applied since named;
+    /// The one other set of voters a configuration it wrote since named;
     /// empty for none.
     pub(crate) term_next: Vec<NodeId>,
     /// Whether every configuration in force since it was elected names no
@@ -577,7 +572,6 @@ pub struct Raft<S> {
     /// The priority votes are judged by: the one given, once the member
     /// has a term.
     priority_in_force: i64,
-    pub(crate) promotable: bool,
     /// The commit this member's storage states durably, as its owner said
     /// (`docs/durable.md` §4.1's `C_d`): what a member that restarts reopens
     /// with. Its answers state no more when they leave
@@ -585,10 +579,19 @@ pub struct Raft<S> {
     pub(crate) durable_commit: u64,
     /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
     lost: Option<Lost>,
-    /// The leader told this member to campaign, and it could not yet: a
-    /// change it has committed is not applied. It campaigns once it is,
-    /// unless it has heard of a leader or a term since.
-    told_to_campaign: bool,
+    /// The configuration the member counts by is the newest its log states, applied or not
+    /// (`docs/raft.md` §3.4): the tracker's. `conf_newest_at` is the index of the entry that made
+    /// it, and `conf_before` the configuration before that entry, made at `conf_before_at`. Of the
+    /// changes a log holds only the newest may be uncommitted: a leader proposes a change only once
+    /// it applied every one its log holds (`Raft::propose`), and one that is elected first applies
+    /// its whole log. An append that replaces the newest takes the configuration back to the one
+    /// before; one that would replace that is a log no protocol made.
+    conf_before: Configuration,
+    conf_before_at: u64,
+    conf_newest_at: u64,
+    /// The configuration the owner applied, entry by entry (`RawNode::apply_conf_change`): what it
+    /// is told, which elections and commitment do not count by.
+    applied_conf: Configuration,
     pub(crate) log: Log<S>,
     pub(crate) tracker: Tracker,
     pub(crate) read_only: ReadOnly,
@@ -621,7 +624,7 @@ pub struct Raft<S> {
 /// messages may grow it by is known before they are sent
 /// ([`Outgoing::growth_of`]), and does not depend on what a library keeps
 /// as its own.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Outgoing {
     msgs: Vec<Message>,
     payload: usize,
@@ -790,6 +793,8 @@ struct Outbox<'a, S> {
     priority: i64,
     max_bytes: u64,
     max_entries: usize,
+    /// What the leader knows committed by a classic quorum, which its appends say.
+    classic: u64,
 }
 
 fn push(msgs: &mut Outgoing, id: NodeId, term: u64, priority: i64, message: Message) -> Result<()> {
@@ -905,6 +910,7 @@ impl<S: Storage> Outbox<'_, S> {
         }
         message.msg_type = MessageType::MsgSnapshot;
         message.snapshot = Some(Box::new(snapshot));
+        message.classic = Some(self.classic);
         progress.become_snapshot(index);
         Ok(true)
     }
@@ -957,6 +963,7 @@ impl<S: Storage> Outbox<'_, S> {
                     message.index = progress.next_index.saturating_sub(1);
                     message.log_term = term;
                     message.commit = self.log.committed();
+                    message.classic = Some(self.classic);
                     if let Some(last) = page.entries.last() {
                         // Charged by the rule the page was cut by, counted
                         // as it was chosen.
@@ -1065,6 +1072,7 @@ impl<S: Storage> Outbox<'_, S> {
             index: after,
             log_term: term,
             commit: self.log.committed(),
+            classic: Some(self.classic),
             entries: page.entries,
             ..Message::default()
         };
@@ -1084,8 +1092,9 @@ impl<S: Storage> Outbox<'_, S> {
     }
     fn heartbeat(&mut self, to: NodeId, progress: &Progress, context: Option<&[u8]>) -> Result<()> {
         let mut message = proto::message(to, MessageType::MsgHeartbeat);
-        // Never a commit the member may not hold.
+        // Never a commit the member may not hold, nor a classic one.
         message.commit = progress.matched.min(self.log.committed());
+        message.classic = Some(progress.matched.min(self.classic));
         if let Some(context) = context {
             message
                 .context
@@ -1152,6 +1161,8 @@ impl<S: Storage> Raft<S> {
         config.validate()?;
         let initial = store.initial_state()?;
         let configuration = Configuration::from_conf_state(&initial.configuration)?;
+        let conf_before = configuration.try_clone()?;
+        let applied_conf = configuration.try_clone()?;
         let log = Log::new(store, config.limits.unstable_entries)?;
         let mut tracker = Tracker::new(
             configuration,
@@ -1180,6 +1191,7 @@ impl<S: Storage> Raft<S> {
             ticks: 0,
             taken_ahead: 0,
             held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
+            classic: 0,
             votes: Votes::new(
                 usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
                 config.limits.vote_bytes,
@@ -1195,10 +1207,12 @@ impl<S: Storage> Raft<S> {
             term_known: false,
             priority: config.priority,
             priority_in_force: 0,
-            promotable: false,
             durable_commit: 0,
             lost: config.lost,
-            told_to_campaign: false,
+            conf_before: Configuration::default(),
+            conf_before_at: 0,
+            conf_newest_at: 0,
+            applied_conf: Configuration::default(),
             #[cfg(feature = "mutants")]
             mutant: None,
             log,
@@ -1218,7 +1232,8 @@ impl<S: Storage> Raft<S> {
             },
             config: config.clone(),
         };
-        raft.promotable = raft.tracker.configuration().votes(raft.id);
+        raft.conf_before = conf_before;
+        raft.applied_conf = applied_conf;
         if initial.hard_state != HardState::default() {
             raft.load_state(&initial.hard_state)?;
         }
@@ -1229,9 +1244,20 @@ impl<S: Storage> Raft<S> {
             // What was applied may be ahead of the commit that was durable.
             raft.log.applied_to_unchecked(config.applied);
         }
-        let last = raft.log.last_index()?;
+        // The configuration storage states is the one applied; the entries above it make the one
+        // elections and commitment count by.
+        let applied = raft
+            .log
+            .applied()
+            .max(raft.log.first_index()?.saturating_sub(1));
+        raft.conf_before_at = applied;
+        raft.conf_newest_at = applied;
+        raft.refresh_configuration(applied.saturating_add(1))?;
+        // What storage released the member knew committed by a classic quorum; the rest it
+        // holds until it knows that of their indexes.
+        raft.classic = initial.released.min(raft.log.committed());
         for held in initial.proposals {
-            if held.index > last {
+            if held.index > raft.classic {
                 raft.held.hold(held, true, false)?;
             }
         }
@@ -1304,9 +1330,16 @@ impl<S: Storage> Raft<S> {
     pub fn tracker(&self) -> &Tracker {
         &self.tracker
     }
-    /// The configuration in force.
+    /// The configuration this member counts votes and commitment by: the newest its log states,
+    /// committed or not (`docs/raft.md` §3.4).
     pub fn configuration(&self) -> &Configuration {
         self.tracker.configuration()
+    }
+    /// The configuration the owner applied, change by change ([`Raft::apply_conf_change`]): what
+    /// the state machine holds, which lags the one this member counts by while a change is in the
+    /// log and not applied.
+    pub fn applied_configuration(&self) -> &Configuration {
+        &self.applied_conf
     }
     /// The messages that wait to be taken, in the order queued.
     pub fn messages(&self) -> &[Message] {
@@ -1329,6 +1362,13 @@ impl<S: Storage> Raft<S> {
     /// How many reads wait for their quorum.
     pub fn pending_read_count(&self) -> usize {
         self.read_only.len()
+    }
+    /// Whether an answer to round `round` that names the read `context` confirms it, the round
+    /// having been sent while it waited ([`ReadOnly::ack_round`]); none where no such read waits.
+    pub fn round_confirms(&self, context: &[u8], round: u64) -> Option<bool> {
+        self.read_only
+            .round_of(context)
+            .map(|first| first != 0 && first <= round)
     }
     /// How many reads wait to be taken.
     pub fn ready_read_count(&self) -> usize {
@@ -1456,9 +1496,15 @@ impl<S: Storage> Raft<S> {
             commit: self.log.committed(),
         }
     }
-    /// Whether this member may campaign: it votes.
+    /// Whether this member may campaign: the newest configuration its log states names it a voter;
+    /// or that configuration's entry is not known committed and the one before names it a voter,
+    /// for the group may still need it until it is (Ongaro's thesis §4.2.2: a server "not part of
+    /// its own latest configuration should still start new elections, as it might still be needed
+    /// until the C_new entry is committed"). Its own vote counts only where it is a voter.
     pub fn promotable(&self) -> bool {
-        self.promotable
+        let id = self.id;
+        self.tracker.configuration().votes(id)
+            || (self.log.committed() < self.conf_newest_at && self.conf_before.votes(id))
     }
     /// Whether a change may be in the log and not applied.
     pub fn has_pending_conf(&self) -> bool {
@@ -1523,7 +1569,7 @@ impl<S: Storage> Raft<S> {
     /// good.) What is in force changes between operations and never within
     /// one.
     pub(crate) fn settle_priority(&mut self) {
-        self.priority_in_force = if self.term == 0 || !self.promotable {
+        self.priority_in_force = if self.term == 0 || !self.promotable() {
             0
         } else {
             self.priority
@@ -1614,7 +1660,7 @@ impl<S: Storage> Raft<S> {
     pub fn campaigns_on_next_tick(&self) -> bool {
         self.watch.is_none()
             && self.state != StateRole::Leader
-            && self.promotable
+            && self.promotable()
             && self.election_elapsed.saturating_add(1)
                 >= self
                     .randomized_election_timeout
@@ -1648,6 +1694,7 @@ impl<S: Storage> Raft<S> {
                 priority: self.priority_in_force,
                 max_bytes: self.config.max_size_per_msg,
                 max_entries: self.config.limits.entries_per_message,
+                classic: self.classic,
             },
             &mut self.tracker,
         )
@@ -1687,23 +1734,25 @@ impl<S: Storage> Raft<S> {
         Ok(())
     }
     fn bcast_heartbeat(&mut self) -> Result<()> {
-        let mut context = Vec::new();
-        let asked = match self.read_only.last_context() {
-            Some(last) => {
-                context
-                    .try_reserve_exact(last.len())
+        // It carries the last read asked: it is a round for every read that waits, and the one
+        // that asks again for a round that was lost.
+        let mut last = Vec::new();
+        let asks = match self.read_only.last_context() {
+            Some(context) => {
+                last.try_reserve_exact(context.len())
                     .map_err(|_| Error::Memory)?;
-                context.extend_from_slice(last);
+                last.extend_from_slice(context);
                 true
             }
             None => false,
         };
-        self.bcast_heartbeat_with(asked.then_some(context.as_slice()))?;
-        // It carried the last read asked: it is a round for every read
-        // that waits, and the one that asks again for a round that was
-        // lost.
-        self.read_only.asked();
-        Ok(())
+        let round = self.read_only.asked();
+        let carried = if asks {
+            Some(ReadOnly::round_context(&last, round)?)
+        } else {
+            None
+        };
+        self.bcast_heartbeat_with(carried.as_deref())
     }
     /// Whether a read waits that no round sent asks for: the member has a
     /// round to send.
@@ -1738,6 +1787,16 @@ impl<S: Storage> Raft<S> {
             self.term
         };
         let classic = self.log.maybe_commit(index, term)?;
+        // The quorum holds this leader's entry at `index`, so every later leader's log holds it
+        // and every entry before it: what this member holds by itself through it is held no more.
+        // A fast quorum may have committed it first. The members learn it with the next append or
+        // heartbeat (`Message::classic`), never by a round of its own: a release frees room, and
+        // one that comes later is still right (`docs/raft.md` §3.5, "The cost").
+        let known =
+            index > self.classic && self.log.term(index).is_ok_and(|held| held == self.term);
+        if known {
+            self.learn_classic(index)?;
+        }
         // What the classic quorum committed may open the next index to the
         // fast one.
         let fast = self.fast_commit()?;
@@ -1750,48 +1809,47 @@ impl<S: Storage> Raft<S> {
             progress.update_committed(committed);
         }
         self.release_deferred_reads()?;
+        self.leave_joint_when_committed()?;
         Ok(true)
+    }
+    /// A joint configuration that leaves by itself does so once the entry that entered it is
+    /// committed: the leader writes the entry that leaves. Written, it is the newest change and
+    /// above the commit, so it is written once.
+    fn leave_joint_when_committed(&mut self) -> Result<()> {
+        let configuration = self.tracker.configuration();
+        if self.state != StateRole::Leader
+            || !configuration.is_joint()
+            || !configuration.auto_leave()
+            || self.log.committed() < self.conf_newest_at
+        {
+            return Ok(());
+        }
+        let leave = Entry {
+            entry_type: EntryType::EntryConfChangeV2,
+            ..Entry::default()
+        };
+        // An entry that states nothing takes no room and is never refused for it.
+        if !self.append_entry(vec![leave])? {
+            return Err(Error::Invariant(
+                "the entry that leaves a joint configuration was refused",
+            ));
+        }
+        self.pending_conf_index = self.log.last_index()?;
+        Ok(())
     }
     /// The application applied through `applied`.
     pub fn commit_apply(&mut self, applied: u64) -> Result<()> {
-        let before = self.log.applied();
         self.log.applied_to(applied)?;
-        if self.told_to_campaign {
-            // It is told again by itself if another change waits.
-            self.told_to_campaign = false;
-            if self.state == StateRole::Follower
-                && self.promotable
-                && let Err(error) = self.hup(true)
-                && error.is_fatal()
-            {
-                // A campaign it may no longer make (its log may lack what it
-                // acknowledged, and the change left the others no quorum
-                // without it) is refused, and changes nothing.
-                return Err(error);
-            }
+        if self.state != StateRole::Leader {
+            return Ok(());
         }
-        // A joint configuration that leaves by itself does so once the
-        // leader applied the entry that entered it.
-        if self.tracker.configuration().auto_leave()
-            && before <= self.pending_conf_index
-            && applied >= self.pending_conf_index
-            && self.state == StateRole::Leader
-        {
-            let leave = Entry {
-                entry_type: EntryType::EntryConfChangeV2,
-                ..Entry::default()
-            };
-            // An entry that states nothing takes no room and is never
-            // refused for it.
-            if !self.append_entry(vec![leave])? {
-                return Err(Error::Invariant(
-                    "the entry that leaves a joint configuration was refused",
-                ));
-            }
-            self.pending_conf_index = self.log.last_index()?;
+        // A leader the newest configuration names no voter leads until that configuration is
+        // committed and applied, without counting itself; then the group is another's to lead.
+        if applied >= self.conf_newest_at && !self.tracker.configuration().votes(self.id) {
+            return self.hand_leadership_on();
         }
         // A change that is applied may open the fast track.
-        if self.config.fast && self.state == StateRole::Leader && self.maybe_commit()? {
+        if self.config.fast && self.maybe_commit()? {
             self.bcast_append()?;
         }
         Ok(())
@@ -1818,7 +1876,6 @@ impl<S: Storage> Raft<S> {
             watch.transfer = Arm::Off;
         }
         self.lead_transferee = None;
-        self.told_to_campaign = false;
         // What was kept ahead of a hole was one leader's, in one term; a
         // learner's rounds are one leader's too.
         self.early.clear();
@@ -1929,6 +1986,8 @@ impl<S: Storage> Raft<S> {
             }
             return Err(error);
         }
+        // A change takes effect as it is written.
+        self.refresh_configuration(last.saturating_add(1))?;
         // The leader's own progress moves when the entries are durable.
         Ok(true)
     }
@@ -1982,7 +2041,7 @@ impl<S: Storage> Raft<S> {
             < self
                 .randomized_election_timeout
                 .saturating_add(self.patience)
-            || !self.promotable
+            || !self.promotable()
         {
             return Ok(false);
         }
@@ -2255,7 +2314,7 @@ impl<S: Storage> Raft<S> {
         // its idle groups asks each member, and a follower that trusts its leader has none.
         let campaign = Watch::due(watch.campaign).filter(|_| {
             (watch.led == self.term && self.term != 0)
-                || (self.promotable
+                || (self.promotable()
                     && !watch.held
                     && self.may_campaign()
                     && self.may_lead()
@@ -2326,18 +2385,6 @@ impl<S: Storage> Raft<S> {
         }
         Ok(acted)
     }
-    /// The low and high bounds of the committed entries not yet applied,
-    /// and whether a change of the configuration is among them: a member
-    /// does not campaign on a configuration it has not applied. A snapshot
-    /// not yet durable states its own.
-    fn change_unapplied(&self) -> Result<bool> {
-        let low = match self.log.unstable().snapshot() {
-            Some(snapshot) => proto::snapshot_index(snapshot).saturating_add(1),
-            None => self.log.applied().saturating_add(1),
-        };
-        let high = self.log.committed().saturating_add(1);
-        self.has_unapplied_conf_changes(low, high)
-    }
     /// It follows `leader` in its term: if it thought it might have led
     /// this term, it did not, for a term has one leader.
     fn followed(&mut self, leader: NodeId) {
@@ -2350,16 +2397,16 @@ impl<S: Storage> Raft<S> {
         }
     }
     /// Whether this member trusts a leader: it knows one, its detectors do
-    /// not suspect it, and the configuration it applied names it a voter (a
-    /// leader that is none steps down once it applies that, and a member
-    /// that applied it knows the change was committed).
+    /// not suspect it, and the configuration it counts by names it a voter (a
+    /// leader that is none leads only until that configuration is committed,
+    /// and hands over once it applies it).
     fn trusts_leader(&self, watch: &Watch) -> bool {
         self.leader_id != 0
             && !watch.suspects(self.leader_id)
             && self.tracker.configuration().votes(self.leader_id)
     }
     fn wake_follower(&mut self, now: u64) -> Result<bool> {
-        let (promotable, local, term) = (self.promotable, self.config.seed, self.term);
+        let (promotable, local, term) = (self.promotable(), self.config.seed, self.term);
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
         let trusts = self
             .watch
@@ -2396,7 +2443,6 @@ impl<S: Storage> Raft<S> {
         let due = (alone && promotable)
             || match watch.campaign {
                 Arm::At(at) => now >= at,
-                Arm::Apply => true,
                 Arm::Off | Arm::Unset { .. } => false,
             };
         if !due {
@@ -2423,10 +2469,6 @@ impl<S: Storage> Raft<S> {
             };
             self.hand_over()?;
             return Ok(true);
-        }
-        if self.change_unapplied()? {
-            self.watch_mut()?.campaign = Arm::Apply;
-            return Ok(false);
         }
         self.watch_mut()?.campaign = Arm::Off;
         self.hup(false)?;
@@ -2537,7 +2579,7 @@ impl<S: Storage> Raft<S> {
         }
         let last = self.log.last_index()?;
         self.term_start = last;
-        self.release_proposals(last)
+        Ok(())
     }
 
     fn campaign(&mut self, campaign: Campaign) -> Result<()> {
@@ -2600,21 +2642,13 @@ impl<S: Storage> Raft<S> {
         }
         Ok(tally)
     }
-    /// Whether `[low, high)` holds a change of the configuration: a yes or
-    /// a no, read where the entries are and copying none of them.
-    fn has_unapplied_conf_changes(&self, low: u64, high: u64) -> Result<bool> {
-        if self.log.applied() >= self.log.committed() {
-            return Ok(false);
-        }
-        self.log.any_entry(low, high, proto::changes_configuration)
-    }
     fn hup(&mut self, transfer: bool) -> Result<()> {
         if self.state == StateRole::Leader {
             return Ok(());
         }
         // One that is no voter would count votes it cannot hold, and lead
         // a group it is no member of.
-        if !self.promotable {
+        if !self.promotable() {
             return Err(Error::NotPromotable);
         }
         if let Some(refusal) = self.lead_refusal()? {
@@ -2626,14 +2660,8 @@ impl<S: Storage> Raft<S> {
             self.leader_id = 0;
             return Err(Error::Lost);
         }
-        // A member does not campaign on a configuration it has not
-        // applied.
-        if self.change_unapplied()? {
-            // One that was told to campaign does once the change is
-            // applied: the leader that told it may have left for it.
-            self.told_to_campaign = transfer;
-            return Ok(());
-        }
+        // It counts by the newest configuration its log holds, applied or not (`promotable`, and
+        // the tracker's): nothing waits for an owner to apply a change.
         if transfer {
             self.campaign(Campaign::Transfer)
         } else if self.config.pre_vote {
@@ -2775,13 +2803,17 @@ impl<S: Storage> Raft<S> {
         // leading hands over until its term moves (`Raft::wake`), and this
         // answer is how it learns that it has.
         let handed = kind == MessageType::MsgTimeoutNow && self.watch.is_some();
-        if (self.config.check_quorum || self.config.pre_vote)
-            && (matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend) || handed)
-        {
+        if matches!(kind, MessageType::MsgHeartbeat | MessageType::MsgAppend) || handed {
             // A leader of an older term: this member moved its term
-            // while it was cut off. Its answer tells that leader, which
-            // no vote request of this member would, refused as they
-            // are while the leader is heard.
+            // while it was cut off, or holds a configuration that names
+            // that leader no voter. Its answer tells that leader (thesis
+            // Figure 3.1: "reply false if term < currentTerm"), which no
+            // vote request of this member would: refused while the leader
+            // is heard, and never sent to a member its configuration does
+            // not name a voter. raft-rs answers only under check-quorum or
+            // pre-vote and leaves the rest to vote requests; without either,
+            // a leader whose group's later configuration made it a learner
+            // led its old term for ever (`docs/sim.md` §15.9).
             self.send(proto::message(message.from, MessageType::MsgAppendResponse))?;
         } else if kind == MessageType::MsgRequestPreVote {
             // Answered and not dropped: a candidate of an older term
@@ -2812,16 +2844,17 @@ impl<S: Storage> Raft<S> {
             kind == MessageType::MsgRequestVote && message.context.as_slice() == CAMPAIGN_TRANSFER;
         // Judged against what this member answers for: its log, or what it marks lost.
         let (last_index, last_term) = self.claim()?;
-        let ahead = match self.config.precedence {
-            Precedence::Log => {
-                message.log_term > last_term
-                    || (message.log_term == last_term && message.index > last_index)
-            }
-            Precedence::Length => message.index > last_index,
+        let ahead = message.log_term > last_term
+            || (message.log_term == last_term && message.index > last_index);
+        #[cfg(feature = "raft-rs-precedence")]
+        let ahead = if self.config.raft_rs_precedence {
+            message.index > last_index
+        } else {
+            ahead
         };
         // A member whose log may lack what it acknowledged refuses no one
         // for priority: a voter that refuses for priority must be one the
-        // group could elect instead (`Precedence::Log`), and a marked member
+        // group could elect instead (the log's precedence), and a marked member
         // may not be (a schedule, seed 560, found one of the highest
         // priority refusing every candidate it was not behind). Judged
         // here, where votes are, and not settled on every operation.
@@ -2880,19 +2913,9 @@ impl<S: Storage> Raft<S> {
         if message.commit <= before || self.state == StateRole::Leader {
             return Ok(());
         }
-        if !self.log.maybe_commit(message.commit, message.commit_term)? {
-            return Ok(());
-        }
-        if !matches!(self.state, StateRole::Candidate | StateRole::PreCandidate) {
-            return Ok(());
-        }
-        // A candidate counts votes by a configuration; one that learns of
-        // a change it has not applied gives the election up.
-        let high = self.log.committed().saturating_add(1);
-        if self.has_unapplied_conf_changes(before.saturating_add(1), high)? {
-            let term = self.term;
-            self.become_follower(term, 0)?;
-        }
+        // A candidate counts votes by the newest configuration its log holds, which a commit does
+        // not change.
+        self.log.maybe_commit(message.commit, message.commit_term)?;
         Ok(())
     }
 
@@ -2937,10 +2960,13 @@ impl<S: Storage> Raft<S> {
     }
     fn propose(&mut self, message: &mut Message) -> Result<()> {
         if message.entries.is_empty() {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::Empty));
         }
-        if self.tracker.get(self.id).is_none() || self.lead_transferee.is_some() {
-            return Err(Error::ProposalDropped);
+        if self.tracker.get(self.id).is_none() {
+            return Err(Error::ProposalDropped(Dropped::NotMember));
+        }
+        if self.lead_transferee.is_some() {
+            return Err(Error::ProposalDropped(Dropped::Transferring));
         }
         let last = self.log.last_index()?;
         let mut pending = self.pending_conf_index;
@@ -2950,7 +2976,7 @@ impl<S: Storage> Raft<S> {
             let plan = match Plan::of_entry(entry) {
                 Ok(None) => continue,
                 Ok(Some(plan)) => plan,
-                Err(_) => return Err(Error::ProposalDropped),
+                Err(_) => return Err(Error::ProposalDropped(Dropped::Malformed)),
             };
             let joint = self.tracker.configuration().is_joint();
             let leaves = plan.stated == 0;
@@ -2972,7 +2998,7 @@ impl<S: Storage> Raft<S> {
         }
         let entries = std::mem::take(&mut message.entries);
         if !self.append_entry(entries)? {
-            return Err(Error::ProposalDropped);
+            return Err(Error::ProposalDropped(Dropped::Uncommitted));
         }
         self.pending_conf_index = pending;
         self.bcast_append()
@@ -3025,7 +3051,10 @@ impl<S: Storage> Raft<S> {
     /// or confirmed by a round.
     fn serve_read(&mut self, from: NodeId, context: Vec<u8>) -> Result<()> {
         let committed = self.log.committed();
-        if self.tracker.is_singleton() {
+        // Alone only where it is the one voter: a leader the newest configuration in its log
+        // leaves out leads until that configuration is committed, and its one voter may have
+        // been elected and committed since (seed 47 of the hostile schedules).
+        if self.tracker.is_singleton() && self.tracker.configuration().votes(self.id) {
             return self.answer_read(from, committed, context);
         }
         if self.read_only.len().saturating_add(self.read_states.len())
@@ -3045,9 +3074,9 @@ impl<S: Storage> Raft<S> {
                     .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
                 heartbeat.extend_from_slice(&context);
                 self.read_only.add(committed, context, from, self.id)?;
-                self.bcast_heartbeat_with(Some(&heartbeat))?;
-                self.read_only.asked();
-                Ok(())
+                let round = self.read_only.asked();
+                let carried = ReadOnly::round_context(&heartbeat, round)?;
+                self.bcast_heartbeat_with(Some(&carried))
             }
         }
     }
@@ -3272,15 +3301,16 @@ impl<S: Storage> Raft<S> {
         if progress.matched < last || progress.pending_request_snapshot != 0 {
             outbox.append(message.from, progress, true)?;
         }
-        if message.context.is_empty() {
+        // A round's answer names the round and the last read it asked for.
+        let Some((context, round)) = ReadOnly::of_round(&message.context) else {
             return Ok(());
-        }
-        let confirmed = match self.read_only.ack(message.from, &message.context)? {
+        };
+        let confirmed = match self.read_only.ack_round(message.from, context, round)? {
             Some(acks) => self.tracker.has_quorum(acks),
             None => false,
         };
         if confirmed {
-            self.confirm_reads(&message.context)?;
+            self.confirm_reads(context)?;
         }
         Ok(())
     }
@@ -3340,7 +3370,7 @@ impl<S: Storage> Raft<S> {
 
     fn step_candidate(&mut self, kind: MessageType, message: Message) -> Result<()> {
         match kind {
-            MessageType::MsgPropose => Err(Error::ProposalDropped),
+            MessageType::MsgPropose => Err(Error::ProposalDropped(Dropped::NoLeader)),
             MessageType::MsgReadIndex => Self::drop_read(&message),
             MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
                 if self.state == StateRole::PreCandidate && self.suspects(message.from) =>
@@ -3388,7 +3418,7 @@ impl<S: Storage> Raft<S> {
                 // hand-over. Ignored, the leader would wait an election
                 // timeout for it and take no proposal meanwhile. One that
                 // asks for votes has a later term than whoever told it.
-                if self.state == StateRole::PreCandidate && self.promotable {
+                if self.state == StateRole::PreCandidate && self.promotable() {
                     self.hup(true)?;
                 }
                 Ok(())
@@ -3404,7 +3434,7 @@ impl<S: Storage> Raft<S> {
         match kind {
             MessageType::MsgPropose => {
                 if self.leader_id == 0 {
-                    return Err(Error::ProposalDropped);
+                    return Err(Error::ProposalDropped(Dropped::NoLeader));
                 }
                 self.forward(message)
             }
@@ -3412,7 +3442,6 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.silence = 0;
                 self.leader_id = message.from;
-                self.told_to_campaign = false;
                 self.followed(message.from);
                 self.handle_append_entries(message)?;
                 self.heard_leader()
@@ -3421,7 +3450,6 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.silence = 0;
                 self.leader_id = message.from;
-                self.told_to_campaign = false;
                 self.followed(message.from);
                 self.handle_heartbeat(message)?;
                 self.heard_leader()
@@ -3430,7 +3458,6 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.silence = 0;
                 self.leader_id = message.from;
-                self.told_to_campaign = false;
                 self.followed(message.from);
                 self.handle_snapshot(message)?;
                 self.heard_leader()
@@ -3448,12 +3475,9 @@ impl<S: Storage> Raft<S> {
                 self.forward(message)
             }
             MessageType::MsgTimeoutNow => {
-                if self.promotable {
-                    // The leader asks: the group is not cut off, and there
-                    // is nothing to ask about first.
-                    self.hup(true)?;
-                }
-                Ok(())
+                // The leader asks: the group is not cut off, and there is nothing to ask about
+                // first. One the newest configuration in its log names no voter says so.
+                self.hup(true)
             }
             MessageType::MsgReadIndexResp => {
                 if message.entries.len() != 1 {
@@ -3541,11 +3565,17 @@ impl<S: Storage> Raft<S> {
             taken,
             self.config.fast,
         )? {
-            Some((_, last)) => {
+            Some((written, last)) => {
+                if written != 0 {
+                    // A change takes effect as it is taken, and one the append replaced ends.
+                    self.refresh_configuration(written)?;
+                }
                 let last = self.take_ahead(last, message.commit)?;
                 answer.index = last;
-                let held = self.log.last_index()?;
-                self.release_proposals(held)?;
+                // The log matches the leader's through `last`.
+                if let Some(classic) = message.classic {
+                    self.learn_classic(classic.min(last))?;
+                }
             }
             None if self.lost.is_some() && message.index > self.log.last_index()? => {
                 // What it refuses follows entries it may have acknowledged
@@ -3591,8 +3621,11 @@ impl<S: Storage> Raft<S> {
             .log
             .append_after_owned(last, term, commit, run, self.config.fast)?
         {
-            Some((_, taken)) => {
+            Some((written, taken)) => {
                 self.taken_ahead = self.taken_ahead.saturating_add(taken.saturating_sub(last));
+                if written != 0 {
+                    self.refresh_configuration(written)?;
+                }
                 Ok(taken)
             }
             None => Err(Error::Invariant(
@@ -3754,6 +3787,11 @@ impl<S: Storage> Raft<S> {
             return self.send_lost(message.from, lost.index);
         }
         self.log.commit_to(message.commit)?;
+        // The leader says no more than the log it knows this member holds.
+        if let Some(classic) = message.classic {
+            let last = self.log.last_index()?;
+            self.learn_classic(classic.min(last))?;
+        }
         if self.pending_request_snapshot != 0 {
             return self.send_request_snapshot();
         }
@@ -3774,12 +3812,18 @@ impl<S: Storage> Raft<S> {
             .take()
             .map(|snapshot| *snapshot)
             .unwrap_or_default();
+        let index = proto::snapshot_index(&snapshot);
         let mut answer = proto::message(message.from, MessageType::MsgAppendResponse);
         answer.index = if self.restore(snapshot)? {
             self.log.last_index()?
         } else {
             self.log.committed()
         };
+        // What the snapshot holds the log holds now, if it was not behind it.
+        if let Some(classic) = message.classic {
+            let held = index.min(self.log.committed());
+            self.learn_classic(classic.min(held))?;
+        }
         self.send(answer)
     }
     /// Begins again from `snapshot`. False when the member keeps its log.
@@ -3803,10 +3847,10 @@ impl<S: Storage> Raft<S> {
             .ok_or(Error::Violation("a snapshot without its configuration"))?;
         let configuration = Configuration::from_conf_state(stated)
             .map_err(|_| Error::Violation("a snapshot whose configuration is none"))?;
-        // A snapshot that does not name this member is not for it.
-        if !configuration.contains(self.id) {
-            return Ok(false);
-        }
+        // A snapshot that does not name this member is taken all the same: a server processes
+        // what a leader of its term sends without consulting its configuration (Ongaro's thesis
+        // §4.1). A member a change in the log adds is counted from that entry on, and the snapshot
+        // that seeds it may be older than the entry (`docs/raft.md` §3.4).
         if self.pending_request_snapshot == 0 && self.log.match_term(index, term) {
             // The log holds what the snapshot holds.
             self.log.commit_to(index)?;
@@ -3817,7 +3861,6 @@ impl<S: Storage> Raft<S> {
         // held.
         self.early.clear();
         let last = self.log.last_index()?;
-        self.release_proposals(last)?;
         self.tracker = Tracker::new(
             configuration,
             last,
@@ -3826,7 +3869,12 @@ impl<S: Storage> Raft<S> {
             self.config.limits.members,
         )?;
         self.tracker.set_page(self.config.max_size_per_msg);
-        self.post_conf_change()?;
+        // The snapshot's configuration is its log's through it, applied there.
+        self.conf_before = self.tracker.configuration().try_clone()?;
+        self.applied_conf = self.tracker.configuration().try_clone()?;
+        self.conf_before_at = index;
+        self.conf_newest_at = index;
+        self.configuration_changed()?;
         if let Some(progress) = self.tracker.get_mut(self.id) {
             let held = progress.next_index.saturating_sub(1);
             progress.maybe_update(held);
@@ -3848,9 +3896,69 @@ impl<S: Storage> Raft<S> {
             watch.forget_unnamed(|member| configuration.contains(member));
         }
     }
-    /// The configuration changed: what follows from it.
-    fn post_conf_change(&mut self) -> Result<ConfState> {
-        let stated = self.tracker.configuration().to_conf_state()?;
+    /// The changes in `[from, last]` take effect: an entry that replaced the newest change took the
+    /// configuration back to the one before it, and each change the entries state is folded on in
+    /// order. The entries are read a page at a time; a leader reads what it just wrote, a follower
+    /// what it just took.
+    fn refresh_configuration(&mut self, from: u64) -> Result<()> {
+        let mut changed = false;
+        if from <= self.conf_newest_at && self.conf_newest_at > self.conf_before_at {
+            if from <= self.conf_before_at {
+                return Err(Error::Invariant(
+                    "an append that replaces a committed change",
+                ));
+            }
+            // Only the newest change can be replaced: the one before is committed (the fields'
+            // note). What replaces it is folded on below.
+            let before = self.conf_before.try_clone()?;
+            let last = self.log.last_index()?;
+            self.tracker.apply(before, &[], last)?;
+            self.conf_newest_at = self.conf_before_at;
+            changed = true;
+        }
+        let last = self.log.last_index()?;
+        let low = from.max(self.log.first_index()?);
+        let mut fold = Fold {
+            configuration: None,
+            before: None,
+            before_at: self.conf_before_at,
+            newest_at: self.conf_newest_at,
+            renewed: Vec::new(),
+            error: None,
+        };
+        if low <= last {
+            // Read where the entries are, none copied: the walk stops only at an error.
+            let start = self.tracker.configuration();
+            self.log.any_entry(low, last.saturating_add(1), |entry| {
+                fold.entry(start, entry).is_err_and(|error| {
+                    fold.error = Some(error);
+                    true
+                })
+            })?;
+        }
+        if let Some(error) = fold.error {
+            return Err(error);
+        }
+        if let Some(before) = fold.before {
+            self.conf_before = before;
+        }
+        self.conf_before_at = fold.before_at;
+        self.conf_newest_at = fold.newest_at;
+        let (configuration, renewed) = (fold.configuration, fold.renewed);
+        if let Some(configuration) = configuration {
+            self.tracker.apply(configuration, &renewed, last)?;
+            changed = true;
+        }
+        if changed {
+            if self.state == StateRole::Leader {
+                self.note_term_change()?;
+            }
+            self.configuration_changed()?;
+        }
+        Ok(())
+    }
+    /// The configuration the member counts by changed: what follows from it.
+    fn configuration_changed(&mut self) -> Result<()> {
         self.forget_unnamed();
         // Only a learner is caught up: one promoted, or no member any more, is
         // staged no more.
@@ -3859,36 +3967,8 @@ impl<S: Storage> Raft<S> {
         } = self;
         let configuration = tracker.configuration();
         stagings.retain(|member| configuration.contains(member) && !configuration.votes(member));
-        let votes = self.tracker.configuration().votes(self.id);
-        self.promotable = votes;
         if self.state != StateRole::Leader {
-            return Ok(stated);
-        }
-        if !votes {
-            // Removed, or a learner now. The group is another's to lead:
-            // the voter that holds the whole log is asked to campaign at
-            // once, so the group does not wait out an election timeout,
-            // and this member follows.
-            let last = self.log.last_index()?;
-            let configuration = self.tracker.configuration();
-            let heir = self
-                .tracker
-                .iter()
-                .filter(|(member, progress)| {
-                    configuration.votes(*member) && progress.matched == last
-                })
-                .map(|(member, _)| member)
-                .next();
-            match heir {
-                Some(heir) => self.send(proto::message(heir, MessageType::MsgTimeoutNow))?,
-                // By suspicion its followers trust its node, which lives: none
-                // would campaign. The voter that holds the most is told to.
-                None if self.watch.is_some() => self.hand_over()?,
-                None => {}
-            }
-            let term = self.term;
-            self.become_follower(term, 0)?;
-            return Ok(stated);
+            return Ok(());
         }
         if self.maybe_commit()? {
             // A smaller quorum may hold more.
@@ -3925,18 +4005,44 @@ impl<S: Storage> Raft<S> {
         {
             self.lead_transferee = None;
         }
-        Ok(stated)
+        Ok(())
     }
-    /// A committed change is applied: the configuration it makes.
-    pub fn apply_conf_change(&mut self, plan: &Plan) -> Result<ConfState> {
-        let changed = plan.apply(self.tracker.configuration())?;
-        let from = self.log.last_index()?;
-        self.tracker
-            .apply(changed.configuration, &changed.renewed, from)?;
-        if self.state == StateRole::Leader {
-            self.note_term_change()?;
+    /// A leader the configuration names no voter any more, now that it is committed and applied:
+    /// removed, or a learner now. The group is another's to lead: the voter that holds the whole
+    /// log is asked to campaign at once, so the group does not wait out an election timeout, and
+    /// this member follows.
+    fn hand_leadership_on(&mut self) -> Result<()> {
+        {
+            let last = self.log.last_index()?;
+            let configuration = self.tracker.configuration();
+            let heir = self
+                .tracker
+                .iter()
+                .filter(|(member, progress)| {
+                    configuration.votes(*member) && progress.matched == last
+                })
+                .map(|(member, _)| member)
+                .next();
+            match heir {
+                Some(heir) => self.send(proto::message(heir, MessageType::MsgTimeoutNow))?,
+                // By suspicion its followers trust its node, which lives: none
+                // would campaign. The voter that holds the most is told to.
+                None if self.watch.is_some() => self.hand_over()?,
+                None => {}
+            }
+            let term = self.term;
+            self.become_follower(term, 0)?;
         }
-        self.post_conf_change()
+        Ok(())
+    }
+    /// A committed change is applied: the configuration it makes, which is what the owner is
+    /// told. The member counts by the newest change its log holds from the moment it holds it
+    /// (`Raft::refresh_configuration`); applying changes nothing it counts by.
+    pub fn apply_conf_change(&mut self, plan: &Plan) -> Result<ConfState> {
+        let changed = plan.apply(&self.applied_conf)?;
+        let stated = changed.configuration.to_conf_state()?;
+        self.applied_conf = changed.configuration;
+        Ok(stated)
     }
     fn load_state(&mut self, state: &HardState) -> Result<()> {
         if state.commit < self.log.committed() || state.commit > self.log.last_index()? {
@@ -3962,6 +4068,53 @@ impl<S: Storage> Raft<S> {
             .config
             .election_tick
             .saturating_add(usize::try_from(within).unwrap_or(0));
+    }
+}
+
+/// The changes an append's entries state, folded in order onto the configuration before them
+/// (`Raft::refresh_configuration`).
+struct Fold {
+    /// The configuration the entries folded so far make; none before the first change.
+    configuration: Option<Configuration>,
+    /// The configuration before the newest change folded, made at `before_at`.
+    before: Option<Configuration>,
+    before_at: u64,
+    newest_at: u64,
+    /// The members a change removed and added again, once each.
+    renewed: Vec<NodeId>,
+    error: Option<Error>,
+}
+
+impl Fold {
+    fn entry(&mut self, start: &Configuration, entry: &Entry) -> Result<()> {
+        let Some(plan) = Plan::of_entry(entry)? else {
+            return Ok(());
+        };
+        let current = match self.configuration.take() {
+            Some(current) => current,
+            None => start.try_clone()?,
+        };
+        let next = match plan.apply(&current) {
+            Ok(next) => next,
+            // A change the configuration before it cannot take changes nothing, at every member
+            // alike, as its owner's apply is refused (`Raft::apply_conf_change`).
+            Err(Error::Configuration(_)) => {
+                self.configuration = Some(current);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        for member in next.renewed {
+            if !self.renewed.contains(&member) {
+                self.renewed.try_reserve(1).map_err(|_| Error::Memory)?;
+                self.renewed.push(member);
+            }
+        }
+        self.before = Some(current);
+        self.before_at = self.newest_at;
+        self.newest_at = entry.index;
+        self.configuration = Some(next.configuration);
+        Ok(())
     }
 }
 

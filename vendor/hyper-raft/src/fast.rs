@@ -11,12 +11,14 @@
 //!
 //! What a member approved by itself is kept here, beside the log and never
 //! in it: the log holds what a leader approved and nothing else, so the
-//! log is the classic one, elections compare it as they always did, and a
-//! leader's entry takes the place of what a member held by taking its
-//! index. Because elections see only the log, what a member holds beside
-//! it counts for a fast commit only once its log holds an entry of the
-//! committing leader's term ([`crate::track`]): an election weighs the log,
-//! and the log must then say the member took that leader's word.
+//! log is the classic one and elections compare it as they always did. A
+//! member keeps what it holds after its log reaches the index, until it
+//! knows the index committed by a classic quorum: an election counts what
+//! members hold, and a log that reached the index can be cut back short of
+//! it ([`crate::track`], `docs/raft.md` §3.5). Because elections compare
+//! logs, what a member holds counts for a fast commit only once its log
+//! holds an entry of the committing leader's term: the log must then say
+//! the member took that leader's word.
 //!
 //! A leader stamps what it takes with its own term. The term a proposer
 //! gave says nothing of the entry, for two proposers of one term propose
@@ -61,9 +63,10 @@ struct Held {
     own: bool,
 }
 
-/// What this member approved by itself: at most one entry an index, above
-/// its log, and no more than the bounds admit. What is refused for room is
-/// not held and not voted for, and its proposer proposes it again.
+/// What this member approved by itself: at most one entry an index, taken
+/// above its log and kept until a classic commit covers it, and no more than
+/// the bounds admit. What is refused for room is not held and not voted for,
+/// and its proposer proposes it again.
 #[derive(Clone, Debug)]
 pub struct Proposals {
     /// In order of index.
@@ -172,9 +175,10 @@ impl Proposals {
     pub fn iter(&self) -> impl Iterator<Item = &Entry> + Clone {
         self.held.iter().map(|held| &held.entry)
     }
-    /// The log reaches `index`: what was held at or below it is held no
-    /// more. `taken` says whether the log holds the entry that was held;
-    /// what was proposed here and not taken is given to `displaced`.
+    /// A classic quorum committed through `index`: what was held at or below
+    /// it is held no more. `taken` says whether the log holds the entry that
+    /// was held; what was proposed here and not taken is given to
+    /// `displaced`.
     pub fn release(
         &mut self,
         index: u64,

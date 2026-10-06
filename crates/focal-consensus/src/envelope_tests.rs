@@ -319,6 +319,9 @@ fn message(rng: &mut Seeded) -> Message {
         reject: rng.below(2) == 1,
         lost: false,
         kept: false,
+        // focal's wire carries no field for it: what a frozen or kept
+        // member decodes says nothing known (hyper-raft `Message::classic`).
+        classic: None,
         reject_hint: number(rng),
         context: bytes(rng),
         priority,
@@ -535,4 +538,44 @@ fn what_no_raft_rs_message_holds_is_refused() {
         encode_message(&kept),
         Err(EnvelopeError::Unstated("an append kept ahead of a hole"))
     );
+}
+
+/// The leader's classic commit (`Message::classic`) goes on the kept wire with its presence, zero
+/// included, and nowhere else: below the fence it is left out, never refused, because a message
+/// without it says nothing known, which never releases what a member holds; and a reader below
+/// the fence skips it.
+#[test]
+fn the_classic_commit_travels_only_on_the_kept_wire_with_its_presence() {
+    for classic in [None, Some(0), Some(1), Some(u64::MAX)] {
+        let mut sent = message(&mut Seeded::new(11));
+        sent.classic = classic;
+        let kept = crate::encode_message_in(&sent, Wire::Kept).unwrap();
+        assert_eq!(
+            crate::decode_message_in(&kept, Wire::Kept).unwrap().classic,
+            classic
+        );
+        // A reader below the fence skips the field.
+        assert_eq!(
+            crate::decode_message_in(&kept, Wire::Frozen)
+                .unwrap()
+                .classic,
+            None
+        );
+        // Below the fence it is not written.
+        let frozen = crate::encode_message_in(&sent, Wire::Frozen).unwrap();
+        assert_eq!(
+            crate::decode_message_in(&frozen, Wire::Kept)
+                .unwrap()
+                .classic,
+            None
+        );
+        let mut without = sent.clone();
+        without.classic = None;
+        assert_eq!(
+            frozen,
+            crate::encode_message_in(&without, Wire::Frozen).unwrap()
+        );
+        // What a member charges for it counts the field.
+        assert!(crate::envelope::message_len(&sent).unwrap() >= kept.len());
+    }
 }

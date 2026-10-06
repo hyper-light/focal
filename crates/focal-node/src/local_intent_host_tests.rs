@@ -12,6 +12,7 @@ fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Work>) {
     let (sender, receiver) = mpsc::sync_channel(1);
     let (_progress, progress) = watch::channel(ControlProgressState {
         value: ControlProgress {
+            wire: focal_consensus::Wire::Frozen,
             identity: ControlIdentity {
                 cluster: focal_directory::ClusterId([1; 16]),
                 group: [2; 16],

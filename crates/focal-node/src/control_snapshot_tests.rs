@@ -90,6 +90,7 @@ impl Fixture {
         let status = replica.status();
         let (progress, _watch) = watch::channel(ControlProgressState {
             value: ControlProgress {
+                wire: focal_consensus::Wire::Frozen,
                 identity: replica.identity(),
                 node: 1,
                 leader: 1,

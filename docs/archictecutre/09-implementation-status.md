@@ -13939,3 +13939,139 @@ default budget admits an anchor and alias that the stated one refuses, and the s
 without the budget. `scripts/check-contracts.py` now refuses `serde_saphyr::from_str`,
 `from_slice` and `from_reader` in production sources (an inline test module may compare against
 them), so a new site cannot take the default.
+
+### 2026-10-05 — The shared crates at hyper-raft b5e372d, and hyper-seal
+
+The six `hyper-*` snapshots move to `b5e372d`, the shared repository's line with its six targets
+green. The core changes what focal sees:
+- elections and commitment count by the newest configuration in a member's log (`Raft::configuration`;
+  `Raft::applied_configuration` is what the owner applied), and a campaign by a member that
+  configuration does not make a voter is `Error::NotPromotable`;
+- a dropped proposal names its cause (`Error::ProposalDropped(Dropped)`).
+
+`hyper-log` now seals a log at rest when asked (format 4), so `hyper-seal` is vendored beside it as
+a seventh crate: its dependencies (aws-lc-rs through focal's vendored copy, getrandom, thiserror,
+rustix or windows-sys) are all ones focal already carries. A log created unsealed is the format it
+was. `vendor/README.md` and `docs/dependencies/inventory.tsv` name the new revision; focal's own
+adoption of the typed drop, the newest-configuration count and `NotPromotable` follows in the next
+commit.
+
+### 2026-10-05 — focal on hyper-raft b5e372d: drop reasons, the newest configuration, typed NotPromotable
+
+focal's side of taking the shared crates at b5e372d (the vendoring commit before this one):
+
+- **Drop reasons.** The core now names why it dropped a proposal (`ProposalDropped(Dropped)`).
+  `core_state::proposal_refused`, which inferred the cause from the core's state since 3d45055, is
+  now a plain match: `NoLeader` to `NotLeader` (naming no leader), `Transferring` and `NotMember`
+  to `LeaderLeaving`, and `Uncommitted`, which fires only where the leader's uncommitted bytes are
+  at their bound, to `Capacity`. `Empty` and `Malformed` are the caller's bugs and stay the core's
+  error. `a_dropped_proposal_is_refused_by_its_cause` is unchanged and passes.
+- **The newest configuration.** Elections and commitment count by the newest configuration in
+  the log, committed or not (Ongaro's thesis §4.1; hyper-raft `docs/raft.md` §3.4). `sole_commit`
+  names `Raft::configuration()` and decides alone only while that configuration, not joint, has
+  this member as its one voter. `a_logged_change_adding_a_voter_ends_the_sole_voters_commit` logs
+  an `AddNode` on a sole voter and drains it alone, and nothing after the change commits until the
+  new voter holds it. Counting by `applied_configuration()` instead, the test fails: the leader
+  commits alone a change its new voter never heard of. `proto::changes_configuration` is gone from
+  the core. Its two uses, the staging for members committed changes add and the commit fence, test
+  `entry_type != EntryNormal` in place.
+- **NotPromotable.** A campaign by a member the newest configuration makes no voter is refused by
+  the core, from `campaign` and from a leader's `MsgTimeoutNow`. focal's own check
+  (`check_campaign`) and a stepped `MsgTimeoutNow` now give the typed `ConsensusError::NotPromotable`
+  where `campaign` gave an untyped `Configuration` error. The control RPC, the replica admin
+  protocol and session control answer it as not ready: the member may become a voter once the
+  change commits.
+- **What the newest-configuration rule changed in focal's tests, and one defect it exposed.** The
+  first full gate on this tree failed four tests.
+  - Three assumed the old core and are restated, not weakened:
+    - The removal fence test used two voters, where the removal of the other now commits on the
+      leader's own write (`{1}` is its own majority) and the same write states the commit. It now
+      uses three voters, so the second voter's answer commits the removal in the core while the
+      leader's disk is held. With `fenced` disabled it fails.
+    - A leader no longer sends the member it removes anything once the removal is logged, so that
+      member never holds, applies or leads with its own removal.
+      `a_member_whose_removal_is_logged_is_sent_nothing_and_never_leads_a_group_it_left` asserts
+      that: with the leader cut off before the commit, the other two elect, no node leads a group it
+      is not in, and the uncommitted removal is discarded.
+    - A learner's campaign is refused `NotPromotable`, not an untyped `Configuration` error.
+  - The fourth was a real-process stall. `cli_nodes`'s drained host never retired: its session copy
+    had heard nothing since its removal was logged. As a grant voter it collected the session-fact
+    proof itself, and its own replica, which never held the removal's commit, refused to attest it.
+    `collect` ended on that local refusal although the other three voters were a majority.
+    `PlacementAgent::collect` now treats a local refusal as one voter that does not sign, as a
+    remote refusal already was, and reports it only if no majority signs. The test passes in 87 s,
+    where it stalled to its 240 s bound.
+
+### 2026-10-05 — R17's `kept` and `lost` on the wire behind the fence: the node's half
+
+The consensus half (fields 17 and 18, `Wire`, `set_raft_wire`, `encode_message_in`) landed with
+hyper-raft 4c4a199. This is the node's half, as 27 §15.9 and 24 §21 state it:
+
+- **The level.** `CAPABILITY_LEVEL` is now 3, so the founder can raise the fence to
+  `RAFT_KEPT_LEVEL` once every enrolled node reports it (`cli_upgrade` rehearses the rollout to the
+  compiled level and activates it). `upgrade::raft_wire(fence)` is `Wire::Kept` at or above the
+  level and `Wire::Frozen` below it.
+- **One wire a node.** The service starts a watch at the wire its root replica's applied fence
+  opens, before any group of the node is spawned. The network controller raises it on each
+  registry it observes (the fence never lowers).
+- **Every group follows it.** The root's and each hosted partition's control owners take it in
+  their config and apply it before their first drain and at every turn of their loop. The session
+  fleet's group owner applies a change to every session it holds, and sets a session it installs
+  before assembling it. Both encoders write under the group's own wire (`encode_message_in`).
+  `ReplicaProgress` and `ControlProgress` say which wire each group carries.
+- **Tests.**
+  - `the_wire_carries_kept_and_lost_only_from_their_level` checks the mapping.
+  - `a_control_group_carries_the_wire_its_fence_opened_and_follows_it` opens a control group
+    under an open fence and below one that opens later, and both carry `Kept`.
+  - `an_installed_session_follows_the_wire_its_fence_opens` raises a fleet's wire after a
+    session is installed, and the session carries `Kept` without being reinstalled, as does one
+    installed after. With the group's `follow_wire` disabled it fails.
+
+
+### 2026-10-05 — The shared crates at hyper-raft 38140c1
+
+The seven `hyper-*` snapshots move to `38140c1`, two landings past `b5e372d` on the shared
+repository's line, each with its six targets green:
+- **A livelock `b5e372d` could reach with every member up is closed.** Under the newest-configuration
+  rule, raft-rs's precedence of length let a voter of the longest log but an older term refuse, for
+  priority, the only candidates that could win, with no member able to win itself. hyper-raft's
+  swarm found it at seed 9,657 once its no-defect campaign ran its derived seed count. That
+  precedence is gone from the API (`Precedence`, `Config::precedence`); it survives behind the
+  `raft-rs-precedence` feature for hyper-raft's differential tests against raft-rs, which focal never
+  enables. A member of priority now grants a candidate whose log is more current, however short.
+  Reconfig.tla and its mirror check `Elects`, that with every member up some member is elected: it
+  holds under the remaining rule and is refused under raft-rs's.
+- **The fast track's hold (design A):** a member holds a fast-written entry until a classic commit
+  covers it.
+- focal uses neither `Precedence` nor `Config::precedence`; two doc comments that named
+  `Precedence::Log` are reworded in focal's next commit.
+
+### 2026-10-05 — focal on hyper-raft 38140c1: proposals held until released, the classic commit on the kept wire
+
+38140c1 closes the livelock b5e372d had (a voter refused, for priority, a candidate whose log was
+more current; raft-rs's rule, now test-only) and holds what a member approved by itself on the
+fast track until it knows the index committed by a classic quorum (d8578be, design A). focal's
+side:
+
+- **Storage holds a proposal until a `Ready` releases it.** `RamLog` dropped a proposal once its
+  log reached the index, and recovery and checkpoints did the same. The core now forbids that:
+  storage drops a proposal only at or below `Ready::released`, never because the log reached it,
+  nor at a snapshot or compaction. `prepare_with` carries the release, `publish` applies it before
+  the `Ready`'s own proposals, recovery gives back every proposal record, and a checkpoint writes
+  every proposal storage holds. focal's log keeps no record of a release, so
+  `InitialState::released` is zero at open. The core's contract makes that safe: a member is given
+  back every proposal its log still holds and holds them until it learns their commit again, which
+  costs the core's bounded room. The shell's `FloorStore` delegates `released` to its store.
+- **The classic commit on the wire.** A member releases only through the classic commit its leader
+  states (`Message::classic`, set on every append, heartbeat and snapshot). focal's wire had no
+  field for it, so the fast-track tests' followers held their proposals for good. It is field 19,
+  written with its presence and only under `Wire::Kept`. Below the fence it is left out, not
+  refused, because a message without it says nothing known; a reader below the fence skips it.
+  The fast track needs it, so a group has the fast track only above the fence, which focal
+  withholds outside tests in any case (`NodeConfig::validate`).
+  `the_classic_commit_travels_only_on_the_kept_wire_with_its_presence` checks both wires and
+  `Some(0)`. The fast-track tests run their members on the kept wire, and the fast-quorum test
+  beats until each follower learns the classic commit and releases, within four heartbeat
+  periods.
+- **Precedence.** `hyper_raft::Precedence` and `Config::precedence` are gone. focal used neither;
+  two doc comments that named `Precedence::Log` are reworded.

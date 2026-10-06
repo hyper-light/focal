@@ -205,6 +205,7 @@ fn owner(
     let (outbound, _outgoing) = async_mpsc::channel(8);
     let (progress, _changes) = watch::channel(ControlProgressState {
         value: ControlProgress {
+            wire: focal_consensus::Wire::Frozen,
             identity: replica.identity(),
             node: status.node_id,
             leader: status.leader_id,

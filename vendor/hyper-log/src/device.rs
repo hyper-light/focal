@@ -271,6 +271,22 @@ pub(crate) struct Reads {
     /// Entries a run did not hold as asked: moved since their place was taken, or damaged.
     pub(crate) missed: Vec<Wanted>,
     pub(crate) result: Result<(), LogError>,
+    /// In a sealed log, each entry copied in as stored, to be opened by the owner, which holds the
+    /// keys: its place in the reservation, its segment's slot, its bytes' file offset, its index
+    /// and term. Empty in an unsealed log.
+    pub(crate) sealed: Vec<Sealed>,
+    /// Whether the log is sealed: its entries are copied in as stored and listed in `sealed`.
+    pub(crate) seals: bool,
+}
+
+/// A sealed entry copied into a reservation as stored, for the owner to open.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sealed {
+    pub(crate) at: usize,
+    pub(crate) slot: u32,
+    pub(crate) offset: u64,
+    pub(crate) index: u64,
+    pub(crate) term: u64,
 }
 
 /// A block-aligned span of the file and the entries in it.
@@ -297,6 +313,8 @@ impl Reads {
             into: crate::Fetched::default(),
             missed: Vec::new(),
             result: Ok(()),
+            sealed: Vec::new(),
+            seals: false,
         }
     }
 }
@@ -342,6 +360,8 @@ pub(crate) struct Device<F> {
     /// The owner's inbox, for a word that cannot wait in `flushed`, and to wake the owner for a
     /// completion it must answer.
     inbox: SyncSender<Message<F>>,
+    /// A sealed log's framing MAC, which every frame a sweep reads is checked against.
+    mac: Option<hyper_seal::log::FrameMac>,
     /// Where the carrier goes back to the owner, and where each job back is told by its
     /// sequence, for a watch (`serve`).
     returns: SyncSender<Box<Carrier<F>>>,
@@ -371,9 +391,16 @@ impl<F: BlockFile> Device<F> {
             more,
             flushed,
             inbox,
+            mac: None,
             returns: back.returns,
             tokens: back.tokens,
         }
+    }
+
+    /// The device of a sealed log, which checks every frame it reads against `mac`.
+    pub(crate) fn sealed(mut self, mac: Option<hyper_seal::log::FrameMac>) -> Self {
+        self.mac = mac;
+        self
     }
 
     /// The file, the device done with.
@@ -545,7 +572,12 @@ impl<F: BlockFile> Device<F> {
     /// The verified frames of `segment` from `offset` to its end `end`, read through a window of
     /// a segment: nothing writes the tail while it is swept.
     fn sweep(&self, segment: Segment, offset: u64, end: u64) -> Result<Vec<Swept>, LogError> {
-        let mut reader = Reader::new(&self.file, self.file.alignment(), self.segment_bytes)?;
+        let mut reader = Reader::new(
+            &self.file,
+            self.file.alignment(),
+            self.segment_bytes,
+            self.mac.clone(),
+        )?;
         let mut out = Vec::new();
         let mut offset = offset;
         loop {
@@ -557,7 +589,7 @@ impl<F: BlockFile> Device<F> {
                 }
             };
             let body = bytes
-                .get(FRAME_HEADER_LEN..header.frame_len().unwrap_or(0))
+                .get(FRAME_HEADER_LEN..header.mac_at().unwrap_or(0))
                 .ok_or(LogError::Damaged("a frame shorter than its header says"))?;
             let records = format::records(body, header.records)
                 .ok_or(LogError::Damaged("a verified frame does not decode"))?;
@@ -612,7 +644,7 @@ impl<F: BlockFile> Device<F> {
             });
         if read.is_ok() {
             for wanted in entries {
-                take_entry(reads, buf.as_slice(), run.begin, *wanted);
+                take_entry(reads, buf.as_slice(), run.begin, *wanted, run.slot);
             }
         }
         self.pool.give(buf);
@@ -622,15 +654,26 @@ impl<F: BlockFile> Device<F> {
 
 /// Copies the entry `wanted` from `bytes`, which hold the file from `begin`, into the caller's
 /// reservation if it verifies as the group's entry of that index and term; a miss otherwise.
-fn take_entry(reads: &mut Reads, bytes: &[u8], begin: u64, wanted: Wanted) {
+fn take_entry(reads: &mut Reads, bytes: &[u8], begin: u64, wanted: Wanted, slot: u32) {
     let found = usize::try_from(wanted.offset.saturating_sub(begin))
         .ok()
         .and_then(|skip| bytes.get(skip..))
         .and_then(|at| format::entry_slice(at, reads.group, wanted.index))
         .filter(|(term, _)| *term == wanted.term);
-    match found {
-        Some((_, payload)) => reads.into.fill(wanted.at, payload),
-        None => reads.missed.push(wanted),
+    match (found, wanted.offset.checked_add(format::ENTRY_HEADER_BYTES)) {
+        (Some((_, payload)), Some(offset)) => {
+            reads.into.fill(wanted.at, payload);
+            if reads.seals {
+                reads.sealed.push(Sealed {
+                    at: wanted.at,
+                    slot,
+                    offset,
+                    index: wanted.index,
+                    term: wanted.term,
+                });
+            }
+        }
+        _ => reads.missed.push(wanted),
     }
 }
 

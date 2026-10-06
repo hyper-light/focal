@@ -79,4 +79,12 @@ pub enum LogError {
     /// A configuration the log cannot run with.
     #[error("the log's configuration is invalid: {0}")]
     Config(&'static str),
+    /// A sealed log's bytes whose CRC held and whose MAC or tag does not: changed by someone who
+    /// could recompute a CRC, never a torn write (hyper-raft docs/seal.md §5.1). The log serves
+    /// nothing from such a file.
+    #[error("the sealed log was tampered with: {0}")]
+    Tampered(&'static str),
+    /// A sealed log's key could not be made, wrapped or unwrapped.
+    #[error(transparent)]
+    Seal(#[from] hyper_seal::SealError),
 }

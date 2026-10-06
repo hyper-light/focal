@@ -26,6 +26,12 @@ struct Group {
     /// The members' settings.
     make: fn(u64) -> NodeConfig,
 }
+/// A member of a fast-track group: the fast track needs what only the kept wire carries, the
+/// leader's classic commit (`Message::classic`), so such a group runs above the fence.
+fn kept(mut node: DurableNode) -> DurableNode {
+    node.set_raft_wire(crate::Wire::Kept).unwrap();
+    node
+}
 impl Group {
     fn new() -> Self {
         Self::with(fast)
@@ -36,7 +42,7 @@ impl Group {
         let nodes = dirs
             .iter()
             .enumerate()
-            .map(|(i, dir)| DurableNode::open(make(i as u64 + 1), dir.path()).unwrap())
+            .map(|(i, dir)| kept(DurableNode::open(make(i as u64 + 1), dir.path()).unwrap()))
             .collect();
         let mut group = Self {
             dirs,
@@ -75,7 +81,7 @@ impl Group {
                 let to = message.to;
                 // As a peer sends it: encoded, and its sender the one the
                 // transport knows.
-                let encoded = crate::encode_message(&message).unwrap();
+                let encoded = crate::encode_message_in(&message, crate::Wire::Kept).unwrap();
                 self.nodes[(to - 1) as usize]
                     .step_authenticated(message.from, &encoded)
                     .unwrap();
@@ -88,7 +94,7 @@ impl Group {
     }
     /// Delivers one message, as `carry` does.
     fn deliver(&mut self, message: Message) {
-        let encoded = crate::encode_message(&message).unwrap();
+        let encoded = crate::encode_message_in(&message, crate::Wire::Kept).unwrap();
         self.nodes[(message.to - 1) as usize]
             .step_authenticated(message.from, &encoded)
             .unwrap();
@@ -105,7 +111,7 @@ impl Group {
             DurableNode::open(other, placeholder.path()).unwrap(),
         );
         drop(old);
-        self.nodes[node] = DurableNode::open(config, dir).unwrap();
+        self.nodes[node] = kept(DurableNode::open(config, dir).unwrap());
     }
     fn held(&self, node: usize) -> Vec<(u64, Vec<u8>)> {
         self.nodes[node]
@@ -140,9 +146,27 @@ fn a_followers_proposal_is_committed_by_the_fast_quorum_and_applied_by_all() {
     );
     assert_eq!(group.applied[0].last().unwrap(), b"fast");
     group.settle();
+    // A member releases what it approved by itself only through the classic commit the leader
+    // states (`Message::classic`). The fast quorum committed the index before a classic one held
+    // it, so the members learn it from a later append or heartbeat: the group beats until each
+    // has released, within four heartbeat periods.
+    for _ in 0..4 * fast(1).heartbeat_tick {
+        if (0..3).all(|node| group.held(node).is_empty()) {
+            break;
+        }
+        for node in &mut group.nodes {
+            node.tick().unwrap();
+        }
+        group.settle();
+    }
     for node in 0..3 {
         assert_eq!(group.applied[node].last().unwrap(), b"fast");
-        assert!(group.held(node).is_empty());
+        assert!(
+            group.held(node).is_empty(),
+            "member {} holds {:?}",
+            node + 1,
+            group.held(node)
+        );
     }
     assert_eq!(group.nodes[1].fast_stats().proposed, 1);
     assert!(group.displaced.iter().all(Vec::is_empty));
@@ -217,7 +241,7 @@ fn what_a_member_approved_is_on_disk_before_it_says_so_and_after_it_stopped() {
         1
     );
     assert!(kinds.contains(&(RecordKind::Proposal, index)));
-    group.nodes[2] = DurableNode::open(fast(3), &dir).unwrap();
+    group.nodes[2] = kept(DurableNode::open(fast(3), &dir).unwrap());
     // With the leader gone, whoever is elected takes what the two hold.
     for _ in 0..60 {
         for node in [1, 2] {

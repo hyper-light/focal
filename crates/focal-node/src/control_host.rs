@@ -36,6 +36,11 @@ pub struct ControlHostConfig {
     pub checkpoint_interval: u64,
     /// Trusted immutable-genesis pin; absent means remote enrollment is denied.
     pub enrollment_authority: Option<crate::network_control::FounderControlAuthority>,
+    /// The fields beyond raft-rs's this group carries (`Wire`), as the
+    /// committed upgrade fence opens them (`upgrade::RAFT_KEPT_LEVEL`). The
+    /// owner follows it before it sends; absent, the group keeps
+    /// `Wire::Frozen`.
+    pub wire: Option<watch::Receiver<focal_consensus::Wire>>,
 }
 impl ControlHostConfig {
     pub fn new(namespace: LedgerId) -> Self {
@@ -50,6 +55,7 @@ impl ControlHostConfig {
             request_timeout: Duration::from_secs(5),
             checkpoint_interval: 1024,
             enrollment_authority: None,
+            wire: None,
         }
     }
     fn validate(&self) -> Result<(), ControlError> {
@@ -73,6 +79,9 @@ impl ControlHostConfig {
 }
 #[derive(Debug, Clone)]
 pub struct ControlProgress {
+    /// The fields beyond raft-rs's this group's messages carry, as the
+    /// committed upgrade fence opened them (`upgrade::raft_wire`).
+    pub wire: focal_consensus::Wire,
     pub identity: ControlIdentity,
     pub node: u64,
     pub leader: u64,
@@ -660,6 +669,7 @@ impl ControlHost {
         let pace = TickPeriod::default();
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
+                wire: replica.wire(),
                 identity: replica.identity(),
                 node: status.node_id,
                 leader: status.leader_id,
@@ -952,9 +962,23 @@ type Finished = (
     Option<Allocation>,
 );
 impl<V: AuthorityVerifier> Owner<V> {
+    /// Carry the wire the fence opened from now on: checked before the
+    /// first drain, so a group opened under an open fence never sends
+    /// without its fields, and at every turn of the loop after.
+    fn follow_wire(&mut self) -> Result<(), ControlError> {
+        let Some(receiver) = self.config.wire.as_mut() else {
+            return Ok(());
+        };
+        let wire = *receiver.borrow_and_update();
+        if self.replica.wire() != wire {
+            self.replica.set_raft_wire(wire)?;
+        }
+        Ok(())
+    }
     fn run(mut self, receiver: mpsc::Receiver<Work>, peers: mpsc::Receiver<Work>) {
         self.pace.announce(self.replica.election_tick());
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
+            self.follow_wire()?;
             self.drain()?;
             let mut next_tick = Instant::now()
                 .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
@@ -964,6 +988,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             );
             let mut next_beat = Instant::now();
             loop {
+                self.follow_wire()?;
                 for _ in 0..8 {
                     match peers.try_recv() {
                         Ok(work) => {
@@ -2247,8 +2272,8 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
-            let encoded =
-                focal_consensus::encode_message(&message).map_err(|_| ControlError::Failed)?;
+            let encoded = focal_consensus::encode_message_in(&message, self.replica.wire())
+                .map_err(|_| ControlError::Failed)?;
             if encoded
                 .len()
                 .checked_add(256)
@@ -2466,6 +2491,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         let status = self.replica.status();
         self.progress.send_modify(|state| {
             state.value = ControlProgress {
+                wire: self.replica.wire(),
                 identity: self.replica.identity(),
                 node: status.node_id,
                 leader: status.leader_id,

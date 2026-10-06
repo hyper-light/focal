@@ -288,7 +288,7 @@ impl LogNode {
                         .rev()
                         .take_while(|entry| entry.index > delivered),
                 )
-                .filter(|entry| proto::changes_configuration(entry))
+                .filter(|entry| entry.entry_type != EntryType::EntryNormal)
                 .fold(0usize, |added, entry| {
                     added.saturating_add(memory::members_added(entry, tracker))
                 })
@@ -336,13 +336,20 @@ impl LogNode {
     /// the same write states it. Asked once the entries the `Ready` gave to
     /// apply are applied: a change among them is in force when the core
     /// counts what is durable.
+    ///
+    /// "The one voter" is of the newest configuration in the log, committed
+    /// or not (`Raft::configuration`), which elections and commitment count
+    /// by (Ongaro's thesis §4.1; hyper-raft `docs/raft.md` §3.4), and never
+    /// of the configuration applied so far, which lags a logged change: a
+    /// member that logged a change adding a voter no longer decides alone.
     fn sole_commit(&self, ready: &Ready) -> Option<u64> {
         let raft = &self.raw.raft;
         let last = ready.entries().last()?;
+        let configuration = raft.configuration();
         (ready.snapshot().is_none()
             && raft.state() == StateRole::Leader
-            && raft.tracker().is_singleton()
-            && raft.tracker().configuration().votes(raft.id())
+            && !configuration.is_joint()
+            && configuration.voters() == [raft.id()]
             && last.term == raft.term())
         .then_some(last.index)
     }
@@ -528,6 +535,7 @@ impl LogNode {
                         ready.entries(),
                         ready.snapshot(),
                         ready.proposals(),
+                        ready.released(),
                     )?;
                     pending.phase = Phase::Ready(Box::new(ReadyPhase {
                         ready,
@@ -680,7 +688,7 @@ impl LogNode {
     fn fenced(&self, entries: &[Entry]) -> bool {
         entries.iter().any(|entry| {
             entry.index > self.commit_durable
-                && (self.written_commit || proto::changes_configuration(entry))
+                && (self.written_commit || entry.entry_type != EntryType::EntryNormal)
         })
     }
     /// What follows `advance_append`: what the `Ready` committed is given

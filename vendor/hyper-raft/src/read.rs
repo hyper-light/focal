@@ -32,6 +32,9 @@ pub struct PendingRead {
     pub index: u64,
     /// Who confirmed the leader since, in order.
     acks: Vec<NodeId>,
+    /// The first round sent while it waited, zero before one is: an answer to an earlier round
+    /// says nothing of it, whatever context that round carried (`ReadOnly::ack_round`).
+    round: u64,
 }
 impl PendingRead {
     /// Who confirmed the leader for this read so far, in order of identity.
@@ -48,6 +51,9 @@ impl PendingRead {
     }
 }
 
+/// The bytes of a round's number, after the context its heartbeats carry.
+const ROUND_BYTES: usize = 8;
+
 /// Reads in the order asked, at most `limit` of them.
 #[derive(Clone, Debug)]
 pub struct ReadOnly {
@@ -61,6 +67,11 @@ pub struct ReadOnly {
     /// that answers it confirms them all. Those behind were asked after it
     /// was sent, and it proves nothing for them.
     asked: usize,
+    /// The rounds sent, which name each round apart from the context it carries: an asker may ask
+    /// a read again under a context an earlier round carried, and an answer to that round, late or
+    /// repeated, then names a read asked after it was sent (hyper-check's swarm, group seed 4,521,
+    /// 2026-10-05).
+    rounds: u64,
 }
 impl ReadOnly {
     /// No reads, and room for at most `limit`.
@@ -70,16 +81,66 @@ impl ReadOnly {
             limit,
             members,
             asked: 0,
+            rounds: 0,
         }
     }
     /// Whether a read waits that no round sent asks for.
     pub fn unasked(&self) -> bool {
         self.asked < self.queue.len()
     }
-    /// A round was sent with the context of the last read: it asks for
-    /// every read that waits.
-    pub fn asked(&mut self) {
+    /// A round is sent with the context of the last read: it asks for every read that waits. Its
+    /// number, which the round's heartbeats carry after the context ([`ReadOnly::round_context`]).
+    pub fn asked(&mut self) -> u64 {
         self.asked = self.queue.len();
+        if self.queue.is_empty() {
+            return self.rounds;
+        }
+        self.rounds = self.rounds.saturating_add(1);
+        let round = self.rounds;
+        for read in self.queue.iter_mut().filter(|read| read.round == 0) {
+            read.round = round;
+        }
+        round
+    }
+    /// What a round's heartbeats carry: the last read's context, and the round's number.
+    pub fn round_context(context: &[u8], round: u64) -> Result<Vec<u8>> {
+        let mut carried = Vec::new();
+        carried
+            .try_reserve_exact(context.len().saturating_add(ROUND_BYTES))
+            .map_err(|_| Error::Memory)?;
+        carried.extend_from_slice(context);
+        carried.extend_from_slice(&round.to_le_bytes());
+        Ok(carried)
+    }
+    /// The read's context and the round's number an answer carries back; none for one that does
+    /// not carry a round.
+    pub fn of_round(carried: &[u8]) -> Option<(&[u8], u64)> {
+        let at = carried.len().checked_sub(ROUND_BYTES)?;
+        let (context, round) = carried.split_at(at);
+        Some((context, u64::from_le_bytes(round.try_into().ok()?)))
+    }
+    /// The first round sent while the read `context` waited, zero before one is; none for a read
+    /// that does not wait.
+    pub fn round_of(&self, context: &[u8]) -> Option<u64> {
+        self.position(context)
+            .and_then(|position| self.queue.get(position))
+            .map(|read| read.round)
+    }
+    /// `member` confirmed the leader in answer to round `round`, which carried the read `context`:
+    /// who has so far, when the read waits and the round was sent while it did.
+    pub fn ack_round(
+        &mut self,
+        member: NodeId,
+        context: &[u8],
+        round: u64,
+    ) -> Result<Option<&[NodeId]>> {
+        let current = self
+            .round_of(context)
+            .is_some_and(|first| first != 0 && first <= round);
+        if !current {
+            return Ok(None);
+        }
+        self.ack(member, context)
     }
     /// How many reads wait.
     pub fn len(&self) -> usize {
@@ -141,6 +202,7 @@ impl ReadOnly {
             origins,
             index,
             acks,
+            round: 0,
         });
         Ok(())
     }

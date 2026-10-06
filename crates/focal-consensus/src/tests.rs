@@ -1339,3 +1339,69 @@ fn a_dropped_proposal_is_refused_by_its_cause() {
         Err(ConsensusError::NotLeader { leader: 1 })
     ));
 }
+/// A member decides a commit alone only while the newest configuration in
+/// its log, committed or not, names it the one voter (`sole_commit`;
+/// Ongaro's thesis §4.1). Once it has logged a change adding a voter, what it
+/// writes commits only when the new voter holds it too, though the change is
+/// not yet applied: counting by the applied configuration would let it
+/// commit alone a change whose new voter never heard of it.
+#[test]
+fn a_logged_change_adding_a_voter_ends_the_sole_voters_commit() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut learner = config(2);
+    learner.voters = vec![1];
+    learner.learners = vec![2];
+    let mut cluster = Cluster {
+        nodes: vec![
+            DurableNode::open(config(1), dirs[0].path()).unwrap(),
+            DurableNode::open(learner, dirs[1].path()).unwrap(),
+        ],
+        dirs,
+        applied: vec![Vec::new(); 2],
+        snapshots: vec![Vec::new(); 2],
+    };
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0]
+        .propose_conf_change(member_change(2, ConfChangeType::AddLearnerNode))
+        .unwrap();
+    cluster.pump(None);
+    cluster.nodes[0].propose(b"caught-up".to_vec()).unwrap();
+    cluster.pump(None);
+    assert_eq!(cluster.applied[1], vec![b"caught-up".to_vec()]);
+
+    // The change is logged and the leader drains alone: the member it adds
+    // hears nothing, so nothing after it commits.
+    let committed = cluster.nodes[0].status().committed_index;
+    cluster.nodes[0]
+        .propose_conf_change(member_change(2, ConfChangeType::AddNode))
+        .unwrap();
+    cluster.nodes[0]
+        .propose(b"after-the-change".to_vec())
+        .unwrap();
+    for _ in 0..4 {
+        let events = cluster.nodes[0].drain().unwrap();
+        assert!(events.committed.is_empty());
+    }
+    assert_eq!(cluster.nodes[0].status().committed_index, committed);
+    assert!(!cluster.nodes[0].status().voters.contains(&2));
+
+    // Once the new voter holds them, both commit. What the leader sent while
+    // it drained alone was not delivered, so its heartbeats find the voter
+    // behind and send them again.
+    for _ in 0..8 {
+        for node in &mut cluster.nodes {
+            node.tick().unwrap();
+        }
+        cluster.pump(None);
+    }
+    assert!(cluster.nodes[0].status().voters.contains(&2));
+    assert_eq!(
+        cluster.applied[0].last(),
+        Some(&b"after-the-change".to_vec())
+    );
+    assert_eq!(
+        cluster.applied[1].last(),
+        Some(&b"after-the-change".to_vec())
+    );
+}

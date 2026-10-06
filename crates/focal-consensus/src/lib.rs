@@ -232,6 +232,11 @@ pub enum ConsensusError {
     MalformedMessage(&'static str),
     #[error("a leader does not remove itself; transfer leadership first")]
     LeaderLeaving,
+    /// A campaign, asked for or a leader's `MsgTimeoutNow`, by a member the
+    /// newest configuration in its log makes no voter (hyper-raft's
+    /// configuration safety, `docs/raft.md` §3.4). A refusal: nothing changed.
+    #[error("this member is no voter of the newest configuration it holds")]
+    NotPromotable,
 }
 
 impl From<hyper_raft::StorageError> for ConsensusError {
@@ -999,7 +1004,8 @@ impl LogNode {
     ///
     /// A lower priority is voted for all the same when its log is more
     /// current than the voter's, by its last term and then its length
-    /// (`hyper_raft::Precedence::Log`): a voter that refuses for priority
+    /// (hyper-raft's one rule since 38140c1; raft-rs's, which refused it,
+    /// livelocked a group and is kept only to test against): a voter that refuses for priority
     /// could then have been elected itself, so priority never leaves a group
     /// that can elect without a leader.
     /// The fields beyond raft-rs's this member's peers carry, from now on (`Wire`): under
@@ -1230,8 +1236,10 @@ impl LogNode {
     fn step_inner(&mut self, message: Message) -> Result<(), ConsensusError> {
         self.check()?;
         core_state::check_message(&self.config, &message)?;
-        self.raw.step(message)?;
-        Ok(())
+        self.raw.step(message).map_err(|error| match error {
+            hyper_raft::Error::NotPromotable => ConsensusError::NotPromotable,
+            error => ConsensusError::Raft(error),
+        })
     }
 
     /// Decode through the bounded prost codec and bind the Raft sender to the
@@ -1702,10 +1710,11 @@ fn replay_record(
             {
                 return Err(ConsensusError::Corruption("proposal envelope mismatch"));
             }
-            // What the log has reached since is set aside.
-            if entry.index > storage.last_index()? {
-                storage.hold_proposal(entry)?;
-            }
+            // Every proposal the log still holds is given back, whatever the
+            // log has reached since: the core holds it until it learns its
+            // index committed by a classic quorum (hyper-raft
+            // `InitialState::released`).
+            storage.hold_proposal(entry)?;
         }
         RecordKind::DecoderFloor => {
             if config.is_none() || required_decoder.is_some() {

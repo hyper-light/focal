@@ -3171,8 +3171,17 @@ impl PlacementAgent {
         let hosts = handles.fleet.hosts(ledger)
             || (ledger == handles.directory.namespace()
                 && handles.directory.host_of_group(group).is_some());
+        // A local replica that cannot state the fact is one voter that does
+        // not sign, as a remote one that refuses is: the others may still
+        // make the majority. A member removed from the log is sent nothing
+        // once its removal is logged (Ongaro's thesis §4.1; hyper-raft
+        // `docs/raft.md` §3.4), so it never holds the removal's commit and
+        // refuses to attest it, while the grant still names it a voter until
+        // the change installs. Its refusal once ended the collection, and the
+        // drained copy never retired (cli_nodes on hyper-raft b5e372d).
+        let mut local_refusal = None;
         if voters.contains(&node) && hosts {
-            let permit = crate::placement_control::prepare_session_fact(
+            match crate::placement_control::prepare_session_fact(
                 &handles.fleet,
                 &handles.control,
                 &handles.directory,
@@ -3180,10 +3189,15 @@ impl PlacementAgent {
                 fact.clone(),
                 window,
             )
-            .await?;
-            let local = permit.sign(&self.credentials)?;
-            if collected.merge(local.proof().clone())? {
-                return collected.finish();
+            .await
+            {
+                Ok(permit) => {
+                    let local = permit.sign(&self.credentials)?;
+                    if collected.merge(local.proof().clone())? {
+                        return collected.finish();
+                    }
+                }
+                Err(error) => local_refusal = Some(error),
             }
         }
         let body = crate::placement_collect::sign_request_body(&fact, window)
@@ -3219,7 +3233,10 @@ impl PlacementAgent {
         if let Some(error) = refused {
             return Err(error);
         }
-        collected.finish()
+        // Without a majority, this node's own refusal says the most.
+        collected
+            .finish()
+            .map_err(|quorum| local_refusal.map_or(quorum, CollectError::Proof))
     }
     pub fn status(&self, usage: BTreeMap<TenantId, focal_directory::QueueUsage>) -> AgentStatus {
         AgentStatus {

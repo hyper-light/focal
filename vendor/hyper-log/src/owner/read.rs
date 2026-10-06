@@ -105,6 +105,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     bytes: p.bytes.clone(),
                 })
                 .collect(),
+            released: g.released.map_or(0, |(through, _)| through),
             uncertain: g.uncertain.map(|(mark, _)| mark),
         }))
     }
@@ -142,6 +143,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         reads.runs.clear();
         reads.wanted.clear();
         reads.missed.clear();
+        reads.sealed.clear();
+        reads.seals = self.seal.is_some();
         reads.result = Ok(());
         if let Err(e) = self.plan(group, range, &mut into, &mut reads) {
             self.spare_reads = reads;
@@ -196,7 +199,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             if !into.is_empty() && total > max_bytes {
                 break;
             }
-            plan_one(g, index, self.p.align, into, reads)
+            plan_one(g, index, (self.p.align, self.p.tag), into, reads)
                 .ok_or(LogError::Corrupt { group, index })?;
         }
         Ok(())
@@ -219,6 +222,13 @@ impl<F: BlockFile + 'static> Owner<F> {
         };
         let outcome = std::mem::replace(&mut reads.result, Ok(()))
             .and_then(|()| self.again(&mut reads, fetch.retries));
+        let outcome = outcome.and_then(|()| {
+            if reads.runs.is_empty() {
+                self.open_read(&mut reads)
+            } else {
+                Ok(())
+            }
+        });
         match outcome {
             Ok(()) if reads.runs.is_empty() => {
                 let into = std::mem::take(&mut reads.into);
@@ -233,6 +243,33 @@ impl<F: BlockFile + 'static> Owner<F> {
             Err(e) => fetch.ticket.answer(Err(e)),
         }
         self.read_next();
+    }
+
+    /// A sealed log's entries read back as stored, opened: each under the session of its segment
+    /// that began at or before it. One that does not open is tampering, its CRC having held.
+    fn open_read(&self, reads: &mut Reads) -> Result<(), LogError> {
+        let Some(seal) = &self.seal else {
+            return Ok(());
+        };
+        let group = reads.group;
+        let state = &self.state;
+        let sealed = std::mem::take(&mut reads.sealed);
+        let result = reads.into.open_each(|at, stored| {
+            let Some(s) = sealed.iter().find(|s| s.at == at) else {
+                return Ok(None);
+            };
+            let incarnation = usize::try_from(s.slot)
+                .ok()
+                .and_then(|slot| state.segments.incarnation.get(slot))
+                .copied()
+                .ok_or(LogError::Damaged(
+                    "a read from a slot the log does not hold",
+                ))?;
+            seal.open(incarnation, s.offset, group, s.index, s.term, stored)
+                .map(Some)
+        });
+        reads.sealed = sealed;
+        result
     }
 
     /// Replaces `reads`' runs with reads of the entries that missed: each where the group now
@@ -285,7 +322,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 fn plan_one(
     g: &Group,
     index: u64,
-    align: Alignment,
+    (align, tag): (Alignment, usize),
     into: &mut Fetched,
     reads: &mut Reads,
 ) -> Option<()> {
@@ -294,12 +331,13 @@ fn plan_one(
         into.push(slot.term, bytes);
         return Some(());
     }
+    // A sealed entry is read as stored: its bytes and the tag after them.
     let wanted = Wanted {
         at: into.reserve(slot.term),
         index,
         term: slot.term,
         offset: slot.place.offset,
-        len: slot.len,
+        len: slot.len.checked_add(u32::try_from(tag).ok()?)?,
     };
     add_to_runs(reads, align, slot.place.slot, wanted)
 }

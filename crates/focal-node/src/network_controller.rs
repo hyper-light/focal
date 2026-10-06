@@ -1007,6 +1007,8 @@ pub struct NetworkController {
     /// The local socket's grant and the tenants it was bound with: every
     /// tenant the committed registry admits joins them on each refresh.
     local_grant: Option<(tokio::sync::watch::Sender<PeerGrant>, BTreeSet<TenantId>)>,
+    /// The wire this node's groups carry (`follow_wire`).
+    wire: Option<tokio::sync::watch::Sender<focal_consensus::Wire>>,
     /// The failure-domain labels this node announces with its contact
     /// (24 §22).
     topology: crate::config::Topology,
@@ -1059,6 +1061,24 @@ impl NetworkController {
     pub fn follow_local_grant(&mut self, grant: tokio::sync::watch::Sender<PeerGrant>) {
         let base = grant.borrow().tenants.clone();
         self.local_grant = Some((grant, base));
+    }
+    /// Raise the wire of every group this node hosts as the committed fence
+    /// opens it (`upgrade::raft_wire`); the fence never lowers.
+    pub(crate) fn follow_wire(&mut self, wire: tokio::sync::watch::Sender<focal_consensus::Wire>) {
+        self.wire = Some(wire);
+    }
+    fn publish_wire(&self, enrollment: &EnrollmentRegistry) {
+        let Some(wire) = &self.wire else {
+            return;
+        };
+        let next = crate::upgrade::raft_wire(enrollment.fence());
+        wire.send_if_modified(|current| {
+            if *current == next {
+                return false;
+            }
+            *current = next;
+            true
+        });
     }
     fn publish_local_grant(&self, enrollment: &EnrollmentRegistry) {
         let Some((grant, base)) = &self.local_grant else {
@@ -1122,6 +1142,7 @@ impl NetworkController {
             observed_revision: 0,
             pin_reads: 0,
             local_grant: None,
+            wire: None,
             topology: crate::config::Topology::default(),
             budget,
             _allocation: allocation,
@@ -1772,6 +1793,7 @@ impl NetworkController {
             return Err(ControllerError::Retired);
         }
         self.publish_local_grant(&enrollment);
+        self.publish_wire(&enrollment);
         let grants = active_grants(&enrollment, &self.state, now)?;
         let known = enrollment
             .enrollments()

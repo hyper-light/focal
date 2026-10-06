@@ -205,7 +205,8 @@ impl From<ControlError> for ControlFailure {
             ControlError::Consensus(
                 focal_consensus::ConsensusError::LearnerBehind
                 | focal_consensus::ConsensusError::MembershipPending
-                | focal_consensus::ConsensusError::LeaderLeaving,
+                | focal_consensus::ConsensusError::LeaderLeaving
+                | focal_consensus::ConsensusError::NotPromotable,
             ) => Self::NotReady,
             ControlError::Consensus(focal_consensus::ConsensusError::Configuration(_)) => {
                 Self::Invalid

@@ -132,7 +132,7 @@ impl Configuration {
         configuration.validate()?;
         Ok(configuration)
     }
-    fn try_clone(&self) -> Result<Self, ConfigurationError> {
+    pub(crate) fn try_clone(&self) -> Result<Self, ConfigurationError> {
         Ok(Self {
             voters: copy(&self.voters)?,
             outgoing: copy(&self.outgoing)?,

@@ -54,6 +54,7 @@ async fn a_tenant_admitted_at_runtime_installs_its_sessions_under_its_own_quota(
         budget.clone(),
         ReplicaHost::wire_limits(),
         ManagedFleetConfig::default(),
+        tokio::sync::watch::channel(focal_consensus::Wire::Frozen).1,
     )
     .unwrap();
     let first = LedgerId {

@@ -190,6 +190,7 @@ pub struct Ready {
     read_states: Vec<ReadState>,
     entries: Vec<Entry>,
     proposals: Vec<Entry>,
+    released: Option<u64>,
     displaced: Vec<Entry>,
     snapshot: Option<Snapshot>,
     after_persisting: bool,
@@ -230,12 +231,26 @@ impl Ready {
         std::mem::take(&mut self.entries)
     }
     /// To persist beside the log: what this member approved by itself
-    /// ([`crate::fast`]). What it holds it says only once this is durable,
-    /// and storage gives it back when the member opens
-    /// ([`crate::InitialState::proposals`]) until the log reaches its
-    /// index.
+    /// ([`crate::fast`]), a proposal given again at an index replacing the
+    /// one storage holds there. What it holds it says only once this is
+    /// durable, and storage gives it back when the member opens
+    /// ([`crate::InitialState::proposals`]) until a `Ready` releases it
+    /// ([`Ready::released`]), whatever its log holds.
     pub fn proposals(&self) -> &[Entry] {
         &self.proposals
+    }
+    /// The index through which what this member approved by itself is held
+    /// no more: it knows the log committed through it by a classic quorum
+    /// (`docs/raft.md` §3.5). Storage may drop the proposals it holds at or
+    /// below it, before it takes this `Ready`'s; one that keeps them gives
+    /// them back at the next open, and the member holds them until it learns
+    /// the index again, which costs room and never safety. None when it did
+    /// not move, or when the `Ready` persists nothing else: a release waits
+    /// for a write the member makes anyway. Storage must not drop a proposal
+    /// for any other reason: not when its log reaches the index, not at a
+    /// snapshot or a compaction.
+    pub fn released(&self) -> Option<u64> {
+        self.released
     }
     /// What was proposed here by the fast track and another entry took the
     /// index of: its proposer proposes it again.
@@ -373,7 +388,7 @@ struct Mark {
 }
 
 /// A `Ready` whose write is out.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Given {
     mark: Mark,
     /// What this member approved by itself and gave, moved from the `Ready`
@@ -393,6 +408,7 @@ struct Stable {
 
 /// A member as its owner drives it: operations in, [`Ready`]s out, and
 /// notices of what became durable in.
+#[derive(Clone)]
 pub struct RawNode<S> {
     /// The state machine itself.
     pub raft: Raft<S>,
@@ -415,6 +431,9 @@ pub struct RawNode<S> {
     /// The owner holds what it was given to apply and is given no more
     /// ([`RawNode::pause_apply`]).
     apply_paused: bool,
+    /// The index through which a `Ready` released what the member approved
+    /// by itself.
+    released: u64,
 }
 
 impl<S> RawNode<S> {
@@ -448,6 +467,7 @@ impl<S: Storage> RawNode<S> {
             previous_soft: raft.soft_state(),
             previous_hard: raft.hard_state(),
             durable_vote: (raft.term(), raft.vote()),
+            released: raft.classic,
             raft,
             number: 0,
             taken: None,
@@ -455,6 +475,22 @@ impl<S: Storage> RawNode<S> {
             commit_since: config.applied,
             apply_paused: false,
         })
+    }
+    /// The index through which the `Ready`s taken released what this member approved by itself
+    /// ([`Ready::released`]): an owner that writes again what a refused write held writes this
+    /// release with it.
+    pub fn released(&self) -> u64 {
+        self.released
+    }
+    /// The release a `Ready` that `persists` something carries: the classic commit this member
+    /// knows, if it moved since the last one given.
+    fn release_with(&mut self, persists: bool) -> Option<u64> {
+        let classic = self.raft.classic;
+        if classic > self.released && persists {
+            self.released = classic;
+            return Some(classic);
+        }
+        None
     }
     /// The storage the member reads.
     pub fn store(&self) -> &S {
@@ -977,6 +1013,15 @@ impl<S: Storage> RawNode<S> {
             }
             ready.hard_state = Some(hard);
         }
+        // What the member knows committed by a classic quorum rides with a
+        // write it makes anyway: a release is never worth a write of its own
+        // (it frees room, and a store that keeps a proposal longer is still
+        // right), and a `Ready` of nothing else to persist is not waited on.
+        let persists = new_entries
+            || new_snapshot.is_some()
+            || ready.hard_state.is_some()
+            || !ready.proposals.is_empty();
+        ready.released = self.release_with(persists);
         // Taken, and not emptied: what the member holds when it rests is
         // what it held before.
         ready.read_states = std::mem::take(&mut self.raft.read_states);

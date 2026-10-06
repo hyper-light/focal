@@ -22,6 +22,24 @@ pub const PERSIST_MAGIC: [u8; 4] = *b"MNLP";
 /// sequence in the other slot is the copy an open restoring it made; before, a confirmation
 /// there held no groups, and would read now as a lost frame's record that restores nothing.
 pub const FORMAT: u8 = 3;
+/// 4: a sealed log (hyper-raft docs/seal.md §5). Each entry's and proposal's bytes are sealed
+/// under the writer session's key at their file offset, the tag after them and counted in their
+/// length; the segment header carries the opening session's key frame; every segment header,
+/// frame and persist record ends with a MAC under the log's authentication key. A log is sealed or
+/// not from its creation, and a sealed log reads no frame of format 3.
+pub const FORMAT_SEALED: u8 = 4;
+
+/// Bytes of the MAC a sealed log's segment header, frame and persist record end with: a full
+/// HMAC-SHA-256 (hyper-raft docs/seal.md §5.1).
+pub const MAC_LEN: usize = hyper_seal::log::MAC;
+/// Bytes of the tag after each sealed entry's and proposal's bytes: GCM's full tag.
+pub const TAG_LEN: usize = hyper_seal::TAG;
+/// Bytes of a session's key frame: in a sealed segment's header, or in a key record.
+pub const KEY_FRAME_LEN: usize = hyper_seal::log::KEY_FRAME;
+/// Bytes of a sealed segment's header before its MAC: the header, then the key frame.
+pub const SEALED_SEGMENT_HEADER_LEN: usize = SEGMENT_HEADER_LEN + KEY_FRAME_LEN;
+/// Bytes of a key record: its kind and group, then the key frame.
+pub const KEY_RECORD_LEN: usize = RECORD_HEADER_LEN + KEY_FRAME_LEN;
 
 /// Bytes of a segment header before its padding.
 pub const SEGMENT_HEADER_LEN: usize = 52;
@@ -51,6 +69,11 @@ const REMOVED: u8 = 6;
 const UNCERTAIN: u8 = 7;
 /// The group's acknowledged records are damaged.
 const DAMAGED: u8 = 8;
+/// A sealed log's writer session begins: every sealed record after it in its segment is under
+/// its key.
+const KEY: u8 = 9;
+/// The group's proposals through an index end.
+const RELEASED: u8 = 10;
 
 /// Bytes of a persist record before its groups: magic, format, padding, the log's ID, the
 /// frame's sequence, the last sequence known flushed, and the count of groups.
@@ -73,14 +96,22 @@ pub struct SegmentHeader {
     pub nonce: u64,
     /// Bytes of each of the log's segments.
     pub segment_bytes: u64,
+    /// In a sealed log, the key frame of the session that opened the segment; its MAC follows
+    /// the header, over the header and the key frame.
+    pub key: Option<[u8; KEY_FRAME_LEN]>,
 }
 
 impl SegmentHeader {
-    /// The header's bytes, checksummed.
+    /// The header's bytes, checksummed, then the key frame of a sealed log's (whose MAC the
+    /// caller appends).
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(SEGMENT_HEADER_LEN);
+        let mut w = Writer::with_capacity(SEALED_SEGMENT_HEADER_LEN);
         w.bytes(&SEGMENT_MAGIC);
-        w.u8(FORMAT);
+        w.u8(if self.key.is_some() {
+            FORMAT_SEALED
+        } else {
+            FORMAT
+        });
         w.zeros(3);
         w.u128(self.log);
         w.u64(self.incarnation);
@@ -88,10 +119,14 @@ impl SegmentHeader {
         w.u64(self.segment_bytes);
         let crc = crate::codec::crc32c(w.as_slice());
         w.u32(crc);
+        if let Some(key) = &self.key {
+            w.bytes(key);
+        }
         w.into_vec()
     }
 
-    /// The header at the start of `block`, if it is one and its checksum holds.
+    /// The header at the start of `block`, if it is one and its checksum holds, with the key frame
+    /// of a sealed log's. The MAC of a sealed header is the caller's to verify.
     pub fn decode(block: &[u8]) -> Option<Self> {
         let bytes = block.get(..SEGMENT_HEADER_LEN)?;
         let (body, crc) = bytes.split_at(SEGMENT_HEADER_LEN.checked_sub(4)?);
@@ -99,15 +134,27 @@ impl SegmentHeader {
             return None;
         }
         let mut r = Reader::new(body);
-        if r.take(4)? != SEGMENT_MAGIC || r.u8()? != FORMAT {
+        if r.take(4)? != SEGMENT_MAGIC {
             return None;
         }
+        let sealed = match r.u8()? {
+            FORMAT => false,
+            FORMAT_SEALED => true,
+            _ => return None,
+        };
         r.take(3)?;
+        let key = if sealed {
+            let frame = block.get(SEGMENT_HEADER_LEN..SEALED_SEGMENT_HEADER_LEN)?;
+            Some(frame.try_into().ok()?)
+        } else {
+            None
+        };
         Some(Self {
             log: r.u128()?,
             incarnation: r.u64()?,
             nonce: r.u64()?,
             segment_bytes: r.u64()?,
+            key,
         })
     }
 }
@@ -131,6 +178,8 @@ pub struct FrameHeader {
     pub records: u32,
     /// CRC-32C of the header before it and the payload.
     pub crc: u32,
+    /// Whether the frame is a sealed log's (format 4): a MAC follows its payload.
+    pub sealed: bool,
 }
 
 impl FrameHeader {
@@ -167,6 +216,7 @@ impl FrameHeader {
             sequence,
             tail,
             records,
+            sealed: false,
         };
         frame.header(payload).map(|h| h.to_vec())
     }
@@ -187,6 +237,8 @@ pub struct Frame {
     pub tail: u64,
     /// Records in the payload.
     pub records: u32,
+    /// Whether the frame is a sealed log's: format 4, a MAC after its payload.
+    pub sealed: bool,
 }
 
 impl Frame {
@@ -197,7 +249,7 @@ impl Frame {
         let mut out = [0u8; FRAME_HEADER_LEN];
         let mut w = Fixed::new(&mut out);
         w.bytes(&FRAME_MAGIC)?;
-        w.bytes(&[FORMAT, 0, 0, 0])?;
+        w.bytes(&[if self.sealed { FORMAT_SEALED } else { FORMAT }, 0, 0, 0])?;
         w.bytes(&self.log.to_le_bytes())?;
         w.bytes(&self.incarnation.to_le_bytes())?;
         w.bytes(&self.nonce.to_le_bytes())?;
@@ -241,9 +293,14 @@ impl FrameHeader {
     /// checked against the payload by [`FrameHeader::verifies`].
     pub fn decode(block: &[u8]) -> Option<Self> {
         let mut r = Reader::new(block.get(..FRAME_HEADER_LEN)?);
-        if r.take(4)? != FRAME_MAGIC || r.u8()? != FORMAT {
+        if r.take(4)? != FRAME_MAGIC {
             return None;
         }
+        let sealed = match r.u8()? {
+            FORMAT => false,
+            FORMAT_SEALED => true,
+            _ => return None,
+        };
         r.take(3)?;
         Some(Self {
             log: r.u128()?,
@@ -254,17 +311,24 @@ impl FrameHeader {
             payload_len: r.u32()?,
             records: r.u32()?,
             crc: r.u32()?,
+            sealed,
         })
     }
 
-    /// Bytes of the frame, header and payload, before padding.
+    /// Bytes of the frame, header and payload, and the MAC of a sealed log's, before padding.
     pub fn frame_len(&self) -> Option<usize> {
+        let mac = if self.sealed { MAC_LEN } else { 0 };
+        self.mac_at()?.checked_add(mac)
+    }
+
+    /// Where a sealed frame's MAC starts: the end of its header and payload, which it covers.
+    pub fn mac_at(&self) -> Option<usize> {
         FRAME_HEADER_LEN.checked_add(usize::try_from(self.payload_len).ok()?)
     }
 
     /// Whether the CRC holds over `frame`, the header and payload as read.
     pub fn verifies(&self, frame: &[u8]) -> bool {
-        let Some(len) = self.frame_len() else {
+        let Some(len) = self.mac_at() else {
             return false;
         };
         let (Some(head), Some(payload)) = (
@@ -367,6 +431,21 @@ pub enum Record<'a> {
         /// The group the record is of.
         group: u128,
     },
+    /// A sealed log's writer session begins, its key frame in the clear (its key is wrapped, and
+    /// its commitment checked before it opens anything): every sealed record after it in its
+    /// segment is under its key. Its group is 0.
+    Key {
+        /// The session's key frame.
+        frame: &'a [u8; KEY_FRAME_LEN],
+    },
+    /// The group's proposals at or below `through` end: its replica knows them committed by a
+    /// classic quorum. The latest wins.
+    Released {
+        /// The group the record is of.
+        group: u128,
+        /// The index.
+        through: u64,
+    },
 }
 
 /// Where each piece of a record went in the payload: its entries' or proposal's encoded
@@ -391,8 +470,10 @@ pub fn entry_crc(group: u128, index: u64, term: u64, bytes: &[u8]) -> u32 {
 }
 
 /// Appends `record` to `payload` and says where its pieces went. `None` when a length does
-/// not fit its field.
-pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
+/// not fit its field. In a sealed log `tag` is [`TAG_LEN`]: each entry's and proposal's length
+/// counts the tag, room for it follows its bytes, and its CRC is left for the seal, which covers
+/// the sealed bytes ([`sealables`]); in an unsealed log `tag` is 0.
+pub fn put(payload: &mut Writer, record: &Record<'_>, tag: usize) -> Option<Placed> {
     let at = payload.len();
     match *record {
         Record::Entries {
@@ -419,9 +500,7 @@ pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
                 let index = first.checked_add(i)?;
                 placed.push((index, payload.len()));
                 payload.u64(term);
-                payload.u32(u32::try_from(bytes.len()).ok()?);
-                payload.u32(entry_crc(group, index, term, bytes));
-                payload.bytes(bytes);
+                put_bytes(payload, group, index, term, bytes, tag)?;
             }
             Some(Placed::Entries(placed))
         }
@@ -451,9 +530,7 @@ pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
             let placed = payload.len();
             payload.u64(index);
             payload.u64(term);
-            payload.u32(u32::try_from(bytes.len()).ok()?);
-            payload.u32(entry_crc(group, index, term, bytes));
-            payload.bytes(bytes);
+            put_bytes(payload, group, index, term, bytes, tag)?;
             Some(Placed::Record(placed))
         }
         Record::Removed { group } => {
@@ -473,7 +550,40 @@ pub fn put(payload: &mut Writer, record: &Record<'_>) -> Option<Placed> {
             payload.u128(group);
             Some(Placed::Record(at))
         }
+        Record::Key { frame } => {
+            payload.u8(KEY);
+            payload.u128(0);
+            payload.bytes(frame);
+            Some(Placed::Record(at))
+        }
+        Record::Released { group, through } => {
+            payload.u8(RELEASED);
+            payload.u128(group);
+            payload.u64(through);
+            Some(Placed::Record(at))
+        }
     }
+}
+
+/// An entry's or proposal's length, CRC and bytes, and room for its tag in a sealed log, whose
+/// CRC the seal writes once the bytes are sealed.
+fn put_bytes(
+    payload: &mut Writer,
+    group: u128,
+    index: u64,
+    term: u64,
+    bytes: &[u8],
+    tag: usize,
+) -> Option<()> {
+    payload.u32(u32::try_from(bytes.len().checked_add(tag)?).ok()?);
+    payload.u32(if tag == 0 {
+        entry_crc(group, index, term, bytes)
+    } else {
+        0
+    });
+    payload.bytes(bytes);
+    payload.zeros(tag);
+    Some(())
 }
 
 /// Bytes of a record's kind and group, before its fields.
@@ -486,9 +596,11 @@ pub const PROPOSAL_FIELDS_LEN: usize = 24;
 
 /// Bytes an `Entries` or `Relocated` record of entries of these payload lengths takes: what
 /// [`encoded_len`] says of it, with no list of the entries made.
-pub fn entries_len(mut lens: impl Iterator<Item = usize>) -> Option<usize> {
+pub fn entries_len(mut lens: impl Iterator<Item = usize>, tag: usize) -> Option<usize> {
     lens.try_fold(ENTRIES_HEADER_LEN, |sum, len| {
-        sum.checked_add(ENTRY_HEADER_LEN)?.checked_add(len)
+        sum.checked_add(ENTRY_HEADER_LEN)?
+            .checked_add(len)?
+            .checked_add(tag)
     })
 }
 
@@ -502,6 +614,7 @@ pub fn put_entries<'a>(
     group: u128,
     first: u64,
     entries: impl ExactSizeIterator<Item = (u64, &'a [u8])>,
+    tag: usize,
 ) -> Option<usize> {
     let at = payload.len();
     payload.u8(if relocated { RELOCATED } else { ENTRIES });
@@ -511,25 +624,27 @@ pub fn put_entries<'a>(
     for (i, (term, bytes)) in (0u64..).zip(entries) {
         let index = first.checked_add(i)?;
         payload.u64(term);
-        payload.u32(u32::try_from(bytes.len()).ok()?);
-        payload.u32(entry_crc(group, index, term, bytes));
-        payload.bytes(bytes);
+        put_bytes(payload, group, index, term, bytes, tag)?;
     }
     Some(at)
 }
 
-/// Bytes `record` takes in a payload.
-pub fn encoded_len(record: &Record<'_>) -> Option<usize> {
+/// Bytes `record` takes in a payload, with `tag` after each entry's and proposal's bytes.
+pub fn encoded_len(record: &Record<'_>, tag: usize) -> Option<usize> {
     let body = match *record {
         Record::Entries { entries, .. } | Record::Relocated { entries, .. } => {
             entries.iter().try_fold(12usize, |sum, (_, bytes)| {
-                sum.checked_add(ENTRY_HEADER_LEN)?.checked_add(bytes.len())
+                sum.checked_add(ENTRY_HEADER_LEN)?
+                    .checked_add(bytes.len())?
+                    .checked_add(tag)
             })?
         }
         Record::HardState { .. } => 24,
         Record::Start { .. } | Record::Uncertain { .. } => 16,
-        Record::Proposal { bytes, .. } => 24usize.checked_add(bytes.len())?,
+        Record::Proposal { bytes, .. } => 24usize.checked_add(bytes.len())?.checked_add(tag)?,
+        Record::Released { .. } => 8,
         Record::Removed { .. } | Record::Damaged { .. } => 0,
+        Record::Key { .. } => KEY_FRAME_LEN,
     };
     body.checked_add(17)
 }
@@ -616,6 +731,22 @@ pub enum Owned {
         /// The group the record is of.
         group: u128,
     },
+    /// A sealed log's writer session begins here.
+    Key {
+        /// Where the record starts in the payload.
+        at: usize,
+        /// The session's key frame.
+        frame: [u8; KEY_FRAME_LEN],
+    },
+    /// The group's proposals through an index end.
+    Released {
+        /// Where the record starts in the payload.
+        at: usize,
+        /// The group the record is of.
+        group: u128,
+        /// The index.
+        through: u64,
+    },
 }
 
 /// The records of a verified frame's payload, in order; `None` if any does not decode or
@@ -680,6 +811,15 @@ fn record(r: &mut Reader<'_>, kind: u8, group: u128, at: usize) -> Option<Owned>
             mark: start(r)?,
         },
         DAMAGED => Owned::Damaged { at, group },
+        KEY if group == 0 => Owned::Key {
+            at,
+            frame: r.take(KEY_FRAME_LEN)?.try_into().ok()?,
+        },
+        RELEASED => Owned::Released {
+            at,
+            group,
+            through: r.u64()?,
+        },
         _ => return None,
     })
 }
@@ -806,6 +946,8 @@ pub struct Persist {
     pub confirms: u64,
     /// What the frame wrote, group by group.
     pub groups: Vec<Persisted>,
+    /// Whether the record is a sealed log's: format 4, its MAC after it.
+    pub sealed: bool,
 }
 
 /// A persist row's flag: it carries a hard state.
@@ -829,17 +971,22 @@ fn when<T>(set: bool, value: T) -> Option<T> {
 
 /// A persist record's header, if it has the magic and format: its log, sequence, the sequence it
 /// confirms, and its count of groups.
-fn persist_header(bytes: &[u8]) -> Option<(u128, u64, u64, usize)> {
+fn persist_header(bytes: &[u8]) -> Option<(u128, u64, u64, usize, bool)> {
     let mut r = Reader::new(bytes.get(..PERSIST_HEADER_LEN)?);
-    if r.take(4)? != PERSIST_MAGIC || r.u8()? != FORMAT {
+    if r.take(4)? != PERSIST_MAGIC {
         return None;
     }
+    let sealed = match r.u8()? {
+        FORMAT => false,
+        FORMAT_SEALED => true,
+        _ => return None,
+    };
     r.take(3)?;
     let log = r.u128()?;
     let sequence = r.u64()?;
     let confirms = r.u64()?;
     let count = usize::try_from(r.u32()?).ok()?;
-    Some((log, sequence, confirms, count))
+    Some((log, sequence, confirms, count, sealed))
 }
 
 /// One group's row of a persist record.
@@ -871,7 +1018,7 @@ fn persisted(r: &mut Reader<'_>) -> Option<Persisted> {
     })
 }
 
-/// Bytes of a persist record of `groups` groups, with its CRC.
+/// Bytes of a persist record of `groups` groups, with its CRC; a sealed log's MAC follows it.
 pub fn persist_len(groups: usize) -> Option<usize> {
     PERSIST_GROUP_LEN
         .checked_mul(groups)?
@@ -891,7 +1038,7 @@ impl Persist {
     pub fn encode_into(&self, w: &mut Writer) -> Option<()> {
         let from = w.len();
         w.bytes(&PERSIST_MAGIC);
-        w.u8(FORMAT);
+        w.u8(if self.sealed { FORMAT_SEALED } else { FORMAT });
         w.zeros(3);
         w.u128(self.log);
         w.u64(self.sequence);
@@ -936,7 +1083,7 @@ impl Persist {
 
     /// The persist record at the start of `bytes`, if it is one and its checksum holds.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let (log, sequence, confirms, count) = persist_header(bytes)?;
+        let (log, sequence, confirms, count, sealed) = persist_header(bytes)?;
         let len = persist_len(count)?;
         let whole = bytes.get(..len)?;
         let (body, crc) = whole.split_at(len.checked_sub(4)?);
@@ -953,8 +1100,95 @@ impl Persist {
             sequence,
             confirms,
             groups,
+            sealed,
         })
     }
+
+    /// Bytes of this record as encoded, before a sealed log's MAC: what the MAC covers.
+    pub fn encoded_len(&self) -> Option<usize> {
+        persist_len(self.groups.len())
+    }
+}
+
+/// One sealed record's bytes in a laid payload: what the seal seals in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sealable {
+    /// Where its CRC field is, which the seal writes once the bytes are sealed.
+    pub crc_at: usize,
+    /// Where its bytes start; its tag ends them.
+    pub bytes_at: usize,
+    /// Its bytes as stored: the plaintext's length and the tag's.
+    pub stored: usize,
+    /// Its group, index and term, which its tag binds.
+    pub group: u128,
+    /// See [`Sealable::group`].
+    pub index: u64,
+    /// See [`Sealable::group`].
+    pub term: u64,
+}
+
+/// Visits each entry and proposal of a laid payload of `count` records, in order, with nothing
+/// allocated: what the seal walks. `None` if a record does not decode.
+pub fn sealables(
+    payload: &[u8],
+    count: u32,
+    mut visit: impl FnMut(Sealable) -> Option<()>,
+) -> Option<()> {
+    let mut r = Reader::new(payload);
+    for _ in 0..count {
+        let kind = r.u8()?;
+        let group = r.u128()?;
+        sealables_of(&mut r, kind, group, &mut visit)?;
+    }
+    (r.remaining() == 0).then_some(())
+}
+
+/// The sealed bytes of one record of `kind` and `group`, the reader past its kind and group.
+fn sealables_of(
+    r: &mut Reader<'_>,
+    kind: u8,
+    group: u128,
+    visit: &mut impl FnMut(Sealable) -> Option<()>,
+) -> Option<()> {
+    match kind {
+        ENTRIES | RELOCATED => {
+            let first = r.u64()?;
+            let n = r.u32()?;
+            for i in 0..u64::from(n) {
+                let index = first.checked_add(i)?;
+                let term = r.u64()?;
+                visit(sealable(r, group, index, term)?)?;
+            }
+        }
+        PROPOSAL => {
+            let index = r.u64()?;
+            let term = r.u64()?;
+            visit(sealable(r, group, index, term)?)?;
+        }
+        HARD_STATE => drop(r.take(24)?),
+        START | UNCERTAIN => drop(r.take(16)?),
+        REMOVED | DAMAGED => {}
+        KEY => drop(r.take(KEY_FRAME_LEN)?),
+        _ => return None,
+    }
+    Some(())
+}
+
+/// The sealed bytes of one entry or proposal, the reader at its length field.
+fn sealable(r: &mut Reader<'_>, group: u128, index: u64, term: u64) -> Option<Sealable> {
+    let stored = usize::try_from(r.u32()?).ok()?;
+    let crc_at = r.position();
+    r.u32()?;
+    let bytes_at = r.position();
+    r.take(stored)?;
+    Some(Sealable {
+        crc_at,
+        bytes_at,
+        stored,
+        group,
+        index,
+        term,
+    })
 }
 
 #[cfg(test)]
@@ -969,6 +1203,7 @@ mod tests {
             incarnation: 9,
             nonce: 0xfeed,
             segment_bytes: 1 << 26,
+            key: None,
         };
         let bytes = h.encode();
         assert_eq!(bytes.len(), SEGMENT_HEADER_LEN);
@@ -988,6 +1223,103 @@ mod tests {
         let mut bad = frame.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(!header.verifies(&bad));
+    }
+
+    /// A sealed log's layout: each entry's and proposal's length counts its tag and room for the
+    /// tag follows its bytes, the walk the seal makes visits exactly those bytes, the segment header
+    /// carries its key frame, and a sealed frame's length counts its MAC.
+    #[test]
+    fn a_sealed_layout_leaves_room_for_tags_and_macs() {
+        let mut payload = Writer::with_capacity(256);
+        let key = [7u8; KEY_FRAME_LEN];
+        let laid = [
+            Record::Key { frame: &key },
+            Record::Entries {
+                group: 5,
+                first: 10,
+                entries: &[(2, b"abc".as_slice()), (2, b"".as_slice())],
+            },
+            Record::HardState {
+                group: 5,
+                state: HardState {
+                    term: 2,
+                    vote: 1,
+                    commit: 9,
+                },
+            },
+            Record::Proposal {
+                group: 5,
+                index: 12,
+                term: 2,
+                bytes: b"xy",
+            },
+        ];
+        for record in &laid {
+            let before = payload.len();
+            put(&mut payload, record, TAG_LEN).unwrap();
+            assert_eq!(
+                payload.len() - before,
+                encoded_len(record, TAG_LEN).unwrap()
+            );
+        }
+        let mut bytes = payload.into_vec();
+        let mut seen = Vec::new();
+        sealables(&bytes, 4, |s| {
+            seen.push(s);
+            Some(())
+        })
+        .unwrap();
+        // The seal's part, with the bytes left as laid: each CRC written over the stored bytes.
+        for s in &seen {
+            let crc = entry_crc(
+                s.group,
+                s.index,
+                s.term,
+                &bytes[s.bytes_at..s.bytes_at + s.stored],
+            );
+            bytes[s.crc_at..s.crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        }
+        let seen: Vec<_> = seen
+            .iter()
+            .map(|s| (s.group, s.index, s.term, s.stored))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (5, 10, 2, 3 + TAG_LEN),
+                (5, 11, 2, TAG_LEN),
+                (5, 12, 2, 2 + TAG_LEN)
+            ]
+        );
+        // With its CRCs written, the payload decodes, its stored bytes opaque to the decoder.
+        let decoded = records(&bytes, 4).unwrap();
+        assert!(matches!(decoded[0], Owned::Key { frame, .. } if frame == key));
+
+        let header = SegmentHeader {
+            log: 7,
+            incarnation: 9,
+            nonce: 3,
+            segment_bytes: 1 << 26,
+            key: Some(key),
+        };
+        let encoded = header.encode();
+        assert_eq!(encoded.len(), SEALED_SEGMENT_HEADER_LEN);
+        assert_eq!(SegmentHeader::decode(&encoded), Some(header));
+
+        let frame = Frame {
+            log: 7,
+            incarnation: 9,
+            nonce: 3,
+            sequence: 1,
+            tail: 1,
+            records: 0,
+            sealed: true,
+        };
+        let head = frame.header(b"payload").unwrap();
+        let decoded = FrameHeader::decode(&head).unwrap();
+        assert!(decoded.sealed);
+        assert_eq!(decoded.frame_len(), Some(FRAME_HEADER_LEN + 7 + MAC_LEN));
+        assert_eq!(decoded.mac_at(), Some(FRAME_HEADER_LEN + 7));
     }
 
     /// A persist record reads back as written, and any flipped bit makes it unreadable.
@@ -1025,6 +1357,7 @@ mod tests {
                     ..Persisted::default()
                 },
             ],
+            sealed: false,
         };
         let bytes = record.encode().unwrap();
         assert_eq!(bytes.len(), persist_len(2).unwrap());
@@ -1038,7 +1371,7 @@ mod tests {
 
     fn record() -> impl Strategy<Value = (u8, u128, u64, Vec<(u64, Vec<u8>)>)> {
         (
-            0u8..8,
+            0u8..9,
             any::<u128>(),
             0u64..u64::MAX / 2,
             prop::collection::vec(
@@ -1069,11 +1402,12 @@ mod tests {
                     4 => Record::Proposal { group, index: first, term: 5, bytes },
                     5 => Record::Uncertain { group, mark: Start { index: first, term: 6 } },
                     6 => Record::Damaged { group },
+                    7 => Record::Released { group, through: first },
                     _ => Record::Removed { group },
                 };
                 let before = payload.len();
-                placed.push(put(&mut payload, &record).unwrap());
-                prop_assert_eq!(payload.len() - before, encoded_len(&record).unwrap());
+                placed.push(put(&mut payload, &record, 0).unwrap());
+                prop_assert_eq!(payload.len() - before, encoded_len(&record, 0).unwrap());
             }
             let bytes = payload.into_vec();
             let decoded = records(&bytes, u32::try_from(input.len()).unwrap()).unwrap();
