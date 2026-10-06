@@ -28,8 +28,8 @@ use std::time::Instant;
 use crate::codec::Writer as Payload;
 use crate::format::{self, Owned, Placed, Record};
 use crate::state::{
-    self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, START_BYTES, Slot, State,
-    UNCERTAIN_BYTES, entry_bytes, resolves,
+    self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, RELEASED_BYTES,
+    START_BYTES, Slot, State, UNCERTAIN_BYTES, entry_bytes, resolves,
 };
 use crate::ticket::Ticket;
 use crate::{Class, Config, LogError, Marks, Params, Update};
@@ -147,6 +147,7 @@ pub(crate) struct Placement {
     /// The tag after each entry's and proposal's bytes in a sealed log: what an entry's or
     /// proposal's stride counts beside its header and bytes.
     tag: usize,
+    released: Option<usize>,
 }
 
 /// A live piece of the tail copied into the payload.
@@ -158,6 +159,7 @@ pub(crate) enum Moved {
     Proposal { group: u128, index: u64, at: usize },
     Uncertain { group: u128, at: usize },
     Damaged { group: u128, at: usize },
+    Released { group: u128, at: usize },
 }
 
 /// A sweep of the tail laid into the payload.
@@ -520,6 +522,10 @@ enum Copy<'a> {
     Damaged {
         group: u128,
     },
+    Released {
+        group: u128,
+        through: u64,
+    },
 }
 
 impl Copy<'_> {
@@ -558,6 +564,10 @@ impl Copy<'_> {
                 mark: *mark,
             },
             Copy::Damaged { group } => Record::Damaged { group: *group },
+            Copy::Released { group, through } => Record::Released {
+                group: *group,
+                through: *through,
+            },
         }
     }
 
@@ -588,6 +598,9 @@ impl Copy<'_> {
             }
             (Copy::Damaged { group }, Placed::Record(at)) => {
                 out.push(Moved::Damaged { group: *group, at });
+            }
+            (Copy::Released { group, .. }, Placed::Record(at)) => {
+                out.push(Moved::Released { group: *group, at });
             }
             _ => {}
         }
@@ -706,6 +719,17 @@ fn piece_copy<'a>(
         Owned::Damaged { at: offset, group } => (state.damaged.get(group)
             == Some(&Some(at(*offset))))
         .then_some(Copy::Damaged { group: *group }),
+        Owned::Released {
+            at: offset,
+            group,
+            through,
+        } => group_of(group)
+            .and_then(|g| g.released)
+            .is_some_and(|(_, p)| p == at(*offset))
+            .then_some(Copy::Released {
+                group: *group,
+                through: *through,
+            }),
         // A key record keys its own session's records and is not a piece of any group: a sweep
         // reseals what it copies under the session that writes the copy.
         Owned::Entries { .. }
@@ -770,6 +794,13 @@ fn move_piece(
                 live.add(*p, DAMAGED_BYTES);
             }
         }
+        Moved::Released { group, at } => {
+            if let Some((_, p)) = groups.get_mut(&group).and_then(|g| g.released.as_mut()) {
+                live.kill(*p, RELEASED_BYTES);
+                *p = place(at)?;
+                live.add(*p, RELEASED_BYTES);
+            }
+        }
     }
     Ok(())
 }
@@ -825,7 +856,8 @@ pub(crate) fn validate(
         let alone = update.start.is_none()
             && update.entries.is_none()
             && update.hard_state.is_none()
-            && update.proposals.is_empty();
+            && update.proposals.is_empty()
+            && update.released.is_none();
         return if alone {
             Ok(false)
         } else {
@@ -877,17 +909,15 @@ pub(crate) fn validate(
         bytes = e.entries.iter().fold(bytes, |sum, entry| {
             sum.saturating_add(u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX))
         });
-        last = e
-            .first
+        // The entries end at an index; a proposal may sit at or below it, for the log reaching
+        // a proposal ends nothing (`state::Replayed::reach`).
+        e.first
             .checked_add(added)
             .and_then(|end| end.checked_sub(1))
             .ok_or(invalid("an index past u64"))?;
     }
     if count > config.group_entries || bytes > config.group_bytes {
         return Err(LogError::Backlog(group));
-    }
-    if update.proposals.iter().any(|p| p.index <= last) {
-        return Err(invalid("a proposal the log has reached"));
     }
     Ok(new)
 }
@@ -898,18 +928,21 @@ pub(crate) fn update_len(group: u128, update: &Update, tag: usize) -> Option<usi
     if update.remove {
         return format::encoded_len(&Record::Removed { group }, tag);
     }
-    if let Some(start) = update.start {
-        len = len.checked_add(format::encoded_len(&Record::Start { group, start }, tag)?)?;
-    }
     if let Some(e) = &update.entries {
         let lens = e.entries.iter().map(|x| x.bytes.len());
         len = len.checked_add(format::entries_len(lens, tag)?)?;
     }
-    if let Some(state) = update.hard_state {
-        len = len.checked_add(format::encoded_len(
-            &Record::HardState { group, state },
-            tag,
-        )?)?;
+    let singles = [
+        update.start.map(|start| Record::Start { group, start }),
+        update
+            .hard_state
+            .map(|state| Record::HardState { group, state }),
+        update
+            .released
+            .map(|through| Record::Released { group, through }),
+    ];
+    for record in singles.iter().flatten() {
+        len = len.checked_add(format::encoded_len(record, tag)?)?;
     }
     for p in &update.proposals {
         let proposal = Record::Proposal {
@@ -950,23 +983,28 @@ pub(crate) fn encode(
         lay.put(&Record::Removed { group })?;
         return Some(Placement::default());
     }
-    let start = match update.start {
-        Some(start) => Some(lay.put(&Record::Start { group, start })?),
-        None => None,
-    };
+    let start = lay.maybe(update.start.map(|start| Record::Start { group, start }))?;
     let entries = match &update.entries {
         Some(e) => Some(lay.entries(group, e)?),
         None => None,
     };
-    let hard = match update.hard_state {
-        Some(state) => Some(lay.put(&Record::HardState { group, state })?),
-        None => None,
-    };
+    let hard = lay.maybe(
+        update
+            .hard_state
+            .map(|state| Record::HardState { group, state }),
+    )?;
+    // The release before the proposals it is written with, as they apply.
+    let released = lay.maybe(
+        update
+            .released
+            .map(|through| Record::Released { group, through }),
+    )?;
     let proposals = lay.proposals(group, &update.proposals)?;
-    let uncertain = match marks.uncertain {
-        Some(mark) => Some(lay.put(&Record::Uncertain { group, mark })?),
-        None => None,
-    };
+    let uncertain = lay.maybe(
+        marks
+            .uncertain
+            .map(|mark| Record::Uncertain { group, mark }),
+    )?;
     Some(Placement {
         start,
         entries,
@@ -975,6 +1013,7 @@ pub(crate) fn encode(
         uncertain,
         damaged: None,
         tag,
+        released,
     })
 }
 
@@ -992,6 +1031,14 @@ impl Lay<'_> {
         match format::put(self.payload, record, self.tag)? {
             Placed::Record(at) => Some(at),
             Placed::Entries(_) => None,
+        }
+    }
+
+    /// Appends `record` if there is one, and says where `put` placed it.
+    fn maybe(&mut self, record: Option<Record<'_>>) -> Option<Option<usize>> {
+        match record {
+            Some(record) => self.put(&record).map(Some),
+            None => Some(None),
         }
     }
 
@@ -1138,6 +1185,7 @@ fn apply(
     apply_entries(g, live, config, update, handed, placement, place)?;
     reach(g, live)?;
     apply_hard(g, live, update, placement, place)?;
+    apply_released(g, live, update, placement, place)?;
     apply_proposals(g, live, update, placement, place)?;
     apply_mark(g, live, marks, placement, place)
 }
@@ -1271,8 +1319,9 @@ fn apply_entries(
     Ok(())
 }
 
-/// What the log has reached, by entries or by its start, is no longer a proposal (07 §1.4),
-/// and no longer uncertain once it holds what the mark covers.
+/// What the log has reached, by entries or by its start, is no longer uncertain once it holds
+/// what the mark covers. A proposal outlives the log reaching its index: only a release ends
+/// it (`apply_released`).
 fn reach(g: &mut Group, live: &mut state::Live) -> Result<(), LogError> {
     let last = g.last().ok_or(LogError::Damaged("an index past u64"))?;
     if let Some((mark, at)) = g.uncertain
@@ -1281,13 +1330,37 @@ fn reach(g: &mut Group, live: &mut state::Live) -> Result<(), LogError> {
         live.kill(at, UNCERTAIN_BYTES);
         g.uncertain = None;
     }
+    Ok(())
+}
+
+/// The proposals at or below what the update releases end, and its record is the group's
+/// release unless an earlier one released more.
+fn apply_released(
+    g: &mut Group,
+    live: &mut state::Live,
+    update: &Update,
+    placement: &Placement,
+    place: &Places<'_>,
+) -> Result<(), LogError> {
+    let (Some(through), Some(at)) = (update.released, placement.released) else {
+        return Ok(());
+    };
     while let Some(entry) = g.proposals.first_entry() {
-        if *entry.key() > last {
+        if *entry.key() > through {
             break;
         }
         let p = entry.remove();
         live.kill(p.place, proposal_bytes(&p.bytes));
     }
+    if g.released.is_some_and(|(held, _)| held >= through) {
+        return Ok(());
+    }
+    if let Some((_, old)) = g.released {
+        live.kill(old, RELEASED_BYTES);
+    }
+    let new_at = place(at)?;
+    g.released = Some((through, new_at));
+    live.add(new_at, RELEASED_BYTES);
     Ok(())
 }
 

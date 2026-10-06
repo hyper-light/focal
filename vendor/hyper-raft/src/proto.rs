@@ -161,6 +161,12 @@ pub struct Message {
     pub context: Vec<u8>,
     /// The sender's election priority.
     pub priority: i64,
+    /// On a leader's append, heartbeat or snapshot: the index through which it knows its log
+    /// committed by a classic quorum, which every later leader's log holds (`docs/raft.md`,
+    /// "Releasing what a member holds"). A member releases what it holds by itself only through
+    /// it. `None` from a sender that does not say, which a member takes as nothing known: never
+    /// the commit, which counts what fast quorums committed.
+    pub classic: Option<u64>,
 }
 
 /// What a member must keep across a restart.

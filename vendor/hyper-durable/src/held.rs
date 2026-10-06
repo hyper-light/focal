@@ -51,6 +51,7 @@ impl<L: LogStore> Storage for Held<L> {
             hard_state: self.opened,
             configuration: self.configuration.clone(),
             proposals,
+            released: self.log.released()?,
         })
     }
 

@@ -51,6 +51,9 @@ pub(crate) struct Group {
     /// Entries through this mark's index, of terms up to its term, that the group's log may
     /// lack, and where the mark was written (docs/design/raft-log.md §6).
     pub(crate) uncertain: Option<(Start, Place)>,
+    /// The greatest index an update released the group's proposals through, and where its
+    /// record was written.
+    pub(crate) released: Option<(u64, Place)>,
 }
 
 /// Whether a log whose last entry is `last`, of term `term`, again holds what an uncertainty
@@ -100,6 +103,7 @@ impl Group {
             .into_iter()
             .chain(self.hard.iter().map(|(_, p)| (*p, HARD_STATE_BYTES)))
             .chain(self.uncertain.iter().map(|(_, p)| (*p, UNCERTAIN_BYTES)))
+            .chain(self.released.iter().map(|(_, p)| (*p, RELEASED_BYTES)))
             .chain(self.entries.iter().map(|s| (s.place, entry_bytes(s.len))))
             .chain(self.proposals.values().map(|p| {
                 let len = u32::try_from(p.bytes.len()).unwrap_or(u32::MAX);
@@ -115,6 +119,8 @@ pub(crate) const START_BYTES: u64 = 33;
 pub(crate) const UNCERTAIN_BYTES: u64 = 33;
 /// Bytes a `Damaged` record takes: its kind and group.
 pub(crate) const DAMAGED_BYTES: u64 = 17;
+/// Bytes a `Released` record takes: its kind and group (17), its index.
+pub(crate) const RELEASED_BYTES: u64 = 25;
 /// Bytes a `HardState` record takes: its kind and group (17), its term, vote and commit.
 pub(crate) const HARD_STATE_BYTES: u64 = 41;
 /// A proposal's bytes beyond an entry's: its record's kind and group, and its index.
@@ -284,6 +290,9 @@ pub(crate) struct Replayed {
     pub(crate) uncertain: Option<(Start, Place)>,
     /// Where a `Damaged` record fenced the group, which then holds nothing else.
     pub(crate) damaged: Option<Place>,
+    /// The greatest index a `Released` record released the group's proposals through, and
+    /// where it is.
+    pub(crate) released: Option<(u64, Place)>,
 }
 
 impl Replayed {
@@ -292,15 +301,11 @@ impl Replayed {
         self.entries.split_off(&first);
     }
 
-    /// The group's log reached `last`: proposals at or before it end, as they do when the
-    /// update that reached it was applied (07 §1.4), and an uncertainty mark ends when the
-    /// log holds what it covers (`resolves`).
+    /// The group's log reached `last`: an uncertainty mark ends when the log holds what it
+    /// covers (`resolves`). Proposals outlive it, as they do when the update that reached it
+    /// was applied: only a release ends them (`release`).
     pub(crate) fn reach(&mut self, last: u64) {
         self.last = last;
-        match last.checked_add(1) {
-            Some(after) => self.proposals = self.proposals.split_off(&after),
-            None => self.proposals.clear(),
-        }
         let term = if last == self.start.index {
             Some(self.start.term)
         } else {
@@ -310,6 +315,18 @@ impl Replayed {
             && resolves(mark, last, term)
         {
             self.uncertain = None;
+        }
+    }
+
+    /// A `Released` record at `place`: the proposals through `through` end, as they did when
+    /// its update was applied, and it is the group's release unless one before released more.
+    pub(crate) fn release(&mut self, through: u64, place: Place) {
+        self.proposals = match through.checked_add(1) {
+            Some(after) => self.proposals.split_off(&after),
+            None => BTreeMap::new(),
+        };
+        if self.released.is_none_or(|(held, _)| held < through) {
+            self.released = Some((through, place));
         }
     }
 
@@ -331,14 +348,13 @@ impl Replayed {
             .start
             .index
             .checked_add(u64::try_from(entries.len()).ok()?)?;
-        // What the log has reached is no longer a proposal (07 §1.4).
-        let proposals = self.proposals.split_off(&last.checked_add(1)?);
         Some(Group {
             start: self.start,
             start_at: self.start_at,
             entries,
             hard: self.hard,
-            proposals,
+            proposals: self.proposals,
+            released: self.released,
             bytes,
             cached: 0,
             cache_from: last.checked_add(1)?,

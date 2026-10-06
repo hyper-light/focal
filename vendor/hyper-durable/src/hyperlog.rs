@@ -308,6 +308,7 @@ fn update_of(write: &Write<'_>) -> Result<Update, Fault> {
         entries,
         hard_state: write.hard_state.map(hard_to_log),
         proposals,
+        released: write.released,
         remove: false,
     })
 }
@@ -451,6 +452,11 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
             into.push(copy);
         }
         Ok(())
+    }
+
+    fn released(&self) -> Result<u64, StorageError> {
+        let view = self.group.view().map_err(|e| storage(&e))?;
+        Ok(view.map_or(0, |view| view.released))
     }
 
     fn room(&self) -> bool {

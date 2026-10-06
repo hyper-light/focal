@@ -1427,6 +1427,12 @@ fn replay_records(
             Owned::Uncertain { at, group, mark } => {
                 groups.entry(group).or_default().uncertain = Some((mark, place(at)?));
             }
+            Owned::Released { at, group, through } => {
+                groups
+                    .entry(group)
+                    .or_default()
+                    .release(through, place(at)?);
+            }
             Owned::Damaged { at, group } => {
                 *groups.entry(group).or_default() = Replayed {
                     damaged: Some(place(at)?),

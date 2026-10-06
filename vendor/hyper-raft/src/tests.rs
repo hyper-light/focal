@@ -4357,3 +4357,31 @@ fn a_dropped_proposal_says_why() {
         assert!(!reason.is_callers_bug(), "{reason:?}");
     }
 }
+
+/// Member 2 of the highest priority holds three entries of term 1; member 3, of lower priority,
+/// asks with two entries of term 2. By the log's precedence the voter grants: it could not be
+/// elected instead. By raft-rs's (the tests' build alone) it refuses the shorter log, the refusal
+/// that left swarm group seed 9,657 without a leader with every member up (`docs/raft.md` §3.3).
+#[test]
+fn a_voter_of_higher_priority_grants_a_log_more_current_however_short() {
+    fn asked(raft_rs_precedence: bool) -> Message {
+        let mut node = follower_with(Config {
+            priority: 3,
+            raft_rs_precedence,
+            ..config(2)
+        });
+        let mut ask = answer(MessageType::MsgRequestVote, 3, 2, 3);
+        ask.log_term = 2;
+        ask.index = 2;
+        ask.priority = 1;
+        node.step(ask).unwrap();
+        let mut answers: Vec<Message> = drain(&mut node)
+            .into_iter()
+            .filter(|message| message.msg_type == MessageType::MsgRequestVoteResponse)
+            .collect();
+        assert_eq!(answers.len(), 1);
+        answers.remove(0)
+    }
+    assert!(!asked(false).reject);
+    assert!(asked(true).reject);
+}

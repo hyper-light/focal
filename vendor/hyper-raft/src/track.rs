@@ -16,9 +16,14 @@
 //! in its log, for the quorum that elected it has a member that held the
 //! entry from the leader and votes for no one whose log is behind its own.
 //! What a leader committed by the fast quorum R every later leader takes at
-//! its election: of the members that elected it, more hold that entry by
-//! themselves than are outside R, so it is the most held among them, and
-//! one that holds it from the leader votes for no one whose log lacks it.
+//! its election, or holds: R counts only members that hold the entry by
+//! themselves, and each holds it until it knows the index committed by a
+//! classic quorum, after which every later leader's log holds it. Of the
+//! members that elect a leader whose log ends below the index, more hold
+//! that entry by themselves than are outside R, so it is the most held
+//! among them. A copy in a log is no such record: a later leader's
+//! election takes entries again under its own term, and its append can cut
+//! a log back short of the index (`docs/raft.md` §3.5).
 //!
 //! **A vote counts once the voter's log is of the leader's term.** That
 //! argument needs the later leader's log to end below the index, for the
@@ -220,10 +225,11 @@ impl<S: Storage> Raft<S> {
                     "a proposal that may not go by the fast track",
                 ));
             }
+            // A leader holds what it hears of first as any voter does: its
+            // holding is its vote, which counts once it is durable.
+            self.hold(entry)?;
             if self.state == StateRole::Leader {
                 self.leader_hears(entry, None)?;
-            } else {
-                self.hold(entry)?;
             }
         }
         if self.state == StateRole::Leader {
@@ -281,16 +287,41 @@ impl<S: Storage> Raft<S> {
     /// Storage holds `entries` of what this member approved by itself: it
     /// may say so.
     pub fn on_persist_proposals(&mut self, entries: &[Entry]) -> Result<()> {
+        let mut counted = false;
         for entry in entries {
-            if self.held.persisted(entry)
-                && self.state == StateRole::Follower
+            if !self.held.persisted(entry) {
+                continue;
+            }
+            if self.state == StateRole::Leader {
+                counted |= self.holds_what_it_took(entry)?;
+            } else if self.state == StateRole::Follower
                 && self.leader_id != 0
                 && self.voted_to == (self.term, self.leader_id)
             {
                 self.send_vote(entry.index)?;
             }
         }
+        if counted && self.maybe_commit()? {
+            self.bcast_append()?;
+        }
         Ok(())
+    }
+    /// A leader holds `entry` durably by itself: if it took that entry at its index and has not
+    /// committed it, it counts itself among those that hold it. True when it does now.
+    fn holds_what_it_took(&mut self, entry: &Entry) -> Result<bool> {
+        if entry.index <= self.log.committed() || !self.decided.knows(entry.index) {
+            return Ok(false);
+        }
+        let index = entry.index;
+        if !self
+            .log
+            .any_entry(index, index.saturating_add(1), |taken| same(taken, entry))?
+        {
+            return Ok(false);
+        }
+        self.decided
+            .holds(index, self.id, self.config.limits.members)?;
+        Ok(true)
     }
     /// A leader was heard from. One that was not yet told what this
     /// member holds is told.
@@ -313,9 +344,21 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
-    /// The log reaches `index`: what was held at or below it is held no
-    /// more, and what was proposed here and not taken is said.
-    pub(crate) fn release_proposals(&mut self, index: u64) -> Result<()> {
+    /// This member knows its log committed by a classic quorum through
+    /// `index`: what it holds at or below it is held no more, and what was
+    /// proposed here and not taken there is said.
+    ///
+    /// Only then: an entry a fast quorum committed is in that quorum's
+    /// holdings and in no majority's logs, and a member's log can still be
+    /// cut back short of it by a later leader whose election took it again
+    /// under a later term, so a member that let its holding go once its log
+    /// reached the index left an election nothing to recover it from (swarm
+    /// fast seed 41,345, `docs/raft.md` §3.5).
+    pub(crate) fn learn_classic(&mut self, index: u64) -> Result<()> {
+        if index <= self.classic {
+            return Ok(());
+        }
+        self.classic = index;
         if self.held.is_empty() {
             return Ok(());
         }
@@ -329,8 +372,10 @@ impl<S: Storage> Raft<S> {
         proposals.release(
             index,
             |held| {
-                log.slice(held.index, held.index.saturating_add(1), u64::MAX)
-                    .is_ok_and(|taken| taken.first().is_some_and(|taken| same(taken, held)))
+                log.any_entry(held.index, held.index.saturating_add(1), |taken| {
+                    same(taken, held)
+                })
+                .is_ok_and(|taken| taken)
             },
             displaced,
         )?;
@@ -452,6 +497,18 @@ impl<S: Storage> Raft<S> {
         self.decided
             .decide(index, holders, self.config.limits.unstable_entries)?;
         self.votes.release(index);
+        // What it held durably at the index before it took it, read where it is held.
+        let Self { held, log, .. } = &*self;
+        let own = held
+            .durable()
+            .find(|held| held.index == index)
+            .map_or(Ok(false), |own| {
+                log.any_entry(index, index.saturating_add(1), |taken| same(taken, own))
+            })?;
+        if own && index > self.log.committed() {
+            self.decided
+                .holds(index, self.id, self.config.limits.members)?;
+        }
         self.fast_stats.taken = self.fast_stats.taken.saturating_add(1);
         Ok(true)
     }
@@ -480,20 +537,21 @@ impl<S: Storage> Raft<S> {
                     .map_err(|_| Error::Memory)?;
                 let decided = self.decided.holders(index);
                 for (member, progress) in self.tracker.iter() {
-                    // One that holds the entry beside its log counts only
-                    // once its log holds an entry of this term: then its
-                    // log says, to every later election, that it took
-                    // this leader's word, and it votes for no one whose
-                    // log is older (module header).
-                    let beside = || {
-                        decided.binary_search(&member).is_ok()
-                            && (self.planted(crate::Mutant::FastBesideAnyTerm)
-                                || self
-                                    .log
-                                    .term(progress.matched)
-                                    .is_ok_and(|term| term == self.term))
-                    };
-                    if progress.matched >= index || beside() {
+                    // Only what members hold by themselves counts: what a
+                    // member holds from the leader it holds in its log
+                    // alone, which a later leader's append can cut back
+                    // and no election reads (module header). And one that
+                    // holds the entry counts only once its log holds an
+                    // entry of this term: then its log says, to every later
+                    // election, that it took this leader's word, and it
+                    // votes for no one whose log is older.
+                    let holds = decided.binary_search(&member).is_ok()
+                        && (self.planted(crate::Mutant::FastBesideAnyTerm)
+                            || self
+                                .log
+                                .term(progress.matched)
+                                .is_ok_and(|term| term == self.term));
+                    if holds {
                         holding.push(member);
                     }
                 }

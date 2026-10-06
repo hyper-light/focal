@@ -56,9 +56,11 @@ pub(crate) struct Mirror {
     /// Bytes in `cache`.
     pub(crate) cached: u64,
     pub(crate) hard: Option<HardState>,
-    /// The proposals the log has not reached: index and term.
+    /// The proposals no update released: index and term.
     pub(crate) proposals: BTreeMap<u64, u64>,
     pub(crate) uncertain: Option<Start>,
+    /// The greatest index an update released proposals through.
+    pub(crate) released: u64,
 }
 
 impl Mirror {
@@ -75,6 +77,7 @@ impl Mirror {
             hard: None,
             proposals: BTreeMap::new(),
             uncertain: None,
+            released: 0,
         }
     }
 
@@ -119,6 +122,7 @@ impl Mirror {
             hard: g.hard.map(|(h, _)| h),
             proposals: g.proposals.iter().map(|(&i, p)| (i, p.term)).collect(),
             uncertain: g.uncertain.map(|(mark, _)| mark),
+            released: g.released.map_or(0, |(through, _)| through),
         }
     }
 
@@ -196,7 +200,8 @@ impl Mirror {
         }
     }
 
-    /// What the log has reached is no longer a proposal, nor uncertain (`writer::reach`).
+    /// What the log has reached is no longer uncertain (`writer::reach`); proposals outlive
+    /// it until a release.
     fn reach(&mut self) {
         let last_term = self.last_term();
         if self
@@ -204,12 +209,6 @@ impl Mirror {
             .is_some_and(|mark| resolves(mark, self.last, last_term))
         {
             self.uncertain = None;
-        }
-        while let Some(entry) = self.proposals.first_entry() {
-            if *entry.key() > self.last {
-                break;
-            }
-            entry.remove();
         }
     }
 
@@ -230,6 +229,13 @@ impl Mirror {
         if let Some(hard) = write.hard {
             self.hard = Some(hard);
         }
+        if let Some(through) = write.released {
+            self.proposals = match through.checked_add(1) {
+                Some(after) => self.proposals.split_off(&after),
+                None => BTreeMap::new(),
+            };
+            self.released = self.released.max(through);
+        }
         for (index, term) in write.proposals {
             self.proposals.insert(index, term);
         }
@@ -247,6 +253,7 @@ struct Written {
     first: Option<u64>,
     hard: Option<HardState>,
     proposals: Vec<(u64, u64)>,
+    released: Option<u64>,
     remove: bool,
 }
 
@@ -395,6 +402,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             first: update.entries.as_ref().map(|e| e.first),
             hard: update.hard_state,
             proposals: update.proposals.iter().map(|p| (p.index, p.term)).collect(),
+            released: update.released,
             remove: update.remove,
         };
         let (reply, answer) = ticket::port();
@@ -480,6 +488,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             last: m.last,
             hard_state: m.hard,
             proposals: Vec::<Proposal>::new(),
+            released: m.released,
             uncertain: m.uncertain,
         }))
     }

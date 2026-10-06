@@ -96,9 +96,16 @@ pub struct Write<'a> {
     pub entries: Option<Entries<'a>>,
     /// The hard state; the latest written is the group's.
     pub hard_state: Option<HardState>,
-    /// What the member approved by itself on the fast track, held beside the log until it
-    /// reaches their indexes.
+    /// What the member approved by itself on the fast track, each replacing the one held at its
+    /// index, held beside the log until a write releases it, whatever the log reaches
+    /// (`hyper_raft::Ready::proposals`).
     pub proposals: &'a [Entry],
+    /// The proposals at or below this index end, before this write's are taken: the member
+    /// knows its log committed through it by a classic quorum (`hyper_raft::Ready::released`).
+    /// The store keeps the greatest it was written durably and gives it back
+    /// ([`LogStore::released`]). Nothing else ends a proposal: not the log reaching its index,
+    /// not a start that moves past it.
+    pub released: Option<u64>,
 }
 
 impl Write<'_> {
@@ -108,6 +115,7 @@ impl Write<'_> {
             && self.entries.is_none()
             && self.hard_state.is_none()
             && self.proposals.is_empty()
+            && self.released.is_none()
     }
 }
 
@@ -222,8 +230,12 @@ pub trait LogStore {
         visit: &mut dyn FnMut(EntryRef<'_>) -> bool,
     ) -> Result<(), StorageError>;
 
-    /// The fast track's proposals the store holds beside the log, appended to `into`.
+    /// The fast track's proposals the store holds beside the log, appended to `into`: every one
+    /// a write gave that no write released.
     fn proposals(&self, into: &mut Vec<Entry>) -> Result<(), StorageError>;
+
+    /// The greatest index a durable write released proposals through, or zero.
+    fn released(&self) -> Result<u64, StorageError>;
 
     /// Whether the store takes another write now.
     fn room(&self) -> bool;

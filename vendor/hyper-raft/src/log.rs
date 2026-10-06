@@ -1189,6 +1189,7 @@ pub(crate) mod tests {
                 hard_state: self.hard_state,
                 configuration: self.configuration.clone(),
                 proposals: self.proposals.clone(),
+                released: 0,
             })
         }
         fn entries(

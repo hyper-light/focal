@@ -135,8 +135,13 @@ pub struct Update {
     pub entries: Option<Entries>,
     /// The hard state; the latest written wins.
     pub hard_state: Option<HardState>,
-    /// Entries approved on the fast track, held until the log reaches them.
+    /// Entries approved on the fast track, each replacing the one held at its index, held until
+    /// an update releases them, whatever the log reaches.
     pub proposals: Vec<Proposal>,
+    /// The proposals at or below this index end, before this update's are taken: the replica
+    /// knows its log committed through it by a classic quorum (hyper-raft's `Ready::released`).
+    /// The greatest written is the group's, and a view says it.
+    pub released: Option<u64>,
     /// The replica left this device: every record of the group is dead. Nothing else may
     /// come with it.
     pub remove: bool,
@@ -166,8 +171,10 @@ pub struct View {
     pub last: u64,
     /// The group's hard state, if it wrote one.
     pub hard_state: Option<HardState>,
-    /// Its proposals the log has not reached.
+    /// Its proposals no update released.
     pub proposals: Vec<Proposal>,
+    /// The greatest index an update released proposals through, or zero.
+    pub released: u64,
     /// Entries the log may lack, through this mark's index and of terms up to its term,
     /// that a frame no longer readable held (mantle docs/design/raft-log.md §6). Until the log
     /// again reaches the index, or holds an entry of a later term, the replica takes no part
@@ -330,6 +337,7 @@ pub(crate) fn parts(
         entries,
         hard_state,
         proposals,
+        released,
         ..
     } = update;
     let mut parts = Vec::new();
@@ -384,12 +392,13 @@ pub(crate) fn parts(
     }
     if let Some(state) = hard_state {
         let cost = record(&format::Record::HardState { group, state })?;
-        if used.saturating_add(cost) > room {
-            parts.push(std::mem::take(&mut part));
-            used = 0;
-        }
+        make_room(&mut parts, &mut part, &mut used, cost, room);
         part.hard_state = Some(state);
-        used = used.saturating_add(cost);
+    }
+    if let Some(through) = released {
+        let cost = record(&format::Record::Released { group, through })?;
+        make_room(&mut parts, &mut part, &mut used, cost, room);
+        part.released = Some(through);
     }
     for p in proposals {
         let cost = record(&format::Record::Proposal {
@@ -401,15 +410,27 @@ pub(crate) fn parts(
         if cost > room {
             return Err(LogError::TooLarge(cost));
         }
-        if used.saturating_add(cost) > room {
-            parts.push(std::mem::take(&mut part));
-            used = 0;
-        }
+        make_room(&mut parts, &mut part, &mut used, cost, room);
         part.proposals.push(p);
-        used = used.saturating_add(cost);
     }
     parts.push(part);
     Ok(parts)
+}
+
+/// Counts `cost` more bytes into the part being filled, closing it first where they would pass
+/// `room`.
+fn make_room(
+    parts: &mut Vec<Update>,
+    part: &mut Update,
+    used: &mut usize,
+    cost: usize,
+    room: usize,
+) {
+    if used.saturating_add(cost) > room {
+        parts.push(std::mem::take(part));
+        *used = 0;
+    }
+    *used = used.saturating_add(cost);
 }
 
 /// Payload bytes one frame holds: a segment less its header block and the frame's header.

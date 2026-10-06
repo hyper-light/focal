@@ -72,6 +72,8 @@ const DAMAGED: u8 = 8;
 /// A sealed log's writer session begins: every sealed record after it in its segment is under
 /// its key.
 const KEY: u8 = 9;
+/// The group's proposals through an index end.
+const RELEASED: u8 = 10;
 
 /// Bytes of a persist record before its groups: magic, format, padding, the log's ID, the
 /// frame's sequence, the last sequence known flushed, and the count of groups.
@@ -436,6 +438,14 @@ pub enum Record<'a> {
         /// The session's key frame.
         frame: &'a [u8; KEY_FRAME_LEN],
     },
+    /// The group's proposals at or below `through` end: its replica knows them committed by a
+    /// classic quorum. The latest wins.
+    Released {
+        /// The group the record is of.
+        group: u128,
+        /// The index.
+        through: u64,
+    },
 }
 
 /// Where each piece of a record went in the payload: its entries' or proposal's encoded
@@ -546,6 +556,12 @@ pub fn put(payload: &mut Writer, record: &Record<'_>, tag: usize) -> Option<Plac
             payload.bytes(frame);
             Some(Placed::Record(at))
         }
+        Record::Released { group, through } => {
+            payload.u8(RELEASED);
+            payload.u128(group);
+            payload.u64(through);
+            Some(Placed::Record(at))
+        }
     }
 }
 
@@ -626,6 +642,7 @@ pub fn encoded_len(record: &Record<'_>, tag: usize) -> Option<usize> {
         Record::HardState { .. } => 24,
         Record::Start { .. } | Record::Uncertain { .. } => 16,
         Record::Proposal { bytes, .. } => 24usize.checked_add(bytes.len())?.checked_add(tag)?,
+        Record::Released { .. } => 8,
         Record::Removed { .. } | Record::Damaged { .. } => 0,
         Record::Key { .. } => KEY_FRAME_LEN,
     };
@@ -721,6 +738,15 @@ pub enum Owned {
         /// The session's key frame.
         frame: [u8; KEY_FRAME_LEN],
     },
+    /// The group's proposals through an index end.
+    Released {
+        /// Where the record starts in the payload.
+        at: usize,
+        /// The group the record is of.
+        group: u128,
+        /// The index.
+        through: u64,
+    },
 }
 
 /// The records of a verified frame's payload, in order; `None` if any does not decode or
@@ -788,6 +814,11 @@ fn record(r: &mut Reader<'_>, kind: u8, group: u128, at: usize) -> Option<Owned>
         KEY if group == 0 => Owned::Key {
             at,
             frame: r.take(KEY_FRAME_LEN)?.try_into().ok()?,
+        },
+        RELEASED => Owned::Released {
+            at,
+            group,
+            through: r.u64()?,
         },
         _ => return None,
     })
@@ -1340,7 +1371,7 @@ mod tests {
 
     fn record() -> impl Strategy<Value = (u8, u128, u64, Vec<(u64, Vec<u8>)>)> {
         (
-            0u8..8,
+            0u8..9,
             any::<u128>(),
             0u64..u64::MAX / 2,
             prop::collection::vec(
@@ -1371,6 +1402,7 @@ mod tests {
                     4 => Record::Proposal { group, index: first, term: 5, bytes },
                     5 => Record::Uncertain { group, mark: Start { index: first, term: 6 } },
                     6 => Record::Damaged { group },
+                    7 => Record::Released { group, through: first },
                     _ => Record::Removed { group },
                 };
                 let before = payload.len();

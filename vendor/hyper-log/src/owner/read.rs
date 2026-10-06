@@ -105,6 +105,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     bytes: p.bytes.clone(),
                 })
                 .collect(),
+            released: g.released.map_or(0, |(through, _)| through),
             uncertain: g.uncertain.map(|(mark, _)| mark),
         }))
     }

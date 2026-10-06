@@ -14004,3 +14004,22 @@ hyper-raft 4c4a199. This is the node's half, as 27 §15.9 and 24 §21 state it:
   - `an_installed_session_follows_the_wire_its_fence_opens` raises a fleet's wire after a
     session is installed, and the session carries `Kept` without being reinstalled, as does one
     installed after. With the group's `follow_wire` disabled it fails.
+
+
+### 2026-10-05 — The shared crates at hyper-raft 38140c1
+
+The seven `hyper-*` snapshots move to `38140c1`, two landings past `b5e372d` on the shared
+repository's line, each with its six targets green:
+- **A livelock `b5e372d` could reach with every member up is closed.** Under the newest-configuration
+  rule, raft-rs's precedence of length let a voter of the longest log but an older term refuse, for
+  priority, the only candidates that could win, with no member able to win itself. hyper-raft's
+  swarm found it at seed 9,657 once its no-defect campaign ran its derived seed count. That
+  precedence is gone from the API (`Precedence`, `Config::precedence`); it survives behind the
+  `raft-rs-precedence` feature for hyper-raft's differential tests against raft-rs, which focal never
+  enables. A member of priority now grants a candidate whose log is more current, however short.
+  Reconfig.tla and its mirror check `Elects`, that with every member up some member is elected: it
+  holds under the remaining rule and is refused under raft-rs's.
+- **The fast track's hold (design A):** a member holds a fast-written entry until a classic commit
+  covers it.
+- focal uses neither `Precedence` nor `Config::precedence`; two doc comments that named
+  `Precedence::Log` are reworded in focal's next commit.
