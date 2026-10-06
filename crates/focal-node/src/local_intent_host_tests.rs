@@ -24,6 +24,13 @@ fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Work>) {
             applied_index: 1,
             revisions: ControlRevisions::default(),
             dropped_replication: 0,
+            peers_unreachable: 0,
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
+            peer_reports_coalesced: 0,
+            peer_reports_dropped: 0,
             stopped: false,
             snapshot_index: 0,
             peers: Vec::new(),
@@ -243,10 +250,15 @@ async fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and
     ));
     assert!(budget.stats().used >= 16 * 1024);
     pause.resume().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), write)
-        .await
-        .unwrap()
-        .unwrap();
+    crate::test_waits::charged(
+        || vec![host.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        write,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // A later owner request proves the queued write has been processed; the
     // abandoned reply releases its journal lock and admission charge.
     drop(host.observe_root().await.unwrap());

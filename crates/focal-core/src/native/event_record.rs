@@ -119,6 +119,7 @@ pub fn invocation(value: NativeInvocation) -> NativeInvocationRef {
         },
         NativeInvocation::Import => NativeInvocationRef::Import,
         NativeInvocation::Retirement(root) => NativeInvocationRef::Retirement { root },
+        NativeInvocation::Seal(ordinal) => NativeInvocationRef::Seal { ordinal },
     }
 }
 pub fn phase(value: validation::Phase) -> NativePhase {
@@ -521,7 +522,8 @@ pub fn delta_actor(invocation: NativeInvocation) -> ParticipantId {
         | NativeInvocation::ClaimDeadline(_)
         | NativeInvocation::MonitorDeadline(_)
         | NativeInvocation::Import
-        | NativeInvocation::Retirement(_) => ParticipantId::default(),
+        | NativeInvocation::Retirement(_)
+        | NativeInvocation::Seal(_) => ParticipantId::default(),
     }
 }
 /// One version-2 delta at the ledger's stream position `sequence` (the

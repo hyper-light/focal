@@ -46,6 +46,8 @@ pub struct ArchiveAgent {
     ticks: u64,
     proposed: u64,
     waiting: u64,
+    seals_proposed: u64,
+    seals_waiting: u64,
     status: watch::Sender<AdminArchiveAgent>,
 }
 
@@ -66,6 +68,8 @@ impl ArchiveAgent {
             ticks: 0,
             proposed: 0,
             waiting: 0,
+            seals_proposed: 0,
+            seals_waiting: 0,
             last_tick_ms: 0,
         });
         (
@@ -76,6 +80,8 @@ impl ArchiveAgent {
                 ticks: 0,
                 proposed: 0,
                 waiting: 0,
+                seals_proposed: 0,
+                seals_waiting: 0,
                 status,
             },
             ArchiveHandle(receiver),
@@ -88,23 +94,16 @@ impl ArchiveAgent {
             ticks: self.ticks,
             proposed: self.proposed,
             waiting: self.waiting,
+            seals_proposed: self.seals_proposed,
+            seals_waiting: self.seals_waiting,
             last_tick_ms: now_ms(),
         };
         let _ = self.status.send(status);
     }
     /// The interval and grace from the environment, else the defaults.
     pub fn from_env() -> (Self, ArchiveHandle) {
-        let millis = |name: &str| {
-            std::env::var_os(name).and_then(|value| {
-                value
-                    .to_str()
-                    .and_then(|text| text.trim().parse::<u64>().ok())
-            })
-        };
-        let interval = millis(INTERVAL_ENV)
-            .filter(|millis| *millis > 0)
-            .map_or(DEFAULT_INTERVAL, Duration::from_millis);
-        Self::new(interval, millis(GRACE_ENV).unwrap_or(DEFAULT_GRACE_MS))
+        let (interval, grace_ms) = settings_from_env();
+        Self::new(interval, grace_ms)
     }
     pub async fn run(mut self, handles: &NetworkHandles) -> Result<(), AccessError> {
         if tokio::runtime::Handle::try_current().is_err() {
@@ -123,9 +122,69 @@ impl ArchiveAgent {
             // A replica that is not native, not authoritative, or refuses
             // the walk simply waits for a later tick.
             let _ = self.step(ledger, &host, handles).await;
+            let _ = self.seal_step(ledger, &host, handles).await;
         }
         self.ticks = self.ticks.saturating_add(1);
         self.publish();
+    }
+    /// One seal for the replica when the committed state yields one worth
+    /// proposing (F12): the bundle (and a fold's) sealed as content under
+    /// custody first, the record proposed once every required copy holds
+    /// them.
+    async fn seal_step(
+        &mut self,
+        ledger: LedgerId,
+        host: &ReplicaHost,
+        handles: &NetworkHandles,
+    ) -> Result<(), AccessError> {
+        let Some(sealed) = host
+            .seal_bundle()
+            .await
+            .map_err(|_| AccessError::Unavailable)?
+        else {
+            return Ok(());
+        };
+        let crate::fleet::SealedOutcomes {
+            plan,
+            bundle,
+            fold,
+            _allocation,
+            ..
+        } = sealed;
+        let policy = handles
+            .content
+            .policy(ledger)
+            .await?
+            .ok_or(AccessError::Unavailable)?;
+        let route = policy.scope().route_epoch;
+        let outcome = handles.evidence.archive(ledger, route, bundle).await?;
+        let folded = match fold {
+            Some((plan, bytes, _)) => {
+                let outcome = handles.evidence.archive(ledger, route, bytes).await?;
+                Some((plan, outcome))
+            }
+            None => None,
+        };
+        drop(_allocation);
+        if !outcome.obligation.satisfied()
+            || folded
+                .as_ref()
+                .is_some_and(|(_, outcome)| !outcome.obligation.satisfied())
+        {
+            self.seals_waiting = self.seals_waiting.saturating_add(1);
+            return Ok(());
+        }
+        let fold = folded.map(|(plan, outcome)| focal_core::native::seal::Fold {
+            first: plan.first,
+            last: plan.last,
+            bundle: outcome.reference.root,
+            bytes: outcome.reference.length,
+        });
+        host.propose_seal(plan, outcome.reference.root, outcome.reference.length, fold)
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        self.seals_proposed = self.seals_proposed.saturating_add(1);
+        Ok(())
     }
     async fn step(
         &mut self,
@@ -182,5 +241,166 @@ impl ArchiveAgent {
             return Ok(());
         }
         Ok(())
+    }
+}
+
+/// The interval and grace from the environment, else the defaults.
+pub(crate) fn settings_from_env() -> (Duration, u64) {
+    let millis = |name: &str| {
+        std::env::var_os(name).and_then(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        })
+    };
+    let interval = millis(INTERVAL_ENV)
+        .filter(|millis| *millis > 0)
+        .map_or(DEFAULT_INTERVAL, Duration::from_millis);
+    (interval, millis(GRACE_ENV).unwrap_or(DEFAULT_GRACE_MS))
+}
+
+/// The archive agent of an embedded node (26 §4, and the audit's F12): the
+/// walk the network node's agent runs, on the owner thread at the agent's
+/// interval, each bundle sealed into the node's own store — the one copy
+/// such a node has — before its record is proposed and polled to
+/// commitment. A step that cannot run now (a candidate in flight, the
+/// session not native, custody refused) waits for a later tick, as the
+/// network agent's does, and is counted.
+pub(crate) struct EmbeddedArchive {
+    interval: Duration,
+    grace_ms: u64,
+    next: std::time::Instant,
+    cursor: Option<focal_core::native::retirement::RetirementCursor>,
+    pub(crate) proposed: u64,
+    pub(crate) seals_proposed: u64,
+    pub(crate) deferred: u64,
+}
+impl EmbeddedArchive {
+    pub(crate) fn from_env() -> Self {
+        let (interval, grace_ms) = settings_from_env();
+        Self {
+            interval: interval.max(Duration::from_millis(10)),
+            grace_ms,
+            next: std::time::Instant::now(),
+            cursor: None,
+            proposed: 0,
+            seals_proposed: 0,
+            deferred: 0,
+        }
+    }
+    /// One tick once the interval has passed since the last.
+    pub(crate) fn maintain(
+        &mut self,
+        node: &mut crate::embedded::EmbeddedNode,
+        budget: &focal_memory::MemoryBudget,
+    ) -> Result<(), crate::embedded::NodeError> {
+        let now = std::time::Instant::now();
+        if now < self.next {
+            return Ok(());
+        }
+        self.next = now.checked_add(self.interval).ok_or_else(|| {
+            crate::embedded::NodeError::Domain("the archive interval overflows the clock".into())
+        })?;
+        if node.session.native_core().is_err() {
+            return Ok(());
+        }
+        if self.retire_step(node, budget).is_err() {
+            self.deferred = self.deferred.saturating_add(1);
+        }
+        if self.seal_step(node, budget).is_err() {
+            self.deferred = self.deferred.saturating_add(1);
+        }
+        Ok(())
+    }
+    /// Seal `bytes` as an object of the ledger's tenant domain in the
+    /// node's own store, as the content host seals an archive bundle.
+    fn seal(
+        node: &mut crate::embedded::EmbeddedNode,
+        bytes: Vec<u8>,
+    ) -> Result<focal_model::ContentRef, crate::embedded::NodeError> {
+        let domain = focal_model::ContentDomainId(node.identity.ledger.tenant.0);
+        let chunk = node.content.upload_chunk_bytes();
+        Ok(node.content.seal_import_inline(domain, &bytes, chunk)?)
+    }
+    /// Poll the session until the record it proposed has applied, a bounded
+    /// number of times; what has not applied by then applies under the
+    /// next request or tick.
+    fn settle(node: &mut crate::embedded::EmbeddedNode) -> Result<(), crate::embedded::NodeError> {
+        for _ in 0..crate::native_ingress::COMMIT_POLLS {
+            node.session.poll()?;
+            if node.session.native_check_retirement().is_ok() {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn retire_step(
+        &mut self,
+        node: &mut crate::embedded::EmbeddedNode,
+        budget: &focal_memory::MemoryBudget,
+    ) -> Result<(), crate::embedded::NodeError> {
+        let candidates = node.session.native_core().and_then(|core| {
+            core.retirement_candidates(self.cursor, VISITS_PER_TICK)
+                .map_err(|error| focal_ledger::LedgerError::Native(error.into()))
+        })?;
+        self.cursor = candidates.next;
+        for root in candidates.claims {
+            let Some(archived) =
+                crate::archive_derive::archived_family(&node.session, budget, root, self.grace_ms)?
+            else {
+                continue;
+            };
+            let crate::fleet::ArchivedFamily {
+                bundle,
+                through,
+                _allocation,
+                ..
+            } = archived;
+            let reference = Self::seal(node, bundle)?;
+            drop(_allocation);
+            node.session.native_propose_retirement(
+                root,
+                reference.root,
+                reference.length,
+                through,
+            )?;
+            self.proposed = self.proposed.saturating_add(1);
+            return Self::settle(node);
+        }
+        Ok(())
+    }
+    fn seal_step(
+        &mut self,
+        node: &mut crate::embedded::EmbeddedNode,
+        budget: &focal_memory::MemoryBudget,
+    ) -> Result<(), crate::embedded::NodeError> {
+        let Some(sealed) = crate::archive_derive::sealed_outcomes(&node.session, budget)? else {
+            return Ok(());
+        };
+        let crate::fleet::SealedOutcomes {
+            plan,
+            bundle,
+            fold,
+            _allocation,
+            ..
+        } = sealed;
+        let reference = Self::seal(node, bundle)?;
+        let fold = match fold {
+            Some((plan, bytes, _)) => {
+                let directory = Self::seal(node, bytes)?;
+                Some(focal_core::native::seal::Fold {
+                    first: plan.first,
+                    last: plan.last,
+                    bundle: directory.root,
+                    bytes: directory.length,
+                })
+            }
+            None => None,
+        };
+        drop(_allocation);
+        node.session
+            .native_propose_seal(&plan, reference.root, reference.length, fold)?;
+        self.seals_proposed = self.seals_proposed.saturating_add(1);
+        Self::settle(node)
     }
 }

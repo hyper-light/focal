@@ -1,0 +1,36 @@
+[package]
+name = "focal-compare"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Open-loop tail-latency comparison of durable replicated appends (docs/qualification/competitive-p99.md); a measurement tool, never shipped."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "focal-compare"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+hdrhistogram = { version = "7.6", default-features = false }
+# One cryptographic provider (F57): aws-lc-rs, never ring.
+async-nats = { version = "0.50", default-features = false, features = ["aws-lc-rs", "jetstream", "server_2_12"] }
+redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
+# Kafka's canonical high-performance client (librdkafka, built from its
+# vendored source): no TLS, no SASL, no compression codecs; plaintext on the
+# bench network.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+
+# On Windows librdkafka builds with CMake (installed on the CI runners): its
+# autotools `./configure` is a shell script Windows cannot run. Elsewhere the
+# autotools build needs no tool beyond a C compiler.
+[target.'cfg(windows)'.dependencies]
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build"] }

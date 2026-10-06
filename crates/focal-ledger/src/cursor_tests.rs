@@ -419,6 +419,68 @@ fn pump_sessions(sessions: &mut [Session]) {
     }
     panic!("transport did not quiesce");
 }
+/// A checkpoint is of the applied prefix, and a proposal waiting for its
+/// quorum is above it (26 §3): the leader checkpoints while a domain
+/// candidate waits, the candidate commits after the checkpoint, and a
+/// restart from the checkpoint replays it once. A session used to refuse
+/// any checkpoint while a proposal was pending, so a steady load held its
+/// log past the cadence.
+#[test]
+fn a_checkpoint_is_taken_while_a_proposal_waits_for_its_quorum() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |id: u64| {
+        let mut cfg = config();
+        cfg.node_id = id;
+        cfg.voters = vec![1, 2, 3];
+        Session::open(
+            dir.path().join(id.to_string()),
+            identity(),
+            cfg,
+            SessionLimits::default(),
+        )
+        .unwrap()
+    };
+    let mut sessions = (1..=3).map(open).collect::<Vec<_>>();
+    sessions[0].campaign().unwrap();
+    pump_sessions(&mut sessions);
+    sessions[0].propose(&epoch(1)).unwrap();
+    pump_sessions(&mut sessions);
+    assert_eq!(sessions[0].sequence(), SessionSeq(1));
+    // The second waits: written here, its appends held back from the others.
+    let second = epoch(2);
+    assert!(matches!(
+        sessions[0].propose(&second).unwrap(),
+        Submission::Pending(_)
+    ));
+    let held = sessions[0].poll().unwrap().messages;
+    assert_eq!(sessions[0].pending_count(), 1);
+    sessions[0].checkpoint().unwrap();
+    let floor = sessions[0].snapshot_index();
+    assert!(floor > 0, "the applied prefix is checkpointed");
+    assert_eq!(sessions[0].pending_count(), 1, "the candidate still waits");
+    for message in held {
+        sessions[message.to as usize - 1].step(message).unwrap();
+    }
+    pump_sessions(&mut sessions);
+    let key = RequestKey {
+        principal: second.principal,
+        epoch: second.request_epoch,
+        id: second.request_id,
+    };
+    for session in &sessions {
+        assert_eq!(session.sequence(), SessionSeq(2));
+    }
+    let receipt = sessions[0].receipt(&key).unwrap().clone();
+    assert_eq!(sessions[0].pending_count(), 0);
+    // Reopened from the checkpoint, the leader replays what came after it.
+    let leader = sessions.remove(0);
+    drop(leader);
+    let reopened = open(1);
+    assert_eq!(reopened.snapshot_index(), floor);
+    assert_eq!(reopened.sequence(), SessionSeq(2));
+    assert_eq!(reopened.receipt(&key), Some(&receipt));
+}
+
 #[test]
 fn cursor_metadata_needs_quorum_and_lost_leadership_drops_reservations() {
     let dir = tempfile::tempdir().unwrap();
@@ -462,12 +524,13 @@ fn cursor_metadata_needs_quorum_and_lost_leadership_drops_reservations() {
     let baseline = s.memory_stats().used;
     s.submit_cursor(&acknowledgment).unwrap();
     assert!(s.memory_stats().used > baseline);
-    assert!(matches!(s.checkpoint(), Err(LedgerError::Capacity)));
-    let mut heartbeat = Message::default();
-    heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-    heartbeat.from = 2;
-    heartbeat.to = 1;
-    heartbeat.term = s.status().term + 1;
+    let heartbeat = Message {
+        msg_type: focal_consensus::MessageType::MsgHeartbeat,
+        from: 2,
+        to: 1,
+        term: s.status().term + 1,
+        ..Message::default()
+    };
     s.step(heartbeat).unwrap();
     drop(s.poll().unwrap());
     assert_eq!(s.pending_count(), 0);
@@ -714,4 +777,173 @@ fn maintenance_expiry_waits_for_quorum_before_releasing_projection_pin() {
         assert_eq!(s.cursors.retention_limit(SessionSeq(1)), SessionSeq(1));
         assert_eq!(s.cursor_meta.receipts.len(), 1);
     }
+}
+
+/// An expired consumer's slot returns (the audit's F62), and its name with it:
+/// the owner record leaves with the row, so another principal registers the
+/// name once the slot frees.
+#[test]
+fn an_expired_consumer_s_name_is_free_for_another_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = SessionLimits::default();
+    limits.cursors.max_consumers = 1;
+    let mut s = Session::open(dir.path(), identity(), config(), limits).unwrap();
+    elect(&mut s);
+    let first = ParticipantId::from_u128(1);
+    let second = ParticipantId::from_u128(2);
+    s.submit_local(&epoch(1)).unwrap();
+    let mut negotiate = input(
+        300,
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(1),
+        },
+    );
+    negotiate.principal = second;
+    s.submit_local(&negotiate).unwrap();
+    let one = ConsumerId::from_u128(1);
+    let two = ConsumerId::from_u128(2);
+    let register_as = |s: &Session, id: u128, principal: ParticipantId, consumer, now: u64| {
+        let mut request = cursor_input(
+            s,
+            id,
+            CursorOperation::Register {
+                consumer,
+                scope: ContentHash([8; 32]),
+                filter: DeltaFilter::All,
+                start: Position::origin(identity()),
+                expires_at: now + 1000,
+            },
+        );
+        request.key.principal = principal;
+        request.command.now = now;
+        request
+    };
+    cursor_receipt(
+        s.submit_cursor_local(&register_as(&s, 10, first, one, 0))
+            .unwrap(),
+    );
+    assert_eq!(s.cursor_owner(one), Some(first));
+    // At the bound while the lease lives: refused.
+    assert!(matches!(
+        s.submit_cursor_local(&register_as(&s, 11, second, two, 500)),
+        Err(LedgerError::Stream(focal_stream::StreamError::Capacity))
+    ));
+    assert_eq!(s.cursor_owner(one), Some(first));
+    // The lease ended: the registration goes through; the expired row and
+    // its owner record leave.
+    cursor_receipt(
+        s.submit_cursor_local(&register_as(&s, 12, second, two, 2000))
+            .unwrap(),
+    );
+    assert!(s.cursor(one).is_none());
+    assert_eq!(s.cursor_owner(one), None);
+    assert_eq!(s.cursor_owner(two), Some(second));
+    // The name is the other principal's to register once its slot frees.
+    cursor_receipt(
+        s.submit_cursor_local(&register_as(&s, 13, second, one, 4000))
+            .unwrap(),
+    );
+    assert_eq!(s.cursor_owner(one), Some(second));
+    assert!(s.cursor(two).is_none());
+    assert_eq!(s.cursor_owner(two), None);
+}
+
+/// The audit's F61: a cursor command carries its receipt and its owner into
+/// the metadata; it never copies the receipt map, so what a command holds
+/// while it waits for its quorum is the same with two receipts as with
+/// hundreds.
+#[test]
+fn a_cursor_command_holds_its_entry_never_the_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+    elect(&mut s);
+    s.submit_local(&epoch(1)).unwrap();
+    s.submit_cursor_local(&register(&s, 1, false)).unwrap();
+    let position = Position::origin(identity());
+    let mut held = Vec::new();
+    for round in 0..2u128 {
+        let before = s.memory_stats().used;
+        assert!(matches!(
+            s.submit_cursor(&ack(&s, 1000 + round, position)).unwrap(),
+            CursorSubmission::Pending(_)
+        ));
+        held.push(s.memory_stats().used - before);
+        assert!(s.poll().unwrap().messages.is_empty());
+        for id in 0..256u128 {
+            s.submit_cursor_local(&ack(&s, 2000 + round * 1000 + id, position))
+                .unwrap();
+        }
+    }
+    // Only the receipt's own encoding grows — its revision's varint, at the
+    // reference multiplier — never a copy of the map.
+    assert!(held[1].abs_diff(held[0]) <= 64 * 8, "{held:?}");
+    assert_eq!(s.cursor_meta.receipts.len(), 1 + 2 + 512);
+}
+
+/// A poll that finds a lease past its half-life has the node renew it by
+/// its own entry: no receipt, no request key; nothing before the half.
+#[test]
+fn a_polled_lease_past_its_half_life_is_renewed_by_the_node_s_own_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let consumer = ConsumerId::from_u128(1);
+    {
+        let mut s =
+            Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+        elect(&mut s);
+        s.submit_local(&epoch(1)).unwrap();
+        // A lease to 1000 at clock 0.
+        s.submit_cursor_local(&register(&s, 1, false)).unwrap();
+        let generation = s.cursor(consumer).unwrap().token.generation;
+        let revision = s.cursor_revision();
+        let receipts = s.cursor_meta.receipts.len();
+        let index = s.status().committed_index;
+        // At 400, a renewal to 1400 would leave 600 of a term of 1000 —
+        // more than half: nothing is due, nothing is written.
+        assert_eq!(
+            s.propose_cursor_renewal(consumer, generation, 400, 1400)
+                .unwrap(),
+            None
+        );
+        assert_eq!(s.status().committed_index, index);
+        // At 500 the half has passed: 500 remain of the 1000 granted.
+        let target = s
+            .propose_cursor_renewal(consumer, generation, 500, 1500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.revision, revision + 1);
+        assert!(s.poll().unwrap().messages.is_empty());
+        assert_eq!(s.cursor_revision(), revision + 1);
+        assert_eq!(s.cursor(consumer).unwrap().expires_at, 1500);
+        assert_eq!(s.cursor_clock(), 500);
+        assert_eq!(s.cursor_meta.receipts.len(), receipts);
+        assert_eq!(s.next_cursor_expiry(), Some(1500));
+        assert!(matches!(
+            s.propose_cursor_renewal(consumer, generation + 1, 1100, 2100),
+            Err(LedgerError::Stream(StreamError::WrongGeneration))
+        ));
+        let protected = ConsumerId::from_u128(2);
+        s.submit_cursor_control_local(&cursor_input(
+            &s,
+            77,
+            CursorOperation::RegisterProtected {
+                consumer: protected,
+                scope: ContentHash([8; 32]),
+                filter: DeltaFilter::All,
+                start: Position::origin(identity()),
+            },
+        ))
+        .unwrap();
+        let generation = s.cursor(protected).unwrap().token.generation;
+        assert_eq!(
+            s.propose_cursor_renewal(protected, generation, 1100, 2100)
+                .unwrap(),
+            None,
+            "a protected consumer holds no lease to renew"
+        );
+    }
+    // The entry replays from the log through the maintenance decoder.
+    let mut s = Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+    elect(&mut s);
+    assert_eq!(s.cursor(consumer).unwrap().expires_at, 1500);
+    assert_eq!(s.cursor_clock(), 500);
 }

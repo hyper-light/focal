@@ -19,26 +19,51 @@ fn network_service_requires_runtime_before_starting_physical_owners() {
     assert!(!directory.path().join("IDENTITY").exists());
 }
 
+/// The allowance a starting node has to report ready, in seconds: what a
+/// test that commits a credential lifetime derives the lifetime from, since
+/// a host's credential, issued at its join, must outlive its start.
+pub(crate) const START_ALLOWANCE: u64 = 15;
+/// What a supervisor gives a probe before it counts it failed: Kubernetes'
+/// default `timeoutSeconds`, which the probes the deployment renderer writes
+/// rely on (`deploy/kubernetes`). A probe's answer is a claim about time,
+/// held to that timeout here, not a wait on an owner's progress.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) struct Running {
     pub(crate) handles: NetworkHandles,
     pub(crate) status: NetworkServiceStatus,
     /// The node's data handler, for requests without a transport.
     pub(crate) data: DataService,
     stop: Option<oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<Result<(), ServiceError>>,
+    task: tokio::task::JoinHandle<Result<ServiceStopped, ServiceError>>,
+    /// How the service ended, once it has, for a wait that failed to say
+    /// why: a service that ended is what every handle's `Unavailable` means.
+    ended: tokio::sync::watch::Receiver<Option<String>>,
 }
 impl Running {
-    pub(crate) async fn start(settings: &TestSettings) -> Self {
+    /// Boxed by a plain function, as `NetworkService::open_with_socket` is:
+    /// a test body's poll frame holds a pointer to the start, not its
+    /// state, in a debug build (the renewal journey's body held 628 KiB of
+    /// such temporaries, and a Windows test thread of 2 MiB overflowed).
+    pub(crate) fn start(
+        settings: &TestSettings,
+    ) -> std::pin::Pin<Box<impl Future<Output = Self> + '_>> {
+        Box::pin(Self::start_inner(settings))
+    }
+    async fn start_inner(settings: &TestSettings) -> Self {
         Self::from_service(settings.open().await.unwrap()).await
     }
-    async fn from_service(service: NetworkService) -> Self {
+    fn from_service(service: NetworkService) -> std::pin::Pin<Box<impl Future<Output = Self>>> {
+        Box::pin(Self::from_service_inner(service))
+    }
+    async fn from_service_inner(service: NetworkService) -> Self {
         let handles = service.handles();
         let data = service.data.clone();
         let (stop, receive) = oneshot::channel();
         let (ready, status) = oneshot::channel();
         let mut ready = Some(ready);
+        let (ended_send, ended) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
-            service
+            let outcome = service
                 .run_until(
                     async {
                         let _ = receive.await;
@@ -51,19 +76,41 @@ impl Running {
                         Ok(())
                     },
                 )
-                .await
+                .await;
+            let _ = ended_send.send(Some(format!("{outcome:?}")));
+            outcome
         });
-        let status = tokio::time::timeout(Duration::from_secs(15), status)
-            .await
-            .expect("service did not publish startup status")
-            .unwrap();
+        let mut task = task;
+        // Charged to the root owner's periods (27 §3.1 P8): what the
+        // allowance holds at its tick, however slowly the machine runs it.
+        let status = match crate::test_waits::charged(
+            || vec![handles.control.periods()],
+            Duration::from_secs(START_ALLOWANCE),
+            crate::test_waits::CONTROL_TICK,
+            status,
+        )
+        .await
+        .unwrap_or_else(|spent| panic!("service did not publish startup status: {spent}"))
+        {
+            Ok(status) => status,
+            Err(_) => panic!(
+                "the service ended before publishing its status: {:?}",
+                (&mut task).await
+            ),
+        };
         Self {
             handles,
             status,
             data,
             stop: Some(stop),
             task,
+            ended,
         }
+    }
+    /// How the service ended, if it has: the word a failed wait prints
+    /// beside what its handles answered.
+    pub(crate) fn ended(&self) -> Option<String> {
+        self.ended.borrow().clone()
     }
     /// Stop and report how the service ended, without unwrapping.
     pub(crate) async fn outcome(mut self) -> Result<(), ServiceError> {
@@ -81,10 +128,10 @@ impl Running {
     /// stop reports is the service's own `ShutdownTimeout`, not a guess of
     /// the harness about how long a stop takes on this machine.
     async fn stopped(
-        task: &mut tokio::task::JoinHandle<Result<(), ServiceError>>,
+        task: &mut tokio::task::JoinHandle<Result<ServiceStopped, ServiceError>>,
     ) -> Result<(), ServiceError> {
         match tokio::time::timeout(SHUTDOWN_DEADLINE.saturating_add(FROZEN), task).await {
-            Ok(joined) => joined.unwrap(),
+            Ok(joined) => joined.unwrap().map(|_| ()),
             Err(_) => panic!(
                 "the service did not return within its shutdown deadline of {SHUTDOWN_DEADLINE:?} and a frozen allowance of {FROZEN:?}"
             ),
@@ -134,7 +181,13 @@ pub(crate) async fn until<T>(
 ) -> T {
     match try_until(services, allowance, poll).await {
         Ok(value) => value,
-        Err(spent) => panic!("never reached: {what}: {spent}"),
+        Err(spent) => panic!(
+            "never reached: {what}: {spent}; services ended {:?}",
+            services
+                .iter()
+                .map(|service| service.ended())
+                .collect::<Vec<_>>()
+        ),
     }
 }
 /// [`until`], for a caller that reports what it observed when the wait is
@@ -170,11 +223,11 @@ impl Drop for Running {
     }
 }
 pub(crate) struct TestSettings {
-    value: Settings,
+    pub(crate) value: Settings,
     // Keep the physical reservation throughout startup, client creation, and
     // restart. Quinn receives a duplicate handle to this same bound socket,
     // never an address obtained by closing a temporary socket.
-    socket: std::net::UdpSocket,
+    pub(crate) socket: std::net::UdpSocket,
 }
 impl std::ops::Deref for TestSettings {
     type Target = Settings;
@@ -183,8 +236,10 @@ impl std::ops::Deref for TestSettings {
     }
 }
 impl TestSettings {
-    async fn open(&self) -> Result<NetworkService, ServiceError> {
-        NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap())).await
+    pub(crate) fn open(
+        &self,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<NetworkService, ServiceError>> + '_>> {
+        NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap()))
     }
 }
 pub(crate) fn settings(root: &Path) -> TestSettings {
@@ -268,9 +323,14 @@ async fn interrupted_listener_shutdown_preserves_the_release_fence() {
         // receiver and make the next shutdown report a false success.
         assert!(shutdown.as_mut().poll(&mut context).is_pending());
     }
-    tokio::time::timeout(Duration::from_secs(5), service.listener.shutdown())
-        .await
-        .unwrap();
+    crate::test_waits::charged(
+        || vec![service.handles.control.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        service.listener.shutdown(),
+    )
+    .await
+    .expect("the listener shut down");
     service.listener.shutdown().await;
     drop(std::net::UdpSocket::bind(address).unwrap());
     drop(service);
@@ -287,16 +347,24 @@ fn wire_request(ledger: LedgerId, id: u128, operation: Operation) -> RequestEnve
     }
 }
 
+/// The service dropped, its physical owners release the node directory as
+/// they end. No owner is left to charge the wait to: the frozen window is
+/// its bound (`crate::test_waits`).
 async fn wait_unlocked(settings: &Settings) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(directory) = NodeDirectory::open(settings) {
-                drop(directory);
-                break;
+    crate::test_waits::charged(
+        Vec::new,
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        async {
+            loop {
+                if let Ok(directory) = NodeDirectory::open(settings) {
+                    drop(directory);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("physical owners failed to release the node directory");
 }
@@ -1048,36 +1116,75 @@ async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leade
     .await;
     let admin = ClusterAdmin::open(&host_settings).unwrap();
     // Alive while the root leader is reachable.
-    tokio::time::timeout(Duration::from_millis(800), admin.probe("alive"))
+    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
         .await
         .expect("alive answers at once")
         .expect("the host is alive");
     // The root leader goes away: the host's own process is untouched.
     founder.stop().await;
     let started = tokio::time::Instant::now();
-    tokio::time::timeout(Duration::from_millis(800), admin.probe("alive"))
+    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
         .await
         .expect("alive answers at once with the root leader down")
         .expect("the host is still alive");
     assert!(
-        started.elapsed() < Duration::from_millis(800),
+        started.elapsed() < PROBE_TIMEOUT,
         "liveness never waits on the control plane"
     );
     // The readiness report waits on what is unreachable only up to its
     // budget, then reports what it could not see as absent: bounded, and it
     // does not claim the node is ready.
     let started = tokio::time::Instant::now();
-    let readiness = tokio::time::timeout(Duration::from_secs(3), admin.probe("catching-up")).await;
+    let readiness = tokio::time::timeout(PROBE_TIMEOUT, admin.probe("catching-up")).await;
     assert!(
         readiness.is_ok(),
         "the readiness report returns within its budget with the root leader down"
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < PROBE_TIMEOUT);
     assert!(
         matches!(readiness, Ok(Err(ClusterAdminError::ProbeFailed(_)))),
         "a host without a root leader is not catching up: {readiness:?}"
     );
+    // Serving asks whether the owners run, never for a quorum: a healthy
+    // follower with the root leader down is ready to serve (the audit's
+    // F25), so its supervisor keeps it in the endpoints its peers need.
+    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("serving"))
+        .await
+        .expect("serving answers within the readiness budget")
+        .expect("a healthy host serves with the root leader down");
     host.stop().await;
+}
+
+/// A node one of whose session owners stopped is alive and not serving (the
+/// audit's F25): its supervisor's liveness keeps it, its readiness takes it
+/// out until the owner runs again — with no leadership or quorum asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_whose_session_owner_stopped_is_alive_and_not_serving() {
+    use crate::cluster_admin::{ClusterAdmin, ClusterAdminError};
+    let dir = tempfile::tempdir().unwrap();
+    let settings = settings(dir.path());
+    let founder = Running::start(&settings).await;
+    let admin = ClusterAdmin::open(&settings).unwrap();
+    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("serving"))
+        .await
+        .expect("serving answers within the readiness budget")
+        .expect("a founder whose owners run serves");
+    let (_, session) = founder
+        .handles
+        .fleet
+        .next_host(None)
+        .expect("the founder's session");
+    session.stop().await.unwrap();
+    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
+        .await
+        .expect("alive answers at once")
+        .expect("the process answers while a session owner is stopped");
+    let serving = tokio::time::timeout(PROBE_TIMEOUT, admin.probe("serving")).await;
+    assert!(
+        matches!(serving, Ok(Err(ClusterAdminError::ProbeFailed("serving")))),
+        "a stopped session owner is not serving: {serving:?}"
+    );
+    founder.stop().await;
 }
 
 /// A joined host measures its path to the root's voter and derives its tick

@@ -34,11 +34,21 @@ pub fn observe(root: &Path) {
         }
     });
 }
+/// The data directories this test observes, for a wait's report.
+pub fn observed() -> Vec<PathBuf> {
+    OBSERVED.with(|observed| observed.borrow().clone())
+}
 /// The periods the root owner of the process on `root` has run; none while
 /// it does not answer.
 pub fn periods(root: &Path) -> Option<u64> {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.to_str()?, "cluster", "node", "metrics"])
+        .args([
+            "--data-dir",
+            root.to_str()?,
+            "diagnose",
+            "node",
+            "--metrics",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

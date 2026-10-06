@@ -3,16 +3,16 @@
 use super::{
     DeploymentError, GuaranteeLevel, hex, now_ms,
     observe::observe,
-    plan::{Change, DeploymentPlan, Observation, ObservedSession},
+    plan::{Change, DeploymentPlan, Observation, ObservedControl, ObservedSession},
     survive_code,
 };
 use crate::{
-    cluster_admin::ClusterAdmin,
+    cluster_admin::{ClusterAdmin, ClusterAdminError},
     config::policy::{self, PolicyRevision},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -153,6 +153,9 @@ impl Journal {
 pub struct Current {
     pub policy_revision: u64,
     pub sessions: BTreeMap<([u8; 16], [u8; 16]), ObservedSession>,
+    /// The nodes the directory knows now.
+    pub nodes: BTreeSet<u64>,
+    pub control: Option<ObservedControl>,
 }
 impl Current {
     pub fn of(observation: &Observation) -> Self {
@@ -163,6 +166,8 @@ impl Current {
                 .iter()
                 .map(|session| ((session.tenant, session.session), session.clone()))
                 .collect(),
+            nodes: observation.nodes.iter().map(|node| node.node).collect(),
+            control: observation.control.clone(),
         }
     }
 }
@@ -189,6 +194,8 @@ pub fn preflight(
                 "membership_epoch" => "membership_epoch",
                 "placement_epoch" => "placement_epoch",
                 "operation" => "operation",
+                "voters" => "voters",
+                "members" => "members",
                 _ => "presence",
             },
         });
@@ -204,6 +211,41 @@ pub fn preflight(
             Change::CommitPolicy { from_revision, .. } => {
                 if current.policy_revision != *from_revision {
                     return Err(stale("policy".into(), "committed_revision"));
+                }
+            }
+            // The root's configuration moves as the controller admits
+            // learners, so its index is not a fence; a planned voter the
+            // directory no longer knows is.
+            Change::PlanRoot { voters, .. } => {
+                if current.control.is_none() {
+                    return Err(stale("root".into(), "presence"));
+                }
+                if voters.iter().any(|voter| !current.nodes.contains(voter)) {
+                    return Err(stale("root".into(), "members"));
+                }
+            }
+            Change::PlanPartition {
+                partition,
+                group,
+                voters,
+                ..
+            } => {
+                let name = partition_name(partition);
+                let observed = current
+                    .control
+                    .as_ref()
+                    .and_then(|control| {
+                        control
+                            .partitions
+                            .iter()
+                            .find(|observed| observed.partition == *partition)
+                    })
+                    .ok_or_else(|| stale(name.clone(), "presence"))?;
+                if observed.group != *group {
+                    return Err(stale(name, "group"));
+                }
+                if voters.iter().any(|voter| !current.nodes.contains(voter)) {
+                    return Err(stale(name, "members"));
                 }
             }
             Change::PlanSession {
@@ -257,6 +299,9 @@ pub fn session_progress(
     Phase::Committed
 }
 
+fn partition_name(partition: &[u8; 16]) -> String {
+    format!("partition {}", super::hex(partition))
+}
 pub fn journal_dir(root: &Path, plan_id: &[u8; 16]) -> PathBuf {
     root.join("cluster").join("apply").join(hex(plan_id))
 }
@@ -359,8 +404,13 @@ pub async fn apply(
     if plan.body.deployment.cluster != admin.identity().cluster {
         return Err(DeploymentError::WrongDeployment);
     }
-    if !plan.body.blocked.is_empty() {
-        return Err(DeploymentError::Blocked(plan.body.blocked.len()));
+    if !plan.body.blocked.is_empty() || plan.body.blocked_control.is_some() {
+        return Err(DeploymentError::Blocked(
+            plan.body
+                .blocked
+                .len()
+                .saturating_add(usize::from(plan.body.blocked_control.is_some())),
+        ));
     }
     let observation = observe(admin, network).await?;
     // The journal exists only once the plan passed preflight at least once,
@@ -422,20 +472,185 @@ pub async fn apply(
                 journal.record(index, Phase::Complete, None, now_ms()?)?;
                 write_journal(&dir, &journal)?;
             }
+            Change::PlanRoot { voters, .. } => {
+                if journal.phase(index).is_none() {
+                    journal.record(index, Phase::Prepared, None, now_ms()?)?;
+                    write_journal(&dir, &journal)?;
+                }
+                // Each planned voter the root does not hold as a voter yet is
+                // promoted once the root holds it as a learner (the
+                // controller admits every enrolled node as one) and it has
+                // caught up: a promotion refused for a learner behind, a
+                // request decided meanwhile or an earlier request still
+                // deciding is asked again as the root moves, within the
+                // operator's allowance; what is not done stays journaled
+                // as under way and a repeated apply resumes it.
+                loop {
+                    let configuration = admin.configuration().await?;
+                    let voting: BTreeSet<u64> =
+                        configuration.configuration.voters.iter().copied().collect();
+                    let next = voters.iter().copied().find(|voter| !voting.contains(voter));
+                    let Some(node) = next else {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        write_journal(&dir, &journal)?;
+                        break;
+                    };
+                    let mut advanced = false;
+                    // A joint configuration (one change still leaving) takes
+                    // no other change: asked again once it has left.
+                    if configuration.configuration.voters_outgoing.is_empty()
+                        && configuration.configuration.learners.contains(&node)
+                    {
+                        match admin
+                            .membership(
+                                focal_consensus::MembershipChange::Promote { node },
+                                Some(configuration.configuration_index),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                journal.record(index, Phase::Committed, None, now_ms()?)?;
+                                write_journal(&dir, &journal)?;
+                                advanced = true;
+                            }
+                            Err(
+                                ClusterAdminError::Pending
+                                | ClusterAdminError::Control(
+                                    focal_control::ControlFailure::NotReady
+                                    | focal_control::ControlFailure::CompareFailed,
+                                ),
+                            ) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    if advanced {
+                        continue;
+                    }
+                    if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+            }
+            Change::PlanPartition {
+                partition, voters, ..
+            } => {
+                if journal.phase(index).is_none() {
+                    journal.record(index, Phase::Prepared, None, now_ms()?)?;
+                    write_journal(&dir, &journal)?;
+                }
+                // Each planned voter the group does not hold is admitted as
+                // a learner first — no controller admits partition learners
+                // on its own — then promoted once it votes nowhere yet, has
+                // a replica (the root's grant seats it and it hosts one)
+                // and has caught up; refusals for a learner behind, a group
+                // not ready or a configuration that moved are asked again
+                // within the operator's allowance, as the root's are.
+                loop {
+                    let current = admin.partition_configuration(*partition).await?;
+                    let configuration = &current.configuration.configuration;
+                    let next = voters
+                        .iter()
+                        .copied()
+                        .find(|voter| !configuration.voters.contains(voter));
+                    let Some(node) = next else {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        write_journal(&dir, &journal)?;
+                        break;
+                    };
+                    let mut advanced = false;
+                    if configuration.voters_outgoing.is_empty() {
+                        let change = if configuration.learners.contains(&node) {
+                            focal_consensus::MembershipChange::Promote { node }
+                        } else {
+                            focal_consensus::MembershipChange::AddLearner { node }
+                        };
+                        match admin
+                            .partition_change(
+                                *partition,
+                                change,
+                                Some(current.configuration.configuration_index),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                journal.record(index, Phase::Committed, None, now_ms()?)?;
+                                write_journal(&dir, &journal)?;
+                                advanced = true;
+                            }
+                            Err(
+                                ClusterAdminError::Pending
+                                | ClusterAdminError::Control(
+                                    focal_control::ControlFailure::NotReady
+                                    | focal_control::ControlFailure::CompareFailed
+                                    | focal_control::ControlFailure::Unavailable
+                                    | focal_control::ControlFailure::OutcomeUnknown,
+                                ),
+                            ) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    if advanced {
+                        continue;
+                    }
+                    if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+            }
             Change::PlanSession {
                 tenant,
                 session,
                 durability,
                 operation,
+                voters,
                 expected,
                 ..
             } => {
+                // The placement epoch the request's effect is measured
+                // past: the one the session has as the request is made,
+                // where it re-fenced under the plan, else the one the plan
+                // observed (a resumed apply measures from the latter).
+                let mut base = expected.placement;
                 if journal
                     .phase(index)
                     .is_none_or(|phase| phase < Phase::Committed)
                 {
                     journal.record(index, Phase::Prepared, None, now_ms()?)?;
                     write_journal(&dir, &journal)?;
+                    // The seats the directory would plan now, journaling
+                    // nothing: the plan's, or the plan is stale before any
+                    // side effect. A session that re-fenced under the plan
+                    // with the seats it was planned from — the fleet moved
+                    // its leader while the root and the partition were
+                    // seated (the VM journey, macOS CI, 2026-10-02) — is
+                    // the plan's request under its new authority, named by
+                    // the operation the directory gives it now (08 §9); one
+                    // whose seats moved is what the operator did not review.
+                    let preview = admin
+                        .plan_session_reply(
+                            *tenant,
+                            *session,
+                            survive_code(durability.survive),
+                            durability.max_failures,
+                            true,
+                        )
+                        .await?;
+                    if preview.voters != *voters {
+                        let name = session_name(tenant, session);
+                        journal.outcome = Outcome::Stale {
+                            step: index,
+                            subject: name.clone(),
+                            field: "voters".into(),
+                        };
+                        write_journal(&dir, &journal)?;
+                        return Err(stale(name, "voters"));
+                    }
+                    current = Current::of(&observe(admin, network).await?);
+                    if let Some(observed) = current.sessions.get(&(*tenant, *session)) {
+                        base = base.max(observed.epochs.placement);
+                    }
                     let reply = admin
                         .plan_session_reply(
                             *tenant,
@@ -445,25 +660,26 @@ pub async fn apply(
                             false,
                         )
                         .await?;
-                    if reply.operation != *operation {
+                    if reply.voters != *voters {
                         let name = session_name(tenant, session);
                         journal.outcome = Outcome::Stale {
                             step: index,
                             subject: name.clone(),
-                            field: "operation".into(),
+                            field: "voters".into(),
                         };
                         write_journal(&dir, &journal)?;
-                        return Err(stale(name, "operation"));
+                        return Err(stale(name, "voters"));
                     }
-                    journal.record(index, Phase::Committed, Some(*operation), now_ms()?)?;
+                    journal.record(index, Phase::Committed, Some(reply.operation), now_ms()?)?;
                     write_journal(&dir, &journal)?;
                 }
+                let committed = journal.operation(index).unwrap_or(*operation);
                 loop {
                     let progress = session_progress(
                         current.sessions.get(&(*tenant, *session)),
-                        *operation,
+                        committed,
                         *durability,
-                        expected.placement,
+                        base,
                     );
                     let recorded = journal.phase(index).unwrap_or(Phase::Committed);
                     if progress > recorded {
@@ -562,6 +778,43 @@ pub async fn status(
             let current = observation.as_ref().map(Current::of);
             let mut changed = false;
             for (index, change) in (0u32..).zip(&plan.body.changes) {
+                let recorded = journal.phase(index).unwrap_or(Phase::Prepared);
+                if recorded < Phase::Committed || recorded == Phase::Complete {
+                    continue;
+                }
+                if let Change::PlanRoot { voters, .. } = change {
+                    let seated = current
+                        .as_ref()
+                        .and_then(|current| current.control.as_ref())
+                        .is_some_and(|root| voters.iter().all(|voter| root.voters.contains(voter)));
+                    if seated {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        changed = true;
+                    }
+                    continue;
+                }
+                if let Change::PlanPartition {
+                    partition, voters, ..
+                } = change
+                {
+                    let seated = current
+                        .as_ref()
+                        .and_then(|current| current.control.as_ref())
+                        .and_then(|control| {
+                            control
+                                .partitions
+                                .iter()
+                                .find(|observed| observed.partition == *partition)
+                        })
+                        .is_some_and(|group| {
+                            voters.iter().all(|voter| group.voters.contains(voter))
+                        });
+                    if seated {
+                        journal.record(index, Phase::Complete, None, now_ms()?)?;
+                        changed = true;
+                    }
+                    continue;
+                }
                 let Change::PlanSession {
                     tenant,
                     session,
@@ -573,10 +826,6 @@ pub async fn status(
                 else {
                     continue;
                 };
-                let recorded = journal.phase(index).unwrap_or(Phase::Prepared);
-                if recorded < Phase::Committed || recorded == Phase::Complete {
-                    continue;
-                }
                 let progress = session_progress(
                     current
                         .as_ref()

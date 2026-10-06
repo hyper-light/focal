@@ -409,6 +409,15 @@ pub struct PlacementAgent {
     /// The last intent the owner refused before admission, by kind and
     /// failure, cleared by the next intent that commits (24 §7).
     last_refusal: Option<String>,
+    /// The kind of intent `last_refusal` is about: a commit of another kind
+    /// does not clear it.
+    last_refusal_kind: Option<&'static str>,
+    /// The pending intent the owner has not decided yet, asked again each
+    /// pass: which journal, its kind and sequence, how many times it was
+    /// asked and the last answer. A pass that resolves it clears it; an
+    /// intent asked without end otherwise leaves no trace, its passes
+    /// succeeding.
+    retrying: Option<Retrying>,
     /// Where each session's log was last found to lead, from a leader's
     /// redirect, for sessions this node drives without leading (24 §9).
     session_leaders: BTreeMap<LedgerId, u64>,
@@ -538,6 +547,8 @@ impl PlacementAgent {
             last_ready: None,
             last_error: None,
             last_refusal: None,
+            last_refusal_kind: None,
+            retrying: None,
             session_leaders: BTreeMap::new(),
             ticks: 0,
             last_observed: Vec::new(),
@@ -642,6 +653,11 @@ impl PlacementAgent {
                                     reply,
                                 } = *job;
                                 self.queue_plan_request(ledger, durability, dry_run, reply);
+                            }
+                            Some(AgentJob::PlanControl(job)) => {
+                                let crate::placement_control::PlanControlJob { durability, reply } = *job;
+                                let result = self.plan_control(handles, pool, durability).await;
+                                let _ = reply.send(result);
                             }
                             Some(AgentJob::MoveRange(job)) => {
                                 if self.move_requests.len() >= MAX_MOVE_REQUESTS
@@ -794,6 +810,7 @@ impl PlacementAgent {
             let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
             if let Some(pending) = journals.root.pending() {
                 let kind = intent_kind(&pending.command);
+                let sequence = pending.id.sequence;
                 let control = &handles.control;
                 // A root intent is submitted where the root leads: here, or
                 // through the leader's placement-control ingress, which admits
@@ -812,7 +829,7 @@ impl PlacementAgent {
                     submit_partition(&access, pool, root_namespace, root_peer.clone(), request)
                 };
                 let outcome = journals.root.advance(control, submit).await?;
-                self.note_intent(kind, &outcome);
+                self.note_intent(IntentJournalKind::Root, kind, sequence, &outcome);
                 return Ok(AgentStep::Advanced);
             }
         }
@@ -833,19 +850,31 @@ impl PlacementAgent {
         // Every partition this node can act on, observed at one prefix each.
         let mut observed: Vec<Observed> = Vec::new();
         for delegation in &delegations {
+            self.host_seated_partition(handles, &root, delegation)?;
             let access = match handles.directory.host_of(delegation.partition) {
                 Some(host) => {
                     let progress = host.progress();
                     if progress.stopped {
                         return Err(AgentError::Stopped);
                     }
-                    if progress.applied_index == 0 || progress.leader != node {
+                    if progress.applied_index == 0 {
                         continue;
                     }
-                    PartitionAccess::Local(host)
+                    if progress.leader == node {
+                        PartitionAccess::Local(host)
+                    } else if progress.leader != 0 {
+                        // A replica that follows submits this node's own
+                        // intents where the group leads (F24).
+                        PartitionAccess::Remote {
+                            target: progress.leader,
+                            group: delegation.log_group.0,
+                        }
+                    } else {
+                        continue;
+                    }
                 }
                 None => PartitionAccess::Remote {
-                    target: self.state.genesis.founder.node,
+                    target: self.partition_target(handles, &root, delegation),
                     group: delegation.log_group.0,
                 },
             };
@@ -859,11 +888,22 @@ impl PlacementAgent {
                 .ok_or(AgentError::Identity)?;
             if let Some(pending) = journal.pending() {
                 let kind = intent_kind(&pending.command);
+                let sequence = pending.id.sequence;
+                let planned = planned_session_of(&pending.command);
+                let reported = reported_load(&pending.command);
                 let submit = |request: ControlRequest| {
                     submit_partition(&access, pool, namespace, partition_peer.clone(), request)
                 };
                 let outcome = journal.advance(&handles.control, submit).await?;
-                self.note_intent(kind, &outcome);
+                self.note_intent(IntentJournalKind::Partition, kind, sequence, &outcome);
+                self.answer_plan_outcome(planned, &outcome);
+                note_load(
+                    &mut self.last_load,
+                    delegation.partition,
+                    reported,
+                    &outcome,
+                    now,
+                );
                 return Ok(AgentStep::Advanced);
             }
             if let Some((snapshot, installed)) = self
@@ -873,6 +913,12 @@ impl PlacementAgent {
                 observed.try_reserve(1).map_err(|_| AgentError::Capacity)?;
                 observed.push((*delegation, access, snapshot, installed));
             }
+        }
+        // A pass that observed no partition (a replica between leaders, a
+        // read refused) leaves the operator's view as it was, dated as it
+        // was: an empty view would read as a cluster without partitions.
+        if observed.is_empty() {
+            return Ok(AgentStep::Idle);
         }
         // The last-observed snapshot only feeds the operator's on-demand
         // placement view, so rebuild it (a deep clone of every partition
@@ -901,9 +947,6 @@ impl PlacementAgent {
             self.last_observed = next;
         }
         self.observed_at = now;
-        if observed.is_empty() {
-            return Ok(AgentStep::Idle);
-        }
         self.report_liveness_facts(handles, &observed, unchanged);
         let root_leader = handles.control.progress().leader == node;
         for (delegation, access, snapshot, installed) in &observed {
@@ -981,6 +1024,13 @@ impl PlacementAgent {
             {
                 return Ok(step);
             }
+            if let PartitionAccess::Local(host) = access
+                && let Some(step) = self
+                    .follow_partition_grant(handles, pool, &root, delegation, host, now)
+                    .await?
+            {
+                return Ok(step);
+            }
             for descriptor in directory.sessions.values() {
                 Self::sync_members(handles, descriptor, directory).await?;
                 self.sync_custody(handles, descriptor, directory).await?;
@@ -1036,6 +1086,200 @@ impl PlacementAgent {
     /// Open the exact-retry journal of one partition the first time its
     /// delegation is visited: the first partition keeps its historical name,
     /// every later one is named by its identifier.
+    /// Host a replica of a partition's group this node holds a seat in (a
+    /// voter's or a learner's, by the root's grant) and does not host yet
+    /// (F24). The first partition is opened from the group's genesis; a
+    /// split destination's member from the group's identity the root's
+    /// grant carries and the image digest its delegation's fence does,
+    /// brought up by snapshot (24 §13).
+    fn host_seated_partition(
+        &self,
+        handles: &NetworkHandles,
+        root: &RootObservation,
+        delegation: &Delegation,
+    ) -> Result<(), AgentError> {
+        let node = self.state.node;
+        if handles.directory.is_hosted(delegation.partition)
+            || node == self.state.genesis.founder.node
+        {
+            return Ok(());
+        }
+        let Some(authority) = root.authority() else {
+            return Ok(());
+        };
+        let Some(grant) = authority.groups.get(&delegation.log_group) else {
+            return Ok(());
+        };
+        if !grant.voters.contains_key(&node) && !grant.learners.contains_key(&node) {
+            return Ok(());
+        }
+        let first = handles.directory.plan();
+        let plan =
+            if delegation.partition == first.partition() && delegation.log_group == first.group() {
+                first.hosted_by(node)
+            } else {
+                let Some(fence) = delegation.activation else {
+                    return Ok(());
+                };
+                match crate::directory_bootstrap::PartitionPlan::split_member(
+                    self.state.genesis.founder.cluster,
+                    self.state.genesis.founder.node,
+                    *delegation,
+                    grant.genesis.0,
+                    fence.destination_ready,
+                    node,
+                ) {
+                    Ok(plan) => plan,
+                    // A grant not yet shaped as a founded destination (its
+                    // delegation unfenced): seated on the next pass.
+                    Err(_) => return Ok(()),
+                }
+            };
+        match handles
+            .directory
+            .request(crate::network_service::HostRequest::Host {
+                plan: Box::new(plan),
+                image: None,
+            }) {
+            // Asked already and not opened yet: asked again next pass.
+            Ok(()) | Err(crate::directory_bootstrap::DirectoryBootstrapError::Capacity) => Ok(()),
+            Err(_) => Err(AgentError::Stopped),
+        }
+    }
+    /// Where a partition this node does not host is reached: a voter of its
+    /// group the failure detector does not hold dead, the founder first
+    /// (F24). The group leads where it leads; a voter that follows answers
+    /// a submission with its leader's refusal, which the journal retries.
+    fn partition_target(
+        &self,
+        handles: &NetworkHandles,
+        root: &RootObservation,
+        delegation: &Delegation,
+    ) -> u64 {
+        let founder = self.state.genesis.founder.node;
+        let Some(grant) = root
+            .authority()
+            .and_then(|authority| authority.groups.get(&delegation.log_group))
+        else {
+            return founder;
+        };
+        let view = handles.liveness.view();
+        let dead = |node: u64| {
+            view.members
+                .get(&node)
+                .is_some_and(|member| member.status == crate::liveness::MemberStatus::Dead)
+        };
+        if grant.voters.contains_key(&founder) && !dead(founder) {
+            return founder;
+        }
+        grant
+            .voters
+            .keys()
+            .copied()
+            .find(|voter| *voter != self.state.node && !dead(*voter))
+            .unwrap_or(founder)
+    }
+    /// The root's grant for a partition group follows the group's log, as a
+    /// session's does (`control`): once the log committed a configuration
+    /// the grant does not name, the group's installed voters attest the
+    /// exact entry and the grant is changed to it (F24).
+    async fn follow_partition_grant(
+        &mut self,
+        handles: &NetworkHandles,
+        pool: &PeerConnectionPool,
+        root: &RootObservation,
+        delegation: &Delegation,
+        host: &ControlHost,
+        now: i64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        let Some(authority) = root.authority() else {
+            return Ok(None);
+        };
+        let Some(grant) = authority.groups.get(&delegation.log_group) else {
+            return Ok(None);
+        };
+        let witness = host.witness_membership().await?;
+        let configuration = &witness.configuration.configuration;
+        // A change under way (a joint configuration leaving) is attested
+        // once it has left; the grant never names a transitional shape.
+        if !configuration.learners_next.is_empty() || configuration.auto_leave {
+            return Ok(None);
+        }
+        let members = |ids: &[u64]| -> Result<BTreeMap<u64, u64>, AgentError> {
+            ids.iter()
+                .map(|id| {
+                    authority
+                        .nodes
+                        .get(id)
+                        .map(|grant| (*id, grant.enrollment.generation))
+                        .ok_or(AgentError::Identity)
+                })
+                .collect()
+        };
+        let voters = members(&configuration.voters)?;
+        let outgoing_voters = members(&configuration.voters_outgoing)?;
+        let learners = members(&configuration.learners)?;
+        if voters == grant.voters
+            && outgoing_voters == grant.outgoing_voters
+            && learners == grant.learners
+        {
+            return Ok(None);
+        }
+        let Some(record) = witness.record.as_ref() else {
+            return Ok(None);
+        };
+        if record.index != witness.configuration.configuration_index
+            || record.configuration != *configuration
+        {
+            return Ok(None);
+        }
+        let voters_changed = !controller::same_members(&configuration.voters, &grant.voters)
+            || !controller::same_members(&configuration.voters_outgoing, &grant.outgoing_voters);
+        let next = focal_directory::GroupAuthorityGrant {
+            group: grant.group,
+            genesis: grant.genesis,
+            scope: grant.scope.clone(),
+            membership_epoch: grant
+                .membership_epoch
+                .checked_add(u64::from(voters_changed))
+                .ok_or(AgentError::Capacity)?,
+            voters,
+            outgoing_voters,
+            learners,
+            expires_at: configuration
+                .voters
+                .iter()
+                .chain(&configuration.voters_outgoing)
+                .chain(&configuration.learners)
+                .filter_map(|id| authority.nodes.get(id).map(|grant| grant.expires_at))
+                .min()
+                .unwrap_or(grant.expires_at),
+        };
+        let record = crate::placement_proof::MembershipRecord {
+            index: focal_model::RaftIndex(record.index),
+            term: focal_model::RaftTerm(record.term),
+            record_hash: focal_model::ContentHash(record.request_hash),
+        };
+        let window = self.window(now)?;
+        let request = crate::placement_control::CollectRequest {
+            ledger: handles.directory.namespace(),
+            group: delegation.log_group.0,
+            voters: grant.voters.keys().copied().collect(),
+            fact: crate::placement_control::SessionFact::Membership { next, record },
+            window,
+        };
+        let proof = self.collect(handles, pool, request).await?;
+        let enrollment_revision = self.root_enrollment_revision(root)?;
+        let command = ControlCommand::Authority(focal_directory::AuthorityCommand {
+            expected_revision: authority.revision,
+            enrollment_revision,
+            decided_at: now,
+            operation: focal_directory::AuthorityOperation::ChangeGroup { proof },
+        });
+        let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
+        journals.root.intend(&handles.control, command).await?;
+        Ok(Some(AgentStep::Advanced))
+    }
     async fn open_partition_journal(
         &mut self,
         handles: &NetworkHandles,
@@ -1053,8 +1297,11 @@ impl PlacementAgent {
         }
         let (identity, partition_client) = match access {
             PartitionAccess::Local(host) => (host.progress().identity, client),
-            PartitionAccess::Remote { .. } => (
-                self.remote_identity(handles, pool, delegation.log_group.0)
+            // Asked of the node this access reaches the group at: its
+            // leader where this node hosts a replica that follows (F24),
+            // the founder or a live voter otherwise — never this node.
+            PartitionAccess::Remote { target, .. } => (
+                self.remote_identity(handles, pool, *target, delegation.log_group.0)
                     .await?,
                 self.principal.0,
             ),
@@ -1249,9 +1496,9 @@ impl PlacementAgent {
         &mut self,
         handles: &NetworkHandles,
         pool: &PeerConnectionPool,
+        target: u64,
         group: [u8; 16],
     ) -> Result<focal_control::ControlIdentity, AgentError> {
-        let target = self.state.genesis.founder.node;
         match self
             .remote_read(
                 pool,
@@ -1688,6 +1935,199 @@ impl PlacementAgent {
             }
         }
     }
+    /// The root group's voters under `durability` (the audit's F24): the
+    /// voters there are, where they already tolerate the failures asked for
+    /// as a quorum (`voters_tolerance`, the rule a session's placement is
+    /// measured by); else what the directory's solver seats among the live,
+    /// eligible nodes, keeping the voters there are (`propose_placement_
+    /// keeping`), under the founder's session's residency and home regions
+    /// — the metadata bounded by the same geography as the data. Answered
+    /// from the partition as last observed and the root as observed now;
+    /// nothing is journaled, since promotion is the operator's own exact
+    /// request through the root, and the plan is read-only (doc 08 §9).
+    async fn plan_control(
+        &mut self,
+        handles: &NetworkHandles,
+        pool: &PeerConnectionPool,
+        durability: focal_directory::DurabilityIntent,
+    ) -> Result<crate::placement_control::PlannedControl, AgentError> {
+        use crate::placement_control::{PlanState, PlannedControl, PlannedPartition};
+        if durability.max_failures > u16::from(u8::MAX) {
+            return Err(AgentError::Registration(
+                SessionRegistrationError::PolicyUnsatisfied,
+            ));
+        }
+        // Not observed yet: the request waits for a pass, like a plan.
+        let Some((_, directory)) = self.last_observed.first() else {
+            return Err(AgentError::Behind);
+        };
+        let directory = directory.clone();
+        let observation = handles.control.observe_root().await?;
+        let configuration = observation.configuration();
+        let root = Self::plan_group(
+            &self.identity.ledger,
+            self.partition_config(),
+            &directory,
+            durability,
+            &configuration.configuration.voters,
+        )
+        .ok_or(AgentError::Registration(
+            SessionRegistrationError::PolicyUnsatisfied,
+        ))?;
+        // Every partition group the root grants, by the same rule (F24):
+        // its voters are the grant's, its configuration index the one its
+        // replica here applied, or the one its founder's answers with.
+        let ControlBootstrap::Root {
+            directory: root_directory,
+            ..
+        } = &observation.snapshot().state
+        else {
+            return Err(AgentError::Identity);
+        };
+        let delegations: Vec<Delegation> = root_directory.delegations.values().copied().collect();
+        let grants: Vec<(Delegation, Vec<u64>)> = delegations
+            .iter()
+            .filter_map(|delegation| {
+                observation
+                    .authority()
+                    .and_then(|authority| authority.groups.get(&delegation.log_group))
+                    .map(|grant| (*delegation, grant.voters.keys().copied().collect()))
+            })
+            .collect();
+        let mut partitions = Vec::new();
+        partitions
+            .try_reserve_exact(grants.len())
+            .map_err(|_| AgentError::Capacity)?;
+        for (delegation, current) in grants {
+            let configuration_index = match handles.directory.host_of(delegation.partition) {
+                Some(host) => {
+                    host.witness_membership()
+                        .await?
+                        .configuration
+                        .configuration_index
+                }
+                None => {
+                    let target = self.partition_target(handles, &observation, &delegation);
+                    match self
+                        .remote_read(
+                            pool,
+                            target,
+                            delegation.log_group.0,
+                            handles.directory.namespace(),
+                            ControlRead::Configuration,
+                        )
+                        .await?
+                    {
+                        ControlReadResult::Configuration(configuration)
+                            if configuration.identity.group == delegation.log_group.0 =>
+                        {
+                            configuration.configuration_index
+                        }
+                        _ => return Err(AgentError::Identity),
+                    }
+                }
+            };
+            let planned = Self::plan_group(
+                &self.identity.ledger,
+                self.partition_config(),
+                &directory,
+                durability,
+                &current,
+            );
+            partitions.push(match planned {
+                Some((voters, state)) => PlannedPartition {
+                    partition: delegation.partition.0,
+                    group: delegation.log_group.0,
+                    voters,
+                    configuration_index,
+                    state,
+                    refused: false,
+                },
+                None => PlannedPartition {
+                    partition: delegation.partition.0,
+                    group: delegation.log_group.0,
+                    voters: current,
+                    configuration_index,
+                    state: PlanState::Planned,
+                    refused: true,
+                },
+            });
+        }
+        Ok(PlannedControl {
+            voters: root.0,
+            configuration_index: configuration.configuration_index,
+            state: root.1,
+            partitions,
+        })
+    }
+    /// The voters one control group needs under `durability`: the current
+    /// ones when they already tolerate the failures asked for
+    /// (`Satisfied`), else the solver's with the current kept as incumbents
+    /// (`Planned`); `None` when no set of nodes seats it.
+    fn plan_group(
+        ledger: &LedgerId,
+        config: focal_directory::PartitionConfig,
+        directory: &PartitionCheckpoint,
+        durability: focal_directory::DurabilityIntent,
+        current: &[u64],
+    ) -> Option<(Vec<u64>, crate::placement_control::PlanState)> {
+        use crate::placement_control::PlanState;
+        let tolerance = focal_directory::voters_tolerance(
+            current.iter().copied(),
+            durability.survive,
+            &directory.nodes,
+        )
+        .ok()?;
+        if tolerance.blocked_by.is_empty()
+            && tolerance
+                .achieved
+                .is_some_and(|achieved| achieved >= durability.max_failures)
+        {
+            let mut voters = Vec::new();
+            voters.try_reserve_exact(current.len()).ok()?;
+            voters.extend_from_slice(current);
+            return Some((voters, PlanState::Satisfied));
+        }
+        let base = directory
+            .sessions
+            .get(ledger)
+            .map(|descriptor| descriptor.active.policy.clone());
+        let policy = focal_directory::PlacementPolicy {
+            durability,
+            residency: base
+                .as_ref()
+                .map(|policy| policy.residency.clone())
+                .unwrap_or_default(),
+            home_regions: base
+                .as_ref()
+                .map(|policy| policy.home_regions.clone())
+                .unwrap_or_default(),
+            required_memory: 0,
+        };
+        let incumbents: BTreeMap<u64, u64> = current
+            .iter()
+            .filter_map(|voter| {
+                directory
+                    .nodes
+                    .get(voter)
+                    .map(|node| (*voter, node.enrollment.generation))
+            })
+            .collect();
+        let proposal = focal_directory::propose_placement_keeping(
+            &directory.nodes,
+            &policy,
+            &incumbents,
+            config.max_members,
+            config.min_disk_available,
+        )
+        .ok()?;
+        let mut voters = Vec::new();
+        voters
+            .try_reserve_exact(proposal.spec.placement.voters.len())
+            .ok()?;
+        voters.extend(proposal.spec.placement.voters.keys().copied());
+        Some((voters, PlanState::Planned))
+    }
     /// The identity of an operator's plan: exact for one session, one
     /// authority record and one requested durability, so a retry finds the
     /// plan it asked for.
@@ -1861,21 +2301,70 @@ impl PlacementAgent {
                     )),
                 }
             };
-        let (_, waiters) = self
-            .plan_requests
-            .remove(&descriptor.ledger)
-            .ok_or(AgentError::Identity)?;
         match outcome {
-            Ok((planned, command)) => {
+            // A fact the directory already states, or a dry run: answered
+            // now. A plan to commit is journaled first, and its waiters are
+            // answered by the intent's outcome (`answer_plan_outcome`); a
+            // partition with an intent still pending is asked again at the
+            // next observation, with the request kept.
+            Ok((planned, Some(command))) => {
+                let partition = self.current_partition.ok_or(AgentError::Identity)?;
+                if self
+                    .journals
+                    .as_ref()
+                    .and_then(|journals| journals.partitions.get(&partition))
+                    .is_some_and(|journal| journal.pending().is_some())
+                {
+                    return Ok(None);
+                }
+                let (durability, waiters) = self
+                    .plan_requests
+                    .remove(&descriptor.ledger)
+                    .ok_or(AgentError::Identity)?;
+                let mut waiting = Vec::new();
+                waiting
+                    .try_reserve(waiters.len())
+                    .map_err(|_| AgentError::Capacity)?;
+                for (waiter, dry_run) in waiters {
+                    if dry_run {
+                        let _ = waiter.send(Ok(planned.clone()));
+                    } else {
+                        waiting.push((waiter, dry_run));
+                    }
+                }
+                if !waiting.is_empty() {
+                    self.plan_requests
+                        .insert(descriptor.ledger, (durability, waiting));
+                }
+                match self.intend_partition(handles, command).await {
+                    Ok(step) => Ok(Some(step)),
+                    Err(error) => {
+                        // Not journaled: the waiters hear it, and the
+                        // request is gone with them.
+                        if let Some((_, waiters)) = self.plan_requests.remove(&descriptor.ledger) {
+                            for (waiter, _) in waiters {
+                                let _ = waiter.send(Err(AgentError::Identity));
+                            }
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Ok((planned, None)) => {
+                let (_, waiters) = self
+                    .plan_requests
+                    .remove(&descriptor.ledger)
+                    .ok_or(AgentError::Identity)?;
                 for (waiter, _) in waiters {
                     let _ = waiter.send(Ok(planned.clone()));
                 }
-                match command {
-                    Some(command) => self.intend_partition(handles, command).await.map(Some),
-                    None => Ok(None),
-                }
+                Ok(None)
             }
             Err(error) => {
+                let (_, waiters) = self
+                    .plan_requests
+                    .remove(&descriptor.ledger)
+                    .ok_or(AgentError::Identity)?;
                 for (waiter, _) in waiters {
                     let _ = waiter.send(Err(AgentError::Registration(
                         SessionRegistrationError::PolicyUnsatisfied,
@@ -2317,16 +2806,14 @@ impl PlacementAgent {
         };
         let generation = record.enrollment.generation;
         let partition = self.current_partition.ok_or(AgentError::Identity)?;
-        let due = match (self.last_load.get(&partition).copied(), record.load) {
-            (_, None) => true,
-            (None, Some(_)) => true,
-            (Some((at, reported)), Some(load)) => {
-                reported != generation
-                    || load.generation != generation
-                    || now.saturating_sub(at) >= LOAD_INTERVAL
-            }
-        };
-        if !due {
+        let capability = crate::upgrade::announced_level();
+        if !load_due(
+            self.last_load.get(&partition).copied(),
+            record.load,
+            generation,
+            capability,
+            now,
+        ) {
             return Ok(None);
         }
         let stats = self.node_budget.stats();
@@ -2346,7 +2833,7 @@ impl PlacementAgent {
             // Free bytes of the data volume that no queued durable write has
             // been promised, as the disk envelope estimates them.
             disk_available: self.wal.available_bytes().unwrap_or(0),
-            capability: crate::upgrade::announced_level(),
+            capability,
         };
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
             command: PartitionCommand {
@@ -2364,7 +2851,9 @@ impl PlacementAgent {
         if snapshot.revisions.partition != directory.revision {
             return Err(AgentError::Identity);
         }
-        self.last_load.insert(partition, (now, generation));
+        // Counted as reported once it commits (`note_load`): a report the
+        // owner refuses on a stale compare is planned again at the next
+        // pass from a fresh observation, never held for an interval.
         self.intend_partition(handles, command).await.map(Some)
     }
     /// Install the copy a plan assigns to this node and report `Installed`.
@@ -2677,10 +3166,16 @@ impl PlacementAgent {
         } = request;
         let mut collected = Collected::new(voters.len())?;
         let node = self.state.node;
-        if voters.contains(&node) && handles.fleet.hosts(ledger) {
+        // This node signs first where it hosts the log: a session's copy, or
+        // its replica of a partition group under the directory's namespace.
+        let hosts = handles.fleet.hosts(ledger)
+            || (ledger == handles.directory.namespace()
+                && handles.directory.host_of_group(group).is_some());
+        if voters.contains(&node) && hosts {
             let permit = crate::placement_control::prepare_session_fact(
                 &handles.fleet,
                 &handles.control,
+                &handles.directory,
                 ledger,
                 fact.clone(),
                 window,
@@ -2745,21 +3240,81 @@ impl PlacementAgent {
                 .unwrap_or_default(),
             last_error: self.last_error.as_ref().map(|error| error.to_string()),
             last_refusal: self.last_refusal.clone(),
+            retrying: self.retrying.as_ref().map(Retrying::describe),
         }
     }
-    /// Keep the last refused intent visible; a committed one clears it.
+    /// Keep the last refused intent visible, a committed one clearing it,
+    /// and the intent still undecided with how often it was asked.
     fn note_intent(
         &mut self,
+        journal: IntentJournalKind,
         kind: &'static str,
+        sequence: u64,
         outcome: &crate::placement_journal::IntentOutcome,
     ) {
         use crate::placement_journal::IntentOutcome;
         match outcome {
-            IntentOutcome::Committed(_) => self.last_refusal = None,
+            IntentOutcome::Committed(_) | IntentOutcome::Refused(_) => {
+                if self
+                    .retrying
+                    .as_ref()
+                    .is_some_and(|retrying| retrying.journal == journal)
+                {
+                    self.retrying = None;
+                }
+            }
+            IntentOutcome::Retry(failure) => {
+                let asked = match &self.retrying {
+                    Some(retrying)
+                        if retrying.journal == journal && retrying.sequence == sequence =>
+                    {
+                        retrying.asked.saturating_add(1)
+                    }
+                    _ => 1,
+                };
+                self.retrying = Some(Retrying {
+                    journal,
+                    kind,
+                    sequence,
+                    asked,
+                    last: *failure,
+                });
+            }
+        }
+        match outcome {
+            IntentOutcome::Committed(_) if self.last_refusal_kind == Some(kind) => {
+                self.last_refusal = None;
+                self.last_refusal_kind = None;
+            }
+            IntentOutcome::Committed(_) | IntentOutcome::Retry(_) => {}
             IntentOutcome::Refused(failure) => {
                 self.last_refusal = Some(format!("{kind}: {failure}"));
+                self.last_refusal_kind = Some(kind);
             }
-            IntentOutcome::Retry => {}
+        }
+    }
+    /// Answer the operators waiting on a session plan by the intent's
+    /// outcome (24 §16): `planned` once the plan committed — the directory
+    /// pends it now — and the refusal itself when the partition refused it
+    /// (an observation gone stale), so an operator told `planned` is never
+    /// left waiting on a plan that was lost.
+    fn answer_plan_outcome(
+        &mut self,
+        planned: Option<(LedgerId, focal_directory::OperationId, Vec<u64>)>,
+        outcome: &crate::placement_journal::IntentOutcome,
+    ) {
+        let Some(planned) = planned else {
+            return;
+        };
+        if plan_answer(&planned, outcome).is_none() {
+            return;
+        }
+        if let Some((_, waiters)) = self.plan_requests.remove(&planned.0) {
+            for (waiter, _) in waiters {
+                if let Some(answer) = plan_answer(&planned, outcome) {
+                    let _ = waiter.send(answer);
+                }
+            }
         }
     }
     pub fn node(&self) -> u64 {
@@ -2789,7 +3344,24 @@ async fn submit_partition(
     request: ControlRequest,
 ) -> Result<ControlReceipt, ControlFailure> {
     match access {
-        PartitionAccess::Local(host) => host.submit(peer, request).await,
+        PartitionAccess::Local(host) => {
+            // The intent is presented as the client it was journaled under:
+            // this node's principal while its replica followed the group
+            // (submitted through the leader, 24 §16), its local client while
+            // it led. Leadership may have moved between the two — a seated
+            // member that came to lead resubmits what it journaled as a
+            // follower — and the local ingress binds a request to its own
+            // client, so a peer built from the other client was refused
+            // every time (2026-10-02).
+            let own = AuthenticatedPeer::local(PeerGrant {
+                principal: ParticipantId(request.id.client),
+                tenants: BTreeSet::from([namespace.tenant]),
+                role: PeerRole::Runtime,
+            })
+            .map_err(|_| ControlFailure::Unauthorized)?;
+            drop(peer);
+            host.submit(own, request).await
+        }
         PartitionAccess::Remote { target, group } => {
             let id = RequestId::from_u128(u128::from(request.id.sequence));
             let body = ControlRpc::Submit(request)
@@ -2847,6 +3419,141 @@ pub mod split;
 pub(crate) mod tests;
 
 /// A bounded name for an intent's command, for diagnostics.
+/// What a session plan's waiters hear from its intent's outcome (24 §16):
+/// `planned` once it committed — the directory pends it from that commit —
+/// the refusal itself when the partition refused it, and nothing while it
+/// is still retried.
+fn plan_answer(
+    planned: &(LedgerId, focal_directory::OperationId, Vec<u64>),
+    outcome: &crate::placement_journal::IntentOutcome,
+) -> Option<Result<PlannedSession, AgentError>> {
+    use crate::placement_journal::IntentOutcome;
+    let (ledger, operation, voters) = planned;
+    match outcome {
+        IntentOutcome::Committed(_) => Some(Ok(PlannedSession {
+            ledger: *ledger,
+            operation: *operation,
+            voters: voters.clone(),
+            state: PlanState::Planned,
+        })),
+        IntentOutcome::Refused(failure) => Some(Err(AgentError::Control(*failure))),
+        IntentOutcome::Retry(_) => None,
+    }
+}
+/// The session plan a journaled intent carries, if it is one: whose
+/// waiters its outcome answers (`answer_plan_outcome`).
+fn planned_session_of(
+    command: &ControlCommand,
+) -> Option<(LedgerId, focal_directory::OperationId, Vec<u64>)> {
+    let ControlCommand::VerifiedPartition(command) = command else {
+        return None;
+    };
+    let PartitionOperation::Session {
+        ledger,
+        change: SessionChange::Plan {
+            operation, desired, ..
+        },
+        ..
+    } = &command.command.operation
+    else {
+        return None;
+    };
+    Some((
+        *ledger,
+        *operation,
+        desired.placement.voters.keys().copied().collect(),
+    ))
+}
+/// Whether this node's load report to a partition is due: `last` is the
+/// time and generation of its last committed report there, `committed` the
+/// load the directory holds. The facts the cluster gates on — the
+/// generation, the level the upgrade fence waits for (24 §21) — are due
+/// until the directory holds this node's own; the rest refresh once an
+/// interval. A report the previous process journaled may commit after a
+/// restart with the level that process announced, and is followed at once.
+fn load_due(
+    last: Option<(i64, u64)>,
+    committed: Option<NodeLoad>,
+    generation: u64,
+    capability: u32,
+    now: i64,
+) -> bool {
+    match (last, committed) {
+        (_, None) | (None, Some(_)) => true,
+        (Some((at, reported)), Some(load)) => {
+            reported != generation
+                || load.generation != generation
+                || load.capability != capability
+                || now.saturating_sub(at) >= LOAD_INTERVAL
+        }
+    }
+}
+/// What a load report's intent established (`reported`: its generation, when
+/// the intent was one): a committed report starts the interval; a refused
+/// one — a compare gone stale — leaves the report due at the next pass; an
+/// undecided one is asked again and changes nothing.
+fn note_load(
+    last_load: &mut BTreeMap<PartitionId, (i64, u64)>,
+    partition: PartitionId,
+    reported: Option<u64>,
+    outcome: &crate::placement_journal::IntentOutcome,
+    now: i64,
+) {
+    use crate::placement_journal::IntentOutcome;
+    let Some(generation) = reported else {
+        return;
+    };
+    match outcome {
+        IntentOutcome::Committed(_) => {
+            last_load.insert(partition, (now, generation));
+        }
+        IntentOutcome::Refused(_) => {
+            last_load.remove(&partition);
+        }
+        IntentOutcome::Retry(_) => {}
+    }
+}
+/// The generation a pending load report reports at, when the intent is one.
+fn reported_load(command: &ControlCommand) -> Option<u64> {
+    match command {
+        ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
+            command:
+                PartitionCommand {
+                    operation: PartitionOperation::ReportLoad { load },
+                    ..
+                },
+            ..
+        }) => Some(load.generation),
+        _ => None,
+    }
+}
+/// Which of the agent's journals an intent waits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentJournalKind {
+    Root,
+    Partition,
+}
+/// An intent its owner has not decided yet (24 §7).
+#[derive(Debug, Clone, Copy)]
+struct Retrying {
+    journal: IntentJournalKind,
+    kind: &'static str,
+    sequence: u64,
+    asked: u64,
+    last: ControlFailure,
+}
+impl Retrying {
+    fn describe(&self) -> String {
+        let journal = match self.journal {
+            IntentJournalKind::Root => "root",
+            IntentJournalKind::Partition => "partition",
+        };
+        format!(
+            "{journal} intent {} ({}): asked {} times, last answer: {}",
+            self.sequence, self.kind, self.asked, self.last
+        )
+    }
+}
 fn intent_kind(command: &ControlCommand) -> &'static str {
     match command {
         ControlCommand::Root(_) => "root",
@@ -2860,6 +3567,7 @@ fn intent_kind(command: &ControlCommand) -> &'static str {
                 "authority bootstrap group"
             }
             focal_directory::AuthorityOperation::ChangeGroup { .. } => "authority change group",
+            focal_directory::AuthorityOperation::ReleaseGroup { .. } => "authority release group",
         },
         ControlCommand::VerifiedRoot(_) => "verified root",
         ControlCommand::VerifiedPartition(command) => match &command.command.operation {

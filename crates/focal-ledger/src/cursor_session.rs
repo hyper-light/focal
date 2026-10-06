@@ -60,6 +60,7 @@ struct SnapshotEnvelopeV2 {
     schema: u16,
     ledger: LedgerId,
     raft_index: u64,
+    #[serde(with = "focal_memory::serde_bytes")]
     core: Vec<u8>,
     cursors: CursorCheckpoint,
     cursor_meta: CursorMetadata,
@@ -75,10 +76,40 @@ struct SnapshotEnvelopeV3 {
 struct CursorCandidate {
     entry_hash: ContentHash,
     prepared: PreparedCursorUpdate,
-    metadata: CursorMetadata,
     receipt: CursorReceipt,
-    metadata_charge: Allocation,
+    /// The consumer this command names first, and who names it: its owner
+    /// once the command applies.
+    owner: Option<(ConsumerId, ParticipantId)>,
+    /// The receipt's entry and the owner's, admitted before proposal and
+    /// joined to the metadata's charge at apply — never a copy of the maps
+    /// (the audit's F61).
+    entry_charge: Allocation,
     result_charge: Allocation,
+}
+
+/// What the cursor metadata holds for one receipt, and for one owner:
+/// entries are charged as they arrive and released as they leave.
+fn receipt_entry_charge(key: &RequestKey, receipt: &CursorReceipt) -> Result<usize, LedgerError> {
+    Ok(reference_charge(&(key, receipt))?)
+}
+fn owner_entry_charge(consumer: &ConsumerId, principal: &ParticipantId) -> Result<usize, LedgerError> {
+    Ok(reference_charge(&(consumer, principal))?)
+}
+/// The metadata's charge as its entries sum: what a restored metadata is
+/// charged, and what the per-entry charges keep it at.
+fn metadata_charge(metadata: &CursorMetadata) -> Result<usize, LedgerError> {
+    let mut charge = reference_charge(&CursorMetadata::default())?;
+    for (key, receipt) in &metadata.receipts {
+        charge = charge
+            .checked_add(receipt_entry_charge(key, receipt)?)
+            .ok_or(LedgerError::Capacity)?;
+    }
+    for (consumer, principal) in &metadata.owners {
+        charge = charge
+            .checked_add(owner_entry_charge(consumer, principal)?)
+            .ok_or(LedgerError::Capacity)?;
+    }
+    Ok(charge)
 }
 
 impl Session {
@@ -135,8 +166,9 @@ impl Session {
         input: &CursorInput,
         control: bool,
     ) -> Result<CursorSubmission, LedgerError> {
-        let status = self.status();
-        if status.voters != [status.node_id] || !status.learners.is_empty() {
+        let status = self.scalars();
+        let members = self.members();
+        if members.voters != [status.node_id] || !members.learners.is_empty() {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
             });
@@ -161,7 +193,7 @@ impl Session {
         control: bool,
     ) -> Result<CursorSubmission, LedgerError> {
         self.check()?;
-        let status = self.status();
+        let status = self.scalars();
         if status.role != StateRole::Leader || self.ready_term != Some(status.term) {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
@@ -329,16 +361,13 @@ impl Session {
             }
             _ => {}
         }
-        let meta_bytes = reference_charge(&self.cursor_meta)?
-            .checked_add(reference_charge(input)?)
-            .and_then(|n| {
-                n.checked_add(self.placement_charge.as_ref().map_or(0, Allocation::bytes))
-            })
+        let scratch_bytes = reference_charge(input)?
+            .checked_add(self.placement_charge.as_ref().map_or(0, Allocation::bytes))
             .and_then(|n| n.checked_mul(3))
             .ok_or(LedgerError::Capacity)?;
         let _scratch =
             self.budget
-                .reserve(BudgetKind::Pending, BudgetLane::Completion, meta_bytes)?;
+                .reserve(BudgetKind::Pending, BudgetLane::Completion, scratch_bytes)?;
         // Positions are validated against the stream line, not the legacy
         // domain sequence; the receipt keeps naming the domain sequence.
         let published = self.stream_published();
@@ -353,30 +382,24 @@ impl Session {
             ledger: self.ledger,
             key: input.key,
             intent_hash: input.intent_hash,
-            revision: prepared.checkpoint().revision,
+            revision: prepared.revision(),
             domain_sequence: self.sequence(),
             raft_index: 0,
-            floor: envelope.replay_floor.max(prepared.checkpoint().floor),
-            record: consumer.and_then(|id| prepared.checkpoint().consumers.get(&id).cloned()),
+            floor: envelope.replay_floor.max(prepared.floor()),
+            record: consumer.and_then(|id| self.cursors.projected(&prepared, id)),
         };
-        let mut metadata = CursorMetadata {
-            receipts: self.cursor_meta.receipts.clone(),
-            owners: self.cursor_meta.owners.clone(),
-        };
-        if let Some(consumer) = consumer {
-            metadata
-                .owners
-                .entry(consumer)
-                .or_insert(input.key.principal);
-        }
-        metadata.receipts.insert(input.key, receipt.clone());
-        let metadata_charge = self
+        // A consumer named for the first time is owned by its principal.
+        let owner = consumer
+            .filter(|id| self.cursor_owner(*id).is_none())
+            .map(|id| (id, input.key.principal));
+        let entry_bytes = receipt_entry_charge(&input.key, &receipt)?
+            .checked_add(owner.map_or(Ok(0), |(id, principal)| {
+                owner_entry_charge(&id, &principal)
+            })?)
+            .ok_or(LedgerError::Capacity)?;
+        let entry_charge = self
             .budget
-            .reserve(
-                BudgetKind::ReadPins,
-                BudgetLane::Completion,
-                reference_charge(&metadata)?,
-            )?
+            .reserve(BudgetKind::ReadPins, BudgetLane::Completion, entry_bytes)?
             .commit();
         let result_charge = self
             .budget
@@ -389,11 +412,23 @@ impl Session {
         Ok(CursorCandidate {
             entry_hash,
             prepared,
-            metadata,
             receipt,
-            metadata_charge,
+            owner,
+            entry_charge,
             result_charge,
         })
+    }
+    /// A retired consumer's name is free: its owner leaves with its row, so
+    /// whoever registers the name next owns it.
+    fn retire_owners(&mut self, retired: &[ConsumerId]) -> Result<(), LedgerError> {
+        for consumer in retired {
+            if let Some(principal) = self.cursor_meta.owners.remove(consumer) {
+                let bytes = owner_entry_charge(consumer, &principal)?;
+                self.cursor_charge
+                    .shrink_to(self.cursor_charge.bytes().saturating_sub(bytes))?;
+            }
+        }
+        Ok(())
     }
     fn apply_cursor_entry(
         &mut self,
@@ -402,7 +437,7 @@ impl Session {
     ) -> Result<(CursorReceipt, Allocation), LedgerError> {
         self.pending_maintenance = None;
         let digest = ContentHash(*blake3::hash(data).as_bytes());
-        let mut candidate = if self
+        let candidate = if self
             .pending_cursor
             .as_ref()
             .is_some_and(|p| p.entry_hash == digest)
@@ -450,20 +485,25 @@ impl Session {
         // computed identically on every replica (23 §6); the candidate's
         // proposal-time value bounded the positions it validated.
         let published = self.stream_published();
-        candidate.receipt.raft_index = raft_index;
-        candidate.receipt.domain_sequence = published;
-        let stored = candidate
-            .metadata
-            .receipts
-            .get_mut(&candidate.receipt.key)
-            .ok_or(LedgerError::Corrupt)?;
-        stored.raft_index = raft_index;
-        stored.domain_sequence = published;
-        self.cursors.publish(candidate.prepared)?;
-        self.cursor_meta = candidate.metadata;
-        self.cursor_charge = candidate.metadata_charge;
-        self.retire_deltas(candidate.receipt.floor)?;
-        Ok((candidate.receipt, candidate.result_charge))
+        let CursorCandidate {
+            prepared,
+            mut receipt,
+            owner,
+            mut entry_charge,
+            result_charge,
+            ..
+        } = candidate;
+        receipt.raft_index = raft_index;
+        receipt.domain_sequence = published;
+        let retired = self.cursors.publish(prepared)?;
+        self.retire_owners(&retired)?;
+        if let Some((consumer, principal)) = owner {
+            self.cursor_meta.owners.entry(consumer).or_insert(principal);
+        }
+        self.cursor_meta.receipts.insert(receipt.key, receipt.clone());
+        self.cursor_charge.absorb(&mut entry_charge)?;
+        self.retire_deltas(receipt.floor)?;
+        Ok((receipt, result_charge))
     }
 
     // Whole transactions are retired atomically. A partial transaction cursor
@@ -606,11 +646,18 @@ impl Session {
         retain_bytes: bool,
     ) -> Result<Option<EncodedCheckpoint>, LedgerError> {
         self.check()?;
-        if self.pending_managed.is_some()
-            || !self.pending.is_empty()
-            || self.pending_cursor.is_some()
-            || self.pending_maintenance.is_some()
-            || self.pending_membership.is_some()
+        // A checkpoint is of the applied prefix, and a proposal in flight is
+        // above it, in the log the checkpoint leaves: a domain candidate, a
+        // managed or cursor command or a cursor maintenance changes the core,
+        // the graph, the deltas, the cursors or the request streams only
+        // when it applies (each is prepared from a copy), so it neither waits
+        // for nor holds back the checkpoint. A replica a steady load kept
+        // with some proposal pending checkpointed only at a period that
+        // found none, and kept 182 entries past a cadence of 32 (26 §3). A
+        // delivery under way is the prefix itself moving; a membership,
+        // placement, evidence or activation record still in flight is rare,
+        // one at a time and short, and waits as before.
+        if self.pending_membership.is_some()
             || self.pending_placement.is_some()
             || self.pending_evidence.is_some()
             || self.pending_activation.is_some()
@@ -1021,7 +1068,7 @@ impl Session {
             .reserve(
                 BudgetKind::ReadPins,
                 BudgetLane::Completion,
-                reference_charge(&envelope.cursor_meta)?,
+                metadata_charge(&envelope.cursor_meta)?,
             )?
             .commit();
         let graph = GraphStore::from_state(

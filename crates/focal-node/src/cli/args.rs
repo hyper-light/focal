@@ -576,6 +576,35 @@ pub(crate) enum GetCommand {
     /// Read the requirement and a page of recorded runs and verdict attempts.
     Validation(GetValidationArgs),
     Artifact(GetArtifactArgs),
+    /// Native engine: one object of a claim's family wherever the family is
+    /// — from the ledger while it is live, from its archive bundle once it
+    /// retired.
+    Archived(GetArchivedArgs),
+}
+#[derive(Args)]
+pub(crate) struct GetArchivedArgs {
+    /// The claim whose family holds the object.
+    pub claim: String,
+    /// An artifact of the family, by its ID.
+    #[arg(long, conflicts_with_all = ["work", "diagnostic", "validation", "testament", "receipt"])]
+    pub artifact: Option<String>,
+    /// A work artifact of the family, by its ID.
+    #[arg(long, conflicts_with_all = ["diagnostic", "validation", "testament", "receipt"])]
+    pub work: Option<String>,
+    /// A diagnostic of the family, by its ID.
+    #[arg(long, conflicts_with_all = ["validation", "testament", "receipt"])]
+    pub diagnostic: Option<String>,
+    /// A validation declared under the claim, by its ID.
+    #[arg(long, conflicts_with_all = ["testament", "receipt"])]
+    pub validation: Option<String>,
+    /// A testament of the family, by its ID.
+    #[arg(long, conflicts_with = "receipt")]
+    pub testament: Option<String>,
+    /// A receipt of the family, by its ID.
+    #[arg(long)]
+    pub receipt: Option<String>,
+    #[command(flatten)]
+    pub output: OutputOptions,
 }
 #[derive(Args)]
 pub(crate) struct GetValidationArgs {

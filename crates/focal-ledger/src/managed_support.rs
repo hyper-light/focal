@@ -17,6 +17,18 @@ struct ManagedSupportCache {
     _native_charge: Option<Allocation>,
 }
 impl Session {
+    /// The decoder promises this replica holds (24 §21; the audit's F24):
+    /// the configuration index they were recorded at, the peers that
+    /// promised the managed baseline and those that promised the native
+    /// successor. What a learner's admission and a voter's promotion wait
+    /// on, for the diagnostics that say why one is held.
+    pub fn promises(&self) -> (Option<u64>, &[u64], &[u64]) {
+        (
+            self.managed_support.configuration_index,
+            &self.managed_support.nodes,
+            &self.managed_support.native_nodes,
+        )
+    }
     /// The compiled immutable managed decoder descriptor; inspecting it never
     /// requests the irreversible durable floor or activates managed admission.
     pub fn managed_decoder_hash() -> [u8; 32] {
@@ -30,7 +42,7 @@ impl Session {
         if self.consensus.decoder_floor_ready(managed_format_hash()) {
             return Ok(());
         }
-        if message.to != self.status().node_id || message.from == 0 {
+        if message.to != self.scalars().node_id || message.from == 0 {
             return Err(
                 ConsensusError::Configuration("wrong destination or missing sender").into(),
             );
@@ -39,7 +51,7 @@ impl Session {
             entry.data.starts_with(MANAGED_DOMAIN_MAGIC)
                 || entry.data.starts_with(MANAGED_CURSOR_MAGIC)
                 || entry.data.starts_with(REQUEST_STREAM_MAGIC)
-        }) || message.get_snapshot().data.starts_with(SNAPSHOT_V5_MAGIC);
+        }) || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V5_MAGIC));
         if managed {
             // Existing learners need not have participated in the initial voter
             // support barrier. Fence their first managed packet before Raft can
@@ -83,7 +95,7 @@ impl Session {
     }
 
     pub fn needs_managed_support(&self, node: u64) -> bool {
-        node != self.status().node_id
+        node != self.scalars().node_id
             && (self.managed_support.configuration_index
                 != Some(self.membership_state.configuration_index)
                 || !self.managed_support.nodes.contains(&node)
@@ -113,7 +125,7 @@ impl Session {
         if current.configuration.voters.is_empty() {
             return Err(ManagedError::Unsupported.into());
         }
-        let local = self.status().node_id;
+        let local = self.scalars().node_id;
         for node in current
             .configuration
             .voters
@@ -154,7 +166,7 @@ impl Session {
             cluster: self.cluster_id(),
             ledger: self.ledger,
             group: self.group_id(),
-            node: self.status().node_id,
+            node: self.scalars().node_id,
             configuration_index: membership.configuration_index,
             voters: configuration.voters,
             voters_outgoing: configuration.voters_outgoing,
@@ -289,7 +301,7 @@ impl Session {
         if self.managed_protocol_active() {
             return Ok(());
         }
-        let local = self.status().node_id;
+        let local = self.scalars().node_id;
         for node in current
             .configuration
             .voters

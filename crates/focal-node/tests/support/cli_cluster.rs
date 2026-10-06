@@ -1,8 +1,12 @@
 use super::*;
-use std::time::Instant;
 
+/// Asked again until `condition` holds, the wait charged to the periods the
+/// asked node's root owner runs (`root_periods`).
 fn eventually(root: &Path, args: &[&str], condition: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut wait = super::progress::Progress::begin(
+        vec![Box::new(root_periods(root))],
+        Duration::from_secs(20),
+    );
     loop {
         let output = command(root, args);
         if output.status.success() {
@@ -11,11 +15,12 @@ fn eventually(root: &Path, args: &[&str], condition: impl Fn(&Value) -> bool) ->
                 return value;
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "cluster did not converge: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if let Some(spent) = wait.spent() {
+            panic!(
+                "cluster did not converge: {spent}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }

@@ -18,11 +18,13 @@ mod catalog_transfer;
 mod catalog_watch;
 pub use admin::{AdminAction, AdminBackend, AdminChange, AdminError};
 mod catalog;
+mod code;
 mod codec;
 mod json;
 mod protocol;
 #[cfg(test)]
 mod skill_contract_tests;
+mod skills;
 mod stdio;
 #[cfg(all(test, unix))]
 mod stdio_tests;
@@ -32,7 +34,7 @@ mod tests;
 pub use backend::{Backend, JournalError, NativeJournal};
 pub use codec::{EncodedFrame, FrameDecoder, InputFrame};
 pub use protocol::{Action, CallToken, Protocol, ServerInfo, Tool, ToolCall};
-pub use stdio::{ServeError, serve};
+pub use stdio::{ServeError, run_code, serve};
 
 pub const MODERN_VERSION: &str = "2026-07-28";
 pub const LEGACY_VERSION: &str = "2025-11-25";

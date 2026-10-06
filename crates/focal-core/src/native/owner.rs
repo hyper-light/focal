@@ -427,6 +427,13 @@ struct Pending {
 /// protects bounded RAM/report slots; disk capacity and durable reconstruction
 /// still require the enclosing log/custody owner.
 /// A durable owner must retain it while append/commit status is unresolved.
+/// [`NativeOwner::checkpoint_projection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointProjection {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
 pub struct NativeOwner {
     // Drop buffers and retained pages before releasing their queue allowance.
     pending: VecDeque<Pending>,
@@ -940,6 +947,54 @@ impl NativeOwner {
         &self.core
     }
 
+    /// The most a checkpoint of the committed root, with every pending
+    /// candidate published, could take: its rows (the committed rows and
+    /// every pending candidate's writes, each at most one new row) and an
+    /// upper bound of its encoded bytes (a frame header, every row at its
+    /// widest inline encoding, and the rows' heap at the codec's expansion). A session refuses fresh work whose
+    /// projection its checkpoint could not hold, typed at admission, so that
+    /// what it admitted it can always checkpoint (rule 2) instead of failing
+    /// that checkpoint and stopping.
+    pub fn checkpoint_projection(&self) -> Result<CheckpointProjection, NativeOwnerError> {
+        let capacity =
+            |_: ()| NativeOwnerError::Native(NativeError::Capacity("checkpoint projection"));
+        let rows = self
+            .pending
+            .iter()
+            .try_fold(self.core.state.rows.len(), |rows, pending| {
+                rows.checked_add(pending.prepared.mutation_count())
+            })
+            .ok_or_else(|| capacity(()))?;
+        // The rows' variable bodies: a page is charged its entries inline and
+        // their heap (`RangeStore`'s page charge), so the pages' charge less
+        // the committed rows' inline size bounds the committed heap from
+        // above; a pending candidate's rows are charged as pending. Neither
+        // counts the indexes, recovery or allocator bookkeeping a root also
+        // charges, which a checkpoint does not carry.
+        let stats = self.core.native_budget();
+        let committed_inline = self
+            .core
+            .state
+            .rows
+            .len()
+            .checked_mul(super::NATIVE_ENTRY_BYTES)
+            .ok_or_else(|| capacity(()))?;
+        let heap = stats
+            .used_by(focal_memory::BudgetKind::Pages)
+            .saturating_sub(committed_inline)
+            .checked_add(stats.used_by(focal_memory::BudgetKind::Pending))
+            .ok_or_else(|| capacity(()))?;
+        let bytes = rows
+            .checked_mul(record_codec::row_fixed_bytes())
+            .and_then(|fixed| {
+                heap.checked_mul(record_codec::HEAP_EXPANSION)
+                    .and_then(|heap| fixed.checked_add(heap))
+            })
+            .and_then(|body| body.checked_add(record_codec::header_fixed_bytes()))
+            .ok_or_else(|| capacity(()))?;
+        Ok(CheckpointProjection { rows, bytes })
+    }
+
     /// The range layout the committed rows are held in (25 §4).
     pub fn native_layout(&self) -> &ranges::RangeLayout {
         self.core.native_layout()
@@ -983,6 +1038,38 @@ impl NativeOwner {
         if self.faulted {
             return Err(NativeError::Capacity("completion owner requires reconstruction").into());
         }
+        Ok(())
+    }
+
+    /// Whether one family may retire now (26 §4): nothing pending, the
+    /// owner sound, and the outcome and sequence the retirement publishes
+    /// to spare beyond those the book holds for the reports it promised and
+    /// the one control it keeps for an authority decision — the check every
+    /// fresh candidate passes. [`Core::retirement_family`] checks the bound
+    /// alone; this is the bound less what is promised, so a retirement never
+    /// takes the outcome a live report was admitted against, and the owner
+    /// rebuilt over the retired core admits every report it promised. A
+    /// refusal of the book is `Capacity`, as for a candidate; a faulted
+    /// owner refuses the same way, as it refuses every fresh candidate.
+    pub fn check_retirement(&self) -> Result<(), NativeOwnerError> {
+        self.check_layout_change()?;
+        let view = View {
+            state: &self.core.state,
+            tail: None,
+        };
+        let mut meta = view.meta();
+        meta.outcomes = meta
+            .outcomes
+            .checked_add(1)
+            .ok_or(NativeError::Capacity("outcomes"))?;
+        let sequence = SessionSeq(
+            view.prefix()
+                .0
+                .checked_add(1)
+                .ok_or(NativeError::Capacity("sequence"))?,
+        );
+        self.book
+            .check_slots(meta, sequence, self.core.state.rows.len())?;
         Ok(())
     }
 

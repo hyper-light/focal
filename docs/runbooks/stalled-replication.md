@@ -5,18 +5,18 @@ or cut off, while the leader and the other voters go on.
 
 **Symptoms.** `cluster placement` shows the node `alive: false` once the failure detector
 confirms it ([24 §12](../archictecutre/24-placement-execution-and-fleet-control.md)) and the
-session's guarantee `blocked_by` that member; `cluster replicas diagnostics --session ID`
+session's guarantee `blocked_by` that member; `diagnose cluster --replicas --session ID`
 on the stalled node shows `applied_index` frozen while the leader's advances;
-`focal_session_apply_lag` and `focal_liveness_members{status="suspect"}` in `cluster node
-metrics`. Writes still commit while a majority of voters applies.
+`focal_session_apply_lag` and `focal_liveness_members{status="suspect"}` in `diagnose node
+--metrics`. Writes still commit while a majority of voters applies.
 
 **Read-only diagnostics.**
 
 ```sh
 focal --data-dir DIR cluster placement
-focal --data-dir DIR cluster replicas diagnostics --session ID      # on the leader and the stalled node
-focal --data-dir DIR cluster node readiness                          # catching_up, authoritative
-focal --data-dir DIR cluster node metrics | grep -E 'apply_lag|liveness'
+focal --data-dir DIR diagnose cluster --replicas --session ID      # on the leader and the stalled node
+focal --data-dir DIR diagnose node --readiness                          # catching_up, authoritative
+focal --data-dir DIR diagnose node --metrics | grep -E 'apply_lag|liveness'
 ```
 
 **Preconditions.** A majority of the session's voters is healthy; otherwise the session is

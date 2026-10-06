@@ -16,10 +16,154 @@ pub(super) struct DecoderPair {
     pub(super) predecessor: [u8; 32],
     pub(super) successor: [u8; 32],
 }
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum FloorWrite {
+/// A write of the group's decoder records: its floor, or its one transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FloorWrite {
     Baseline([u8; 32]),
     Transition(DecoderPair),
+}
+
+/// What a group's records state of the decoders its entries need, and what its application
+/// confirmed it compiled: the gate both backends keep ([27] §15.7), each making the records
+/// durable its own way.
+///
+/// [27]: ../../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
+#[derive(Debug, Default)]
+pub(super) struct DecoderGate {
+    /// The floor the group's records state durable.
+    pub(super) required: Option<[u8; 32]>,
+    /// The application's compiled decoder, confirmed.
+    confirmed: Option<[u8; 32]>,
+    /// The compiled ordered pair the application registered.
+    compiled: Option<DecoderPair>,
+    /// The transition the group's records state durable.
+    pub(super) transition: Option<DecoderPair>,
+}
+
+impl DecoderGate {
+    /// The gate of a group whose records state `required` and `transition`, before its
+    /// application confirms anything.
+    pub(super) fn new(required: Option<[u8; 32]>, transition: Option<DecoderPair>) -> Self {
+        Self {
+            required,
+            confirmed: None,
+            compiled: None,
+            transition,
+        }
+    }
+    /// The application's compiled decoder. A single hash cannot confirm recovery containing a
+    /// decoder transition, even when that hash equals the effective successor requirement.
+    pub(super) fn confirm(&mut self, hash: [u8; 32]) -> Result<(), ConsensusError> {
+        if self.required.is_some_and(|required| required != hash)
+            || self.confirmed.is_some_and(|confirmed| confirmed != hash)
+            || self
+                .transition
+                .is_some_and(|pair| self.compiled != Some(pair))
+        {
+            return Err(ConsensusError::DecoderMismatch);
+        }
+        self.confirmed = Some(hash);
+        Ok(())
+    }
+    /// The application's compiled ordered pair. A matching single predecessor registration may
+    /// be widened once.
+    pub(super) fn confirm_pair(
+        &mut self,
+        predecessor: [u8; 32],
+        successor: [u8; 32],
+    ) -> Result<(), ConsensusError> {
+        let pair = DecoderPair {
+            predecessor,
+            successor,
+        };
+        if predecessor == successor
+            || self.required.is_some_and(|hash| hash != predecessor)
+            || self.confirmed.is_some_and(|hash| hash != predecessor)
+            || self.compiled.is_some_and(|registered| registered != pair)
+            || self.transition.is_some_and(|durable| durable != pair)
+        {
+            return Err(ConsensusError::DecoderMismatch);
+        }
+        self.compiled = Some(pair);
+        self.confirmed = Some(predecessor);
+        Ok(())
+    }
+    /// Effective minimum decoder: the transition's successor once it is durable, else the floor.
+    pub(super) fn effective(&self) -> Option<[u8; 32]> {
+        self.transition.map(|pair| pair.successor).or(self.required)
+    }
+    /// Whether the application confirmed what the records require.
+    pub(super) fn confirmed(&self) -> bool {
+        self.required
+            .is_none_or(|hash| self.confirmed == Some(hash))
+            && self
+                .transition
+                .is_none_or(|pair| self.compiled == Some(pair))
+    }
+    /// Whether the records state `hash` durable, as the floor or as the transition's successor.
+    pub(super) fn states(&self, hash: [u8; 32]) -> bool {
+        self.required == Some(hash) || self.transition.is_some_and(|pair| pair.successor == hash)
+    }
+    /// The floor's write `hash` asks for, with `pending` the write already staged: none when the
+    /// records state it or it is staged. It remains idempotent after a transition; passing the
+    /// successor here cannot bypass the separate transition record.
+    pub(super) fn floor_write(
+        &self,
+        hash: [u8; 32],
+        pending: Option<FloorWrite>,
+    ) -> Result<Option<FloorWrite>, ConsensusError> {
+        if self.confirmed != Some(hash) {
+            return Err(ConsensusError::DecoderUnconfirmed);
+        }
+        if let Some(required) = self.required {
+            return if required == hash {
+                Ok(None)
+            } else {
+                Err(ConsensusError::DecoderMismatch)
+            };
+        }
+        if let Some(pending) = pending {
+            return if pending == FloorWrite::Baseline(hash) {
+                Ok(None)
+            } else {
+                Err(ConsensusError::DecoderMismatch)
+            };
+        }
+        Ok(Some(FloorWrite::Baseline(hash)))
+    }
+    /// The registered transition's write, once the predecessor floor is durable, with `pending`
+    /// the write already staged: none when the records state it or it is staged.
+    pub(super) fn transition_write(
+        &self,
+        pending: Option<FloorWrite>,
+    ) -> Result<Option<FloorWrite>, ConsensusError> {
+        let pair = self.compiled.ok_or(ConsensusError::DecoderUnconfirmed)?;
+        if self.required != Some(pair.predecessor) {
+            return Err(if pending.is_some() {
+                ConsensusError::PersistencePending
+            } else {
+                ConsensusError::DecoderUnconfirmed
+            });
+        }
+        if self.transition == Some(pair) {
+            return Ok(None);
+        }
+        if let Some(pending) = pending {
+            return if pending == FloorWrite::Transition(pair) {
+                Ok(None)
+            } else {
+                Err(ConsensusError::DecoderMismatch)
+            };
+        }
+        Ok(Some(FloorWrite::Transition(pair)))
+    }
+    /// The records state `intent`'s write durable.
+    pub(super) fn written(&mut self, intent: FloorWrite) {
+        match intent {
+            FloorWrite::Baseline(hash) => self.required = Some(hash),
+            FloorWrite::Transition(pair) => self.transition = Some(pair),
+        }
+    }
 }
 
 pub(super) struct PendingDecoderFloor {
@@ -28,26 +172,20 @@ pub(super) struct PendingDecoderFloor {
     receipt: Option<WalAppend>,
     _allocation: Allocation,
 }
-impl DurableNode {
+impl PendingDecoderFloor {
+    /// Whether the log took the floor's write.
+    pub(super) fn taken(&self) -> bool {
+        self.receipt.is_some()
+    }
+}
+impl LogNode {
     /// Register the actual compiled application decoder before replay or Raft
     /// participation. This never persists or advertises a capability. A single
     /// hash cannot confirm recovery containing a decoder transition, even when
     /// that hash equals the effective successor requirement.
     pub fn confirm_decoder(&mut self, hash: [u8; 32]) -> Result<(), ConsensusError> {
         self.check_state()?;
-        if self
-            .required_decoder
-            .is_some_and(|required| required != hash)
-            || self
-                .confirmed_decoder
-                .is_some_and(|confirmed| confirmed != hash)
-            || self
-                .decoder_transition
-                .is_some_and(|pair| self.compiled_decoders != Some(pair))
-        {
-            return Err(ConsensusError::DecoderMismatch);
-        }
-        self.confirmed_decoder = Some(hash);
+        self.decoders.confirm(hash)?;
         self.rebuild_recovered_membership()?;
         Ok(())
     }
@@ -62,28 +200,7 @@ impl DurableNode {
         successor: [u8; 32],
     ) -> Result<(), ConsensusError> {
         self.check_state()?;
-        let pair = DecoderPair {
-            predecessor,
-            successor,
-        };
-        if predecessor == successor
-            || self
-                .required_decoder
-                .is_some_and(|hash| hash != predecessor)
-            || self
-                .confirmed_decoder
-                .is_some_and(|hash| hash != predecessor)
-            || self
-                .compiled_decoders
-                .is_some_and(|registered| registered != pair)
-            || self
-                .decoder_transition
-                .is_some_and(|durable| durable != pair)
-        {
-            return Err(ConsensusError::DecoderMismatch);
-        }
-        self.compiled_decoders = Some(pair);
-        self.confirmed_decoder = Some(predecessor);
+        self.decoders.confirm_pair(predecessor, successor)?;
         self.rebuild_recovered_membership()?;
         Ok(())
     }
@@ -107,9 +224,7 @@ impl DurableNode {
     /// Effective minimum decoder. This does not discard the original baseline
     /// promise, which remains required on recovery and in physical checkpoints.
     pub fn required_decoder(&self) -> Option<[u8; 32]> {
-        self.decoder_transition
-            .map(|pair| pair.successor)
-            .or(self.required_decoder)
+        self.decoders.effective()
     }
     /// Only this predicate authorizes advertising the local durable capability.
     /// After a transition, predecessor readiness also requires confirmation of
@@ -120,41 +235,21 @@ impl DurableNode {
             && self.decoder_confirmed()
             && !self.membership_rebuild_pending
             && self.decoder_write.is_none()
-            && (self.required_decoder == Some(hash)
-                || self
-                    .decoder_transition
-                    .is_some_and(|pair| pair.successor == hash))
+            && self.decoders.states(hash)
     }
     pub(super) fn decoder_confirmed(&self) -> bool {
-        self.required_decoder
-            .is_none_or(|hash| self.confirmed_decoder == Some(hash))
-            && self
-                .decoder_transition
-                .is_none_or(|pair| self.compiled_decoders == Some(pair))
+        self.decoders.confirmed()
     }
     /// Stage the original immutable requirement between existing Ready/checkpoint
     /// work. It remains idempotent after a transition; passing the successor here
     /// cannot bypass the separate transition record.
     pub fn begin_decoder_floor(&mut self, hash: [u8; 32]) -> Result<(), ConsensusError> {
         self.check()?;
-        if self.confirmed_decoder != Some(hash) {
-            return Err(ConsensusError::DecoderUnconfirmed);
+        let pending = self.decoder_write.as_ref().map(|pending| pending.intent);
+        match self.decoders.floor_write(hash, pending)? {
+            Some(intent) => self.stage_decoder_write(intent),
+            None => Ok(()),
         }
-        if let Some(required) = self.required_decoder {
-            return if required == hash {
-                Ok(())
-            } else {
-                Err(ConsensusError::DecoderMismatch)
-            };
-        }
-        if let Some(pending) = &self.decoder_write {
-            return if pending.intent == FloorWrite::Baseline(hash) {
-                Ok(())
-            } else {
-                Err(ConsensusError::DecoderMismatch)
-            };
-        }
-        self.stage_decoder_write(FloorWrite::Baseline(hash))
     }
     /// Stage the one registered transition after the predecessor floor is durable.
     /// Registration alone never authorizes successor publication. Call the same
@@ -162,27 +257,11 @@ impl DurableNode {
     /// this write through queue pressure, caller loss, and the actual fsync fence.
     pub fn begin_decoder_transition(&mut self) -> Result<(), ConsensusError> {
         self.check()?;
-        let pair = self
-            .compiled_decoders
-            .ok_or(ConsensusError::DecoderUnconfirmed)?;
-        if self.required_decoder != Some(pair.predecessor) {
-            return Err(if self.decoder_write.is_some() {
-                ConsensusError::PersistencePending
-            } else {
-                ConsensusError::DecoderUnconfirmed
-            });
+        let pending = self.decoder_write.as_ref().map(|pending| pending.intent);
+        match self.decoders.transition_write(pending)? {
+            Some(intent) => self.stage_decoder_write(intent),
+            None => Ok(()),
         }
-        if self.decoder_transition == Some(pair) {
-            return Ok(());
-        }
-        if let Some(pending) = &self.decoder_write {
-            return if pending.intent == FloorWrite::Transition(pair) {
-                Ok(())
-            } else {
-                Err(ConsensusError::DecoderMismatch)
-            };
-        }
-        self.stage_decoder_write(FloorWrite::Transition(pair))
     }
     fn stage_decoder_write(&mut self, intent: FloorWrite) -> Result<(), ConsensusError> {
         if self.persistence_pending()
@@ -233,9 +312,11 @@ impl DurableNode {
             return Err(ConsensusError::PersistencePending);
         }
         if pending.receipt.is_none() {
-            match self.wal.append_async_in(
+            let persisted = self.persisted.as_ref().map(|signal| signal());
+            match self.wal.append_async_notified(
                 std::slice::from_ref(&pending.record),
                 BudgetLane::Completion,
+                persisted,
             ) {
                 Ok(receipt) => pending.receipt = Some(receipt),
                 Err(LogError::Capacity) => {
@@ -268,10 +349,7 @@ impl DurableNode {
             self.failed = true;
             return Err(error.into());
         }
-        match pending.intent {
-            FloorWrite::Baseline(hash) => self.required_decoder = Some(hash),
-            FloorWrite::Transition(pair) => self.decoder_transition = Some(pair),
-        }
+        self.decoders.written(pending.intent);
         Ok(true)
     }
 }

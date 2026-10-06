@@ -71,7 +71,11 @@ fn frame(
     let compiled = focal_native_client::compile(
         &operation,
         &context,
-        RequestId::from_u128(request),
+        RequestKey {
+            principal: context.actor,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(request),
+        },
         &mut ids(request * 1000),
         resolved,
         &limits,
@@ -173,18 +177,9 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
         chunk_bytes: chunking.0,
         max_manifest_bytes: chunking.1,
     };
-    let mut last = Err(LedgerError::Failed);
-    for _ in 0..200 {
-        last = host.activate_native(call_activation).await;
-        match &last {
-            Err(LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending))
-            | Err(LedgerError::Managed(focal_ledger::ManagedError::Unsupported)) => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            _ => break,
-        }
-    }
-    last.unwrap();
+    // One call: the owner holds the activation until the successor floor
+    // and the local promise it started are durable (KIND D3).
+    host.activate_native(call_activation).await.unwrap();
     let mut active = false;
     for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(25)).await;

@@ -46,6 +46,11 @@ pub enum EnrollmentError {
     WrongCluster,
     #[error("invitation or identity authentication failed")]
     Unauthorized,
+    /// An endpoint's certificate chains to an issuer the trust holds and is
+    /// not one it pins: the sponsor may present a successor the holder has
+    /// not learned of yet (24 §11).
+    #[error("the endpoint presented a certificate the trust does not pin")]
+    Unpinned,
     #[error("invitation or credential has expired")]
     Expired,
     #[error("invitation or enrollment is revoked")]

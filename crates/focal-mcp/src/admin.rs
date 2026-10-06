@@ -13,6 +13,20 @@ pub enum AdminChange {
 }
 #[derive(Debug)]
 pub enum AdminAction {
+    /// A directory partition group's configuration (24 §13).
+    PartitionShow {
+        partition: [u8; 16],
+    },
+    PartitionChange {
+        partition: [u8; 16],
+        change: AdminChange,
+        expected_configuration_index: Option<u64>,
+    },
+    PartitionTransfer {
+        partition: [u8; 16],
+        node: u64,
+        expected_configuration_index: Option<u64>,
+    },
     NodeIdentity,
     NodeHealth,
     NodeConfiguration,
@@ -110,6 +124,8 @@ pub enum AdminAction {
     },
     RenewCredential,
     RotateCredential,
+    Issuers,
+    RotateIssuer,
     Placement,
     Plan,
     InviteClient {
@@ -200,6 +216,18 @@ struct Empty {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Member {
+    node: u64,
+    expected_configuration_index: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartitionArg {
+    partition: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartitionMember {
+    partition: String,
     node: u64,
     expected_configuration_index: Option<u64>,
 }
@@ -315,41 +343,41 @@ pub(crate) fn parse(
 ) -> Result<AdminAction, InputError> {
     let value = serde_json::Value::Object(arguments);
     let action = match name {
-        "cluster.node.identity"
-        | "cluster.node.health"
-        | "cluster.node.config"
-        | "cluster.node.readiness"
-        | "cluster.node.metrics" => {
+        "diagnose.node.identity"
+        | "diagnose.node.health"
+        | "diagnose.node.listener"
+        | "diagnose.node.readiness"
+        | "diagnose.node.metrics" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("node inspection"))?;
             match name {
-                "cluster.node.identity" => AdminAction::NodeIdentity,
-                "cluster.node.health" => AdminAction::NodeHealth,
-                "cluster.node.readiness" => AdminAction::NodeReadiness,
-                "cluster.node.metrics" => AdminAction::NodeMetrics,
+                "diagnose.node.identity" => AdminAction::NodeIdentity,
+                "diagnose.node.health" => AdminAction::NodeHealth,
+                "diagnose.node.readiness" => AdminAction::NodeReadiness,
+                "diagnose.node.metrics" => AdminAction::NodeMetrics,
                 _ => AdminAction::NodeConfiguration,
             }
         }
-        "cluster.replicas.diagnostics" => {
+        "diagnose.cluster.replicas" => {
             let args: ReplicaSession = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("replica diagnostics"))?;
             AdminAction::ReplicaDiagnostics {
                 session: parse_session(args.session)?,
             }
         }
-        "cluster.retention.show" => {
+        "diagnose.cluster.retention" => {
             let args: ReplicaSession = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("retention session"))?;
             AdminAction::RetentionShow {
                 session: parse_session(args.session)?,
             }
         }
-        "cluster.gc.show" => {
+        "diagnose.node.gc" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("collector inspection"))?;
             AdminAction::GcShow
         }
-        "cluster.storage.show" => {
+        "diagnose.node.storage" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("storage inspection"))?;
             AdminAction::StorageShow
@@ -613,6 +641,8 @@ pub(crate) fn parse(
         | "cluster.request.inspect"
         | "cluster.credentials.renew"
         | "cluster.credentials.rotate"
+        | "cluster.credentials.issuers"
+        | "cluster.credentials.rotate_issuer"
         | "cluster.placement"
         | "cluster.plan"
         | "cluster.tenants.list" => {
@@ -624,6 +654,8 @@ pub(crate) fn parse(
                 "cluster.nodes.list" => AdminAction::Contacts,
                 "cluster.credentials.renew" => AdminAction::RenewCredential,
                 "cluster.credentials.rotate" => AdminAction::RotateCredential,
+                "cluster.credentials.issuers" => AdminAction::Issuers,
+                "cluster.credentials.rotate_issuer" => AdminAction::RotateIssuer,
                 "cluster.placement" => AdminAction::Placement,
                 "cluster.plan" => AdminAction::Plan,
                 "cluster.tenants.list" => AdminAction::Tenants,
@@ -690,6 +722,42 @@ pub(crate) fn parse(
             AdminAction::Membership {
                 change: AdminChange::LeaveJoint,
                 expected_configuration_index: args.expected_configuration_index,
+            }
+        }
+        "cluster.partitions.show" => {
+            let args: PartitionArg = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("directory partition"))?;
+            AdminAction::PartitionShow {
+                partition: focal_client::input::parse_id(&args.partition)?,
+            }
+        }
+        "cluster.partitions.add_learner"
+        | "cluster.partitions.promote"
+        | "cluster.partitions.remove"
+        | "cluster.partitions.transfer" => {
+            let args: PartitionMember = serde_json::from_value(value).map_err(|_| {
+                InputError::Invalid("directory partition, cluster node and configuration fence")
+            })?;
+            if args.node == 0 {
+                return Err(InputError::Invalid("zero cluster node"));
+            }
+            let partition = focal_client::input::parse_id(&args.partition)?;
+            if name == "cluster.partitions.transfer" {
+                AdminAction::PartitionTransfer {
+                    partition,
+                    node: args.node,
+                    expected_configuration_index: args.expected_configuration_index,
+                }
+            } else {
+                AdminAction::PartitionChange {
+                    partition,
+                    change: match name {
+                        "cluster.partitions.add_learner" => AdminChange::AddLearner(args.node),
+                        "cluster.partitions.promote" => AdminChange::Promote(args.node),
+                        _ => AdminChange::Remove(args.node),
+                    },
+                    expected_configuration_index: args.expected_configuration_index,
+                }
             }
         }
         "cluster.request.retry" | "cluster.request.reconcile" => {
@@ -790,6 +858,15 @@ mod tests {
                 | "cluster.leader.transfer" => json!({"node":7,"expected_configuration_index":3}),
                 "cluster.request.retry" | "cluster.request.reconcile" => {
                     json!({"operation_id":"a1:0000000000000001:0000000000000002"})
+                }
+                "cluster.partitions.show" => {
+                    json!({"partition":"03030303030303030303030303030303"})
+                }
+                "cluster.partitions.add_learner"
+                | "cluster.partitions.promote"
+                | "cluster.partitions.remove"
+                | "cluster.partitions.transfer" => {
+                    json!({"partition":"03030303030303030303030303030303","node":7,"expected_configuration_index":3})
                 }
                 "cluster.invitations.get"
                 | "cluster.credentials.get"

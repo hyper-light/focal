@@ -100,17 +100,17 @@ spec:
               memory: 2Gi
           startupProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "cluster", "node", "probe", "--check", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "alive"]
             periodSeconds: 5
             failureThreshold: 60
           livenessProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "cluster", "node", "probe", "--check", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "alive"]
             periodSeconds: 10
             failureThreshold: 6
           readinessProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "cluster", "node", "probe", "--check", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "serving"]
             periodSeconds: 5
             failureThreshold: 3
           volumeMounts:

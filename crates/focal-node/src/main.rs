@@ -69,6 +69,11 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Run a program against focal's tools, as the MCP server's code mode does.
+    Code {
+        #[command(subcommand)]
+        command: cli::CodeCommand,
+    },
     /// Run the durable service, using saved network settings on restart.
     Start {
         #[arg(long)]
@@ -80,6 +85,13 @@ enum Commands {
         /// supervised or packaged host.
         #[arg(long)]
         invite_file: Option<PathBuf>,
+    },
+    /// What the selected node and the replicas it hosts report about
+    /// themselves, read through its local socket; nothing here changes
+    /// anything.
+    Diagnose {
+        #[command(subcommand)]
+        command: cli::cluster::DiagnoseCommand,
     },
     /// Inspect and administer the selected physical node through its local socket.
     Cluster {
@@ -152,24 +164,14 @@ fn main() {
 }
 fn execute(args: Args) -> Result<()> {
     let args = match args.command {
+        // Context-backed validation probes the ledger's engine, so it runs
+        // where a runtime exists, with the other manual commands.
         Commands::Schema {
             command:
                 cli::discovery::SchemaCommand::Validate {
-                    operation,
-                    input,
-                    shape_only: false,
+                    shape_only: false, ..
                 },
-        } => {
-            let settings =
-                load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-            return cli::schema_validate(
-                &settings,
-                args.client_context.as_deref(),
-                &operation,
-                input,
-            )
-            .map_err(Into::into);
-        }
+        } => args,
         Commands::Schema { command } => return cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => {
             return cli::discovery::completion(shell).map_err(Into::into);
@@ -180,9 +182,15 @@ fn execute(args: Args) -> Result<()> {
         }) => return cli::check_request_file(&file).map_err(Into::into),
         _ => args,
     };
-    if matches!(&args.command, Commands::Mcp { .. }) {
+    // Code mode, like the MCP adapter, owns its own worker runtime.
+    if matches!(&args.command, Commands::Mcp { .. } | Commands::Code { .. }) {
         let settings = load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-        return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
+        return match args.command {
+            Commands::Code { command } => {
+                cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
+            }
+            _ => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
+        };
     }
     let service = matches!(&args.command, Commands::Start { .. });
     // Tokio's fallible builder can still unwind when an OS worker cannot be
@@ -287,6 +295,9 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Mcp {
             command: McpCommand::Serve,
         } => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
+        Commands::Code { command } => {
+            cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
+        }
         Commands::Context { command } => {
             cli::context::run(runtime, &settings, command).map_err(Into::into)
         }
@@ -312,6 +323,10 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             runtime.block_on(start(settings))
         }
         Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
+        Commands::Diagnose { command } => {
+            let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
+            cli::cluster::diagnose(runtime, &selected, command)
+        }
         Commands::Cluster { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
             cli::cluster::run(runtime, &selected, command)
@@ -334,6 +349,23 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             print_json(&report)
         }
         Commands::Identity => print_json(&decode_identity(&settings.data_dir()?.join("IDENTITY"))?),
+        Commands::Schema {
+            command:
+                cli::discovery::SchemaCommand::Validate {
+                    operation,
+                    input,
+                    shape_only: false,
+                    native,
+                },
+        } => cli::schema_validate(
+            runtime,
+            &settings,
+            args.client_context.as_deref(),
+            &operation,
+            input,
+            native,
+        )
+        .map_err(Into::into),
         Commands::Schema { command } => cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => cli::discovery::completion(shell).map_err(Into::into),
         Commands::Status => {
@@ -505,13 +537,19 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
 }
 async fn start_network(settings: Settings) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
-    service
+    let stopped = service
         .run_until(shutdown_signal(), |status| {
             let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
             writeln!(std::io::stdout().lock(), "{json}")
         })
         .await?;
-    Ok(())
+    // The last line a planned stop prints: what this node led, and what it
+    // handed off before it went (27 §5).
+    print_json(&serde_json::json!({
+        "condition": "Stopped",
+        "sessions_led": stopped.sessions_led,
+        "sessions_handed_off": stopped.sessions_handed_off,
+    }))
 }
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;

@@ -425,6 +425,8 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
             start: None,
         }],
         layout_epoch: 0,
+        // A slice of sorted rows: one seek, no directory.
+        seeks: 1,
     };
     let (image, root) =
         checkpoint::encode_rows(frame, &rows, request.encoding).map_err(ImportError::Codec)?;

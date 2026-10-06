@@ -1,0 +1,84 @@
+# Three-node Kafka, NATS JetStream and Redis on equal terms
+# (docs/qualification/competitive-p99.md): every node limited to the same
+# CPUs and memory, one bridge network. Durability by environment:
+#   NATS_SYNC=always | 2m      KAFKA_FLUSH=1 | 9223372036854775807
+#   REDIS_AOF=yes | no         REDIS_FSYNC=always | everysec
+# One system at a time: `docker compose --profile nats up -d`.
+x-limits: &limits
+  cpus: "2"
+  mem_limit: 2g
+  cap_add: [NET_ADMIN]
+  networks: [bench]
+
+x-nats: &nats
+  <<: *limits
+  image: nats:2.12-alpine
+  profiles: [nats]
+  command: ["-c", "/etc/nats/nats.conf"]
+  volumes: ["./nats.conf:/etc/nats/nats.conf:ro"]
+
+x-kafka: &kafka
+  <<: *limits
+  image: apache/kafka:4.1.0
+  profiles: [kafka]
+  environment: &kafka-env
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+    CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+    KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+    KAFKA_MIN_INSYNC_REPLICAS: "2"
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+    KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: ${KAFKA_FLUSH:-9223372036854775807}
+    KAFKA_HEAP_OPTS: -Xms1g -Xmx1g
+
+x-redis: &redis
+  <<: *limits
+  image: redis:8.2-alpine
+  profiles: [redis]
+
+services:
+  nats1: { <<: *nats, environment: { NAME: nats1, SYNC: "${NATS_SYNC:-2m}" }, ports: ["14221:4222"] }
+  nats2: { <<: *nats, environment: { NAME: nats2, SYNC: "${NATS_SYNC:-2m}" }, ports: ["14222:4222"] }
+  nats3: { <<: *nats, environment: { NAME: nats3, SYNC: "${NATS_SYNC:-2m}" }, ports: ["14223:4222"] }
+
+  kafka1:
+    <<: *kafka
+    ports: ["29091:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "1"
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka1:9092,EXTERNAL://localhost:29091
+  kafka2:
+    <<: *kafka
+    ports: ["29092:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "2"
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka2:9092,EXTERNAL://localhost:29092
+  kafka3:
+    <<: *kafka
+    ports: ["29093:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: "3"
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka3:9092,EXTERNAL://localhost:29093
+
+  redis1:
+    <<: *redis
+    ports: ["16379:6379"]
+    command: ["redis-server", "--appendonly", "${REDIS_AOF:-no}", "--appendfsync", "${REDIS_FSYNC:-everysec}"]
+  redis2:
+    <<: *redis
+    command: ["redis-server", "--appendonly", "${REDIS_AOF:-no}", "--appendfsync", "${REDIS_FSYNC:-everysec}", "--replicaof", "redis1", "6379"]
+  redis3:
+    <<: *redis
+    command: ["redis-server", "--appendonly", "${REDIS_AOF:-no}", "--appendfsync", "${REDIS_FSYNC:-everysec}", "--replicaof", "redis1", "6379"]
+
+networks:
+  bench: {}

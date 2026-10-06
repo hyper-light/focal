@@ -60,6 +60,10 @@ struct Fleet {
 }
 impl Fleet {
     fn open(root: &std::path::Path) -> Self {
+        Self::open_configured(root, |_| {})
+    }
+    /// Three replicas whose owners' configuration `configure` amends.
+    fn open_configured(root: &std::path::Path, configure: impl Fn(&mut ReplicaConfig)) -> Self {
         let mut hosts = vec![];
         let mut owners = vec![];
         let mut channels = vec![];
@@ -76,6 +80,7 @@ impl Fleet {
             let mut service = ReplicaConfig::new(RootCommandId::from_u128(3));
             service.tick = TICK;
             service.request_timeout = Duration::from_millis(500);
+            configure(&mut service);
             let (host, owner, channel) =
                 ReplicaHost::spawn(session, service, ReplicaHost::wire_limits()).unwrap();
             hosts.push(host);
@@ -280,6 +285,123 @@ impl Drop for Fleet {
             pump.abort();
         }
     }
+}
+
+/// A replica's log is kept to the cadence's bound while a steady load
+/// keeps proposals pending (26 §3): it checkpoints its applied prefix
+/// every `checkpoint_after_entries` entries, and a proposal in flight is
+/// above that prefix, in the log the checkpoint leaves. Sixteen clients
+/// ask one after another, each the moment its last was answered, so some
+/// proposal is pending at nearly every period; the log a replica keeps past
+/// its checkpoint is sampled throughout and held to the cadence plus what
+/// the session may have pending (`SessionLimits::pending`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_under_a_steady_load_checkpoints_by_cadence() {
+    const CADENCE: u64 = 32;
+    const CLIENTS: u128 = 16;
+    const EACH: u128 = 40;
+    let root = tempfile::tempdir().unwrap();
+    let fleet = Fleet::open_configured(root.path(), |config| {
+        config.checkpoint_after_entries = CADENCE;
+    });
+    let leader = fleet.leader(None).await;
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let fleet_ref = &fleet;
+    let done_ref = &done;
+    // Each client asks the replica that leads at the time and, refused,
+    // asks again after the pause the client itself takes; its wait is
+    // charged to the group's commits, so only a stall spends it.
+    let policy = focal_client::RetryPolicy::default();
+    let policy = &policy;
+    let clients = futures_util::future::join_all((0..CLIENTS).map(|client| async move {
+        for each in 0..EACH {
+            let envelope = request(
+                10_000 + client * EACH + each,
+                Operation::OpenEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            );
+            let committed = || {
+                fleet_ref
+                    .hosts
+                    .iter()
+                    .map(|host| host.progress().sequence)
+                    .max()
+                    .unwrap_or_default()
+            };
+            let mut wait = fleet_ref.deadline();
+            let mut seen = committed();
+            let mut backoffs = 0u32;
+            loop {
+                let leading = fleet_ref
+                    .hosts
+                    .iter()
+                    .position(|host| {
+                        let progress = host.progress();
+                        progress.node == progress.leader
+                    })
+                    .unwrap_or(leader);
+                let reply = dispatch(
+                    &fleet_ref.hosts[leading],
+                    actor(),
+                    envelope.clone(),
+                    &ReplicaHost::wire_limits(),
+                )
+                .await;
+                match reply.result {
+                    Response::Submitted(MutationReply::Committed(_)) => break,
+                    Response::Error(
+                        refused @ (AccessError::Unavailable
+                        | AccessError::OutcomeUnknown
+                        | AccessError::Capacity),
+                    ) => {
+                        let now = committed();
+                        if now > seen {
+                            seen = now;
+                            wait = fleet_ref.deadline();
+                        }
+                        if let Err(spent) = wait.check(&fleet_ref.periods()) {
+                            panic!("{envelope:?}: {refused:?} after {spent}");
+                        }
+                        if !matches!(refused, AccessError::OutcomeUnknown) {
+                            tokio::time::sleep(policy.pause(backoffs)).await;
+                            backoffs = backoffs.saturating_add(1);
+                        }
+                    }
+                    other => panic!("{envelope:?}: {other:?}"),
+                }
+            }
+        }
+    }));
+    let sampler = async {
+        let mut kept = 0u64;
+        while !done_ref.load(std::sync::atomic::Ordering::Acquire) {
+            for host in &fleet_ref.hosts {
+                if let Ok(reply) = host.diagnostics().await {
+                    kept = kept.max(reply.value().log_entries_since_checkpoint);
+                }
+            }
+            tokio::time::sleep(TICK).await;
+        }
+        kept
+    };
+    let ((), kept) = tokio::join!(
+        async {
+            clients.await;
+            done_ref.store(true, std::sync::atomic::Ordering::Release);
+        },
+        sampler
+    );
+    let bound = CADENCE + u64::try_from(SessionLimits::default().pending).unwrap();
+    println!(
+        "steady load: {} entries; the most a replica kept past its checkpoint {kept}, bound {bound}",
+        CLIENTS * EACH
+    );
+    assert!(
+        kept <= bound,
+        "a replica kept {kept} entries past its checkpoint under load, past {bound}"
+    );
+    fleet.stop().await;
 }
 
 #[path = "fleet_leader_return_tests.rs"]

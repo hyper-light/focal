@@ -41,30 +41,46 @@ fn with_read<T>(
 }
 
 #[test]
-fn outcome_bitmap_proves_unsorted_sequence_uniqueness_and_refunds_exact_scratch() {
+fn outcome_sequences_prove_uniqueness_within_the_prefix_and_refund_exact_scratch() {
     let budget = MemoryBudget::new(1 << 20, 0).unwrap();
     let baseline = budget.stats();
     with_read(&budget, usize::MAX, |read| {
-        let mut bits = Sequences::new(9, read).unwrap();
+        let mut values = Sequences::new(9, read).unwrap();
         assert_eq!(
             budget.stats().used - baseline.used,
-            2 + 9 * size_of::<u64>() + 2 * prepare::ALLOCATION
+            9 * size_of::<(u64, u64)>() + prepare::ALLOCATION
         );
-        for sequence in [9, 2, 7, 1, 8, 3, 5, 4, 6] {
-            bits.mark(SessionSeq(sequence), sequence, 9, read).unwrap();
+        for sequence in [9, 2, 7, 1, 8, 3, 5, 4] {
+            values
+                .mark(SessionSeq(sequence), sequence, SessionSeq(9), read)
+                .unwrap();
         }
-        assert!(bits.mark(SessionSeq(9), 0, 9, read).is_err());
-        assert!(bits.mark(SessionSeq(0), 0, 9, read).is_err());
-        assert!(bits.mark(SessionSeq(10), 0, 9, read).is_err());
-        assert_eq!(bits.bits, [255, 1]);
-        bits.monotonic(read).unwrap();
+        // Zero and past the prefix are refused before they take a place.
+        assert!(values.mark(SessionSeq(0), 0, SessionSeq(9), read).is_err());
+        assert!(values.mark(SessionSeq(10), 0, SessionSeq(9), read).is_err());
+        values.mark(SessionSeq(6), 6, SessionSeq(9), read).unwrap();
+        // The vector holds exactly the resident count.
+        assert!(values.mark(SessionSeq(6), 6, SessionSeq(9), read).is_err());
+        values.finish(9, read).unwrap();
+    });
+    assert_eq!(budget.stats(), baseline);
+    // A sequence twice, or fewer than the count, is refused at the end.
+    with_read(&budget, usize::MAX, |read| {
+        let mut values = Sequences::new(3, read).unwrap();
+        values.mark(SessionSeq(1), 0, SessionSeq(9), read).unwrap();
+        values.mark(SessionSeq(1), 0, SessionSeq(9), read).unwrap();
+        values.mark(SessionSeq(2), 0, SessionSeq(9), read).unwrap();
+        assert!(values.finish(3, read).is_err());
+        let mut values = Sequences::new(3, read).unwrap();
+        values.mark(SessionSeq(1), 0, SessionSeq(9), read).unwrap();
+        assert!(values.finish(3, read).is_err());
     });
     assert_eq!(budget.stats(), baseline);
 }
 
 #[test]
-fn bitmap_funding_and_work_refuse_before_allocation_and_remain_retryable() {
-    let quote = 2 + 9 * size_of::<u64>() + 2 * prepare::ALLOCATION;
+fn sequence_funding_and_work_refuse_before_allocation_and_remain_retryable() {
+    let quote = 9 * size_of::<(u64, u64)>() + prepare::ALLOCATION;
     let missing = MemoryBudget::new(quote - 1, 0).unwrap();
     let baseline = missing.stats();
     with_read(&missing, usize::MAX, |read| {
@@ -73,22 +89,22 @@ fn bitmap_funding_and_work_refuse_before_allocation_and_remain_retryable() {
     assert_eq!(missing.stats(), baseline);
     let budget = MemoryBudget::new(quote, 0).unwrap();
     let baseline = budget.stats();
-    let initialization = 2 + 9 * size_of::<u64>() + 2;
+    let initialization = 9 * size_of::<(u64, u64)>() + 2;
     with_read(&budget, initialization - 1, |read| {
         assert!(Sequences::new(9, read).is_err())
     });
     assert_eq!(budget.stats(), baseline);
     with_read(&budget, initialization, |read| {
-        let mut bits = Sequences::new(9, read).unwrap();
+        let mut values = Sequences::new(9, read).unwrap();
         assert_eq!(read.meter.remaining(), 0);
-        assert!(bits.mark(SessionSeq(1), 0, 9, read).is_err());
-        assert_eq!(bits.bits, [0, 0]);
+        assert!(values.mark(SessionSeq(1), 0, SessionSeq(9), read).is_err());
+        assert!(values.values.is_empty());
     });
     assert_eq!(budget.stats(), baseline);
     with_read(&budget, initialization + 16, |read| {
         Sequences::new(9, read)
             .unwrap()
-            .mark(SessionSeq(1), 0, 9, read)
+            .mark(SessionSeq(1), 0, SessionSeq(9), read)
             .unwrap()
     });
     assert_eq!(budget.stats(), baseline);
@@ -99,10 +115,10 @@ fn logical_clock_rejects_a_middle_regression_even_when_last_is_maximum() {
     let budget = MemoryBudget::new(4096, 0).unwrap();
     with_read(&budget, usize::MAX, |read| {
         let mut index = Sequences::new(3, read).unwrap();
-        index.mark(SessionSeq(3), 20, 3, read).unwrap();
-        index.mark(SessionSeq(1), 10, 3, read).unwrap();
-        index.mark(SessionSeq(2), 5, 3, read).unwrap();
-        assert!(index.monotonic(read).is_err());
+        index.mark(SessionSeq(3), 20, SessionSeq(3), read).unwrap();
+        index.mark(SessionSeq(1), 10, SessionSeq(3), read).unwrap();
+        index.mark(SessionSeq(2), 5, SessionSeq(3), read).unwrap();
+        assert!(index.finish(3, read).is_err());
     });
     assert_eq!(budget.stats().used, 0);
 }

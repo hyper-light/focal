@@ -390,9 +390,9 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "cluster",
+          "diagnose",
           "node",
-          "identity"
+          "--identity"
         ]
       },
       {
@@ -1093,7 +1093,7 @@
           "--plan-file",
           "<founder>/node-1.plan",
           "--wait",
-          "180"
+          "300"
         ]
       },
       {
@@ -2439,9 +2439,9 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
+          "diagnose",
           "node",
-          "metrics"
+          "--metrics"
         ]
       },
       {
@@ -2793,7 +2793,23 @@
           "upgrade",
           "activate",
           "--fence",
-          "1"
+          "3"
+        ]
+      },
+      {
+        "concept": "upgrade activate",
+        "inputs": [
+          "fence level"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "upgrade",
+          "activate",
+          "--fence",
+          "3"
         ]
       },
       {
@@ -2810,22 +2826,6 @@
           "activate",
           "--fence",
           "2"
-        ]
-      },
-      {
-        "concept": "upgrade activate",
-        "inputs": [
-          "fence level"
-        ],
-        "command": [
-          "focal",
-          "--data-dir",
-          "<founder>",
-          "cluster",
-          "upgrade",
-          "activate",
-          "--fence",
-          "1"
         ]
       },
       {
@@ -3634,9 +3634,9 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
+          "diagnose",
           "node",
-          "metrics"
+          "--metrics"
         ]
       }
     ]

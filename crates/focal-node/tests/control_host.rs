@@ -142,17 +142,44 @@ struct Rig {
     owners: Vec<ControlOwner>,
     routers: Vec<tokio::task::JoinHandle<()>>,
     isolated: Arc<AtomicU64>,
+    /// The node the routers send no entries to — appends and snapshots
+    /// dropped, everything else carried — so its log falls behind while it
+    /// still hears its leader. Zero withholds nothing.
+    withheld: Arc<AtomicU64>,
+    /// The applied index at which the routers hold every frame, until a
+    /// test lets the next one through: a commit at a time, at the test's
+    /// pace. `u64::MAX` holds nothing.
+    allowed: Arc<AtomicU64>,
+    /// The replicas' election timeout, in ticks.
+    election_tick: usize,
+    /// The owners' request time.
+    request_timeout: Duration,
     bootstrap: ControlBootstrap,
     group: [u8; 16],
 }
 impl Rig {
     fn new(bootstrap: ControlBootstrap, group: [u8; 16]) -> Self {
+        Self::with_timing(bootstrap, group, 10, Duration::from_millis(350))
+    }
+    /// A rig whose replicas campaign only after `election_tick` ticks of
+    /// silence and whose owners give a request `request_timeout`: for a
+    /// test that holds the group's frames on purpose.
+    fn with_timing(
+        bootstrap: ControlBootstrap,
+        group: [u8; 16],
+        election_tick: usize,
+        request_timeout: Duration,
+    ) -> Self {
         let mut value = Self {
             directories: (0..3).map(|_| tempfile::tempdir().unwrap()).collect(),
             hosts: vec![],
             owners: vec![],
             routers: vec![],
             isolated: Arc::new(AtomicU64::new(0)),
+            withheld: Arc::new(AtomicU64::new(0)),
+            allowed: Arc::new(AtomicU64::new(u64::MAX)),
+            election_tick,
+            request_timeout,
             bootstrap,
             group,
         };
@@ -165,6 +192,7 @@ impl Rig {
             let id = offset as u64 + 1;
             let mut config = NodeConfig::single(id, CLUSTER, self.group);
             config.voters = vec![1, 2, 3];
+            config.election_tick = self.election_tick;
             let allowance = budget();
             let replica = ControlReplica::open(
                 ControlOptions::new(config),
@@ -175,7 +203,7 @@ impl Rig {
             .unwrap();
             let mut config = ControlHostConfig::new(namespace());
             config.tick = RIG_TICK;
-            config.request_timeout = Duration::from_millis(350);
+            config.request_timeout = self.request_timeout;
             let (host, owner, channel) =
                 ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();
             self.hosts.push(host);
@@ -185,6 +213,8 @@ impl Rig {
         for (from, mut channel) in channels {
             let hosts = self.hosts.clone();
             let isolated = self.isolated.clone();
+            let withheld = self.withheld.clone();
+            let allowed = self.allowed.clone();
             self.routers.push(tokio::spawn(async move {
                 // What the machine takes to wake a task that asked for a
                 // millisecond is the path the sender's pace is derived from
@@ -196,14 +226,46 @@ impl Rig {
                 // pace fed its own period holds itself wherever it is.
                 let mut paths: std::collections::BTreeMap<u64, focal_timing::PathRtt> =
                     std::collections::BTreeMap::new();
+                // The path is sampled at most once a tick: a sample after
+                // every frame put a wake on the delivery of each, and a
+                // backlog held behind a hold drained a wake at a time — on a
+                // runner at a load of sixty, tens of the leader's periods
+                // before its heartbeats reached a follower (2026-10-04).
+                let mut sampled: Option<std::time::Instant> = None;
                 while let Some(frame) = channel.recv().await {
                     let excluded = isolated.load(Ordering::SeqCst);
                     if excluded == from || excluded == frame.target {
                         continue;
                     }
+                    if withheld.load(Ordering::SeqCst) == frame.target {
+                        let (Operation::Raft { message, .. }
+                        | Operation::RaftOrdered { message, .. }) = &frame.request.operation
+                        else {
+                            continue;
+                        };
+                        let kind = focal_consensus::decode_message(message).unwrap().msg_type;
+                        if matches!(
+                            kind,
+                            focal_consensus::MessageType::MsgAppend
+                                | focal_consensus::MessageType::MsgSnapshot
+                        ) {
+                            continue;
+                        }
+                    }
                     let Some(target) = hosts.get(frame.target.saturating_sub(1) as usize) else {
                         continue;
                     };
+                    // Held while the group has applied what the test
+                    // allows: nothing more commits until it allows more.
+                    while hosts
+                        .iter()
+                        .map(|host| host.progress().applied_index)
+                        .max()
+                        .unwrap_or(0)
+                        >= allowed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                     let verified = verify_request(
                         peer(PeerRole::Node { node_id: from }),
                         frame.request.clone(),
@@ -211,12 +273,15 @@ impl Rig {
                     )
                     .unwrap();
                     let _ = target.handle(&verified).await;
-                    let asked = std::time::Instant::now();
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    let taken = u64::try_from(asked.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    paths.entry(frame.target).or_default().on_sample(taken);
-                    if let Some(sender) = hosts.get(from.saturating_sub(1) as usize) {
-                        sender.pace(paths.values());
+                    if sampled.is_none_or(|at| at.elapsed() >= RIG_TICK) {
+                        let asked = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        let taken = u64::try_from(asked.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        paths.entry(frame.target).or_default().on_sample(taken);
+                        if let Some(sender) = hosts.get(from.saturating_sub(1) as usize) {
+                            sender.pace(paths.values());
+                        }
+                        sampled = Some(std::time::Instant::now());
                     }
                     drop(frame);
                 }
@@ -800,8 +865,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         term: 1,
         ..Default::default()
     };
-    message.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-    use focal_consensus::PbMessageExt;
+    message.msg_type = focal_consensus::MessageType::MsgHeartbeat;
     let wire = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
         ledger: namespace(),
@@ -810,7 +874,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         request_id: RequestId::from_u128(56),
         operation: Operation::Raft {
             group,
-            message: message.write_to_bytes().unwrap(),
+            message: focal_consensus::encode_message(&message).unwrap(),
         },
     };
     let verified = verify_request(
@@ -944,6 +1008,7 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
         1,
         OPERATOR,
         EnrollmentLimits::default(),
+        0,
         now(),
     )
     .unwrap();
@@ -1201,6 +1266,19 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
     };
     assert_eq!(after.configuration_index, added.committed_index);
     assert_eq!(after.configuration.learners, vec![4]);
+    // The entry that changed the configuration is on record, the same on
+    // the leader and on a follower: what the group's voters attest to the
+    // root when its grant follows the log (F24).
+    let (leader, ControlReadResult::MembershipRecord(Some(record))) = rig
+        .read_on_leader(leader, 912, ControlRead::MembershipRecord)
+        .await
+    else {
+        panic!("membership record")
+    };
+    assert_eq!(record.index, added.committed_index);
+    assert_eq!(record.term, added.committed_term);
+    assert_eq!(record.request_hash, added.request_hash);
+    assert_eq!(record.configuration, after.configuration);
     // A follower answers the exact request from what was committed.
     let mut follower = (leader + 1) % 3;
     assert_eq!(
@@ -1293,7 +1371,6 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
 
 #[tokio::test]
 async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_after_owner_stop() {
-    use focal_consensus::PbMessageExt;
     let data = tempfile::tempdir().unwrap();
     let authority = BootstrapAuthority::open_or_create(
         data.path().join("ca"),
@@ -1325,7 +1402,12 @@ async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_aft
     let mut expected: Vec<_> = initial
         .messages
         .iter()
-        .map(|message| (message.to, message.write_to_bytes().unwrap()))
+        .map(|message| {
+            (
+                message.to,
+                focal_consensus::encode_message(message).unwrap(),
+            )
+        })
         .collect();
     expected.sort();
     assert!(!expected.is_empty());
@@ -1462,4 +1544,271 @@ async fn an_owner_refused_the_room_waits_and_goes_on() {
     assert_eq!(host.progress().failure, None);
     host.stop().await.unwrap();
     owner.join().unwrap();
+}
+
+/// What comes while the owner decides another command waits its turn and
+/// is decided after it, in the order it came, each given its request time
+/// from its turn. A replica decides one command at a time, and what came
+/// meanwhile was refused for capacity: an operator's `membership remove`
+/// that met a placement intent of the node's own was told `[capacity]` (the
+/// macOS run of 2026-10-01), as four of these five writes are without the
+/// turn, and the transfer after them. Then the fifth was given one request
+/// time for all five, from when it came, and given up on a slow disk (the
+/// macOS run of the day after): here the group commits one write at a time,
+/// held apart for more than half the request time each, so that four holds
+/// outlast the request time and the fifth write's turn comes only after it;
+/// every write is decided. The holds hold heartbeats too, so the replicas
+/// are given as many ticks of silence as the request time holds before
+/// they campaign; and the request time is four seconds, so that a commit
+/// on a starved runner — two seconds after a hold on one macOS run of
+/// 2026-10-02, four tests of three owners each sharing two cores — fits
+/// beside a hold of half of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
+    let keys = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        keys.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    const REQUEST: Duration = Duration::from_secs(4);
+    let request_periods = focal_timing::ProgressDeadline::periods(REQUEST, RIG_TICK);
+    let mut rig = Rig::with_timing(
+        root_bootstrap(&authority),
+        GROUP,
+        usize::try_from(request_periods).unwrap(),
+        REQUEST,
+    );
+    rig.hosts[0].campaign().await.unwrap();
+    let leader = rig.leader(0).await;
+    let (leader, ControlReadResult::Configuration(configuration)) = rig
+        .read_on_leader(leader, 920, ControlRead::Configuration)
+        .await
+    else {
+        panic!("configuration")
+    };
+    let (leader, state) = rig.state_on_leader(leader).await;
+    let revision = state.revisions.root;
+    // Five writes at once, each expecting the revision the one before it
+    // leaves, and a transfer of leadership behind them.
+    let host = rig.hosts[leader].clone();
+    // Each write's answer as it arrives, for a failure to name.
+    let answered = std::sync::Mutex::new(Vec::new());
+    let write = |at: u64| {
+        let host = host.clone();
+        let answered = &answered;
+        async move {
+            let answer = host
+                .submit(
+                    peer(PeerRole::Runtime),
+                    request(at, region(revision + at - 1, u128::from(at))),
+                )
+                .await;
+            answered.lock().unwrap().push((at, format!("{answer:?}")));
+            answer
+        }
+    };
+    let target = (leader as u64 + 1) % 3 + 1;
+    let transfer = host.transfer(
+        peer(PeerRole::Runtime),
+        RequestId::from_u128(921),
+        ControlTransfer {
+            expected_configuration_index: configuration.configuration_index,
+            expected: configuration.configuration.clone(),
+            target,
+        },
+    );
+    // One commit at a time: the routers hold the group at each, for more
+    // than half the request time in the leader's periods, before the next
+    // is let through; four holds then outlast the request time.
+    let hold = request_periods / 2 + 1;
+    assert!(hold * 4 > request_periods && hold * 2 < request_periods + request_periods / 2);
+    let applied = host.progress().applied_index;
+    rig.allowed.store(applied + 1, Ordering::SeqCst);
+    let paced = async {
+        for written in 1..=5 {
+            let mut wait = rig.deadline();
+            while host.progress().applied_index < applied + written {
+                if let Err(spent) = wait.check(&rig.periods()) {
+                    panic!(
+                        "write {written} never applied: {spent}; answered {:?}; {:?}",
+                        answered.lock().unwrap(),
+                        host.progress()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if written == 5 {
+                break;
+            }
+            let from = host.periods();
+            let mut wait = focal_timing::ProgressDeadline::begin(&[from], hold + 1, FROZEN);
+            while host.periods() < from + hold {
+                if let Err(spent) = wait.check(&[host.periods()]) {
+                    panic!("the leader's periods stopped: {spent}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            rig.allowed.store(applied + written + 1, Ordering::SeqCst);
+        }
+        rig.allowed.store(u64::MAX, Ordering::SeqCst);
+    };
+    let (first, second, third, fourth, fifth, transferred, ()) = tokio::join!(
+        write(1),
+        write(2),
+        write(3),
+        write(4),
+        write(5),
+        transfer,
+        paced
+    );
+    let receipts: Vec<ControlReceipt> = [first, second, third, fourth, fifth]
+        .into_iter()
+        .map(|answer| answer.expect("a write that waited its turn"))
+        .collect();
+    // Decided in the order they came.
+    assert!(
+        receipts
+            .windows(2)
+            .all(|pair| pair[0].committed_index < pair[1].committed_index),
+        "{receipts:?}"
+    );
+    assert_eq!(transferred, Ok(()));
+    rig.stop().await;
+}
+
+/// A follower's read answered above what it has applied waits for the
+/// entries it names (27 §5), and never fails the replica. The follower is
+/// sent no entries while the other two commit, so the leader answers its
+/// read with a commit the follower has not applied; the barrier was taken
+/// for corruption, and a member brought up by snapshot that read before it
+/// caught up failed (`a_crowded_partition_splits_survives_a_restart_and_merges_back`,
+/// 2026-10-03). Its entries let through, the follower answers the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_read_answered_ahead_of_what_it_applied_waits_and_never_fails_it() {
+    let keys = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        keys.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    rig.hosts[0].campaign().await.unwrap();
+    let leader = rig.leader(0).await;
+    let follower = (leader + 1) % 3;
+    let follower_node = rig.hosts[follower].progress().node;
+    rig.withheld.store(follower_node, Ordering::SeqCst);
+    // The other two commit what the follower is not sent.
+    let mut index = leader;
+    for sequence in 1..=3 {
+        let revision = rig.hosts[leader].progress().revisions.root;
+        rig.definite(
+            &mut index,
+            PeerRole::Runtime,
+            &request(sequence, region(revision, u128::from(9_000 + sequence))),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        rig.hosts[follower].progress().applied_index < rig.hosts[leader].progress().applied_index
+    );
+    // The follower's read is answered by the leader with a commit it has
+    // not applied: the read waits, and the replica goes on.
+    let asked = rig.hosts[follower]
+        .read(
+            peer(PeerRole::Runtime),
+            RequestId::from_u128(9_100),
+            ControlRead::Membership,
+        )
+        .await;
+    assert!(asked.is_err(), "{asked:?}");
+    let progress = rig.hosts[follower].progress();
+    assert!(
+        progress.failure.is_none() && !progress.stopped,
+        "the follower failed on a read answered ahead of it: {:?}",
+        progress.failure
+    );
+    // Its entries let through, it catches up and answers.
+    rig.withheld.store(0, Ordering::SeqCst);
+    let mut wait = rig.deadline();
+    let mut asked = 9_100u128;
+    let answered = loop {
+        asked += 1;
+        match rig.hosts[follower]
+            .read(
+                peer(PeerRole::Runtime),
+                RequestId::from_u128(asked),
+                ControlRead::Membership,
+            )
+            .await
+        {
+            Ok(ControlReadResult::Membership(membership)) => break membership,
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => {
+                if let Err(spent) = wait.check(&rig.periods()) {
+                    panic!("the follower never answered: {spent}; last {error:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(answered.node, follower_node);
+    let progress = rig.hosts[follower].progress();
+    assert!(progress.failure.is_none() && !progress.stopped);
+    rig.stop().await;
+}
+
+/// A follower answers a read through its leader (27 §5). The root's reads
+/// were served by its leader alone, so once a root had three voters a node
+/// whose root followed another — the founder restarted under its committed
+/// policy, asking its own root for the membership before it reports `Ready`;
+/// any operator's `membership show` on a non-leader — was refused
+/// `not_leader` (the F24 fleet, 2026-10-02).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_answers_a_read_through_its_leader() {
+    let keys = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        keys.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    rig.hosts[0].campaign().await.unwrap();
+    let leader = rig.leader(0).await;
+    let follower = (leader + 1) % 3;
+    let mut wait = rig.deadline();
+    let mut asked = 930u128;
+    let answered = loop {
+        asked += 1;
+        match rig.hosts[follower]
+            .read(
+                peer(PeerRole::Runtime),
+                RequestId::from_u128(asked),
+                ControlRead::Membership,
+            )
+            .await
+        {
+            Ok(ControlReadResult::Membership(membership)) => break membership,
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => {
+                if let Err(spent) = wait.check(&rig.periods()) {
+                    panic!("the follower never answered: {spent}; last {error:?}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(answered.node, rig.hosts[follower].progress().node);
+    assert_eq!(answered.leader, rig.hosts[leader].progress().node);
+    assert_ne!(answered.node, answered.leader);
+    assert_eq!(answered.voters.len(), 3, "{answered:?}");
+    rig.stop().await;
 }

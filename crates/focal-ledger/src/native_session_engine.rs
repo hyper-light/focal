@@ -63,6 +63,17 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Families retired through the applied prefix, counted from genesis or
     /// the checkpoint that seeded this replica.
     pub(super) retired_families: u64,
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened; a diagnostic, never an input to state.
+    pub(super) retirements_inert: u64,
+    /// The seal record this authority proposed and has not seen applied
+    /// (F12); native admission waits for it, and a term change lets it go.
+    pub(super) seal: Option<super::seal::SealRecord>,
+    /// Seals applied through the applied prefix, from genesis or the
+    /// checkpoint that seeded this replica; and the records applied nothing
+    /// for since it opened (a diagnostic).
+    pub(super) seals_applied: u64,
+    pub(super) seals_inert: u64,
     /// The chunks of this replica's latest checkpoint seed (25 §5): what
     /// its seed store must keep for peers that seed from it (26 §5).
     pub(super) seed_chunks: Vec<ContentHash>,
@@ -73,9 +84,22 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) admissions_since_sample: u32,
     pub(super) ready_term: Option<u64>,
     pub(super) readiness_requested: Option<u64>,
+    /// Read barriers the leader answered above this copy's applied index:
+    /// a follower's reads wait for the entries, never the other way round.
+    /// Bounded by the core's reads in flight; charged once, when first used.
+    pub(super) parked_reads: Vec<focal_consensus::ReadBarrier>,
+    pub(super) parked_charge: Option<Allocation>,
+    /// Barriers parked, and barriers dropped at the parked bound, since
+    /// this engine opened, for diagnostics.
+    pub(super) reads_parked: u64,
+    pub(super) reads_dropped: u64,
     pub(super) observed_term: u64,
     pub(super) observed_leader: bool,
     pub(super) reconstruction_needed: bool,
+    /// Reconstructions the next promotions refuse as memory, for the tests
+    /// of the session's handling of a refused reconstruction.
+    #[cfg(test)]
+    pub(crate) refuse_reconstructions: u32,
     pub(super) failed: bool,
     pub(super) materializer: super::MaterializerStats,
     pub(super) _pending_allocation: Allocation,
@@ -164,15 +188,25 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             archived_through: SessionSeq(0),
             retirement: None,
             retired_families: 0,
+            retirements_inert: 0,
+            seal: None,
+            seals_applied: 0,
+            seals_inert: 0,
             seed_chunks: Vec::new(),
             movement: None,
             disk_sample: None,
             admissions_since_sample: 0,
             ready_term: None,
             readiness_requested: None,
+            parked_reads: Vec::new(),
+            parked_charge: None,
+            reads_parked: 0,
+            reads_dropped: 0,
             observed_term: 0,
             observed_leader: false,
             reconstruction_needed: true,
+            #[cfg(test)]
+            refuse_reconstructions: 0,
             failed: false,
             materializer: super::MaterializerStats::default(),
             _pending_allocation: permit.commit(),
@@ -211,7 +245,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     /// Current-term authority past its committed readiness barrier, with the
     /// genesis applied, the owner reconstructed and no delivery in flight.
-    pub(crate) fn is_authoritative(&self, status: &NodeStatus) -> bool {
+    pub(crate) fn is_authoritative(&self, status: &focal_consensus::NodeScalars) -> bool {
         !self.failed
             && self.delivery.is_none()
             && status.role == StateRole::Leader
@@ -242,13 +276,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         operation: super::range::LayoutOperation,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
         }
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         if self
             .movement
@@ -296,6 +333,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn retirement_in_flight(&self) -> Option<super::retirement::RetirementRecord> {
         self.retirement
     }
+    pub(crate) fn seal_in_flight(&self) -> Option<super::seal::SealRecord> {
+        self.seal.clone()
+    }
+    pub(crate) fn seals_applied(&self) -> u64 {
+        self.seals_applied
+    }
+    pub(crate) fn seals_inert(&self) -> u64 {
+        self.seals_inert
+    }
     /// The owner must be reconstructed before this engine is authoritative
     /// again: a record it did not author through its owner applied through
     /// its committed core (a retirement, 26 §4).
@@ -304,6 +350,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     pub(crate) fn retired_families(&self) -> u64 {
         self.retired_families
+    }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4): the prefix they named had passed, a movement was
+    /// pending, or the committed state refused the family — a version-1
+    /// record beyond this replica's outcome bound among them.
+    pub(crate) fn retirements_inert(&self) -> u64 {
+        self.retirements_inert
     }
     /// The chunks of the latest checkpoint seed, sorted.
     pub(crate) fn seed_chunks(&self) -> &[ContentHash] {
@@ -331,23 +384,19 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.seed_chunks = chunks;
         Ok(())
     }
-    /// Propose one family's retirement as a session decision (26 §4). Only
-    /// an authority with no pending candidate and nothing else in flight
-    /// may; the family is derived from the committed state and the bundle's
-    /// claim is checked against it before the record is proposed, so an
-    /// applicable record is what the log carries.
-    pub(crate) fn propose_retirement(
-        &mut self,
-        consensus: &mut DurableNode,
-        root: focal_model::ClaimId,
-        bundle: ContentHash,
-        bytes: u64,
-        through: SessionSeq,
+    /// The gates a retirement passes before its family is derived (26 §4):
+    /// authority, no retirement, layout change or movement step in flight,
+    /// no pending candidate and no delivery.
+    fn retirement_gates(
+        &self,
+        status: &focal_consensus::NodeScalars,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
-        self.require_authority(&status)?;
+        self.require_authority(status)?;
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
@@ -362,11 +411,65 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if !self.pending.is_empty() || self.delivery.is_some() {
             return Err(NativeSessionError::Capacity);
         }
+        Ok(())
+    }
+    /// The core's outcome bound (`OutcomeCapacity`, the permanent one,
+    /// named first), then the owner's word that the outcome a retirement
+    /// publishes is not one it promised to a live report or keeps for the
+    /// control (`OutcomesReserved`); the book's refusal is `Capacity`, as
+    /// for a candidate, and is named here for what it holds.
+    fn retirement_reservation(&self) -> Result<(), NativeSessionError> {
+        let Some(Domain::Active(owner, _)) = self.domain.as_ref() else {
+            return Err(NativeSessionError::Failed);
+        };
+        owner
+            .committed_core()
+            .check_retirement_outcome()
+            .map_err(NativeSessionError::Retirement)?;
+        owner.check_retirement().map_err(|error| match error {
+            NativeOwnerError::PendingCandidates => NativeSessionError::Capacity,
+            NativeOwnerError::Native(NativeError::Capacity(_)) => NativeSessionError::Retirement(
+                focal_core::native::retirement::RetirementRefusal::OutcomesReserved,
+            ),
+            other => other.into(),
+        })
+    }
+    /// Whether this authority could propose a retirement now (26 §4): the
+    /// gates and the owner's reservation `propose_retirement` applies, short
+    /// of the family itself. The archive agent asks before it seals a
+    /// bundle, so nothing is sealed for a family that cannot be proposed.
+    pub(crate) fn check_retirement(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
+        self.retirement_gates(status)?;
+        self.retirement_reservation()
+    }
+    /// Propose one family's retirement as a session decision (26 §4). Only
+    /// an authority with no pending candidate and nothing else in flight
+    /// may; the family is derived from the committed state (which refuses
+    /// one whose outcome would pass the core's bound), the owner's
+    /// reservation of outcomes for the reports it promised is checked, and
+    /// the bundle's claim is checked against the family, all before the
+    /// record is proposed, so an applicable record is what the log carries
+    /// and a refusal proposes and fences nothing. The record carries the
+    /// bound the retirement was checked against.
+    pub(crate) fn propose_retirement(
+        &mut self,
+        consensus: &mut DurableNode,
+        root: focal_model::ClaimId,
+        bundle: ContentHash,
+        bytes: u64,
+        through: SessionSeq,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.scalars();
+        self.retirement_gates(&status)?;
         let core = self.committed_core()?;
         let family = core
             .retirement_family(root)
             .map_err(NativeSessionError::Retirement)?;
         let prefix = core.native_sequence();
+        self.retirement_reservation()?;
         if bundle.0 == [0; 32]
             || bytes == 0
             || through.0 == 0
@@ -378,6 +481,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             )
             .into());
         }
+        let outcome_limit = u64::try_from(self.limits.recovery.native.outcomes)
+            .map_err(|_| NativeSessionError::Capacity)?;
         let record = super::retirement::RetirementRecord {
             ledger: self.ledger,
             expected_prefix: prefix,
@@ -385,9 +490,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             bundle,
             bytes,
             through,
+            outcome_limit: Some(outcome_limit),
         };
         let mut encoded = [0u8; super::retirement::BYTES];
-        record.write_into(&mut encoded);
+        record.write_into(&mut encoded)?;
         let _permit = self.budget.reserve(
             BudgetKind::Pending,
             BudgetLane::Completion,
@@ -395,6 +501,77 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         )?;
         consensus.propose_borrowed_in(&encoded, BudgetLane::Completion)?;
         self.retirement = Some(record);
+        Ok(())
+    }
+    /// Whether this authority could propose a seal now (F12): the gates a
+    /// retirement passes, and the owner's reservation of outcomes for the
+    /// reports it promised (the seal publishes one outcome of its own).
+    pub(crate) fn check_seal(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
+        self.retirement_gates(status)?;
+        self.retirement_reservation()
+    }
+    /// Propose one seal as a session decision (F12). Only an authority with
+    /// no pending candidate and nothing else in flight may; the plan must
+    /// have been derived at the committed prefix (a plan derived earlier is
+    /// refused, never proposed), and the core must hold the seal's outcome.
+    pub(crate) fn propose_seal(
+        &mut self,
+        consensus: &mut DurableNode,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.scalars();
+        self.retirement_gates(&status)?;
+        let core = self.committed_core()?;
+        let prefix = core.native_sequence();
+        if plan.through != prefix
+            || bundle.0 == [0; 32]
+            || bytes == 0
+            || plan.rows() == 0
+            || fold.is_some_and(|fold| fold.last >= plan.ordinal)
+        {
+            return Err(NativeError::Contract(
+                focal_model::lifecycle::ContractError::InvalidManifest,
+            )
+            .into());
+        }
+        core.check_seal_outcome()
+            .map_err(NativeSessionError::Seal)?;
+        self.retirement_reservation()?;
+        // The floors the plan was derived under are the pressure floors of
+        // this prefix: the record names them, and apply derives them again.
+        let floors = core
+            .pressure_floors(super::seal::MAX_FLOORS)
+            .map_err(NativeSessionError::Native)?;
+        let record = super::seal::SealRecord {
+            ledger: self.ledger,
+            expected_prefix: prefix,
+            through: plan.through,
+            bundle,
+            bytes,
+            count: u64::try_from(plan.rows()).map_err(|_| NativeSessionError::Capacity)?,
+            bound: focal_core::native::seal::SealBound {
+                principals: plan.principals.len().max(1),
+                rows: plan.rows(),
+            },
+            outcome_limit: u64::try_from(self.limits.recovery.native.outcomes)
+                .map_err(|_| NativeSessionError::Capacity)?,
+            floors,
+            fold,
+        };
+        let encoded = record.encode()?;
+        let _permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            array::<u8>(encoded.len())?,
+        )?;
+        consensus.propose_borrowed_in(&encoded, BudgetLane::Completion)?;
+        self.seal = Some(record);
         Ok(())
     }
     /// Propose one movement step (25 §6). The step is prepared against the
@@ -406,13 +583,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         operation: focal_ranges::RangeOperation,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
         }
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         if !self.pending.is_empty() || self.delivery.is_some() {
             return Err(NativeSessionError::Capacity);
@@ -563,7 +743,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn read_at_least(
         &self,
         boundary: NativeReadBoundary,
-        status: &NodeStatus,
+        status: &focal_consensus::NodeScalars,
     ) -> Result<&Core<NativeState>, NativeSessionError> {
         let core = self.committed_core()?;
         if self.applied_raft < boundary.raft_index
@@ -575,7 +755,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         Ok(core)
     }
-    pub(super) fn require_authority(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+    pub(super) fn require_authority(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
         self.check()?;
         if !self.is_authoritative(status) {
             return Err(NativeSessionError::NotReady {
@@ -583,6 +766,84 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             });
         }
         Ok(())
+    }
+    /// Whether this replica may serve a linearizable read: as the authority,
+    /// or as a follower that knows its leader — the read's barrier goes to
+    /// the leader through the core, and the answer waits for this copy to
+    /// have applied the index it names (27 §5, follower reads).
+    pub(crate) fn serves_reads(&self, status: &focal_consensus::NodeScalars) -> bool {
+        self.is_authoritative(status)
+            || (!self.failed
+                && status.leader_id != 0
+                && self.genesis.is_some()
+                && self.domain.is_some())
+    }
+    pub(super) fn require_reader(
+        &self,
+        status: &focal_consensus::NodeScalars,
+    ) -> Result<(), NativeSessionError> {
+        self.check()?;
+        if !self.serves_reads(status) {
+            return Err(NativeSessionError::NotReady {
+                leader: status.leader_id,
+            });
+        }
+        Ok(())
+    }
+    /// Hold a barrier answered above the applied index until the entries it
+    /// names have been applied; bounded by the reads the core holds in
+    /// flight, so a follower far behind refuses new reads rather than grows.
+    pub(super) fn park_read(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        bound: usize,
+    ) -> Result<(), NativeSessionError> {
+        if self.parked_reads.len() >= bound {
+            return Err(NativeSessionError::Capacity);
+        }
+        if self.parked_charge.is_none() {
+            let permit = self.budget.reserve(
+                BudgetKind::Pending,
+                BudgetLane::Completion,
+                array::<focal_consensus::ReadBarrier>(bound)?,
+            )?;
+            self.parked_reads
+                .try_reserve_exact(bound)
+                .map_err(|_| NativeSessionError::Capacity)?;
+            self.parked_charge = Some(permit.commit());
+        }
+        let mut context = reserved(barrier.context.len())?;
+        context.extend_from_slice(&barrier.context);
+        self.parked_reads.push(focal_consensus::ReadBarrier {
+            index: barrier.index,
+            context,
+        });
+        self.reads_parked = self.reads_parked.saturating_add(1);
+        Ok(())
+    }
+    /// The parked barriers this copy has now applied up to, in the order
+    /// they were parked; the rest stay.
+    pub(super) fn take_applied_parked_reads(&mut self) -> Vec<focal_consensus::ReadBarrier> {
+        let applied = self.applied_raft;
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.parked_reads.len() {
+            if self
+                .parked_reads
+                .get(index)
+                .is_some_and(|barrier| barrier.index <= applied)
+            {
+                let barrier = self.parked_reads.remove(index);
+                if ready.try_reserve_exact(1).is_err() {
+                    self.parked_reads.insert(index, barrier);
+                    break;
+                }
+                ready.push(barrier);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+        ready
     }
 
     /// Stage one input against the owner and submit the resulting candidate.
@@ -597,13 +858,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             ContentDomainId,
         ) -> Result<NativeStaging, NativeOwnerError>,
     ) -> Result<NativeSubmission, NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
         }
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         let limit = self.limits.recovery.native.pending;
         let full = self.pending.len() >= limit || self.pending.len() == self.pending.capacity();
@@ -654,12 +918,26 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     return Err(error);
                 }
             };
-            if full || !headroom {
+            if full || !headroom || !self.checkpointable()? {
                 self.discard_candidate(candidate)?;
                 return Err(NativeSessionError::Capacity);
             }
         }
         self.submit_staged(consensus, staged, status.term)
+    }
+    /// Whether the committed root, with every pending candidate published,
+    /// still fits a checkpoint (rule 2): what this session admits it must be
+    /// able to checkpoint. A fresh candidate past the checkpoint's rows or
+    /// assembled bytes is refused typed at admission, and the session keeps
+    /// serving; never admitted and then a checkpoint failed and the session
+    /// stopped (a ledger did, at 4,200 claims, before this check).
+    fn checkpointable(&self) -> Result<bool, NativeSessionError> {
+        let Some(Domain::Active(owner, _)) = self.domain.as_ref() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let projection = owner.checkpoint_projection()?;
+        let limits = self.limits.checkpoint;
+        Ok(projection.rows <= limits.rows && projection.bytes <= limits.assembled_bytes)
     }
     /// Discard a prepared candidate, re-borrowing the active owner. Used when a
     /// refusal is decided after a `&mut self` call has ended the owner borrow.

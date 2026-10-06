@@ -9,7 +9,16 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 1;
+pub const CAPABILITY_LEVEL: u32 = 2;
+/// The level at which the issuer succeeds itself (24 §11): a credential
+/// issued under a successor issuer is presented with the predecessor's
+/// endorsement, which a binary below this level cannot verify.
+pub const ISSUER_SUCCESSION_LEVEL: u32 = 2;
+/// The level at which consensus carries fields beyond raft-rs's (24 §21,
+/// 27 §15.9): a refusal's `kept` (R17) and `lost`, which a binary below this
+/// level cannot read. Every group a node hosts runs `Wire::Kept` once the
+/// fence opens it.
+pub const RAFT_KEPT_LEVEL: u32 = 3;
 /// The environment variable that lowers the announced level for a staged
 /// rollout or a rehearsal; it can never raise it.
 pub const ANNOUNCED_LEVEL_ENV: &str = "FOCAL_CAPABILITY_LEVEL";

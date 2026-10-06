@@ -2,10 +2,7 @@
 //! requires server authentication before the client has a issued certificate.
 //! Its distinct ALPN exposes only the bounded enrollment handler.
 use crate::*;
-use quinn::{
-    Endpoint,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-};
+use quinn::Endpoint;
 use serde::{Deserialize, Serialize};
 use std::{
     future::{Future, poll_fn},
@@ -165,7 +162,7 @@ impl EnrollmentServer {
     ) -> Result<Self, JoinTransportError> {
         require_runtime()?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(identity.server_config()?)
+            focal_wire::quic_server(identity.server_config()?)
                 .map_err(|_| EnrollmentError::Crypto)?,
         ));
         config.transport_config(limits.quic()?);
@@ -321,7 +318,7 @@ impl EnrollmentClient {
             return Err(EnrollmentError::WrongCluster.into());
         }
         let mut tls = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(invitation.client_config()?)
+            focal_wire::quic_client(invitation.client_config()?)
                 .map_err(|_| EnrollmentError::Crypto)?,
         ));
         tls.transport_config(self.limits.quic()?);
@@ -365,7 +362,15 @@ impl EnrollmentClient {
                     || receipt.csr_hash != hash("focal.enrollment.csr.v1", key.csr())
                     || receipt.public_key != pki::csr_key_hash(key.csr())?
                     || receipt.expires_at <= now
-                    || pki::verify_issued(&receipt, &invitation.trust().ca_certificate).is_err()
+                    || pki::verify_issued(
+                        &receipt,
+                        invitation
+                            .trust()
+                            .issuers
+                            .iter()
+                            .map(|issuer| issuer.certificate.as_slice()),
+                    )
+                    .is_err()
                 {
                     return Err(JoinTransportError::OutcomeUnknown);
                 }
@@ -391,8 +396,7 @@ impl EnrollmentClient {
             return Err(EnrollmentError::Invalid.into());
         }
         let mut tls = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(trust.client_config()?)
-                .map_err(|_| EnrollmentError::Crypto)?,
+            focal_wire::quic_client(trust.client_config()?).map_err(|_| EnrollmentError::Crypto)?,
         ));
         tls.transport_config(self.limits.quic()?);
         let connecting = self
@@ -431,7 +435,14 @@ impl EnrollmentClient {
                     || receipt.identity.cluster != trust_cluster(&request)
                     || receipt.expires_at <= now
                     || receipt.expires_at <= request.holds_until()
-                    || pki::verify_issued(&receipt, &trust.ca_certificate).is_err()
+                    || pki::verify_issued(
+                        &receipt,
+                        trust
+                            .issuers
+                            .iter()
+                            .map(|issuer| issuer.certificate.as_slice()),
+                    )
+                    .is_err()
                 {
                     return Err(JoinTransportError::OutcomeUnknown);
                 }

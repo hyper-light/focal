@@ -112,7 +112,7 @@ fn key(event: NativeEvent) -> HistoryKey {
 // In-place heapsort has no allocator or error-hiding comparison callback.
 // Each sift performs at most height comparisons of two children and the root.
 // The three linear sift schedules fit n*(height+1)*1024 fixed-key work units.
-fn sort_visits(count: usize) -> Result<usize, NativeError> {
+pub(super) fn sort_visits(count: usize) -> Result<usize, NativeError> {
     let height = usize::BITS
         .checked_sub(count.leading_zeros())
         .ok_or_else(invalid)?;
@@ -178,7 +178,6 @@ impl HistoryIndex {
             return Err(NativeError::Capacity("recovery history events"));
         }
         let capacity = count.checked_mul(2).ok_or_else(invalid)?;
-        read.charge(sort_visits(capacity)?)?;
         let charge = capacity
             .checked_mul(size_of::<IndexedEvent>())
             .and_then(|bytes| {
@@ -267,6 +266,10 @@ impl HistoryIndex {
         if observed != count {
             return Err(invalid());
         }
+        // The sort is charged for the entries there are, once they are
+        // counted — the events and the secondary entries some carry — not for
+        // the capacity every event might have filled (the audit's F57).
+        read.charge(sort_visits(rows.len())?)?;
         sort(&mut rows)?;
         read.charge(
             rows.len()

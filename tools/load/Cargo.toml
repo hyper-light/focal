@@ -18,8 +18,10 @@ focal-client = { version = "0.1.0", path = "../../crates/focal-client" }
 focal-core = { version = "0.1.0", path = "../../crates/focal-core" }
 focal-ledger = { version = "0.1.0", path = "../../crates/focal-ledger" }
 focal-model = { version = "0.1.0", path = "../../crates/focal-model" }
+focal-native-client = { version = "0.1.0", path = "../../crates/focal-native-client" }
 focal-node = { version = "0.1.0", path = "../../crates/focal-node" }
 focal-wire = { version = "0.1.0", path = "../../crates/focal-wire" }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 clap = { workspace = true }
 getrandom = { workspace = true }
 serde = { workspace = true }
@@ -27,3 +29,7 @@ serde_json = { workspace = true }
 serde_saphyr = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[[bench]]
+name = "allocs"
+harness = false

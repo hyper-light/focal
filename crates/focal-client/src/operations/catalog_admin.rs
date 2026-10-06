@@ -5,7 +5,7 @@ use crate::input::MAX_INPUT_BYTES;
 
 /// Local physical-node administration. Root changes journal `a1:` references, application changes `r1:` references; invitations come from the founder signer.
 const CLUSTER_NODE_IDENTITY: OperationDescriptor = OperationDescriptor {
-    name: "cluster.node.identity",
+    name: "diagnose.node.identity",
     version: 1,
     description: "Read the authenticated physical owner's immutable identity. No participant or administration authority is transferred.",
     capability: Capability::Node,
@@ -16,12 +16,12 @@ const CLUSTER_NODE_IDENTITY: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster node identity"),
+    cli_path: Some("diagnose node --identity"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
 const CLUSTER_NODE_HEALTH: OperationDescriptor = OperationDescriptor {
-    name: "cluster.node.health",
+    name: "diagnose.node.health",
     version: 1,
     description: "Observe local root and fleet owner progress. This diagnostic is not a quorum, placement or complete service health guarantee.",
     capability: Capability::Node,
@@ -32,12 +32,12 @@ const CLUSTER_NODE_HEALTH: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster node health"),
+    cli_path: Some("diagnose node --health"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
 const CLUSTER_NODE_READINESS: OperationDescriptor = OperationDescriptor {
-    name: "cluster.node.readiness",
+    name: "diagnose.node.readiness",
     version: 1,
     description: "The node's readiness probes with the facts they derive from (08 §9): alive whenever it answers; catching_up when every replica it hosts and its root replica follow a known leader with nothing pending but it leads none; authoritative when it leads the root or a hosted session's log at a committed prefix; policy_satisfied when every hosted session's desired durability is achieved in the directory with nothing blocking. A local read, not a quorum.",
     capability: Capability::Node,
@@ -48,12 +48,12 @@ const CLUSTER_NODE_READINESS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster node readiness"),
+    cli_path: Some("diagnose node --readiness"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
 const CLUSTER_NODE_METRICS: OperationDescriptor = OperationDescriptor {
-    name: "cluster.node.metrics",
+    name: "diagnose.node.metrics",
     version: 1,
     description: "The node's metrics as Prometheus text exposition (24 §23): its memory and volume envelopes, WAL counters, every hosted replica's leader, indices, apply and cursor lag, retention floor and pending seeds or objects, peer delivery counters, the failure detector's members and counters, the credential's expiry, the placement agent's intents and admission, the directory's epochs and achieved durability per session, and the upgrade fence — every series under fixed node, cluster, region and zone labels. Sampled by the service every five seconds; a local read, not a quorum. The same text is served on `node.metrics_listen` when configured.",
     capability: Capability::Node,
@@ -64,12 +64,12 @@ const CLUSTER_NODE_METRICS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster node metrics"),
+    cli_path: Some("diagnose node --metrics"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
 const CLUSTER_NODE_CONFIG: OperationDescriptor = OperationDescriptor {
-    name: "cluster.node.config",
+    name: "diagnose.node.listener",
     version: 1,
     description: "Read the running physical node's validated saved listener and root namespace configuration. No desired placement policy or achieved guarantee is inferred.",
     capability: Capability::Node,
@@ -80,12 +80,12 @@ const CLUSTER_NODE_CONFIG: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster node config"),
+    cli_path: Some("diagnose node --listener"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
 const CLUSTER_REPLICAS_DIAGNOSTICS: OperationDescriptor = OperationDescriptor {
-    name: "cluster.replicas.diagnostics",
+    name: "diagnose.cluster.replicas",
     version: 1,
     description: "Observe an installed application owner's commit/applied prefix, pending checkpoint and immutable decoder floor. No checkpoint, activation or upgrade is initiated.",
     capability: Capability::Node,
@@ -96,14 +96,14 @@ const CLUSTER_REPLICAS_DIAGNOSTICS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas diagnostics"),
+    cli_path: Some("diagnose cluster --replicas"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"properties":{"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}}}"#,
     ),
     family: None,
 };
 const CLUSTER_RETENTION_SHOW: OperationDescriptor = OperationDescriptor {
-    name: "cluster.retention.show",
+    name: "diagnose.cluster.retention",
     version: 1,
     description: "A native session's retention floor (the published prefix, what registered consumers still need, what the archive reports holding, the least of them and what holds it there) and its archive counts (families retired, a retirement in flight). No reclamation is initiated.",
     capability: Capability::Node,
@@ -114,7 +114,7 @@ const CLUSTER_RETENTION_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster retention show"),
+    cli_path: Some("diagnose cluster --retention"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"properties":{"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}}}"#,
     ),
@@ -139,7 +139,7 @@ const CLUSTER_ARCHIVE_SHOW: OperationDescriptor = OperationDescriptor {
     family: None,
 };
 const CLUSTER_GC_SHOW: OperationDescriptor = OperationDescriptor {
-    name: "cluster.gc.show",
+    name: "diagnose.node.gc",
     version: 1,
     description: "The collector's state on this node: its settings (interval, grace, quarantine, terminal fence, records kept, mark bound), whether a pass is in progress, how many completed, and the last pass's report (roots protected, opaque domains, unreadable bundles, what the content store expired, quarantined, deferred and deleted, what the seed sweeps removed). No collection is initiated.",
     capability: Capability::Node,
@@ -150,7 +150,7 @@ const CLUSTER_GC_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster gc show"),
+    cli_path: Some("diagnose node --gc"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -209,7 +209,7 @@ const CLUSTER_BACKUP_VERIFY: OperationDescriptor = OperationDescriptor {
     family: None,
 };
 const CLUSTER_STORAGE_SHOW: OperationDescriptor = OperationDescriptor {
-    name: "cluster.storage.show",
+    name: "diagnose.node.storage",
     version: 1,
     description: "The storage view of this node: the volume envelope every durable owner promises its bytes to (free bytes at the last sample, bytes outstanding by kind, the headroom never spent and the completion reserve), uploads staged, the archive agent's settings and progress, the collector's settings, and for every hosted native session whether this node is its authority, the log kept beyond its checkpoint and its retention floor with what holds it there. No reclamation is initiated.",
     capability: Capability::Node,
@@ -220,7 +220,7 @@ const CLUSTER_STORAGE_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster storage show"),
+    cli_path: Some("diagnose node --storage"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -674,6 +674,96 @@ const CLUSTER_LEADER_TRANSFER: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_PARTITIONS_SHOW: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.show",
+    version: 1,
+    description: "Read a directory partition group's committed configuration and applied fence from the replica this node hosts (24 §13).",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions show"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["partition"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_ADD_LEARNER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.add_learner",
+    version: 1,
+    description: "Journal and commit a learner admission to a directory partition group, through the replica this node hosts when it leads the group; the root's grant seats the learner and it hosts a replica. On a lost response the exact p1: reference is asked again.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions add-learner"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_PROMOTE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.promote",
+    version: 1,
+    description: "Journal and commit a voter promotion in a directory partition group after actual catch-up, through the replica this node hosts when it leads the group.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions promote"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_REMOVE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.remove",
+    version: 1,
+    description: "Journal and commit a removal from a directory partition group, through the replica this node hosts when it leads the group; cluster.nodes.remove vacates a leaving node's seats itself.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions remove"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_PARTITIONS_TRANSFER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.partitions.transfer",
+    version: 1,
+    description: "Initiate a transfer of a directory partition group's leadership to one of its voters, from the replica this node hosts when it leads, or to this node itself through the leader. Success is initiation.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: true,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster partitions transfer"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_REQUEST_INSPECT: OperationDescriptor = OperationDescriptor {
     name: "cluster.request.inspect",
     version: 1,
@@ -872,6 +962,42 @@ const CLUSTER_CREDENTIALS_RENEW: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_CREDENTIALS_ISSUERS: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.issuers",
+    version: 1,
+    description: "The issuers the cluster's credentials chain to, as committed (24 §11): the one issuing, one staged to succeed it (trusted from its staging, endorsed by the one it succeeds), the one it succeeded while a credential issued under it still lives, each with its fingerprint and validity, and the upgrade fence the succession is gated on (24 §21). A read of committed enrollment facts.",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials issuers"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_CREDENTIALS_ROTATE_ISSUER: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.rotate_issuer",
+    version: 1,
+    description: "Stage the issuer's successor now (24 §11), under the founder's authority: a fresh issuer, endorsed by the current one, committed so every node trusts it before anything is issued under it; the next step activates it, every credential renews under it, and the current issuer retires once nothing live was issued under it. Refused by name while the upgrade fence is below the level that verifies an endorsed chain (24 §21); a successor already staged or committed is answered as it is. Answers with the issuers as committed.",
+    capability: Capability::FounderNode,
+    mutation: true,
+    destructive: false,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials rotate-issuer"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_PLACEMENT: OperationDescriptor = OperationDescriptor {
     name: "cluster.placement",
     version: 1,
@@ -999,7 +1125,7 @@ const CLUSTER_SESSIONS_CREATE: OperationDescriptor = OperationDescriptor {
 const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     name: "cluster.sessions.plan",
     version: 2,
-    description: "Plan a session's placement under a requested durability (survive node, zone or region with up to N failures): the planner picks live, eligible nodes from the committed directory and the controller executes the plan unattended (install, catch up, promote, cut over, activate). The reply names the plan: planned, pending when one is already under way, or satisfied when the active placement already provides it. With dry_run the same plan is reported without being journaled, so nothing changes. Exact on retry.",
+    description: "Plan a session's placement under a requested durability (survive node, zone or region with up to N failures): the planner picks live, eligible nodes from the committed directory and the controller executes the plan unattended (install, catch up, promote, cut over, activate). The reply names the plan once it committed: planned, pending when one is already under way, or satisfied when the active placement already provides it; a plan the partition refused (planned on an observation that went stale) is compare_failed, and the caller plans again. With dry_run the same plan is reported without being journaled, so nothing changes. Exact on retry.",
     capability: Capability::Node,
     mutation: true,
     destructive: false,
@@ -1014,7 +1140,7 @@ const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
-pub const ADMIN_TOOL_COUNT: usize = 57;
+pub const ADMIN_TOOL_COUNT: usize = 64;
 const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_NODE_IDENTITY,
     CLUSTER_NODE_HEALTH,
@@ -1054,6 +1180,11 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_MEMBERSHIP_REMOVE,
     CLUSTER_MEMBERSHIP_LEAVE_JOINT,
     CLUSTER_LEADER_TRANSFER,
+    CLUSTER_PARTITIONS_SHOW,
+    CLUSTER_PARTITIONS_ADD_LEARNER,
+    CLUSTER_PARTITIONS_PROMOTE,
+    CLUSTER_PARTITIONS_REMOVE,
+    CLUSTER_PARTITIONS_TRANSFER,
     CLUSTER_REQUEST_INSPECT,
     CLUSTER_REQUEST_RECONCILE,
     CLUSTER_REQUEST_RETRY,
@@ -1064,6 +1195,8 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_CREDENTIALS_REVOKE,
     CLUSTER_CREDENTIALS_RENEW,
     CLUSTER_CREDENTIALS_ROTATE,
+    CLUSTER_CREDENTIALS_ISSUERS,
+    CLUSTER_CREDENTIALS_ROTATE_ISSUER,
     CLUSTER_CLIENT_INVITE,
     CLUSTER_PLACEMENT,
     CLUSTER_PLAN,

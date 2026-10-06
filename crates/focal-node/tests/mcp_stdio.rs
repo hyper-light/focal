@@ -14,6 +14,8 @@ mod claim_selection;
 mod claim_wait;
 #[path = "support/mcp_monitor.rs"]
 mod monitor;
+#[path = "support/owners.rs"]
+mod owners;
 #[path = "support/mcp_peer.rs"]
 mod peer;
 #[path = "support/mcp_summary.rs"]
@@ -193,9 +195,11 @@ impl Mcp {
                 assert!(status.success());
                 break;
             }
+            // The adapter bounds its own shutdown, and the bounded one
+            // exits in failure: this wait is only for a wedge.
             assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "bounded EOF shutdown"
+                start.elapsed() < owners::FROZEN,
+                "EOF shutdown: nothing for the frozen window"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

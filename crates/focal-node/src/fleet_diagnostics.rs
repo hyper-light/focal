@@ -78,6 +78,9 @@ impl Owner {
                 .map(|pending| pending.missing.len()),
             delivery_retained: self.session.delivery_retained(),
             log_entries_since_checkpoint: self.log_entries_since_checkpoint(),
+            promises_at: self.session.promises().0,
+            managed_promises: self.session.promises().1.to_vec(),
+            native_promises: self.session.promises().2.to_vec(),
             retention: self.session.native_retention().ok().map(|report| {
                 focal_client::admin::AdminRetention {
                     published: report.published.0,

@@ -24,29 +24,22 @@ const STORE: &str = "native";
 /// identities and delivery marks, as the V1 request stores do.
 pub(super) const MCP_STORE: &str = "mcp-native";
 
-/// Probe the ledger's engine. A node without the native engine refuses the
-/// profile at negotiation before any frame is seen.
+/// Probe the ledger's engine: the one standing read every host performs
+/// (`focal_client::operations::probe`), resolved with this CLI's own native
+/// journal as the proof that an unreachable ledger is native. A node without
+/// the native engine refuses the profile at negotiation before any frame is
+/// seen.
 pub(super) fn detect(
     runtime: &tokio::runtime::Runtime,
     context: &Context,
-) -> Result<Option<NativeStanding>> {
-    let request = context.envelope(Operation::NativeRead(NativeReadRequest {
-        consistency: ReadConsistency::Linearizable,
-        query: NativeReadQuery::Standing,
-        max_items: 1,
-    }))?;
-    match runtime.block_on(context.client.native_standing(request)) {
-        Ok(standing) => Ok(standing),
-        // Without a reachable owner the engine is unknown. A context that has
-        // already journaled native operations stays native, so no V1 identity
-        // is minted for a native ledger; nothing was sent, so no journal is
-        // owed. Any other context keeps the V1 behaviour, whose local
-        // validation and journaling never needed the network.
-        Err(ClientError::Transport) if !initialized_in(&context.root.join("client"), STORE) => {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
+) -> Result<focal_client::operations::Engine> {
+    Ok(runtime.block_on(focal_client::operations::probe(
+        &context.client,
+        context.build.ledger,
+        RequestId(random_id()?),
+        initialized_in(&context.root.join("client"), STORE),
+        context.build.actor,
+    ))?)
 }
 
 /// Whether a native journal named `name` has been created under `parent`.
@@ -111,10 +104,10 @@ pub(super) fn run(
                     context,
                     &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: args.id }),
                 )?;
-                let focal_native_client::NativeReadOutcome::Page(page) = outcome else {
+                let focal_native_client::NativeReadOutcome::Lineage(lineage) = outcome else {
                     return Err(CliError::InvalidResponse);
                 };
-                return render_page_as("Lineage", page, args.output.format);
+                return render_lineage(*lineage, args.output.format);
             }
             ClaimCommand::Challenge(args) => {
                 let (document, options) = native_documents::challenge(*args)?;
@@ -345,7 +338,7 @@ pub(super) fn store_in(
 }
 /// The exclusive creation lock `<name>.lock` beside the store, held only
 /// while the store is created; contenders wait for the short critical section.
-fn creation_lock(parent: &Path, name: &str) -> Result<std::fs::File> {
+fn creation_lock(parent: &Path, name: &str) -> Result<focal_platform::FileLock> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -358,9 +351,9 @@ fn creation_lock(parent: &Path, name: &str) -> Result<std::fs::File> {
         .checked_add(std::time::Duration::from_secs(5))
         .ok_or_else(|| CliError::Other("clock overflow".into()))?;
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
+        match focal_platform::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(focal_platform::FileLock::owning(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if std::time::Instant::now() >= deadline {
                     return Err(CliError::Other(
                         "another process is still creating the native request journal".into(),
@@ -368,7 +361,7 @@ fn creation_lock(parent: &Path, name: &str) -> Result<std::fs::File> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -463,7 +456,15 @@ fn render_list_page(page: NativeListPage, format: OutputFormat) -> Result<()> {
 }
 
 /// One blocking linearizable read per driver requirement on this context.
-fn reads<'a>(
+/// One blocking submission of an exact journaled frame over this context's
+/// connection.
+pub(super) fn submits<'a>(
+    runtime: &'a tokio::runtime::Runtime,
+    context: &'a Context,
+) -> impl FnMut(RequestEnvelope) -> std::result::Result<NativeMutationReply, DriveError> + 'a {
+    move |request| Ok(runtime.block_on(context.client.submit_native(request))?)
+}
+pub(super) fn reads<'a>(
     runtime: &'a tokio::runtime::Runtime,
     context: &'a Context,
 ) -> impl FnMut(NativeReadRequest) -> std::result::Result<NativeReadPage, DriveError> + 'a {
@@ -505,14 +506,23 @@ pub(super) fn submit(
         .transpose()?;
     let store = store(context, true)?.ok_or(CliError::InvalidResponse)?;
     let limits = CompileLimits::default();
+    let preparation = Preparation {
+        store: &store,
+        context: context.operation,
+        build: &context.build,
+        profile: profile(standing),
+        limits: &limits,
+    };
+    // The journal's own upkeep first (F12): the generation floor advances
+    // once every earlier operation was reported.
+    focal_native_client::maintain(
+        &preparation,
+        &mut random_id,
+        &mut reads(runtime, context),
+        &mut submits(runtime, context),
+    )?;
     let prepared = focal_native_client::prepare(
-        &Preparation {
-            store: &store,
-            context: context.operation,
-            build: &context.build,
-            profile: profile(standing),
-            limits: &limits,
-        },
+        &preparation,
         &operation,
         requested,
         &mut random_id,
@@ -565,6 +575,19 @@ fn drive(
             Err(CliError::Unconfirmed)
         }
         Ok(NativeMutationReply::Refused(refusal)) => {
+            // A generation the owner closed before this frame reached it
+            // (F12): the outcome, when the request had committed, is read
+            // from the seal and delivered as the receipt it is.
+            if refusal.kind == NativeRefusalKind::Refused(NativeErrorCode::RequestHistoryExpired)
+                && let Some(receipt) = focal_native_client::expired(
+                    store,
+                    &context.operation,
+                    &operation,
+                    &mut reads(runtime, context),
+                )?
+            {
+                return deliver(&receipt);
+            }
             let classified = failure::native(&refusal);
             render_failure(
                 &operation,
@@ -698,9 +721,19 @@ pub(super) fn inspect(
     if remote {
         // The owner's committed outcome for this request key; it does not
         // need this adapter's journal, so an operation another adapter
-        // journaled under the same context is observable here.
-        let page =
-            focal_native_client::outcome(id.key(&context.operation), &mut reads(runtime, context))?;
+        // journaled under the same context is observable here. The journal
+        // names the generation when it has the operation; without it the
+        // owner's window says which generations to ask (F12).
+        let key =
+            store(context, false)?.and_then(|store| store.key_of(id, &context.operation).ok());
+        let page = match key {
+            Some(key) => focal_native_client::outcome(key, &mut reads(runtime, context))?,
+            None => focal_native_client::outcome_by_id(
+                context.operation.principal,
+                id.request(),
+                &mut reads(runtime, context),
+            )?,
+        };
         return render_page_as("Observed", page, format);
     }
     let store = store(context, false)?.ok_or(NativeStoreError::MissingOperation)?;
@@ -780,7 +813,8 @@ fn read(
 ) -> Result<NativeReadPage> {
     match observe(runtime, context, operation)? {
         focal_native_client::NativeReadOutcome::Page(page) => Ok(page),
-        focal_native_client::NativeReadOutcome::Wait(_) => Err(CliError::InvalidResponse),
+        focal_native_client::NativeReadOutcome::Lineage(_)
+        | focal_native_client::NativeReadOutcome::Wait(_) => Err(CliError::InvalidResponse),
     }
 }
 /// `claim wait` on the native engine: the same predicates as the V1
@@ -841,6 +875,74 @@ pub(super) fn render_page(page: NativeReadPage, format: OutputFormat) -> Result<
 }
 /// An observation of the owner (a remote outcome read) is labelled apart from
 /// an object read so callers never mistake one for the other.
+/// `claim lineage`: one observation at one prefix, what it holds by role
+/// and what its bounds left beyond it, so a bounded sample is never read as
+/// the whole lineage.
+fn render_lineage(
+    lineage: focal_client::operations::NativeLineage,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => output::structured(
+            &ApplicationResult {
+                schema_version: 2,
+                operation_id: None,
+                condition: "Lineage".into(),
+                result: OperationOutput::NativeLineage {
+                    lineage: Box::new(lineage),
+                },
+            },
+            format,
+        ),
+        OutputFormat::Table => {
+            let mut out = std::io::stdout().lock();
+            writeln!(
+                out,
+                "PREFIX\t{}\tLOGICAL_TIME\t{}\tCOMPLETE\t{}",
+                lineage.native_sequence.0,
+                lineage.logical_time,
+                lineage.is_complete()
+            )?;
+            let row = |out: &mut std::io::StdoutLock<'_>, role: &str, object: &NativeObject| {
+                let value =
+                    serde_json::to_value(object).map_err(|e| CliError::Other(Box::new(e)))?;
+                let body = value
+                    .as_object()
+                    .and_then(|map| map.values().next().cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                writeln!(out, "{role}\t{body}")?;
+                Ok::<(), CliError>(())
+            };
+            row(&mut out, "CLAIM", &lineage.claim)?;
+            for ancestor in &lineage.ancestors {
+                row(&mut out, "ANCESTOR", ancestor)?;
+            }
+            if let Some(beyond) = lineage.ancestors_beyond {
+                writeln!(out, "ANCESTORS_BEYOND\t{}", hex_id(&beyond.0))?;
+            }
+            if let Some(missing) = lineage.ancestors_missing {
+                writeln!(out, "ANCESTORS_MISSING\t{}", hex_id(&missing.0))?;
+            }
+            for follower in &lineage.followers {
+                row(&mut out, "FOLLOWER", follower)?;
+            }
+            for beyond in &lineage.followers_beyond {
+                writeln!(
+                    out,
+                    "FOLLOWERS_BEYOND\t{:?}\tLISTED_NOT_READ\t{}\tCONTINUES\t{}",
+                    beyond.kind,
+                    beyond.listed_not_read,
+                    beyond.cursor.is_some()
+                )?;
+            }
+            out.flush()?;
+            Ok(())
+        }
+    }
+}
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 fn render_page_as(condition: &str, page: NativeReadPage, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Yaml => output::structured(
@@ -911,6 +1013,31 @@ fn get(runtime: &tokio::runtime::Runtime, context: &Context, command: GetCommand
             (
                 NativeReadOperation::ArtifactGet(object(args.id)),
                 args.display.format,
+            )
+        }
+        GetCommand::Archived(args) => {
+            use focal_client::operations::{NativeArchiveDocument, NativeArchiveTarget};
+            let object = if let Some(id) = args.artifact {
+                NativeArchiveTarget::Artifact { id }
+            } else if let Some(id) = args.work {
+                NativeArchiveTarget::Work { id }
+            } else if let Some(id) = args.diagnostic {
+                NativeArchiveTarget::Diagnostic { id }
+            } else if let Some(id) = args.validation {
+                NativeArchiveTarget::Validation { id }
+            } else if let Some(id) = args.testament {
+                NativeArchiveTarget::Testament { id }
+            } else if let Some(id) = args.receipt {
+                NativeArchiveTarget::Receipt { id }
+            } else {
+                NativeArchiveTarget::Claim
+            };
+            (
+                NativeReadOperation::ArchiveGet(NativeArchiveDocument {
+                    claim: args.claim,
+                    object,
+                }),
+                args.output.format,
             )
         }
         GetCommand::Validation(args) => {

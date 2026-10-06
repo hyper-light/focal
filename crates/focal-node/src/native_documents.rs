@@ -53,6 +53,7 @@ pub(crate) fn invocation_of(value: NativeInvocationRef) -> core_native::NativeIn
         }
         NativeInvocationRef::Import => core_native::NativeInvocation::Import,
         NativeInvocationRef::Retirement { root } => core_native::NativeInvocation::Retirement(root),
+        NativeInvocationRef::Seal { ordinal } => core_native::NativeInvocation::Seal(ordinal),
     }
 }
 pub(crate) fn operation(value: core_native::NativeOperation) -> NativeOperationKind {
@@ -90,6 +91,8 @@ pub(crate) fn operation(value: core_native::NativeOperation) -> NativeOperationK
         O::ClaimDeadline => NativeOperationKind::ClaimDeadline,
         O::Import => NativeOperationKind::Import,
         O::Retire => NativeOperationKind::Retire,
+        O::AdvanceEpochFloor => NativeOperationKind::AdvanceEpochFloor,
+        O::Seal => NativeOperationKind::Seal,
     }
 }
 pub(crate) fn outcome(value: core_native::NativeOutcome) -> NativeReceipt {
@@ -305,6 +308,41 @@ pub(crate) fn claim_content(
     }
 }
 /// The continuation of a retired claim (26 §4).
+pub(crate) fn epoch_window(
+    principal: ParticipantId,
+    window: &core_native::EpochWindow,
+) -> NativeEpochWindow {
+    NativeEpochWindow {
+        principal,
+        floor: window.floor,
+        sealed: window.sealed,
+        open: window
+            .counts
+            .iter()
+            .take(usize::from(window.open))
+            .enumerate()
+            .map(|(at, count)| NativeOpenEpoch {
+                epoch: RequestEpoch(
+                    window
+                        .floor
+                        .0
+                        .saturating_add(u64::try_from(at).unwrap_or(u64::MAX)),
+                ),
+                outcomes: count.outcomes,
+                last_logical_time: count.last,
+            })
+            .collect(),
+        ranges: window
+            .ranges()
+            .iter()
+            .map(|range| NativeSealedRange {
+                first: range.first,
+                last: range.last,
+                seal: range.seal,
+            })
+            .collect(),
+    }
+}
 pub(crate) fn retired(claim: ClaimId, value: &core_native::RetiredClaim) -> NativeRetiredClaim {
     NativeRetiredClaim {
         claim,

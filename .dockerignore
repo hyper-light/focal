@@ -6,3 +6,5 @@ docs/qualification/
 tools/load/target/
 /tmp/
 .DS_Store
+.claude/
+examples/

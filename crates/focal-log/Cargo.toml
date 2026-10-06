@@ -9,7 +9,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
-focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-memory = { version = "0.1.0", path = "../focal-memory", features = ["serde"] }
 crc32fast.workspace = true
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
 postcard.workspace = true
@@ -25,4 +25,12 @@ workspace = true
 
 [[bench]]
 name = "append"
+harness = false
+
+[[bench]]
+name = "allocs"
+harness = false
+
+[[bench]]
+name = "checkpoints"
 harness = false

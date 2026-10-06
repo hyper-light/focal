@@ -96,8 +96,9 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         .unwrap()
         .map(|row| row.unwrap().key)
         .collect::<Vec<_>>();
-    assert_eq!(keys.len(), 3);
+    assert_eq!(keys.len(), 4);
     assert!(keys.contains(&Key::Meta));
+    assert!(keys.contains(&Key::Epochs(reuse_request.principal)));
     assert!(keys.contains(&Key::Outcome(NativeInvocation::from(reuse_request))));
     assert!(keys.contains(&Key::CreationResult(NativeInvocation::from(reuse_request))));
     assert!(!keys.iter().any(|key| matches!(key, Key::Event(..))));

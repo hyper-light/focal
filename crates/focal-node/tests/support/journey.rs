@@ -319,6 +319,20 @@ impl Journey {
     /// A manual action outside the binary (a kill, a file written, a
     /// permission changed): recorded as a step so the study counts it.
     pub fn manual(&mut self, concept: &str, inputs: &[&str], description: &[&str]) {
+        // A `focal` command the operator is told to type must be one the
+        // binary has: it is parsed, with its flags, by the binary itself.
+        if description.first() == Some(&"focal") {
+            let parsed = std::process::Command::new(env!("CARGO_BIN_EXE_focal"))
+                .args(&description[1..])
+                .arg("--help")
+                .output()
+                .unwrap();
+            assert!(
+                parsed.status.success(),
+                "the recorded command {description:?} is not focal's: {}",
+                String::from_utf8_lossy(&parsed.stderr)
+            );
+        }
         self.steps.push(Step {
             concept: concept.to_owned(),
             inputs: inputs.iter().map(|input| (*input).to_owned()).collect(),

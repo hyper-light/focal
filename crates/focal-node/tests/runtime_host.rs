@@ -21,10 +21,16 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[path = "support/owners.rs"]
+mod owners;
+
+/// The replicas' configured tick (`Fleet::start`).
+const TICK: Duration = Duration::from_millis(20);
 const ISSUER: ParticipantId = ParticipantId::from_u128(1);
 const WORKER: ParticipantId = ParticipantId::from_u128(2);
 const EVALUATOR: ParticipantId = ParticipantId::from_u128(3);
@@ -355,12 +361,17 @@ impl Executor for Counted {
 struct LatePass {
     calls: AtomicUsize,
     cancelled: AtomicUsize,
+    /// Set once the test is done with the run (`Release`).
+    released: AtomicBool,
 }
 impl Executor for LatePass {
     fn execute(&self, _: &Task, cancellation: &Cancellation) -> WorkerOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let until = Instant::now() + Duration::from_secs(15);
-        while !cancellation.is_cancelled() && Instant::now() < until {
+        // Held until it is cancelled, the property under test, or until the
+        // test, which waits for the cancellation charged to the owners'
+        // periods, releases it. A clock's guess at when the isolated leader's
+        // quorum check runs gave the run up first under load.
+        while !cancellation.is_cancelled() && !self.released.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
         if cancellation.is_cancelled() {
@@ -371,6 +382,14 @@ impl Executor for LatePass {
             code: DiagnosticCode::Evaluated,
             reason: "late result after authority loss".into(),
         }
+    }
+}
+/// Releases the late run when dropped: the test passing or not, its worker
+/// returns before the fleet's runtimes stop.
+struct Release(Arc<LatePass>);
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.released.store(true, Ordering::SeqCst);
     }
 }
 fn runtime(catalog: Arc<Catalog>, executor: Arc<dyn Executor>, tiny: bool) -> Runtime {
@@ -511,36 +530,53 @@ impl Fleet {
             None
         }
     }
+    /// The periods each replica's owner has run: what a wait on the fleet is
+    /// charged in (27 §3.1 P8).
+    fn periods(&self) -> Vec<u64> {
+        self.hosts.iter().map(ReplicaHost::periods).collect()
+    }
+    /// A wait of what `allowance` holds at the replicas' tick.
+    fn deadline(&self, allowance: Duration) -> focal_timing::ProgressDeadline {
+        focal_timing::ProgressDeadline::begin(
+            &self.periods(),
+            focal_timing::ProgressDeadline::periods(allowance, TICK),
+            owners::FROZEN,
+        )
+    }
+    /// Why `deadline` is over, once it is.
+    fn spent(&self, deadline: &mut focal_timing::ProgressDeadline) -> Option<focal_timing::Spent> {
+        deadline.check(&self.periods()).err()
+    }
     async fn terminal(&self, excluding: Option<usize>) -> (usize, SessionSeq) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                for (index, host) in self.hosts.iter().enumerate() {
-                    assert!(!host.progress().stopped, "owner stopped unexpectedly");
-                    if Some(index) == excluding || host.progress().node != host.progress().leader {
-                        continue;
-                    }
-                    if let Some((ClaimStatus::Satisfied, sequence)) = self.claim(index).await {
-                        return (index, sequence);
-                    }
+        let mut wait = self.deadline(Duration::from_secs(15));
+        loop {
+            for (index, host) in self.hosts.iter().enumerate() {
+                assert!(!host.progress().stopped, "owner stopped unexpectedly");
+                if Some(index) == excluding || host.progress().node != host.progress().leader {
+                    continue;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                if let Some((ClaimStatus::Satisfied, sequence)) = self.claim(index).await {
+                    return (index, sequence);
+                }
             }
-        })
-        .await
-        .expect("runtime did not finish through replica owner")
+            if let Some(spent) = self.spent(&mut wait) {
+                panic!("runtime did not finish through replica owner: {spent}");
+            }
+            tokio::time::sleep(TICK).await;
+        }
     }
     async fn all_at(&self, sequence: SessionSeq) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self
-                .hosts
-                .iter()
-                .any(|host| host.progress().sequence < sequence)
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut wait = self.deadline(Duration::from_secs(10));
+        while self
+            .hosts
+            .iter()
+            .any(|host| host.progress().sequence < sequence)
+        {
+            if let Some(spent) = self.spent(&mut wait) {
+                panic!("the replicas did not reach {sequence:?}: {spent}");
             }
-        })
-        .await
-        .unwrap();
+            tokio::time::sleep(TICK).await;
+        }
     }
     async fn stop(mut self) {
         for host in &self.hosts {
@@ -573,6 +609,7 @@ async fn threaded_owners_recover_execution_after_leader_loss_and_restart() {
     let late = Arc::new(LatePass {
         calls: AtomicUsize::new(0),
         cancelled: AtomicUsize::new(0),
+        released: AtomicBool::new(false),
     });
     let calls = Arc::new(AtomicUsize::new(0));
     let executor = Arc::new(Counted {
@@ -587,13 +624,15 @@ async fn threaded_owners_recover_execution_after_leader_loss_and_restart() {
             runtime(catalog.clone(), executor.clone(), false),
         ],
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while late.calls.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    // Released when the test ends, passing or not, before the fleet stops.
+    let _release = Release(late.clone());
+    let mut wait = fleet.deadline(Duration::from_secs(10));
+    while late.calls.load(Ordering::SeqCst) == 0 {
+        if let Some(spent) = fleet.spent(&mut wait) {
+            panic!("the late run never began: {spent}");
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(TICK).await;
+    }
     fleet.isolated.store(1, Ordering::SeqCst);
     let (_, sequence) = fleet.terminal(Some(0)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -601,13 +640,13 @@ async fn threaded_owners_recover_execution_after_leader_loss_and_restart() {
     // leads, which its own quorum check decides on its own clock — after the
     // majority has already finished. The property is that the run is
     // cancelled, exactly once, not that it happens before the successor ends.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while late.cancelled.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut wait = fleet.deadline(Duration::from_secs(30));
+    while late.cancelled.load(Ordering::SeqCst) == 0 {
+        if let Some(spent) = fleet.spent(&mut wait) {
+            panic!("the isolated former leader never cancelled its run: {spent}");
         }
-    })
-    .await
-    .expect("the isolated former leader never cancelled its run");
+        tokio::time::sleep(TICK).await;
+    }
     assert_eq!(late.cancelled.load(Ordering::SeqCst), 1);
     fleet.isolated.store(0, Ordering::SeqCst);
     fleet.all_at(sequence).await;
@@ -644,7 +683,16 @@ async fn runtime_capacity_keeps_the_replicated_owner_serving() {
         .map(|_| runtime(catalog.clone(), executor.clone(), true))
         .collect();
     let fleet = Fleet::start(nodes, runtimes);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // The owners run the periods a quarter of a second holds at their tick,
+    // the runtime refusing for capacity all the while: no call is made.
+    let mut ran = fleet.deadline(Duration::from_millis(250));
+    loop {
+        match fleet.spent(&mut ran) {
+            Some(focal_timing::Spent::Budget { .. }) => break,
+            Some(stalled) => panic!("the owners ran no period: {stalled}"),
+            None => tokio::time::sleep(TICK).await,
+        }
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(fleet.hosts.iter().all(|host| !host.progress().stopped));
     let response = dispatch(

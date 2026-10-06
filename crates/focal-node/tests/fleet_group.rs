@@ -150,32 +150,63 @@ async fn ready(
     ledger: LedgerId,
     excluded: Option<usize>,
 ) -> usize {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            for (i, hosts) in hosts.iter().enumerate() {
-                if Some(i) == excluded {
-                    continue;
-                }
-                let host = &hosts[&ledger];
-                let status = host.progress();
-                if status.node == status.leader && status.term > 0 {
-                    let reply = dispatch(
-                        host,
-                        actor(ledger),
-                        read(ledger),
-                        &ReplicaHost::wire_limits(),
-                    )
-                    .await;
-                    if matches!(reply.result, Response::Read(_)) {
-                        return i;
-                    }
+    // Charged to the replicas' own periods (27 §3.1 P8): fifteen seconds of
+    // their ticks, not of the clock. Held to the clock, a gate's run of the
+    // suite beside heavier tests in this binary spent it while the replicas
+    // were starved of their periods (2026-10-04).
+    let tick = Duration::from_millis(20);
+    let periods = || -> Vec<u64> {
+        hosts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != excluded)
+            .map(|(_, hosts)| hosts[&ledger].periods())
+            .collect()
+    };
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &periods(),
+        focal_timing::ProgressDeadline::periods(Duration::from_secs(15), tick),
+        Duration::from_secs(60),
+    );
+    loop {
+        for (i, hosts) in hosts.iter().enumerate() {
+            if Some(i) == excluded {
+                continue;
+            }
+            let host = &hosts[&ledger];
+            let status = host.progress();
+            if status.node == status.leader && status.term > 0 {
+                let reply = dispatch(
+                    host,
+                    actor(ledger),
+                    read(ledger),
+                    &ReplicaHost::wire_limits(),
+                )
+                .await;
+                if matches!(reply.result, Response::Read(_)) {
+                    return i;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    })
-    .await
-    .expect("no authoritative session leader")
+        if let Err(spent) = wait.check(&periods()) {
+            let states: Vec<_> = hosts
+                .iter()
+                .map(|hosts| {
+                    let progress = hosts[&ledger].progress();
+                    (
+                        progress.node,
+                        progress.leader,
+                        progress.term,
+                        progress.sequence,
+                    )
+                })
+                .collect();
+            panic!(
+                "no authoritative session leader: {spent}; (node, leader, term, sequence) {states:?}"
+            );
+        }
+        tokio::time::sleep(tick).await;
+    }
 }
 async fn stop(hosts: &BTreeMap<LedgerId, ReplicaHost>) {
     for host in hosts.values() {
@@ -380,17 +411,47 @@ async fn multiple_session_quorums_share_node_workers_and_wal_through_leader_loss
         "{committed:?}"
     );
     isolated.store(0, Ordering::Release);
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while groups.iter().any(|group| {
-            group.hosts.iter().any(|(id, host)| {
-                host.progress().sequence < SessionSeq(if *id == ledger(0) { 2 } else { 1 })
-            })
-        }) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    // Every replica catches up once the old leader rejoins, the wait charged
+    // to their own periods as `ready`'s is.
+    let periods = || -> Vec<u64> {
+        groups
+            .iter()
+            .flat_map(|group| group.hosts.values().map(|host| host.periods()))
+            .collect()
+    };
+    let tick = Duration::from_millis(20);
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &periods(),
+        focal_timing::ProgressDeadline::periods(Duration::from_secs(15), tick),
+        Duration::from_secs(60),
+    );
+    while groups.iter().any(|group| {
+        group.hosts.iter().any(|(id, host)| {
+            host.progress().sequence < SessionSeq(if *id == ledger(0) { 2 } else { 1 })
+        })
+    }) {
+        if let Err(spent) = wait.check(&periods()) {
+            let states: Vec<_> = groups
+                .iter()
+                .flat_map(|group| {
+                    group.hosts.iter().map(|(id, host)| {
+                        let progress = host.progress();
+                        (
+                            id.session,
+                            progress.node,
+                            progress.leader,
+                            progress.term,
+                            progress.sequence,
+                        )
+                    })
+                })
+                .collect();
+            panic!(
+                "the replicas did not catch up: {spent}; (session, node, leader, term, sequence) {states:?}"
+            );
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(tick).await;
+    }
     for group in &groups {
         stop(&group.hosts).await;
     }
@@ -419,6 +480,164 @@ async fn multiple_session_quorums_share_node_workers_and_wal_through_leader_loss
             );
         }
         stop(&group.hosts).await;
+        group.owner.join().unwrap();
+    }
+}
+
+/// A session's queued proposals share its writes (27 §9): sixteen clients
+/// ask one session of three grouped owners for entries one after another,
+/// each the moment its last was answered, and the leader's log takes them
+/// in fewer writes than entries. Before, an owner that shares its thread
+/// started a write for each proposal as it came and dispatched nothing to a
+/// session with a write out — one proposal a write. What the burst took and
+/// how many entries a write carried is printed (the measurement of the
+/// change); the test claims the burst commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sessions_queued_proposals_share_its_writes() {
+    const CLIENTS: u128 = 16;
+    const EACH: u128 = 40;
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut groups: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| open(root.path(), i as u64 + 1, &[1, 2, 3], 1))
+        .collect();
+    let targets: Vec<_> = groups.iter().map(|group| group.hosts.clone()).collect();
+    let mut pumps = Vec::new();
+    // Each frame is carried on a task of its own, as a peer connection
+    // carries each on its own stream: a pump that waited for every frame's
+    // answer — given once its receiver persisted it — would carry one frame
+    // at a time and make the followers' writes the burst's pace. As many
+    // at once as the consensus window lets a peer have in flight.
+    let window = focal_consensus::DEFAULT_INFLIGHT_WINDOW;
+    for (index, group) in groups.iter_mut().enumerate() {
+        let mut outgoing = group.outgoing.take().unwrap();
+        let targets = targets.clone();
+        let lanes = Arc::new(tokio::sync::Semaphore::new(window * 2));
+        pumps.push(tokio::spawn(async move {
+            while let Some(frame) = outgoing.recv().await {
+                let Ok(lane) = lanes.clone().acquire_owned().await else {
+                    break;
+                };
+                let targets = targets.clone();
+                tokio::spawn(async move {
+                    let source = index as u64 + 1;
+                    let ledger = frame.request.ledger;
+                    let peer = AuthenticatedPeer::local(PeerGrant {
+                        principal: ParticipantId::from_u128(source as u128),
+                        tenants: [ledger.tenant].into_iter().collect(),
+                        role: PeerRole::Node { node_id: source },
+                    })
+                    .unwrap();
+                    let _ = dispatch(
+                        &targets[frame.target as usize - 1][&ledger],
+                        peer,
+                        frame.request.clone(),
+                        &ReplicaHost::wire_limits(),
+                    )
+                    .await;
+                    drop(lane);
+                });
+            }
+        }));
+    }
+    let hosts: Vec<_> = groups.iter().map(|group| &group.hosts).collect();
+    let session = ledger(0);
+    let leader = ready(&hosts, session, None).await;
+    let wal = &groups[leader].wal;
+    let before = wal.stats().unwrap();
+    let started = std::time::Instant::now();
+    let policy = focal_client::RetryPolicy::default();
+    let policy = &policy;
+    let hosts_ref = &hosts;
+    futures_util::future::join_all((0..CLIENTS).map(|client| async move {
+        for each in 0..EACH {
+            let envelope = epoch(session, 20_000 + client * EACH + each);
+            // Charged to the group's commits: only a stall spends it.
+            let periods = || -> Vec<u64> {
+                hosts_ref
+                    .iter()
+                    .map(|hosts| hosts[&session].periods())
+                    .collect()
+            };
+            let committed = || {
+                hosts_ref
+                    .iter()
+                    .map(|hosts| hosts[&session].progress().sequence)
+                    .max()
+                    .unwrap_or_default()
+            };
+            let budget = focal_timing::ProgressDeadline::periods(
+                Duration::from_secs(10),
+                Duration::from_millis(20),
+            );
+            let frozen = Duration::from_secs(60);
+            let mut wait = focal_timing::ProgressDeadline::begin(&periods(), budget, frozen);
+            let mut seen = committed();
+            let mut backoffs = 0u32;
+            loop {
+                // The replica that leads at the time.
+                let leading = hosts_ref
+                    .iter()
+                    .position(|hosts| {
+                        let progress = hosts[&session].progress();
+                        progress.node == progress.leader
+                    })
+                    .unwrap_or(leader);
+                let reply = dispatch(
+                    &hosts_ref[leading][&session],
+                    actor(session),
+                    envelope.clone(),
+                    &ReplicaHost::wire_limits(),
+                )
+                .await;
+                match reply.result {
+                    Response::Submitted(MutationReply::Committed(_)) => break,
+                    Response::Error(
+                        refused @ (AccessError::Unavailable
+                        | AccessError::OutcomeUnknown
+                        | AccessError::Capacity),
+                    ) => {
+                        let now = committed();
+                        if now > seen {
+                            seen = now;
+                            wait =
+                                focal_timing::ProgressDeadline::begin(&periods(), budget, frozen);
+                        }
+                        if let Err(spent) = wait.check(&periods()) {
+                            panic!("{envelope:?}: {refused:?} after {spent}");
+                        }
+                        if !matches!(refused, AccessError::OutcomeUnknown) {
+                            tokio::time::sleep(policy.pause(backoffs)).await;
+                            backoffs = backoffs.saturating_add(1);
+                        }
+                    }
+                    other => panic!("{envelope:?}: {other:?}"),
+                }
+            }
+        }
+    }))
+    .await;
+    let elapsed = started.elapsed();
+    let after = wal.stats().unwrap();
+    let entries = u64::try_from(CLIENTS * EACH).unwrap();
+    let writes = after.group_commits - before.group_commits;
+    println!(
+        "queued proposals: {entries} entries in {elapsed:?} ({:.0} a second); the leader's log took them in {writes} writes ({:.2} entries a write, {} records)",
+        entries as f64 / elapsed.as_secs_f64(),
+        entries as f64 / writes.max(1) as f64,
+        after.appended_records - before.appended_records
+    );
+    for group in &groups {
+        stop(&group.hosts).await;
+    }
+    for pump in pumps {
+        pump.abort();
+        let _ = pump.await;
+    }
+    drop(hosts);
+    drop(targets);
+    for group in groups {
         group.owner.join().unwrap();
     }
 }

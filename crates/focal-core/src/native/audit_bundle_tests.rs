@@ -801,7 +801,7 @@ fn insufficient_batch_capacity_and_copy_failure_leave_no_partial_bundle_or_consu
     assert!(core.native_claim_result_testament(CLAIM).is_none());
     assert!(core.native_outcome(f::request(f::ISSUER, 1300)).is_none());
 
-    core.limits.range.max_batch_entries = 5;
+    core.limits.range.max_batch_entries = 6;
     let failed = crate::native::prepare::fail_copies_after(0, || {
         core.prepare_native(
             f::context(f::ISSUER, 100),
@@ -849,7 +849,7 @@ fn insufficient_batch_capacity_and_copy_failure_leave_no_partial_bundle_or_consu
         ResultTestamentState::Generated
     );
     assert!(core.native_outcome(f::request(f::ISSUER, 1301)).is_none());
-    core.limits.range.max_batch_entries = 4;
+    core.limits.range.max_batch_entries = 5;
     f::publish(&mut core, 100, post(binding, f::ISSUER, 1301));
     assert_eq!(
         core.native_result_testament(BUNDLE)

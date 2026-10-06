@@ -23,7 +23,7 @@ use fleet::*;
 /// Where `node` says the session leads, from its metrics; none while it
 /// does not answer or does not host the session.
 fn session_leader(node: &Node, ledger: &str) -> Option<u64> {
-    let output = run(node, None, &["cluster", "node", "metrics"]);
+    let output = run(node, None, &["diagnose", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -161,13 +161,21 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
                 .iter()
                 .map(|node| {
                     format!(
-                        "leader {:?}; health {}; periods {}",
+                        "leader {:?}; health {}; replicas {}; plan {}; periods {}",
                         session_leader(node, &ledger),
                         String::from_utf8_lossy(
-                            &run(node, None, &["cluster", "node", "health"]).stdout
+                            &run(node, None, &["diagnose", "node", "--health"]).stdout
                         ),
+                        // Which replica of the session each node runs, with
+                        // its leader, commit and apply: a replacement stuck
+                        // at `Installed` is one that never caught up, or never
+                        // learned a leader (three CI runs of 2026-10-01/02).
                         String::from_utf8_lossy(
-                            &run(node, None, &["cluster", "node", "metrics"]).stdout
+                            &run(node, None, &["diagnose", "cluster", "--replicas"]).stdout
+                        ),
+                        String::from_utf8_lossy(&run(node, None, &["cluster", "plan"]).stdout),
+                        String::from_utf8_lossy(
+                            &run(node, None, &["diagnose", "node", "--metrics"]).stdout
                         )
                         .lines()
                         .filter(|line| line.contains("period") || line.contains("pace"))
@@ -205,7 +213,7 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
     let mut wait = Progress::begin(&[&hosts[0]], Duration::from_secs(120));
     while session_leader(&hosts[0], &ledger) == Some(node_a) {
         if let Some(spent) = wait.spent() {
-            let metrics = run(&hosts[0], None, &["cluster", "node", "metrics"]);
+            let metrics = run(&hosts[0], None, &["diagnose", "node", "--metrics"]);
             panic!(
                 "the drained host still claims the session: {spent}: {:?}",
                 String::from_utf8_lossy(&metrics.stdout)

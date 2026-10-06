@@ -32,10 +32,16 @@ impl SnapshotFeedback {
         message: &Message,
         budget: &MemoryBudget,
     ) -> Result<Option<oneshot::Sender<SnapshotStatus>>, SnapshotFeedbackError> {
-        if message.msg_type != MessageType::MsgSnapshot as i32 {
+        if message.msg_type != MessageType::MsgSnapshot {
             return Ok(None);
         }
-        if message.to == 0 || message.term == 0 || message.get_snapshot().get_metadata().index == 0
+        if message.to == 0
+            || message.term == 0
+            || message
+                .snapshot
+                .as_deref()
+                .map_or(0, focal_consensus::snapshot_index)
+                == 0
         {
             return Err(SnapshotFeedbackError::Invalid);
         }
@@ -58,7 +64,10 @@ impl SnapshotFeedback {
             message.to,
             Flight {
                 term: message.term,
-                index: message.get_snapshot().get_metadata().index,
+                index: message
+                    .snapshot
+                    .as_deref()
+                    .map_or(0, focal_consensus::snapshot_index),
                 receiver,
                 completed: None,
                 _charge: charge,

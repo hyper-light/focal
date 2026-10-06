@@ -36,6 +36,8 @@ fn private(path: &Path) {
 }
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/progress.rs"]
+mod progress;
 fn address() -> String {
     ports::address()
 }
@@ -83,6 +85,18 @@ fn run(root: &Path, context: Option<&str>, args: &[&str]) -> Output {
         command.args(["--client-context", context]);
     }
     command.args(args).output().unwrap()
+}
+/// The periods the root owner of the node at `root` has run, read from its
+/// metrics: what a wait on it is charged in (`progress`). None while the
+/// node does not answer.
+fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
+    move || {
+        let output = run(root, None, &["diagnose", "node", "--metrics"]);
+        if !output.status.success() {
+            return None;
+        }
+        progress::periods_in(&String::from_utf8_lossy(&output.stdout))
+    }
 }
 fn cli(root: &Path, context: Option<&str>, args: &[&str]) -> Value {
     let mut args = args.to_vec();
@@ -873,33 +887,29 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     assert_eq!(claim_object(root, &e)["status"], POSTED);
     // Expired is code 16 of the frozen claim status vocabulary; the owner's
     // sweep runs once a second on the embedded host.
-    let started = std::time::Instant::now();
+    // The deadline is wall time; once it has passed, the owner's sweep
+    // expires the claim in its periods, which the wait is charged to.
+    let mut wait =
+        progress::Progress::begin(vec![Box::new(root_periods(root))], Duration::from_secs(20));
     let expired = loop {
         let claim = claim_object(root, &e);
         if claim["status"] == 16 {
             break claim;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "claim did not expire: {claim}"
-        );
+        if let Some(spent) = wait.spent() {
+            panic!("claim did not expire: {spent}: {claim}");
+        }
         std::thread::sleep(Duration::from_millis(250));
     };
     assert_eq!(expired["deadline"]["at"], soon, "{expired}");
     // The expired claim's monitor timer fires on the terminal owner and is
     // consumed without inventing a release; the registration stays readable.
-    let started = std::time::Instant::now();
-    loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        if now > soon + 2_000 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-        assert!(started.elapsed() < Duration::from_secs(20));
-    }
+    // Its instant is wall time (soon + 500), and the reads come after it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::thread::sleep(Duration::from_millis((soon + 2_000).saturating_sub(now)));
     let monitors = list(root, None, &["monitors", "--claim", &e]);
     assert_eq!(
         hex_hash(&monitors[0]["Monitor"]["id"]),

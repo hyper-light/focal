@@ -1,2 +1,5 @@
 # Third-party sources built into the binaries (vendor/README.md), not focal's own.
 vendor/** linguist-vendored
+# Content-addressed files: their digests are pinned (skills/manifest.json, the MCP
+# skills manifests), so their bytes are the same on every platform: never CRLF.
+skills/** text eol=lf

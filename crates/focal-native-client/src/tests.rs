@@ -172,7 +172,11 @@ impl Harness {
         let compiled = compile(
             operation,
             &context(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut generator,
             resolved,
             &limits,
@@ -193,7 +197,11 @@ impl Harness {
         let again = compile(
             operation,
             &context(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut ids(request * 1000),
             resolved,
             &limits,
@@ -229,7 +237,11 @@ impl Harness {
         let compiled = compile(
             operation,
             &context(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut ids(request * 1000),
             resolved,
             &limits,
@@ -364,7 +376,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &work,
             &context(ISSUER),
-            RequestId::from_u128(4),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(4),
+            },
             &mut ids(4000),
             &resolved,
             &CompileLimits::default()
@@ -456,7 +472,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         requirements(&begin).unwrap(),
         vec![
             Requirement::Objects(vec![focal_wire::NativeObjectRef::Claim(claim)]),
-            Requirement::Evaluations { validation }
+            Requirement::Evaluation {
+                claim,
+                validation,
+                selector: crate::EvaluationSelector::WholeWork { slot: None },
+            }
         ]
     );
     let resolved = h.resolved(claim, None, Some(key));
@@ -468,7 +488,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &begin,
             &context(EVALUATOR),
-            RequestId::from_u128(10),
+            RequestKey {
+                principal: EVALUATOR,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(10),
+            },
             &mut ids(10_000),
             &h.resolved(claim, None, Some(key)),
             &CompileLimits::default()
@@ -485,7 +509,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &report,
             &context(SUBJECT),
-            RequestId::from_u128(10),
+            RequestKey {
+                principal: SUBJECT,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(10),
+            },
             &mut ids(10_000),
             &resolved,
             &CompileLimits::default()
@@ -512,7 +540,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
     let compiled = compile(
         &cancel,
         &context(ISSUER),
-        RequestId::from_u128(11),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(11),
+        },
         &mut ids(11_000),
         &resolved,
         &CompileLimits::default(),
@@ -571,7 +603,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &post,
             &context(ISSUER),
-            RequestId::from_u128(15),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(15),
+            },
             &mut ids(15_000),
             &resolved,
             &CompileLimits::default()
@@ -675,7 +711,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
                 compile(
                     &operation,
                     &context(ISSUER),
-                    RequestId::from_u128(1),
+                    RequestKey {
+                        principal: ISSUER,
+                        epoch: RequestEpoch(1),
+                        id: RequestId::from_u128(1),
+                    },
                     &mut ids(1_000),
                     &Resolved::default(),
                     &CompileLimits::default()
@@ -714,7 +754,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
     let compiled = compile(
         &adopt,
         &context(ISSUER),
-        RequestId::from_u128(2),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(2),
+        },
         &mut ids(2_000),
         &resolved,
         &CompileLimits::default(),
@@ -744,7 +788,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
     let compiled = compile(
         &register,
         &context(ISSUER),
-        RequestId::from_u128(3),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(3),
+        },
         &mut ids(3_000),
         &resolved,
         &CompileLimits::default(),
@@ -786,7 +834,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
             compile(
                 &parse("monitor.register", document),
                 &context(ISSUER),
-                RequestId::from_u128(4),
+                RequestKey {
+                    principal: ISSUER,
+                    epoch: RequestEpoch(1),
+                    id: RequestId::from_u128(4),
+                },
                 &mut ids(4_000),
                 &resolved,
                 &CompileLimits::default()
@@ -809,7 +861,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
         compile(
             &rebind,
             &context(ISSUER),
-            RequestId::from_u128(5),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(5),
+            },
             &mut ids(5_000),
             &resolved,
             &CompileLimits::default()
@@ -832,7 +888,11 @@ fn creation_rules_are_checked_before_any_identity_leaves_the_compiler() {
         let error = compile(
             &operation,
             &context(ISSUER),
-            RequestId::from_u128(1),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(1),
+            },
             &mut ids(1),
             &Resolved::default(),
             &limits,
@@ -878,7 +938,11 @@ fn creation_rules_are_checked_before_any_identity_leaves_the_compiler() {
         compile(
             &operation,
             &context(ISSUER),
-            RequestId::from_u128(0),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(0),
+            },
             &mut ids(1),
             &Resolved::default(),
             &limits
@@ -898,7 +962,11 @@ fn creation_rules_are_checked_before_any_identity_leaves_the_compiler() {
         compile(
             &operation,
             &context(ISSUER),
-            RequestId::from_u128(1),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(1),
+            },
             &mut ids(1),
             &Resolved::default(),
             &limits
@@ -938,7 +1006,11 @@ fn responses_need_diagnostics_for_failure_and_bind_content_to_the_authored_repor
         compile(
             &failed,
             &context(SUBJECT),
-            RequestId::from_u128(4),
+            RequestKey {
+                principal: SUBJECT,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(4),
+            },
             &mut ids(4000),
             &resolved,
             &CompileLimits::default()
@@ -960,7 +1032,11 @@ fn responses_need_diagnostics_for_failure_and_bind_content_to_the_authored_repor
     let first = compile(
         &cited,
         &context(SUBJECT),
-        RequestId::from_u128(5),
+        RequestKey {
+            principal: SUBJECT,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(5),
+        },
         &mut ids(5000),
         &resolved,
         &CompileLimits::default(),
@@ -983,7 +1059,11 @@ fn responses_need_diagnostics_for_failure_and_bind_content_to_the_authored_repor
     let second = compile(
         &other,
         &context(SUBJECT),
-        RequestId::from_u128(5),
+        RequestKey {
+            principal: SUBJECT,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(5),
+        },
         &mut ids(5000),
         &resolved,
         &CompileLimits::default(),
@@ -1163,7 +1243,11 @@ fn resolution_reads_wire_objects_and_selects_the_current_evaluation() {
     let compiled = compile(
         &begin,
         &context(EVALUATOR),
-        RequestId::from_u128(1),
+        RequestKey {
+            principal: EVALUATOR,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(1),
+        },
         &mut ids(1),
         &resolved,
         &CompileLimits::default(),
@@ -1187,7 +1271,11 @@ fn resolution_reads_wire_objects_and_selects_the_current_evaluation() {
     let compiled = compile(
         &report,
         &context(EVALUATOR),
-        RequestId::from_u128(2),
+        RequestKey {
+            principal: EVALUATOR,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(2),
+        },
         &mut ids(2),
         &resolved,
         &CompileLimits::default(),
@@ -1308,7 +1396,11 @@ fn a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the
         let compiled = compile(
             &parse("claim.submit", stale),
             &context(ISSUER),
-            RequestId::from_u128(6),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(6),
+            },
             &mut ids(6000),
             &Resolved::default(),
             &CompileLimits::default(),
@@ -1355,7 +1447,11 @@ fn a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the
         compile(
             &parse("claim.submit", dependent),
             &context(ISSUER),
-            RequestId::from_u128(7),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(7),
+            },
             &mut ids(7000),
             &Resolved::default(),
             &CompileLimits::default()
@@ -2087,7 +2183,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         })
     };
     let mut pause = |_: std::time::Duration| panic!("a lineage read never pauses");
-    let NativeReadOutcome::Page(page) = crate::read(
+    let NativeReadOutcome::Lineage(lineage) = crate::read(
         &NativeReadOperation::ClaimLineage(NativeObjectDocument {
             id: hex_of(claim.0),
         }),
@@ -2099,17 +2195,24 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
     .unwrap() else {
         panic!()
     };
-    let ids: Vec<_> = page
-        .objects
-        .iter()
-        .map(|object| match object {
-            NativeObject::Claim(claim) => ClaimId(claim.binding.object.0),
-            _ => panic!(),
-        })
-        .collect();
-    assert_eq!(ids, vec![claim, parent, correction, child]);
-    assert_eq!(page.token.sequence, SessionSeq(20));
-    assert_eq!(page.visited, 7);
+    let id_of = |object: &NativeObject| match object {
+        NativeObject::Claim(claim) => ClaimId(claim.binding.object.0),
+        _ => panic!(),
+    };
+    assert_eq!(id_of(&lineage.claim), claim);
+    assert_eq!(
+        lineage.ancestors.iter().map(id_of).collect::<Vec<_>>(),
+        vec![parent]
+    );
+    assert_eq!(
+        lineage.followers.iter().map(id_of).collect::<Vec<_>>(),
+        vec![correction, child]
+    );
+    // Nothing lies beyond this observation: the chain reached its root and
+    // every relation list reached its end within the bounds.
+    assert!(lineage.is_complete(), "{lineage:?}");
+    assert_eq!(lineage.token.sequence, SessionSeq(20));
+    assert_eq!(lineage.visited, 7);
     assert_eq!(
         kinds,
         vec![
@@ -2118,6 +2221,360 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
             RelationKind::CausedBy
         ]
     );
+    // One prefix: the first read is linearizable and every later read is
+    // exact at its token (the audit's F10).
     assert_eq!(tokens[0], ReadConsistency::Linearizable);
-    assert!(tokens[1..].iter().all(|consistency| matches!(consistency, ReadConsistency::AtLeast(token) if token.sequence == SessionSeq(20))));
+    assert!(tokens[1..].iter().all(|consistency| matches!(consistency, ReadConsistency::Exact(token) if token.sequence == SessionSeq(20))));
+}
+
+/// The audit's F10: what the lineage's bounds leave out is named. A chain
+/// deeper than the depth names the next ancestor; a relation list past the
+/// related bound counts the followers it named but the observation did not
+/// read, and carries the list's own continuation; an ancestor unreadable at
+/// the prefix is named where the chain stops short.
+#[test]
+fn a_lineage_names_what_its_bounds_left_beyond_it() {
+    use crate::NativeReadOutcome;
+    use crate::observe::LINEAGE_DEPTH;
+    use focal_client::operations::{NativeObjectDocument, NativeReadOperation};
+    use focal_wire::*;
+    let root = Cause::Root(RootCommandId::from_u128(1));
+    // Claim 100 is caused by 101, which is caused by 102, ... a chain of
+    // forty; claim 900 is missing at the prefix.
+    let chain = |n: u128| ClaimId::from_u128(100 + n);
+    let missing = ClaimId::from_u128(900);
+    let mut reads = |request: NativeReadRequest| {
+        let NativeReadQuery::Claim { id, .. } = request.query else {
+            panic!("{request:?}");
+        };
+        if id == missing {
+            let mut page = synthetic_claim(id, ClaimStatus::Posted, 1, false, root.clone(), 20);
+            page.objects.clear();
+            return Ok(page);
+        }
+        let n = u128::from_be_bytes(id.0) - 100;
+        let cause = if n < 40 {
+            Cause::Claim(chain(n + 1))
+        } else {
+            root.clone()
+        };
+        Ok(synthetic_claim(
+            id,
+            ClaimStatus::Posted,
+            1,
+            false,
+            cause,
+            20,
+        ))
+    };
+    // Every relation list names a hundred followers and continues.
+    let mut lists = |request: NativeListRequest| {
+        let NativeListFilter::Claims {
+            relation: Some(relation),
+            ..
+        } = &request.filter
+        else {
+            panic!("{request:?}");
+        };
+        let base = match relation.kind {
+            RelationKind::Invalidates => 1000,
+            RelationKind::Refines => 2000,
+            _ => 3000,
+        };
+        let mut objects = Vec::new();
+        for i in 0..100u128 {
+            objects.extend(
+                synthetic_claim(
+                    ClaimId::from_u128(base + i),
+                    ClaimStatus::Posted,
+                    1,
+                    false,
+                    root.clone(),
+                    20,
+                )
+                .objects,
+            );
+        }
+        Ok(NativeListPage {
+            token: ReadToken {
+                ledger: ledger(),
+                sequence: SessionSeq(20),
+                route_epoch: RouteEpoch(1),
+            },
+            native_sequence: SessionSeq(20),
+            objects,
+            next: Some(NativeListCursor(vec![7; 8])),
+            visited: 100,
+        })
+    };
+    let mut pause = |_: std::time::Duration| panic!("a lineage read never pauses");
+    let mut observe = |id: ClaimId, reads: &mut Reads<'_>, lists: &mut Lists<'_>| {
+        let NativeReadOutcome::Lineage(lineage) = crate::read(
+            &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: hex_of(id.0) }),
+            &context(ISSUER),
+            reads,
+            lists,
+            &mut pause,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        lineage
+    };
+    let lineage = observe(chain(0), &mut reads, &mut lists);
+    assert!(!lineage.is_complete());
+    assert_eq!(lineage.ancestors.len(), LINEAGE_DEPTH);
+    assert_eq!(
+        lineage.ancestors_beyond,
+        Some(chain(LINEAGE_DEPTH as u128 + 1))
+    );
+    assert_eq!(lineage.ancestors_missing, None);
+    // Sixty-four followers read: all of the corrections' hundred that fit,
+    // none of the refinements' or the children's; each list says what it
+    // named beyond them and that it continues.
+    assert_eq!(lineage.followers.len(), 64);
+    let beyond: Vec<_> = lineage
+        .followers_beyond
+        .iter()
+        .map(|beyond| (beyond.kind, beyond.listed_not_read, beyond.cursor.is_some()))
+        .collect();
+    assert_eq!(
+        beyond,
+        vec![
+            (RelationKind::Invalidates, 36, true),
+            (RelationKind::Refines, 100, true),
+            (RelationKind::CausedBy, 100, true),
+        ]
+    );
+    // A chain that stops at an ancestor unreadable at the prefix names it.
+    let mut reads_missing = |request: NativeReadRequest| {
+        let NativeReadQuery::Claim { id, .. } = request.query else {
+            panic!("{request:?}");
+        };
+        if id == missing {
+            let mut page = synthetic_claim(id, ClaimStatus::Posted, 1, false, root.clone(), 20);
+            page.objects.clear();
+            return Ok(page);
+        }
+        Ok(synthetic_claim(
+            id,
+            ClaimStatus::Posted,
+            1,
+            false,
+            Cause::Claim(missing),
+            20,
+        ))
+    };
+    let lineage = observe(chain(0), &mut reads_missing, &mut lists);
+    assert!(lineage.ancestors.is_empty());
+    assert_eq!(lineage.ancestors_missing, Some(missing));
+    assert_eq!(lineage.ancestors_beyond, None);
+}
+
+#[test]
+fn validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound() {
+    use focal_client::operations::{NativeObjectDocument, NativeReadOperation};
+    use focal_wire::*;
+    let claim = ClaimId::from_u128(10);
+    let validation = ValidationId::from_u128(11);
+    let token = |sequence: u64| ReadToken {
+        ledger: ledger(),
+        sequence: SessionSeq(sequence),
+        route_epoch: RouteEpoch(1),
+    };
+    let binding = |object: u128| NativeBinding {
+        object: ObjectId::from_u128(object),
+        content: ContentHash([9; 32]),
+        revision: ObjectRevision(1),
+    };
+    let definition = NativeObject::Definition(Box::new(NativeDefinition {
+        binding: binding(11),
+        claim,
+        issuer: ISSUER,
+        declaration_index: 0,
+        kind: ValidationKind::Receipt,
+        phase: ValidationPhase::WholeWork,
+        mode: ValidationMode::Required,
+        target: NativeTargetDeclaration::Delivery,
+        program: NativeProgram::Delivery,
+        deadline: Deadline {
+            timer: TimerId::from_u128(1),
+            generation: 1,
+            at: 10_000,
+        },
+        attempt_bound: 1,
+        content: None,
+    }));
+    let evaluation = |generation: u64| {
+        let key = NativeEvaluationKey {
+            claim,
+            validation,
+            target: NativeEvaluationTarget::Work {
+                response: TestamentId::from_u128(16),
+                slot: 0,
+                artifact: ArtifactId::from_u128(15),
+            },
+            generation,
+        };
+        (
+            key,
+            NativeObject::Evaluation(Box::new(NativeEvaluation {
+                binding: binding(500 + generation as u128),
+                key,
+                target: NativeTarget::Artifact {
+                    response: binding(16),
+                    slot: 0,
+                    artifact: binding(15),
+                },
+                state: NativeValidationState::Ready,
+                phase: NativePhase::Programmatic,
+                declared_phase: ValidationPhase::WholeWork,
+                declaration_index: 1,
+                issuer: ISSUER,
+                evaluator: Some(EVALUATOR),
+                mode: ValidationMode::Required,
+                receipt: None,
+                has_begun: false,
+                attempt_index: None,
+                attempt_bound: 2,
+                fence: None,
+                suppression: None,
+                last_result: None,
+                sealed: None,
+                deadline: Deadline {
+                    timer: TimerId::from_u128(1),
+                    generation: 1,
+                    at: 10_000,
+                },
+                current_attempt: None,
+            })),
+        )
+    };
+    let operation = NativeReadOperation::ValidationGet(NativeObjectDocument { id: hex(11) });
+    // A span of three pages: the driver follows each continuation at exactly
+    // the first page's prefix and returns the definition with every row.
+    let mut sent = Vec::new();
+    let mut reads = |request: NativeReadRequest| -> Result<NativeReadPage, DriveError> {
+        sent.push(request.consistency.clone());
+        let (objects, next) = match request.query {
+            NativeReadQuery::Objects(_) => (vec![definition.clone()], None),
+            NativeReadQuery::Evaluations { after, .. } => {
+                let generation = after.map_or(1, |key| key.generation + 1);
+                let (key, object) = evaluation(generation);
+                let next = (generation < 3).then_some(NativeContinuation::Evaluations(key));
+                (vec![object], next)
+            }
+            other => panic!("{other:?}"),
+        };
+        Ok(NativeReadPage {
+            token: token(4),
+            native_sequence: SessionSeq(4),
+            logical_time: 0,
+            objects,
+            next,
+            visited: 1,
+        })
+    };
+    let mut lists = |_: NativeListRequest| -> Result<NativeListPage, DriveError> {
+        panic!("a validation read lists nothing")
+    };
+    let mut pause = |_: std::time::Duration| Ok(());
+    let page = match read(
+        &operation,
+        &context(ISSUER),
+        &mut reads,
+        &mut lists,
+        &mut pause,
+    )
+    .unwrap()
+    {
+        NativeReadOutcome::Page(page) => page,
+        NativeReadOutcome::Lineage(lineage) => panic!("{lineage:?}"),
+        NativeReadOutcome::Wait(wait) => panic!("{wait:?}"),
+    };
+    assert_eq!(page.objects.len(), 4);
+    assert!(matches!(page.objects[0], NativeObject::Definition(_)));
+    let generations: Vec<u64> = page.objects[1..]
+        .iter()
+        .map(|object| match object {
+            NativeObject::Evaluation(evaluation) => evaluation.key.generation,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(generations, [1, 2, 3]);
+    assert!(page.next.is_none());
+    assert_eq!(page.visited, 4);
+    assert_eq!(
+        sent,
+        vec![
+            ReadConsistency::Linearizable,
+            ReadConsistency::AtLeast(token(4)),
+            ReadConsistency::Exact(token(4)),
+            ReadConsistency::Exact(token(4)),
+        ]
+    );
+    // A span that never ends is refused at the driver's page bound — the
+    // core's evaluations per claim over a page — as a capacity, never
+    // returned short as if it were whole.
+    let mut served = 0usize;
+    let mut endless = |request: NativeReadRequest| -> Result<NativeReadPage, DriveError> {
+        served += 1;
+        let (objects, next) = match request.query {
+            NativeReadQuery::Objects(_) => (vec![definition.clone()], None),
+            NativeReadQuery::Evaluations { after, .. } => {
+                let (key, object) = evaluation(after.map_or(1, |key| key.generation + 1));
+                (vec![object], Some(NativeContinuation::Evaluations(key)))
+            }
+            other => panic!("{other:?}"),
+        };
+        Ok(NativeReadPage {
+            token: token(4),
+            native_sequence: SessionSeq(4),
+            logical_time: 0,
+            objects,
+            next,
+            visited: 1,
+        })
+    };
+    let result = read(
+        &operation,
+        &context(ISSUER),
+        &mut endless,
+        &mut lists,
+        &mut pause,
+    );
+    assert!(
+        matches!(result, Err(DriveError::Input(InputError::Capacity))),
+        "{result:?}"
+    );
+    assert_eq!(served, 1 + crate::driver::EVALUATION_PAGES);
+    // A continuation of another kind is not an evaluation page.
+    let mut wrong = |request: NativeReadRequest| -> Result<NativeReadPage, DriveError> {
+        let (objects, next) = match request.query {
+            NativeReadQuery::Objects(_) => (vec![definition.clone()], None),
+            NativeReadQuery::Evaluations { .. } => (
+                vec![evaluation(1).1],
+                Some(NativeContinuation::Responses { cycle: 1 }),
+            ),
+            other => panic!("{other:?}"),
+        };
+        Ok(NativeReadPage {
+            token: token(4),
+            native_sequence: SessionSeq(4),
+            logical_time: 0,
+            objects,
+            next,
+            visited: 1,
+        })
+    };
+    assert!(matches!(
+        read(
+            &operation,
+            &context(ISSUER),
+            &mut wrong,
+            &mut lists,
+            &mut pause
+        ),
+        Err(DriveError::Input(InputError::Invalid(_)))
+    ));
 }

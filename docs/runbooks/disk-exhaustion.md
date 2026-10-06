@@ -4,19 +4,19 @@
 quota or size limit refuses the write.
 
 **Symptoms.** Writes through this node fail with an operation error naming the log (exit 1,
-`[operation_failed]`), never with an acknowledgement; `cluster storage show` reports the
+`[operation_failed]`), never with an acknowledgement; `diagnose node --storage` reports the
 volume's `free` near zero and `headroom` unmet; `focal_disk_free_bytes` in
-`cluster node metrics` is at the floor; the node may stop its ledger owner and exit when the
+`diagnose node --metrics` is at the floor; the node may stop its ledger owner and exit when the
 write-ahead log itself cannot be extended (`ledger egress ended`). Readers keep answering
 from the durable prefix.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir DIR cluster storage show        # disk: free, outstanding, headroom, by kind
-focal --data-dir DIR cluster node metrics | grep focal_disk
-focal --data-dir DIR cluster retention show      # what holds the retention floor (cursors, archive)
-focal --data-dir DIR cluster gc show             # what the collector reclaimed and quarantined
+focal --data-dir DIR diagnose node --storage        # disk: free, outstanding, headroom, by kind
+focal --data-dir DIR diagnose node --metrics | grep focal_disk
+focal --data-dir DIR diagnose cluster --retention      # what holds the retention floor (cursors, archive)
+focal --data-dir DIR diagnose node --gc             # what the collector reclaimed and quarantined
 ```
 
 **Preconditions.** The volume is the node's own data directory; another node's volume is
@@ -28,7 +28,7 @@ to reconcile on the client beyond retrying the same request identity.
 
 1. Free space on the volume, outside Focal, or raise the limit. Focal's own reclaim is
    bounded by the retention floor: a consumer that stopped acknowledging holds the log
-   (`cluster retention show` shows `blocker: cursors`); an archive that has not received a
+   (`diagnose cluster --retention` shows `blocker: cursors`); an archive that has not received a
    family holds it (`blocker: archive`). Nothing below the floor is deleted.
 2. Restart the node if it stopped: `focal --data-dir DIR start ...` with the same arguments.
    Recovery replays the durable log; a write that was refused is absent, a write that was
@@ -40,11 +40,11 @@ to reconcile on the client beyond retrying the same request identity.
 The other voters of a session continue without this node as long as a majority holds.
 
 **Stop conditions.** Stop and escalate if the node fails to start after space was freed
-(the log is refused as corrupt rather than short), or if `cluster storage show` still
+(the log is refused as corrupt rather than short), or if `diagnose node --storage` still
 reports `free` at zero after the filesystem says otherwise (a stale sample: wait one
 sampling interval, then escalate).
 
-**Verification.** After restart, `cluster node readiness` reports `alive` and, for a founder,
+**Verification.** After restart, `diagnose node --readiness` reports `alive` and, for a founder,
 `authoritative`; a claim written before the exhaustion is read back unchanged; a new claim
 commits.
 

@@ -340,7 +340,7 @@ fn io_failure_has_no_completion_and_fail_stops_until_disk_recovery() {
         leader(&mut replica);
         let request = request(1, 1, 0, region(0, 1));
         replica.submit(request.clone(), &Evidence).unwrap();
-        replica.inject_fault_once(fault);
+        replica.inject_fault_once(fault).unwrap();
         assert!(replica.drain(&Evidence).is_err());
         assert_eq!(replica.root().unwrap().revision(), 0);
         assert!(matches!(
@@ -355,9 +355,25 @@ fn io_failure_has_no_completion_and_fail_stops_until_disk_recovery() {
         let mut replica =
             ControlReplica::open(options(1), bootstrap, budget(), dir.path()).unwrap();
         replica.drain(&Evidence).unwrap();
-        // A partially durable proposal is not a committed outcome. Elections
-        // may later commit it; no reply is fabricated from its presence on disk.
-        assert!(replica.receipt(request.id).unwrap().is_none());
+        if fault == FaultPoint::AfterFenceInstall {
+            // The fence was installed: the log holds the proposal and, the
+            // member deciding alone, the commit written with it (the
+            // audit's F17). No completion was given before the failure;
+            // the exact retry finds the committed outcome.
+            let committed = replica.receipt(request.id).unwrap().unwrap();
+            assert_eq!(
+                replica.submit(request.clone(), &Evidence).unwrap(),
+                ControlSubmission::Existing(committed)
+            );
+            assert_eq!(replica.root().unwrap().revision(), 1);
+        } else {
+            // The proposal never reached the log's durable prefix: there is
+            // nothing to commit, and no reply is fabricated.
+            assert!(replica.receipt(request.id).unwrap().is_none());
+            leader(&mut replica);
+            assert!(replica.receipt(request.id).unwrap().is_none());
+            assert_eq!(replica.root().unwrap().revision(), 0);
+        }
     }
 }
 
@@ -572,7 +588,7 @@ impl Cluster {
                 if isolated == Some(message.from) || isolated == Some(message.to) {
                     continue;
                 }
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 let from = message.from;
                 let to = message.to;
                 self.nodes[(to - 1) as usize].step(message).unwrap();

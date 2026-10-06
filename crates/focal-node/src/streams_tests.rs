@@ -1152,3 +1152,215 @@ fn changed_intent_during_a_pending_request_cannot_replace_its_durable_outcome() 
     drop(conflict);
     assert_eq!(streams.charged_bytes(), 0);
 }
+
+fn poll(cursor: CursorToken, acknowledged: Option<CursorToken>) -> StreamRequest {
+    StreamRequest::Poll {
+        cursor,
+        filter: DeltaFilter::All,
+        acknowledged,
+        credits: Credits {
+            items: 64,
+            bytes: 64 * 1024,
+        },
+    }
+}
+
+/// The audit's F61: a poll with nothing to acknowledge is a read — nothing
+/// proposed, no receipt, the log untouched — and a lease it finds past its
+/// half-life the node renews by its own entry.
+#[test]
+fn a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past_its_half() {
+    let root = tempfile::tempdir().unwrap();
+    let mut node = open(root.path());
+    crate::demo::run(&mut node).unwrap();
+    let mut views = ReadViews::new();
+    // A lease of 400 ms: past 200 ms a poll has the node renew it. The
+    // test names every time the host reads, so what it asserts of the
+    // lease's half never depends on how long the machine took between two
+    // polls.
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut streams = Streams::new().unwrap().with_lease(400);
+    streams.at(start);
+    let consumer = ConsumerId::from_u128(100);
+    let principal = node.identity.issuer;
+    let key = move |id: u128| RequestKey {
+        principal,
+        epoch: RequestEpoch(1),
+        id: RequestId::from_u128(id),
+    };
+    let first = invoke(&mut node, &mut views, &mut streams, 1, register(false)).unwrap();
+    // Acknowledge through to the end of the history: each is a commit.
+    let mut acked = first;
+    let mut id = 2u128;
+    loop {
+        let reply = invoke(
+            &mut node,
+            &mut views,
+            &mut streams,
+            id,
+            poll(acked.cursor, Some(acked.cursor)),
+        )
+        .unwrap();
+        assert_eq!(reply.acknowledged, acked.cursor);
+        assert!(node.session.cursor_receipt(&key(id)).is_some());
+        id += 1;
+        acked = reply;
+        if acked.events.is_empty() {
+            break;
+        }
+    }
+    let revision = node.session.cursor_revision();
+    let index = node.session.status().committed_index;
+    let expires = node.session.cursor(consumer).unwrap().expires_at;
+    assert_eq!(expires, start + 400);
+    // A millisecond short of the lease's half, a poll is still a read.
+    streams.at(start + 199);
+    for _ in 0..4 {
+        let reply = invoke(
+            &mut node,
+            &mut views,
+            &mut streams,
+            id,
+            poll(acked.cursor, None),
+        )
+        .unwrap();
+        assert!(reply.events.is_empty());
+        assert_eq!(reply.acknowledged, acked.acknowledged);
+        assert_eq!(reply.cursor, acked.cursor);
+        assert_eq!(
+            node.session.cursor_revision(),
+            revision,
+            "a read commits nothing"
+        );
+        assert_eq!(node.session.status().committed_index, index);
+        assert!(
+            node.session.cursor_receipt(&key(id)).is_none(),
+            "no receipt for a read"
+        );
+        id += 1;
+    }
+    // Acknowledging what the row already holds is nothing new: a read too.
+    invoke(
+        &mut node,
+        &mut views,
+        &mut streams,
+        id,
+        poll(acked.cursor, Some(acked.acknowledged)),
+    )
+    .unwrap();
+    assert!(node.session.cursor_receipt(&key(id)).is_none());
+    assert_eq!(node.session.cursor_revision(), revision);
+    id += 1;
+    // Half the lease after its last renewal, a poll has the node renew it:
+    // one entry, no receipt, no request key.
+    streams.at(start + 200);
+    let reply = invoke(
+        &mut node,
+        &mut views,
+        &mut streams,
+        id,
+        poll(acked.cursor, None),
+    )
+    .unwrap();
+    assert!(reply.events.is_empty());
+    assert_eq!(node.session.cursor_revision(), revision + 1);
+    assert!(node.session.cursor_receipt(&key(id)).is_none());
+    let renewed = node.session.cursor(consumer).unwrap().expires_at;
+    assert_eq!(renewed, expires + 200);
+    id += 1;
+    // Within the first half of the new lease: nothing again.
+    streams.at(start + 399);
+    invoke(
+        &mut node,
+        &mut views,
+        &mut streams,
+        id,
+        poll(acked.cursor, None),
+    )
+    .unwrap();
+    assert_eq!(node.session.cursor_revision(), revision + 1);
+    assert_eq!(node.session.cursor(consumer).unwrap().expires_at, renewed);
+}
+
+/// On a replicated host a poll with nothing new waits for a page instead
+/// of answering an empty one every round trip: it parks after its barrier
+/// holding only its request's bytes, is answered when the stream line
+/// moves, and — given up with nothing new — answers the empty page it held.
+#[test]
+fn a_poll_with_nothing_new_parks_for_a_page_and_holds_only_its_request() {
+    let mut cluster = StreamCluster::new();
+    cluster.submit(
+        0,
+        2,
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(2),
+        },
+    );
+    let mut streams = Streams::new().unwrap();
+    let mut views = ReadViews::new();
+    let request = cluster.request(101, register(false));
+    let first = cluster.invoke(0, &mut streams, &mut views, &request);
+    let request = cluster.request(102, poll(first.cursor, Some(first.cursor)));
+    let acked = cluster.invoke(0, &mut streams, &mut views, &request);
+    assert_eq!(acked.acknowledged, first.cursor);
+    let revision = cluster.sessions[0].cursor_revision();
+    let index = cluster.sessions[0].status().committed_index;
+    // Nothing new: the poll crosses its barrier, proposes nothing and parks.
+    let request = cluster.request(103, poll(acked.cursor, None));
+    let mut pending = cluster.begin(0, &mut streams, &request);
+    let full = streams.charged_bytes();
+    assert!(
+        cluster
+            .drive(0, &mut streams, &mut views, &mut pending, false)
+            .is_none()
+    );
+    let parked = streams.charged_bytes();
+    assert!(
+        parked < full,
+        "the page's staging is released while it waits: {parked} < {full}"
+    );
+    assert_eq!(cluster.sessions[0].cursor_revision(), revision);
+    assert_eq!(cluster.sessions[0].status().committed_index, index);
+    assert_eq!(pending.interrupted(), AccessError::Unavailable);
+    // A commit moves the stream line: the parked poll is answered with it,
+    // and still commits nothing of its own.
+    cluster.submit(
+        0,
+        3,
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(3),
+        },
+    );
+    let reply = cluster
+        .drive(0, &mut streams, &mut views, &mut pending, false)
+        .unwrap();
+    assert!(!reply.events.is_empty());
+    assert!(reply.cursor.position > acked.cursor.position);
+    assert_eq!(reply.acknowledged, acked.acknowledged);
+    assert_eq!(cluster.sessions[0].cursor_revision(), revision);
+    validate_response(
+        &request,
+        &request.reply(Response::Stream(reply.clone())),
+        Some(cluster.identity.issuer),
+        &WireLimits::default(),
+    )
+    .unwrap();
+    // Given up with nothing new, a parked poll answers the empty page it
+    // held: the barrier it crossed was current.
+    let request = cluster.request(104, poll(reply.cursor, None));
+    let mut pending = cluster.begin(0, &mut streams, &request);
+    assert!(
+        cluster
+            .drive(0, &mut streams, &mut views, &mut pending, false)
+            .is_none()
+    );
+    let page = pending.parked_reply().unwrap();
+    assert!(page.events.is_empty());
+    assert_eq!(page.cursor, reply.cursor);
+    assert_eq!(page.acknowledged, reply.acknowledged);
+    assert!(pending.parked_reply().is_none());
+    assert_eq!(cluster.sessions[0].cursor_revision(), revision);
+}

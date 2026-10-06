@@ -12,8 +12,8 @@ use focal_model::*;
 use focal_wire::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Polls after a fresh proposal before the reply reports a pending ticket.
-const COMMIT_POLLS: usize = 8;
+/// Owner polls after a fresh proposal before the reply reports a pending ticket.
+pub(crate) const COMMIT_POLLS: usize = 8;
 
 /// Command tags whose bodies carry an artifact payload and therefore need
 /// custody verification by the exclusive content writer (21 §4).
@@ -115,6 +115,8 @@ fn code(error: ContractError) -> NativeErrorCode {
         ContractError::Capacity => NativeErrorCode::Capacity,
         ContractError::ConflictingCause => NativeErrorCode::ConflictingCause,
         ContractError::InvalidCut => NativeErrorCode::InvalidCut,
+        ContractError::RequestHistoryExpired => NativeErrorCode::RequestHistoryExpired,
+        ContractError::EpochNotAdmitted => NativeErrorCode::EpochNotAdmitted,
     }
 }
 fn native_kind(error: &NativeError) -> NativeRefusalKind {
@@ -167,42 +169,24 @@ pub(crate) fn failure(error: LedgerError) -> Result<NativeMutationReply, AccessE
         other => Err(access(other)),
     }
 }
-/// Resolve a fresh proposal. A committed outcome is final; a candidate that
-/// does not commit within a few polls is reported as pending, never as success.
-pub(crate) fn resolve(
-    session: &mut Session,
-    key: RequestKey,
-    submission: NativeSubmission,
-) -> Result<NativeMutationReply, AccessError> {
-    match submission {
-        NativeSubmission::Committed(outcome) => Ok(NativeMutationReply::Committed(
-            crate::native_documents::outcome(outcome),
-        )),
-        NativeSubmission::Pending { outcome, .. } => {
-            for _ in 0..COMMIT_POLLS {
-                let _ = session.poll().map_err(access)?;
-                if let Some(committed) = session.native_outcome(key).map_err(access)?
-                    && committed == outcome
-                {
-                    return Ok(NativeMutationReply::Committed(
-                        crate::native_documents::outcome(committed),
-                    ));
-                }
-            }
-            Ok(NativeMutationReply::Pending(NativeTicket {
-                key,
-                intent: outcome.intent,
-            }))
-        }
-    }
+/// A native frame the local owner proposed and has not seen commit. The
+/// owner parks it rather than wait for it here, so the frames that arrive
+/// while one flush is in flight are proposed before the next and share it
+/// (group commit).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Proposal {
+    pub(crate) key: RequestKey,
+    pub(crate) outcome: focal_core::native::NativeOutcome,
 }
 /// Admit one frame on the embedded owner. Artifact payloads are verified and
-/// sealed by the exclusive content writer before the owner records them.
+/// sealed by the exclusive content writer before the owner records them. A
+/// fresh proposal is left in `proposed`, and its answer is its commit.
 pub(crate) fn admit_local(
     node: &mut EmbeddedNode,
     peer: &AuthenticatedPeer,
     envelope: &RequestEnvelope,
     frame: &[u8],
+    proposed: &mut Option<Proposal>,
 ) -> Result<Response, AccessError> {
     let header = native_frame_admissible(frame, peer, envelope)?;
     let context = context(peer, &node.session)?;
@@ -210,12 +194,41 @@ pub(crate) fn admit_local(
     let result =
         node.session
             .propose_native_frame(context, frame, NativeCustody::Store(&mut node.content));
-    let reply = match result {
-        Ok(submission) => resolve(&mut node.session, header.key, submission)?,
-        Err(error) => failure(error)?,
-    };
-    if matches!(reply, NativeMutationReply::Committed(_)) {
-        crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
+    match result {
+        Ok(NativeSubmission::Committed(outcome)) => Ok(committed_reply(outcome)),
+        Ok(NativeSubmission::Pending { outcome, .. }) => {
+            *proposed = Some(Proposal {
+                key: header.key,
+                outcome,
+            });
+            // Never sent: the parked proposal is answered by its commit.
+            Err(AccessError::OutcomeUnknown)
+        }
+        Err(error) => failure(error).map(Response::Native),
     }
-    Ok(Response::Native(reply))
+}
+/// The answer of a parked proposal once the session holds its outcome;
+/// `None` while it does not yet.
+pub(crate) fn settled(
+    session: &Session,
+    proposal: Proposal,
+) -> Result<Option<Response>, AccessError> {
+    match session.native_outcome(proposal.key).map_err(access)? {
+        Some(committed) if committed == proposal.outcome => Ok(Some(committed_reply(committed))),
+        _ => Ok(None),
+    }
+}
+/// The answer of a proposal whose commit its polls did not see: the ticket
+/// the client resends the exact frame under.
+pub(crate) fn ticket(proposal: Proposal) -> Response {
+    Response::Native(NativeMutationReply::Pending(NativeTicket {
+        key: proposal.key,
+        intent: proposal.outcome.intent,
+    }))
+}
+fn committed_reply(outcome: focal_core::native::NativeOutcome) -> Response {
+    crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
+    Response::Native(NativeMutationReply::Committed(
+        crate::native_documents::outcome(outcome),
+    ))
 }

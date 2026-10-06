@@ -1,0 +1,20 @@
+[package]
+name = "hyper-durable"
+version = "0.1.0"
+edition = "2024"
+# focal's toolchain (rust-toolchain.toml); this snapshot builds on it, which focal's gates show.
+rust-version = "1.94"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+
+[dependencies]
+hyper-block = { version = "0.1.0", path = "../hyper-block" }
+hyper-liveness = { version = "0.1.0", path = "../hyper-liveness" }
+hyper-log = { version = "0.1.0", path = "../hyper-log" }
+hyper-raft = { version = "0.1.0", path = "../hyper-raft" }
+hyper-timing = { version = "0.1.0", path = "../hyper-timing" }
+thiserror = "2.0"
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
+# suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
+[workspace]

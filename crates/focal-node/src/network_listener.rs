@@ -6,7 +6,6 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_wire::{ALPN, PeerRegistry, RequestHandler, TlsIdentity, WireError, WireLimits};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustls::{
-    pki_types::CertificateDer,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -79,16 +78,16 @@ impl ResolvesServerCert for ProtocolCertificate {
 fn server_config(
     node: &CredentialMaterial,
     enrollment: Option<&CredentialMaterial>,
-    ca: &[u8],
+    roots: &[Vec<u8>],
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(ca))
-        .map_err(|_| WireError::Authentication)?;
+    let provider = Arc::new(focal_wire::crypto_provider());
+    // A client's chain is verified against the issuers this node trusts; a
+    // successor issuer's endorsement by one of them is an ordinary
+    // intermediate to it (24 §11). The enrollment protocol authenticates
+    // a joiner without a certificate.
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
+        Arc::new(focal_wire::TrustRoots::new(roots.to_vec())?.store()?),
         provider.clone(),
     )
     .allow_unauthenticated()
@@ -120,17 +119,25 @@ fn server_config(
     focal_wire::server_transport(tls, limits)
 }
 /// The endpoint's identity, swappable while it serves: a renewed node
-/// credential is presented to the next handshake without rebinding.
+/// credential, or a succeeded bootstrap server certificate (24 §11), is
+/// presented to the next handshake without rebinding.
 #[derive(Clone)]
 pub struct ListenerIdentity {
     endpoint: quinn::Endpoint,
-    ca: Vec<u8>,
-    enrollment: Option<CredentialMaterial>,
     limits: WireLimits,
 }
 impl ListenerIdentity {
-    pub fn replace(&self, node: &CredentialMaterial) -> Result<(), WireError> {
-        let config = server_config(node, self.enrollment.as_ref(), &self.ca, &self.limits)?;
+    /// Present `node` as the data identity and `enrollment` as the
+    /// enrollment identity (the founder's; none elsewhere) from the next
+    /// handshake on, verifying clients against `roots` — the issuers the
+    /// committed registry names (24 §11), as the controller holds them.
+    pub fn replace(
+        &self,
+        node: &CredentialMaterial,
+        enrollment: Option<&CredentialMaterial>,
+        roots: &[Vec<u8>],
+    ) -> Result<(), WireError> {
+        let config = server_config(node, enrollment, roots, &self.limits)?;
         self.endpoint.set_server_config(Some(config));
         Ok(())
     }
@@ -147,24 +154,22 @@ pub struct NetworkListener {
     /// the identity they authenticated as.
     admission: focal_wire::Admission,
     budget: MemoryBudget,
-    ca: Vec<u8>,
-    enrollment: Option<CredentialMaterial>,
 }
 impl NetworkListener {
     /// A handle that swaps the identity this endpoint presents.
     pub fn identity(&self) -> Result<ListenerIdentity, WireError> {
         Ok(ListenerIdentity {
             endpoint: self.endpoint.clone().ok_or(WireError::Connection)?,
-            ca: self.ca.clone(),
-            enrollment: self.enrollment.clone(),
             limits: self.limits.clone(),
         })
     }
+    /// `roots`: the issuers' certificates clients' chains are verified
+    /// against (24 §11).
     pub fn bind(
         address: SocketAddr,
         node: &CredentialMaterial,
         enrollment: Option<&CredentialMaterial>,
-        ca: &[u8],
+        roots: &[Vec<u8>],
         registry: PeerRegistry,
         limits: WireLimits,
         budget: MemoryBudget,
@@ -174,7 +179,7 @@ impl NetworkListener {
             UdpSocket::bind(address)?,
             node,
             enrollment,
-            ca,
+            roots,
             registry,
             limits,
             budget,
@@ -184,14 +189,14 @@ impl NetworkListener {
         socket: UdpSocket,
         node: &CredentialMaterial,
         enrollment: Option<&CredentialMaterial>,
-        ca: &[u8],
+        roots: &[Vec<u8>],
         registry: PeerRegistry,
         limits: WireLimits,
         budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
         limits.validate()?;
-        let config = server_config(node, enrollment, ca, &limits)?;
+        let config = server_config(node, enrollment, roots, &limits)?;
         let join_limits = TransportLimits::default();
         let allocation = budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)
@@ -216,9 +221,12 @@ impl NetworkListener {
             )
         }))
         .map_err(|_| WireError::Connection)??;
-        let admission = focal_wire::Admission::new(focal_wire::AdmissionLimits::for_connections(
-            limits.max_connections,
-        ))
+        // The listener's budget funds the request bodies it admits (the
+        // audit's F03), beside the charge of each connection.
+        let admission = focal_wire::Admission::new(
+            focal_wire::AdmissionLimits::for_connections(limits.max_connections),
+            budget.clone(),
+        )
         .map_err(|_| WireError::Limit)?;
         Ok(Self {
             endpoint: Some(endpoint),
@@ -229,8 +237,6 @@ impl NetworkListener {
             admission,
             join_limits,
             budget,
-            ca: ca.to_vec(),
-            enrollment: enrollment.cloned(),
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {
@@ -291,9 +297,15 @@ impl NetworkListener {
             tokio::select! {
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else { break; };
-                    if connections.len() >= self.limits.max_connections { incoming.refuse(); continue; }
                     // A handshake takes a pending place, which no
-                    // authenticated connection uses.
+                    // authenticated connection uses; connections are bounded
+                    // by the admission's total, met after the replacement
+                    // rule, and enrollment by its slots — never by an outer
+                    // count that a full listener would refuse a replacement
+                    // with (the audit's F20). A source that has not proven
+                    // its address takes no place while half of them are
+                    // taken (RFC 9000 §8.1.2, Retry under load).
+                    if focal_wire::validate_address(&incoming, &self.admission) { let _ = incoming.retry(); continue; }
                     let Ok(pending) = self.admission.begin() else { incoming.refuse(); continue; };
                     let Ok(charge) = self.budget.reserve(BudgetKind::Control, BudgetLane::Ordinary, 64 * 1024) else { incoming.refuse(); continue; };
                     let data = data.clone();

@@ -78,28 +78,33 @@ async fn completion_and_receipt_probe_use_reserved_bytes_and_queue_slots() {
     .unwrap();
     let host = &hosts[&ledger()];
     let limits = ReplicaHost::wire_limits();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let reply = dispatch(
-                host,
-                actor(),
-                request(
-                    99,
-                    Operation::Read(ReadRequest {
-                        consistency: ReadConsistency::Linearizable,
-                        query: ReadQuery::Objects(vec![]),
-                        max_items: 1,
-                    }),
-                ),
-                &limits,
-            )
-            .await;
-            if matches!(reply.result, Response::Read(_)) {
-                break;
+    crate::test_waits::within(
+        &[host],
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        async {
+            loop {
+                let reply = dispatch(
+                    host,
+                    actor(),
+                    request(
+                        99,
+                        Operation::Read(ReadRequest {
+                            consistency: ReadConsistency::Linearizable,
+                            query: ReadQuery::Objects(vec![]),
+                            max_items: 1,
+                        }),
+                    ),
+                    &limits,
+                )
+                .await;
+                if matches!(reply.result, Response::Read(_)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let reply = dispatch(

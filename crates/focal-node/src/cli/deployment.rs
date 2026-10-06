@@ -386,12 +386,60 @@ fn plan(
         .map_err(DeploymentError::Unsatisfiable)?;
     }
     let plan = runtime.block_on(async {
+        use deployment::plan::ControlProposal;
         let observation = deployment::observe::observe(&admin, network).await?;
         let mut proposals = Vec::new();
         proposals
             .try_reserve_exact(observation.sessions.len())
             .map_err(|_| DeploymentError::Capacity)?;
         let survive = deployment::survive_code(requested.durability.survive);
+        // The root group first (F24): the voters the durability needs,
+        // proposed by the directory's solver and journaled nowhere.
+        let mut partitions = Vec::new();
+        let control = if network {
+            match admin
+                .plan_control_reply(survive, requested.durability.max_failures)
+                .await
+            {
+                Ok(reply) => {
+                    partitions
+                        .try_reserve_exact(reply.partitions.len())
+                        .map_err(|_| DeploymentError::Capacity)?;
+                    for group in reply.partitions {
+                        partitions.push(deployment::plan::PartitionProposal {
+                            partition: group.partition,
+                            group: group.group,
+                            proposal: match group.state {
+                                2 => ControlProposal::Satisfied,
+                                3 => ControlProposal::Refused(
+                                    "no set of enrolled, live nodes seats the partition group under the requested durability".into(),
+                                ),
+                                _ => ControlProposal::Planned {
+                                    voters: group.voters,
+                                    configuration_index: group.configuration_index,
+                                },
+                            },
+                        });
+                    }
+                    if reply.state == 2 {
+                        ControlProposal::Satisfied
+                    } else {
+                        ControlProposal::Planned {
+                            voters: reply.voters,
+                            configuration_index: reply.configuration_index,
+                        }
+                    }
+                }
+                Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {
+                    ControlProposal::Refused(
+                        "no set of enrolled, live nodes seats the root group under the requested durability".into(),
+                    )
+                }
+                Err(error) => return Err(DeploymentError::Admin(error)),
+            }
+        } else {
+            ControlProposal::Unobserved
+        };
         for session in &observation.sessions {
             // Dry runs: the agent proposes and journals nothing.
             let proposal = match admin
@@ -413,6 +461,11 @@ fn plan(
                         operation: reply.operation,
                         voters: reply.voters,
                     },
+                    // The partition refused the plan: its observation went
+                    // stale between the planning and the commit (24 §16).
+                    3 => deployment::plan::Proposal::Refused(
+                        "the partition's observation went stale while the plan was made; plan again".into(),
+                    ),
                     _ => deployment::plan::Proposal::Satisfied,
                 },
                 Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {
@@ -424,7 +477,14 @@ fn plan(
             };
             proposals.push(proposal);
         }
-        deployment::plan::compose(&observation, &requested, &proposals, deployment::now_ms()?)
+        deployment::plan::compose_with_partitions(
+            &observation,
+            &requested,
+            &proposals,
+            &control,
+            &partitions,
+            deployment::now_ms()?,
+        )
     })?;
     if let Some(output) = output {
         write_new(output, &plan.encode()?)?;

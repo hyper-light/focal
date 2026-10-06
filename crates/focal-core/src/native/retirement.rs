@@ -55,6 +55,14 @@ pub enum RetirementRefusal {
         evaluation: EvaluationKey,
     },
     TooLarge,
+    /// The outcome the retirement publishes would take the core past its
+    /// outcome bound, the bound checkpoint recovery enforces: the state it
+    /// made could not be restored under the configuration that made it.
+    OutcomeCapacity,
+    /// The outcome is promised to a live report, or is the one control
+    /// outcome the owner keeps for an authority decision; it frees as the
+    /// reports arrive.
+    OutcomesReserved,
     /// The committed rows contradict themselves.
     Corrupt,
 }
@@ -134,6 +142,10 @@ fn names_member(key: Key, member: ClaimId) -> bool {
             result.evaluation.claim == member
         }
         Key::ArtifactInput(object, _) => object.0 == member.0,
+        // A timer's outcome is its claim's (F12); a request's never.
+        Key::Outcome(NativeInvocation::ClaimDeadline(key)) => key.claim == member,
+        Key::Outcome(NativeInvocation::MonitorDeadline(key)) => key.claim == member,
+        Key::Outcome(NativeInvocation::EvaluationDeadline(key)) => key.evaluation.claim == member,
         Key::Outcome(_) | Key::CreationResult(_) => false,
         other => match index_rows::primary(other) {
             Some(index_rows::Primary::Claim(claim)) => claim == member,
@@ -302,7 +314,13 @@ impl Closure<'_> {
             if layout::affinity(&entry.key) != affinity {
                 break;
             }
-            if matches!(entry.key, Key::Outcome(_) | Key::CreationResult(_)) {
+            // An outcome under an object's affinity is one of its timers'
+            // (F12): it leaves with the family, into the bundle, since
+            // nothing re-delivers a retired object's timer. Requests'
+            // outcomes sit under their principal, never here.
+            if matches!(entry.key, Key::CreationResult(_))
+                || matches!(entry.key, Key::Outcome(NativeInvocation::Request(_)))
+            {
                 continue;
             }
             if found.len() >= MAX_FAMILY_ROWS {
@@ -338,9 +356,31 @@ impl Closure<'_> {
 }
 
 impl Core<NativeState> {
+    /// Whether the outcome a retirement publishes fits the core's outcome
+    /// bound, the bound checkpoint recovery enforces, as every outcome
+    /// ordinary admission publishes must: the first thing a family
+    /// derivation asks, before a row is walked, and what a session asks
+    /// before it derives one. One row read.
+    pub fn check_retirement_outcome(&self) -> Result<(), RetirementRefusal> {
+        let outcomes = match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => meta.outcomes.saturating_sub(meta.sealed),
+            _ => return Err(RetirementRefusal::Corrupt),
+        };
+        if outcomes
+            .checked_add(1)
+            .is_none_or(|next| next > self.limits.outcomes)
+        {
+            return Err(RetirementRefusal::OutcomeCapacity);
+        }
+        Ok(())
+    }
     /// The family rooted at `root` and every row it takes to the archive,
     /// or why it cannot leave yet. Deterministic over the committed rows.
+    /// Refused first, before a row is walked, when the outcome the
+    /// retirement publishes would pass the outcome bound
+    /// (`OutcomeCapacity`).
     pub fn retirement_family(&self, root: ClaimId) -> Result<RetirementFamily, RetirementRefusal> {
+        self.check_retirement_outcome()?;
         let mut closure = Closure {
             core: self,
             members: Vec::new(),
@@ -675,7 +715,13 @@ impl Core<NativeState> {
     /// that deletes every row of the family, leaves a `Retired` continuation
     /// where each member's claim row was, writes the prefix's own outcome
     /// (a `Retirement` invocation with the `Retire` operation) and the
-    /// updated meta row. Returns how many rows went.
+    /// updated meta row. Returns how many rows went. The outcome it
+    /// publishes is guarded as ordinary admission guards its own: one
+    /// outcome per published sequence (the invariant recovery checks; a
+    /// contradiction is `InvalidManifest`) and the core's outcome bound
+    /// (`Capacity`), so no publication makes a state the same configuration
+    /// cannot restore. The derivation refuses such a family first
+    /// (`OutcomeCapacity`); the guard here is the last fence, not the check.
     pub fn retire_native_family(
         &mut self,
         family: &RetirementFamily,
@@ -683,9 +729,27 @@ impl Core<NativeState> {
         bytes: u64,
         through: SessionSeq,
     ) -> Result<usize, NativeError> {
+        let mut meta = match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => *meta,
+            _ => return Err(ContractError::InvalidManifest.into()),
+        };
+        if u64::try_from(meta.outcomes).ok() != Some(self.native_sequence().0) {
+            return Err(ContractError::InvalidManifest.into());
+        }
+        if meta
+            .outcomes
+            .saturating_sub(meta.sealed)
+            .checked_add(1)
+            .is_none_or(|outcomes| outcomes > self.limits.outcomes)
+        {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let derived = self
             .retirement_family(family.root)
-            .map_err(|_| NativeError::Contract(ContractError::InvalidManifest))?;
+            .map_err(|refusal| match refusal {
+                RetirementRefusal::OutcomeCapacity => NativeError::Capacity("outcomes"),
+                _ => NativeError::Contract(ContractError::InvalidManifest),
+            })?;
         if derived != *family
             || bundle.0 == [0; 32]
             || bytes == 0
@@ -694,10 +758,6 @@ impl Core<NativeState> {
         {
             return Err(ContractError::InvalidManifest.into());
         }
-        let mut meta = match self.state.rows.get(&Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
-            _ => return Err(ContractError::InvalidManifest.into()),
-        };
         let sequence = SessionSeq(
             self.native_sequence()
                 .0
@@ -739,6 +799,22 @@ impl Core<NativeState> {
                 Row::Monitor(_) => Some(&mut meta.monitors),
                 Row::MonitorLink(_) => Some(&mut meta.monitor_links),
                 Row::Event(_) => Some(&mut meta.events),
+                Row::Outcome(outcome) => {
+                    // A timer's outcome leaving with the family is sealed
+                    // in its bundle (F12), its events with it.
+                    meta.sealed = meta
+                        .sealed
+                        .checked_add(1)
+                        .ok_or(NativeError::Capacity("sealed outcomes"))?;
+                    meta.sealed_events = meta
+                        .sealed_events
+                        .checked_add(
+                            usize::try_from(outcome.events)
+                                .map_err(|_| NativeError::Capacity("sealed events"))?,
+                        )
+                        .ok_or(NativeError::Capacity("sealed events"))?;
+                    None
+                }
                 _ => None,
             };
             if let Some(counter) = counter {

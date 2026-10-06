@@ -11,25 +11,25 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
     let (server, _) = start(founder.path(), Some(&listen));
     let mut mcp = super::client_context::PeerMcp::open(founder.path());
     let identity = success(founder.path(), &["identity"]).0;
-    let inspected = mcp.call("cluster.node.identity", json!({}));
+    let inspected = mcp.call("diagnose.node.identity", json!({}));
     assert_eq!(
         inspected["result"]["result"]["identity"]["node"],
         identity["node"]
     );
     assert_eq!(
-        success(founder.path(), &["cluster", "node", "identity"]).0["result"],
+        success(founder.path(), &["diagnose", "node", "--identity"]).0["result"],
         inspected["result"]["result"]
     );
-    let config = mcp.call("cluster.node.config", json!({}));
+    let config = mcp.call("diagnose.node.listener", json!({}));
     assert_eq!(
         config["result"]["result"]["configuration"]["advertise"],
         listen
     );
     assert_eq!(
-        success(founder.path(), &["cluster", "node", "config"]).0["result"],
+        success(founder.path(), &["diagnose", "node", "--listener"]).0["result"],
         config["result"]["result"]
     );
-    let health = mcp.call("cluster.node.health", json!({}));
+    let health = mcp.call("diagnose.node.health", json!({}));
     assert_eq!(health["result"]["result"]["health"]["root_stopped"], false);
     assert_eq!(health["result"]["result"]["health"]["running"], 1);
     let listed = mcp.call("cluster.replicas.list", json!({}));
@@ -37,7 +37,7 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["sequence"], 0);
     let session = rows[0]["session"].as_str().unwrap().to_owned();
-    let diagnostics = mcp.call("cluster.replicas.diagnostics", json!({"session":session}));
+    let diagnostics = mcp.call("diagnose.cluster.replicas", json!({"session":session}));
     let observed = &diagnostics["result"]["result"]["diagnostics"];
     assert_eq!(observed["session"], session);
     assert_eq!(observed["sequence"], 0);
@@ -47,7 +47,7 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
         observed["compiled_managed_decoder"].as_str().unwrap().len(),
         64
     );
-    let cli_diagnostics = success(founder.path(), &["cluster", "replicas", "diagnostics"]).0;
+    let cli_diagnostics = success(founder.path(), &["diagnose", "cluster", "--replicas"]).0;
     assert_eq!(
         cli_diagnostics["result"]["diagnostics"]["required_decoder"],
         serde_json::Value::Null

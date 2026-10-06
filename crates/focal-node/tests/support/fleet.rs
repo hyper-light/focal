@@ -47,7 +47,9 @@ impl Node {
         self.dir.path()
     }
 }
-pub struct Server(pub Child);
+/// A started node and its status lines (`{"condition": ...}` on stdout),
+/// the last of which a planned stop prints.
+pub struct Server(pub Child, pub Option<mpsc::Receiver<Value>>);
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -119,7 +121,7 @@ pub use deadline::progress;
 /// The periods a node's root owner has run since it started, from its
 /// metrics; none while the node does not answer.
 pub fn periods(node: &Node) -> Option<u64> {
-    let output = run(node, None, &["cluster", "node", "metrics"]);
+    let output = run(node, None, &["diagnose", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -217,7 +219,6 @@ pub fn spawn(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc:
 }
 pub fn start_with(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> Server {
     let (child, receive) = spawn(node, args, envs);
-    let server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(45))
         .unwrap_or_else(|_| panic!("{} did not publish readiness", node.root().display()));
@@ -225,7 +226,7 @@ pub fn start_with(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> Server {
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"
     );
-    server
+    Server(child, Some(receive))
 }
 pub fn start(node: &Node, args: &[&str]) -> Server {
     start_with(node, args, &[])
@@ -265,7 +266,7 @@ pub fn join_start(founder: &Node, host: &Node, name: &str, advertise: &str) -> (
 }
 /// (node, tenant, session) of a running node.
 pub fn identity(node: &Node) -> (u64, String, String) {
-    let identity = admin(node, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(node, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     (
         identity["node"].as_u64().unwrap(),
         identity["tenant"].as_str().unwrap().to_owned(),
@@ -335,7 +336,7 @@ pub fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let health = run(node, None, &["cluster", "node", "health"]);
+    let health = run(node, None, &["diagnose", "node", "--health"]);
     panic!(
         "{what} did not happen ({spent}; allowance {timeout:?}); health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -523,7 +524,7 @@ pub fn repair(node: &Node, tenant: &str, ledger: &str) -> Value {
     report["result"]["repair"].clone()
 }
 pub fn readiness(node: &Node) -> Value {
-    admin(node, &["cluster", "node", "readiness"])["result"]["readiness"].clone()
+    admin(node, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone()
 }
 /// Start under a file-size limit (`ulimit -f`, in 512-byte blocks) with
 /// `SIGXFSZ` ignored, so an oversized write returns `EFBIG` instead of
@@ -564,7 +565,6 @@ pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
             }
         }
     });
-    let server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(45))
         .expect("the limited node did not publish readiness");
@@ -572,7 +572,7 @@ pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"
     );
-    server
+    Server(child, Some(receive))
 }
 /// The largest file under the data directory, in bytes.
 pub fn largest_file(root: &Path) -> u64 {

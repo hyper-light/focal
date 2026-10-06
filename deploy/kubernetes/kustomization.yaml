@@ -1,5 +1,6 @@
 namespace: focal
 resources:
+  - namespace.yaml
   - configmap.yaml
   - service.yaml
   - pdb.yaml

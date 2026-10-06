@@ -144,6 +144,9 @@ pub(super) fn prepare(
         NativeCommand::ReleaseScope { expected } => {
             super::scope_release::prepare(expected, context, cut, view, limits, extras, scratch)
         }
+        // Prepared against the principal's window beside every request's
+        // admission (`epochs::prepare_advance`), never here.
+        NativeCommand::AdvanceEpochFloor { .. } => Err(ContractError::InvalidTransition.into()),
         NativeCommand::AdoptReceipt {
             expected,
             previous,

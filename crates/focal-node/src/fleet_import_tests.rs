@@ -264,21 +264,11 @@ fn populate(session: &mut Session) {
     );
 }
 
-/// The successor floor and the local promise become durable on later polls;
-/// the ledger harness retries the same two conditions.
+/// One call: the owner holds the activation until the successor floor and
+/// the local promise it started are durable (KIND D3), where this harness
+/// retried the two conditions.
 async fn activate(host: &ReplicaHost, call: ActivateNativeCall) -> Result<(), LedgerError> {
-    let mut last = Err(LedgerError::Failed);
-    for _ in 0..200 {
-        last = host.activate_native(call).await;
-        match &last {
-            Err(LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending))
-            | Err(LedgerError::Managed(focal_ledger::ManagedError::Unsupported)) => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            _ => return last,
-        }
-    }
-    last
+    host.activate_native(call).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -3,10 +3,11 @@ use focal_memory::{
 };
 use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 const MANIFEST_MAGIC: &[u8] = b"focal.evidence.manifest\0\x01\0";
@@ -58,7 +59,7 @@ impl CustodyRecordKind {
 
 #[path = "transfer.rs"]
 mod transfer;
-pub use transfer::{TransferManifest, describe_encoded};
+pub use transfer::{ImportCompletion, TransferManifest, describe_encoded};
 #[path = "gc.rs"]
 mod gc;
 pub use gc::{CollectorConfig, CollectorReport, ProtectionSet, SeedReport};
@@ -153,6 +154,37 @@ struct Upload {
     /// not promise its remainder, which the watermark still guards.
     _staging: Option<DiskReservation>,
 }
+/// An upload's seal in slices (the audit's F51), held by its one caller (a
+/// node's custody coordinator): the staged bytes read a chunk at a time, each
+/// chunk installed under its name as it is read, the stream hashed over
+/// them, the manifest's chunk list growing; the manifest is installed once
+/// the last byte is read ([`ContentStore::advance_seal`]). The volume's
+/// promise for the sealed copy is held from before the first chunk to the
+/// manifest. Dropped, it releases both; a seal asked again begins again, the
+/// chunks already installed found in place.
+pub struct UploadSealing {
+    id: UploadId,
+    length: u64,
+    done: u64,
+    whole: blake3::Hasher,
+    chunks: Vec<Chunk>,
+    objects: Option<DiskReservation>,
+}
+impl UploadSealing {
+    /// The heap and value storage the seal holds: its chunk list, reserved
+    /// whole when it began.
+    pub fn resident_bytes(&self) -> Result<usize, ContentError> {
+        self.chunks
+            .capacity()
+            .checked_mul(std::mem::size_of::<Chunk>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(ContentError::Capacity)
+    }
+    /// The bytes of the upload sealed so far, of its length.
+    pub fn done(&self) -> (u64, u64) {
+        (self.done, self.length)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Chunk {
@@ -168,6 +200,49 @@ struct Manifest {
     length: u64,
     stream_digest: ContentHash,
     chunks: Vec<Chunk>,
+}
+
+/// An installed object's verification in slices (the audit's F51): what
+/// [`ContentStore::verify`] reads at once — every chunk against its name, the
+/// stream against the manifest's digest — one chunk a call
+/// ([`ContentStore::advance_verify`]), so the store's one owner serves other
+/// work between chunks. It holds the object's chunk list, validated once
+/// from its manifest; its holder charges [`Self::resident_bytes`].
+pub struct ObjectVerification {
+    reference: ContentRef,
+    chunks: Vec<Chunk>,
+    stream_digest: ContentHash,
+    next: usize,
+    whole: blake3::Hasher,
+}
+impl ObjectVerification {
+    pub fn reference(&self) -> &ContentRef {
+        &self.reference
+    }
+    /// The chunks verified so far, of the object's [`Self::chunks`].
+    pub fn verified(&self) -> usize {
+        self.next
+    }
+    pub fn chunks(&self) -> usize {
+        self.chunks.len()
+    }
+    /// The heap and value storage a verification holds.
+    pub fn resident_bytes(&self) -> Result<usize, ContentError> {
+        self.chunks
+            .capacity()
+            .checked_mul(std::mem::size_of::<Chunk>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(ContentError::Capacity)
+    }
+    /// The most a verification can hold: the chunks a manifest may name,
+    /// each at least 33 encoded bytes.
+    pub fn resident_bound() -> Result<usize, ContentError> {
+        MAX_TRANSFER_MANIFEST_BYTES
+            .checked_div(33)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<Chunk>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(ContentError::Capacity)
+    }
 }
 
 /// The fixed header contains no allocating fields. Validate the sequence count
@@ -232,7 +307,94 @@ pub struct ContentStore {
     disk: DiskBudget,
     /// The collector's pass in progress (26 §5).
     collector: gc::CollectorState,
-    _writer_lock: File,
+    /// Sealed objects' chunk plans, each validated once under its immutable
+    /// digest (the audit's F19); a lock, since readers share the store
+    /// across threads, held for one range's read; poisoned, it is an error.
+    plans: Mutex<PlanCache>,
+    _writer_lock: focal_platform::FileLock,
+}
+
+/// A sealed object's chunks with each chunk's start: a range finds its first
+/// chunk by search instead of scanning the manifest from its head, and the
+/// manifest is read, hashed and validated once per object while its plan is
+/// held. Every chunk delivered is still read whole and hashed.
+struct Plan {
+    class: ContentClass,
+    length: u64,
+    chunks: Vec<Chunk>,
+    starts: Vec<u64>,
+}
+impl Plan {
+    fn of(manifest: Manifest) -> Result<Self, ContentError> {
+        let mut starts = Vec::new();
+        starts
+            .try_reserve_exact(manifest.chunks.len())
+            .map_err(|_| ContentError::Capacity)?;
+        let mut start = 0u64;
+        for chunk in &manifest.chunks {
+            starts.push(start);
+            start = start
+                .checked_add(u64::from(chunk.length))
+                .ok_or(ContentError::Corrupt)?;
+        }
+        Ok(Self {
+            class: manifest.class,
+            length: manifest.length,
+            chunks: manifest.chunks,
+            starts,
+        })
+    }
+    /// The chunk holding `offset`: the last one starting at or before it.
+    fn first_chunk(&self, offset: u64) -> usize {
+        self.starts
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1)
+    }
+}
+/// The plans held: as many as the store admits uploads, the least recently
+/// used given up first — a bound on memory of that many manifests' chunks,
+/// the same allowance the store's upload states have.
+struct PlanCache {
+    plans: VecDeque<((ContentDomainId, ContentHash), Plan)>,
+    bound: usize,
+    /// Manifests read and validated: a test's evidence that a paged read
+    /// loads its plan once.
+    loads: u64,
+}
+impl PlanCache {
+    fn new(bound: usize) -> Self {
+        Self {
+            plans: VecDeque::new(),
+            bound: bound.max(1),
+            loads: 0,
+        }
+    }
+    /// The object's plan, loaded and validated once, then held; a reference
+    /// that names the same root with another class or length is refused as
+    /// the manifest's own validation refuses it.
+    fn plan(&mut self, root: &Path, reference: &ContentRef) -> Result<&Plan, ContentError> {
+        let key = (reference.domain, reference.root);
+        if let Some(at) = self.plans.iter().position(|(held, _)| *held == key) {
+            if let Some(entry) = self.plans.remove(at) {
+                self.plans.push_back(entry);
+            }
+        } else {
+            let plan = Plan::of(manifest_at(root, reference)?)?;
+            self.loads = self.loads.saturating_add(1);
+            while self.plans.len() >= self.bound {
+                self.plans.pop_front();
+            }
+            self.plans
+                .try_reserve(1)
+                .map_err(|_| ContentError::Capacity)?;
+            self.plans.push_back((key, plan));
+        }
+        let (_, plan) = self.plans.back().ok_or(ContentError::Failed)?;
+        if plan.class != reference.class || plan.length != reference.length {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(plan)
+    }
 }
 
 impl ContentStore {
@@ -245,6 +407,10 @@ impl ContentStore {
     }
     pub fn max_manifest_bytes(&self) -> usize {
         MAX_TRANSFER_MANIFEST_BYTES
+    }
+    /// The uploads the store stages at once at most.
+    pub fn max_uploads(&self) -> usize {
+        self.limits.max_uploads
     }
     /// Open the store guarded by the standard disk watermark alone.
     pub fn open(root: impl AsRef<Path>, limits: StoreLimits) -> Result<Self, ContentError> {
@@ -277,7 +443,7 @@ impl ContentStore {
             .read(true)
             .write(true)
             .open(root.join("LOCK"))?;
-        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
+        let lock = focal_platform::FileLock::exclusive(lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 ContentError::Locked
             } else {
@@ -289,6 +455,7 @@ impl ContentStore {
         durable_directory(&root.join("checkpoints"))?;
         durable_directory(&root.join("custody"))?;
         durable_directory(&root.join("receipts"))?;
+        let plans = Mutex::new(PlanCache::new(limits.max_uploads));
         let mut store = Self {
             root,
             limits,
@@ -299,6 +466,7 @@ impl ContentStore {
             disk,
             failed: false,
             collector: gc::CollectorState::new(),
+            plans,
             _writer_lock: lock,
         };
         store.recover_uploads()?;
@@ -381,23 +549,27 @@ impl ContentStore {
         }
         let directory = self.root.join(kind.directory());
         let path = directory.join(format!("{name}.record"));
-        let record = disk_reserve(
-            &self.disk,
-            &self.root,
-            DiskKind::Content,
-            BudgetLane::Completion,
-            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
-        )?;
-        let installed = durable_directory(&directory)
-            .map_err(ContentError::Io)
-            .and_then(|()| atomic_install(&path, bytes));
-        if let Err(error) = installed {
-            if matches!(error, ContentError::Io(_)) {
-                self.failed = true;
+        // The identical record on the volume already needs no promise and
+        // adds no byte.
+        if !already_installed(&path, bytes, None)? {
+            let record = disk_reserve(
+                &self.disk,
+                &self.root,
+                DiskKind::Content,
+                BudgetLane::Completion,
+                u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            )?;
+            let installed = durable_directory(&directory)
+                .map_err(ContentError::Io)
+                .and_then(|()| atomic_install(&path, bytes));
+            if let Err(error) = installed {
+                if matches!(error, ContentError::Io(_)) {
+                    self.failed = true;
+                }
+                return Err(error);
             }
-            return Err(error);
+            record.commit();
         }
-        record.commit();
         Ok(())
     }
     /// A named record's bytes, `None` when none was installed.
@@ -588,13 +760,39 @@ impl ContentStore {
             .ok_or(ContentError::MissingUpload)
     }
 
+    /// Seal a complete upload at once: [`Self::advance_seal`] to its end,
+    /// for a caller that holds the store alone (a tool, a test). A node's
+    /// content owner seals a chunk a call, serving other work between.
     pub fn seal(&mut self, id: UploadId) -> Result<ContentRef, ContentError> {
+        let mut sealing = self.begin_seal(id)?;
+        let block = sealing.length.min(self.limits.chunk_bytes as u64);
+        let mut scratch =
+            zeroed_buffer(usize::try_from(block).map_err(|_| ContentError::Capacity)?)?;
+        // A slice a chunk, and the manifest's.
+        let slices = sealing
+            .length
+            .div_ceil(block.max(1))
+            .checked_add(1)
+            .ok_or(ContentError::Capacity)?;
+        for _ in 0..slices {
+            if let Some(reference) = self.advance_seal(&mut sealing, &mut scratch)? {
+                return Ok(reference);
+            }
+        }
+        Err(ContentError::Failed)
+    }
+    /// Begin a complete upload's seal in slices ([`UploadSealing`]): the
+    /// staged bytes synced, the volume promised the sealed copy, the
+    /// manifest's chunk list reserved whole from the upload's length.
+    pub fn begin_seal(&mut self, id: UploadId) -> Result<UploadSealing, ContentError> {
         self.check()?;
-        let result = self.seal_inner(id);
+        let result = self.begin_seal_inner(id);
         self.mark_failure(&result);
         result
     }
-    fn seal_inner(&mut self, id: UploadId) -> Result<ContentRef, ContentError> {
+    fn begin_seal_inner(&mut self, id: UploadId) -> Result<UploadSealing, ContentError> {
+        let chunk_bytes = self.limits.chunk_bytes as u64;
+        let max_manifest_bytes = self.limits.max_manifest_bytes;
         let upload = self
             .uploads
             .get_mut(&id)
@@ -605,9 +803,22 @@ impl ContentStore {
                 expected: upload.meta.expected_length,
             });
         }
+        // The chunk count is known from the object size and chunk length;
+        // the list is reserved once instead of growing a chunk at a time. The
+        // manifest is bounded at forty bytes a chunk (as each slice checks):
+        // a seal of more chunks than it can name fails at its last anyway, so
+        // it is refused before anything is synced, promised or read.
+        let count = usize::try_from(
+            upload
+                .offset
+                .div_ceil(upload.offset.min(chunk_bytes).max(1)),
+        )
+        .map_err(|_| ContentError::Capacity)?;
+        if count.checked_mul(40).ok_or(ContentError::Capacity)? > max_manifest_bytes {
+            return Err(ContentError::Capacity);
+        }
         upload.file.sync_all()?;
-        upload.file.seek(SeekFrom::Start(0))?;
-        let domain = upload.meta.domain;
+        let directory = self.root.join("objects").join(hex(&upload.meta.domain.0));
         // The sealed object is a second copy of the staged bytes until the
         // part is removed at finish; promise it before the first chunk lands.
         let objects = disk_reserve(
@@ -617,44 +828,91 @@ impl ContentStore {
             BudgetLane::Ordinary,
             upload.offset,
         )?;
-        let directory = self.root.join("objects").join(hex(&domain.0));
         durable_directory(&directory)?;
         let mut chunks = Vec::new();
-        let mut hasher = blake3::Hasher::new();
-        let buffer_len = usize::try_from(upload.offset.min(self.limits.chunk_bytes as u64))
-            .map_err(|_| ContentError::Capacity)?;
-        let mut buffer = zeroed_buffer(buffer_len)?;
-        // The chunk count is known from the object size and chunk length;
-        // reserve once instead of growing the manifest by one per chunk.
-        let chunk_count = usize::try_from(upload.offset.div_ceil(buffer_len.max(1) as u64))
-            .map_err(|_| ContentError::Capacity)?;
         chunks
-            .try_reserve_exact(chunk_count)
+            .try_reserve_exact(count)
             .map_err(|_| ContentError::Capacity)?;
-        let mut remaining = upload.offset;
-        while remaining > 0 {
-            let count = usize::try_from(remaining.min(buffer.len() as u64))
-                .map_err(|_| ContentError::Capacity)?;
-            let block = buffer.get_mut(..count).ok_or(ContentError::Corrupt)?;
+        Ok(UploadSealing {
+            id,
+            length: upload.offset,
+            done: 0,
+            whole: blake3::Hasher::new(),
+            chunks,
+            objects: Some(objects),
+        })
+    }
+    /// One slice of an upload's seal (the audit's F51): the next chunk of the
+    /// staged bytes read into `scratch`, hashed into the stream and
+    /// installed under its name; past the last byte, the manifest installed
+    /// and its reference answered. The upload must still be staged, complete
+    /// and of the length the seal began with.
+    pub fn advance_seal(
+        &mut self,
+        sealing: &mut UploadSealing,
+        scratch: &mut [u8],
+    ) -> Result<Option<ContentRef>, ContentError> {
+        self.check()?;
+        let result = self.advance_seal_inner(sealing, scratch);
+        self.mark_failure(&result);
+        result
+    }
+    fn advance_seal_inner(
+        &mut self,
+        sealing: &mut UploadSealing,
+        scratch: &mut [u8],
+    ) -> Result<Option<ContentRef>, ContentError> {
+        let chunk_bytes = self.limits.chunk_bytes as u64;
+        let max_manifest_bytes = self.limits.max_manifest_bytes;
+        let upload = self
+            .uploads
+            .get_mut(&sealing.id)
+            .ok_or(ContentError::MissingUpload)?;
+        if upload.offset != sealing.length || upload.meta.expected_length != sealing.length {
+            return Err(ContentError::Invalid);
+        }
+        let domain = upload.meta.domain;
+        let directory = self.root.join("objects").join(hex(&domain.0));
+        let remaining = sealing
+            .length
+            .checked_sub(sealing.done)
+            .ok_or(ContentError::Corrupt)?;
+        if remaining > 0 {
+            let count =
+                usize::try_from(remaining.min(chunk_bytes)).map_err(|_| ContentError::Capacity)?;
+            let block = scratch.get_mut(..count).ok_or(ContentError::Capacity)?;
+            upload.file.seek(SeekFrom::Start(sealing.done))?;
             upload.file.read_exact(block)?;
-            hasher.update(block);
+            sealing.whole.update(block);
             let hash = ContentHash(*blake3::hash(block).as_bytes());
             install_verified_chunk(&directory.join(format!("{hash}.chunk")), block, hash)?;
-            chunks.push(Chunk {
+            // The list was reserved whole: a chunk past it is no seal of
+            // this length.
+            if sealing.chunks.len() >= sealing.chunks.capacity() {
+                return Err(ContentError::Corrupt);
+            }
+            sealing.chunks.push(Chunk {
                 hash,
-                length: count as u32,
+                length: u32::try_from(count).map_err(|_| ContentError::Capacity)?,
             });
             // Bound intermediate manifest growth before serializing it.
-            if chunks.len().checked_mul(40).ok_or(ContentError::Capacity)?
-                > self.limits.max_manifest_bytes
+            if sealing
+                .chunks
+                .len()
+                .checked_mul(40)
+                .ok_or(ContentError::Capacity)?
+                > max_manifest_bytes
             {
                 return Err(ContentError::Capacity);
             }
-            remaining = remaining
-                .checked_sub(count as u64)
+            sealing.done = sealing
+                .done
+                .checked_add(count as u64)
                 .ok_or(ContentError::Corrupt)?;
+            return Ok(None);
         }
-        let stream_digest = ContentHash(*hasher.finalize().as_bytes());
+        let objects = sealing.objects.take().ok_or(ContentError::Invalid)?;
+        let stream_digest = ContentHash(*sealing.whole.finalize().as_bytes());
         if upload
             .meta
             .expected_digest
@@ -666,27 +924,27 @@ impl ContentStore {
             schema: 1,
             domain,
             class: upload.meta.class,
-            length: upload.offset,
+            length: sealing.length,
             stream_digest,
-            chunks,
+            chunks: std::mem::take(&mut sealing.chunks),
         };
         let mut bytes = MANIFEST_MAGIC.to_vec();
         bytes.extend(postcard::to_stdvec(&manifest)?);
-        if bytes.len() > self.limits.max_manifest_bytes {
+        if bytes.len() > max_manifest_bytes {
             return Err(ContentError::Capacity);
         }
         let root = ContentHash(*blake3::hash(&bytes).as_bytes());
         atomic_install(&directory.join(format!("{root}.manifest")), &bytes)?;
         objects.commit();
-        let reference = ContentRef {
+        // Upload metadata stays for an idempotent seal after a lost
+        // response or a restart, until an explicit finish acknowledges that
+        // the caller retains the reference.
+        Ok(Some(ContentRef {
             domain,
             root,
             length: manifest.length,
             class: manifest.class,
-        };
-        // Keep upload metadata for idempotent seal after a lost response/restart until
-        // explicit finish acknowledges the reference is retained by its caller.
-        Ok(reference)
+        }))
     }
 
     pub fn finish(&mut self, id: UploadId) -> Result<(), ContentError> {
@@ -761,6 +1019,46 @@ impl ContentStore {
     pub fn verify(&self, reference: &ContentRef) -> Result<(), ContentError> {
         self.read_verified(reference, std::io::sink())
     }
+    /// Begin `verify` in slices ([`ObjectVerification`]): the object's
+    /// manifest read and validated once, nothing else read yet.
+    pub fn begin_verify(&self, reference: &ContentRef) -> Result<ObjectVerification, ContentError> {
+        self.check()?;
+        let manifest = manifest_at(&self.root, reference)?;
+        Ok(ObjectVerification {
+            reference: reference.clone(),
+            chunks: manifest.chunks,
+            stream_digest: manifest.stream_digest,
+            next: 0,
+            whole: blake3::Hasher::new(),
+        })
+    }
+    /// One slice of a verification: the next chunk read into `scratch` and
+    /// checked against its name, or, past the last, the stream against the
+    /// manifest's digest. Whether the object is verified whole.
+    pub fn advance_verify(
+        &self,
+        verification: &mut ObjectVerification,
+        scratch: &mut [u8],
+    ) -> Result<bool, ContentError> {
+        self.check()?;
+        let directory = self
+            .root
+            .join("objects")
+            .join(hex(&verification.reference.domain.0));
+        if let Some(chunk) = verification.chunks.get(verification.next) {
+            let block = verify_chunk_into(&directory, chunk.hash, chunk.length as usize, scratch)?;
+            verification.whole.update(block);
+            verification.next = verification
+                .next
+                .checked_add(1)
+                .ok_or(ContentError::Capacity)?;
+            return Ok(false);
+        }
+        if ContentHash(*verification.whole.finalize().as_bytes()) != verification.stream_digest {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(true)
+    }
 
     /// Authenticates the manifest and every selected chunk before returning a
     /// bounded byte range up to MAX_TRANSFER_CHUNK_BYTES, independent of local
@@ -774,7 +1072,9 @@ impl ContentStore {
         if max_bytes == 0 || max_bytes > MAX_TRANSFER_CHUNK_BYTES || offset > reference.length {
             return Err(ContentError::Capacity);
         }
-        let manifest = self.manifest(reference)?;
+        self.check()?;
+        let mut plans = self.plans.lock().map_err(|_| ContentError::Failed)?;
+        let plan = plans.plan(&self.root, reference)?;
         let end = offset
             .checked_add(max_bytes as u64)
             .ok_or(ContentError::Capacity)?
@@ -785,8 +1085,9 @@ impl ContentStore {
             .try_reserve_exact(usize::try_from(length).map_err(|_| ContentError::Capacity)?)
             .map_err(|_| ContentError::Capacity)?;
         let directory = self.root.join("objects").join(hex(&reference.domain.0));
-        let mut start = 0u64;
-        for chunk in manifest.chunks {
+        let first = plan.first_chunk(offset);
+        let mut start = plan.starts.get(first).copied().unwrap_or(reference.length);
+        for chunk in plan.chunks.iter().skip(first) {
             let next = start
                 .checked_add(u64::from(chunk.length))
                 .ok_or(ContentError::Corrupt)?;
@@ -847,6 +1148,9 @@ impl ContentStore {
         (self.uploads.len(), self.staged_bytes)
     }
 
+    /// The manifest read and validated afresh: what the tests compare a
+    /// held plan against.
+    #[cfg(test)]
     fn manifest(&self, reference: &ContentRef) -> Result<Manifest, ContentError> {
         self.check()?;
         manifest_at(&self.root, reference)
@@ -1059,18 +1363,7 @@ fn read_verified_at(
         .unwrap_or(0);
     let mut scratch = zeroed_buffer(scratch_len)?;
     for chunk in &manifest.chunks {
-        let len = chunk.length as usize;
-        let block = scratch.get_mut(..len).ok_or(ContentError::Corrupt)?;
-        let mut file = File::open(dir.join(format!("{}.chunk", chunk.hash)))?;
-        file.read_exact(block)?;
-        // The chunk file must be exactly `len`: a trailing byte is corruption.
-        let mut extra = [0u8; 1];
-        if file.read(&mut extra)? != 0 {
-            return Err(ContentError::Corrupt);
-        }
-        if ContentHash(*blake3::hash(block).as_bytes()) != chunk.hash {
-            return Err(ContentError::Corrupt);
-        }
+        let block = verify_chunk_into(&dir, chunk.hash, chunk.length as usize, &mut scratch)?;
         whole.update(block);
         sink.write_all(block)?;
     }
@@ -1078,6 +1371,37 @@ fn read_verified_at(
         return Err(ContentError::Corrupt);
     }
     Ok(())
+}
+/// The chunk of `length` bytes named `hash` in `directory`, read into the
+/// head of `scratch` and checked against its name: the verified bytes,
+/// borrowed from the scratch. A file of another length is corrupt — a short
+/// one is not the volume's failure — and a scratch too small for the chunk
+/// is refused before anything is read.
+pub(crate) fn verify_chunk_into<'a>(
+    directory: &Path,
+    hash: ContentHash,
+    length: usize,
+    scratch: &'a mut [u8],
+) -> Result<&'a [u8], ContentError> {
+    if length > MAX_TRANSFER_CHUNK_BYTES {
+        return Err(ContentError::Capacity);
+    }
+    let block = scratch.get_mut(..length).ok_or(ContentError::Capacity)?;
+    let mut file = File::open(directory.join(format!("{hash}.chunk")))?;
+    if file.metadata()?.len() != length as u64 {
+        return Err(ContentError::Corrupt);
+    }
+    file.read_exact(block)?;
+    // The chunk file must be exactly `length`: a byte appended since the
+    // length was read is corruption.
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(ContentError::Corrupt);
+    }
+    if ContentHash(*blake3::hash(block).as_bytes()) != hash {
+        return Err(ContentError::Corrupt);
+    }
+    Ok(block)
 }
 fn read_bytes_at(
     root: &Path,
@@ -1201,20 +1525,28 @@ fn refresh_mtime(path: &Path) -> Result<(), ContentError> {
 /// them is left alone; one holding anything else is corrupt under this
 /// content-addressed name and is replaced by the verified bytes, never
 /// kept: a recopy is how a corrupt chunk is repaired.
-pub(crate) fn install_transferred_chunk(
+/// Whether an identical file — equal bytes, and the hash when one is named
+/// — is already at `path`; when it is, its freshness is refreshed and nothing
+/// else is written. Asked before a durable write is promised its bytes (the
+/// audit's F59): a chunk an exact retry or a resumed transfer sends again, a
+/// manifest a repeated completion installs, a custody record installed
+/// twice add no byte to the volume, so they neither need the promise nor
+/// lower the estimate — and near the watermark they are not refused.
+pub(crate) fn already_installed(
     path: &Path,
     bytes: &[u8],
-    hash: ContentHash,
-) -> Result<(), ContentError> {
+    hash: Option<ContentHash>,
+) -> Result<bool, ContentError> {
     if path.exists()
         && read_bounded(path, bytes.len()).is_ok_and(|previous| {
-            previous == bytes && ContentHash(*blake3::hash(&previous).as_bytes()) == hash
+            previous == bytes
+                && hash.is_none_or(|hash| ContentHash(*blake3::hash(&previous).as_bytes()) == hash)
         })
     {
         refresh_mtime(path)?;
-        return Ok(());
+        return Ok(true);
     }
-    atomic_install(path, bytes)
+    Ok(false)
 }
 
 fn atomic_install(path: &Path, bytes: &[u8]) -> Result<(), ContentError> {
@@ -1470,6 +1802,67 @@ mod tests {
         assert!(s.verify(&wrong).is_err());
     }
 
+    /// A paged read loads and validates the object's manifest once and finds
+    /// each page's first chunk by search (the audit's F19); the plans held
+    /// are bounded by the uploads the store admits.
+    #[test]
+    fn paged_reads_load_the_plan_once_and_hold_a_bounded_number_of_plans() {
+        let root = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        limits.chunk_bytes = 4;
+        limits.max_uploads = 2;
+        let mut store = ContentStore::open(root.path(), limits).unwrap();
+        let mut references = Vec::new();
+        for object in 0..3u8 {
+            let id = UploadId([object; 16]);
+            let bytes: Vec<u8> = (0..64u8)
+                .map(|i| i.wrapping_mul(object.wrapping_add(1)))
+                .collect();
+            store
+                .begin(
+                    id,
+                    ContentDomainId([2; 16]),
+                    ContentClass::Evidence,
+                    bytes.len() as u64,
+                    None,
+                )
+                .unwrap();
+            for (i, part) in bytes.chunks(4).enumerate() {
+                store.append(id, (i * 4) as u64, part).unwrap();
+            }
+            let reference = store.seal(id).unwrap();
+            store.finish(id).unwrap();
+            references.push((reference, bytes));
+        }
+        let (reference, bytes) = &references[0];
+        let mut paged = Vec::new();
+        for offset in (0..bytes.len()).step_by(3) {
+            paged.extend(store.read_range(reference, offset as u64, 3).unwrap());
+        }
+        assert_eq!(&paged, bytes, "the pages are the object");
+        assert_eq!(
+            store.plans.lock().unwrap().loads,
+            1,
+            "one manifest read for every page"
+        );
+        for (reference, bytes) in &references {
+            assert_eq!(&store.read_range(reference, 5, 7).unwrap(), &bytes[5..12]);
+        }
+        assert_eq!(
+            store.plans.lock().unwrap().plans.len(),
+            2,
+            "held plans are bounded"
+        );
+        assert_eq!(store.plans.lock().unwrap().loads, 3);
+        // A reference with the right root and the wrong length is refused.
+        let mut wrong = reference.clone();
+        wrong.length = 63;
+        assert!(matches!(
+            store.read_range(&wrong, 0, 4),
+            Err(ContentError::Corrupt)
+        ));
+    }
+
     #[test]
     fn bounded_ranges_verify_selected_chunks_across_boundaries() {
         let root = tempfile::tempdir().unwrap();
@@ -1630,5 +2023,112 @@ mod tests {
             ContentStore::open(dir.path(), limits()),
             Err(ContentError::Locked)
         ));
+    }
+
+    /// An upload sealed a chunk a call installs what a seal at once does —
+    /// the same chunks and manifest, the same reference — with nothing of the
+    /// manifest installed before the last chunk is read (the audit's F51);
+    /// a seal whose chunks a manifest could not name is refused before a byte
+    /// is read.
+    #[test]
+    fn a_seal_in_slices_installs_what_a_seal_at_once_does() {
+        let at_once = tempfile::tempdir().unwrap();
+        let sliced = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..30u8).collect();
+        let id = UploadId([7; 16]);
+        let domain = ContentDomainId([1; 16]);
+        let staged = |root: &Path, limits: StoreLimits| {
+            let mut store = ContentStore::open(root, limits).unwrap();
+            store
+                .begin(id, domain, ContentClass::Evidence, 30, None)
+                .unwrap();
+            for (index, part) in bytes.chunks(4).enumerate() {
+                store.append(id, (index * 4) as u64, part).unwrap();
+            }
+            store
+        };
+        let whole = staged(at_once.path(), limits()).seal(id).unwrap();
+        let mut store = staged(sliced.path(), limits());
+        let mut sealing = store.begin_seal(id).unwrap();
+        let mut scratch = vec![0u8; 4];
+        let manifest = sliced
+            .path()
+            .join("objects")
+            .join(hex(&domain.0))
+            .join(format!("{}.manifest", whole.root));
+        let mut slices = 0;
+        let reference = loop {
+            slices += 1;
+            if let Some(reference) = store.advance_seal(&mut sealing, &mut scratch).unwrap() {
+                break reference;
+            }
+            assert!(!manifest.exists(), "{slices}");
+        };
+        // Eight chunks — seven of four bytes and one of two — then the
+        // manifest.
+        assert_eq!(slices, 9);
+        assert_eq!(reference, whole);
+        store.verify(&reference).unwrap();
+        let tight = tempfile::tempdir().unwrap();
+        let mut store = staged(
+            tight.path(),
+            StoreLimits {
+                max_manifest_bytes: 64,
+                ..limits()
+            },
+        );
+        assert!(matches!(store.begin_seal(id), Err(ContentError::Capacity)));
+        assert_eq!(
+            fs::read_dir(tight.path().join("objects")).unwrap().count(),
+            0
+        );
+    }
+    /// An installed object is verified a chunk a call, and a chunk that has
+    /// turned corrupt on the volume is found where it lies (the audit's F51).
+    #[test]
+    fn a_verification_in_slices_reads_every_chunk_and_finds_a_corrupt_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+        let id = UploadId([3; 16]);
+        let domain = ContentDomainId([2; 16]);
+        let bytes: Vec<u8> = (0..16u8).collect();
+        store
+            .begin(id, domain, ContentClass::Evidence, 16, None)
+            .unwrap();
+        for (index, part) in bytes.chunks(4).enumerate() {
+            store.append(id, (index * 4) as u64, part).unwrap();
+        }
+        let reference = store.seal(id).unwrap();
+        let mut scratch = vec![0u8; MAX_TRANSFER_CHUNK_BYTES];
+        let mut verification = store.begin_verify(&reference).unwrap();
+        let mut slices = 1;
+        while !store
+            .advance_verify(&mut verification, &mut scratch)
+            .unwrap()
+        {
+            slices += 1;
+        }
+        assert_eq!(slices, 5, "four chunks, then the stream");
+        assert_eq!(verification.verified(), 4);
+        // The third chunk overwritten with other bytes of its length.
+        let third = ContentHash(*blake3::hash(&bytes[8..12]).as_bytes());
+        fs::write(
+            dir.path()
+                .join("objects")
+                .join(hex(&domain.0))
+                .join(format!("{third}.chunk")),
+            b"wxyz",
+        )
+        .unwrap();
+        let mut verification = store.begin_verify(&reference).unwrap();
+        let mut outcome = Ok(false);
+        for _ in 0..5 {
+            outcome = store.advance_verify(&mut verification, &mut scratch);
+            if !matches!(outcome, Ok(false)) {
+                break;
+            }
+        }
+        assert!(matches!(outcome, Err(ContentError::Corrupt)));
+        assert_eq!(verification.verified(), 2);
     }
 }

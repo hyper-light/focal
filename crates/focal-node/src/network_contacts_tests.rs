@@ -100,12 +100,13 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
         2,
         PRINCIPAL,
         EnrollmentLimits::default(),
+        0,
         now(),
     )
     .unwrap();
     let receipt = draft.receipt().clone();
     let material = key
-        .complete(&receipt, authority.ca_certificate(), now())
+        .complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     let registry = EnrollmentRegistry::restore(
         &draft.registry().checkpoint().unwrap(),
@@ -154,6 +155,7 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
             .unwrap(),
             peers.clone(),
             limits.clone(),
+            MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
     );

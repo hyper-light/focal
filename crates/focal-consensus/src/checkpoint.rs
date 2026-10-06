@@ -10,6 +10,12 @@ pub(super) struct PendingCheckpoint {
     // All pending payloads precede their staging permit in drop order.
     _allocation: Allocation,
 }
+impl PendingCheckpoint {
+    /// Whether the log took the checkpoint's write.
+    pub(super) fn taken(&self) -> bool {
+        self.receipt.is_some()
+    }
+}
 
 // The source buffer always dies before its funding, including validation
 // refusal. Consensus snapshot/WAL copies have their own staging allowance.
@@ -18,7 +24,7 @@ struct FundedCheckpointInput {
     allocation: Allocation,
 }
 
-impl DurableNode {
+impl LogNode {
     pub fn checkpoint_pending(&self) -> bool {
         self.checkpoint.is_some()
     }
@@ -67,7 +73,7 @@ impl DurableNode {
         {
             return Err(ConsensusError::CheckpointIndex);
         }
-        if data.len() > 8 * 1024 * 1024 {
+        if data.len() > IMAGE_BYTES {
             return Err(ConsensusError::Capacity);
         }
         let bytes = memory::staging_bytes(&self.raw, &self.config, data.capacity(), 0)?;
@@ -79,13 +85,14 @@ impl DurableNode {
         )?;
         let result = catch_unwind(AssertUnwindSafe(|| {
             let term = self.raw.store().term(index)?;
-            let mut snapshot = Snapshot::default();
-            snapshot.mut_metadata().index = index;
-            snapshot.mut_metadata().term = term;
-            snapshot
-                .mut_metadata()
-                .set_conf_state(self.raw.store().conf_state.clone());
-            snapshot.data = data;
+            let snapshot = Snapshot {
+                data,
+                metadata: Some(SnapshotMetadata {
+                    conf_state: Some(self.raw.store().conf_state.clone()),
+                    index,
+                    term,
+                }),
+            };
             let prepared = self.raw.store().prepare_snapshot(&snapshot)?;
             let mut records = Vec::new();
             let count = self
@@ -98,8 +105,10 @@ impl DurableNode {
                 .checked_add(3)
                 .and_then(|count| count.checked_add(self.raw.store().proposals.len()))
                 .and_then(|count| count.checked_add(usize::from(self.config.fast)))
-                .and_then(|count| count.checked_add(usize::from(self.required_decoder.is_some())))
-                .and_then(|count| count.checked_add(usize::from(self.decoder_transition.is_some())))
+                .and_then(|count| count.checked_add(usize::from(self.decoders.required.is_some())))
+                .and_then(|count| {
+                    count.checked_add(usize::from(self.decoders.transition.is_some()))
+                })
                 .ok_or(ConsensusError::Capacity)?;
             records
                 .try_reserve_exact(count)
@@ -108,10 +117,10 @@ impl DurableNode {
             if self.config.fast {
                 records.push(fast_track_record(&self.config));
             }
-            if let Some(hash) = self.required_decoder {
+            if let Some(hash) = self.decoders.required {
                 records.push(decoder::floor_record(self.config.group_id, hash)?);
             }
-            if let Some(pair) = self.decoder_transition {
+            if let Some(pair) = self.decoders.transition {
                 records.push(decoder::transition_record(self.config.group_id, pair)?);
             }
             records.push(proto_record(
@@ -226,10 +235,12 @@ impl DurableNode {
     fn checkpoint_progress(&mut self, blocking: bool) -> Result<bool, ConsensusError> {
         let mut pending = self.checkpoint.take().ok_or(ConsensusError::Failed)?;
         if pending.receipt.is_none() {
-            match self
-                .wal
-                .rewrite_checkpoint_async_in(&pending.records, BudgetLane::Completion)
-            {
+            let persisted = self.persisted.as_ref().map(|signal| signal());
+            match self.wal.rewrite_checkpoint_async_notified(
+                &pending.records,
+                BudgetLane::Completion,
+                persisted,
+            ) {
                 Ok(receipt) => pending.receipt = Some(receipt),
                 Err(focal_log::LogError::Capacity) => {
                     // Completion-lane back-pressure is retryable in both modes;
@@ -262,6 +273,10 @@ impl DurableNode {
         drop(records);
         drop(receipt);
         self.raw.store_mut().compact_prepared(prepared)?;
+        // The checkpoint wrote the stored hard state, and no commit moved
+        // while it was written.
+        self.commit_unwritten = false;
+        self.commit_durable = self.commit_durable.max(self.raw.store().hard_state.commit);
         _allocation
             .shrink_to(memory::raw_bytes(&self.raw)?)
             .map_err(|_| ConsensusError::Capacity)?;
@@ -314,7 +329,7 @@ mod tests {
             node.drain().unwrap();
             node.propose(b"retained-published-entry".to_vec()).unwrap();
             let index = node.drain().unwrap().applied_index;
-            node.inject_fault_once(point);
+            node.inject_fault_once(point).unwrap();
             node.begin_checkpoint(index, b"durable-application-prefix".to_vec())
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

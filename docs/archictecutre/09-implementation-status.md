@@ -6359,7 +6359,7 @@ the prefix until R8; an unfiltered testament watch seeds the claims.
 The four packaged skills (`skills/focal-claims`, `focal-evidence`,
 `focal-validation`, `focal-cluster`) now carry an "On a native ledger" branch
 and the shared contract a "Native engine" section
-([workflow-contract.md](../../skills/references/workflow-contract.md)):
+([workflow-contract.md](../../skills/focal-claims/references/workflow-contract.md)):
 `ledger.standing` selects the branch; native identity is minted per call and
 resumed through `operation_id` (no reservation or seal), recovery is the
 four `request.*` tools, refusals are typed and a `capacity` refusal leaves
@@ -11578,3 +11578,2364 @@ zip member marked a regular file, `S_IFREG`, which the builder now sets), run by
 `uvx --from <wheel> focal`, all eight wheels passing `twine check`, and the npm
 pair installed with and without install scripts (`focal 0.1.0` both ways, the
 command on `PATH` a Mach-O executable after postinstall and the Node shim without).
+
+### 2026-09-29 — the port from slates, batch one: a round's whole deadline, a leader that hands off when told to stop; the allocation audit's first two reductions
+
+**What slates has that focal lacked, catalogued.** Every transport, runtime and
+consensus change slates made since focal's last port (2026-09-10 to 09-29) is
+judged in [`docs/qualification/slates-delta-2026-09-29.md`](../qualification/slates-delta-2026-09-29.md):
+of its transport work quinn already provides eighteen items and focal had five;
+its consensus work leaves two defect classes present in focal and one port of
+the first rank, all three taken here or next. The KIND fault campaign
+([`docs/qualification/campaigns/2026-09-29-kind.md`](../qualification/campaigns/2026-09-29-kind.md))
+brought focal up on real pods, passed the two-party workflow through them and
+measured kills, partitions and netem, and found five defects (D1 to D5, open
+below); the allocation audit
+([`docs/qualification/allocations-2026-09-29.md`](../qualification/allocations-2026-09-29.md))
+counted 357 allocations, 12 reallocations and 574 KB per committed claim, six
+`F_FULLFSYNC` per claim, and ranked sixteen reductions.
+
+**A round that has gathered nothing is given its whole deadline** (27 §3.1 P1).
+`RoundBudget::derive` judged every round at three quarters of its deadline; a
+round with no answer in hand ended there, though the deadline was derived from
+the tail of the round's peers so an answer inside it is the one the round opened
+for — the defect slates found in its `DispatchWait` on 2026-09-29, in focal's port
+since P1. `DeadlineExtender::judgement_ns` is the deadline while nothing has
+arrived and the lookahead once something has; the wire round's test that pinned
+the old rule (`a_round_with_no_answer_ends_at_its_lookahead`, 75 ms) now ends at
+100 ms, and an answer at 90 ms of a 100 ms round is collected.
+
+**A leader told to stop hands its log off** (27 §5; slates 4e38d3e). A replica that
+leads when its owner is told to stop asks the most caught-up voter it hears from to
+campaign (`focal_control::heir`: replicating, recently active, the furthest
+matched, the lowest id among equals; a session prefers its placement's preferred
+leader when that one qualifies) and keeps ticking and beating until the log leads
+elsewhere or one election timeout of its own periods has passed, then stops as
+before; the control groups do the same in their loop. On three real processes
+(`tests/stop_handoff.rs`: three voters, the session's leader sent SIGTERM) the
+survivors were led again in **84 ms, in one term**, where the leader that went
+silent had cost them 5.2 to 7.0 s under this machine's load. The test reads the
+succession from the survivors' live `cluster replicas diagnostics` (the metrics
+are sampled every five seconds and cannot time a hand-off) and requires the
+stopped node's own account of it: a planned stop now prints one last status
+record, `{"condition": "Stopped", "sessions_led": n, "sessions_handed_off": m}`
+([network-startup](../network-startup.md)), from the replica's progress
+(`StopHandOff`) through the fleet's stop (`FleetStopReport`) and the service
+(`ServiceStopped`). Four defects of the stop path stood in the way, each found by
+the test: the service's `select!` returned on the signal and dropped the egress
+drivers and the listener before the owners stopped, so nothing a leader sent
+could leave and nothing its peers sent could arrive (a stop is now a phase of
+`run_tasks`: the owners stop while `network`, `control_driver` and
+`ledger_driver` are still polled, and a driver that ends because an owner closed
+it is not what ends the service); the fleet's quiesce refused every routing lookup
+(`replica_target` routes to a fleet's sessions while they stop, each refusing for
+itself); the shared worker discarded every message routed to a stopping session
+(`enqueue` and `schedule_when` keep a handing-off session's work); the peer pool
+closed before the owners (it closes after them). `focal_session_periods_total`
+joins the metrics: the session owner's periods, the unit its election timer
+counts.
+
+**The audit's first reductions.** R3: `RamLog::reserve_slots` charged the budget
+for the next power of two of what the log needs and then reserved exactly the
+addition, so every commit moved the whole retained log (two reallocations a
+commit, hundreds of kilobytes before a checkpoint); it reserves to the charged
+power of two now (`slots_grow_to_the_power_of_two_the_budget_was_charged_for`,
+failing first). R8: the host and the object reads encoded a whole reply only to
+measure it; `payload_len` applies the same limit without allocating. The audit's
+counting benches (`allocs` in focal-memory, -wire, -log, -core, -raft and
+tools/load; bench-only, a counting allocator with sampled sites) are kept for the
+reductions to come.
+
+**Open, from the campaign and the catalog:** D1 the rendered kustomization emits no
+Namespace object; D2 a native activation over an empty prefix before scale-out
+fail-closes the voters added after it (they never promised the successor decoder
+floor); D3 the first `activate-native` after a fresh founder answers a transient
+unavailable; D4 an operator read on a follower's socket stalls 30 s (the client's
+retry ceiling) instead of forwarding or refusing with the leader named; D5 the
+rendered deployment leaves the root group a single voter; C3 consensus messages
+refused `Busy` on the two-permit per-peer lane are dropped uncounted; the
+audit's R1/R2 (one durable group commit per proposal; one fsync per commit) are
+design decisions to take.
+
+### 2026-09-29 — two of the KIND campaign's defects at their causes: the rendered Namespace, the activation a late voter could not apply
+
+**D1.** The Kubernetes renderer set `namespace:` on every object and emitted no
+Namespace object, so `kubectl apply -k .` on a fresh cluster failed with
+"namespaces \"focal\" not found". It renders `namespace.yaml` first in the
+kustomization now; the checked-in manifests and the render golden test follow.
+
+**D2, the campaign's headline.** Every voter added by `deployment apply` after
+`activate-native` stopped with `Corrupt` ("persisted ledger identity, format or
+prefix mismatch") and the session stayed in Catchup for good, the pods Ready.
+Reproduced in process
+(`a_voter_added_after_a_genesis_activation_promises_the_successor_and_applies_it`,
+`session_native_tests.rs`): a founder alone activates, a copy joins, states its
+promise of the successor decoder until it is durable and is admitted as a
+learner — the ledger's own gate, the node's `ManagedSupport` probe in process —
+and its replay of the founder's log fails at the activation record. Not at the
+decoder floor, which the promise had made durable, but at the record's
+configuration: `apply_activation` compared the record's hash of the
+configuration it was proposed under with the consensus's *current*
+configuration, which on the copy already held the learner's own addition,
+committed after the record and handed over in the same batch — while the
+ledger's applied position (`membership_state.configuration_index`, advanced in
+order by `apply_delivered_membership`) was still the record's. On any replica the
+same comparison fails on any replay past a later configuration change. The record
+names its configuration by the index that committed it, which within one log
+identifies one configuration; the apply compares that index alone now (the hash
+stays in the record, computed at proposal). The test goes on to promote the copy,
+commit natively on both, and reopen the copy with its immutable bootstrap to
+replay the record again. The campaign record is updated; D3 (a transient
+`unavailable` on the first `activate-native`), D4 (a follower's operator read
+stalls for the client's 30 s resend ceiling: `LedgerError::NotReady` reaches the
+client as `Unavailable`, with no leader named and no forwarding) and D5 (the
+rendered deployment leaves the root group a single voter) remain open.
+
+### 2026-09-29 — follower reads: the KIND campaign's D4 at its cause
+
+A domain read asked of a host that did not lead the session refused it
+(`NotReady`, reaching the client as `Unavailable`), and the client resent it for
+its whole 30 s ceiling before reporting `unavailable` — on both hosts, every time
+(the campaign's 6 of 6 reads at 30.08–30.15 s). A follower serves a linearizable
+read now (27 §5): the consensus admits the read on a follower that knows its
+leader (`read_index_inner`; the core forwards `MsgReadIndex` and the leader
+answers with its commit index), the engine parks a barrier answered above this
+copy's applied index until the entries it names have been applied — bounded by
+the reads the core holds in flight (`DurableNode::pending_reads`), charged once —
+where it failed closed (`Corrupt`) on the same condition before, and the page is
+read from the copy's own committed core at that index (`read_at_least`); the
+node's read dispatch and its resolution ask `serves_native_reads` instead of
+`is_authoritative`. A follower with no leader to ask refuses as before, and the
+client's bounded resends ride out the election. On three real processes
+(`tests/follower_reads.rs`: written through the leader, read through each host's
+operator socket, three rounds) every read answered in **45–47 ms for the whole CLI
+invocation**, with the claim the leader had just committed; the ledger's cluster
+test asks a barrier of a follower and serves it at the committed sequence, and an
+isolated authority still completes none. Reads therefore scale across a log's
+voters, and a copy's read is exactly as fresh as the leader's commit index at the
+moment it asked.
+
+### 2026-09-29 — C3: the lanes of a connection derived from the core's window, a lost exchange the core hears of; the liveness view before an answer
+
+**The consensus lane (27 §7).** A connection had sixteen streams, two of them the
+lane for what a group asks of the peer (`RemoteCapacity::control`), and the pool let
+two exchanges to a peer be in flight (`per_peer_inflight`) for every group the two
+nodes share, while the core keeps 128 messages in flight to a follower
+(`NodeConfig::max_inflight_messages`): the leader's pipeline on the wire was two. A
+Raft message that found either lane full was refused at once (`try_acquire` →
+`WireError::Limit` → `PeerSendError::Busy`), counted by the driver
+(`focal_peer_messages_busy_total`) and dropped, and a message to a peer the pool could
+not reach was counted and dropped the same way, so a leader kept streaming to a peer it
+could not reach. The streams of a connection are derived now (`WireLimits::for_consensus`,
+`PeerPoolLimits::for_consensus`, `DEFAULT_INFLIGHT_WINDOW` in focal-consensus): one for
+the probe, the consensus window for the control lane (`WireLimits::control_streams`),
+and the content lane the reference path fills (`content_streams`: 1 Gbit/s × 100 ms =
+12 MiB, thirteen streams of a megabyte's window) — 142 streams, which quinn's
+`max_concurrent_bidi_streams` follows on both ends, the connection's receive window
+bounding buffered bytes whatever the count; the pool's lanes follow the same window,
+per peer and in all. A Raft send waits its turn on the control lane and on the slot's
+lane (`acquire().await`), bounded by the exchange's time (`PeerPoolLimits::timeout`),
+and is `Busy` past it, counted as before; a `Lost` exchange reaches the frame's owner
+(`ReplicationFrame::lost`, a sync channel of `LOST_PEERS` per owner) and the owner
+reports the peer to its core before its next period (`Session::report_unreachable`,
+`ReplicaHost::report_unreachable`), which probes the member instead of streaming to it;
+counted per session (`focal_session_peers_unreachable_total`). Tests: the wire's
+`the_lanes_of_a_connection_are_derived_from_the_consensus_window_and_the_path` (142
+streams, 128 the control lane, 13 content, the default pool's lanes 128 per peer) and
+`a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused` (messages beyond
+a lane of one complete in order, none refused); the node's
+`a_peer_that_cannot_be_reached_is_told_to_the_frames_owner` (a route to a socket
+nothing answers on: the driver counts the exchange lost and the owner is told the peer).
+The workspace gates found two consequences of a report that is real now, both fixed at
+their cause. A report reaching a core fenced by a write it still persisted
+(`guarded_in`: `PersistencePending`) was propagated by the owner as the period's error,
+which stops the session ("stopped after application failure"); a report is a hint about
+a peer, so the owner keeps it for the next period (it goes back on its own channel) and
+goes on, and the control host the same. And a member the leader lost one message to is
+probed by the core until its log moves (`MsgUnreachable` → `become_probe`, the
+raft-rs/etcd rule: a probe ends when the match index advances, which a log with nothing
+proposed never does), while the leader's return of leadership (27 §5) and a stopping
+leader's choice of heir judged a member fit only in the replicate state: a voter that
+came back caught up and heard from was never asked, and the placement test
+`the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss` waited out
+its budget. Fitness is the log now — caught up to what is committed, heard from, not
+being sent a snapshot (`PEER_SNAPSHOT`) — in `return_leadership`, the return policy's
+`current` and `focal_control::heir`.
+
+**Liveness: the view before the answer.** PR #3's Windows run failed
+`probes_bind_their_sender_refute_self_suspicion_and_ration_extensions` at
+`extensions` 0 ≠ 1: the driver answered a probe whose extension it had granted, the
+test took the view once it had the answer, and the driver's loop had not yet reached
+the publish that follows an answer. The driver publishes before any probe answer leaves
+now (`LivenessDriver::answer_published`), keyed by the counters the published view was
+built from (`published`; the loop's end-of-iteration publish compares against the
+same), so a reader that holds an answer sees in the view what the answer reports. No
+wait was lengthened.
+
+### 2026-09-29 — the first online activation: the KIND campaign's D3 at its cause
+
+On every run of the campaign the first `cluster replicas activate-native` on a
+freshly Ready founder answered `[unavailable] metadata owner is unavailable`
+(exit 6) and the retry succeeded. Not a race with readiness: an activation needs
+the local promise of the native decoder durable and every voter's recorded, the
+promise is begun by the first thing that asks for it, and on an idle fresh
+founder that is the activation itself — `activation_barrier` →
+`begin_native_support` → `begin_managed_support` staged the `FOCALDF1` floor and
+returned `PersistencePending`, the owner answered with it at once, and the
+replica-admin protocol's catch-all worded a live owner "unavailable". The offline
+path (`activate_local`) and the in-process harnesses looped on exactly this
+condition, so nothing caught it. The owner holds an activation at its managed
+gate now (`Owner::activation_gate`, the gate that already holds managed work for
+the durable floor): it begins the support, holds while the write persists, holds
+while any voter's promise is missing (the support driver records them), and lets
+the call through once the barrier holds (`Session::native_activation_barrier`,
+read-only) — bounded by the request deadline in the owner's periods, past which
+the answer is the barrier's own refusal, not an unknown outcome; a session that
+cannot take an activation at all goes through to its definitive refusal. The
+protocol words `PersistencePending` `not_ready`. The in-process tests ask once
+now (`fleet_native_tests`, `fleet_import_tests`), and `tests/online_activation.rs`
+asks a fresh founder once through its running node's admin socket, without the
+harness riding out exit 6, and writes a claim natively after it.
+
+### 2026-09-29 — byte payloads read in one exact reservation (allocation audit R5)
+
+A `Vec<u8>` field derives as a sequence: written as varint(len) and every byte,
+read back one byte at a time into a vector that guesses its size from the
+length and grows, and measured per byte on every size pass. postcard writes
+`serialize_bytes` as the same varint(len) and the same bytes, so
+`focal_memory::serde_bytes` (behind the crate's `serde` feature) keeps every wire
+and durable byte — proved across the varint boundaries (0, 1, 127, 128, 300,
+16 383, 16 384, 70 000 bytes) in both directions — and reads a field back with
+one exact, fallible reservation of what the frame holds (postcard checks the
+length against the input before the visitor runs; a length beyond it is a decode
+error, tested), while a text format's sequence still reads. Annotated: the wire's
+19 message fields and the native payload, artifact, legacy row and list cursor;
+the WAL's `Record.payload` and the three era records; the ledger's checkpoint
+envelopes (`SnapshotEnvelope`, `SnapshotEnvelopeV2`); a range's `DataRow`. Fixed
+arrays (`[u8; 16]`) are untouched: they carry no length, and `serialize_bytes`
+would add one. Measured (`docs/qualification/performance/2026-09-29-macos-arm64.md`):
+decode of a native frame 1964 → 102 ns at 4 KiB and 30 695 → 776 ns at 64 KiB,
+encode 262 → 120 and 3040 → 1072 ns, the empty frame's fixed cost unchanged; the
+WAL's path A moves 3.6× fewer bytes per 4 KiB append (16 810 → 4 607) with half
+the reallocations. Nothing on disk or on the wire changed; the frozen-format and
+replay suites pass unchanged.
+
+### 2026-09-29 — F54: what the allocation counter measures, said exactly
+
+The audit's F54: the counting allocator's "bytes moved by realloc" added
+`min(old, new)` on every reallocation whether or not the block moved, requested
+bytes were read as live memory, a phase's peak was read as an operation's, and the
+allocation record converted this host's page faults at 4 KiB where the page is
+16 KiB. The allocator counts a reallocation as a copy only when it returned another
+pointer (`realloc_moved`, `realloc_moved_bytes`) and in-place growth apart
+(`realloc_in_place`), its report labels `moved/op` and `requested/op` for what they
+are, and its module comment states what each figure is and is not. The allocation
+record carries a dated corrections section (§6a): the 4 KiB fault arithmetic,
+corrected to the host's 16 KiB page, agrees with the RSS growth per claim it sat
+next to (10.7 KB against 10.9 KB); the "moved" figures of §2 are marked upper bounds;
+process figures state the page size from now on, and counted runs attribute while
+uninstrumented runs measure.
+
+### 2026-09-29 — F31: the arena's page directory doubles; F52: an encode written once
+
+F31: `Arena::add_page` built a new directory of length n+1 and moved every page
+descriptor into it on every page added — O(P²) descriptor moves over P pages, and
+a fresh allocation each time. The directory grows to the power of two of its
+length now, charged for its whole capacity before anything of the arena changes
+(a refusal leaves the directory, its charge and every handle as they were), and a
+directory with room takes a page without a new allocation or charge;
+`the_page_directory_grows_by_doubling_and_is_charged_for_its_capacity` adds a
+thousand pages and sees eleven reallocations. F52, the wire's half: `encode_payload`
+reserved the measured size, zeroed the whole buffer, then overwrote it; it appends
+into the reserved buffer now (`postcard::to_extend`), refusing a value whose
+encoding did not match its measured size as an invalid frame rather than growing;
+`an_encode_writes_its_reserved_buffer_once_and_exactly` holds the bytes identical to
+a whole-vector serialization and the capacity exact. The WAL's half is R6's one
+buffer per batch, written the same way; the receive side's buffer stays initialized
+until F03's funded, arriving-bytes reader replaces it.
+
+### 2026-09-29 — F19 and F25: a range read finds its chunk once; readiness asks whether the owners serve
+
+F19: every `read_range` of an evidence object read, hashed, decoded and validated
+the whole manifest, then scanned its chunks from the head to the requested offset —
+a paged download of an N-chunk object did O(N²) manifest work. The content store
+holds a sealed object's chunk plan (`Plan`: the chunks and each one's start),
+validated once under the object's immutable digest and held for as many objects as
+the store admits uploads (least recently used given up), and a range finds its first
+chunk by search; a reference naming the same root with another class or length is
+refused as the manifest's validation refuses it, and every delivered chunk is still
+read whole and hashed. `paged_reads_load_the_plan_once_and_hold_a_bounded_number_of_plans`
+pages an object in threes with one manifest read and holds two plans of three
+objects. Pages remain chunk-sized on the wire (`max_frame_bytes`), so a page reads
+one chunk; a cache of verified chunk bytes is not added (its memory would be
+uncharged).
+
+F25: the rendered startup, liveness and readiness probes all asked `--check alive`,
+which reads only the node's identity, so a pod whose owners had stopped stayed
+Ready. `cluster node probe --check serving` asks whether the owners serve: the root
+replica's not stopped and every installed session's running (a session stopped on
+a failure or on request leaves the fleet's running count below its installed
+count) — never leadership or a quorum, since a readiness that failed for a missing
+quorum would take the pod from the endpoints its peers need to re-form one (the
+headless Service publishes not-ready addresses for that reason). The renderer's
+readiness probe and the Helm chart ask it; startup and liveness stay `alive`.
+`a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leader_is_down`
+sees a healthy follower serve with the root leader down;
+`a_node_whose_session_owner_stopped_is_alive_and_not_serving` sees a founder whose
+session owner stopped stay alive and stop serving.
+
+### 2026-09-29 — evaluation pages that concatenate, a selection the owner makes over the whole span (the audit's F07, F08)
+
+The declaration page walked the claim's registrations in registration order
+and compared its cursor as a key: a page that filled named the row it had not
+shown, so the next page skipped it (F07). The client read the first page of a
+declaration's evaluations, ignored its continuation, and chose the "current"
+evaluation among those objects, though the core allows 4096 per claim (F08).
+Now the core scans one declaration's evaluations in key order
+(`native_declaration_evaluations_from`, resumable exclusively after any key,
+proved against registration order and cursors no row has), the page's
+continuation is the last key it consumed and the page is judged full before a
+row is consumed, so pages of every size — 1, 2, 3, 5, 17, 64, 255, 256, 257,
+271, 272, 273 — concatenate to a 272-evaluation span without a skip or a
+repeat at one exact prefix; a resumed page that is not exact, a cursor of
+another claim or declaration, or a declaration under another claim is
+refused. The owner selects the current evaluation itself
+(`NativeReadQuery::SelectEvaluation`): over the declaration's whole span the
+targets the selector names, at the named generation when one is, live when
+asked, the tie set at the highest generation — one object, or several the
+caller must narrow, or a `Capacity` refusal when the set would not fit, never a
+cut. `validation.begin`/`report` resolve through that selection (the compiled
+`BeginIncrement` binds the evaluation at position 264 of 272, past the first
+page), `validation.context` selects the same way, and `validation.get` follows
+the declaration's pages at exactly the first page's prefix to the end (bounded
+by the core's evaluations per claim over a page; an endless span is a
+`Capacity` refusal, a foreign continuation invalid). The claim expansion is
+ordered — the responses from the latest cycle back, then the evaluations in
+key order — and a page that fills carries the position to resume at instead
+of truncating; a resumed page never repeats the claim. The responses list
+passes the rows above a resumed cursor uncharged, so a page of one row and one
+visit reaches the end of a 17-response chain. The wire validates each page's
+shape against its query (key order, a forward continuation, one tie set, no
+repeated claim). The read query's registered encoding changed with it (doc 19
+records the re-registration; no release carried the profile before).
+Tests: `focal-core` `native::increment_scan_tests`, `focal-node`
+`native_reads_tests` (five, over a real owner through the node's own page and
+the client's driver), `focal-wire`
+`native::tests::native_pages_are_validated_against_the_shape_their_query_names`,
+`focal-native-client`
+`validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound`.
+### 2026-09-29 — F09: discovery selects the engine the mutation path uses
+
+`focal schema example claim.submit` printed the V1 engine's document whatever engine
+the ledger ran, normalised through the V1 decoder, and on a native ledger it failed at
+four layers in turn (an unknown `evidence_schemas`, a missing per-declaration
+`deadline`, a receipt declaration naming an evaluator, a claim on oneself the owner
+never posts); `schema list`, shape-only validation and name completion used the V1
+registry too, and discovery's tests validated examples against the registry that
+produced them. One engine selection serves every surface now
+(`focal_client::operations::engine`): offline, `--native` wins, else the only catalogue
+that has the name, else V1; online, the standing probe every host performs once
+(shared by the CLI and the MCP adapter), with `--native` against a V1 answer refused and
+an assumed engine reported as assumed. Every native descriptor has an authored example
+(`operations::native_examples`, the single source the tests draw on: deadlines at
+2100-01-01, claims that name another participant), normalised through the native
+decoder; `schema list` shows each operation's engine and version; `schema validate`
+with a context compiles the document against the ledger's committed bindings without
+claiming a journal identity. Tests: both engines' examples decode through their own
+decoder and shape (`discovery_tests`, `engine_tests`, `native_tests`), each authored
+coverage row's example loads through its command with the same canonical intent
+(`cli/tests.rs`), the generated example commits through the MCP adapter unchanged
+(`native_stdio_tests`), documented commands and their flags resolve in the command
+tree (`command_tree_tests`), the native catalogue and every example need no state
+(`tests/cli_discovery.rs`), and the documented native quickstart runs verbatim on a
+fresh native ledger through the real binary (`tests/cli_native_quickstart.rs`: submit,
+post, a read showing the claim posted, the engine named by the context-backed
+validation, the V1 example refused by the field the native contract lacks). The README
+and the manual carry the native quickstart and the rule.
+### 2026-09-29 — F02 — a retirement that the same configuration cannot restore
+
+Addendum: the hosted apply loop reconstructed the owner after a retirement record
+applied and before the delivery cursor passed the entry, so a reconstruction refused
+for memory was retried against an entry already applied and failed the session as
+`Corrupt` (reproduced first). The cursor now passes the entry before the
+reconstruction and a ready authority rebuilds its owner at the end of every delivery
+until it can; the refusal is a `Retry`, the record applies once
+(`session::native_tests::a_reconstruction_refused_after_the_record_applied_is_retried_without_reapplying_it`).
+
+The audit's F02 (P1). `Core::retire_native_family` incremented the outcome
+count and published a retirement's outcome at the next prefix without asking
+the core's outcome bound, while checkpoint recovery requires the count it
+restores at or under `limits.outcomes` and equal to the prefix: a session that
+had admitted its bound's last outcome and then retired a family encoded a
+checkpoint the same limits refused (`Contract(Capacity)`), and an owner rebuilt
+over the core refused the same way. Nothing consulted the completion book
+either — the promised slots every candidate and every owner rebuild pass
+(`check_slots`) — so a retirement that fit the bound but took an outcome
+promised to a live report left a core no owner rebuilt over: `NativeOwner::new`
+refused `Capacity` at every readiness barrier, the authority never returned,
+and in the hosted session the retained delivery re-applied the entry and
+failed closed as `Corrupt`. The bound is per node and was committed nowhere.
+The outcome is guarded now as ordinary admission guards its own.
+`Core::retirement_family` refuses first, before a row is walked, when the
+outcomes counted plus one pass the bound (`RetirementRefusal::OutcomeCapacity`);
+`retire_native_family` refuses the same at publication (`Capacity("outcomes")`)
+after checking that the outcomes counted equal the prefix (a contradiction is
+`InvalidManifest`) — the last fence, never the check. `NativeOwner::check_retirement`,
+modelled on the layout change's check, asks the book what every fresh
+candidate is asked, with the meta row one outcome and the prefix one sequence
+ahead; the session names that refusal `OutcomesReserved`, and it frees as the
+reports arrive. `propose_retirement` runs its gates, derives the family, asks
+the owner, then encodes, so a refusal proposes and fences nothing; the archive
+agent asks `Session::native_check_retirement` before it seals a bundle. The
+retirement record is version 2 and carries the bound the retirement was
+checked against (`FOCALRT1`, 154 bytes, digest domain `.v2`; a record without
+a bound, or whose prefix its bound does not hold one past, is refused at
+encoding and decoding alike); at application a replica whose own bound cannot
+hold a committed retirement fails closed with both bounds named
+(`NativeSessionError::OutcomeBound { committed, local }`), as a layout record
+fails a replica below the authority's member bound, while a version-1 record
+that does not fit is inert and counted (`retirements_inert`), never a stop,
+since its authority checked nothing; version-1 records still decode, their
+golden bytes kept. Tests: the core at the bound less one, at it and past it,
+over several families, and against the book's promised slots (at the smallest
+bound an owner rebuilds under, the core's check passes, the owner refuses, and
+retiring regardless leaves a core no owner rebuilds over); a single session
+refused at the bound with nothing fenced and a reopen unchanged, allowed one
+under it with reopens from the log alone and from a checkpoint under the same
+bound, a replica below the committed bound refused on the record and opened
+under it, a version-1 record applied where it fits and inert where it does
+not; three voters at the bound with the lagging follower restored from the
+authority's checkpoint under the bound and restarted under it; the hosted
+authority allowed and refused. Left in place and described in the remediation
+record: the hosted apply loop reconstructs the owner in line right after a
+retirement applies, and a retryable refusal there retains the delivery at the
+applied entry, which the resume re-applies as `Corrupt`.
+
+### 2026-09-29 — F55: a follower's read answered ahead of its log waits, and the replica stays live
+
+The hosted `Session` required a read barrier's index to be applied the moment
+the leader's answer arrived (`barrier.index > applied_raft` → `Corrupt`, then
+`Failed`), though a `MsgReadIndexResp` owes no ordering to the append that
+carries its index: on a three-voter hosted cluster with node 2's appends held
+back, one linearizable read asked of node 2 failed its session
+(`poll 2: Corrupt`, reproduced first). The standalone engine already parked such
+barriers (D4); the hosted session now does the same: a barrier above the applied
+index is held — bounded by the reads the core keeps in flight
+(`DurableNode::pending_reads`), charged once for that bound — until the entries
+it names are applied, the delivery goes on so they can arrive, and each parked
+barrier is answered, in order, at the first delivery that reaches its index and
+leaves the set only then. At the bound a new read is refused as `Capacity` at the
+request (`read_index`, `native_read_index`, and the engine's) and a barrier that
+still arrives is dropped and counted (`reads_dropped`), never held back with the
+delivery — the engine's loop now does the same instead of retaining the
+delivery, which would have blocked the entries the parked reads wait for.
+`session::native_tests::a_follower_read_answered_ahead_of_its_log_waits_for_the_entries_and_stays_live`:
+the read parked (`reads_parked == 1`), the replica live, the boundary answered at
+an index no older than the leader's applied index at the time of the ask once the
+held appends are released, the claim applied, the next read answered at once.
+
+### 2026-09-29 — F56: Raft acknowledgments admitted beside the participants; F63: every asker of one read is answered
+
+**F56.** The replica owner admitted a peer's Raft message into the same pending
+queue as its participants (`pending_clients`, 128): once participant work
+filled it, the heartbeat and append answers that quorum progress — and those
+participants' own completion — needed were refused `Capacity`. Reproduced with
+a one-slot queue: one waiting participant read, the followers' heartbeat answers
+refused through the leader's authenticated ingress. Peers and participants are
+now admitted under separate bounds: participants keep `pending_clients`; Raft
+traffic has its own reserve, the members the configuration names (voters,
+learners, admitted) times the in-flight window the core itself allows one peer
+(`NodeConfig::max_inflight_messages`, `Session::inflight_window`) — every member
+may have its whole window outstanding, no more; neither side takes the other's
+slots. The reply still waits behind the exact Ready fence.
+`fleet::list_tests::peer_admission_tests::a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on`
+(before the fix: the answers refused `Capacity`; after: `PeerAccepted`, the
+participant's read completes, and the reserve is three voters' windows).
+
+**F63.** The core's read-only queue keyed pending reads on their context alone:
+a second member forwarding the same context was dropped with its origin, and
+the leader answered the first only. The native correlation hashed principal,
+request id and an owner-local nonce, so the same principal's exact retry at two
+replicas, or at one across a restart, could name one context twice. A pending
+read now keeps every asker (bounded by `MAX_MEMBERS`, memory reserved) and the
+leader answers each when the quorum confirms
+(`tests::a_read_asked_by_two_members_under_one_context_answers_both`: two
+followers, one context, two `MsgReadIndexResp`), and every read context an owner
+mints — the native correlation (`focal.native.read-correlation.v2`) and the
+managed/summary/list contexts — carries the owner's node id and an incarnation
+drawn when the owner started, so contexts never repeat across replicas or
+restarts. Etcd's contract is the reference: a request context is unique per
+read round; where a caller's context collides anyway, no asker is stranded.
+
+### 2026-09-29 — F62: an expired consumer returns its slot
+
+The cursor registry kept every consumer row for ever: expiry and resync released
+a row's retention but not its slot, admission counted the whole map, and no
+operation removed a row, so a fleet that creates distinct consumer names reached
+a cumulative ceiling of 4096 per registry with no live observer at all
+(reproduced at a bound of one: one expired row, zero live consumers, `Capacity`).
+A released row — an ordinary consumer whose lease expired or whose cursor was
+sent to resync — is now retired when a registration needs its slot (until then
+it stays, so a consumer that comes back reads why it must reseed), named in the
+prepared update so the session's owner record leaves with it (the name is free
+for another principal); generations are
+the registry's revisions, unique across every incarnation of a name, so a stale
+token or renewal of a retired consumer is refused (`MissingConsumer`, or
+`WrongGeneration` against the name's next incarnation) and never moves its
+cursor; the checkpoint invariant `generation ≤ revision` is validated on
+restore; a protected consumer is never retired. No format changed: the
+checkpoint schema and every field are as before, the fixtures replay.
+Tests: `focal-stream/tests/consumer_retirement.rs` (the slot returns and the
+stale token is refused; at the bound the released rows leave together and a
+protected one never; 4608 distinct names churn through a registry of 4096 that
+stays bounded and restores), and the session's
+`an_expired_consumer_s_name_is_free_for_another_principal` (the owner record
+follows the row).
+
+### 2026-09-29 — F58: a restore is funded by the completion allowance alone
+
+`recovery::restore` completes admitted work — a committed checkpoint a replica
+installs, an activation a replica applies — and charged its later stages to the
+completion lane, but its first bytes to the ordinary one: the index store's
+root, the decoded layout, the hydration owner's root and the assembled group's
+directory (`RangeStore::new_partitioned`, `StructuralCheckpoint::layout`,
+`ranges::reserve`, which `assemble` called with a lane it did not pass on). With
+ordinary credit held entirely by admitted work the restore failed at its first
+root (`Memory(Capacity { requested: 224, available: 0 })`, reproduced), and a
+pool funded from the completion lane alone could not restore at all
+(`InvalidConfiguration`). The lane now travels the whole way:
+`restore_in(.., lane)` (with `restore` = the completion lane) reaches
+`Index::build`, `layout`, `begin_hydration_partitioned_in`, `from_store` and
+`reserve`, and the range store gained `new_partitioned_in`; layout splits and
+merges charge their directories to the lane they already took. Ordinary work
+still cannot borrow completion funding (`funded_child` refuses it), and the
+completion allowance is asked for exactly what recovery needs.
+`native::record_codec::replay::tests::a_restore_is_funded_by_the_completion_allowance_and_never_waits_on_ordinary_credit`
+(every ordinary byte held → restores; a completion-only 8 MiB pool → restores;
+before the fix, `Memory(Capacity)` at the first root).
+
+### 2026-09-29 — F57: a restore's work is the envelope of the checkpoint's shape
+
+The recovery work allowances were a chosen constant (`1 << 30` for each of
+parsing, source, model and lookup) with no relation to the history admission
+bounds, and the history index precharged a heapsort over twice the events
+before it knew the population: a history of 4096 claims under the standard
+configuration (69 633 rows, 10.8 MB, 8192 events) did not restore (the audit's
+reproduction: `Contract(Capacity)` at the model meter; measured here: 2.86 G
+model units and 1.17 G lookup units spent, both past the old constant). Now
+`recovery::Work::for_shape(visits, bytes, rows)` is the envelope of the
+checkpoint's declared shape — whole scans of the inspection's visits, body
+parsing per byte, per-row and per-byte ceilings, the sort at its bound, a
+lookup ceiling per row, and once the index has counted the artifact rows a
+custody recovery per artifact under the largest verification a schema may
+declare (`NativeVerificationBudget::ceiling().recovery_work()`, the same term
+`Custody::recover` charges) — and the sort is charged for the entries there
+are. The standard configuration's work is `Work::for_limits` at its checkpoint
+bounds (256 Mi visits, 256 MiB, 100 000 rows). The per-unit ceilings (source
+4096/row and 64/byte, model 65 536/row and 256/byte, lookup 65 536/row, body
+parsing 32/byte) are measured on the recorded workflows at authored maxima
+(projection: 301 rows, source 494/row, lookup 15 954/row, parsing 18/byte;
+authored: 27 rows, model 39 179/row and 113/byte, lookup 4503/row) and pinned
+by `bound_tests::a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares`;
+`replay::tests::a_history_of_thousands_of_claims_restores_under_the_derived_envelope`
+restores the 4096-claim history in 16 s under the derived ceiling and within its
+envelope; `native_session::tests::the_standard_recovery_work_is_derived_from_the_checkpoint_bounds`
+holds the configuration to the derivation. Record replay's per-record meters
+draw on the same ceiling as before.
+
+### 2026-09-29 — F46: a history admitted under a budget reopens under it
+
+The WAL's recovery index charged one chunk per append batch (the batch's frame
+locations plus 256 bytes) but, at reopen and at a checkpoint's rewrite, one
+chunk per record: a 256-record batch retained 8,448 index bytes when written
+and 81,920 when reopened, so a budget that admitted the history refused its
+recovery (the audit's reproduction: append `Ok`, reopen `Err(Capacity)` at an
+unchanged budget). A reopen now reads the durable prefix twice — first each
+frame's logical log from the record's leading field (`postcard::take_from_bytes`
+of the frozen layout's first field, nothing owned), then the records — and packs
+one exactly sized chunk a log (`RecoveryIndex::{count, pack, place, seal}`); the
+checkpoint's rewrite packs its replacement index from the counts it already
+knows; the scan lends every frame's bytes from one buffer that grows to the
+largest record and no further, instead of a vector per frame (the audit's 795
+allocations). The index therefore costs `32 × records + 256 × logs`, at most
+what the appends charged. `an_admitted_history_reopens_within_the_budget_that_admitted_it`
+(256 records of 64 bytes: the bytes retained after the appends, plus the scan's
+transient three records, admit the reopen, and the reopen retains no more) and
+`the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_checkpoints`
+(three logs, batches of 1–100 interleaved, a rewrite, a reopen; every log replays
+what was written).
+
+### 2026-09-29 — F59: a duplicate chunk adds no byte, so it charges none
+
+A chunk import promised the volume its payload and committed the promise
+whatever the installation did; a verified duplicate — an exact retry, or a
+resumed transfer's chunk already held — rewrote nothing, refreshed the file's
+freshness, and still lowered the free-space estimate by its length, so retries
+near the watermark invented volume use until the next sample (the audit's
+reproduction: 16 free bytes, four duplicate imports of a four-byte chunk, the
+estimate at 0, the fifth refused). `already_installed` is asked before the
+promise: a chunk, a transfer's manifest on a repeated completion or a custody
+record whose identical bytes are on the volume refreshes its freshness and
+needs neither promise nor charge — and is not refused near the watermark, where
+the promise itself would have been; a new or repaired payload is promised and
+charged as before. `store::transfer::tests::duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once`
+(an estimate of exactly the payload, the manifest and four bytes: four exact
+retries and a second completion move it by nothing; every payload once).
+
+### 2026-09-29 — F60: cold calls to one route dial once
+
+The participant's QUIC transport kept one connection per route but dialed under
+no lock: concurrent cold calls to one endpoint each resolved, connected and
+greeted, then overwrote the same cache entry while keeping the connection each
+had opened; `max_connections` bounded the cached routes, not the physical
+connections or the dials in flight, and the server's per-identity limit replaced
+the earlier connections — under calls already dispatched (the audit's probe: 24
+cold calls to a cache of one; 24 admitted, 8 replaced, 16 of 24 completed). A
+request's failure also removed the route whichever connection was cached by
+then. `focal_wire::RouteConnections` now owns the participant's routes: one dial
+per route at a time, on its own task, so a caller that gives up under its own
+deadline neither abandons the dial nor holds the others; callers arriving while
+it dials wait on it (a `watch` of the outcome, nothing of the cache per waiter,
+bounded by the dial's own deadline — resolver, connection and greeting under one
+`request_timeout` each) and share the connection, whose lanes then queue them as
+they queue any request; dials in flight hold their room in `max_routes`, the
+least recently used cached route leaves for a new one, and a caller waits on at
+most two dials. Every cached connection carries a generation: a failed request
+forgets the route only while its generation is the one cached, and a slow
+waiter never re-caches a connection already forgotten.
+`cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing`
+(24 concurrent cold calls over real loopback QUIC to a cache of one: one dial,
+one admission, no replacement, 24 answers; a stale generation forgets nothing
+and the current one lets the route be dialed again; a caller cancelled
+microseconds into the dial leaves it to the next, which starts no third dial —
+with each caller dialing alone, callers failed with `Connection` as their
+connections were replaced under them).
+
+### 2026-09-29 — F61: a poll with nothing to acknowledge costs nothing durable
+
+Every tail poll of a projection consumer copied the cursor registry three times
+over and committed once: `CursorRegistry::prepare` cloned the whole checkpoint
+(every consumer's row and filter) for a scalar renewal, charged and validated it
+whole; the session's candidate cloned the receipt and owner maps beside it; and
+the poll itself was a managed request that committed `AcknowledgeAndRenew` or
+`Renew` whether or not it acknowledged anything, took a receipt and a window
+ordinal the client retired with a later control — every 250 ms per idle watcher.
+Now a prepared update is one named row's patch, insert or replacement plus the
+names it retires, validated as that row will stand, its bytes joined to the
+registry's per-lane charge at publication; the session's candidate carries its
+receipt and owner as charged entries; a plain poll with nothing to acknowledge
+proposes nothing and is answered after its barrier as a read; a polled lease
+past its half-life is renewed by the node's own maintenance entry (a `Renew`
+under `FOCALCM1`, no receipt, judged due on every replica from the committed
+row); on a replicated host an empty read parks for a page — holding only its
+request's bytes — until the stream line moves or the owner gives it up with the
+empty page; and the watch journal (schema 3) polls as a plain read whenever its
+cursor is no further than the acknowledgment its last page reported, sending a
+durable acknowledgment only for a consumed page. Preparing one renewal over the
+audit's row (64 consumers × 256-claim filters) charged 7,039,128 bytes before
+and 0 after; a registry restored under exactly its bytes renews; a session
+candidate holds the same at 3 receipts as at 515. Tests:
+`focal-stream/tests/renewal_cost.rs`,
+`a_cursor_command_holds_its_entry_never_the_receipts`,
+`a_polled_lease_past_its_half_life_is_renewed_by_the_node_s_own_entry`,
+`a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past_its_half`,
+`a_poll_with_nothing_new_parks_for_a_page_and_holds_only_its_request`,
+`watch_client::idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal`.
+
+### 2026-09-29 — F64: callers that failed together do not return together
+
+The participant's retry loop slept the capped exponential step whole (20, 40,
+80 … 500 ms), so every caller one leader loss, opening service or capacity
+refusal turned away came back at the same instant, each wave as tall as the
+last; the peer pool's retry pause and unreachable cooldown were fixed the same
+way. The step is now spread by full jitter — a wait drawn uniformly between
+nothing and the whole step, under the attempt, elapsed and refusal budgets as
+before — and the pool's pauses by equal jitter, from half the configured pause
+to the whole of it; the draw is the operating system's, and when it has none
+to give the pause is the whole step. A seeded simulation of a thousand callers
+refused together by a service serving fifty a millisecond: the whole step
+takes 10,500 calls in twenty waves (tallest 950) and drains in 7,602 ms; the
+spread takes 2,029–2,046 calls, its tallest wave 82–109, and drains in 69–83
+ms. Tests: `backoff_tests` (two), `a_peer_pause_is_spread_over_its_second_half`.
+
+### 2026-09-29 — F65: a slow owner costs its entry, never the sample
+
+The metrics sampler asked each hosted replica's owner in turn and awaited each
+without a deadline, so one stuck owner delayed every later session and the
+whole snapshot while the previous stayed published; a refused or departed
+owner was skipped in silence; the cadence stretched by the collection; and the
+loopback rendered the whole snapshot before reading a request, serially, so a
+slow scraper held the rest. Now every replica is asked at once and the round
+closes at the cadence (`metrics::collect`): an owner refused, gone or late
+leaves its entry `focal_session_observed 0` with the owner-side series absent
+and is counted in `focal_metrics_sessions_unobserved`;
+`focal_metrics_collection_milliseconds` says how long the round took; rounds
+start on the cadence whatever the last one took; the text is rendered once at
+publication (`MetricsPage`) and served as it is by the socket and the
+loopback, which reads the request before it writes and serves as many scrapes
+at once as the admin socket admits operators. Tests: `metrics::tests`
+(`an_unobserved_session_says_so_and_carries_no_owner_side_numbers`,
+`a_round_closes_at_its_deadline_with_the_late_unobserved`,
+`a_silent_scrape_delays_no_other_and_the_text_is_the_page_s`).
+
+### 2026-09-29 — F04, F05, F06: the native journal's life ends by retirement
+
+The native journal counted catalogue entries and nothing ever left it, so the
+default 256 operations was a cumulative-use cutoff (the audit's probe: one slot,
+delivered, `outstanding()` 0, usage 1, the next prepare `Capacity`); a claim whose
+expansion failed held its slot unseen; and every transition read the operation
+under one hold of the lock and wrote under another, so a stale refusal could
+overwrite a committed receipt. Now an operation whose committed receipt or closed
+refusal has been reported stays answered from its journal until a claim needs its
+slot; then the one reported longest ago retires: its identity moves to the
+catalogue's bounded retired table (with its intent and how it ended, durably
+first) and its frame and journal leave; a retired identity is never another
+operation under any intent (`Retired`); a capacity refusal keeps the frame for the
+exact retry and never retires; a failed expansion releases its claim with the
+failure and a claim that never became ready is swept at the next open, as is a
+retirement's directory left by a crash; and every transition reads, judges and
+writes under one hold of the store's file lock. The catalogue is schema 2 (schema
+1 read once more). Tests:
+`a_reported_operation_retires_when_a_claim_needs_its_slot_and_its_identity_stays_taken`,
+`a_failed_or_interrupted_claim_holds_no_slot`,
+`concurrent_transitions_never_lose_a_committed_receipt`, and the adapted
+`prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_receipts`.
+
+### 2026-09-29 — F15, F16: a page is chosen before it is copied, and a transition stages its own copies
+
+Raft catch-up copied the whole selected suffix before cutting it to the page (the
+audit's probe: one entry returned, 4,268,032 bytes requested, room for 1,024
+retained), and every guarded transition — a tick, a read barrier, a report —
+reserved twice the resident history and six times the core's state before it ran,
+walking the message queue and the unstable entries to know it. Now the page is
+chosen before any of it is copied (`log::page_of`, exact reservation, the entry
+bound applied before the bytes, `Storage::any_entry` for a question that copies
+nothing), and the guard's allowance names the transition's own copies — the
+unstable entries into the Ready, the records and the prepared storage; the held
+proposals; a committed page read from storage a page at most; a page to each peer
+behind, the window of pages to the one that answers, or the snapshot to one behind
+the log, read from running totals the storage keeps beside its entries
+(`RamLog::bytes_between`); a joining member the last entry; the queue's growth —
+from counters kept as the core changes and checked against a walk in the
+differential harness. The members a change adds are counted where their progress
+is made (the drain that applies it, from the change's bytes), not as the most a
+change may name: a first cut priced a malformed change naming 1,024 members at
+8.6 GB and refused it for capacity before the core could refuse it. The events a
+drain delivers keep the charge they carry. Measured under the counting allocator:
+the estimate is 79,272 bytes at 64 and at 1,024 committed entries (before 546,728
+and 23,385,104), and the transitions' peaks — 0, 1,184, 0, 21,916 bytes — are
+unchanged by the history. Tests:
+`a_page_is_chosen_before_it_is_copied_and_holds_no_spare_room`,
+`the_cores_agree_on_pages_of_a_hundred_bytes_and_a_window_of_four`,
+`staging_peaks::a_transition_stages_its_own_copies_whatever_the_history`,
+`a_member_that_joins_is_priced_its_progress_and_the_last_entry`,
+`a_member_behind_is_priced_its_pages_from_the_running_totals`,
+`the_running_totals_say_what_a_walk_of_the_entries_says`.
+
+### 2026-09-29 — F03, F20, F35: a body is permitted before it is allocated, a full listener still replaces, and a grant is current at dispatch
+
+A request's body is permitted before any of it is allocated (`focal_wire::IngressLane`,
+funded from the listener's budget, nodes on the completion lane, within the identity's
+share of the lane and one frame at least; refusals typed and counted, the stream reset),
+and a payload's buffer is held no longer than its bytes take at the least a live QUIC
+sender delivers over the measured round trip (`frame::residency`, RFC 9002 §7.2). The
+listeners' outer connection count is gone: handshakes are bounded by their pending
+places, enrollment by its slots and connections by the admission's total met after the
+replacement rule, and a source that has not proven its address is answered with Retry
+while half the pending places are taken (RFC 9000 §8.1.2). A stream's grant is looked
+up before anything is read and again once the whole request has arrived; a revocation
+closes the certificate's connections (`PeerRegistry::attach`/`revoke`/`replace_grants`),
+releasing the bodies in flight and their permits. Tests:
+`a_body_is_permitted_before_it_is_allocated_within_the_identity_s_share`,
+`a_full_listener_still_replaces_an_identity_s_own_connection`,
+`a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connection`,
+`a_complete_request_is_authorized_by_the_grant_current_at_dispatch`. Metrics:
+`focal_listener_refused_total{bound="connections"|"bytes"|"memory"}`,
+`focal_listener_ingress_bytes`.
+
+### 2026-09-29 — F10: a lineage is one observation at one prefix, and names what it left out
+
+`claim.lineage` returns `NativeLineage` (result kind `native_lineage`): the claim, its
+ancestors and its followers every one read exact at the first read's token, with
+`ancestors_beyond`, `ancestors_missing` and `followers_beyond` naming what the depth of
+16, the related bound of 64 and the relation lists' visits left beyond the observation
+(`focal-native-client/src/observe.rs`, `focal-client/src/operations/native_lineage.rs`).
+The CLI prints it by role with a `COMPLETE` flag; the peers skill is at version 2. Tests:
+`a_lineage_names_what_its_bounds_left_beyond_it`,
+`the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads`, the peer-workflow
+suites.
+
+### 2026-09-29 — F11: a retired family is read from its bundle by every identity a participant kept
+
+`archive.get` / `get archived CLAIM [--artifact|--work|--diagnostic|--validation|--testament|--receipt ID]`
+follows an identity through its claim: a live family answers from the ledger, a retired
+one from the archive bundle its `Retired` continuation names
+(`NativeReadQuery::Archived`, `NativeObject::Archived`). The bundle is hydrated into a
+core of the family alone by the phased hydration a checkpoint restore runs
+(`recovery::hydrate_frame` over a `RowFrame`; `StructuralArchive::hydrate` →
+`ArchiveCore`) and read by the documents a live read builds, on the content owner
+(`archive_reads`), under the tenant scope; a validation comes with its evaluations and
+results. Denied access, custody the node lacks and an object the bundle never held are
+`Unauthorized`, `Unavailable` and `Missing`. Tests:
+`a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was`,
+`cli_archive::a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept`.
+
+### 2026-09-30 — F12: the outcome history leaves the live core
+
+A principal's requests are issued in generations ([21 §3](21-native-input-format.md)):
+the owner keeps a window per principal (`Key::Epochs`), admits at most two open
+generations in order, refuses a request below the floor `RequestHistoryExpired` and one
+beyond the next `EpochNotAdmitted`; the client's journal rotates at half its capacity and
+advances the floor with `epoch.advance` (tag 28) once the generations below are delivered.
+A seal (`FOCALSO1`, `FCNSEAL1`, `Key::Seal`; [26 §4a](26-custody-archive-retention-and-restore.md))
+moves the closed outcomes into a bundle under custody, applied alike on every replica,
+forcing least-recently-used floors under pressure and folding its index at its bound;
+resident outcomes are `outcomes − sealed`. A sealed outcome is read through
+`NativeObject::Sealed` → `NativeReadQuery::Sealed` on the content owner. Tests:
+`seal_tests` (five), `native_store::tests` (two), 
+`committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generation`,
+`cli_native_epochs::a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read`.
+`FOCAL_NATIVE_OUTCOMES` sizes a node's resident window for qualification. The embedded
+node runs the archive agent's walk on its owner thread (`EmbeddedArchive`; the derivations
+shared in `archive_derive`), so it retires and seals as a network node does
+(`an_embedded_node_seals_its_closed_generations_and_retires_released_families`);
+`focal-load` issues in generations as the journal does and reports `expired` and
+`floors_advanced`.
+
+### 2026-09-30 — F16's residual: every fixed allowance of the consensus pricing is derived
+
+`focal-consensus/src/memory.rs` (and `RamLog::new`, `proto::MESSAGE_ALLOWANCE`) name each
+allowance by the structures it stands for and the allocations whose bookkeeping
+(`ALLOCATOR_OVERHEAD` apiece) it carries — the message, the snapshot and its retained
+configuration, the events, the node around the core, a member's tracker row and window, a
+transition's own structures and records, a decoded message's and record's structures —
+where 512, 1024, 4096, 16384, 65536 and per-member 512/4096 stood. `tests/allowances.rs`
+holds each to the counting allocator by innermost frame (decode of three shapes, a group's
+open alone on a shared WAL with one and 1,024 members, a proposal's transition); the
+measurements are in the remediation record under F16.
+
+
+### 2026-09-30 — F13 (stage 1): the founder renews its own credential
+
+The founder's node credential is an ordinary credential of its genesis key ([24](24-placement-execution-and-fleet-control.md)
+§11): the founding subject binds the assigned principal at every revision, the controller
+asks the enrollment host it runs itself and publishes the certificate it presents once
+granted, the founder's authority over the root pins its identity and no certificate (each
+enrollment-control request is authorized by the certificate it presented, at dispatch and
+at completion), the start presents what the key holds and adopts a committed renewal the
+crash lost, a rotated founder key restarts, the renewal window is a third of the receipt's
+lifetime and the retry a sixtieth of the window, and the lifetime is committed policy
+(`node.credential_lifetime_seconds`, [08](08-stepped-complexity-and-deployment.md) §2;
+three seconds to a year; restore adopts the committed lifetimes). The root's group record
+seats the founder at the generation of its grant and a founder re-granted since holds it.
+The bootstrap server certificate's succession and the issuer's are designed in the
+remediation record under F13.
+
+### 2026-09-30 — F13 (stage 2): the bootstrap server certificate succeeds itself
+
+The certificate the founder's enrollment endpoint presents lasts the cluster's credential
+lifetime and succeeds itself ([24](24-placement-execution-and-fleet-control.md) §11): the
+registry names it and its staged successor (schema 5, one change under the founder
+authority moving record → stage → activate), the founder stages in the last third of the
+lifetime and presents the successor once every invitation open at the staging has closed,
+invitations and joined nodes carry and accept both pins (invitations schema 2, network
+states schema 3, older ones decode), and the pins are facts the registry moves rather than
+the sponsor's identity. Running a whole cluster at a twelve-second lifetime found what the
+renewals had left: a node's grant and every group grant expired with the credentials of
+their first lifetime (a renewal now extends the node's grant at its generation, and a group
+is authorized while its members are), and a renewed leader was refused by a follower that
+had not applied the renewal it could learn only from that leader (the transport admits a
+CA-verified renewal of an enrolled key before the registry names it). CA succession and issuer recovery remain designed (the remediation
+record, F13).
+
+### 2026-09-30 — a request follows a leader that moves within a route epoch
+
+`drain_leader` failed now and then with `invalid_response` on a `receipt acquire` issued
+while the drained leader handed leadership on. Cause: the client's route cache refused a
+hint at the epoch it held that named another endpoint (`Routes::insert`), taking a route
+epoch's hint for immutable; but a route epoch names a placement, and within one the leader
+moves — the node asked first named the leader it knew, which had handed on and named its
+successor at the same epoch, and the second hint was an invalid response. The hint is now
+followed (each one counted against the request's attempts, an unchanged one still ends the
+request, an older epoch is still refused); `focal-client`
+`a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused`
+reproduces the two hints ([24](24-placement-execution-and-fleet-control.md) §10).
+
+### 2026-09-30 — the node's own cursor entries on a native ledger, and two tests that read the wall clock
+
+The gate run on the batch above failed two tests, and the host's power log
+(`pmset -g log`) shows why: the machine was cycling through maintenance sleep on battery
+for the whole of the run, so tests crossed suspends that the wall clock counts and a
+test's own (monotonic) duration does not. `cli_native_watch` resumed a watch after a
+restart and was told `resync_required` sixteen seconds into a run: its sixty-second lease
+had run out on the wall clock, which is what a lease is measured on and what a consumer
+of a node that was away that long is owed. The stream host's lease test asserted a
+400 ms lease against real time between four polls. That test now sets the host's clock
+(`Streams::at`, test builds only) and states each time it polls at; the watch test is
+unchanged, and a gate is run on a host that stays awake.
+
+Reproducing the first by restarting a node under a resumed watch forty times found a
+defect the suspend had nothing to do with: the node's own cursor entries (the renewal of
+a polled lease past its half-life, F61, and the clock advance of an expired one) judged
+positions on the legacy domain sequence, so on a native ledger every renewal of a cursor
+that had acknowledged a native record was refused `CursorAhead` and the poll that needed
+it failed. They are judged on the stream line now, as the client's commands are
+([23](23-native-activation-and-import.md) §6); `focal-ledger`
+`a_native_cursor_is_renewed_and_expired_by_the_nodes_own_entries_across_a_restart` fails on
+the code before and passes after, and 492 restarts under a resumed watch through the real
+binary (twelve runs of forty-one) renewed and resumed every time.
+
+### 2026-09-30 — F14: a checkpoint is its group's own, and the shared log is cleaned by a base that moves
+
+A logical group's checkpoint no longer rewrites the physical log
+([04](04-storage-and-distribution.md) §10). It is one group commit — what the group keeps
+and a floor frame that retires what it held — and the fence names a base beside the tail:
+where the durable prefix starts. The writer moves the base toward the tail, past segments
+with nothing live without reading them and, while the log holds more dead bytes than live
+ones and a segment, over frames it reads and verifies, writing each live one again at the
+tail under its origin (the sequence it was first written at), which is what a group's
+order and its floor are judged by; the copies and the base are durable by one fence, and
+the segments behind the base are removed after it. A commit's cleaning writes no more
+than its callers did and shares their flush; an idle writer takes one bounded step at a
+time. On the bench's log of 56 cold groups and 8 hot ones, 128 checkpoints wrote 5.1 MiB
+where they wrote 599.2 MiB, a checkpoint took 26 ms at the median where it took 170 ms,
+another group's appends waited 59 ms at the 99th percentile where they waited 185 ms, and
+the most disk a checkpoint added fell from the log's size to two thirds of a segment; the
+log holds up to as many dead bytes as live ones and a segment, where a rewrite left none
+(the remediation record, F14, has the table).
+`focal-log`: 38 tests, among them seeded histories against a model with a cut at every
+durability boundary (a campaign of seeds 100 to 399 replayed every group as the model held
+it); `focal-consensus` unchanged and green. The node exports the log's physical and live bytes and the cleaning counters.
+
+### 2026-09-30 — a host that joins a cluster older than a credential lifetime is admitted
+
+A host that joined a cluster older than a credential lifetime was enrolled and never
+admitted: its first observation of the root is the genesis, whose founder certificate had
+expired, and the controller routed to the sponsor only while that certificate was granted.
+The route stands while the founder's enrollment is unrevoked; `focal-node`
+`a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up`
+fails on the rule before.
+
+### 2026-09-30 — a payload's residency is priced by the round trip its own datagrams take
+
+The bound on how long an arriving payload holds its buffer (the audit's F03) was computed
+from the connection's round trip when the header arrived — an idle path's. A narrow path
+takes longer than that to carry two datagrams, so a live sender filling it could be given
+up on: the gate run met `early eof` on a megabyte over the four-megabit test path, once in
+about a dozen runs of the wire suite. The reader now asks the connection's round trip as
+the payload arrives and prices the residency by the longest it has answered
+(`focal_wire::read_payload_arriving`). `focal-wire`: 111 tests, the new one in virtual
+time and failing on the rule before; thirty runs of the suite without a failure.
+
+### 2026-09-30 — F17: what a commit waits for
+
+A commit waits for no write of its own, a member that alone decides writes its commit
+with the entries it commits, and what a leader sends leaves while its own write is in
+flight ([27](27-consensus-roadmap-and-slates-port.md) §9). The shell used none of what
+the core says of a `Ready` before: every output waited for the write, and a commit got a
+group commit of its own before anything it committed was released. On this host a member
+alone commits an entry in 12.8 ms where it took 25.5 ms (one group commit, where two),
+three members in 36.2 ms where they took 70.1 ms, and 28,880 entries a second where
+18,092 (`cargo bench -p focal-consensus --bench commits`; the remediation record, F17, has
+the table). A member that restarts replays what its log says committed — a quiet group's
+commit is written within its owner's period, and at a stop — and is told the rest by its
+group; a member may open holding a renewal its own replica has not applied
+(`EnrollmentRegistry::authorize_held`). The owner that shares a thread among sessions is
+woken when the log answers a write instead of asking every millisecond. Two things are
+applied only on a commit the log holds, both found by the node suite: a change of
+membership in any group, and everything in a control group — the root and the directory
+partitions hold what a member acts on at its next start before its group tells it
+anything (enrollment and revocation, the upgrade fence, placement), where a ledger's state
+is served only through its group. A control group's commit rides its next append under
+load, and a control group of one voter pays nothing. Open under F17: a group commit is
+still three device flushes. `focal-consensus`: 80 tests; the control, ledger and node
+suites pass with their restart tests unchanged.
+
+### 2026-10-01 — F43: reads that share a round
+
+A leader sent a round of heartbeats for each read as it was asked, and the owners drained
+after every request, so no two reads ever shared one: the audit's twenty reads and forty
+heartbeats. The core now queues a read and sends one round when it is next asked what
+there is to do, for every read asked since the round before; a read asked after a round
+left is asked for by the next and never confirmed by the one before; a lost round is asked
+again by the leader's beat. The session and control owners take what is queued behind a
+read before the drain that sends its round ([27](27-consensus-roadmap-and-slates-port.md)
+§10; the remediation record, F43). 128 reads asked together were 256 heartbeats and are 2;
+a read asked alone costs what it did, and no latency is claimed. Every answered read in
+every schedule of the core is now checked against what the group had committed when it
+was asked, and a directed schedule holds a round's answers across an election to show a
+deposed leader answers no read asked after its round left. Open: the reads a leader may
+hold are still bounded by its in-flight window, and a forwarded read refused at that bound
+is found by its asker's deadline. `focal-raft`: 56 unit tests, 8 group schedules, the
+comparison with raft-rs unchanged under `ReadRounds::Each`; `focal-consensus`: 81.
+
+### 2026-10-01 — F41: what a member is sent ahead of its answers
+
+A leader's window on a member counted messages, 128 of them, each a page of up to four
+megabytes: a few kilobytes or half a gigabyte, the same on every path. It holds bytes
+now, and is full by either; a page is cut to its room before it is copied and an entry
+larger than the bound is sent alone. The bound is each member's: a page until its owner
+says what the path to it carries, then twice the transport's congestion window for that
+peer, and a page at least where the path carries one within a beat
+([27](27-consensus-roadmap-and-slates-port.md) §11; the remediation record, F41), never
+more than the group's budgets can stage. Every schedule of the core runs with a byte
+bound that changes as it goes, the bytes counted checked against the messages held after
+every step. Open, with the audit's F42: a member that answers heartbeats and no append is
+still sent a message more each beat.
+
+### 2026-10-01 — F45: a held log is asked nothing
+
+The owner that shares a thread among sessions asked the log every millisecond for every
+session with a write out. F17 had the log tell it of a `Ready`'s write; now every write a
+group waits for tells it (a checkpoint's and a decoder floor's too), it takes its signals
+at every pass and not only when idle, and a session that persists has its tick for its
+only deadline ([27](27-consensus-roadmap-and-slates-port.md) §9; the remediation record,
+F45). With the log held and 1, 100 and 1,000 sessions each with a write out, no session is
+asked again, and all are committed 15 ms, 53 ms and 741 ms after the log answers (a debug
+build); the millisecond asked one session 166 times in a quarter of a second.
+
+### 2026-10-01 — F42: a slow peer holds its own lane; and what a heartbeat's answer says
+
+The driver that carries the groups' messages began a send before it had the peer's lane,
+so a peer that stopped answering filled it and the frames of every other peer waited in
+the owners' channel behind it; and a frame that was not delivered was told to its owner
+only when the peer could not be reached at all. A send now begins only when its peer's
+lane has a place; what has none waits in that peer's own queue, what a group cannot do
+without first; the driver never stops receiving; and every frame that is not accepted is
+told, so the core probes the member ([27](27-consensus-roadmap-and-slates-port.md) §12;
+the remediation record, F42). With every loss told, a heartbeat's answer says how far the
+member's log goes and is taken as an append's answer, and a full window waits: the bytes
+out to a member stay within their bound (§11), which closes F41. Found on the way: a
+member that had left a configuration vetoed the only candidate for priority (mended); and
+the fast track's election can commit two entries at one index (forty thousand schedules;
+recorded at 27 §4.6, not mended, used by no owner).
+
+### 2026-10-01 — F37: one operation refused takes no other with it
+
+A peer's answer that something is not to be had now, or that its outcome is not known,
+closed the connection it came on, and with it every other exchange with that peer; so did
+one stream's failure. The connection is kept: the request is asked again on it and its
+caller is told that the peer refused, and a connection is closed for a failed exchange
+only when the connection is what failed — it has ended, it could not be trusted or
+spoken on, or nothing at all was answered on it since the exchange was sent (the
+remediation record, F37). On real QUIC a held request is answered across two refused
+ones and across one the peer never answers, with one connection opened. Open: an
+exchange's own wait is still charged to the whole connection's progress (F38).
+
+
+### 2026-10-01 — The fast track's election, mended; and a model checker with bounds
+
+An election in a group with the fast track could commit a second entry at an index
+that held a committed one: a fast quorum's members voted for the entry in the leader's
+round and for a candidate by their logs, and nothing an election reads recorded the
+first. A member that holds the entry beside its log now counts toward a fast quorum
+only once the leader knows its log holds an entry of the leader's term, and a fast
+quorum is counted only where it is one of every set of voters a member may still count
+by ([27](27-consensus-roadmap-and-slates-port.md) §4.6; the remediation record, after
+F42). The fix was first made in mantle's copy of the core and is taken here against
+focal's own evidence: each of two directed schedules fails without its rule, 160,000
+fast schedules pass, and the classic track's schedules and its comparison with raft-rs
+are unchanged. Fast commits in an ordinary run fall from 418 to 188; the rest are
+committed by the classic quorum a round later.
+
+The model could not have found the defect and now does: it had no step by which a
+deposed leader campaigns again with the log it led with. And its checker had no bound:
+the model as first changed took 26 GB of disk in 87 minutes without ending. Every
+configuration now states its distinct states and the checker stops at one more; the
+script gives it 256 MB of heap, one thread by default, and removes its states however
+it ends. Six configurations run on every change, the largest of 3,207,204 states. Open,
+against any owner taking the fast track: a leader that outlives two changes of its
+configuration has no fast track until its term ends, and the model has no change of
+configuration. No owner takes it.
+
+### 2026-10-01 — F38 and F36: an exchange waits on its own stream, for as long as its path takes
+
+Nothing a group sent a peer was delivered if its path took more than five seconds to
+carry it, and nothing at all at or below eight kilobits a second: the pool gave the whole
+of an exchange one time, and a dial the same. With that gone, the waits beneath it were
+charged to what the connection had sent, which is not what one stream delivered: an
+exchange was given its peer's period to answer while its last window was still on the
+path. Each part of an exchange has its own wait now, what is sent waits for its own
+stream to be acknowledged, and the bound between is the least a live sender delivers by
+RFC 9002, two datagrams a probe timeout, which is also the one thing a receiver gives a
+payload up by ([27](27-consensus-roadmap-and-slates-port.md) §7; the remediation record,
+F38 and F36). A path that returns a datagram within a connection's idle timeout, 1,920
+bits a second, carries a message of any size in the time it takes: a megabyte over 64
+kbit/s in 136.7 s, 64 KiB over 8 kbit/s in 67 s and a megabyte in 1,078 s, with loss,
+jitter, asymmetry and outages shorter than the idle timeout. A stream its peer never reads ends in half a
+second where the other traffic of its connection kept it for twenty-five.
+
+### 2026-10-01 — Three defects CI found in the day's pushes
+
+Five of the day's CI runs failed where the local gate had passed, each on one test
+(the remediation record, "Found by CI"). A log writer answered a batch's caller before
+it gave back what the batch held, so a caller that looked at once found its own refused
+bytes outstanding: a batch now releases, or charges, before it answers. Every file lock
+but one was released by closing its file, which a child process a test or a node starts
+holds open for a moment: one owner type unlocks the file when it ends. And the control
+owner refused for capacity whatever came while it decided another command: it waits its
+turn now, in order, and is given its request time from its turn, not from when it came
+(the macOS run of the day after gave up the fifth of five). A stopped session owner was still
+serving by the fleet's count, which follows a round later than the host's own word: the
+probe asks the hosts too (a Windows run of 2026-10-02). And the replication driver's own test of a dead peer beside a live
+one hung in two runs of sixty, and had held a macOS runner for two hours: on a tie the
+frame that came was given up; the other peer's older frame goes now. Each has a test
+that fails on the tree before. Open: a drained leader's replacement stayed `Installed`
+for 300 s on two macOS runs.
+
+### 2026-10-02 — a body still arriving is never refused
+
+hyper-raft's port of focal's residency law (ca8d44f) found that a body was given one
+budget from its first byte, its residency at the path's round trip and a period at
+least: a peer that writes slower than its path — its owner writing as it has, its
+exchanges sharing the connection under strict priority, its process short of CPU — was
+refused while the body still arrived, at will under a CPU quota and rarely in focal's
+own CI. A body's arrival is charged with what arrives now: judged once a period, given
+up on silence or when everything the peer owed of its class and the less urgent ones
+has arrived without it ([27 §7](27-consensus-roadmap-and-slates-port.md); the remediation
+record under F38 and F36).
+
+### 2026-10-02 — F24: the control plane survives what the data does
+
+A deployment that asked for zone survival placed the session's voters across the zones
+and left the root group with the founder's single vote, the directory partition and the
+issuer with the founder (the KIND campaign's D5): metadata operations stopped while the
+founder was down, and the operator was told the guarantee was achieved. The plan now
+seats the root's voters before the sessions' (`plan_root`), apply promotes them through
+the root one exact request each, `cluster placement` states what the root, the partition
+groups and the issuer each survive by the rule the sessions are measured by, and
+readiness holds the committed policy to the root ([24 §15, §17](24-placement-execution-and-fleet-control.md);
+the remediation record, F24). On real binaries across three zones the root is led from
+another zone while the founder's is silent. Found on the way: a control read was
+served by the leader alone, so a founder whose root followed a host after a restart
+never reported `Ready` and `membership show` on a non-leader was refused; a follower
+asks through its leader now (27 §5) and serves the read at the index it named; and the
+partition permit no longer demands that the root lead, so the founder reopens its
+partition after a restart whichever voter leads. Open:
+the partition groups on other hosts; the issuer with F13 stage 3.
+
+### 2026-10-02 — F48 and F49: a promise across a slow path, a megabyte across a slower one
+
+Native activation and every promotion of a learner need each voter's recorded promise
+of the native decoder, and the exchange of those promises gave each of its three parts
+250 ms of the clock, so a healthy path further than that never contributed one. No part
+has a clock of its own now: the replica answers in its owner's periods, the peer in what
+its path takes, and ledgers' discoveries run at once within one lane's worth ([27](27-consensus-roadmap-and-slates-port.md)
+§7; the remediation record, F48). Three real-process fleets behind relays of 300, 600 and
+1,200 ms round trip activate, promote and serve where the 1,200 ms one never settled.
+
+A transfer's lease was renewed only when a request was executed, after its body had
+arrived, so a megabyte chunk — the unit of custody — arrived to a transfer that had
+expired on any path slower than 140 kbit/s. A chunk goes in parts now where its path
+takes longer than an exchange's time to carry it, each part renewing the lease as it is
+taken, staged in order and verified whole before it is installed under the chunk's own
+name (27 §7; the remediation record, F49). Found on the way: a client's exact retry of a
+seal, asked once its exchange gave up, ran beside the first and pushed the same transfer
+again, every byte twice; it runs after the first now. Measured over relays: at 128 kbit/s
+the copy holds the megabyte 75.9 s after the upload began on a 65 s path, 1.10 chunks
+crossing; at 64 kbit/s 152.9 s on a 131 s path.
+
+### 2026-10-02 — F24 batch 2: the directory's partition groups survive what the data does
+
+The directory's partition group was the founder's alone: its replica, its permit and
+every placement, session-creation and membership operation that passes through it
+waited for the founder while the root answered from another zone. A partition group
+is now seated by the same plan as the root (`plan_partition` after `plan_root`) and
+hosted wherever the root's grant seats a node: the permit admits the seat, voter's or
+learner's; the member's replica catches up from the founder's log; the root's grant
+follows the group's committed configuration by the installed voters' attestation of
+the entry that changed it, which every replica keeps on record and across its
+checkpoints ([24 §13, §15](24-placement-execution-and-fleet-control.md); [08 §9](08-stepped-complexity-and-deployment.md);
+the remediation record, F24). The control plane's promise is the weakest of the
+root's and every partition group's, and readiness holds the policy to all of them.
+Measured on three real processes across three zones (`deployment_control_plane`,
+macOS, 2026-10-02): the plan names the partition group's three voters after the
+root's; `deployment apply` completes in 18 s with the root and the partition group
+each at three voters tolerating zone/1 and node/1, every host running a replica of
+the partition at the leader's applied index; with the founder's zone silenced, the
+partition is led from another zone and a session is created on a host there. On
+the way, the first such run found the root preparing membership permits for
+session groups only, the directory handle counting the first partition as hosted
+everywhere, and a member's replica opening through the founder's bootstrap — each
+silent until node health named it (`partitions`, `partitions_pending`).
+
+### 2026-10-02 — what the drained leader's heal printed, and three schedules for a copy brought up by snapshot
+
+The Linux run of the drained leader's heal printed what the test had been given to
+print: the replacement's replica knew its leader through several terms and held
+nothing, while the leader and the other voter had checkpointed past everything it
+lacked. Three directed schedules on real QUIC replicas now guard the paths that were
+suspected, all passing in seconds: a member away while the leader checkpoints,
+re-admitted and handed to a new leader before it caught up; a fresh copy with an
+empty log admitted after the checkpoint; and the same with the group native — the
+harness opens a fourth, empty-logged replica for it, with native hosting when asked.
+Writing the native one found the gate the replacement most likely waits behind: a
+native group admits a learner only once its leader holds that node's promise of the
+native decoder at the current configuration index, a node not yet a member cannot
+push its promise, and the leader's discovery asks the candidate only while the
+admission is queued ([24 §21](24-placement-execution-and-fleet-control.md); the
+remediation record under the drained leader's heal). The replica diagnostics print
+the promises a replica holds and the index they stand at. On the way: the
+replication driver gave up nothing it still held for a peer's lane when its owner's
+egress ended, and dropped it uncounted; it gives them up and counts them now.
+Then the gate was opened at its cause: the discovery's round-robin covers, beside the
+voters, the learners and the nodes the directory names for the session that the log
+does not hold yet (the placement agent admits a pending plan's voters on every hosted
+copy before the log names them), so a replacement copy is asked for its promise ahead
+of its admission, and the admission waits on nothing.
+
+Two of batch 2's open items closed the same day: `cluster partitions
+show|add-learner|promote|remove|transfer` drive a directory partition group's membership
+and leadership by hand, and `cluster nodes remove` vacates a leaving node's seats in
+every partition group before its root membership (handing a group's leadership on first
+where it leads; `partitions_vacated` reports them). Found on the way: a control replica
+refused a leadership transfer whenever it did not lead, so a removal run anywhere but on
+the leaving leader could not hand its leadership off — a voter asked to lead itself now
+forwards the request through the leader, as the consensus layer already allowed. The
+nodes journey, extended to seat the partition group on all four hosts and hand its
+leadership to the host it drains, found six more on the way, each behind the one before
+(the remediation record under F24 batch 3): a membership change refused as invalid while
+the one before it was committed and not yet applied (`MembershipPending`, `not_ready`); a
+repeated partition change whose first reply was lost answered with its receipt rather
+than a second request; a seated member's permit that required its host eligible, so a
+drained host leading a partition group could not install the very drain (the permit
+admits a seat; a drain does not unseat); a member that came to lead resubmitting the
+intents it journaled as a follower under its local client; the leader's ingress
+admitting a sender's local client in its decoder but not in its `Submit` and `Receipt`
+checks; and `nodes remove` reading a placement not yet observed as an unknown node.
+Node health now shows what a hosted partition's authority refresh last installed and
+why it last refused, and `drain_pending` names the generations and the group's leader.
+The Windows run of the day found the short-lifetime renewal test committing a lifetime
+(12 s) shorter than the start the harness allows a node (15 s): the lifetime is derived
+— three start allowances — and the test's bounds are multiples of it. Batch 2's last
+open item but the split destination closed the same day: an administrator's change of
+the root or of a partition group is made where the group leads by making the group lead
+here — a node whose replica votes and follows asks the leader for leadership and waits,
+bounded, before it submits; one that cannot lead reports who does. Requests are never
+forwarded: a leader cannot derive another node's administrator principal (each node's
+issuer is its own), and admitting a claimed client would open another administrator's
+retry window. Batch 2's last open item closed the same day as well: a seated member of
+a split destination opens with the group's identity from the root's grant and no state,
+and is brought up by the founder's snapshot (the founder compacts before it admits its
+first member, refusing the admission until the floor stands; an entry from the log's
+beginning reaching an empty member is a stated corruption). Seating one in the in-process
+split test found the rest of the group's life: its merge fence signed as the founder's
+alone (a majority of each group's installed voters is collected now); a seal intended
+for a group another node leads (made where the group leads: the reshaper's node takes
+its leadership first); a merged-away group's grant kept forever (the root releases it
+once absorbed, `ReleaseGroup`, and the member's seat and record go with it); a seat
+watch that read an unobservable authority as unseated; a node's service ending when a
+hosted drive ended well; and the seat's own stop raced its own egress.
+
+### 2026-10-02 — F13 stage 3: the issuer succeeds itself
+
+The CA every credential chains to was created once, for ten years, and pinned
+everywhere; a cluster that outlived it, or whose issuer's key was exposed, had
+no move but a re-founding. Now the issuer succeeds itself as the certificates it
+issues do ([24](24-placement-execution-and-fleet-control.md) §11): identity by
+genesis (the genesis issuer stays what every identity check compares), trust by
+the committed set (the registry's `IssuerSuccession`, adopted by every node and
+carried by every invitation), bridged by endorsement (a successor's certificate
+is also issued under its predecessor's signature and presented in every chain,
+so a verifier that has not adopted it yet — a lagging node, a client holding an
+older trust — accepts the chain through the endorsement instead of being cut
+off for good). The succession is staged in the last third of the issuer's
+committed lifetime (`node.issuer_lifetime_seconds`, twelve credential lifetimes
+by default, six at least) or when the operator asks (`cluster credentials
+rotate-issuer`), activated at the next step, and the predecessor retires once
+nothing live was issued under it. It is the first behaviour gated on the
+upgrade fence (level 2); a cluster founded by this binary holds the fence at
+its level from genesis. Measured under the forty-five-second test lifetime:
+activation within a second of the staging, the genesis issuer retired within
+two lifetimes, a chain of three certificates (about 1.6 KiB).
+
+### 2026-10-02 — a session plan is answered by its commit
+
+The macOS run of the drain journey waited three minutes on an activation that
+was never pending: `cluster sessions plan` had answered `planned` before the
+plan's intent was journaled, the request was already off the agent's queue,
+and the partition then refused the intent (its observation had gone stale),
+so the plan was lost while the operator was told it was under way — and the
+refusal's trace was cleared by the next commit of any kind. A plan is now
+answered by the intent's outcome ([24](24-placement-execution-and-fleet-control.md)
+§16): `planned` once it committed and the directory pends it, `compare_failed`
+when the partition refused it, so the operator plans again on the next
+observation; a request whose partition has an intent pending waits for it;
+a refusal stays visible until a commit of the same kind.
+
+### 2026-10-02 — F22: closed enrollment records leave the registry
+
+The enrollment registry kept every record it ever made under the one bound
+that also holds its live population, so ordinary churn spent the bound for
+good. A record is closed at the later of its invitation's expiry and its
+credential's — past it nothing of the record can regain meaning once the
+committed time floor has passed — and closed records now leave the table
+with the next committed decision, counted, their charge released; a
+renewal keeps a record open with the credential, and a compacted token or
+certificate is unknown, which never admits ([24](24-placement-execution-and-fleet-control.md)
+§11). The bound holds the open and live population; the committed command
+stream is the history.
+
+### 2026-10-02 — a participant adopts the endorsed issuer it does not hold
+
+A participant's context holds the issuers its invitation carried; after an
+issuer's succession it verifies the nodes' chains through the predecessor's
+endorsement, and now adopts the successor beside its join journal once a
+request succeeded over the connection, so a succession after that — endorsed
+by the successor it adopted, not by the issuer its invitation named — still
+verifies ([24](24-placement-execution-and-fleet-control.md) §11). Found on
+the way: the endorsement is an ordinary intermediate to path building — a
+trust anchor's path-length constraint is not applied (RFC 5280 §6.1.1;
+webpki applies none), which a wire test now holds the dependency to — so the
+verifiers of the succession's first landing, which carried a crossing rule of
+their own, were never reached; they are gone and every verifier is webpki over
+the committed root set.
+
+### 2026-10-02 — the day's CI runs: five tests, five causes
+
+The four CI runs of batches 6 to 9 failed on five tests that pass on a laptop,
+each a defect at its cause ([the record](../audit/2026-09-29_remediation.md),
+"Found by CI (2026-10-02)"): a wire test that held a withheld body's give-up to
+the clock where the rule gives it up by the connection's quiet (now sampled as
+the rule reads it, `QuicRemote::received`); a debug build's poll frames — 1.8 MB
+to start a service under the renewal journey, the futures themselves small —
+which a Windows test thread's 2 MiB did not hold (the service's open and the
+harness's start boxed by plain functions, the journey in phases; 1.2 MB now,
+the open's own frames recorded as open); a plan's refusal decoded as an
+inconsistent response; a stood-down leader answering a read `OutcomeUnknown`
+where it took nothing (`host::barrier_refused`); and a shaped-path fleet dialling
+under the loopback's half second (`Slow::dial`).
+
+### 2026-10-02 — a chunk's part is what the path delivered
+
+The gate run of the day's batches failed the 128 kbit/s crossing under the
+suite's load: 1.68 chunks crossed for one. A part was sized by the path's law
+— the window over the round trip, stretched over an exchange time — and cold,
+that made a first part of 307 KiB on a path of 16 KiB a second; one such part
+given up under load was sent again whole. A part is now what the last bulk
+exchange the peer answered delivered, over an exchange time, bounded by the
+law; before any, one window's worth (`PeerConnectionPool::part_bytes`,
+`part_for`; the record's F49).
+
+
+### 2026-10-03 — the gate run's CI: three more causes
+
+The two CI runs of the gate commit failed on three tests that pass on a laptop
+([the record](../audit/2026-09-29_remediation.md), "Found by CI (2026-10-02)",
+the second part): a credential request served at the foot of the controller's
+loop on the trust read at its head — a renewal asked the moment the operator's
+rotation activated the successor could not be chained — now served after the
+refresh that follows it, and a receipt whose issuer the holder has not read
+chained once the root is observed up to the receipt's revision
+(`NetworkController::trust_for`, [24](24-placement-execution-and-fleet-control.md)
+§11); a deployment plan's session step stale for a leader the fleet moved while
+the apply's own steps seated the root and the partition — now stale for seats
+that moved and never for a re-fence under the plan, asked as a dry run before
+any side effect ([08](08-stepped-complexity-and-deployment.md) §9); and a hosted
+partition's egress whose end was reported without its owner's failure, which
+it now names.
+
+### 2026-10-03 — a peer's appends are stepped in the order they left it
+
+The audit's F42 residual ([27](27-consensus-roadmap-and-slates-port.md) §12): a group's appends to a peer carry a sequence within the sender's incarnation (`Operation::RaftOrdered`, the ordered profile), the receiver holds a frame that overtook the one before it — for the path's probe timeout at most, within the source's lane and the configuration's members — and steps the frames in their order, so an append never overtakes another and is never refused for it; frames a group cannot do without stay unordered. Over a path that loses one datagram in fifty, 512 entries had 27 appends refused with the older offer and none (61 held, none let go) with the profile (`ReplicaProgress::appends_rejected`, `fleet_quic`). Found on the way: the probe timeout counted no acknowledgement delay (`frame::MAX_ACK_DELAY`), and empty appends went unordered.
+
+### 2026-10-03 — a copy tells what it holds, and is sent what it lacks
+
+The audit's F50 ([24](24-placement-execution-and-fleet-control.md) §20): a
+transfer opened on a copy took an inventory of the prefix before the first
+chunk lacked and forgot every chunk past it — sent again by the next
+transfer, and a seal over an object made whole by the gap's chunk refused.
+The inventory is the whole object now, every chunk verified by its hash; a
+sender whose connection admits the ordered profile asks what the copy holds
+(`CustodyRequest::OpenHeld`, a bit for each chunk) and sends only what it
+lacks, and one of an older binary is sent from the first lacked as it was. A
+second object sharing three of four chunks with one the copy holds crossed
+the path with 69,559 bytes where the older ask sent 203,932 (`evidence_quic`).
+
+### 2026-10-03 — the gate commit's CI: three causes
+
+The runs of b318e80 failed on three tests ([the record](../audit/2026-09-29_remediation.md),
+"Found by CI (2026-10-03)"): the F38 test's claim that a stalled stream's bound is under
+half the old wait, which the probe timeout's acknowledgement delay made 27 s of 51 on a
+Windows loopback (the law is right; the claim is restated as less than the old wait); a
+renewal asked within the second of the holder's own, refused as a conflict and now
+answered with the current certificate ([24](24-placement-execution-and-fleet-control.md)
+§11); and a control replica that kept nothing of the error that stopped it — it names its
+first failure now, and the retained delivery it lacks is recorded as a batch of its own.
+A fourth, open: a host's level that never reached the upgrade view after the rollout's
+restart on one ubuntu run; the journey reports the node's health and placement beside
+the view when that happens again.
+
+### 2026-10-03 — a control replica's delivery is continued, not failed
+
+A control replica marked itself failed on any error of a delivery, a memory refusal
+for a snapshot's decode among them, though the refusal changed nothing of the node and
+the owner would have polled again: a member brought up by snapshot on a loaded runner
+ended ([27](27-consensus-roadmap-and-slates-port.md) §13). The delivery is retained now —
+the events, the output so far, the cursors past what is applied — and continued by the
+next drain at the entry the refusal stopped; only a memory refusal is retained, anything
+else fails the replica by its first failure's name.
+
+### 2026-10-03 — a replica's own owner lets held frames go
+
+The gate of F50 found the F42 residual's defect ([27](27-consensus-roadmap-and-slates-port.md)
+§12): a replica's own owner never asked its resequencer to let held frames go past their
+patience — only a group's progress did — so a follower that lost ordered appends held every
+frame after the gap and stopped applying. The owner asks at every period now, whichever owner
+runs it; a test isolates a follower of single-owner replicas while entries commit, and it held
+40 frames and let none go before the fix. The fleet and evidence harnesses' waits for
+publication and for a leader are charged to the replicas' periods and name each replica's state.
+
+### 2026-10-03 — a control follower's read waits for what its leader committed
+
+The split-and-merge test's failures on ubuntu CI had one cause, named once the
+control replica kept the error that stopped it: a follower's read answered with its
+leader's commit, above what the follower had applied, was taken for corruption — a
+check older than the control replicas' follower reads (27 §5). The barrier is held
+until the entries it names are applied, bounded by the reads the core holds in flight
+and charged while held, as the hosted session has held one since F55; a control-rig
+test withholds a follower's entries while the others commit, and its read waits and
+is answered instead of failing the replica.
+
+### 2026-10-03 — a refused load report is asked again at the next pass
+
+The upgrade journey's failure on ubuntu CI, a restarted host whose level never reached
+the directory in 90 s, was a level that waited: a load report refused on a stale compare
+— another node's write landed between its observation and its submission — was counted
+as made and asked again only after the 30 s load interval, and after a restart two
+nodes' intervals run from the same moment, so their reports raced again every interval
+and the host lost each race. A load report now counts as made once it commits and is
+planned again at the next pass when refused (`note_load`); the level is due while the
+directory holds another than the binary's (`load_due`, 24 §21); and an intent its owner
+keeps undecided is named in the agent's health (`retrying`). Fifteen local runs of the
+journey before the fix: one failed so and nine waited one to three intervals; thirty-six
+after: none. The lossy-path fleet test's retries are charged to the replicas' periods
+and paced a period apart, the upgrade journey prints every node's health when a level
+never comes, and the collector journey judges its second restore across a window no
+pass entered (a pass between the two requests takes the orphan again, rightly).
+
+### 2026-10-03 — a scalar check reads a scalar
+
+The audit's F53: the replica's status was built whole, with its configuration's
+voters and learners cloned, for every check of one scalar, and every read barrier was
+compared against a readiness marker built afresh. The node offers the scalars copied
+and the configuration borrowed (`DurableNode::{scalars, membership}`), the session,
+the native engine and the fleet owner read those on their paths, and the readiness
+marker is read in place. With focal-load's allocation bench (1,000 claims, macOS arm64, exact
+counts): a linearizable read takes 20 allocations and no reallocation, 26 and one at
+916afbf; a committed claim 336.79 allocations, 340.89 before.
+
+### 2026-10-03 — Copa answers a queue manager's mark
+
+The audit's F39: quinn tells a law of a mark (ECN-CE) as a congestion event with no bytes
+lost, and Copa took it for a loss, no signal in its default mode. A mark is congestion:
+once a round trip Copa ends slow start, halves `1/δ` while competing, and halves its
+window (RFC 9002 §B.2; 7/10 and 4/5 were measured to take from NewReno and CUBIC); for
+ten seconds after a mark past slow start its window grows as a classic sender's, a
+datagram a round trip, and competing it raises `1/δ` only after a round trip in which
+the target held the window back — raised beside it a packet a round trip, Copa alone,
+misjudging itself competing, filled CoDel's queue to its target. The congestion harness
+carries ECN where a path does, marks by a one-datagram step or by CoDel
+(`focal_sim::path::Marking`), runs flows side by side, and judges a newcomer's harm over
+eight seeds. Alone, Copa's managed queue is in no scenario longer than its unmanaged one,
+0.377 of it by geometric mean, and it carries 1.108 times what NewReno carries under the
+same manager; beside Copa under CoDel, NewReno and CUBIC carry 1.008 to 1.539 of what
+they carry beside their own kind. Open, the next batch: Copa competing without a manager
+takes more than that at long round trips, its test of the mode misjudges its own queue,
+and on a link without jitter it does not leave the competitive mode.
+
+### 2026-10-03 — a connection says why it gave a body up
+
+From 9e1e463's macOS run: the wire test of a body a peer withholds while it sends others
+held the give-up to the connection's quiet, taking the other rule — everything the peer
+owed of the class delivered, the body not among it — for unreachable; with the headers
+straggling, the others' bytes passed the most that was owed and the body rightly ended a
+judgement after the last of them. The judgement names its rule (`GiveUp::{Quiet,
+Withheld}`), the connection counts the bodies given up by each (`QuicRemote::given_up`),
+and the test takes either, a quiet one only where its samples, by their own spacing,
+cannot rule it out.
+
+### 2026-10-03 — a host learns its sponsor's pins when the sponsor has moved on
+
+From a peer session's loaded runs and macOS CI at b318e80: a host asked to renew the
+moment the founder's issuer succession activated dialed the founder with the pins its own
+root replica had applied, refused the successor certificate the founder presented, and
+reported its own credential material inconsistent. The enrollment client now tells a
+refusal by the pin (`EnrollmentError::Unpinned`) from one by the chain; on it the
+controller learns the pins at a control read that begins after the refusal — answered
+once its replica applied what the root's leader confirmed — and dials again (24 §11). The
+test alone, three copies at once under load: 3 of 3 failed before, 0 of 30 after.
+
+### 2026-10-03 — what two and three suites at once found
+
+The held-log test held a thousand sessions' commits to five seconds of the clock; under
+three suites at once they took nineteen. The owner now counts the wakes the log's answer
+delivers (`ReplicaProgress::waits_answered`) and the test asserts each waiting session
+was woken — which holds under that load. The laptop-expansion test asked the founder for
+a quorum read only the leader serves, wherever the planner made another host the
+preferred leader; it asks the voter that leads. Two waits that ran out under a peer's
+load did not recur in 58 copies and seven suite runs; their failures now print each
+replica's role, its owner's periods and the periods without its tick, and the
+activation's pending placement.
+
+### 2026-10-03 — a member past a small snapshot is staged for what follows it
+
+Found from PR #4's CI, where on macOS and Windows the split test's member seated after the
+split never caught up, and present on this core too. The destination's founder sent the member
+the snapshot, and the member's answer that it held it was refused: the step's reservation could
+not hold what the transition left. The core had queued the entries after the snapshot for the
+member, and the leader stopped itself (`Capacity`, then failed until reopened). The staging
+(`memory::sends_bytes`) priced a member behind the log's start as the snapshot alone. The answer
+that says the member holds the snapshot moves it to the log's first entry, and its page, and
+the window beyond it, are sent in that transition. A one-byte snapshot with pages of entries
+behind it is enough. Now such a member is priced at the larger of the snapshot and the pages
+from the log's first entry, and the window beyond them, as for any member.
+`a_member_past_a_small_snapshot_is_sent_what_follows_it_within_its_staging` fails on 27b0531
+(the leader's step refused) and passes after. PR #4's core made the split test meet it under the
+whole focal-node suite's load: 4 of 7 failed without the fix, none of 6 with it.
+
+### 2026-10-03 — a replica refreshes a snapshot that does not name every member
+
+From 27b0531's macOS run: a drained leader's replacement stayed `Installed` for the whole
+budget, a learner its leader beat and never seeded. Raft discards a snapshot that does
+not name its recipient, and the leader's snapshot predated the learner. The checkpoint
+that would have named it was owed by a flag only the owner that resolved the addition
+set; that host led until the controller moved leadership off it, and the leader that
+followed never knew. Each replica now derives the need from what it has applied, as the
+root's owner does: a stored snapshot that does not name every member of the configuration
+in force is refreshed at its period (`Owner::checkpoint_for_members`,
+`DurableNode::snapshot_names_every_member`), the answer kept per configuration and
+snapshot, and a change that adds no one asks for nothing. An owner test adds a learner by
+the log alone, seeds it, and removes it without a checkpoint; the three
+QUIC schedules that bring a late member up "by any leader" checkpoint every voter now,
+since the voter they handed leadership to had kept its log from the first entry and
+hidden the stale snapshot.
+
+### 2026-10-03 — a follower counts the refusals the order should have spared
+
+From 27b0531's ubuntu run: the lossy path's test held the refusals with appends ordered
+to one per frame let go, while one lost frame has the appends behind it refused too. A
+follower counts the refusals no loss explains (`ReplicaProgress::appends_rejected_in_order`):
+a loss — a frame let go past its patience, found stale or not stepped — is kept as the
+first index the log lacked then, and a refusal in that term whose hint falls before it is
+the loss's; a term's first exchange, an older binary's plain appends and a request for a
+snapshot are not counted either. The test asserts none, while the followers held frames.
+It no longer compares the plain run's refusals with the ordered run's: their number
+rests on load (29 on the CI, 14 on a laptop alone, none in three copies beside a suite).
+Its client asks the replica that leads at the time, pauses as the client does
+(`RetryPolicy::pause`) and charges each request's wait to the group's commits; six copies
+at once pass, their ordered bursts refusing up to 53 appends with up to 49 frames let go
+and none in order. An owner test drives the leader's own appends to a follower
+overtaken, plain and with one lost.
+
+### 2026-10-03 — the signer's decision and the root's state wait on the replicas
+
+From a peer's loaded run on PR #4's tree: the enrollment-control test asked the signer
+eight times 25 ms apart while the root was electing, and read the root's state under ten
+seconds of the clock. Both are charged to the control replicas' own periods now
+(`focal_timing::ProgressDeadline`), asked again a period of theirs later.
+
+### 2026-10-03 — a checkpoint does not wait for the proposals above it
+
+Found while fixing the heal: a session refused to checkpoint while any proposal was
+pending, and the owner asked only when none was, so under a steady load a replica
+checkpointed only at a period that found nothing in flight — three replicas at a cadence
+of 32 kept up to 182 entries past a checkpoint. A checkpoint is of the applied prefix and
+a proposal is above it; a domain candidate, a managed or cursor command and a cursor
+maintenance change nothing a checkpoint holds until they apply, so they no longer hold it
+back (a delivery under way and the rare membership, placement, evidence and activation
+records still do). The same load now keeps 31 at most. A ledger test checkpoints under a
+candidate held from its quorum, commits it after and replays it once from a restart; the
+follower checkpoint of the QUIC schedules waits out a native follower's `CheckpointIndex`.
+
+### 2026-10-03 — an append given up at its sender leaves its gap in the order
+
+From a peer's gate of PR #4 on hyper-raft: the lossy path counted refusals in order
+where the leader had given an append up for want of room before it had a sequence, so
+its follower saw no gap and refused the appends after it in an order that showed none.
+A bulk frame takes its sequence before anything can give it up now, in the fleet's
+owner and the control host's, and the order's epoch is the term of its frames instead of
+an incarnation drawn at random — which a restarted sender drew smaller than the one
+before as often as not, its frames then taken for stale. An owner test gives a frame up
+with the budget held and finds the next one a sequence on, and a new term beginning
+again. Also from CI (457395c's macOS push run): the zone stage read its guarantee once
+after the zone's return and found one member not alive; not reproduced in 22 local
+copies, the assertion now prints the whole placement view. Open.
+
+### 2026-10-03 — the core is hyper-raft's
+
+focal runs the shared repository's core ([27](27-consensus-roadmap-and-slates-port.md) §14):
+`hyper-raft` and `hyper-timing` vendored under `vendor/` (`SNAPSHOT`), `crates/focal-raft`
+removed, its suites and its differential against raft-rs in the shared repository. No byte focal
+writes changes: `focal-consensus`'s envelope (`src/envelope.rs`) writes the core's values exactly
+as raft-proto's prost codec did and reads what any protocol-buffer reader reads, translating a
+change of configuration's data between raft-rs's encoding and the core's record; no
+protocol-buffer runtime ships, and `raft-proto` is the test oracle (4,096 generated values of each
+type equal to its bytes, every prefix and one-byte mutation read alike). The accounting reads a
+committed change in place through `hyper_raft::wire::changes_stated`. Every crate's suite passes
+on it; the types are the core's (typed kinds), and the tests that sent a kind no message has now
+send it as raft-rs writes it, refused by the envelope.
+
+### 2026-10-03 — a session writes the proposals of a batch at once
+
+Found under six fleets at once: an owner drained after every request that was no read,
+so each proposal began a write of its own, and a grouped owner dispatches nothing to a
+session with a write out — a leader wrote one proposal a write however many waited. An
+owner takes its work in batches now (`Owner::batching`): a grouped owner drains a
+session at its next pass, after what it dispatched to it; a replica's own owner takes
+what is queued, up to what it admits at once, and drains once. Three grouped replicas
+under sixteen clients, on hyper-raft (96c61ad), wrote 5.25 to 6.10 entries a write and
+committed 31 to 38 a second, against one entry a write and 17 a second before (on
+focal-raft: 5.0 to 5.6 entries a write, 32 to 38 a second, against 15 to 18).
+
+### 2026-10-04 — an answer of the log that finds the owner's signals full is not lost
+
+PR #4's macOS run left one of a thousand sessions, answered by one write of the log, to
+its tick: the owner's signals hold 1,024, an owner up to 4,096 sessions, and the signal
+that found the queue full was dropped. Such a signal arms a token of one now
+(`OwnerQueue::persisted`), and the owner, having taken it, makes every session with a
+write out due (`GroupOwner::sweep`, counted in `ReplicaProgress::waits_swept`).
+`fleet::grouped::tests::an_answer_that_finds_the_signals_full_arms_the_sweep`; the held
+log's test counts a sweep's look as a wake.
+
+### 2026-10-04 — the gate on 7a4fba1: a batch owes its drain; two tests restated
+
+The gate on 7a4fba1 failed three tests. One hid a defect of batching; the other two were
+the tests' own.
+- **A peer's frame whose step left nothing ready waited for its deadline.** Batching
+  left a request's drain to the batch's end, which drained only a replica with
+  something ready. A frame such as a message of an older term made the session neither
+  ready nor due, so its answer, given by a drain's poll, waited for its deadline. On a
+  path that carries a peer's frames one after another, everything behind it waited
+  too. `fleet_group`'s quorum test, its wait charged to the replicas' periods, found
+  three replicas at term 23 with no leader. Every request a batch takes owes the batch
+  its drain now, run whether or not anything is ready (`Owner::drain_owed`).
+  `fleet::list_tests::write_batch_tests::a_peer_frame_that_leaves_nothing_ready_is_answered_by_its_batchs_drain`;
+  the quorum test passes 3 runs of 3 (it failed 3 of 3 on 2b7a62a, and passed 3 of 3 on
+  96c61ad).
+- **The read-round test** asserted the owner's contract from before batching. It now
+  checks that a batch's drain sends one round for the batch's reads, and that a write
+  among them goes in the same drain.
+- **The lossy-path test's client** dialed once for every request that found its slot
+  empty. That went past the server's sixteen connections for one identity, and the
+  server replaced connections while they carried requests. The client now dials each
+  slot once, as the product's `RouteConnections` does, and reads a lost connection from
+  the connection's own state.
+- **`fleet_group`'s quorum test** now charges its two waits to the replicas' periods.
+
+### 2026-10-04 — a leader answers a read only once it is authoritative in its term
+
+The gate on 9b4c6bd failed `fleet_quic`'s trusted membership test (3 runs of 6 alone).
+A read leaves with its round as soon as it is asked. The readiness barrier, which makes
+the leader authoritative, is asked at the end of the delivery that finds the term's
+first entry committed. So a read asked before that delivery was answered a round ahead
+of the readiness, and the membership read that followed was refused `NotReady`. A
+leader's read barrier now waits, parked under the existing bound, until the term's
+readiness is answered, and is answered in that delivery (`Session::read_waits`).
+`session::tests::a_leader_answers_a_read_only_once_it_is_ready_in_its_term` fails
+without it; the trusted membership test passes 10 runs of 10. Recorded open, with the
+shared core: a read asked before the term's first commit is dropped by the core and
+answered only at its deadline.
+
+
+### 2026-10-04 — F51: a node's content owner passes over a whole object a chunk at a time
+
+A node's content owner took each command whole, and five passed over whole objects in
+one command: a custody seal, an open's inventory, a verification, an upload's seal and a
+backup's restore. Every other request waited behind the pass, up to a gibibyte of reads
+under default custody admission. Each pass now goes a chunk a slice, one queued command a
+slice, behind whatever was asked before it:
+- focal-evidence: `ImportCompletion`, `ObjectVerification`, `UploadSealing` and
+  `holds_chunk`, each slice reading into a buffer its caller lends;
+- the content owner: one chunk-long scratch buffer for its life.
+
+**The store keeps each pass between asks** (`CustodyStore`, `Pass`, `Step`). A retried
+or second ask joins the pass under way, and one that meets a full queue only pauses it.
+A pass that is done keeps only its answer until its lease ends:
+- a verification asked afresh reads the object again;
+- a seal's reference stands;
+- a restore's count answers its backup.
+
+**Found in review, before the first build, and fixed in the batch:**
+- a joined verification was refused `Unavailable` once another ask finished it;
+- a restore's manifest was held uncharged across commands;
+- a restore's continuing ask could carry on another backup's restore.
+
+**Tests.** focal-evidence: `a_seal_in_slices_installs_what_a_seal_at_once_does`,
+`a_verification_in_slices_reads_every_chunk_and_finds_a_corrupt_one`. Six under
+`content_host::tests`. The three review findings' tests each fail with their defect put
+back.
+
+**Measured** (debug, macOS arm64, three runs each way, alternating, at a load of 2.9 to
+6.7 with another project's builds), with
+`content_host::tests::measure_small_request_waits_while_a_large_upload_seals`. A small
+request asked while a 256 MiB upload sealed at 1 MiB chunks:
+- before: waited the whole seal, 7.2–8.5 s;
+- after: waited a slice, p50 25–28 ms, p99 27–117 ms, max 32–181 ms (the tail in the
+  run at load 5.4–6.7).
+
+The seal took 7.2–8.5 s before and 7.1–8.5 s after.
+
+### 2026-10-04 — a leader that steps down within its term answers its waiting reads at once
+
+The owner gave up a waiting read when the term changed, but not when its leader stepped
+down within its term (check-quorum). The read, which only a leader answers, waited out
+its deadline. The waits only a leader answers (`WaitingFor::answered_by_leader`) are now
+given up at the role change as well.
+`fleet::list_tests::read_round_tests::a_leader_that_steps_down_within_its_term_answers_its_waiting_reads_at_once`
+isolates a leader until check-quorum steps it down in its term, and requires the summary
+it was asked to be answered `Unavailable` at once. With the role change ignored, the
+test fails.
+
+### 2026-10-04 — a late frame the follower takes moves its loss with it
+
+Ubuntu CI on 8d4f322 failed F42's lossy-path test: 22 refusals of 46 were counted as the
+order's. Four copies at once reproduced it (one of four, 50 counted). A follower's trace
+showed the cause. The follower noted a loss where its log ended, then stepped frames it
+had let go that came after all, stale, and took them. The refusals behind the hole then
+fell at or past the noted index, and were judged the order's though the loss caused
+them. A loss is now noted once the frame lost has been stepped (`Owner::lost_to`).
+`fleet::list_tests::append_order_tests::a_late_frame_the_log_takes_moves_the_loss_with_it`
+counts (3, 0); with the loss noted before the step, (3, 1).
+
+### 2026-10-04 — every test wait is charged to what it waits on
+
+A wait bounded by a guess of how long its fact takes reads the fact's absence as
+slowness, and fails a slow machine; converting such waits found three of this week's
+defects. P8 had charged the fleet suites of 27 §3.3 to their owners' periods. The 69
+waits that still bounded a test by the clock, and the assertions on elapsed time found
+beside them, now wait on the fact they need, charged to what makes it
+([27](27-consensus-roadmap-and-slates-port.md) §3.1 P8):
+- **In-process owners**: their periods, the allowance counted at their tick
+  (`test_waits` in `focal-node`, `tests/support/owners.rs` beside its integration
+  tests). One step of an owner is two of its periods, the one a request arrives in and
+  the next (`test_waits::STEP`); an owner stopped during a wait is charged nothing
+  while another runs.
+- **Real processes**: the root owner's periods, read from `cluster node metrics`
+  (`tests/support/progress.rs`): a cluster's convergence, a revoke reaching the
+  controller, a claim's expiry.
+- **The listener**: its admission changes. Each release it owes pairs with a place it
+  took, so the changes it has made bound them.
+- **What the system bounds itself**: a QUIC close by the connection's idle timeout, a
+  child `claim wait` by its `--timeout-ms`, the MCP adapter by its shutdown bound, a
+  pool's send by its deadline. Beyond that bound stands only the frozen window (60 s),
+  a wedge.
+- **Servers and workers that report no period**: the frozen window alone.
+
+Assertions on elapsed time now state what they stood for. A moved peer is reached by
+one dial, bounded by the dead address's deadline, that delivered. A send within a
+peer's cooldown is refused without a dial, and the pool counts it
+(`PeerPoolStats::refused_unreachable`, `focal_peer_messages_unreachable_total`). A
+request ended by its route's retirement is NoRoute or RouteChanged, never Lost, its
+deadline's word. A flow-controlled response keeps its charge once its header has
+arrived. A silent scrape is still held when the others are answered. A round's
+deadline holds exactly, on tokio's paused clock. Dropping a runtime, or stopping the
+MCP adapter, would wait for ever were it to wait on the held work. A lost reply is
+cancelled at its commit, which the transport reports.
+
+Under injected load, as [27](27-consensus-roadmap-and-slates-port.md) §6 measures it:
+eighteen processes held every core of this machine busy (load averages 25 to 31 on 18
+cores, from 6 before; a peer's builds ran alongside) while the converted suites ran from
+this batch's own binaries, four tests at a time, in two passes. Every suite passed, in
+the time it takes without the burners:
+
+| Suite | Under load | Without |
+|---|---|---|
+| `fleet_quic` (9 tests) | 54.8 s | 48.3 s |
+| `mcp_stdio` (16) | 32.0 s | 28.1 s |
+| `cli_native_a3` (1) | 16.5 s | 17.0 s |
+| `cli_network` (6) | 11.9 s | 11.3 s |
+| `runtime_host` (2) | 2.9 s | 3.1 s |
+| `control_quic` (1) | 2.0 s | 2.0 s |
+| `fleet_management` (7), `network_listener` (3) | 0.5 s, 0.5 s | 0.6 s, 0.5 s |
+| `focal-node` `fleet::async_tests` (4) | 38.7 s | 36.9 s |
+| `focal-node` `network_service` (18) | 18.4 s | 19.1 s |
+| the eight other converted `focal-node` modules (44) | 8.8 s | 8.9 s |
+| `focal-wire` unit tests (131) | 47.2 s | 42.3 s |
+| `focal-runtime` unit tests (26) | 10.0 s | 11.0 s |
+
+`runtime_host`'s check that a runtime refusing for capacity makes no call now waits for
+the owners to run the periods a quarter of a second holds, not for the quarter second.
+Recorded open: sleeps that only choose which path a test exercises, since no fact yet
+says that the path began (a child `claim wait` started 100 ms before its claim is
+cancelled and 80 ms before SIGINT, where nothing reports a wait begun; a monitor timer
+read 1.5 s past its instant, where nothing reports a timer fired: F26's metrics are where
+both belong); and production waits with no stated derivation that the sweep found: the
+MCP adapter's 3 s shutdown bound and its 20 ms poll, the transfer backend's 30 s,
+`network_state`'s 5 s DNS lookups, the controller's 250 ms pass.
+### 2026-10-03 — the log and the shell move together, designed first
+
+F-1 and D-2 are one step, designed before code and reviewed by focal's session
+([27](27-consensus-roadmap-and-slates-port.md) §15). Each group's Raft state goes to hyper-log,
+one log per data directory. Its image and its records (identity, fast track, decoder floor and
+transition) go to files of its own under `raft/groups/`. Ordering rules stand in for a write
+across files. The old WAL directory is never removed: `CURRENT` at fence version 3 is the
+conversion's commit point, and the binary before it fails closed on it. The conversion runs at
+start once the upgrade fence opens at `STORAGE_LEVEL`, or by `focal storage convert`, on one code
+path. The shared shell gains a tick mode and a held refusal first, in hyper-raft. No code yet.
+
+### 2026-10-03 — one medium for every durable install
+
+The install sequence (a temporary name, the bytes, a file flush, the rename, the directory flush)
+was written once over `BackupMedium` in focal-ledger, with the real filesystem and a test adapter
+of focal-sim's disk under it. The group files of [27](27-consensus-roadmap-and-slates-port.md)
+§15 need the same sequence, and focal-consensus cannot depend on focal-ledger. The trait, the
+filesystem's medium and the sequence move unchanged to focal-platform (`fs::Medium`,
+`fs::FileMedium`, `fs::install`). focal-sim's disk is now a medium itself, so the backup suites and
+the group files' crash cuts cut the one adapter, and focal-ledger's test adapter is gone. The
+backup keeps its names (`BackupMedium` is the medium) and calls a path with no parent a corrupt
+backup path, as before. `install` states the constraint its temporary name sets: two names of one
+directory that differ only in their extension share it.
+
+### 2026-10-03 — an unreadable record is not an absent one
+
+The medium answered `exists` as `Path::exists` does: any failure to read a path's metadata, a
+permission or an I/O error among them, read as no file there. For 27 §15's rule that a group's log
+without its records is corruption and never a fresh group, an unreadable record must not read as
+a missing one. `Medium::exists` now returns the error (`Path::try_exists`), focal-sim's disk
+answers absent only for a name it does not hold, and the backup's refusal to write over an
+existing manifest passes an error on instead of writing.
+
+### 2026-10-03 — a group's records and image are files of its own
+
+The first piece of [27](27-consensus-roadmap-and-slates-port.md) §15 in code:
+`focal-consensus::group_files`.
+- A group's records (`meta`: identity, fast track, decoder floor and transition) and its image
+  (`image`: the state at a point, with its configuration) live in `raft/groups/<id>/`.
+- Each is written whole by the shared install and read whole or refused, naming the file: a
+  checksum over every byte, a magic number, a version and a length. A file that does not read
+  whole is never read as no file, nor as an earlier one.
+- The records' bound derives from the largest configuration; the image's is the state machine's
+  own.
+- Tests on focal-sim's disk cut the power at each of the ten operations of a rewrite: each file
+  reads as before or as after, never between, and as after once its install returned. Every
+  flipped byte, a short tail, another file's magic, a later version and an unreadable path are
+  each refused. Nothing uses the files yet.
+
+### 2026-10-03 — the durable shell's crates beside the core
+
+The first commit of [27](27-consensus-roadmap-and-slates-port.md) §15.1. `vendor/` takes
+`hyper-durable` from the shared repository with what it builds on:
+- `hyper-log`, the log a data directory's groups share;
+- `hyper-block`, its block I/O;
+- `hyper-liveness`, the node-pair stream.
+
+They come at one revision (`418851a`, its CI green on all six targets), with `hyper-raft` and
+`hyper-timing` taken again at the same revision; their sources had not changed. That revision
+carries the shell's tick mode and its held refusal, which §15.5 and §15.7 need. focal-consensus
+depends on the shell, which nothing uses yet, so every commit after this one builds it. No
+third-party crate is new to the tree; the release roster and `cargo deny` agree.
+
+### 2026-10-03 — DurableNode over two backends, decided before its code
+
+[27](27-consensus-roadmap-and-slates-port.md) §15.7 records how D-2 meets the owners, decided with
+focal's session. `DurableNode` stays the owners' API, over focal-log below the upgrade fence and the
+shell above it. A hand-over state machine gives committed entries to the owner's next drain, and
+the owner applies them as today.
+
+Seven `NodeEvents` contracts are named, each to be a test on both backends. A differential runs the
+consensus simulations' input against both.
+
+Two gaps the shell had are settled:
+- its state machine now sees the change it applies (hyper-raft, for the membership report's
+  context);
+- the fast track's displaced proposals are not reported on the shell, so its backend and the
+  conversion refuse a fast group until a deadline §14 records.
+
+### 2026-10-03 — the shell's crates again, at the revision D-2 builds on
+
+`vendor/` takes the six shared crates again at `687244f`, its CI green on all six targets. Two
+changes to the shell there are what the hand-over machine of
+[27](27-consensus-roadmap-and-slates-port.md) §15.7 needs:
+- an image states the configuration the group held at its point, and a snapshot sent from it
+  carries that configuration, not the replica's latest (the Raft paper's §7: a snapshot holds the
+  last configuration as of its last included index). The hand-over machine reads it back from the
+  group's image file;
+- a drive applies one page at most, and the next drive the next, so the entries a drain hands
+  over have a bound the backend reserves before it drives (contract (g)).
+
+focal runs as before: hyper-raft's sources are unchanged, hyper-timing's election law changed only
+in its tests, and its detector and hyper-liveness, which changed with the detector model the shared
+repository merged, are called by nothing in focal yet. No manifest and no locked dependency moved.
+
+### 2026-10-03 — DurableNode answers through its backend
+
+The first step of [27](27-consensus-roadmap-and-slates-port.md) §15.7 in code. The member over
+focal-log is `LogNode`, crate-private, its fields and methods as they were. `DurableNode` holds
+its backend, so far that one, inline: the owners keep the node where they kept it, and its memory
+allowance, the size of `DurableNode`, counts what it counted. Each public method is the backend's
+method of the same name, and each constructor opens the backend. Nothing an owner sees changes:
+focal-consensus's suite passes unchanged, the counting allocator's allowance test among it. The
+shell's backend comes beside it next.
+
+### 2026-10-03 — what both backends check, in one place
+
+The core is the same over focal-log and over the shell, so what it reports and what an owner may
+ask of it are the same whichever backend holds it ([27](27-consensus-roadmap-and-slates-port.md)
+§15.7). `core_state` holds them: the core's settings at open, the checks a message, a proposal, a
+read, a change of membership, a hand-over of leadership and a snapshot's feedback pass before the
+core is given them, and the status, its scalars and the peers' progress as reported. Each is moved
+from `LogNode` unchanged, and `LogNode` calls it; the shell's backend will call the same.
+focal-consensus's suite passes unchanged.
+
+### 2026-10-03 — the decoder gate, one type both backends keep
+
+What a group's records state of the decoders its entries need, and what its application confirmed
+it compiled, decide the same things over either backend: whether the group may take part, which
+decoder is required, whether a floor is ready to advertise, and whether a floor or transition write
+is due ([27](27-consensus-roadmap-and-slates-port.md) §15.7). `DecoderGate` holds those decisions,
+moved from `LogNode`'s methods unchanged; `LogNode` stages and makes durable the write the gate asks
+for as before, and the shell's backend will write its group files for it. The decoder suites pass
+unchanged.
+
+### 2026-10-03 — the shared crates at the revision the shell's backend needs
+
+`vendor/` takes the six shared crates again at `1eae0dd`, its CI green on all six targets. The
+shell's backend ([27](27-consensus-roadmap-and-slates-port.md) §15.7) needs four calls hyper-durable
+gained there:
+- the owner's priority and a member's window, passed to the core through the replica;
+- the reads the replica holds for their apply, which an owner bounding reads counts beside the
+  core's;
+- the budget lent, so an owner whose budget charges by lane says which lane before a call;
+- a wait on the group store for the oldest write's answer, as `wait_persisted` waits.
+
+The same revision carries two changes to the core, found by mantle moving its range replica onto the
+shell. They change focal's elections and allocations, not its correctness:
+- a campaign drops the member's own vote requests that have not left, since the campaign asks every
+  voter again;
+- a member keeps a spare message queue for each `Ready` whose write may be out.
+
+No manifest or locked dependency moved.
+
+### 2026-10-03 — DurableNode over the shell, its second backend
+
+[27](27-consensus-roadmap-and-slates-port.md) §15.7's backend in code. `DurableNode::open_on_shell`
+opens a member over hyper-durable's replica. Its log is one group of the node's hyper-log log, and
+its records and image are in the group's own files. The hand-over machine gives each committed
+entry to the owner's next drain, and focal-memory's budget sits under the replica's
+(`FocalBudget`). Every call the owners make answers, its checks the ones focal-log's backend makes
+(`core_state`, `DecoderGate`). Where §15.7 says the shell differs, it does:
+- no `PersistencePending`;
+- a leader's messages leave with the drive that made them;
+- a checkpoint and a decoder record are durable before their begin returns.
+
+`shared_wal` and `inject_fault_once` are focal-log's alone and are refused, typed, on the shell.
+They return a `Result` now, and their owners take it. A log whose frame cannot hold the group's
+largest entry is refused at open, since such an entry's write would fail and fence the member.
+
+The tests run over real files: contracts (a), (e), (f) and (g), a group of three electing,
+replicating and serving a follower's read, the owners' poll, wait and drain loop, and the wake
+signal. The backend takes calls hyper-durable gained for it: the core's priority and windows, the
+reads the replica holds, the budget's lane, and a wait on the group store. Only its tests construct
+it yet; the differential over the consensus simulations (§15.10) is next.
+
+### 2026-10-04 — one input stream, both backends: the differential begins
+
+[27](27-consensus-roadmap-and-slates-port.md) §15.10's differential, in scenarios. The same members
+run on focal-log's backend and on the shell (`differential_tests.rs`, `Twin`), driven by one input
+stream, each member's election seed given (`NodeConfig::election_seed`, a test's, never
+serialized), every member drained to quiescence after each input. After each round the backends
+must agree on what each member's owner was handed: the committed entries and the changes of
+membership in order, the messages in order, the snapshots, the applied index, and the reads as the
+round's set (the shell gives a read once its apply reaches the index, where focal-log may give it a
+drain earlier for the owner to park). A round that differs fails, naming the member, the round and
+what differs.
+
+Three scenarios pass: an election, entries and a follower's read; elections by timeout across a
+partition, where the members left elect one of their own and the healed leader follows; and a member
+restarted between entries, which opens to the same state on both. Each settle ends with a drain with
+nothing ready, as focal's owner now owes every request one (`Owner::drain_owed`), and both backends
+give nothing. Both backends' identity checks are one rule (`NodeConfig::same_identity`), so a test's
+seed restarts on either. The differential over the consensus simulations is next.
+
+
+### 2026-10-04 — two waits that a busy machine broke, and the rig behind one of them
+
+Run beside a machine held at a load average of sixty on eighteen cores, two tests failed.
+- `control_host`'s turn test failed 7 runs of 26: write 4, held then let through, was
+  committed after its request time and answered `OutcomeUnknown`. A trace of every
+  replica showed both followers running their periods and the leader's probes to them
+  paused for 87 of its periods after the hold opened, its heartbeats arriving tens of
+  periods late. The cause was the rig's router: it sampled the path with a millisecond's
+  sleep after every frame it delivered, so the backlog held behind a hold drained one
+  wake at a time. It samples at most once a tick now; neither the core nor the owner was
+  at fault (hyper-raft resends a probe told lost at once, and on a heartbeat's answer two
+  ticks after it). 16 runs of 16 pass at a load of 52 to 78. The test now also names
+  every write's answer when it fails.
+- `evidence_quic`'s seals were bounded by four crossings of the shaped path in the
+  wall clock; they are charged to the replicas' periods now, as every other wait. The
+  evidence suite passes at a load of 46 to 69.
+A recorded operator command in a deployment journey (`Journey::manual`) is now parsed by
+the binary itself, with its flags, so a transcript cannot name a command the CLI lacks.
+
+### 2026-10-04 — F26: the metrics page is what one operator read carries, and covers every session
+
+The sampler listed the first 512 sessions by key and nothing over all of them; and a page
+of more than a few sessions passed the 60 KiB an operator reply carries, so a node's own
+metrics read (`cluster node metrics`, now `diagnose node --metrics`) answered `Capacity`. The page is now bounded by that reply
+(`metrics::MAX_PAGE_BYTES`), every family — hosted sessions, root members, measured peers,
+admitted tenants — is aggregated whole each round without an ask, the counts sessions
+made are kept with a retired total so no node counter falls, and entities are listed
+within what is left of the page, flagged first, then rotating, the room shared in
+proportion to each family's measured cost. With 4,096 sessions in one grouped owner and
+the only stopped one past the first 512, the first round counts and lists it, under a
+load average of 31 to 36 on 18 cores; four sessions are listed a round and every one
+within 1,365 rounds; the process held 285 MiB resident beside 164 MiB its fleet's budget
+accounted. The record's F26 has the evidence; its second half (refusal classes, stop
+causes, histograms) is open there. Doc 24 §23 says how the page is made.
+
+### 2026-10-04 — F58: every connection exchanges its keys post-quantum
+
+Every TLS configuration focal builds — the node's QUIC listener, the wire client and
+server, enrollment's invitation client and authority server, the PKI's server — took
+aws-lc-rs's default provider, which offers X25519MLKEM768 first but lets a peer choose
+X25519, SecP256r1 or SecP384r1 alone, and AES-128-GCM traffic. A recorder of today's
+traffic could read whatever a quantum computer later breaks. One function,
+`focal_wire::crypto_provider`, now builds every provider: key exchange X25519MLKEM768 or
+SecP256r1MLKEM768 only, traffic AES-256-GCM or ChaCha20-Poly1305 only; `quic_client` and
+`quic_server` build the QUIC configurations, keeping RFC 9001's AES-128-GCM for Initial
+packets only, whose keys any observer derives from the connection id. `check-contracts.py`
+refuses a provider or a QUIC configuration built anywhere else in production code (a
+probe file is refused). `a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways`
+asserts a client offering only X25519 is refused, one offering only AES-128 traffic is
+refused, one offering the hybrid is served, and a focal client refuses a server speaking
+only X25519; run against the default provider it fails ("a classical exchange was
+accepted"). Three tests that wrapped focal's own configurations with quinn's `try_from`,
+which requires AES-128-GCM among the negotiated suites, now take `quic_client` /
+`quic_server` as production does. Certificates still sign classically (decision F58 says
+why); at-rest encryption is hyper-seal's, designed in the shared repository.
+
+### 2026-10-04 — R-3: the shared crates at hyper-raft df54729
+
+The six `hyper-*` snapshots move from `1eae0dd` to `df54729`, the shared repository's line, green
+on all six targets. They bring:
+- core step R-3, slates' enhancements: the R16 window rule, R17 kept appends, R13 learner rounds,
+  and every bound of the core derived from what its owner states;
+- hyper-check S-4's two core fixes: a fast leader's reads wait for the entry it began its term
+  with, and a member that lost what it kept ahead of a hole is probed;
+- hyper-durable's compaction by the thesis's rule, which asks a machine its image's bytes;
+- hyper-log's statistics;
+- hyper-timing's freshness and clock-resolution rules.
+
+focal's adaptation:
+- **Bounds stated, not taken.** The core takes `Limits::derive` from what focal states, in place of
+  fixed defaults. `core_state::limits` derives each input from `NodeConfig`:
+  - the largest message is a page or one entry of `max_entry_bytes`, inside the record;
+  - each queue holds one ready's entries counted resident;
+  - one write is out;
+  - the members are `MAX_MEMBERS`, focal's own 1,024, carried unchanged into focal-consensus because
+    the group files' bounds are sized by it.
+- **Kept appends off the wire until the fence** (27 §15.9 states what this costs and when it
+  ends). R17's kept appends say so in a refusal
+  (`Message::kept`), which raft-rs's encoding, the one focal's peers speak until the upgrade fence
+  opens a successor (18 §1), cannot state. So focal's members run `Ahead::Refused`, raft-rs's rule,
+  and the envelope refuses a `kept` it is given, as it refuses a member's mark. The test is
+  `envelope_tests::what_no_raft_rs_message_holds_is_refused`, its new case.
+- **A fast leader's readiness.** focal's readiness (`core_state::committed_in_term`, behind
+  `has_committed_current_term`, which session read barriers, membership changes and control reads
+  wait on) asked whether the entry committed is of the current term. That is the rule S-4 found
+  wrong for a fast group, whose new leader takes what its voters approved into its log under its
+  own term, below a commit made before its term began. A leader now waits for its term-start entry
+  (`Raft::commit_to_current_term`).
+  - A follower of a fast group does the same. focal-ledger's `NativeSession::settle` discards a
+    former leader's older-term proposals once the follower's commit holds an entry of the new
+    term. Under the old rule, a follower that applied the first restamped entry discarded
+    proposals whose restamped copies came later in the same log and did commit.
+  - The follower finds the term-start entry in its log: halving over the terms to the term's
+    first index, then the empty entry among the next `Limits::proposals` and one. Where its log
+    cannot show it, compacted past the term's start, it says no and disposition waits.
+  - A follower of a classic group keeps the old rule. Nothing is restamped there.
+  - `settle` also asked that the entry it had applied be of the new term. A follower applies
+    committed entries a page at a time, so it can stop at a restamped entry with its commit already
+    past the term-start entry. It now asks `DurableNode::term_began_by(applied)`: past the
+    term-start entry in a fast group, or of the new term without the fast track. In
+    `a_fast_leader_is_ready_only_once_its_term_start_entry_commits`, the entry the term-1 fast
+    quorum committed is published under the new term below the term-start entry, and
+    `term_began_by` says no there and yes at the term-start entry. The old test said yes at both.
+  - `a_fast_leader_is_ready_only_once_its_term_start_entry_commits` checks the rule at the leader
+    and at a follower after every message of a fast leader change. It cannot fail on the old rule
+    in focal's bounds, and no setting of a test can make it:
+    - the bytes a member holds approved are not a bound of their own, they are derived
+      (`Limits::derive`): one message's payload, counted resident at more than an entry's bytes
+      on the wire;
+    - an append carries a page, which is that payload;
+    - so whatever focal's settings, the recovered entries and the empty term-start entry fit one
+      append and commit together.
+
+    It holds the rule where hyper-raft's judge reached the defect (seed 15,761 of its fast
+    schedules).
+  - `a_member_restarted_under_loss_catches_up_past_its_hole` restarts a member that missed a
+    batch and refused the appends ahead of it, and checks it applies everything committed.
+- **Images weighed by size.** `HandOver` keeps its durable image's bytes for the compaction rule
+  (`StateMachine::image_bytes`).
+### 2026-10-04 — A liveness probe is never refused for a dial cooldown
+
+The zone stage failed on macOS CI (c885aac). The host in zone a3 had come back after its
+pause, been seen alive and restored the guarantee, and was then committed dead again while
+it ran: its fresh incarnation was declared dead and `DeadNode` blocked the guarantee. The
+CI log says it was declared at its own incarnation. That record had been open since
+457395c's run, and 18 local copies at a load of 56 to 75 on 18 cores did not repeat it.
+
+The cause was in the peer pool, not the detector's rules. A dial that fails puts its peer
+in a cooldown (2 s, the contact-heal fix of 2026-09-13), in which every send fails at once
+as `Lost` without a dial, so dead peers do not hold Raft's send capacity. Liveness probes
+went through the same refusal. The detector reads `Lost` as a probe sent and not answered,
+which is SWIM's failure. The peers' last dials to the paused host had failed, so as it
+came back their probes to it were refused locally, never sent, counted as failures, and
+the host was suspected and declared dead while it answered everything that reached it.
+
+A probe now dials through the cooldown (`PeerConnectionPool::connection`, `probe`). It
+takes nothing the cooldown protects, because probes have lanes of their own and one probe
+at a time per peer. A dial that connects ends the cooldown, so replication resumes on the
+probe's connection. `a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it`
+dials an address nothing answers at, starts the peer there, and asserts that replication
+is still spared its dial within the cooldown while a probe dials and is answered and
+replication then goes at once. Without the change the probe returns `Err(Lost)`.
+### 2026-10-04 — F59: code mode, one program instead of many calls
+
+The MCP adapter offers `code.search` and `code.run` beside its tools, and the CLI runs
+the same programs (`focal code search|run`) through the same backend and journal
+(19 §Code mode). A program runs in QuickJS-NG 0.16.2 through `rquickjs` 0.14, whose
+pre-generated bindings cover all eight release targets. Its calls queue inside the
+sandbox's own heap and the driver dispatches each one as a direct tool call through
+`Backend::execute`, so authorization, the journal and every operation's own limits are
+unchanged. A program that names a tool its caller may not list, or code mode itself, is
+refused `Unlisted` in the program.
+
+- **Bounds, each derived and each a typed end.** Heap: 32 MiB, twice the response bound,
+  reserved from the adapter's budget before the engine exists. Stack: 512 KiB, half the
+  worker thread. Calls: 4,096. Result: 2 MiB of JSON within the protocol's tree bound.
+  Work: 214,410 interrupt-hook calls. The hook fires once per 10,000 polls, at function
+  calls, loop back-edges, long built-in loops and regex backtracking (verified in the
+  vendored source and measured). That count is 30 s, the longest `claim.wait` may
+  already hold the worker, at the slowest rate measured: 7,147 hook calls a second for
+  a loop of built-in sorts, against 13,723 for property writes (release, Apple
+  M-series). Debug builds measured 966 to 1,809. An empty loop spends it in 0.5 s.
+- **Adversarial suite (stdio server).** Each bound ends with its own name, and the
+  server keeps serving after every one: work, heap ("out of memory"), stack (QuickJS-NG
+  raises a `RangeError`, not the `InternalError` first assumed), result (oversized,
+  BigInt, cyclic), unsettled, program, exception. Reassigning a driver entry point is
+  refused (read-only), and forged queue entries cannot choose a reference because the
+  driver counts ordinals itself. Date and Math.random replay identically under one run
+  and differ under another. A cancelled program's answer is suppressed and the slot
+  frees.
+- **Exactly once.** A V1 claim submitted by a program and replayed under the same run
+  commits once (core at sequence 2), and the same run with other input is refused.
+- **Real binary** (`cli_code_mode`, 9 s). On a native ledger, a program submits, posts
+  and reads a claim; the node is SIGKILLed and restarted; the same `focal code run`
+  replays to the same claim with the same `n1:` reference; the same run with other
+  input exits 10 (`program_failed`, a new row in the exit table); and a counting
+  program finds one claim.
+
+### 2026-10-04 — Skills over MCP, and each skill self-contained
+
+The five skills now follow the Agent Skills layout: each directory holds its `SKILL.md`
+and a `references/` folder with every file it links, so one directory copied alone still
+resolves. Before, every skill linked `../references/*.md` and `../manifest.json`, which
+break once a skill leaves the repository, and which a host of the MCP skills extension
+must refuse because it reads only within a skill's manifest. Copies of a shared
+reference are byte-identical, and the contract test refuses drift and any `../` in a
+skill. Skills linked to each other by path, which became links by name. Each skill's
+version rose by one: claims 11, evidence 10, validation 5, peers 3, cluster 22.
+
+The adapter serves the skills with `io.modelcontextprotocol/skills` (SEP-2640, final
+2026-09-13, on revision 2026-07-28). `server/discover` declares `resources` and the
+extension, with no directory reads since every file is in its skill's manifest.
+`skills/list` returns each skill's frontmatter, parsed with the parser the CLI uses, and
+a manifest of each file's `skill://` URI, SHA-256 digest (aws-lc-rs, the one provider)
+and size, computed from the bytes served. `skills/get` looks a skill up by URI, and
+`resources/read` returns a file. A 2025-11-25 client reads the same files through
+`resources/list` and `resources/read`. The files are compiled into the binary
+(`skills.rs`), and a test holds that list to the `skills/` directory byte for byte;
+`code.search` sees them as `skills`. Unknown skills and files, paths leaving a skill, a
+cursor never issued, and a directory read never offered are refused (-32602, or -32601
+for the directory read). Tests: 2 unit and 2 stdio in focal-mcp (43 in all), the
+reshaped client contract test, and focal-evidence's 57.
+
+### 2026-10-04 — Two CI failures of b9b78cb, closed at their causes
+
+- **Windows: `mcp serve` exited at start** (`mcp_native_a1`, the reader saw `Disconnected`).
+  The Windows runners check text out with CRLF, so the binary embedded each `SKILL.md`
+  as `---\r\n…`, the frontmatter parse refused it, and the adapter, which refuses to
+  serve skills it cannot describe, did not start. The skills are content-addressed (the
+  manifest pins BLAKE3 digests, the MCP manifests SHA-256), so their bytes must be the
+  same on every platform. `.gitattributes` now checks `skills/**` out with LF everywhere.
+  The parser stays strict: a CRLF skill would also carry different digests than the
+  ones pinned.
+- **Ubuntu and macOS: code mode's bounds test** waited past the stdio harness's read
+  deadline on the `work` case. Its production bound, 214,410 hook calls, takes 0.5 s on
+  the development host and longer on a runner. The test checks that the counted bound
+  ends a program with `work`, not its magnitude, so under `cfg(test)` the bound is 2,000
+  calls; the production derivation is unchanged.
+
+### 2026-10-04 — R17 behind the fence: `kept` and `lost` on focal's wire at level 3
+
+The consensus half of carrying hyper-raft's fields beyond raft-rs's (27 §15.9). The node half, the
+fence reaching every hosted group, follows in focal-node.
+- **Envelope.** `Wire::Frozen` and `Wire::Kept`; fields 17 (`kept`) and 18 (`lost`). Below the fence
+  neither is written. A reader below the fence skips 17, reading raft-rs's own refusal, and refuses
+  18. At or above it both are read and written.
+- **Members.** `set_raft_wire` and `wire()` on both consensus backends, the facade, focal-ledger's
+  `Session` and `NativeSession`, and focal-control's `Replica`. Raising one sets hyper-raft's
+  `Ahead::Kept` on the running group (hyper-raft `RawNode::set_ahead`, hyper-durable
+  `Replica::set_ahead`, taken here by a new snapshot). Peer messages decode under the member's
+  wire; focal-node encodes each send under its sender's (`encode_message_in`).
+- **Fence.** `RAFT_KEPT_LEVEL` 3 beside `ISSUER_SUCCESSION_LEVEL` 2 (24 §21). The binary's
+  `CAPABILITY_LEVEL` stays 2 until the node half raises every group, so the level a binary claims
+  and the behaviour it gates land together.
+- **Accounting.** A message's length for accounting counts every field it holds (`message_len`): a
+  raised member holding a kept refusal is charged for it, not refused.
+- **Tests** (`wire_tests.rs`, six):
+  - the fields' golden bytes;
+  - raft-proto `8e4cef1` reading a kept refusal as its own;
+  - the reader below the fence;
+  - a member raised before its leader converging;
+  - a leader change between keeping and resend, after which nothing of the former term the new
+    leader lacked survives;
+  - the fence raised during traffic, member by member, every proposal applied once and in order.
+- **Still to come.** R17's timed measurement at focal's level, before and after (p50 and p99,
+  commits a second, load, seeds), and the S-4 kept-hole probe test at focal's level, with the node
+  half.
+
+
+### 2026-10-04 — The shared crates at hyper-raft 4c4a199
+
+The six `hyper-*` snapshots move to `4c4a199`, the shared repository's line once its six targets
+are green on it. `hyper-raft` and `hyper-durable` had been taken from `fc61b65`, the branch that
+carried `set_ahead` before it reached line; their sources are byte-identical at `4c4a199`, and the
+other four are unchanged from `df54729`. Line also carries hyper-quic's second overhead round and
+the e2e harness's flush bound, neither of which focal vendors. `vendor/README.md` and
+`docs/dependencies/inventory.tsv` name the new revision.
+
+### 2026-10-05 — The fast track is withheld until the shared crates' release fix
+
+hyper-check's swarm search, with no mutant planted, found a Leader Completeness violation in the
+shared crates' fast track. A member releases a held fast vote once its log covers the vote's
+index; a later leader cuts that log back below the index; recovery then picks another value.
+FastTrack.tla's `Release` has the same flaw, which is why the model passed. The fix is made in the
+shared repository, at the release rule, with a directed test from the counterexample, the model
+changed so TLC finds the old rule's violation, and the campaigns replayed.
+
+No focal group runs the fast track today: `NodeConfig::fast` defaults to false, and no source
+outside this crate's tests sets it. `NodeConfig::validate` now refuses `fast: true` outside the
+crate's own tests, so that holds by rule rather than by convention until the snapshot with the fix
+is taken, which removes the rule. `tests/fast_withheld.rs` opens a member configured for the fast
+track and asserts the refusal, then opens the same member without it.
+### 2026-10-05 — A ledger stopped for good at about 4,200 claims; what admission takes, a checkpoint holds
+
+A single-node ledger driven over QUIC by `focal-load` stopped permanently at about 4,200
+native claims: "native session checkpoint: native Core checkpoint: native codec capacity
+exceeded". Every restart stopped it again, and every request to it was answered
+`unavailable`. Measured (`measure_the_checkpoint_of_a_ledger_of_thousands_of_claims`,
+release), the bound that fired was the checkpoint plan's work: 4,500 claims are 54,002
+rows and 7.6 MB, but cost 248,714,968 of the 268,435,456 visits allowed, about 4,600 a
+row and linear in the ledger (500 claims 27.7 M, 1,000 55.3 M, 2,000 110.5 M). Three
+defects, each fixed at its cause:
+
+- **A seek per row.** The root frame charged every row `iteration_work()`, a whole
+  directory seek (65 × 64 visits), but an in-order walk seeks once into each member and
+  at most once more per page. It now charges each seek once (`store_seeks`: pages,
+  members and the terminating probe) and each row one in-page step (`ROW_STEP`, 64). The
+  same ledger costs 30,738,456 visits, with byte-identical output.
+- **Admission did not check what a checkpoint could hold.** Rows were admitted past
+  bounds only a checkpoint enforced, so the session reached a state it could not
+  checkpoint and stopped. `NativeOwner::checkpoint_projection` bounds the next checkpoint
+  from above: the committed rows plus every pending candidate's writes, and the encoded
+  bytes as rows at their widest inline encoding plus the rows' heap (the pages' charge
+  less their entries' inline size, plus pending) at the codec's expansion.
+  `checkpointable` refuses a fresh candidate past the checkpoint's rows or assembled
+  bytes with typed, retryable `Capacity`. Exact retries are never refused and the
+  session keeps serving. `a_checkpoint_projection_bounds_the_checkpoint_it_projects`
+  proves the projection is never below the encoding; the first, coarser bound (4× the
+  whole budget) refused a parallel-materialization test's legitimate work and was
+  replaced by the per-kind one.
+- **A fixed 100,000-row bound below what memory holds.** The checkpoint's row bound is
+  now the session's memory over a row's resident size (`NATIVE_ENTRY_BYTES`, 344 bytes):
+  390,167 rows at 128 MiB.
+
+`a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints` fills a
+session to a 200-row bound: the next creation is refused typed and retryable, the
+checkpoint succeeds, and an exact retry is answered. Without the admission check, 200
+rows never refuse. The ledger that had stopped opens Ready on the fixed binary,
+checkpoints, and commits new claims (sequence 4,622).
+
+### 2026-10-05 — Group commit on the single-node owner: 8 callers no longer wait in line for 8 flushes
+
+Measured with `focal-load` (release, embedded, `authored_v1`, 2,000 creations, seeds
+1–3, macOS arm64 with the host otherwise busy), 8 concurrent callers committed no more
+than 1 did: about 73 commits a second either way, with the 8 callers' p50 at 105 ms
+(p99 119–476 ms) against 12.8 ms for 1. Sampling the run showed the cause. The
+session-owner thread spent 97% of its time in `admit_local` → `Session::poll` →
+`WalAppend::wait_blocking`: each native admission proposed its frame and then waited
+for that frame's own flush before the owner took the next request. The WAL writer
+already groups every batch queued with it into one fence (up to 64), but it was never
+given more than one. Each flush is the segment's `fsync` plus the fence's install
+(write, `fsync`, rename, directory `fsync`), about 13 ms here.
+
+The replicated owner (`fleet.rs`) already parks a request with a deadline and answers it
+when its commit arrives. The single-node owner (`LocalHost`, which `focal start` and the
+embedded transport use) now does the same for native mutations. A fresh proposal is
+parked with its reply header, answer channel and charge. The owner takes every queued
+request before it waits on the log, so the frames that arrive during one flush are
+proposed before the next and share it: group commit (DeWitt et al., *Implementation
+Techniques for Main Memory Database Systems*, SIGMOD 1984; Raft thesis §10.2.1 on
+batching). Each parked proposal is answered on its commit, or with its ticket after
+`COMMIT_POLLS` (8) owner polls, the budget a lone proposal had before. Parked proposals
+are bounded by the ingress queue's own bound (`INGRESS`, 32). With that many parked, the
+owner waits on the log before it takes another request, so a slow disk slows callers and
+grows no queue. Stop and a closed ingress answer every parked proposal first.
+
+After, same runs: 1 caller 75 commits/s (p50 12.8 ms, unchanged), 8 callers 503–512
+commits/s (6.9×), p50 15.7 ms, p99 16.9–17.7 ms.
+`proposals_taken_before_one_poll_share_its_flush` dispatches 8 fresh frames on one
+owner, settles them, and asserts all 8 commit in exactly one group commit; before, each
+dispatch polled its own.
+
+### 2026-10-05 — A dropped proposal ended a node's service; the core's refusal now says why
+
+CI on 3113638 (Linux, push run) failed `a_crowded_partition_splits_survives_a_restart_and_merges_back`
+waiting for the merge back to one delegation. One node's service had ended with
+`Directory(Control(Consensus(Raft(ProposalDropped))))`. hyper-raft answers one
+`ProposalDropped` for several causes: a member that does not lead, a leader handing over its
+leadership or no longer a member of what it leads, a leader whose uncommitted entries fill its
+bound. focal passed it through as an untyped `Raft` error. The control RPC answers those as
+`Failed`, and the directory's startup, which runs fail-stop in its owner's thread, ended the
+owner and then the service. The pull-request run of the same commit passed, and 30 runs,
+three at a time, did not reproduce it, so which cause fired here is not known. The fix does not
+depend on it:
+
+- `core_state::proposal_refused` names the cause from the core's own state: `NotLeader { leader }`,
+  `LeaderLeaving` or `Capacity`. `DurableNode`'s proposals (plain, fast track, configuration
+  change) and the shell's answers use it, so every owner gets a refusal it already retries, and
+  the next occurrence names its cause. `a_dropped_proposal_is_refused_by_its_cause` fills a
+  leader's smallest legal bound (three 512-byte entries in 1,536 bytes) and asserts `Capacity`, then
+  `LeaderLeaving` during a handover and `NotLeader` at a follower. Without the classification it
+  fails at the first.
+- The founder's re-activation in `DirectoryBootstrapPermit::open` asks again after a drain when its
+  submission is refused for something that passes as the log drains (`Capacity`,
+  `PersistencePending`, `Busy`, `NotReady`), within startup's 16 rounds. Any other refusal still
+  ends startup, now by its name. The directory bootstrap's admission map answers `LeaderLeaving`
+  as not ready, as the control RPC already did.
+
+### 2026-10-05 — Every YAML document under a stated budget, held by a contract rule
+
+Condition 6's sweep for expansion bombs. focal compresses nothing (no compression crate is in
+the [inventory](../dependencies/inventory.tsv)), so the decompression-bomb surface is what its
+decoders expand. The wire, record and input codecs already refuse declared lengths before
+allocating (R11 §3), and client inputs, deployment configuration and its schema parse YAML with
+no aliases or anchors and bounded depth, events, nodes and scalar bytes. Two sites took
+serde-saphyr's default budget, which admits 50,000 aliases and 250,000 nodes:
+
+- `focal-load`'s shape file. It also read its file with an unbounded `read_to_string` after
+  checking its length, so a file that grew in between was read whole. It now reads through the
+  bound and refuses a file that grew.
+- The MCP server's skill frontmatter. The skills are compiled in, but they are parsed as any
+  YAML focal reads.
+
+Both now parse under the shared budget. `a_shape_that_expands_by_aliases_is_refused` and
+`frontmatter_that_expands_by_aliases_is_refused` refuse a five-level alias expansion (9^5
+nodes from a few hundred bytes, the "billion laughs" shape). The shape test also shows that the
+default budget admits an anchor and alias that the stated one refuses, and the skills test fails
+without the budget. `scripts/check-contracts.py` now refuses `serde_saphyr::from_str`,
+`from_slice` and `from_reader` in production sources (an inline test module may compare against
+them), so a new site cannot take the default.

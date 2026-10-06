@@ -15,6 +15,8 @@
 //! Missing runtime context returns a typed transport error before dispatch.
 mod admission;
 mod auth;
+mod crypto;
+pub use crypto::{crypto_provider, quic_client, quic_server};
 pub mod congestion;
 mod frame;
 mod handler;
@@ -29,6 +31,7 @@ mod reconcile;
 mod round;
 mod transport;
 mod traversal;
+mod trust;
 mod validators;
 pub use admission::*;
 pub use auth::*;
@@ -47,6 +50,7 @@ pub use round::*;
 pub use local::{LocalRemote as UnixRemote, LocalServer as UnixServer};
 pub use transport::*;
 pub use traversal::*;
+pub use trust::*;
 pub use validators::*;
 #[cfg(test)]
 mod tests;

@@ -21,13 +21,16 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const ADMIN_SOCKET: &str = "focal-admin.sock";
 const MAGIC: &[u8] = b"FCLADMIN1";
-const MAX_COMMAND: usize = 60 * 1024;
+pub(crate) const MAX_COMMAND: usize = 60 * 1024;
 /// The lease a repair's export holds; a walk that outlives it resumes.
 const REPAIR_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const WORKSPACE: usize = 2 * 1024 * 1024;
 #[path = "replica_admin_protocol.rs"]
 mod replicas;
 pub use replicas::{ReplicaAdminCommand, ReplicaAdminReply, ReplicaAdminStatus};
+#[path = "partition_admin_protocol.rs"]
+mod partitions;
+pub use partitions::{PartitionAdminCommand, PartitionAdminReply};
 #[path = "operator_admin.rs"]
 pub(crate) mod operator;
 pub use operator::OperatorRead;
@@ -39,6 +42,7 @@ pub fn admin_wire_limits() -> WireLimits {
         max_items: 1,
         max_connections: 8,
         streams_per_connection: 1,
+        control_streams: 1,
         request_timeout: Duration::from_secs(20),
     }
 }
@@ -58,11 +62,18 @@ pub enum AdminCommand {
         name: String,
     },
     Replica(Box<ReplicaAdminCommand>),
+    /// A directory partition group this node hosts (24 §13; F24): its
+    /// configuration, or one membership change where this node leads it.
+    Partition(Box<PartitionAdminCommand>),
     Operator(OperatorRead),
     /// Renew this node's own credential now.
     RenewCredential,
     /// Rotate this node's own credential to a fresh key now (24 §11).
     RotateCredential,
+    /// The issuers credentials chain to, as committed (24 §11).
+    Issuers,
+    /// Stage the issuer's successor now; founder only (24 §11).
+    RotateIssuer,
     /// The placement view and the controller's next actions.
     Placement,
     /// Admit a tenant the cluster serves; founder only, exact on retry
@@ -87,6 +98,14 @@ pub enum AdminCommand {
         max_failures: u16,
         /// Propose and report without journaling a plan.
         dry_run: bool,
+    },
+    /// Plan the root group's voters under a requested durability
+    /// (`survive`: 0 node, 1 zone, 2 region; the audit's F24): what the
+    /// directory's solver would seat, reported and never journaled — the
+    /// deployment's apply promotes them, one exact request each.
+    PlanControl {
+        survive: u8,
+        max_failures: u16,
     },
     /// Move one member of a session's range group to a node (25 §6).
     MoveRange {
@@ -201,6 +220,30 @@ pub struct SessionPlannedReply {
     pub dry_run: bool,
 }
 pub const SESSION_PLANNED_REPLY_SCHEMA: u16 = 2;
+/// The reply to [`AdminCommand::PlanControl`]: the root voters the requested
+/// durability needs, at the configuration they were planned against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlannedReply {
+    pub schema: u16,
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    /// `planned` (0) or `satisfied` (2): the current voters already tolerate
+    /// the requested failures.
+    pub state: u8,
+    /// The directory's partition groups under the same request (F24).
+    pub partitions: Vec<PartitionPlannedReply>,
+}
+/// One partition group's plan: `planned` (0), `satisfied` (2) or `refused`
+/// (3, no set of nodes seats it; `voters` are then the current ones).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionPlannedReply {
+    pub partition: [u8; 16],
+    pub group: [u8; 16],
+    pub voters: Vec<u64>,
+    pub configuration_index: u64,
+    pub state: u8,
+}
+pub const CONTROL_PLANNED_REPLY_SCHEMA: u16 = 2;
 /// The tenants the cluster serves: the founder's own and every admitted one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantsReply {
@@ -242,7 +285,7 @@ pub struct PlacementReply {
     pub placement: focal_client::admin::AdminPlacement,
     pub actions: Vec<focal_client::admin::AdminPlannedAction>,
 }
-pub const PLACEMENT_REPLY_SCHEMA: u16 = 1;
+pub const PLACEMENT_REPLY_SCHEMA: u16 = 2;
 /// The view fits one admin frame: sessions and nodes beyond these bounds are
 /// reported as truncated.
 const MAX_REPORT_SESSIONS: usize = 48;
@@ -266,6 +309,23 @@ pub(crate) struct TopologyLabels {
     /// The nodes whose credential the enrollment registry still authorizes;
     /// `None` when the registry could not be read.
     pub credentialed: Option<std::collections::BTreeSet<u64>>,
+    /// The control groups as the root observation names them (F24).
+    pub control: Option<ControlFacts>,
+}
+/// The root's configuration and the groups its authority grants, from one
+/// local observation of the root replica.
+#[derive(Debug, Clone)]
+pub(crate) struct ControlFacts {
+    pub root_group: [u8; 16],
+    pub leader: u64,
+    pub configuration: focal_control::ControlConfiguration,
+    pub authority: Option<focal_directory::AuthorityCheckpoint>,
+    /// The partition groups this node hosts, by group: where each leads and
+    /// the configuration index its replica applied (F24).
+    pub hosted: std::collections::BTreeMap<[u8; 16], (u64, u64)>,
+    /// The nodes holding the issuer's signing key: the founder, until the
+    /// issuer is handed on (F13 stage 3).
+    pub issuer_holders: Vec<u64>,
 }
 /// What a node's committed contact says about it (24 §22, §24).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -303,6 +363,13 @@ pub(crate) fn placement_reply(
     };
     let mut partitions = Vec::new();
     let mut actions = Vec::new();
+    // The control plane measured by the first partition's registry: the
+    // nodes every partition knows are the same nodes.
+    let control = labels
+        .control
+        .as_ref()
+        .zip(report.partitions.first())
+        .map(|(facts, (_, checkpoint))| control_plane(facts, &checkpoint.nodes));
     for (delegation, checkpoint) in report.partitions {
         let (split_at, merge_at) = crate::placement_agent::split::thresholds(checkpoint.cluster.0);
         let partition = hex(&delegation.partition.0);
@@ -535,8 +602,112 @@ pub(crate) fn placement_reply(
         placement: AdminPlacement {
             observed_at: report.observed_at,
             partitions,
+            control,
         },
         actions,
+    }
+}
+/// One control group for the operator: its voters and what they tolerate
+/// of each failure class as a quorum, by the rule a session's placement is
+/// measured by (`voters_tolerance`, the audit's F24).
+#[allow(clippy::too_many_arguments)]
+fn control_group(
+    kind: &str,
+    group: [u8; 16],
+    partition: Option<String>,
+    leader: u64,
+    configuration_index: u64,
+    voters: Vec<u64>,
+    learners: Vec<u64>,
+    nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+) -> focal_client::admin::AdminControlGroup {
+    let measure = |class: focal_directory::FailureClass| {
+        focal_directory::voters_tolerance(voters.iter().copied(), class, nodes).ok()
+    };
+    let node = measure(focal_directory::FailureClass::Node);
+    let zone = measure(focal_directory::FailureClass::Zone);
+    let region = measure(focal_directory::FailureClass::Region);
+    focal_client::admin::AdminControlGroup {
+        kind: kind.to_owned(),
+        group: hex(&group),
+        partition,
+        leader,
+        configuration_index,
+        tolerates_node: node.as_ref().and_then(|tolerance| tolerance.achieved),
+        tolerates_zone: zone.as_ref().and_then(|tolerance| tolerance.achieved),
+        tolerates_region: region.as_ref().and_then(|tolerance| tolerance.achieved),
+        // What blocks a voter blocks it in every class; the node class
+        // names them without the unknown domains the broader classes add.
+        blocked_by: node
+            .as_ref()
+            .map(|tolerance| {
+                tolerance
+                    .blocked_by
+                    .iter()
+                    .map(|blocker| match blocker.node {
+                        Some(node) => format!("{:?} on node {node}", blocker.reason),
+                        None => format!("{:?}", blocker.reason),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        voters,
+        learners,
+    }
+}
+/// The control plane's survival (24 §15, F24): the root group from its
+/// configuration, every partition group from the root's authority grants,
+/// and the issuer from where its key is held.
+fn control_plane(
+    facts: &ControlFacts,
+    nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+) -> focal_client::admin::AdminControlPlane {
+    let root = control_group(
+        "root",
+        facts.root_group,
+        None,
+        facts.leader,
+        facts.configuration.configuration_index,
+        facts.configuration.configuration.voters.clone(),
+        facts.configuration.configuration.learners.clone(),
+        nodes,
+    );
+    let partitions = facts
+        .authority
+        .iter()
+        .flat_map(|authority| authority.groups.values())
+        .filter_map(|grant| match &grant.scope {
+            focal_directory::GroupScope::Partition { partition, .. } => {
+                // Where this node hosts the group it knows the leader and
+                // the applied configuration; elsewhere the root's grant
+                // names the seats and neither.
+                let (leader, configuration_index) =
+                    facts.hosted.get(&grant.group.0).copied().unwrap_or((0, 0));
+                Some(control_group(
+                    "partition",
+                    grant.group.0,
+                    Some(hex(&partition.0)),
+                    leader,
+                    configuration_index,
+                    grant.voters.keys().copied().collect(),
+                    grant.learners.keys().copied().collect(),
+                    nodes,
+                ))
+            }
+            focal_directory::GroupScope::Session(_) => None,
+        })
+        .collect();
+    focal_client::admin::AdminControlPlane {
+        root,
+        partitions,
+        issuer: focal_client::admin::AdminIssuer {
+            tolerates_node: u16::try_from(facts.issuer_holders.len().saturating_sub(1))
+                .unwrap_or(u16::MAX),
+            holders: facts.issuer_holders.clone(),
+            note: "the issuer's signing key is held by the founder alone: enrollment, \
+                   credential renewal and rotation wait for it (24 §11)"
+                .into(),
+        },
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -634,9 +805,13 @@ impl AdminCommand {
         match self {
             Self::Operator(read) => read.validate(),
             Self::Replica(command) => command.validate(),
-            Self::RenewCredential | Self::RotateCredential | Self::Placement | Self::Tenants => {
-                Ok(())
-            }
+            Self::Partition(command) => command.validate(),
+            Self::RenewCredential
+            | Self::RotateCredential
+            | Self::Issuers
+            | Self::RotateIssuer
+            | Self::Placement
+            | Self::Tenants => Ok(()),
             Self::AdmitTenant { tenant } if *tenant == [0; 16] => Err(AccessError::InvalidRequest),
             Self::AdmitTenant { .. } => Ok(()),
             Self::UpgradeStatus => Ok(()),
@@ -657,6 +832,15 @@ impl AdminCommand {
             } => {
                 if *tenant == [0; 16] || *session == [0; 16] || *survive > 2 || *max_failures > 255
                 {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::PlanControl {
+                survive,
+                max_failures,
+            } => {
+                if *survive > 2 || *max_failures > 255 {
                     return Err(AccessError::InvalidRequest);
                 }
                 Ok(())
@@ -887,6 +1071,8 @@ pub struct LocalNetworkAdmin {
     directory: PathBuf,
     identity: NodeIdentity,
     root: ControlIdentity,
+    /// The founder's node: the issuer's key is held there (24 §11).
+    founder: u64,
     advertise: SocketAddr,
     /// The name this node advertises (24 §24), when it has one.
     endpoint: Option<String>,
@@ -894,6 +1080,8 @@ pub struct LocalNetworkAdmin {
     enrollment: Option<QuorumEnrollmentHost>,
     control: Option<crate::control_host::ControlHost>,
     fleet: Option<crate::fleet::FleetManager>,
+    /// The partitions this node hosts (F24).
+    partitions: Option<crate::network_service::DirectoryHandle>,
     content: Option<crate::content_host::ContentHost>,
     credentials: Option<crate::credential_renewal::CredentialHandle>,
     placement: Option<crate::placement_control::PlacementHandle>,
@@ -903,7 +1091,7 @@ pub struct LocalNetworkAdmin {
     /// The evidence coordinator, for repairs (24 §20).
     evidence: Option<crate::evidence_service::EvidenceCoordinator>,
     /// The latest metrics snapshot the service sampled (24 §23).
-    metrics: Option<tokio::sync::watch::Receiver<Option<crate::metrics::MetricsSnapshot>>>,
+    metrics: Option<tokio::sync::watch::Receiver<Option<crate::metrics::MetricsPage>>>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -928,12 +1116,14 @@ impl LocalNetworkAdmin {
             directory: directory.root().to_path_buf(),
             identity: directory.identity().clone(),
             root,
+            founder: state.genesis.founder.node,
             advertise,
             endpoint: state.endpoint.clone(),
             listen: state.listen,
             enrollment: Some(enrollment),
             control: None,
             fleet: None,
+            partitions: None,
             content: None,
             credentials: None,
             placement: None,
@@ -967,12 +1157,14 @@ impl LocalNetworkAdmin {
             directory: directory.root().to_path_buf(),
             identity: directory.identity().clone(),
             root,
+            founder: state.genesis.founder.node,
             advertise,
             endpoint: state.endpoint.clone(),
             listen: state.listen,
             enrollment,
             control: None,
             fleet: None,
+            partitions: None,
             content: None,
             credentials: None,
             placement: None,
@@ -1011,7 +1203,7 @@ impl LocalNetworkAdmin {
     }
     pub fn with_metrics(
         mut self,
-        metrics: tokio::sync::watch::Receiver<Option<crate::metrics::MetricsSnapshot>>,
+        metrics: tokio::sync::watch::Receiver<Option<crate::metrics::MetricsPage>>,
     ) -> Self {
         self.metrics = Some(metrics);
         self
@@ -1212,6 +1404,60 @@ impl LocalNetworkAdmin {
         postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
         Ok(bytes)
     }
+    /// The root group's voters a durability needs (F24; `survive` 0 node,
+    /// 1 zone, 2 region).
+    async fn plan_control(&self, survive: u8, max_failures: u16) -> Result<Vec<u8>, AccessError> {
+        let durability = focal_directory::DurabilityIntent {
+            survive: match survive {
+                0 => focal_directory::FailureClass::Node,
+                1 => focal_directory::FailureClass::Zone,
+                2 => focal_directory::FailureClass::Region,
+                _ => return Err(AccessError::InvalidRequest),
+            },
+            max_failures,
+        };
+        let planned = self
+            .placement
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .plan_control(durability)
+            .await
+            .map_err(|error| {
+                use crate::placement_agent::AgentError;
+                match error {
+                    AgentError::Capacity => AccessError::Capacity,
+                    AgentError::Registration(_) | AgentError::Identity => {
+                        AccessError::InvalidRequest
+                    }
+                    _ => AccessError::Unavailable,
+                }
+            })?;
+        let state = |state: crate::placement_control::PlanState| match state {
+            crate::placement_control::PlanState::Planned => 0,
+            crate::placement_control::PlanState::Pending => 1,
+            crate::placement_control::PlanState::Satisfied => 2,
+        };
+        let mut partitions = Vec::new();
+        partitions
+            .try_reserve_exact(planned.partitions.len())
+            .map_err(|_| AccessError::Capacity)?;
+        for group in planned.partitions {
+            partitions.push(PartitionPlannedReply {
+                partition: group.partition,
+                group: group.group,
+                voters: group.voters,
+                configuration_index: group.configuration_index,
+                state: if group.refused { 3 } else { state(group.state) },
+            });
+        }
+        encode_reply(&ControlPlannedReply {
+            schema: CONTROL_PLANNED_REPLY_SCHEMA,
+            voters: planned.voters,
+            configuration_index: planned.configuration_index,
+            state: state(planned.state),
+            partitions,
+        })
+    }
     /// The controller's clock, and for how long a death of each session of
     /// `report` stands before its seat moves (27 §5): one election window
     /// of the session's group where this node hosts a copy of it, and of
@@ -1287,6 +1533,26 @@ impl LocalNetworkAdmin {
                     .collect()
             });
         }
+        let mut hosted = std::collections::BTreeMap::new();
+        if let Some(directory) = &self.partitions {
+            for partition in directory.hosted() {
+                let progress = partition.host.progress();
+                if let Ok(witness) = partition.host.witness_membership().await {
+                    hosted.insert(
+                        progress.identity.group,
+                        (progress.leader, witness.configuration.configuration_index),
+                    );
+                }
+            }
+        }
+        labels.control = Some(ControlFacts {
+            root_group: self.root.group,
+            leader: control.progress().leader,
+            configuration: observation.configuration().clone(),
+            authority: observation.authority().cloned(),
+            hosted,
+            issuer_holders: vec![self.founder],
+        });
         for contact in &observation.contacts().contacts.records {
             labels.contacts.insert(
                 contact.node,
@@ -1573,17 +1839,35 @@ impl LocalNetworkAdmin {
             .as_ref()
             .ok_or(AccessError::Unavailable)?
             .plan_session(ledger, durability, dry_run)
-            .await
-            .map_err(|error| {
+            .await;
+        // A plan the partition refused — the observation it was made on
+        // went stale — is answered by name (24 §16): the operator replans.
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(crate::placement_agent::AgentError::Control(
+                ControlFailure::CompareFailed | ControlFailure::Rejected,
+            )) => {
+                return encode_reply(&SessionPlannedReply {
+                    schema: SESSION_PLANNED_REPLY_SCHEMA,
+                    tenant,
+                    session,
+                    operation: [0; 16],
+                    voters: Vec::new(),
+                    state: 3,
+                    dry_run,
+                });
+            }
+            Err(error) => {
                 use crate::placement_agent::AgentError;
-                match error {
+                return Err(match error {
                     AgentError::Capacity => AccessError::Capacity,
                     AgentError::Registration(_) | AgentError::Identity => {
                         AccessError::InvalidRequest
                     }
                     _ => AccessError::Unavailable,
-                }
-            })?;
+                });
+            }
+        };
         encode_reply(&SessionPlannedReply {
             schema: SESSION_PLANNED_REPLY_SCHEMA,
             tenant,
@@ -1616,6 +1900,47 @@ impl LocalNetworkAdmin {
         };
         encode_credential_reply(&reply)
     }
+}
+impl LocalNetworkAdmin {
+    /// The issuers as the committed registry names them (24 §11).
+    async fn issuers(&self, id: RequestId) -> Result<Vec<u8>, AccessError> {
+        use crate::credential_renewal::{IssuerReply, IssuerSummary};
+        let (_, registry) = self.read_registry(id).await?;
+        encode_reply(&IssuerReply::Issuers(Box::new(IssuerSummary::of(
+            registry.issuers(),
+            registry.fence().level,
+        ))))
+    }
+    /// Stage the issuer's successor through the founder's enrollment
+    /// authority (24 §11), then answer with the issuers as committed; a
+    /// fence below the succession's level is answered by name.
+    async fn rotate_issuer(&self, id: RequestId) -> Result<Vec<u8>, AccessError> {
+        use crate::credential_renewal::{IssuerReply, IssuerSummary};
+        let enrollment = self.enrollment.as_ref().ok_or(AccessError::Unauthorized)?;
+        let now = unix_now()?;
+        match enrollment.rotate_issuer(now).await {
+            Ok(issuers) => {
+                let (_, registry) = self.read_registry(id).await?;
+                encode_reply(&IssuerReply::Issuers(Box::new(IssuerSummary::of(
+                    &issuers,
+                    registry.fence().level,
+                ))))
+            }
+            Err(QuorumEnrollmentError::Fenced { level, needed }) => {
+                encode_reply(&IssuerReply::Fenced { level, needed })
+            }
+            Err(error) => Err(enrollment_error(error)),
+        }
+    }
+}
+fn unix_now() -> Result<i64, AccessError> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| AccessError::Unavailable)?
+            .as_secs(),
+    )
+    .map_err(|_| AccessError::Unavailable)
 }
 fn encode_credential_reply(
     reply: &crate::credential_renewal::CredentialReply,
@@ -1679,11 +2004,20 @@ impl LocalNetworkAdmin {
         if let AdminCommand::Replica(command) = command {
             return self.replica_command(*command).await;
         }
+        if let AdminCommand::Partition(command) = command {
+            return self.partition_command(*command).await;
+        }
         if let AdminCommand::RenewCredential = command {
             return self.renew_credential().await;
         }
         if let AdminCommand::RotateCredential = command {
             return self.rotate_credential().await;
+        }
+        if let AdminCommand::Issuers = command {
+            return self.issuers(request.request_id).await;
+        }
+        if let AdminCommand::RotateIssuer = command {
+            return self.rotate_issuer(request.request_id).await;
         }
         if let AdminCommand::Placement = command {
             return self.placement().await;
@@ -1743,6 +2077,13 @@ impl LocalNetworkAdmin {
             return self
                 .plan_session(tenant, session, survive, max_failures, dry_run)
                 .await;
+        }
+        if let AdminCommand::PlanControl {
+            survive,
+            max_failures,
+        } = command
+        {
+            return self.plan_control(survive, max_failures).await;
         }
         if let AdminCommand::MoveRange {
             tenant,
@@ -1900,13 +2241,17 @@ impl LocalNetworkAdmin {
             | AdminCommand::InviteClient { .. }
             | AdminCommand::Operator(_)
             | AdminCommand::Replica(_)
+            | AdminCommand::Partition(_)
             | AdminCommand::RenewCredential
             | AdminCommand::RotateCredential
+            | AdminCommand::Issuers
+            | AdminCommand::RotateIssuer
             | AdminCommand::Placement
             | AdminCommand::AdmitTenant { .. }
             | AdminCommand::Tenants
             | AdminCommand::CreateSession { .. }
             | AdminCommand::PlanSession { .. }
+            | AdminCommand::PlanControl { .. }
             | AdminCommand::MoveRange { .. }
             | AdminCommand::GcRestore { .. }
             | AdminCommand::BackupCreate { .. }
@@ -1963,11 +2308,13 @@ fn enrollment_error(error: QuorumEnrollmentError) -> AccessError {
         }
         QuorumEnrollmentError::Stopped => AccessError::OutcomeUnknown,
         QuorumEnrollmentError::Identity => AccessError::Unauthorized,
+        QuorumEnrollmentError::Fenced { .. } => AccessError::Unavailable,
         QuorumEnrollmentError::IntentConflict => AccessError::InvalidRequest,
         QuorumEnrollmentError::Enrollment(
             EnrollmentError::Invalid
             | EnrollmentError::WrongCluster
             | EnrollmentError::Unauthorized
+            | EnrollmentError::Unpinned
             | EnrollmentError::Expired
             | EnrollmentError::Revoked
             | EnrollmentError::Used,

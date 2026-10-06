@@ -1,7 +1,7 @@
 use super::{ConsensusError, NodeConfig};
 use crate::memory::{entry_bytes, reserve, snapshot_bytes};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_raft::{
+use hyper_raft::{
     InitialState, Storage, StorageError,
     proto::{self, ConfState, Entry, HardState, Snapshot},
 };
@@ -18,10 +18,17 @@ pub(super) struct RamLog {
     /// with its charge. At most what the core holds (`Limits::proposals`).
     pub proposals: Vec<(Entry, Allocation)>,
     charges: VecDeque<Allocation>,
+    /// The bytes of the retained entries, running: through each entry,
+    /// from an origin that moves with compaction, so the bytes of any
+    /// range are a subtraction (`bytes_between`) and never a walk.
+    cumulative: VecDeque<u64>,
+    /// The running total before the first retained entry.
+    origin: u64,
     entry_bytes: usize,
     snapshot_charge: Option<Allocation>,
     slots: Option<Allocation>,
-    metadata: Allocation,
+    /// Held for the log's life: the charge of its identity and configuration.
+    _metadata: Allocation,
     budget: MemoryBudget,
 }
 pub(super) struct PreparedSnapshot {
@@ -36,12 +43,16 @@ pub(super) struct PreparedUpdate {
 }
 impl RamLog {
     pub fn new(config: &NodeConfig, budget: MemoryBudget) -> Result<Self, ConsensusError> {
+        // The log's own state and its copy of the configuration: each
+        // member's id once, in the voters or the learners, with the
+        // bookkeeping of the four member lists.
         let amount = config
             .voters
             .len()
             .checked_add(config.learners.len())
-            .and_then(|n| n.checked_mul(64))
-            .and_then(|n| n.checked_add(4096))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<u64>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .and_then(|n| n.checked_add(4 * focal_memory::ALLOCATOR_OVERHEAD))
             .ok_or(ConsensusError::Capacity)?;
         let metadata = reserve(&budget, BudgetKind::Control, BudgetLane::Completion, amount)?;
         Ok(Self {
@@ -55,28 +66,66 @@ impl RamLog {
             snapshot: Snapshot::default(),
             proposals: Vec::new(),
             charges: VecDeque::new(),
+            cumulative: VecDeque::new(),
+            origin: 0,
             entry_bytes: 0,
             snapshot_charge: None,
             slots: None,
-            metadata,
+            _metadata: metadata,
             budget,
         })
-    }
-    pub fn resident_bytes(&self) -> Result<usize, ConsensusError> {
-        self.proposals
-            .iter()
-            .try_fold(self.metadata.bytes(), |bytes, (_, charge)| {
-                bytes.checked_add(charge.bytes())
-            })
-            .and_then(|n| n.checked_add(self.entry_bytes))
-            .and_then(|n| n.checked_add(self.snapshot_charge.as_ref().map_or(0, Allocation::bytes)))
-            .and_then(|n| n.checked_add(self.slots.as_ref().map_or(0, Allocation::bytes)))
-            .ok_or(ConsensusError::Capacity)
     }
     /// The index of the stored snapshot the log is compacted behind; zero
     /// while the log is complete from its first entry.
     pub fn snapshot_index(&self) -> u64 {
         proto::snapshot_index(&self.snapshot)
+    }
+    /// The bytes the retained entries of `[low, high)` hold — the first
+    /// `max_entries` of them at most, and `cap` at most — from the running
+    /// totals kept beside the entries, so that asking about a range costs
+    /// nothing whatever its length. Indexes behind the first retained
+    /// entry hold nothing here (they are the snapshot's).
+    pub fn bytes_between(
+        &self,
+        low: u64,
+        high: u64,
+        max_entries: usize,
+        cap: usize,
+    ) -> Result<usize, ConsensusError> {
+        let low = low.max(self.first_index()?);
+        let high = high
+            .min(self.last_index()?.saturating_add(1))
+            .min(low.saturating_add(u64::try_from(max_entries).unwrap_or(u64::MAX)));
+        if low >= high {
+            return Ok(0);
+        }
+        let from = self.position(low)?;
+        let through = self.position(high.saturating_sub(1))?;
+        let before = match from.checked_sub(1) {
+            Some(previous) => self.total_through(previous)?,
+            None => self.origin,
+        };
+        let bytes = self
+            .total_through(through)?
+            .checked_sub(before)
+            .ok_or(ConsensusError::Corruption("entry accounting mismatch"))?;
+        Ok(usize::try_from(bytes).unwrap_or(usize::MAX).min(cap))
+    }
+    /// The running total through the retained entry at `position`.
+    fn total_through(&self, position: usize) -> Result<u64, ConsensusError> {
+        self.cumulative
+            .get(position)
+            .copied()
+            .ok_or(ConsensusError::Corruption("entry accounting mismatch"))
+    }
+    /// The position of `index` among the retained entries.
+    fn position(&self, index: u64) -> Result<usize, StorageError> {
+        usize::try_from(
+            index
+                .checked_sub(self.first_index()?)
+                .ok_or(StorageError::Unavailable)?,
+        )
+        .map_err(|_| StorageError::Unavailable)
     }
     pub fn validate(&self) -> Result<(), ConsensusError> {
         super::validate_conf_state(&self.conf_state)?;
@@ -93,6 +142,15 @@ impl RamLog {
                 "commit outside retained snapshot/log",
             ));
         }
+        let running = self
+            .cumulative
+            .back()
+            .map_or(0, |through| through.saturating_sub(self.origin));
+        if self.cumulative.len() != self.entries.len()
+            || running != u64::try_from(self.entry_bytes).unwrap_or(u64::MAX)
+        {
+            return Err(ConsensusError::Corruption("entry accounting mismatch"));
+        }
         Ok(())
     }
     fn reserve_slots(&mut self, additional: usize) -> Result<(), ConsensusError> {
@@ -101,27 +159,41 @@ impl RamLog {
             .len()
             .checked_add(additional)
             .ok_or(ConsensusError::Capacity)?;
-        if needed <= self.entries.capacity() && needed <= self.charges.capacity() {
+        if needed <= self.entries.capacity()
+            && needed <= self.charges.capacity()
+            && needed <= self.cumulative.capacity()
+        {
             return Ok(());
         }
         let capacity = needed
             .checked_next_power_of_two()
             .ok_or(ConsensusError::Capacity)?;
-        let amount = capacity
-            .checked_mul(
-                std::mem::size_of::<Entry>().saturating_add(std::mem::size_of::<Allocation>()),
-            )
-            .ok_or(ConsensusError::Capacity)?;
+        let slot = std::mem::size_of::<Entry>()
+            .saturating_add(std::mem::size_of::<Allocation>())
+            .saturating_add(std::mem::size_of::<u64>());
+        let amount = capacity.checked_mul(slot).ok_or(ConsensusError::Capacity)?;
         let mut allocation = reserve(
             &self.budget,
             BudgetKind::Index,
             BudgetLane::Completion,
             amount,
         )?;
+        // Grow to the power of two the budget was just charged for, not by
+        // the addition alone: reserving exactly what was asked moved the
+        // whole retained log on every commit (two reallocations a commit,
+        // hundreds of kilobytes each before a checkpoint) for the same
+        // charge.
         let result = self
             .entries
-            .try_reserve_exact(additional)
-            .and_then(|()| self.charges.try_reserve_exact(additional));
+            .try_reserve_exact(capacity.saturating_sub(self.entries.len()))
+            .and_then(|()| {
+                self.charges
+                    .try_reserve_exact(capacity.saturating_sub(self.charges.len()))
+            })
+            .and_then(|()| {
+                self.cumulative
+                    .try_reserve_exact(capacity.saturating_sub(self.cumulative.len()))
+            });
         let actual = self
             .entries
             .capacity()
@@ -130,6 +202,12 @@ impl RamLog {
                 self.charges
                     .capacity()
                     .checked_mul(std::mem::size_of::<Allocation>())
+                    .and_then(|m| n.checked_add(m))
+            })
+            .and_then(|n| {
+                self.cumulative
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<u64>())
                     .and_then(|m| n.checked_add(m))
             })
             .ok_or(ConsensusError::Capacity)?;
@@ -257,6 +335,8 @@ impl RamLog {
         if let Some(snapshot) = update.snapshot {
             self.entries.clear();
             self.charges.clear();
+            self.cumulative.clear();
+            self.origin = 0;
             self.entry_bytes = 0;
             self.conf_state = snapshot.conf;
             self.hard_state.commit = self
@@ -273,6 +353,9 @@ impl RamLog {
                 .is_some_and(|old| old.index >= entry.index)
             {
                 self.entries.pop_back();
+                self.cumulative
+                    .pop_back()
+                    .ok_or(ConsensusError::Corruption("entry accounting mismatch"))?;
                 let old = self
                     .charges
                     .pop_back()
@@ -286,6 +369,16 @@ impl RamLog {
                 .entry_bytes
                 .checked_add(allocation.bytes())
                 .ok_or(ConsensusError::Capacity)?;
+            let through = self
+                .cumulative
+                .back()
+                .copied()
+                .unwrap_or(self.origin)
+                .checked_add(
+                    u64::try_from(allocation.bytes()).map_err(|_| ConsensusError::Capacity)?,
+                )
+                .ok_or(ConsensusError::Capacity)?;
+            self.cumulative.push_back(through);
             self.entries.push_back(entry);
             self.charges.push_back(allocation);
         }
@@ -331,6 +424,10 @@ impl RamLog {
             .is_some_and(|entry| entry.index <= index)
         {
             self.entries.pop_front();
+            self.origin = self
+                .cumulative
+                .pop_front()
+                .ok_or(ConsensusError::Corruption("entry accounting mismatch"))?;
             let old = self
                 .charges
                 .pop_front()
@@ -349,7 +446,7 @@ impl RamLog {
 impl Storage for RamLog {
     fn initial_state(&self) -> Result<InitialState, StorageError> {
         Ok(InitialState {
-            hard_state: self.hard_state.clone(),
+            hard_state: self.hard_state,
             configuration: self.conf_state.clone(),
             proposals: self
                 .proposals
@@ -371,29 +468,64 @@ impl Storage for RamLog {
         if low > high || high > self.last_index()?.saturating_add(1) {
             return Err(StorageError::Unavailable);
         }
-        let mut size = 0u64;
         let want = usize::try_from(high.checked_sub(low).ok_or(StorageError::Unavailable)?)
             .map_err(|_| StorageError::Unavailable)?;
-        // The upper bound (high - low) is known; reserve it so replication and
-        // read fetches never reallocate the entry spine (max_bytes only trims).
-        into.try_reserve_exact(want)
-            .map_err(|_| StorageError::Unavailable)?;
-        let offset = usize::try_from(
-            low.checked_sub(self.first_index()?)
-                .ok_or(StorageError::Unavailable)?,
-        )
-        .map_err(|_| StorageError::Unavailable)?;
-        let mut taken = 0usize;
-        for entry in self.entries.iter().skip(offset).take(want) {
-            let bytes = proto::encoded_bytes(entry);
-            if taken > 0 && size.saturating_add(bytes) > max_bytes {
-                break;
+        let offset = self.position(low)?;
+        // The page is chosen before any of it is copied: the longest
+        // prefix of the range whose encoded bytes fit, and one entry at
+        // least. Only that many are reserved for and cloned, so a page
+        // costs what it carries, never what lies behind it.
+        let taken = if max_bytes == u64::MAX {
+            want
+        } else {
+            let mut size = 0u64;
+            let mut taken = 0usize;
+            for entry in self.entries.iter().skip(offset).take(want) {
+                size = size.saturating_add(proto::encoded_bytes(entry));
+                if taken > 0 && size > max_bytes {
+                    break;
+                }
+                taken = taken.saturating_add(1);
             }
-            size = size.saturating_add(bytes);
-            into.push(entry.clone());
-            taken = taken.saturating_add(1);
+            taken
+        };
+        into.try_reserve_exact(taken)
+            .map_err(|_| StorageError::LogTemporarilyUnavailable)?;
+        for entry in self.entries.iter().skip(offset).take(taken) {
+            let mut copy = Entry {
+                entry_type: entry.entry_type,
+                term: entry.term,
+                index: entry.index,
+                ..Entry::default()
+            };
+            copy.data
+                .try_reserve_exact(entry.data.len())
+                .map_err(|_| StorageError::LogTemporarilyUnavailable)?;
+            copy.data.extend_from_slice(&entry.data);
+            copy.context
+                .try_reserve_exact(entry.context.len())
+                .map_err(|_| StorageError::LogTemporarilyUnavailable)?;
+            copy.context.extend_from_slice(&entry.context);
+            into.push(copy);
         }
         Ok(())
+    }
+    fn any_entry(
+        &self,
+        low: u64,
+        high: u64,
+        predicate: &mut dyn FnMut(&Entry) -> bool,
+    ) -> Result<bool, StorageError> {
+        if low < self.first_index()? {
+            return Err(StorageError::Compacted);
+        }
+        if low > high || high > self.last_index()?.saturating_add(1) {
+            return Err(StorageError::Unavailable);
+        }
+        let want = usize::try_from(high.checked_sub(low).ok_or(StorageError::Unavailable)?)
+            .map_err(|_| StorageError::Unavailable)?;
+        let offset = self.position(low)?;
+        Ok(self.entries.iter().skip(offset).take(want).any(predicate))
     }
     fn term(&self, index: u64) -> Result<u64, StorageError> {
         let (snapshot_index, snapshot_term) = (
@@ -437,5 +569,130 @@ impl Storage for RamLog {
             return Err(StorageError::SnapshotTemporarilyUnavailable);
         }
         Ok(self.snapshot.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::config;
+
+    /// The budget is charged for the next power of two of what the log
+    /// needs, so the slots grow to that: one reallocation per doubling, not
+    /// one per commit moving the whole log each time.
+    #[test]
+    fn slots_grow_to_the_power_of_two_the_budget_was_charged_for() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 0).unwrap();
+        let mut log = RamLog::new(&config(1), budget).unwrap();
+        let mut capacities = Vec::new();
+        for _ in 0..1_000 {
+            log.reserve_slots(1).unwrap();
+            let capacity = log.entries.capacity();
+            if capacities.last() != Some(&capacity) {
+                capacities.push(capacity);
+            }
+            assert!(capacity.is_power_of_two(), "{capacity}");
+            assert!(log.charges.capacity() >= capacity);
+            // What the slots hold is what the budget holds for them.
+            let charged = log.slots.as_ref().map(|slots| slots.bytes()).unwrap_or(0);
+            assert!(
+                charged >= capacity * std::mem::size_of::<Entry>(),
+                "{charged} charged for {capacity} slots"
+            );
+            log.entries.push_back(Entry::default());
+            log.charges.push_back(
+                reserve(&log.budget, BudgetKind::Payload, BudgetLane::Completion, 1).unwrap(),
+            );
+        }
+        // Doublings only: 1, 2, 4, ..., 1024.
+        assert!(capacities.len() <= 11, "{capacities:?}");
+    }
+
+    /// The running totals say what a walk of the entries says, through
+    /// appends, a replaced suffix, compaction and a snapshot; and they say
+    /// it in one subtraction, whatever the range.
+    #[test]
+    fn the_running_totals_say_what_a_walk_of_the_entries_says() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 0).unwrap();
+        let mut log = RamLog::new(&config(1), budget).unwrap();
+        let entry = |index: u64, bytes: usize| Entry {
+            index,
+            term: 1,
+            data: vec![index as u8; bytes],
+            ..Entry::default()
+        };
+        let walk = |log: &RamLog, low: u64, high: u64, max_entries: usize, cap: usize| {
+            log.entries
+                .iter()
+                .filter(|entry| entry.index >= low && entry.index < high)
+                .take(max_entries)
+                .map(|entry| entry_bytes(entry).unwrap())
+                .sum::<usize>()
+                .min(cap)
+        };
+        let agree = |log: &RamLog| {
+            let first = log.first_index().unwrap();
+            let last = log.last_index().unwrap();
+            for low in first.saturating_sub(2)..=last + 2 {
+                for high in low..=last + 2 {
+                    for (max_entries, cap) in [
+                        (usize::MAX, usize::MAX),
+                        (2, usize::MAX),
+                        (usize::MAX, 300),
+                        (1, 10),
+                    ] {
+                        assert_eq!(
+                            log.bytes_between(low, high, max_entries, cap).unwrap(),
+                            walk(log, low, high, max_entries, cap),
+                            "[{low}, {high}) of {max_entries} entries under {cap}"
+                        );
+                    }
+                }
+            }
+            log.validate().unwrap();
+        };
+        log.append(
+            &(1..=8)
+                .map(|index| entry(index, 100 * index as usize))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        log.hard_state.commit = 4;
+        agree(&log);
+        // A suffix replaced: the totals of what it replaced leave with it.
+        log.append(&[entry(6, 7), entry(7, 9)]).unwrap();
+        assert_eq!(log.last_index().unwrap(), 7);
+        agree(&log);
+        // Compacted behind a checkpoint: the origin moves.
+        let snapshot = Snapshot {
+            metadata: Some(hyper_raft::proto::SnapshotMetadata {
+                conf_state: Some(log.conf_state.clone()),
+                index: 4,
+                term: 1,
+            }),
+            ..Snapshot::default()
+        };
+        let prepared = log.prepare_snapshot(&snapshot).unwrap();
+        log.compact_prepared(prepared).unwrap();
+        assert_eq!(log.first_index().unwrap(), 5);
+        agree(&log);
+        log.append(&[entry(8, 1000), entry(9, 1)]).unwrap();
+        agree(&log);
+        // A snapshot installed: the log begins again.
+        let installed = Snapshot {
+            metadata: Some(hyper_raft::proto::SnapshotMetadata {
+                conf_state: Some(log.conf_state.clone()),
+                index: 20,
+                term: 1,
+            }),
+            ..Snapshot::default()
+        };
+        log.install_snapshot(installed).unwrap();
+        assert_eq!(
+            log.bytes_between(1, 100, usize::MAX, usize::MAX).unwrap(),
+            0
+        );
+        log.append(&[entry(21, 50)]).unwrap();
+        agree(&log);
     }
 }

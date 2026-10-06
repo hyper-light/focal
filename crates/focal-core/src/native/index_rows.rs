@@ -211,11 +211,12 @@ pub(super) fn timer_bound(
 pub(super) const STATUS_ROWS: usize = 2;
 /// Index rows one accepted result adds beyond its artifact.
 pub(super) const ACCEPTED_ROWS: usize = 1;
-/// The smallest failed admission report: eleven primary rows, a result
-/// artifact without inputs (four rows: identity, producer, kind and schema),
-/// its verdict and the parent claim's status move.
+/// The smallest failed admission report: twelve primary rows (the
+/// principal's window among them, F12), a result artifact without inputs
+/// (four rows: identity, producer, kind and schema), its verdict and the
+/// parent claim's status move.
 pub(super) const MINIMUM_FAILED_REPORT_ROWS: usize =
-    11 + ARTIFACT_FIXED_ROWS + ACCEPTED_ROWS + STATUS_ROWS;
+    12 + ARTIFACT_FIXED_ROWS + ACCEPTED_ROWS + STATUS_ROWS;
 /// The most inputs one artifact admitted under `limits` can cite: the
 /// configured allowance, never above the model's fixed ceiling.
 pub(super) fn input_bound(limits: NativeLimits) -> usize {

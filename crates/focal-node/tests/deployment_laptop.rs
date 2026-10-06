@@ -153,8 +153,12 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
     assert_ne!(later, claim);
     // Planning and explaining read the directory, which names the node
     // once it has installed.
-    let identity = journey.admin(&laptop, "identity", &[], &["cluster", "node", "identity"])
-        ["result"]["identity"]
+    let identity = journey.admin(
+        &laptop,
+        "identity",
+        &[],
+        &["diagnose", "node", "--identity"],
+    )["result"]["identity"]
         .clone();
     let laptop_node = identity["node"].as_u64().unwrap();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();

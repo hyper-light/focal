@@ -176,6 +176,13 @@ impl ContentStore {
                 .root
                 .join("objects")
                 .join(hex(&transfer.reference.domain.0));
+            let path = directory.join(format!("{}.chunk", chunk.hash));
+            // A verified duplicate — an exact retry, or a resumed transfer's
+            // chunk already held — adds no byte to the volume: it needs no
+            // promise and lowers no estimate (the audit's F59).
+            if already_installed(&path, bytes, Some(chunk.hash))? {
+                return Ok(());
+            }
             // Custody transfers are fleet work: they draw on the completion
             // lane so a tenant's uploads cannot starve replication.
             let copy = disk_reserve(
@@ -186,11 +193,7 @@ impl ContentStore {
                 u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
             )?;
             durable_directory(&directory)?;
-            install_transferred_chunk(
-                &directory.join(format!("{}.chunk", chunk.hash)),
-                bytes,
-                chunk.hash,
-            )?;
+            atomic_install(&path, bytes)?;
             copy.commit();
             Ok(())
         })();
@@ -198,62 +201,332 @@ impl ContentStore {
         result
     }
 
-    /// Verifies every chunk and the whole stream before publishing the original
-    /// manifest. Success proves local durable custody of exactly this root.
-    pub fn complete_import(
+    /// How much of chunk `index` is staged in parts: the offset the next
+    /// part is taken at. Zero where none is, or the chunk is installed.
+    pub fn staged_chunk_bytes(
+        &self,
+        transfer: &TransferManifest,
+        index: usize,
+    ) -> Result<u64, ContentError> {
+        self.check()?;
+        let chunk = transfer
+            .manifest
+            .chunks
+            .get(index)
+            .ok_or(ContentError::Invalid)?;
+        let path = self.chunk_part_path(transfer, chunk.hash);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.len().min(u64::from(chunk.length))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+    /// Take a part of chunk `index` that begins at `offset`: a chunk that
+    /// would take its path longer than a transfer's lease to cross goes in
+    /// parts (the audit's F49). Parts go in order and are held in a
+    /// staging file beside the objects until the chunk is whole; a part
+    /// that is wholly held already is an exact retry and takes nothing, one
+    /// that overlaps what is held adds what it brings past it (a sender
+    /// that lost a reply, or begins the chunk again, sends from where it
+    /// was); one that begins past what is held is a gap and is refused.
+    /// When the
+    /// last byte is held the chunk is verified against the manifest's hash
+    /// and installed as `import_chunk` installs one, under the same name;
+    /// a chunk that does not verify is discarded whole. The staged bytes
+    /// are promised to the volume as they are taken, part by part, and the
+    /// installed chunk is the same bytes moved: nothing is promised twice.
+    /// Returns how much of the chunk is held after the part, the chunk's
+    /// length once it is installed.
+    pub fn import_chunk_part(
         &mut self,
         transfer: &TransferManifest,
-    ) -> Result<ContentRef, ContentError> {
+        index: usize,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u64, ContentError> {
         self.check()?;
         let result = (|| {
-            if transfer.encoded.len() > MAX_TRANSFER_MANIFEST_BYTES
+            let chunk = transfer
+                .manifest
+                .chunks
+                .get(index)
+                .ok_or(ContentError::Invalid)?;
+            let length = u64::from(chunk.length);
+            let part = u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?;
+            if bytes.is_empty()
+                || offset.checked_add(part).is_none_or(|end| end > length)
                 || transfer.reference.length > MAX_TRANSFER_CONTENT_BYTES
             {
-                return Err(ContentError::Capacity);
-            }
-            let mut whole = blake3::Hasher::new();
-            let mut received = 0u64;
-            for index in 0..transfer.manifest.chunks.len() {
-                let bytes = match self.read_transfer_chunk(transfer, index) {
-                    Err(ContentError::Io(error))
-                        if error.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        return Err(ContentError::Incomplete {
-                            received,
-                            expected: transfer.reference.length,
-                        });
-                    }
-                    result => result?,
-                };
-                received = received
-                    .checked_add(bytes.len() as u64)
-                    .ok_or(ContentError::Corrupt)?;
-                whole.update(&bytes);
-            }
-            if ContentHash(*whole.finalize().as_bytes()) != transfer.manifest.stream_digest {
-                return Err(ContentError::Corrupt);
+                return Err(ContentError::Invalid);
             }
             let directory = self
                 .root
                 .join("objects")
                 .join(hex(&transfer.reference.domain.0));
-            let manifest = disk_reserve(
+            let installed = directory.join(format!("{}.chunk", chunk.hash));
+            if installed.exists() && self.read_transfer_chunk(transfer, index).is_ok() {
+                // Held whole already (F59): the part adds nothing.
+                return Ok(length);
+            }
+            let path = self.chunk_part_path(transfer, chunk.hash);
+            let staged = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.into()),
+            };
+            let end = offset.saturating_add(part);
+            if end <= staged {
+                // An exact retry of a part already held.
+                return Ok(staged);
+            }
+            if offset > staged {
+                return Err(ContentError::Invalid);
+            }
+            // What the part brings past what is held.
+            let skip = usize::try_from(staged.saturating_sub(offset))
+                .map_err(|_| ContentError::Capacity)?;
+            let fresh = bytes.get(skip..).ok_or(ContentError::Invalid)?;
+            let promise = disk_reserve(
                 &self.disk,
                 &self.root,
                 DiskKind::Content,
                 focal_memory::BudgetLane::Completion,
-                u64::try_from(transfer.encoded.len()).map_err(|_| ContentError::Capacity)?,
+                u64::try_from(fresh.len()).map_err(|_| ContentError::Capacity)?,
             )?;
             durable_directory(&directory)?;
-            atomic_install(
-                &directory.join(format!("{}.manifest", transfer.reference.root)),
-                &transfer.encoded,
-            )?;
-            manifest.commit();
-            Ok(transfer.reference.clone())
+            {
+                let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+                file.write_all(fresh)?;
+                file.sync_all()?;
+            }
+            promise.commit();
+            if end < length {
+                return Ok(end);
+            }
+            // Whole: verified, then the staged bytes become the chunk.
+            let held = read_bounded(&path, chunk.length as usize)?;
+            if held.len() != chunk.length as usize
+                || ContentHash(*blake3::hash(&held).as_bytes()) != chunk.hash
+            {
+                let _ = std::fs::remove_file(&path);
+                sync_directory(&directory)?;
+                return Err(ContentError::Corrupt);
+            }
+            focal_platform::fs::atomic_replace(&path, &installed)?;
+            sync_directory(&directory)?;
+            Ok(length)
         })();
         self.mark_failure(&result);
         result
+    }
+    /// Discard the parts of every chunk of `transfer` still staged: a
+    /// transfer that expired, was cancelled or failed holds no more of the
+    /// volume. Chunks installed whole stay, as `import_chunk`'s do.
+    pub fn discard_chunk_parts(&mut self, transfer: &TransferManifest) -> Result<(), ContentError> {
+        self.check()?;
+        let result = (|| {
+            let directory = self
+                .root
+                .join("objects")
+                .join(hex(&transfer.reference.domain.0));
+            let mut removed = false;
+            for chunk in &transfer.manifest.chunks {
+                let path = self.chunk_part_path(transfer, chunk.hash);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if removed {
+                sync_directory(&directory)?;
+            }
+            Ok(())
+        })();
+        self.mark_failure(&result);
+        result
+    }
+    fn chunk_part_path(
+        &self,
+        transfer: &TransferManifest,
+        hash: ContentHash,
+    ) -> std::path::PathBuf {
+        self.root
+            .join("objects")
+            .join(hex(&transfer.reference.domain.0))
+            .join(format!("{hash}.part"))
+    }
+
+    /// Verifies every chunk and the whole stream before publishing the original
+    /// manifest. Success proves local durable custody of exactly this root.
+    /// At once: [`Self::advance_completion`] to its end, for a caller that
+    /// holds the store alone (a tool, a backup's restore); a node's content
+    /// owner completes a transfer a chunk a call.
+    pub fn complete_import(
+        &mut self,
+        transfer: &TransferManifest,
+    ) -> Result<ContentRef, ContentError> {
+        let mut completion = self.begin_completion(transfer)?;
+        let largest = transfer
+            .manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.length as usize)
+            .max()
+            .unwrap_or(0);
+        let mut scratch = zeroed_buffer(largest)?;
+        // A slice a chunk, and the manifest's.
+        for _ in 0..=transfer.manifest.chunks.len() {
+            if let Some(reference) =
+                self.advance_completion(transfer, &mut completion, &mut scratch)?
+            {
+                return Ok(reference);
+            }
+        }
+        Err(ContentError::Failed)
+    }
+    /// Begin a transfer's completion in slices ([`ImportCompletion`]):
+    /// nothing read yet.
+    pub fn begin_completion(
+        &self,
+        transfer: &TransferManifest,
+    ) -> Result<ImportCompletion, ContentError> {
+        self.check()?;
+        if transfer.encoded.len() > MAX_TRANSFER_MANIFEST_BYTES
+            || transfer.reference.length > MAX_TRANSFER_CONTENT_BYTES
+        {
+            return Err(ContentError::Capacity);
+        }
+        Ok(ImportCompletion {
+            root: transfer.reference.root,
+            next: 0,
+            received: 0,
+            whole: blake3::Hasher::new(),
+        })
+    }
+    /// One slice of a transfer's completion (the audit's F51): the next
+    /// chunk read back into `scratch` and verified against its name, its
+    /// bytes hashed into the stream; past the last, the stream checked
+    /// against the manifest's digest and the manifest installed, and its
+    /// reference answered. A chunk not held is `Incomplete`; nothing is
+    /// installed before every chunk and the stream verify.
+    pub fn advance_completion(
+        &mut self,
+        transfer: &TransferManifest,
+        completion: &mut ImportCompletion,
+        scratch: &mut [u8],
+    ) -> Result<Option<ContentRef>, ContentError> {
+        self.check()?;
+        let result = self.advance_completion_inner(transfer, completion, scratch);
+        self.mark_failure(&result);
+        result
+    }
+    fn advance_completion_inner(
+        &mut self,
+        transfer: &TransferManifest,
+        completion: &mut ImportCompletion,
+        scratch: &mut [u8],
+    ) -> Result<Option<ContentRef>, ContentError> {
+        if completion.root != transfer.reference.root {
+            return Err(ContentError::Invalid);
+        }
+        let directory = self
+            .root
+            .join("objects")
+            .join(hex(&transfer.reference.domain.0));
+        if let Some(chunk) = transfer.manifest.chunks.get(completion.next) {
+            let bytes =
+                match verify_chunk_into(&directory, chunk.hash, chunk.length as usize, scratch) {
+                    Err(ContentError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Err(ContentError::Incomplete {
+                            received: completion.received,
+                            expected: transfer.reference.length,
+                        });
+                    }
+                    result => result?,
+                };
+            completion.whole.update(bytes);
+            completion.received = completion
+                .received
+                .checked_add(u64::from(chunk.length))
+                .ok_or(ContentError::Corrupt)?;
+            completion.next = completion
+                .next
+                .checked_add(1)
+                .ok_or(ContentError::Capacity)?;
+            return Ok(None);
+        }
+        if ContentHash(*completion.whole.finalize().as_bytes()) != transfer.manifest.stream_digest {
+            return Err(ContentError::Corrupt);
+        }
+        let path = directory.join(format!("{}.manifest", transfer.reference.root));
+        // A repeated completion finds its manifest installed: no promise,
+        // no byte.
+        if already_installed(&path, &transfer.encoded, Some(transfer.reference.root))? {
+            return Ok(Some(transfer.reference.clone()));
+        }
+        let manifest = disk_reserve(
+            &self.disk,
+            &self.root,
+            DiskKind::Content,
+            focal_memory::BudgetLane::Completion,
+            u64::try_from(transfer.encoded.len()).map_err(|_| ContentError::Capacity)?,
+        )?;
+        durable_directory(&directory)?;
+        atomic_install(&path, &transfer.encoded)?;
+        manifest.commit();
+        Ok(Some(transfer.reference.clone()))
+    }
+    /// Whether this store holds chunk `index` of `transfer` verified: read
+    /// into `scratch` and checked against its name. A chunk absent, or held
+    /// with other bytes, is not held — an import installs verified bytes
+    /// over it (24 §20). A slice of a transfer's inventory (the audit's F51).
+    pub fn holds_chunk(
+        &self,
+        transfer: &TransferManifest,
+        index: usize,
+        scratch: &mut [u8],
+    ) -> Result<bool, ContentError> {
+        self.check()?;
+        let chunk = transfer
+            .manifest
+            .chunks
+            .get(index)
+            .ok_or(ContentError::Invalid)?;
+        let directory = self
+            .root
+            .join("objects")
+            .join(hex(&transfer.reference.domain.0));
+        match verify_chunk_into(&directory, chunk.hash, chunk.length as usize, scratch) {
+            Ok(_) => Ok(true),
+            Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(ContentError::Corrupt) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// A transfer's completion in slices (the audit's F51): what
+/// [`ContentStore::complete_import`] does at once — every chunk read back
+/// and verified, the stream's digest over them in order, then the manifest
+/// installed — one chunk a call ([`ContentStore::advance_completion`]), so
+/// the store's one owner serves other work between chunks. Begun for one
+/// transfer's root; nothing is installed before the last chunk and the stream
+/// verify.
+pub struct ImportCompletion {
+    root: ContentHash,
+    next: usize,
+    received: u64,
+    whole: blake3::Hasher,
+}
+impl ImportCompletion {
+    /// The chunks verified so far.
+    pub fn verified(&self) -> usize {
+        self.next
     }
 }
 
@@ -430,6 +703,113 @@ mod tests {
             exported.encoded()
         );
     }
+    /// A chunk imported in parts is the chunk `import_chunk` would have
+    /// installed: in order, an exact retry taking nothing, a gap refused, a
+    /// part past the chunk refused, the whole verified before it is
+    /// installed and discarded whole where it does not verify; and the
+    /// parts of a transfer discarded leave its installed chunks.
+    #[test]
+    fn a_chunk_imported_in_parts_is_the_chunk_once_whole() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut source_store = ContentStore::open(source_dir.path(), limits(8)).unwrap();
+        let reference = source(&mut source_store);
+        let exported = source_store.export_manifest(&reference).unwrap();
+        assert_eq!(exported.chunks(), 2);
+        let first = source_store.read_transfer_chunk(&exported, 0).unwrap();
+        let second = source_store.read_transfer_chunk(&exported, 1).unwrap();
+        let mut target = ContentStore::open(target_dir.path(), limits(8)).unwrap();
+        let imported = target
+            .prepare_import(reference.clone(), exported.encoded().to_vec())
+            .unwrap();
+        assert_eq!(target.staged_chunk_bytes(&imported, 0).unwrap(), 0);
+        // Two bytes, then three from the start (one new), the same three
+        // again, two within, a gap, a part past the end.
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 0, 0, &first[0..2])
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 0, 0, &first[0..3])
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 0, 0, &first[0..3])
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 0, 1, &first[1..3])
+                .unwrap(),
+            3
+        );
+        assert!(matches!(
+            target.import_chunk_part(&imported, 0, 4, &first[4..5]),
+            Err(ContentError::Invalid)
+        ));
+        assert!(matches!(
+            target.import_chunk_part(&imported, 0, 3, &[0; 6]),
+            Err(ContentError::Invalid)
+        ));
+        assert!(matches!(
+            target.import_chunk_part(&imported, 0, 3, &[]),
+            Err(ContentError::Invalid)
+        ));
+        assert_eq!(target.staged_chunk_bytes(&imported, 0).unwrap(), 3);
+        assert!(target.read_transfer_chunk(&imported, 0).is_err());
+        // The rest: the chunk is installed, as import_chunk installs one.
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 0, 3, &first[3..8])
+                .unwrap(),
+            8
+        );
+        assert_eq!(target.staged_chunk_bytes(&imported, 0).unwrap(), 0);
+        assert_eq!(target.read_transfer_chunk(&imported, 0).unwrap(), first);
+        // A part of an installed chunk adds nothing: held whole.
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 0, 0, &first[0..1])
+                .unwrap(),
+            8
+        );
+        // A last part that is not the chunk's: discarded whole.
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 1, 0, &second[0..1])
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            target.import_chunk_part(&imported, 1, 1, &[0]),
+            Err(ContentError::Corrupt)
+        ));
+        assert_eq!(target.staged_chunk_bytes(&imported, 1).unwrap(), 0);
+        assert!(target.read_transfer_chunk(&imported, 1).is_err());
+        // Parts discarded with their transfer; the chunk installed stays.
+        assert_eq!(
+            target
+                .import_chunk_part(&imported, 1, 0, &second[0..1])
+                .unwrap(),
+            1
+        );
+        target.discard_chunk_parts(&imported).unwrap();
+        assert_eq!(target.staged_chunk_bytes(&imported, 1).unwrap(), 0);
+        assert_eq!(target.read_transfer_chunk(&imported, 0).unwrap(), first);
+        // Whole by parts, the import completes as any.
+        assert_eq!(
+            target.import_chunk_part(&imported, 1, 0, &second).unwrap(),
+            2
+        );
+        assert_eq!(target.complete_import(&imported).unwrap(), reference);
+        assert_eq!(target.read_bytes(&reference, 10).unwrap(), b"abcdefghij");
+    }
     fn limits(chunk_bytes: usize) -> StoreLimits {
         StoreLimits {
             max_content_bytes: 1024,
@@ -531,5 +911,61 @@ mod tests {
         assert!(receiver.complete_import(&imported).is_err());
         assert!(receiver.verify(&reference).is_err());
         assert!(receiver.read_transfer_chunk(&imported, usize::MAX).is_err());
+    }
+    /// The audit's F59: an exact retry of a chunk, a resumed transfer's chunk
+    /// already held, and a repeated completion add no byte to the volume, so
+    /// none lowers the free-space estimate; only the first installation of
+    /// each payload does.
+    #[test]
+    fn duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut sender = ContentStore::open(source_dir.path(), limits(4)).unwrap();
+        let reference = source(&mut sender);
+        let descriptor = sender.export_manifest(&reference).unwrap();
+        let disk = DiskBudget::new(DiskBudgetConfig {
+            headroom: 0,
+            completion_reserve: 0,
+            sample_interval: 64,
+        })
+        .unwrap();
+        // Exactly the payload, the manifest and four more bytes: a duplicate
+        // that charged the estimate would leave the completion without room.
+        let manifest_bytes = descriptor.encoded().len() as u64;
+        disk.observe(reference.length + manifest_bytes + 4);
+        let mut receiver =
+            ContentStore::open_with_disk(target_dir.path(), limits(8), disk.clone()).unwrap();
+        let imported = receiver
+            .prepare_import(reference.clone(), descriptor.encoded().to_vec())
+            .unwrap();
+        let chunk = sender.read_transfer_chunk(&descriptor, 0).unwrap();
+        let before = disk.uncommitted_free();
+        receiver.import_chunk(&imported, 0, &chunk).unwrap();
+        let once = disk.uncommitted_free();
+        assert_eq!(once, before - chunk.len() as u64);
+        for _ in 0..4 {
+            receiver.import_chunk(&imported, 0, &chunk).unwrap();
+        }
+        assert_eq!(
+            disk.uncommitted_free(),
+            once,
+            "four exact retries added no byte"
+        );
+        for index in 1..descriptor.chunks() {
+            let bytes = sender.read_transfer_chunk(&descriptor, index).unwrap();
+            receiver.import_chunk(&imported, index, &bytes).unwrap();
+        }
+        assert_eq!(disk.uncommitted_free(), before - reference.length);
+        assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
+        let completed = disk.uncommitted_free();
+        assert_eq!(completed, before - reference.length - manifest_bytes);
+        assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
+        assert_eq!(
+            disk.uncommitted_free(),
+            completed,
+            "a repeated completion added no byte"
+        );
+        assert_eq!(receiver.read_bytes(&reference, 10).unwrap(), b"abcdefghij");
+        assert_eq!(disk.stats().outstanding, 0);
     }
 }

@@ -17,17 +17,30 @@ jobs:
         run: cargo deny check advisories bans licenses sources
   model:
     # The fast track's model (docs/models/FastTrack.tla): every state of the
-    # model a change is checked with, and the rule the core does not follow,
-    # which the checker must refuse.
+    # configurations a change is checked with, each within the states it
+    # states, and the rules the core does not follow, which the checker must
+    # refuse.
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # The runner does nothing else.
+      TLC_WORKERS: auto
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Java
         run: java -version
-      - name: Check the model
+      - name: Check the model, one index
         run: bash scripts/check-model.sh
+      - name: Check the model, two indexes
+        run: bash scripts/check-model.sh round
+      - name: The checker finds an index committed by what members hold
+        run: bash scripts/check-model.sh reached
       - name: The checker refuses the wrong rule
         run: bash scripts/check-model.sh wrong
+      - name: The checker refuses a fast quorum counted without its round
+        run: bash scripts/check-model.sh anyround
+      - name: Check the model, the same four voters with the round counted
+        run: bash scripts/check-model.sh four
   check:
     strategy:
       fail-fast: false

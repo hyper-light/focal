@@ -164,7 +164,9 @@ mod tests {
                     .any(|branch| branch["properties"]["kind"]["const"] == "error")
             );
             // Admin tools intentionally share their identical family schema.
-            if !tool.name.starts_with("cluster.") {
+            if focal_client::operations::surface_of(&tool.name)
+                != Some(focal_client::operations::Surface::Administration)
+            {
                 assert!(ids.insert(tool.output_schema["$id"].as_str().unwrap()));
             }
             if let Some(definitions) = tool.output_schema["$defs"].as_object() {

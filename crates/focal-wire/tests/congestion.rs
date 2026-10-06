@@ -35,10 +35,10 @@
 //! the laws honest. `FOCAL_CONGESTION_FULL=1` runs the grid, which is what
 //! the decision is recorded from (release, nightly).
 use bytes::BytesMut;
-use focal_sim::path::{Fabric, Fate, Link, Loss, Path};
+use focal_sim::path::{Fabric, Fate, Link, Loss, Marking, Path};
 use quinn_proto::{
-    ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig,
-    Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
+    ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, Endpoint,
+    EndpointConfig, Event, ServerConfig, StreamEvent, StreamId, TransportConfig, VarInt,
     congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig},
 };
 use std::{
@@ -51,8 +51,6 @@ use std::{
 const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000 * MS;
 const DATAGRAM: usize = 1_200;
-const CLIENT: u64 = 1;
-const SERVER: u64 = 2;
 const EXCHANGE_EVERY: u64 = 50 * MS;
 const EXCHANGE_BYTES: usize = 200;
 /// What the transfer hands the connection at once.
@@ -66,6 +64,9 @@ enum Law {
     Copa,
     /// Copa whose window a round trip moves by this part of itself at most.
     Stride(u64),
+    /// Copa whose window a mark multiplies by this fraction, as numerator
+    /// and denominator.
+    Backoff(u64, u64),
 }
 impl Law {
     const ALL: [Law; 4] = [Law::NewReno, Law::Cubic, Law::Bbr, Law::Copa];
@@ -77,6 +78,13 @@ impl Law {
             Law::Copa => Arc::new(focal_wire::congestion::CopaConfig::default()),
             Law::Stride(stride) => Arc::new(focal_wire::congestion::CopaConfig {
                 stride,
+                ..focal_wire::congestion::CopaConfig::default()
+            }),
+            Law::Backoff(numerator, denominator) => Arc::new(focal_wire::congestion::CopaConfig {
+                mark_backoff: focal_wire::congestion::MarkBackoff {
+                    numerator,
+                    denominator,
+                },
                 ..focal_wire::congestion::CopaConfig::default()
             }),
         }
@@ -103,6 +111,12 @@ struct Scenario {
     /// holds megabytes, and one: `focal_wire::bulk_width`. `transfers` is
     /// the most there are.
     derived: bool,
+    /// Whether the path carries the IP header's ECN field (RFC 3168). One
+    /// that does not bleaches it, as many do: quinn's validation hears no
+    /// marks echoed and sends none ECN-capable (RFC 9000 §13.4.2).
+    ecn: bool,
+    /// What the bottleneck's queue manager does short of dropping.
+    marking: Marking,
 }
 impl Scenario {
     fn bdp_bytes(&self) -> u64 {
@@ -115,8 +129,18 @@ impl Scenario {
         } else {
             format!("{}k", self.rate_bits_per_second / 1_000)
         };
+        let marking = match self.marking {
+            Marking::Off => String::new(),
+            Marking::Step { threshold_bytes } => {
+                format!(" step {}p", threshold_bytes.div_ceil(DATAGRAM as u64))
+            }
+            Marking::CoDel {
+                target_ns,
+                interval_ns,
+            } => format!(" codel {}/{}ms", target_ns / MS, interval_ns / MS),
+        };
         format!(
-            "{rate} {}ms {}%{}{}",
+            "{rate} {}ms {}%{}{}{}{marking}",
             self.rtt_ns / MS,
             f64::from(self.loss_ppm) / 10_000.0,
             if self.bursts { " bursts" } else { "" },
@@ -124,7 +148,8 @@ impl Scenario {
                 String::new()
             } else {
                 format!(" queue x{}", self.queue_bdps)
-            }
+            },
+            if self.ecn { " ecn" } else { "" },
         )
     }
 }
@@ -147,6 +172,22 @@ struct Measured {
     streams: usize,
     /// Why the connection ended before the run did, and when.
     closed: Option<(u64, String)>,
+    /// Datagrams a queue manager marked Congestion Experienced, in the
+    /// whole run and by the end of the warm-up (slow start's).
+    marked: u64,
+    marked_at_warm: u64,
+    /// How long the client's datagrams (its transfer's) waited in the
+    /// bottleneck's queue after the warm-up: the median and the 99th
+    /// percentile.
+    queue_p50_ns: u64,
+    queue_p99_ns: u64,
+    /// The congestion events the client's law was told of: losses and
+    /// marks alike.
+    congestion_events: u64,
+    /// Whether the client's last datagram was ECN-capable: quinn stops
+    /// marking its own when the path fails its validation (RFC 9000
+    /// §13.4.2).
+    ecn: bool,
 }
 
 struct Pki {
@@ -184,6 +225,36 @@ fn transport(law: Law) -> Arc<TransportConfig> {
     Arc::new(transport)
 }
 
+/// A datagram on the fabric, with the ECN codepoint its IP header carries.
+struct Datagram {
+    bytes: Vec<u8>,
+    ecn: Option<EcnCodepoint>,
+}
+/// A datagram onto the fabric: ECN-capable where the path carries the
+/// field and quinn sent it so, a queue manager marking it Congestion
+/// Experienced (RFC 3168 §5); on a path that bleaches the field, as one
+/// that does not carry it.
+fn send_datagram(
+    fabric: &mut Fabric<Datagram>,
+    carries_ecn: bool,
+    from: u64,
+    to: u64,
+    bytes: Vec<u8>,
+    ecn: Option<EcnCodepoint>,
+) -> Fate {
+    let size = bytes.len();
+    let ecn = if carries_ecn { ecn } else { None };
+    let capable = matches!(ecn, Some(EcnCodepoint::Ect0 | EcnCodepoint::Ect1));
+    let datagram = Datagram { bytes, ecn };
+    if capable {
+        fabric.send_ecn(from, to, datagram, size, |datagram| {
+            datagram.ecn = Some(EcnCodepoint::Ce);
+        })
+    } else {
+        fabric.send(from, to, datagram, size)
+    }
+}
+
 struct Side {
     node: u64,
     address: SocketAddr,
@@ -194,14 +265,13 @@ struct Exchange {
     asked_at: u64,
     received: usize,
 }
-struct Run {
-    scenario: Scenario,
-    began: Instant,
-    fabric: Fabric<Vec<u8>>,
+/// One connection: its two ends, the law its client sends by, and what it
+/// carries. Flow `f` is nodes `2f+1` (the client) and `2f+2`.
+struct Flow {
+    law: Law,
     client: Side,
     server: Side,
     server_config: Arc<ServerConfig>,
-    scratch: Vec<u8>,
     connected: bool,
     transfers: Vec<StreamId>,
     transfer_received: u64,
@@ -214,80 +284,47 @@ struct Run {
     asked_after_warm: u64,
     datagrams: u64,
     closed: Option<(u64, String)>,
+    /// How long each of the client's datagrams after the warm-up waits in
+    /// the bottleneck's queue.
+    queued: Vec<u64>,
+    /// Whether the client's last datagram was ECN-capable.
+    ecn: bool,
 }
-impl Run {
-    fn warm(&self) -> u64 {
-        self.scenario.seconds * SECOND / 4
-    }
-    fn end(&self) -> u64 {
-        self.scenario.seconds * SECOND
-    }
-    fn at(&self, now: u64) -> Instant {
-        self.began + Duration::from_nanos(now)
-    }
-    fn new(scenario: Scenario, law: Law, pki: &Pki) -> Self {
+impl Flow {
+    fn new(index: u64, law: Law, seed: u64, pki: &Pki) -> Self {
         let mut server_config =
             ServerConfig::with_single_cert(vec![pki.certificate.clone()], pki.key.clone_key())
                 .unwrap();
         server_config.transport_config(transport(law));
         let server_config = Arc::new(server_config);
-        let mut seed = [0u8; 32];
-        seed[..8].copy_from_slice(&scenario.seed.to_le_bytes());
-        let endpoint = |server: Option<Arc<ServerConfig>>, salt: u8| {
-            let mut seed = seed;
-            seed[31] = salt;
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        let endpoint = |server: Option<Arc<ServerConfig>>, salt: u64| {
+            let mut bytes = bytes;
+            bytes[31] = u8::try_from(salt).unwrap();
             Endpoint::new(
                 Arc::new(EndpointConfig::default()),
                 server,
                 false,
-                Some(seed),
+                Some(bytes),
             )
         };
-        let mut fabric = Fabric::new(scenario.seed, 1 << 20, 1 << 30);
-        let queue = (scenario.bdp_bytes() * scenario.queue_bdps).max(4 * DATAGRAM as u64);
-        let loss = if scenario.bursts {
-            // Bursts of five messages on average that lose half of what
-            // they hold, entered so often that the whole loses what is
-            // stated.
-            Loss::bursty(scenario.loss_ppm * 2 / 5, 200_000, 500_000)
-        } else {
-            Loss::random(scenario.loss_ppm)
-        };
-        for (from, to) in [(CLIENT, SERVER), (SERVER, CLIENT)] {
-            let link = fabric
-                .add_link(Link {
-                    rate_bits_per_second: scenario.rate_bits_per_second,
-                    queue_bytes: queue,
-                })
-                .unwrap();
-            fabric
-                .set_pair_path(
-                    from,
-                    to,
-                    Path::in_order(scenario.rtt_ns / 2, 0)
-                        .with_loss(loss)
-                        .through(link),
-                )
-                .unwrap();
-        }
+        let (client, server) = (2 * index + 1, 2 * index + 2);
         Self {
-            scenario,
-            began: Instant::now(),
-            fabric,
+            law,
             client: Side {
-                node: CLIENT,
-                address: "10.0.0.1:4433".parse().unwrap(),
-                endpoint: endpoint(None, 1),
+                node: client,
+                address: format!("10.0.{index}.1:4433").parse().unwrap(),
+                endpoint: endpoint(None, client),
                 connection: None,
             },
             server: Side {
-                node: SERVER,
-                address: "10.0.0.2:4433".parse().unwrap(),
-                endpoint: endpoint(Some(server_config.clone()), 2),
+                node: server,
+                address: format!("10.0.{index}.2:4433").parse().unwrap(),
+                endpoint: endpoint(Some(server_config.clone()), server),
                 connection: None,
             },
             server_config,
-            scratch: Vec::with_capacity(2 * DATAGRAM),
             connected: false,
             transfers: Vec::new(),
             transfer_received: 0,
@@ -299,73 +336,12 @@ impl Run {
             asked_after_warm: 0,
             datagrams: 0,
             closed: None,
-        }
-    }
-    fn connect(&mut self, law: Law, pki: &Pki) {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(pki.certificate.clone()).unwrap();
-        let mut config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
-        config.transport_config(transport(law));
-        let now = self.at(0);
-        let connection = self
-            .client
-            .endpoint
-            .connect(now, config, self.server.address, "localhost")
-            .unwrap();
-        self.client.connection = Some(connection);
-    }
-    /// What arrived by `now` is handed to whom it is for.
-    fn deliver(&mut self, now: u64) {
-        let at = self.at(now);
-        while let Some(delivery) = self.fabric.receive() {
-            let (side, from) = if delivery.to == SERVER {
-                (&mut self.server, self.client.address)
-            } else {
-                (&mut self.client, self.server.address)
-            };
-            self.scratch.clear();
-            let event = side.endpoint.handle(
-                at,
-                from,
-                None,
-                None,
-                BytesMut::from(delivery.message.as_slice()),
-                &mut self.scratch,
-            );
-            match event {
-                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                    if let Some((own, connection)) = &mut side.connection
-                        && *own == handle
-                    {
-                        connection.handle_event(event);
-                    }
-                }
-                Some(DatagramEvent::NewConnection(incoming)) => {
-                    self.scratch.clear();
-                    let accepted = side
-                        .endpoint
-                        .accept(
-                            incoming,
-                            at,
-                            &mut self.scratch,
-                            Some(self.server_config.clone()),
-                        )
-                        .unwrap_or_else(|error| panic!("the server refused: {:?}", error.cause));
-                    side.connection = Some(accepted);
-                }
-                Some(DatagramEvent::Response(transmit)) => {
-                    let (node, peer) = (side.node, delivery.from);
-                    let bytes = self.scratch[..transmit.size].to_vec();
-                    let size = bytes.len();
-                    let _ = self.fabric.send(node, peer, bytes, size);
-                }
-                None => {}
-            }
+            queued: Vec::new(),
+            ecn: false,
         }
     }
     /// What the two ends do with what they were told.
-    fn apply(&mut self, now: u64) {
-        let (warm, end) = (self.warm(), self.end());
+    fn apply(&mut self, now: u64, scenario: &Scenario, warm: u64, end: u64) {
         if let Some((_, connection)) = &mut self.client.connection {
             while let Some(event) = connection.poll() {
                 match event {
@@ -406,14 +382,14 @@ impl Run {
                 }
             }
             if self.connected {
-                let width = if self.scenario.derived {
-                    focal_wire::bulk_width(connection.stats().path.cwnd, self.scenario.transfers)
+                let width = if scenario.derived {
+                    focal_wire::bulk_width(connection.stats().path.cwnd, scenario.transfers)
                 } else {
-                    self.scenario.transfers
+                    scenario.transfers
                 };
                 while self.transfers.len() < width {
                     let id = connection.streams().open(Dir::Uni).unwrap();
-                    if self.scenario.classes {
+                    if scenario.classes {
                         connection
                             .send_stream(id)
                             .set_priority(focal_wire::TrafficClass::Bulk.priority())
@@ -430,7 +406,7 @@ impl Run {
                 while self.next_exchange <= now && self.next_exchange < end {
                     if let Some(id) = connection.streams().open(Dir::Bi) {
                         let mut stream = connection.send_stream(id);
-                        if self.scenario.classes {
+                        if scenario.classes {
                             stream
                                 .set_priority(focal_wire::TrafficClass::Control.priority())
                                 .unwrap();
@@ -500,7 +476,7 @@ impl Run {
                     assert_eq!(*question, EXCHANGE_BYTES);
                     self.questions.remove(&id);
                     let mut answer = connection.send_stream(id);
-                    if self.scenario.classes {
+                    if scenario.classes {
                         answer
                             .set_priority(focal_wire::TrafficClass::Control.priority())
                             .unwrap();
@@ -514,35 +490,223 @@ impl Run {
             }
         }
     }
+}
+struct Run {
+    scenario: Scenario,
+    began: Instant,
+    fabric: Fabric<Datagram>,
+    flows: Vec<Flow>,
+    scratch: Vec<u8>,
+    marked_at_warm: u64,
+}
+impl Run {
+    fn warm(&self) -> u64 {
+        self.scenario.seconds * SECOND / 4
+    }
+    fn end(&self) -> u64 {
+        self.scenario.seconds * SECOND
+    }
+    fn at(&self, now: u64) -> Instant {
+        self.began + Duration::from_nanos(now)
+    }
+    /// One flow for each law, all of them through the one bottleneck in
+    /// each direction: the dumbbell of RFC 5166.
+    fn new(scenario: Scenario, laws: &[Law], pki: &Pki) -> Self {
+        let mut fabric = Fabric::new(scenario.seed, 1 << 20, 1 << 30);
+        let queue = (scenario.bdp_bytes() * scenario.queue_bdps).max(4 * DATAGRAM as u64);
+        let loss = if scenario.bursts {
+            // Bursts of five messages on average that lose half of what
+            // they hold, entered so often that the whole loses what is
+            // stated.
+            Loss::bursty(scenario.loss_ppm * 2 / 5, 200_000, 500_000)
+        } else {
+            Loss::random(scenario.loss_ppm)
+        };
+        let link = Link {
+            marking: scenario.marking,
+            ..Link::drop_tail(scenario.rate_bits_per_second, queue)
+        };
+        let up = fabric.add_link(link).unwrap();
+        let down = fabric.add_link(link).unwrap();
+        let flows: Vec<Flow> = laws
+            .iter()
+            .enumerate()
+            .map(|(index, law)| Flow::new(index as u64, *law, scenario.seed, pki))
+            .collect();
+        for flow in &flows {
+            for (from, to, link) in [
+                (flow.client.node, flow.server.node, up),
+                (flow.server.node, flow.client.node, down),
+            ] {
+                fabric
+                    .set_pair_path(
+                        from,
+                        to,
+                        Path::in_order(scenario.rtt_ns / 2, 0)
+                            .with_loss(loss)
+                            .through(link),
+                    )
+                    .unwrap();
+            }
+        }
+        Self {
+            scenario,
+            began: Instant::now(),
+            fabric,
+            flows,
+            scratch: Vec::with_capacity(2 * DATAGRAM),
+            marked_at_warm: 0,
+        }
+    }
+    fn connect(&mut self, pki: &Pki) {
+        let now = self.at(0);
+        for flow in &mut self.flows {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(pki.certificate.clone()).unwrap();
+            let mut config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+            config.transport_config(transport(flow.law));
+            let connection = flow
+                .client
+                .endpoint
+                .connect(now, config, flow.server.address, "localhost")
+                .unwrap();
+            flow.client.connection = Some(connection);
+        }
+    }
+    /// What arrived by `now` is handed to whom it is for.
+    fn deliver(&mut self, now: u64) {
+        let at = self.at(now);
+        let carries_ecn = self.scenario.ecn;
+        while let Some(delivery) = self.fabric.receive() {
+            let flow = &mut self.flows[usize::try_from((delivery.to - 1) / 2).unwrap()];
+            let (side, from) = if delivery.to % 2 == 0 {
+                (&mut flow.server, flow.client.address)
+            } else {
+                (&mut flow.client, flow.server.address)
+            };
+            let ecn = if carries_ecn {
+                delivery.message.ecn
+            } else {
+                None
+            };
+            self.scratch.clear();
+            let event = side.endpoint.handle(
+                at,
+                from,
+                None,
+                ecn,
+                BytesMut::from(delivery.message.bytes.as_slice()),
+                &mut self.scratch,
+            );
+            match event {
+                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                    if let Some((own, connection)) = &mut side.connection
+                        && *own == handle
+                    {
+                        connection.handle_event(event);
+                    }
+                }
+                Some(DatagramEvent::NewConnection(incoming)) => {
+                    self.scratch.clear();
+                    let accepted = side
+                        .endpoint
+                        .accept(
+                            incoming,
+                            at,
+                            &mut self.scratch,
+                            Some(flow.server_config.clone()),
+                        )
+                        .unwrap_or_else(|error| panic!("the server refused: {:?}", error.cause));
+                    side.connection = Some(accepted);
+                }
+                Some(DatagramEvent::Response(transmit)) => {
+                    let (node, peer) = (side.node, delivery.from);
+                    let bytes = self.scratch[..transmit.size].to_vec();
+                    let _ = send_datagram(
+                        &mut self.fabric,
+                        carries_ecn,
+                        node,
+                        peer,
+                        bytes,
+                        transmit.ecn,
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+    /// What the ends of every flow do with what they were told.
+    fn apply(&mut self, now: u64) {
+        let (warm, end) = (self.warm(), self.end());
+        let scenario = self.scenario;
+        for flow in &mut self.flows {
+            flow.apply(now, &scenario, warm, end);
+        }
+    }
     /// Timers that are due fire, and what each end has to send leaves.
     /// Whether anything did.
     fn transmit(&mut self, now: u64) -> bool {
         let at = self.at(now);
+        let warm = self.warm();
+        let scenario = self.scenario;
         let mut sent = false;
-        for side in [&mut self.client, &mut self.server] {
-            let peer = if side.node == CLIENT { SERVER } else { CLIENT };
-            let Some((handle, connection)) = &mut side.connection else {
-                continue;
-            };
-            if connection.poll_timeout().is_some_and(|due| due <= at) {
-                connection.handle_timeout(at);
-            }
-            while let Some(event) = connection.poll_endpoint_events() {
-                if let Some(event) = side.endpoint.handle_event(*handle, event) {
-                    connection.handle_event(event);
-                }
-            }
-            loop {
-                self.scratch.clear();
-                let Some(transmit) = connection.poll_transmit(at, 1, &mut self.scratch) else {
-                    break;
+        for flow in &mut self.flows {
+            let client = flow.client.node;
+            for side in [&mut flow.client, &mut flow.server] {
+                let peer = if side.node == client {
+                    client + 1
+                } else {
+                    client
                 };
-                assert!(transmit.segment_size.is_none());
-                let bytes = self.scratch[..transmit.size].to_vec();
-                let size = bytes.len();
-                self.datagrams += 1;
-                sent = true;
-                if let Fate::Arrives { .. } = self.fabric.send(side.node, peer, bytes, size) {}
+                let Some((handle, connection)) = &mut side.connection else {
+                    continue;
+                };
+                if connection.poll_timeout().is_some_and(|due| due <= at) {
+                    connection.handle_timeout(at);
+                }
+                while let Some(event) = connection.poll_endpoint_events() {
+                    if let Some(event) = side.endpoint.handle_event(*handle, event) {
+                        connection.handle_event(event);
+                    }
+                }
+                loop {
+                    self.scratch.clear();
+                    let Some(transmit) = connection.poll_transmit(at, 1, &mut self.scratch) else {
+                        break;
+                    };
+                    assert!(transmit.segment_size.is_none());
+                    let bytes = self.scratch[..transmit.size].to_vec();
+                    let size = bytes.len();
+                    flow.datagrams += 1;
+                    sent = true;
+                    let fate = send_datagram(
+                        &mut self.fabric,
+                        scenario.ecn,
+                        side.node,
+                        peer,
+                        bytes,
+                        transmit.ecn,
+                    );
+                    if side.node != client {
+                        continue;
+                    }
+                    flow.ecn = scenario.ecn && transmit.ecn.is_some();
+                    // The wait in the queue: what is left of the arrival
+                    // after the propagation and the datagram's own time on
+                    // the link.
+                    if let Fate::Arrives { at: arrives } = fate
+                        && now >= warm
+                    {
+                        let serialization = (size as u64 * 8 * SECOND)
+                            .div_ceil(scenario.rate_bits_per_second.max(1));
+                        flow.queued.push(
+                            arrives
+                                .saturating_sub(now)
+                                .saturating_sub(scenario.rtt_ns / 2)
+                                .saturating_sub(serialization),
+                        );
+                    }
+                }
             }
         }
         sent
@@ -552,34 +716,42 @@ impl Run {
         if let Some(arrival) = self.fabric.next_arrival() {
             next = next.min(arrival);
         }
-        if self.connected {
-            next = next.min(self.next_exchange.max(now));
-        }
         let began = self.began;
-        for side in [&mut self.client, &mut self.server] {
-            if let Some((_, connection)) = &mut side.connection
-                && let Some(due) = connection.poll_timeout()
-            {
-                let due = u64::try_from(due.saturating_duration_since(began).as_nanos()).unwrap();
-                next = next.min(due);
+        for flow in &mut self.flows {
+            if flow.connected {
+                next = next.min(flow.next_exchange.max(now));
+            }
+            for side in [&mut flow.client, &mut flow.server] {
+                if let Some((_, connection)) = &mut side.connection
+                    && let Some(due) = connection.poll_timeout()
+                {
+                    let due =
+                        u64::try_from(due.saturating_duration_since(began).as_nanos()).unwrap();
+                    next = next.min(due);
+                }
             }
         }
         next
     }
-    fn run(mut self, law: Law, pki: &Pki) -> Measured {
-        self.connect(law, pki);
+    fn closed(&self) -> bool {
+        self.flows.iter().any(|flow| flow.closed.is_some())
+    }
+    fn run(mut self, pki: &Pki) -> Vec<Measured> {
+        self.connect(pki);
         let mut now = 0u64;
         let mut warmed = false;
         // Every pass either sends, or moves the clock: a run ends.
         let mut passes = 0u64;
         let bound = self.scenario.seconds
             * (self.scenario.rate_bits_per_second / 8 / DATAGRAM as u64 + 1_000)
-            * 64;
-        while now < self.end() && self.closed.is_none() {
+            * 64
+            * self.flows.len() as u64;
+        let laws: Vec<Law> = self.flows.iter().map(|flow| flow.law).collect();
+        while now < self.end() && !self.closed() {
             passes += 1;
             assert!(
                 passes < bound,
-                "{law:?} in {}: the run spins",
+                "{laws:?} in {}: the run spins",
                 self.scenario.name()
             );
             self.deliver(now);
@@ -587,7 +759,10 @@ impl Run {
             let sent = self.transmit(now);
             if !warmed && now >= self.warm() {
                 warmed = true;
-                self.transfer_at_warm = self.transfer_received;
+                for flow in &mut self.flows {
+                    flow.transfer_at_warm = flow.transfer_received;
+                }
+                self.marked_at_warm = self.fabric.stats().marked;
             }
             if sent {
                 // What was sent may be due at once, and may let more leave.
@@ -608,38 +783,76 @@ impl Run {
             self.fabric.advance_to(now).unwrap();
         }
         let stats = self.fabric.stats();
-        let mut took = std::mem::take(&mut self.took);
-        took.sort_unstable();
-        let at = |per_cent: usize| {
-            if took.is_empty() {
-                return 0;
-            }
-            took[((took.len() * per_cent).div_ceil(100)).clamp(1, took.len()) - 1]
-        };
         let measured_ns = self.end() - self.warm();
         let could = u128::from(self.scenario.rate_bits_per_second) / 8 * u128::from(measured_ns)
             / 1_000_000_000;
-        let carried = u128::from(self.transfer_received - self.transfer_at_warm);
-        // Exchanges asked within the last second may be on their way.
-        let asked = self.asked_after_warm;
-        Measured {
-            asked,
-            answered: took.len() as u64,
-            p50_ns: at(50),
-            p99_ns: at(99),
-            worst_ns: took.last().copied().unwrap_or(0),
-            carried_ppm: u64::try_from(carried * 1_000_000 / could.max(1)).unwrap(),
-            queue_drops: stats.dropped_queue,
-            lost: stats.dropped_loss,
-            datagrams: self.datagrams,
-            streams: self.transfers.len(),
-            closed: self.closed.clone(),
-        }
+        let marked_at_warm = self.marked_at_warm;
+        self.flows
+            .iter_mut()
+            .map(|flow| {
+                let mut took = std::mem::take(&mut flow.took);
+                took.sort_unstable();
+                let mut queued = std::mem::take(&mut flow.queued);
+                queued.sort_unstable();
+                let at = |values: &[u64], per_cent: usize| {
+                    if values.is_empty() {
+                        return 0;
+                    }
+                    values[((values.len() * per_cent).div_ceil(100)).clamp(1, values.len()) - 1]
+                };
+                let carried = u128::from(flow.transfer_received - flow.transfer_at_warm);
+                let congestion_events = flow
+                    .client
+                    .connection
+                    .as_ref()
+                    .map_or(0, |(_, connection)| {
+                        connection.stats().path.congestion_events
+                    });
+                Measured {
+                    // Exchanges asked within the last second may be on
+                    // their way.
+                    asked: flow.asked_after_warm,
+                    answered: took.len() as u64,
+                    p50_ns: at(&took, 50),
+                    p99_ns: at(&took, 99),
+                    worst_ns: took.last().copied().unwrap_or(0),
+                    carried_ppm: u64::try_from(carried * 1_000_000 / could.max(1)).unwrap(),
+                    queue_drops: stats.dropped_queue,
+                    lost: stats.dropped_loss,
+                    datagrams: flow.datagrams,
+                    streams: flow.transfers.len(),
+                    closed: flow.closed.clone(),
+                    marked: stats.marked,
+                    marked_at_warm,
+                    queue_p50_ns: at(&queued, 50),
+                    queue_p99_ns: at(&queued, 99),
+                    congestion_events,
+                    ecn: flow.ecn,
+                }
+            })
+            .collect()
     }
 }
 
 fn measure(scenario: Scenario, law: Law, pki: &Pki) -> Measured {
-    Run::new(scenario, law, pki).run(law, pki)
+    Run::new(scenario, &[law], pki).run(pki).remove(0)
+}
+/// Flows of these laws at once through the scenario's bottleneck.
+fn compete(scenario: Scenario, laws: &[Law], pki: &Pki) -> Vec<Measured> {
+    Run::new(scenario, laws, pki).run(pki)
+}
+/// Jain's index of what each flow carried (Jain, Chiu and Hawe, 1984):
+/// one when they share alike, `1/n` when one takes everything.
+fn fairness(measured: &[Measured]) -> f64 {
+    let sum: f64 = measured.iter().map(|m| m.carried_ppm as f64).sum();
+    let squares: f64 = measured
+        .iter()
+        .map(|m| (m.carried_ppm as f64).powi(2))
+        .sum();
+    if squares == 0.0 {
+        return 0.0;
+    }
+    sum * sum / (measured.len() as f64 * squares)
 }
 
 fn geomean(values: impl Iterator<Item = f64>) -> f64 {
@@ -797,6 +1010,8 @@ fn scenario(rate: u64, rtt_ms: u64, loss_ppm: u32, seconds: u64) -> Scenario {
         transfers: 1,
         classes: false,
         derived: false,
+        ecn: false,
+        marking: Marking::Off,
     }
 }
 
@@ -1190,3 +1405,548 @@ fn the_stride_of_the_law_is_the_one_that_was_measured() {
         assert_eq!(chosen, focal_wire::congestion::DEFAULT_STRIDE);
     }
 }
+
+/// The queue managers the marked scenarios run: a step at one datagram (the
+/// low threshold DCTCP's switches mark at, RFC 8257 §3.1) and CoDel's own
+/// defaults (RFC 8289 §4.3), both below the queue of `1/δ` datagrams Copa
+/// keeps on its own on the paths measured.
+fn managers() -> [Marking; 2] {
+    [
+        Marking::Step {
+            threshold_bytes: DATAGRAM as u64,
+        },
+        Marking::CoDel {
+            target_ns: 5 * MS,
+            interval_ns: 100 * MS,
+        },
+    ]
+}
+
+/// Whether a queue manager must mark a law that keeps, without it, the
+/// queue measured in `unmanaged`: a step marks whatever finds more than its
+/// threshold ahead, so a 99th percentile above the threshold (its bytes at
+/// the link's rate) is marked; CoDel marks only a sojourn that has stood
+/// above its target for an interval (RFC 8289 §5), so a queue whose median
+/// stands above the target is.
+fn must_mark(marking: Marking, rate_bits_per_second: u64, unmanaged: &Measured) -> bool {
+    match marking {
+        Marking::Off => false,
+        Marking::Step { threshold_bytes } => {
+            unmanaged.queue_p99_ns > threshold_bytes * 8 * SECOND / rate_bits_per_second.max(1)
+        }
+        Marking::CoDel { target_ns, .. } => unmanaged.queue_p50_ns > target_ns,
+    }
+}
+
+/// The least an incumbent law's flow should carry beside a newcomer through
+/// the scenario's bottleneck: what it carries beside the deployed standard
+/// that harms it most — a flow of its own kind, or CUBIC (RFC 9438, quinn's
+/// and most hosts' default) — the worse-off of each pair. A newcomer may
+/// harm an incumbent no more than the incumbent harms itself (Ware,
+/// Mukerjee, Seshan and Sherry, "Beyond Jain's Fairness Index: Setting the
+/// Bar for the Deployment of Congestion Control Algorithms", HotNets 2019),
+/// and the IETF admits a sender no more aggressive than CUBIC is (RFC 8511
+/// §5). The worse-off of one run's pair stands for the incumbent's
+/// distribution.
+fn harm_bar(path: Scenario, incumbent: Law, pki: &Pki) -> u64 {
+    let own = compete(path, &[incumbent, incumbent], pki)
+        .iter()
+        .map(|m| m.carried_ppm)
+        .min()
+        .unwrap();
+    if incumbent == Law::Cubic {
+        return own;
+    }
+    own.min(compete(path, &[Law::Cubic, incumbent], pki)[1].carried_ppm)
+}
+
+/// What RFC 9002's sender, NewReno, carries alone under one queue manager:
+/// the standard Copa's answer to a mark is held to.
+fn standard_under(path: Scenario, pki: &Pki) -> Measured {
+    measure(path, Law::NewReno, pki)
+}
+
+/// Copa alone answers a queue manager's marks (the audit's F39). **The
+/// rule:** on a path that carries ECN, quinn's validation keeps it
+/// ECN-capable; wherever the queue Copa keeps without the manager stands
+/// where the manager acts ([`must_mark`]), it marks (the scenario is not
+/// vacuous); under the manager Copa drops no more than without it, nine in
+/// ten of its exchanges are answered, and its queue's 99th percentile is
+/// ten ninths at most of its 99th percentile without the manager (the
+/// harness's tolerance for "about as much"): a manager never lengthens the
+/// queue Copa keeps; and over the scenarios, by geometric mean as the
+/// harness judges its other choices, Copa's queue's 99th percentile under
+/// the manager is no longer than without it and it carries no less than
+/// NewReno, RFC 9002's sender, carries under the same manager. A first
+/// statement judged each scenario's queue against its own without the
+/// manager exactly and fell to one run's noise; a second judged the queue
+/// by geometric mean alone, under which Copa alone at 100 Mbit/s, 20 ms
+/// kept CoDel's queue at its target, 5.34 ms where it keeps 0.73 ms without
+/// a manager (2026-10-03).
+#[test]
+fn copa_takes_a_mark_for_a_queue_longer_than_its_manager_wants() {
+    let pki = Pki::new();
+    let full = std::env::var_os("FOCAL_CONGESTION_FULL").is_some();
+    let (paths, seconds): (&[(u64, u64)], u64) = if full {
+        (
+            &[
+                (1_000_000, 20),
+                (1_000_000, 100),
+                (10_000_000, 20),
+                (10_000_000, 100),
+                (100_000_000, 20),
+                (100_000_000, 100),
+            ],
+            30,
+        )
+    } else {
+        (&[(10_000_000, 20), (10_000_000, 100)], 8)
+    };
+    println!(
+        "| Path | marks (by warm-up) | events | queue p50 / p99 ms (unmanaged p99) | carried | NewReno carried | p99 ms | drops |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    let mut queue = Vec::new();
+    let mut carried = Vec::new();
+    for (rate, rtt) in paths {
+        let plain = Scenario {
+            ecn: true,
+            ..scenario(*rate, *rtt, 0, seconds)
+        };
+        let unmarked = measure(plain, Law::Copa, &pki);
+        assert!(unmarked.ecn, "{}: {unmarked:?}", plain.name());
+        for marking in managers() {
+            let path = Scenario { marking, ..plain };
+            let m = measure(path, Law::Copa, &pki);
+            let reno = standard_under(path, &pki);
+            println!(
+                "| {} | {} ({}) | {} | {:.2} / {:.2} ({:.2}) | {:.1}% | {:.1}% | {:.1} | {} |",
+                path.name(),
+                m.marked,
+                m.marked_at_warm,
+                m.congestion_events,
+                m.queue_p50_ns as f64 / MS as f64,
+                m.queue_p99_ns as f64 / MS as f64,
+                unmarked.queue_p99_ns as f64 / MS as f64,
+                m.carried_ppm as f64 / 10_000.0,
+                reno.carried_ppm as f64 / 10_000.0,
+                m.p99_ns as f64 / MS as f64,
+                m.queue_drops
+            );
+            assert_eq!(m.closed, None, "{}", path.name());
+            assert!(m.ecn, "{}: quinn stopped sending ECN: {m:?}", path.name());
+            if must_mark(marking, *rate, &unmarked) {
+                assert!(m.marked > 0, "{}: nothing was marked: {m:?}", path.name());
+            }
+            assert!(
+                m.queue_drops <= unmarked.queue_drops,
+                "{}: {m:?} {unmarked:?}",
+                path.name()
+            );
+            assert!(m.answered * 10 >= m.asked * 9, "{}: {m:?}", path.name());
+            assert!(
+                m.queue_p99_ns * 9 <= unmarked.queue_p99_ns * 10,
+                "{}: the manager lengthened the queue: {m:?} {unmarked:?}",
+                path.name()
+            );
+            queue.push(m.queue_p99_ns.max(1) as f64 / unmarked.queue_p99_ns.max(1) as f64);
+            carried.push(m.carried_ppm.max(1) as f64 / reno.carried_ppm.max(1) as f64);
+        }
+    }
+    let queue = geomean(queue.into_iter());
+    let carried = geomean(carried.into_iter());
+    println!("queue under the manager / without it: {queue:.3}; carried / NewReno's: {carried:.3}");
+    assert!(queue <= 1.0, "the managed queue is longer: {queue:.3}");
+    assert!(carried >= 1.0, "carries less than NewReno: {carried:.3}");
+}
+
+/// What a flow gives and takes beside NewReno or CUBIC through one
+/// bottleneck in one run: the incumbent's share beside it over the
+/// incumbent's bar ([`harm_bar`]), and whether either stalled.
+struct Beside {
+    law: u64,
+    incumbent: u64,
+    bar: u64,
+    jain: f64,
+    marks: u64,
+}
+impl Beside {
+    fn ratio(&self) -> f64 {
+        self.incumbent.max(1) as f64 / self.bar.max(1) as f64
+    }
+    fn stalled(&self) -> bool {
+        self.law * 10 < self.incumbent || self.incumbent * 10 < self.law
+    }
+    fn row(&self) -> String {
+        format!(
+            "{:.1}% / {:.1}% (bar {:.1}%; Jain {:.3}; marks {})",
+            self.law as f64 / 10_000.0,
+            self.incumbent as f64 / 10_000.0,
+            self.bar as f64 / 10_000.0,
+            self.jain,
+            self.marks
+        )
+    }
+}
+fn beside(path: Scenario, law: Law, incumbent: Law, bar: u64, pki: &Pki) -> Beside {
+    let pair = compete(path, &[law, incumbent], pki);
+    let [newcomer, them] = pair.as_slice() else {
+        panic!("{pair:?}")
+    };
+    for m in &pair {
+        assert_eq!(m.closed, None, "{}: {m:?}", path.name());
+    }
+    Beside {
+        law: newcomer.carried_ppm,
+        incumbent: them.carried_ppm,
+        bar,
+        jain: fairness(&pair),
+        marks: newcomer.marked,
+    }
+}
+
+/// The seeds a scenario's harm is judged over. The incumbent's share beside
+/// Copa over its bar is one run's, and a run is its seed: over eight seeds
+/// at 1 Mbit/s, 100 ms under CoDel it spread with a standard deviation of
+/// 0.096 beside CUBIC and 0.064 beside NewReno, the bar itself from 35.5% to
+/// 42.6% (2026-10-03), so one seed's ratio judged against the floor of nine
+/// tenths judges the seed. Over `n` seeds the mean's deviation is the run's
+/// over `√n`: at that spread, eight seeds hold a law at its bar 2.95 of the
+/// mean's deviations above the floor, past [`FLOOR_DEVIATIONS`].
+const HARM_SEEDS: u64 = 8;
+/// How many of the seeds' mean's deviations a scenario's ratio must stand
+/// from the floor of nine tenths, either side, for the seeds to have judged
+/// it and not chance: the one-sided normal quantile at which the eight pairs
+/// of incumbent and path a grid judges are judged at the conventional 5%
+/// together (Bonferroni: 0.05/8, z = 2.50). Each judgement checks it on its
+/// own seeds ([`Harm::resolved`]); one that falls short asks for more seeds.
+const FLOOR_DEVIATIONS: f64 = 2.5;
+
+/// `measure` of each seed of the harm's judgement, the seeds' runs at once:
+/// they share nothing.
+fn per_seed<T: Send>(measure: impl Fn(u64) -> T + Sync) -> Vec<T> {
+    std::thread::scope(|scope| {
+        let measure = &measure;
+        let runs: Vec<_> = (1..=HARM_SEEDS)
+            .map(|seed| scope.spawn(move || measure(seed)))
+            .collect();
+        runs.into_iter().map(|run| run.join().unwrap()).collect()
+    })
+}
+
+/// The incumbent's bar under each seed of the harm's judgement.
+fn bars(path: Scenario, incumbent: Law, pki: &Pki) -> Vec<u64> {
+    per_seed(|seed| harm_bar(Scenario { seed, ..path }, incumbent, pki))
+}
+
+/// What a law does beside an incumbent in one scenario over the seeds of
+/// the harm's judgement ([`HARM_SEEDS`]), against the incumbent's bar under
+/// each seed: the incumbent's share over its bar by geometric mean over the
+/// seeds, as the harness judges its other choices, and their spread.
+struct Harm {
+    ratio: f64,
+    /// The standard deviation of the seeds' ratios' logarithms: the
+    /// geometric mean's spread.
+    deviation: f64,
+    stalled: bool,
+    /// The fewest marks a seed's newcomer took.
+    least_marks: u64,
+    row: String,
+}
+impl Harm {
+    /// Whether the ratio stands [`FLOOR_DEVIATIONS`] of the seeds' mean's
+    /// deviations from the floor of nine tenths, either side, in the
+    /// logarithms the geometric mean is taken in: the floor judged the law,
+    /// not the seeds.
+    fn resolved(&self) -> bool {
+        (self.ratio.ln() - 0.9_f64.ln()).abs()
+            >= FLOOR_DEVIATIONS * self.deviation / (HARM_SEEDS as f64).sqrt()
+    }
+}
+fn harm(path: Scenario, law: Law, incumbent: Law, bars: &[u64], pki: &Pki) -> Harm {
+    let runs = per_seed(|seed| {
+        let at = usize::try_from(seed - 1).unwrap();
+        beside(Scenario { seed, ..path }, law, incumbent, bars[at], pki)
+    });
+    let ratios: Vec<f64> = runs.iter().map(Beside::ratio).collect();
+    let logs: Vec<f64> = ratios
+        .iter()
+        .map(|ratio| ratio.max(f64::MIN_POSITIVE).ln())
+        .collect();
+    let mean = logs.iter().sum::<f64>() / logs.len() as f64;
+    let deviation = (logs.iter().map(|log| (log - mean).powi(2)).sum::<f64>()
+        / (logs.len() as f64 - 1.0).max(1.0))
+    .sqrt();
+    let average = |part: fn(&Beside) -> u64| {
+        runs.iter().map(part).sum::<u64>() as f64 / runs.len() as f64 / 10_000.0
+    };
+    let ratio = geomean(ratios.iter().copied());
+    let least_marks = runs.iter().map(|run| run.marks).min().unwrap_or(0);
+    Harm {
+        ratio,
+        deviation,
+        stalled: runs.iter().any(Beside::stalled),
+        least_marks,
+        row: format!(
+            "{:.1}% / {:.1}% (bar {:.1}%; {ratio:.3} of the bar over {HARM_SEEDS} seeds, deviation {deviation:.3} in logarithms; marks {least_marks} at least)",
+            average(|run| run.law),
+            average(|run| run.incumbent),
+            average(|run| run.bar),
+        ),
+    }
+}
+
+/// Copa beside NewReno and beside CUBIC through one bottleneck, with the
+/// queue managed by CoDel — the classic manager a sender of ECT(0) meets
+/// (RFC 7567, RFC 8289) — and without a manager (the audit's F39). **The
+/// rule:** with CoDel or without a manager, neither flow carries less than a
+/// tenth of what the other carries (this harness's rule for a stall); under
+/// CoDel, where Copa answers marks, CoDel marks Copa beside each, and each
+/// incumbent carries beside Copa nine tenths at least of its bar
+/// ([`harm_bar`]) in every scenario (the harness's tolerance for "about as
+/// much", as in the law's choice), judged over the seeds of [`HARM_SEEDS`],
+/// and its bar at least over the scenarios by geometric mean: Copa harms it
+/// no more than its own kind or CUBIC does. Without a manager the shares
+/// beside the bar are reported: there Copa competing answers a loss by `1/δ`
+/// alone, a loss being no proof of congestion on a lossy path, and takes
+/// more than the bar at long round trips (the record's F39, open). Under a
+/// step at one datagram — DCTCP's threshold for senders of ECT(1) (RFC 8257,
+/// RFC 9330), where a classic sender starves itself — the shares are
+/// reported only. A first statement judged each scenario by one seed's run,
+/// which judged the seed ([`HARM_SEEDS`], 2026-10-03).
+#[test]
+fn copa_shares_a_bottleneck_with_newreno_and_cubic() {
+    let pki = Pki::new();
+    let full = std::env::var_os("FOCAL_CONGESTION_FULL").is_some();
+    let (paths, seconds): (&[(u64, u64)], u64) = if full {
+        (
+            &[
+                (1_000_000, 100),
+                (10_000_000, 20),
+                (10_000_000, 100),
+                (100_000_000, 20),
+            ],
+            30,
+        )
+    } else {
+        (&[(10_000_000, 20)], 10)
+    };
+    println!("| Path | Incumbent | Copa / incumbent carried (bar; Jain; marks) |");
+    println!("|---|---|---|");
+    let mut ratios: BTreeMap<Law, Vec<f64>> = BTreeMap::new();
+    let mut failed = Vec::new();
+    for (rate, rtt) in paths {
+        for marking in std::iter::once(Marking::Off).chain(managers()) {
+            let path = Scenario {
+                ecn: true,
+                marking,
+                ..scenario(*rate, *rtt, 0, seconds)
+            };
+            for incumbent in [Law::NewReno, Law::Cubic] {
+                if !matches!(marking, Marking::CoDel { .. }) {
+                    let bar = harm_bar(path, incumbent, &pki);
+                    let measured = beside(path, Law::Copa, incumbent, bar, &pki);
+                    println!("| {} | {incumbent:?} | {} |", path.name(), measured.row());
+                    if marking == Marking::Off && measured.stalled() {
+                        failed.push(format!(
+                            "{} beside {incumbent:?}: a stall: {}",
+                            path.name(),
+                            measured.row()
+                        ));
+                    }
+                    continue;
+                }
+                let measured = harm(
+                    path,
+                    Law::Copa,
+                    incumbent,
+                    &bars(path, incumbent, &pki),
+                    &pki,
+                );
+                println!("| {} | {incumbent:?} | {} |", path.name(), measured.row);
+                if !measured.resolved() {
+                    failed.push(format!(
+                        "{} beside {incumbent:?}: the seeds spread too far to judge the floor: {}",
+                        path.name(),
+                        measured.row
+                    ));
+                }
+                if measured.stalled {
+                    failed.push(format!(
+                        "{} beside {incumbent:?}: a stall: {}",
+                        path.name(),
+                        measured.row
+                    ));
+                }
+                if measured.ratio * 10.0 < 9.0 {
+                    failed.push(format!(
+                        "{} beside {incumbent:?}: under nine tenths of its bar: {}",
+                        path.name(),
+                        measured.row
+                    ));
+                }
+                if measured.least_marks == 0 {
+                    failed.push(format!(
+                        "{} beside {incumbent:?}: nothing was marked",
+                        path.name()
+                    ));
+                }
+                ratios.entry(incumbent).or_default().push(measured.ratio);
+            }
+        }
+    }
+    for (incumbent, values) in &ratios {
+        let ratio = geomean(values.iter().copied());
+        println!("{incumbent:?} beside Copa / its bar under CoDel: {ratio:.3}");
+        if ratio < 1.0 {
+            failed.push(format!(
+                "Copa harms {incumbent:?} more than its bar: {ratio:.3}"
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// Copa by what a mark multiplies its window by, of the backoffs the RFCs
+/// give a classic sender (RFC 3168 and RFC 9002 §B.2: 1/2; RFC 9438: 7/10;
+/// RFC 8511's experimental β_ecn: 4/5). **The rule:** a backoff is
+/// admissible where, over every queue manager and path by geometric mean,
+/// Copa alone keeps the queue's 99th percentile no longer than without the
+/// manager and carries no less than NewReno under it, and where, under
+/// CoDel — where the backoff is what Copa does, marks being what it
+/// answers — no flow beside NewReno or CUBIC stalls and each carries beside
+/// Copa nine tenths at least of its bar ([`harm_bar`]) in every scenario,
+/// judged over the seeds of [`HARM_SEEDS`], and its bar at least by
+/// geometric mean; of the admissible, the one that carries the most alone
+/// is the law's. A first statement judged harm by geometric mean alone,
+/// over the scenarios without a manager too: those never mark, are the same
+/// for every backoff, and lifted the mean over a scenario where 4/5 left
+/// CUBIC 0.72 of its bar; a second judged each scenario by one seed's run
+/// (2026-10-03).
+#[test]
+fn the_mark_backoff_of_the_law_is_the_one_that_was_measured() {
+    let pki = Pki::new();
+    let full = std::env::var_os("FOCAL_CONGESTION_FULL").is_some();
+    let (paths, seconds): (&[(u64, u64)], u64) = if full {
+        (
+            &[
+                (1_000_000, 100),
+                (10_000_000, 20),
+                (10_000_000, 100),
+                (100_000_000, 20),
+            ],
+            30,
+        )
+    } else {
+        (&[(10_000_000, 20)], 8)
+    };
+    let backoffs = [(1u64, 2u64), (7, 10), (4, 5)];
+    let mut queue = vec![Vec::new(); backoffs.len()];
+    let mut carried = vec![Vec::new(); backoffs.len()];
+    let mut harms: Vec<BTreeMap<Law, Vec<f64>>> = vec![BTreeMap::new(); backoffs.len()];
+    let mut stalled = vec![false; backoffs.len()];
+    let mut under_floor = vec![false; backoffs.len()];
+    println!(
+        "| Path | Backoff | alone: queue p99 ms (unmanaged) / carried (NewReno) | beside NewReno | beside CUBIC |"
+    );
+    println!("|---|---|---|---|---|");
+    for (rate, rtt) in paths {
+        let plain = Scenario {
+            ecn: true,
+            ..scenario(*rate, *rtt, 0, seconds)
+        };
+        let unmarked = measure(plain, Law::Copa, &pki);
+        for marking in std::iter::once(Marking::Off).chain(managers()) {
+            let path = Scenario { marking, ..plain };
+            let judged = matches!(marking, Marking::CoDel { .. });
+            let incumbents = [Law::NewReno, Law::Cubic];
+            // Under CoDel each incumbent's bar under each seed; elsewhere one
+            // run's, reported.
+            let bars: Vec<Vec<u64>> = incumbents
+                .iter()
+                .map(|incumbent| {
+                    if judged {
+                        bars(path, *incumbent, &pki)
+                    } else {
+                        vec![harm_bar(path, *incumbent, &pki)]
+                    }
+                })
+                .collect();
+            let reno = standard_under(path, &pki);
+            for (at, (numerator, denominator)) in backoffs.iter().enumerate() {
+                let law = Law::Backoff(*numerator, *denominator);
+                let mut rows = Vec::new();
+                for (index, incumbent) in incumbents.into_iter().enumerate() {
+                    if !judged {
+                        rows.push(beside(path, law, incumbent, bars[index][0], &pki).row());
+                        continue;
+                    }
+                    let measured = harm(path, law, incumbent, &bars[index], &pki);
+                    stalled[at] |= measured.stalled;
+                    // A ratio its seeds did not resolve from the floor is
+                    // not shown above it.
+                    under_floor[at] |= measured.ratio * 10.0 < 9.0 || !measured.resolved();
+                    harms[at].entry(incumbent).or_default().push(measured.ratio);
+                    rows.push(measured.row);
+                }
+                let alone = if marking == Marking::Off {
+                    None
+                } else {
+                    let alone = measure(path, law, &pki);
+                    queue[at].push(
+                        alone.queue_p99_ns.max(1) as f64 / unmarked.queue_p99_ns.max(1) as f64,
+                    );
+                    carried[at]
+                        .push(alone.carried_ppm.max(1) as f64 / reno.carried_ppm.max(1) as f64);
+                    Some(alone)
+                };
+                println!(
+                    "| {} | {numerator}/{denominator} | {} | {} | {} |",
+                    path.name(),
+                    alone.map_or("—".to_owned(), |alone| format!(
+                        "{:.2} ({:.2}) / {:.1}% ({:.1}%)",
+                        alone.queue_p99_ns as f64 / MS as f64,
+                        unmarked.queue_p99_ns as f64 / MS as f64,
+                        alone.carried_ppm as f64 / 10_000.0,
+                        reno.carried_ppm as f64 / 10_000.0
+                    )),
+                    rows[0],
+                    rows[1]
+                );
+            }
+        }
+    }
+    let judged: Vec<(MarkBackoffPair, bool, f64)> = backoffs
+        .iter()
+        .enumerate()
+        .map(|(at, (numerator, denominator))| {
+            let queue = geomean(queue[at].iter().copied());
+            let carried = geomean(carried[at].iter().copied());
+            let harms: Vec<(Law, f64)> = harms[at]
+                .iter()
+                .map(|(law, values)| (*law, geomean(values.iter().copied())))
+                .collect();
+            let admissible = !stalled[at]
+                && !under_floor[at]
+                && queue <= 1.0
+                && carried >= 1.0
+                && harms.iter().all(|(_, ratio)| *ratio >= 1.0);
+            println!(
+                "backoff {numerator}/{denominator}: admissible {admissible}; alone queue {queue:.3} of unmanaged, carried {carried:.3} of NewReno; beside under CoDel: {harms:?}; stalled {}; under nine tenths of a bar, or not resolved from it, somewhere {}",
+                stalled[at],
+                under_floor[at]
+            );
+            ((*numerator, *denominator), admissible, carried)
+        })
+        .collect();
+    if full {
+        let chosen = judged
+            .iter()
+            .filter(|(_, admissible, _)| *admissible)
+            .max_by(|left, right| left.2.total_cmp(&right.2))
+            .map(|(backoff, _, _)| *backoff);
+        let default = focal_wire::congestion::DEFAULT_MARK_BACKOFF;
+        assert_eq!(chosen, Some((default.numerator, default.denominator)));
+    }
+}
+type MarkBackoffPair = (u64, u64);

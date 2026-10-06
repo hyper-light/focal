@@ -163,7 +163,7 @@ The 47 key-family tags are explicit (30–33 are the frozen legacy rows an impor
 | 40 | ByProducer(participant, artifact) | 47 | DueTimer(logical time, target: claim, evaluation key or claim+monitor) |
 | | | 48 | ByObject(family code, object): the identity index of claims, artifacts and declarations, one contiguous listing per family under the storage layout of [25 §3](25-parallel-materialization-and-ranges.md) |
 
-Invocation namespaces are `0` request, `1`–`3` the three timers, `4` the one-time import and `5` a retirement (`Retirement(root claim)`, [26 §4](26-custody-archive-retention-and-restore.md)); operation tags `30` and `31` are `Import` and `Retire`; key family `49` is `Retired(claim)`, the typed continuation of a retired claim (its body: the bundle's content root and length, the prefix it claims, the claim's final binding and status, the sequence the retirement was published at, and the number of event rows that left with the claim); the archive bundle itself is an `FCNARCHV` frame (magic, version `1`, profile, ledger, the prefix it claims, the root, the members, the content roots of its artifacts held as content objects, the roots of the objects sealed for those held inline, the row count, the rows in key order as the checkpoint writes them, a trailing digest under `focal.native.archive.v1`), never restored, only read through `StructuralArchive`; claim event kind `22` is `Imported(legacy sequence)`; a claim body carries its origin byte (`0` native, `1` legacy) after `created`; the Meta row counts legacy rows after creation results. There is no encoded End sentinel. Key payloads and outcome tags are defined in
+Invocation namespaces are `0` request, `1`–`3` the three timers, `4` the one-time import and `5` a retirement (`Retirement(root claim)`, [26 §4](26-custody-archive-retention-and-restore.md)); operation tags `30` and `31` are `Import` and `Retire`; key family `49` is `Retired(claim)`, the typed continuation of a retired claim (its body: the bundle's content root and length, the prefix it claims, the claim's final binding and status, the sequence the retirement was published at, and the number of event rows that left with the claim); the archive bundle itself is an `FCNARCHV` frame (magic, version `1`, profile, ledger, the prefix it claims, the root, the members, the content roots of its artifacts held as content objects, the roots of the objects sealed for those held inline, the row count, the rows in key order as the checkpoint writes them, a trailing digest under `focal.native.archive.v1`), never restored, only read through `StructuralArchive`; claim event kind `22` is `Imported(legacy sequence)`; a claim body carries its origin byte (`0` native, `1` legacy) after `created`; the Meta row counts legacy rows after creation results, then (F12) the outcome rows sealed out of the live core, the event rows they carried, the seals published and the principals with a window. Key family `50` is `Epochs(principal)`, the principal's request window (floor, sealed-through, the count of open generations, two `(outcomes u32, last logical time u64)` pairs, and a counted list of `(first, last, seal ordinal)` ranges saying which seal holds each sealed generation); family `51` is `Seal(ordinal)`, a fixed row (bundle root, length, the prefix the seal was derived at, the rows it holds, the sequence it was published at, and the first ordinal it covers — its own for a seal, an earlier one for a fold). Invocation namespace `6` is a seal (`Seal(ordinal)`); operation tags `32` and `33` are `AdvanceEpochFloor` (a participant request, [21 §3](21-native-input-format.md)) and `Seal`. Every request record writes its principal's window beside the Meta and its outcome (a timer writes none); replay derives the window from the one before it and refuses any other. Both families and the outcomes of imports, retirements and seals live under the control affinity of [25 §3](25-parallel-materialization-and-ranges.md). The seal bundle is an `FCNSEAL1` frame (magic, version `1`, profile, ledger, a kind byte: `0` a seal — the prefix derived at, the ordinal, the sealed generations per principal, the row count and the outcome and creation-result rows in key order; `1` a fold — the first and last ordinal covered, the member seal rows and every window range pointing into them — under a trailing digest under `focal.native.seal.v1`), never restored, only read through `StructuralSeal`. Resident outcomes are `outcomes − sealed`, bounded by `limits.outcomes`; `outcomes` itself still equals the native prefix. There is no encoded End sentinel. Key payloads and outcome tags are defined in
 the explicit fixed-field writer/reader above. The body implementations are
 [scalar/index and dispatch rows](../../crates/focal-core/src/native/record_codec/rows.rs),
 [claim, evaluation and audit rows](../../crates/focal-core/src/native/record_codec/lifecycle.rs),
@@ -311,6 +311,20 @@ and its entire temporary peak participates in recovery memory admission.
 
 Parsing, model work, source callbacks and dependency lookup use separate
 cumulative allowances across all phases and both preparation/build passes.
+The allowances of a restore are the envelope of the checkpoint's own declared
+shape (2026-09-29, the audit's F57; `recovery::Work::for_shape`): the
+inspection's visits for each whole scan (the index and every hydration
+phase) plus the body parsing per byte; a ceiling per row and per byte for
+source and model work; the history sort at its bound (every event a primary
+entry and at most one secondary), charged for the entries there are once
+they are counted; a lookup ceiling per row; and, once the index has counted
+the artifact rows, a custody recovery per artifact under the largest
+verification any schema may declare. The per-unit ceilings are measured on
+the recorded workflows at authored maxima and pinned by a test that fails
+when a restore outgrows one. A configuration's recovery work is that envelope
+at its checkpoint bounds (`Work::for_limits`), never a chosen constant, so
+every checkpoint the configuration admits fits its recovery, and a body that
+costs more than its declared rows and bytes allow is refused.
 An opaque cursor or model inspection exclusively borrows its offered work
 allowance; nested use of that same meter cannot spend it concurrently. Known
 model work can instead be debited in advance, leaving a separate remainder for
@@ -550,7 +564,16 @@ record format to one Raft group through the consensus replica. Its contract:
    at, the root claim, the bundle's content root and length, the prefix the
    bundle claims and a digest under
    `focal.native.session.retirement-record.v1`; applying one advances the
-   native sequence by one through the outcome the core publishes),
+   native sequence by one through the outcome the core publishes) and seal
+   records (`FOCALSO1`, [26 §4a](26-custody-archive-retention-and-restore.md):
+   magic, version, ledger, the native prefix the seal was derived at (and is
+   applied at), the bundle's content root and length, the row count the
+   replica must derive, the bound of the derivation, the resident outcome
+   bound it was derived under, a fold of older seal rows when the index
+   reached its bound, and the generation floors the pressure forces, under a
+   digest under `focal.native.session.seal-record.v1`; at most 64 KiB;
+   applying one advances the native sequence by one through the seal's own
+   outcome),
    membership and Raft no-ops advance only the Raft prefix. Membership and native entries are merged
    by Raft index during delivery, so the configuration index never exceeds the
    applied index at a retained cursor.

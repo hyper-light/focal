@@ -1,7 +1,5 @@
 use super::*;
-use focal_consensus::{
-    ConfChangeSingle, ConfChangeType, ConfChangeV2, DurableNode, NodeConfig, PbMessageExt,
-};
+use focal_consensus::{ConfChangeSingle, ConfChangeType, ConfChangeV2, DurableNode, NodeConfig};
 use focal_enrollment::{
     BootstrapAuthority, CredentialMaterial, EnrollmentLimits, EnrollmentReceipt,
     EnrollmentRegistry, EnrollmentRole, Invitation, InviteOptions, JoinKey, JoinPreparation,
@@ -117,7 +115,7 @@ impl Fixture {
             let node = receipt.identity.node_id.unwrap();
             credentials.insert(
                 node,
-                key.complete(&receipt, issuer.ca_certificate(), now)
+                key.complete(&receipt, issuer.issuers().unwrap().trusted(), now)
                     .unwrap(),
             );
             receipts.insert(node, receipt);
@@ -539,9 +537,12 @@ fn real_committed_configuration_needs_installed_quorum_and_exact_scoped_signatur
         node_id: 5,
         ..Default::default()
     };
-    add.set_change_type(ConfChangeType::AddLearnerNode);
+    add.change_type = ConfChangeType::AddLearnerNode;
     change.changes.push(add);
-    let record_hash = ContentHash(*blake3::hash(&change.write_to_bytes().unwrap()).as_bytes());
+    let record_hash = ContentHash(
+        *blake3::hash(&focal_consensus::envelope::encode_conf_change_v2(&change).unwrap())
+            .as_bytes(),
+    );
     nodes
         .get_mut(&2)
         .unwrap()
@@ -868,4 +869,82 @@ fn full_authority_maps_reject_growth_before_reservation_without_blocking_existin
     ));
     assert_eq!(fixture.authority.checkpoint(), &before);
     drop(pressure);
+}
+
+#[test]
+fn a_renewed_credential_extends_the_grant_at_its_generation_and_a_group_lasts_with_its_members() {
+    let mut fixture = Fixture::new();
+    fixture.install_nodes();
+    let group = fixture.session_group();
+    fixture.commit(AuthorityOperation::BootstrapGroup {
+        grant: group.clone(),
+    });
+    // A group is authorized while its members are: its end is the earliest
+    // of their grants, whatever expiry it was issued with.
+    assert_eq!(
+        fixture.authority.checkpoint().group_expires_at(&group),
+        fixture.now + 600
+    );
+    // A renewed credential extends the node's grant at the same generation:
+    // the grant as it stands, expiring later.
+    let mut extended = fixture.grant(2);
+    extended.expires_at = fixture.now + 1200;
+    fixture.commit(AuthorityOperation::GrantNode {
+        grant: extended,
+        expected_generation: Some(1),
+    });
+    let after = fixture.authority.checkpoint();
+    assert_eq!(after.nodes[&2].enrollment.generation, 1);
+    assert_eq!(after.nodes[&2].expires_at, fixture.now + 1200);
+    // The group follows the earliest member, and every member once all are extended.
+    assert_eq!(after.group_expires_at(&group), fixture.now + 600);
+    for node in [3, 4] {
+        let mut extended = fixture.grant(node);
+        extended.expires_at = fixture.now + 1200;
+        fixture.commit(AuthorityOperation::GrantNode {
+            grant: extended,
+            expected_generation: Some(1),
+        });
+    }
+    assert_eq!(
+        fixture.authority.checkpoint().group_expires_at(&group),
+        fixture.now + 1200
+    );
+    // At the same generation nothing else moves: an expiry that is not
+    // later, or any other change, is a stale grant.
+    let before = fixture.authority.checkpoint().clone();
+    let mut drained = fixture.grant(5);
+    drained.expires_at = fixture.now + 1200;
+    drained.enrollment.eligible = false;
+    for (grant, expected) in [
+        (fixture.grant(5), DirectoryError::StaleNode),
+        (drained, DirectoryError::StaleNode),
+    ] {
+        let prepared = fixture.authority.prepare(
+            &fixture.command(AuthorityOperation::GrantNode {
+                grant,
+                expected_generation: Some(1),
+            }),
+            &fixture.enrollment,
+        );
+        assert!(
+            matches!(&prepared, Err(error) if *error == expected),
+            "{:?}",
+            prepared.err()
+        );
+    }
+    // An extension never outlives the credential the registry holds.
+    let mut beyond = fixture.grant(5);
+    beyond.expires_at = fixture.receipts[&5].expires_at + 1;
+    assert!(matches!(
+        fixture.authority.prepare(
+            &fixture.command(AuthorityOperation::GrantNode {
+                grant: beyond,
+                expected_generation: Some(1),
+            }),
+            &fixture.enrollment,
+        ),
+        Err(DirectoryError::UnverifiedAuthority)
+    ));
+    assert_eq!(fixture.authority.checkpoint(), &before);
 }

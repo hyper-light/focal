@@ -3,17 +3,17 @@
 **Failure.** A sealed artifact's chunk is gone from a copy's content store, or its bytes no
 longer match the hash the ledger names.
 
-**Symptoms.** `cluster replicas diagnostics` shows `custody_objects_missing` on the copy; a
+**Symptoms.** `diagnose cluster --replicas` shows `custody_objects_missing` on the copy; a
 read of the artifact on that node fails verification; `cluster placement` may show the
 session's guarantee `blocked_by` a custody blocker; `focal_session_custody_objects_missing`
-in `cluster node metrics`.
+in `diagnose node --metrics`.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir DIR cluster replicas diagnostics --session ID
+focal --data-dir DIR diagnose cluster --replicas --session ID
 focal --data-dir DIR cluster placement
-focal --data-dir DIR cluster storage show
+focal --data-dir DIR diagnose node --storage
 ```
 
 **Preconditions.** The session names the object in its committed prefix and at least one

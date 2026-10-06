@@ -8,10 +8,11 @@ license.workspace = true
 [dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 focal-model = { version = "0.1.0", path = "../focal-model" }
-focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-memory = { version = "0.1.0", path = "../focal-memory", features = ["serde"] }
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
 blake3.workspace = true
+getrandom.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -20,6 +21,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # The congestion controller's interface names a type quinn does not re-export.
 quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+x509-parser = { version = "0.18", features = ["verify-aws"] }
 
 [target.'cfg(windows)'.dependencies]
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
@@ -38,4 +40,8 @@ workspace = true
 
 [[bench]]
 name = "codec"
+harness = false
+
+[[bench]]
+name = "allocs"
 harness = false

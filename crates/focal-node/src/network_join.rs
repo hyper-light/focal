@@ -32,7 +32,9 @@ const MAGIC: &[u8; 8] = b"FCLINV01";
 const CLIENT_MAGIC: &[u8; 8] = b"FCLCLI01";
 #[path = "client_join.rs"]
 mod client;
-pub use client::{ClientInvitation, PendingClientJoin};
+pub use client::{
+    ClientInvitation, EnrolledClient, PendingClientJoin, adopt_issuer, adopted_issuers,
+};
 #[path = "joined_context.rs"]
 mod joined_context;
 pub use joined_context::{joined_unix_principal, local_unix_principal};
@@ -435,7 +437,7 @@ impl PendingJoin {
         }
         Ok(self
             .key
-            .complete(receipt, &self.bundle.invitation.trust().ca_certificate, now)?)
+            .complete(receipt, self.bundle.invitation.trust().issuers.iter(), now)?)
     }
     /// Retire this pending join (24 §24): its journal and never-enrolled key
     /// move under a marker named by the invitation they were for, so a
@@ -634,7 +636,7 @@ impl JoinedNode {
                         self.credentials.certificate_chain().to_vec(),
                         self.credentials.private_key_der().to_vec(),
                     ),
-                    vec![self.state.sponsor.ca_certificate.clone()],
+                    self.state.sponsor.root_certificates(),
                     &limits,
                 )?,
                 limits.clone(),
@@ -829,7 +831,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     }
     let lock = options.open(&lock_path)?;
     check_private(&lock_path)?;
-    focal_platform::try_lock_exclusive(&lock)?;
+    let _lock = focal_platform::FileLock::exclusive(lock)?;
     if fs::symlink_metadata(path).is_ok() {
         recover_output_link(path, &temporary)?;
         if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
@@ -898,7 +900,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     // Serialize concurrent publications of this exact output path.
     let lock = focal_platform::fs::open_private(&lock_path, true, true, true)?;
     check_private(&lock_path)?;
-    focal_platform::try_lock_exclusive(&lock)?;
+    let _lock = focal_platform::FileLock::exclusive(lock)?;
     // Republishing the identical bytes is success; different bytes at the same
     // path is a genuine conflict. The installed file is already durable, so no
     // read-time re-sync (FlushFileBuffers would reject a read-only handle).

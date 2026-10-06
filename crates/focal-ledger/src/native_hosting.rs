@@ -279,8 +279,8 @@ type RestoredNative = (
 fn carries_native_history(message: &Message) -> bool {
     message.entries.iter().any(|entry| {
         entry.data.starts_with(ACTIVATION_MAGIC) || engine::NativeEngine::<BuiltinNativeSchemas>::is_native_entry(&entry.data)
-    }) || message.get_snapshot().data.starts_with(SNAPSHOT_V6_MAGIC)
-        || message.get_snapshot().data.starts_with(SNAPSHOT_V7_MAGIC)
+    }) || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V6_MAGIC))
+        || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V7_MAGIC))
 }
 
 impl Session {
@@ -303,7 +303,7 @@ impl Session {
             && self
                 .native
                 .as_ref()
-                .is_some_and(|engine| engine.is_authoritative(&self.consensus.status()))
+                .is_some_and(|engine| engine.is_authoritative(&self.consensus.scalars()))
     }
     fn native_engine(&self) -> Result<&engine::NativeEngine<BuiltinNativeSchemas>, LedgerError> {
         self.check()?;
@@ -333,6 +333,15 @@ impl Session {
     }
     pub fn native_support_ready(&self) -> bool {
         self.consensus.decoder_floor_ready(native_format_hash())
+    }
+    /// Whether an activation may be proposed now: the local native promise
+    /// durable and every voter's recorded (23 §5). The owner holds an
+    /// activation until it is, charged to its request time, where the
+    /// first activation of a fresh ledger was refused with the write it had
+    /// itself just started (the KIND campaign's D3).
+    pub fn native_activation_barrier(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        self.require_native_support()
     }
     /// Refuse native history before Raft persists it unless this replica's
     /// successor floor is durable. The transport drops the packet and Raft
@@ -469,7 +478,7 @@ impl Session {
         self.check()?;
         if !self.is_authoritative() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
         if self.hosting.is_none() {
@@ -526,10 +535,18 @@ impl Session {
                 Err(LedgerError::Corrupt)
             };
         }
+        // The record names the configuration it was proposed under by the
+        // index that committed it, which this replica has applied in order
+        // (`apply_delivered_membership`) up to this entry: equal indices are
+        // one configuration of one log. The record's hash of it is not
+        // compared with the consensus's current configuration, which may
+        // already hold a change committed after this entry — in the same
+        // batch, on a copy that joined after the activation (the KIND
+        // campaign of 2026-09-29, D2: every voter added after
+        // `activate-native` failed closed here), or on any replay.
         if record.predecessor != managed_format_hash()
             || record.successor != native_format_hash()
             || record.configuration_index != self.membership_state.configuration_index
-            || record.configuration_hash != configuration_hash(&self.consensus.membership_configuration())
             || record.v1_sequence != self.core.sequence().0
             || record.v1_applied_raft > entry.index
         {
@@ -588,7 +605,7 @@ impl Session {
             }
         }
         engine.set_activation_index(entry.index);
-        let status = self.consensus.status();
+        let status = self.consensus.scalars();
         engine.observe(&status);
         // An authority already past this term's readiness barrier has applied
         // every earlier committed entry; activation is the next one in order,
@@ -809,7 +826,7 @@ impl Session {
             },
             BuiltinNativeSchemas,
         )?;
-        engine.observe(&self.consensus.status());
+        engine.observe(&self.consensus.scalars());
         // A restore that found objects missing names them for the host
         // before the engine it would have built is dropped (24 §20).
         let restored = engine.restore_from(native, index, term, configuration, &self.consensus);
@@ -848,7 +865,7 @@ impl Session {
         self.check()?;
         if !self.is_authoritative() || self.retained.is_some() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
         let engine = self
@@ -1096,6 +1113,62 @@ impl Session {
                 ))
             })
     }
+    /// Whether this authority could propose a retirement now (26 §4): the
+    /// gates `native_propose_retirement` applies before it derives a
+    /// family, the owner's reservation of outcomes for the reports it
+    /// promised among them. The archive agent asks before it seals a
+    /// bundle, so nothing is sealed for a family that cannot be proposed.
+    pub fn native_check_retirement(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.check_retirement(&self.consensus.scalars())?;
+        Ok(())
+    }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4).
+    pub fn native_retirements_inert(&self) -> Result<u64, LedgerError> {
+        Ok(self.native_engine()?.retirements_inert())
+    }
+    /// Whether this authority could propose a seal now (F12): the archive
+    /// agent asks before it derives a plan and writes a bundle.
+    pub fn native_check_seal(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.check_seal(&self.consensus.scalars())?;
+        Ok(())
+    }
+    /// Propose one seal of closed outcomes as a session decision (F12).
+    pub fn native_propose_seal(
+        &mut self,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.propose_seal(&mut self.consensus, plan, bundle, bytes, fold)?;
+        Ok(())
+    }
+    /// Seals applied through this replica's applied prefix, and the seal
+    /// records it applied nothing for (F12).
+    pub fn native_seals(&self) -> Result<(u64, u64), LedgerError> {
+        let engine = self.native_engine()?;
+        Ok((engine.seals_applied(), engine.seals_inert()))
+    }
+    /// The seal this authority proposed and has not seen applied (F12).
+    pub fn native_seal_in_flight(&self) -> Result<Option<crate::native_session::SealRecord>, LedgerError> {
+        Ok(self.native_engine()?.seal_in_flight())
+    }
     /// Propose one family's retirement as a session decision (26 §4).
     pub fn native_propose_retirement(
         &mut self,
@@ -1140,17 +1213,28 @@ impl Session {
     ) -> Result<&Core<NativeState>, LedgerError> {
         Ok(self
             .native_engine()?
-            .read_at_least(boundary, &self.consensus.status())?)
+            .read_at_least(boundary, &self.consensus.scalars())?)
     }
     /// Request a quorum read barrier for a native read; its boundary arrives
     /// in a later poll under the same correlation.
+    /// Whether a linearizable native read can be served here: by the
+    /// authority, or by a follower that knows its leader (27 §5).
+    pub fn serves_native_reads(&self) -> bool {
+        !self.failed
+            && self.retained.is_none()
+            && self
+                .native
+                .as_deref()
+                .is_some_and(|engine| engine.serves_reads(&self.consensus.scalars()))
+    }
     pub fn native_read_index(&mut self, correlation: ReadCorrelation) -> Result<(), LedgerError> {
         self.check()?;
-        if !self.is_authoritative() || self.retained.is_some() {
+        if !self.serves_native_reads() {
             return Err(LedgerError::NotReady {
-                leader: self.status().leader_id,
+                leader: self.scalars().leader_id,
             });
         }
+        self.refuse_at_parked_bound()?;
         let engine = self
             .native
             .as_deref_mut()

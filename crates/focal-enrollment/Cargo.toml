@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 blake3.workspace = true
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
+focal-wire = { version = "0.1.0", path = "../focal-wire" }
 getrandom.workspace = true
 postcard.workspace = true
 serde.workspace = true

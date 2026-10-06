@@ -215,6 +215,11 @@ pub(super) fn get(
             (token, object, args.output.format)
         }
         GetCommand::Validation(args) => return validation(runtime, context, args),
+        GetCommand::Archived(_) => {
+            return Err(CliError::Input(
+                "get archived reads a native ledger's archive; this ledger runs V1 history".into(),
+            ));
+        }
         GetCommand::Artifact(args) => {
             let (token, object) = exact(runtime, context, ObjectKind::Artifact, &args.id)?;
             if let Some(path) = args.output {

@@ -1,21 +1,25 @@
 //! The MCP adapter adds only correlation/recovery fields to the shared DTO schema.
 use crate::{ProtocolError, Tool};
-use focal_client::operations;
+use focal_client::operations::{self, WireProfile};
 use serde_json::{Map, Value};
 #[path = "catalog_schema.rs"]
 pub(crate) mod schema;
 
+/// The catalogue an adapter serves on a V1 ledger: the V1 application
+/// catalogue (`application(WireProfile::V1)`) plus the six managed recovery
+/// tools.
 pub(crate) fn catalog() -> Result<Vec<Tool>, ProtocolError> {
+    let descriptors = operations::application(WireProfile::V1);
     let mut tools = Vec::new();
     tools
         .try_reserve_exact(
-            operations::descriptors()
+            descriptors
                 .len()
                 .checked_add(6)
                 .ok_or(ProtocolError::Capacity)?,
         )
         .map_err(|_| ProtocolError::Capacity)?;
-    for descriptor in operations::descriptors() {
+    for descriptor in descriptors {
         let mut input = descriptor
             .input_schema()
             .map_err(|_| ProtocolError::Limits)?;
@@ -165,43 +169,47 @@ pub(crate) fn specialized(
     Ok(output)
 }
 pub(crate) fn output_schema(name: &str) -> Result<Value, ProtocolError> {
-    let kinds: &[&str] = if name.starts_with("cluster.") {
-        &["administration", "error"]
-    } else {
-        match name {
-            "upload.begin" | "upload.append" | "upload.seal" | "upload.cancel" => {
-                &["upload", "error"]
+    // Every administration tool, `cluster.*` and `diagnose.*` alike, shares
+    // the administration family; the registry says which they are.
+    let kinds: &[&str] =
+        if operations::surface_of(name) == Some(operations::Surface::Administration) {
+            &["administration", "error"]
+        } else {
+            match name {
+                "upload.begin" | "upload.append" | "upload.seal" | "upload.cancel" => {
+                    &["upload", "error"]
+                }
+                "artifact.download" => &["artifact_payload", "error"],
+                "watch.inspect" => &["watch", "watches", "error"],
+                "watch.open" | "watch.next" | "watch.acknowledge" => &["watch", "error"],
+                "request.inspect" => &[
+                    "mutation",
+                    "managed",
+                    "managed_request",
+                    "managed_reconcile",
+                    "reconcile",
+                    "error",
+                ],
+                "request.retry" => &["mutation", "managed", "managed_request", "error"],
+                "request.reserve" | "request.acknowledge" => &["managed_request", "error"],
+                "request.pending" => &["managed_requests", "error"],
+                "request.seal" => &["managed", "error"],
+                "claim.wait" => &["claim_wait", "error"],
+                "validation.context" => &["validation_context", "error"],
+                "ledger.summary" => &["summary", "error"],
+                "monitor.get" => &["monitor", "error"],
+                "ledger.traverse" => &["traversal", "error"],
+                "code.run" | "code.search" => &["code"],
+                _ => match operations::find(name)
+                    .ok_or(ProtocolError::Limits)?
+                    .result_kind
+                {
+                    operations::ResultKind::Mutation => &["mutation", "managed", "error"],
+                    operations::ResultKind::Read => &["read", "error"],
+                    operations::ResultKind::List => &["list", "error"],
+                    operations::ResultKind::Reconcile => &["reconcile", "error"],
+                },
             }
-            "artifact.download" => &["artifact_payload", "error"],
-            "watch.inspect" => &["watch", "watches", "error"],
-            "watch.open" | "watch.next" | "watch.acknowledge" => &["watch", "error"],
-            "request.inspect" => &[
-                "mutation",
-                "managed",
-                "managed_request",
-                "managed_reconcile",
-                "reconcile",
-                "error",
-            ],
-            "request.retry" => &["mutation", "managed", "managed_request", "error"],
-            "request.reserve" | "request.acknowledge" => &["managed_request", "error"],
-            "request.pending" => &["managed_requests", "error"],
-            "request.seal" => &["managed", "error"],
-            "claim.wait" => &["claim_wait", "error"],
-            "validation.context" => &["validation_context", "error"],
-            "ledger.summary" => &["summary", "error"],
-            "monitor.get" => &["monitor", "error"],
-            "ledger.traverse" => &["traversal", "error"],
-            _ => match operations::find(name)
-                .ok_or(ProtocolError::Limits)?
-                .result_kind
-            {
-                operations::ResultKind::Mutation => &["mutation", "managed", "error"],
-                operations::ResultKind::Read => &["read", "error"],
-                operations::ResultKind::List => &["list", "error"],
-                operations::ResultKind::Reconcile => &["reconcile", "error"],
-            },
-        }
-    };
+        };
     specialized(name, kinds, 1)
 }

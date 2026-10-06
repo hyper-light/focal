@@ -56,6 +56,23 @@ pub struct ToolCall {
     pub arguments: Map<String, Value>,
     _allocation: Allocation,
 }
+impl ToolCall {
+    /// A call a code-mode program makes (19 §Code mode): it is dispatched by
+    /// the worker and answered to the program, never to the protocol, so it
+    /// takes no token of the protocol's.
+    pub(crate) fn nested(
+        tool: String,
+        arguments: Map<String, Value>,
+        allocation: Allocation,
+    ) -> Self {
+        Self {
+            token: CallToken(0),
+            tool,
+            arguments,
+            _allocation: allocation,
+        }
+    }
+}
 impl std::fmt::Debug for ToolCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolCall")
@@ -109,8 +126,40 @@ pub struct Protocol {
     _workspace: Allocation,
     _catalog: Allocation,
     _active: Allocation,
+    /// The skills served over the skills extension, with their charge.
+    skills: Option<(crate::skills::Skills, Allocation)>,
 }
 impl Protocol {
+    /// Serve `skills` (SEP-2640): declare the `resources` capability and the
+    /// `io.modelcontextprotocol/skills` extension, and answer `skills/list`,
+    /// `skills/get`, `resources/list` and `resources/read` from them.
+    pub(crate) fn with_skills(
+        mut self,
+        skills: crate::skills::Skills,
+    ) -> Result<Self, ProtocolError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Ordinary, skills.bytes())?
+            .commit();
+        self.skills = Some((skills, charge));
+        Ok(self)
+    }
+    fn capabilities(&self, modern: bool) -> Capabilities {
+        let served = self.skills.is_some();
+        Capabilities {
+            tools: Map::new(),
+            resources: served.then(Map::new),
+            extensions: (served && modern).then(|| {
+                let mut extensions = Map::new();
+                // No `directoryRead`: every file a skill has is in its manifest.
+                extensions.insert(
+                    "io.modelcontextprotocol/skills".into(),
+                    Value::Object(Map::new()),
+                );
+                extensions
+            }),
+        }
+    }
     pub fn new(
         limits: Limits,
         budget: MemoryBudget,
@@ -224,6 +273,7 @@ impl Protocol {
             _workspace: workspace,
             _catalog: catalog,
             _active: active_charge,
+            skills: None,
         })
     }
     pub fn active_calls(&self) -> usize {
@@ -346,7 +396,7 @@ impl Protocol {
                     &Discovery {
                         result_type: "complete",
                         supported_versions: [MODERN_VERSION, LEGACY_VERSION],
-                        capabilities: Capabilities::default(),
+                        capabilities: self.capabilities(true),
                         _meta: ServerMeta { info: &self.info },
                         ttl_ms: 0,
                         cache_scope: "private",
@@ -361,6 +411,12 @@ impl Protocol {
             }
             "tools/list" => self.list(id, profile, params),
             "tools/call" => self.call(id, profile, params),
+            "skills/list" | "skills/get" if profile == Profile::Modern && self.skills.is_some() => {
+                self.skill(id, &method, params)
+            }
+            "resources/list" | "resources/read" if self.skills.is_some() => {
+                self.resource(id, profile, &method, params)
+            }
             _ => self.error(id, -32601, "Method not found", None),
         }
     }
@@ -387,7 +443,7 @@ impl Protocol {
             id,
             &Init {
                 protocol_version: LEGACY_VERSION,
-                capabilities: Capabilities::default(),
+                capabilities: self.capabilities(false),
                 server_info: &self.info,
             },
         )?;
@@ -471,6 +527,161 @@ impl Protocol {
             arguments,
             _allocation: allocation,
         }))
+    }
+    /// `skills/list` (one page: every skill, each entry whole) and
+    /// `skills/get`. Skill content is the binary's own, the same for every
+    /// caller, so it is public; it is never cached beyond this answer, so a
+    /// client revalidates against the manifest's digests.
+    fn skill(
+        &self,
+        id: Value,
+        method: &str,
+        mut params: Map<String, Value>,
+    ) -> Result<Action, ProtocolError> {
+        let Some((skills, _)) = &self.skills else {
+            return self.error(id, -32601, "Method not found", None);
+        };
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Listed<'a> {
+            result_type: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            skills: Option<&'a [crate::skills::Skill]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            skill: Option<&'a crate::skills::Skill>,
+            ttl_ms: u64,
+            cache_scope: &'static str,
+        }
+        if method == "skills/list" {
+            // One page holds every skill; a cursor this server never issued
+            // is refused, never read as the start.
+            if !matches!(params.remove("cursor"), None | Some(Value::Null)) || !params.is_empty() {
+                return self.error(id, -32602, "Invalid parameters", None);
+            }
+            return self.reply(
+                id,
+                &Listed {
+                    result_type: "complete",
+                    skills: Some(skills.list()),
+                    skill: None,
+                    ttl_ms: 0,
+                    cache_scope: "public",
+                },
+            );
+        }
+        let Some(Value::String(uri)) = params.remove("uri") else {
+            return self.error(id, -32602, "Invalid parameters", None);
+        };
+        if !params.is_empty() {
+            return self.error(id, -32602, "Invalid parameters", None);
+        }
+        let Some(skill) = skills.get(&uri) else {
+            return self.error(id, -32602, "Unknown skill", None);
+        };
+        self.reply(
+            id,
+            &Listed {
+                result_type: "complete",
+                skills: None,
+                skill: Some(skill),
+                ttl_ms: 0,
+                cache_scope: "public",
+            },
+        )
+    }
+    /// `resources/list` (every skill file, one page) and `resources/read`
+    /// (one file's text): what a client without the skills extension uses.
+    fn resource(
+        &self,
+        id: Value,
+        profile: Profile,
+        method: &str,
+        mut params: Map<String, Value>,
+    ) -> Result<Action, ProtocolError> {
+        let Some((skills, _)) = &self.skills else {
+            return self.error(id, -32601, "Method not found", None);
+        };
+        let modern = profile == Profile::Modern;
+        if method == "resources/list" {
+            if !matches!(params.remove("cursor"), None | Some(Value::Null)) || !params.is_empty() {
+                return self.error(id, -32602, "Invalid parameters", None);
+            }
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Entry {
+                uri: String,
+                name: &'static str,
+                mime_type: &'static str,
+            }
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Listed {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                result_type: Option<&'static str>,
+                resources: Vec<Entry>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                ttl_ms: Option<u64>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                cache_scope: Option<&'static str>,
+            }
+            let resources = skills
+                .files()
+                .map(|(uri, name)| Entry {
+                    uri,
+                    name,
+                    mime_type: "text/markdown",
+                })
+                .collect();
+            return self.reply(
+                id,
+                &Listed {
+                    result_type: profile.result_type(),
+                    resources,
+                    ttl_ms: modern.then_some(0),
+                    cache_scope: modern.then_some("public"),
+                },
+            );
+        }
+        let Some(Value::String(uri)) = params.remove("uri") else {
+            return self.error(id, -32602, "Invalid parameters", None);
+        };
+        if !params.is_empty() {
+            return self.error(id, -32602, "Invalid parameters", None);
+        }
+        let Some(text) = skills.read(&uri) else {
+            return self.error(id, -32602, "Unknown resource", None);
+        };
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Content<'a> {
+            uri: &'a str,
+            mime_type: &'static str,
+            text: &'a str,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Read<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            result_type: Option<&'static str>,
+            contents: [Content<'a>; 1],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl_ms: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_scope: Option<&'static str>,
+        }
+        self.reply(
+            id,
+            &Read {
+                result_type: profile.result_type(),
+                contents: [Content {
+                    uri: &uri,
+                    mime_type: "text/markdown",
+                    text,
+                }],
+                ttl_ms: modern.then_some(0),
+                cache_scope: modern.then_some("public"),
+            },
+        )
     }
     fn list(
         &self,
@@ -734,9 +945,13 @@ struct Text<'a> {
     kind: &'static str,
     text: &'a str,
 }
-#[derive(Default, Serialize)]
+#[derive(Serialize)]
 struct Capabilities {
     tools: Map<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extensions: Option<Map<String, Value>>,
 }
 #[derive(Serialize)]
 struct ServerMeta<'a> {

@@ -227,7 +227,10 @@ impl CompletionEnvelope {
             )?,
         )?;
         let fixed_rows = add(
-            add(add(g, original_events)?, add(original_extras, 2)?)?,
+            add(
+                add(g, original_events)?,
+                add(original_extras, super::prepare_budget::REQUEST_CONTROL_ROWS)?,
+            )?,
             add(
                 cohort.changed_keys(),
                 add(
@@ -289,7 +292,10 @@ impl CompletionEnvelope {
             within(bytes, entry)?;
         }
         let changes = add(
-            add(add(g, original_events)?, add(original_extras, 2)?)?,
+            add(
+                add(g, original_events)?,
+                add(original_extras, super::prepare_budget::REQUEST_CONTROL_ROWS)?,
+            )?,
             add(
                 cohort.changed_keys(),
                 add(

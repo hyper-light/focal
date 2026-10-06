@@ -783,13 +783,13 @@ impl CompletionEnvelope {
             let moved = add(1, cohort.claims())?;
             add(
                 add(
-                    add(11, cohort.changed_keys())?,
+                    add(12, cohort.changed_keys())?,
                     add(report_fixed, add(moved, moved)?)?,
                 )?,
                 timers,
             )?
         } else {
-            add(add(9, report_fixed)?, timers)?
+            add(add(10, report_fixed)?, timers)?
         };
         descriptor.inputs =
             crate::native::index_rows::cap_inputs(input_bound(descriptor), fixed_rows, batch);
@@ -857,7 +857,9 @@ impl CompletionEnvelope {
         // also moves the parent and every sealed cohort claim between status
         // keys (doc 22 §7).
         let report_index = crate::native::index_rows::report_rows(input_bound(descriptor))?;
-        let ordinary_keys = add(add(9, report_index)?, timers)?;
+        // The report's rows, the meta, its outcome and its principal's
+        // window (F12), the index rows it writes and the timers it retires.
+        let ordinary_keys = add(add(10, report_index)?, timers)?;
         let ordinary_report = rows.future_write_envelope(
             RangeWriteLimits {
                 changed_keys: ordinary_keys,
@@ -871,7 +873,7 @@ impl CompletionEnvelope {
         let failed_report = if failure_possible {
             let moved = add(1, cohort.claims())?;
             let changes = add(
-                add(11, cohort.changed_keys())?,
+                add(12, cohort.changed_keys())?,
                 add(report_index, add(add(moved, moved)?, timers)?)?,
             )?;
             Some(rows.future_write_envelope(

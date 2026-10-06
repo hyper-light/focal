@@ -190,7 +190,7 @@ fn retired(root: &Path, claim: &str) -> Value {
     }
 }
 fn retention(root: &Path) -> Value {
-    let shown = admin(root, &["cluster", "retention", "show"]);
+    let shown = admin(root, &["diagnose", "cluster", "--retention"]);
     assert_eq!(shown["result"]["kind"], "retention", "{shown}");
     shown["result"]["retention"].clone()
 }
@@ -309,7 +309,7 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert_eq!(shown["members"], json!([a]));
     assert!(shown["rows"].as_u64().unwrap() >= 4, "{archive}");
     assert!(!shown["families"].as_array().unwrap().is_empty());
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     let node = identity["node"].clone();
     let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
     assert_eq!(shown["receipts"], json!([node]), "{archive}");

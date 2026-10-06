@@ -154,9 +154,6 @@ fn cursor_reconciliation_output_preserves_the_distinct_committed_result_family()
 pub(super) fn id(value: u128) -> String {
     format!("{value:032x}")
 }
-pub(super) fn id_hash(value: u8) -> String {
-    hash(value)
-}
 fn hash(value: u8) -> String {
     format!("{value:02x}").repeat(32)
 }

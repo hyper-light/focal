@@ -104,7 +104,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // The operator surface is the network node's admin socket; a laptop
     // node without an address has none.
     let _server = start(root, &config, &advertise);
-    let identity = run(root, &config, &["cluster", "node", "identity"]);
+    let identity = run(root, &config, &["diagnose", "node", "--identity"]);
     assert!(identity.status.success());
     let identity: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
     let node = identity["result"]["identity"]["node"].as_u64().unwrap();
@@ -116,7 +116,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // labels and the founder's session, once the sampler has run.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     let text = loop {
-        let output = run(root, &config, &["cluster", "node", "metrics"]);
+        let output = run(root, &config, &["diagnose", "node", "--metrics"]);
         assert!(
             output.status.success(),
             "{}",
@@ -136,7 +136,10 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     let base = format!("node=\"{node}\",cluster=\"");
     assert!(text.contains(&format!("focal_node_info{{{base}")), "{text}");
     assert!(
-        text.contains("role=\"founder\",region=\"eu-a\",zone=\"eu-a-1\",capability=\"1\"} 1"),
+        text.contains(&format!(
+            "role=\"founder\",region=\"eu-a\",zone=\"eu-a-1\",capability=\"{}\"}} 1",
+            focal_node::upgrade::CAPABILITY_LEVEL
+        )),
         "{text}"
     );
     for series in [

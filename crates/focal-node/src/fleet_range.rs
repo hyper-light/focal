@@ -4,6 +4,7 @@
 //! from its committed rows, and the operator's view names every member.
 use super::*;
 use focal_core::native::retirement::{RetirementCandidates, RetirementCursor};
+use focal_core::native::seal::{Fold, FoldPlan, SealPlan};
 use focal_core::native::{ContentRootsPage, NativeRowCursor, RetiredClaim};
 use focal_ledger::LedgerRangeVerifier;
 use focal_memory::RangeId;
@@ -155,6 +156,18 @@ pub(super) enum RangeCall {
         claim: ClaimId,
         reply: oneshot::Sender<Result<Option<RetiredClaim>, LedgerError>>,
     },
+    /// The seal the committed state yields now, with its bundle (F12).
+    SealBundle {
+        reply: oneshot::Sender<Result<Option<SealedOutcomes>, LedgerError>>,
+    },
+    /// Propose one seal (F12).
+    Seal {
+        plan: Box<SealPlan>,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<Fold>,
+        reply: oneshot::Sender<Result<(), LedgerError>>,
+    },
     /// One page of the content roots the committed rows name (26 §5).
     ContentRoots {
         cursor: Option<NativeRowCursor>,
@@ -168,6 +181,17 @@ pub(super) enum RangeCall {
         max_items: usize,
         reply: oneshot::Sender<Result<focal_evidence::SeedReport, LedgerError>>,
     },
+}
+/// One seal of closed outcomes as the committed core wrote it (F12): the
+/// plan it was derived from, its bundle, and a fold of older seal rows with
+/// its directory bundle when the index reached its bound. The bytes stay
+/// charged to the replica's budget until the agent is done with them.
+pub struct SealedOutcomes {
+    pub plan: SealPlan,
+    pub bundle: Vec<u8>,
+    pub digest: ContentHash,
+    pub fold: Option<(FoldPlan, Vec<u8>, ContentHash)>,
+    pub(crate) _allocation: Allocation,
 }
 /// One family's archive bundle as the committed core wrote it (26 §4):
 /// what the archive agent seals as content before it proposes the
@@ -348,6 +372,29 @@ impl ReplicaHost {
         })
         .await
     }
+    /// The seal the committed state yields now and its bundle, when this
+    /// replica is the authority and a seal is worth proposing (F12).
+    pub async fn seal_bundle(&self) -> Result<Option<SealedOutcomes>, LedgerError> {
+        self.range_call(|reply| RangeCall::SealBundle { reply })
+            .await
+    }
+    /// Propose one seal as a session decision (F12).
+    pub async fn propose_seal(
+        &self,
+        plan: SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<Fold>,
+    ) -> Result<(), LedgerError> {
+        self.range_call(|reply| RangeCall::Seal {
+            plan: Box::new(plan),
+            bundle,
+            bytes,
+            fold,
+            reply,
+        })
+        .await
+    }
     /// The continuation of a retired claim, if the claim retired.
     pub async fn retired(&self, claim: ClaimId) -> Result<Option<RetiredClaim>, LedgerError> {
         self.range_call(|reply| RangeCall::Retired { claim, reply })
@@ -477,6 +524,22 @@ impl Owner {
                 drop(charge);
                 let _ = reply.send(result);
             }
+            RangeCall::SealBundle { reply } => {
+                let result = self.seal_bundle();
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::Seal {
+                plan,
+                bundle,
+                bytes,
+                fold,
+                reply,
+            } => {
+                let result = self.session.native_propose_seal(&plan, bundle, bytes, fold);
+                drop(charge);
+                let _ = reply.send(result);
+            }
             RangeCall::ContentRoots {
                 cursor,
                 max_visits,
@@ -500,67 +563,19 @@ impl Owner {
             }
         }
     }
-    /// One family's bundle from the committed core (26 §4): only on the
-    /// authority, only when the family is eligible, every registered
-    /// consumer has read past its last event, and that event settled at
-    /// least `min_age_ms` of the node's logical time ago (a finished claim
-    /// stays readable in the core for the grace the operator sets); the
-    /// bytes are charged here.
+    /// One family's bundle from the committed core (26 §4), derived as
+    /// `archive_derive::archived_family` says.
     fn archive_family(
         &self,
         root: ClaimId,
         min_age_ms: u64,
     ) -> Result<Option<ArchivedFamily>, LedgerError> {
-        if !self.session.native_authoritative() {
-            return Ok(None);
-        }
-        let now = crate::native_ingress::logical_time(&self.session)
-            .map_err(|_| LedgerError::NotReady { leader: 0 })?;
-        let report = self.session.native_retention()?;
-        let limits = self.session.native_encoding_limits()?;
-        let core = self.session.native_core()?;
-        let Ok(family) = core.retirement_family(root) else {
-            return Ok(None);
-        };
-        if !report.allows_family(family.through) {
-            return Ok(None);
-        }
-        // The family's last event was published by the outcome at its
-        // sequence; the outcome carries the logical time it settled at.
-        let settled = core
-            .native_event(family.through, 0)
-            .and_then(|event| core.native_outcome(event.invocation))
-            .map(|outcome| outcome.logical_time)
-            .ok_or(LedgerError::Corrupt)?;
-        if now.saturating_sub(settled) < min_age_ms {
-            return Ok(None);
-        }
-        let through = core.native_sequence();
-        let quote = core
-            .archive_family_quote(&family, through, limits)
-            .map_err(|error| LedgerError::Native(error.into()))?;
-        let allocation = self
-            .budget
-            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, quote.bytes)?
-            .commit();
-        let mut bundle = Vec::new();
-        bundle
-            .try_reserve_exact(quote.bytes)
-            .map_err(|_| LedgerError::Capacity)?;
-        bundle.resize(quote.bytes, 0);
-        let digest = core
-            .archive_family_into(&family, through, &mut bundle, quote.visits)
-            .map_err(|error| LedgerError::Native(error.into()))?;
-        let rows = family.rows();
-        Ok(Some(ArchivedFamily {
-            root,
-            members: family.members,
-            through,
-            digest,
-            rows,
-            bundle,
-            _allocation: allocation,
-        }))
+        crate::archive_derive::archived_family(&self.session, &self.budget, root, min_age_ms)
+    }
+    /// The seal the committed state yields now (F12), derived as
+    /// `archive_derive::sealed_outcomes` says.
+    fn seal_bundle(&self) -> Result<Option<SealedOutcomes>, LedgerError> {
+        crate::archive_derive::sealed_outcomes(&self.session, &self.budget)
     }
     fn range_view(&self, digests: bool) -> Result<RangeView, LedgerError> {
         let map = self.session.native_range_map()?;

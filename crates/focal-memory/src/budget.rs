@@ -202,6 +202,29 @@ pub struct BudgetStats {
     pub by_kind: [usize; KIND_COUNT],
 }
 
+impl BudgetStats {
+    /// The bytes charged under `kind` when these statistics were taken.
+    pub fn used_by(&self, kind: BudgetKind) -> usize {
+        let index = match kind {
+            BudgetKind::Arena => 0,
+            BudgetKind::Payload => 1,
+            BudgetKind::Index => 2,
+            BudgetKind::Pages => 3,
+            BudgetKind::Roots => 4,
+            BudgetKind::ReadPins => 5,
+            BudgetKind::Pending => 6,
+            BudgetKind::Query => 7,
+            BudgetKind::Monitor => 8,
+            BudgetKind::Dedup => 9,
+            BudgetKind::Timer => 10,
+            BudgetKind::Recovery => 11,
+            BudgetKind::Control => 12,
+            BudgetKind::Reserved => 13,
+        };
+        self.by_kind.get(index).copied().unwrap_or(0)
+    }
+}
+
 impl MemoryBudget {
     /// Immutable allowance; reading it does not sample concurrent usage counters.
     pub fn limit(&self) -> usize {

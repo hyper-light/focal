@@ -129,10 +129,11 @@ impl LocalNetworkAdmin {
                 .map(|readiness| OperatorReply::Readiness(Box::new(readiness))),
             OperatorRead::Metrics => {
                 let view = self.metrics.as_ref().ok_or(AccessError::Unavailable)?;
+                // The page's text, rendered once when it was sampled.
                 let text = view
                     .borrow()
                     .as_ref()
-                    .map(crate::metrics::MetricsSnapshot::render)
+                    .map(|page| page.text.clone())
                     .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
                 Ok(OperatorReply::Metrics(text))
             }
@@ -159,10 +160,54 @@ impl LocalNetworkAdmin {
                                 .collect(),
                             last_error: status.last_error,
                             last_refusal: status.last_refusal,
+                            retrying: status.retrying,
                         }
                     }),
                     None => None,
                 };
+                let partitions = self
+                    .partitions
+                    .as_ref()
+                    .map(|directory| {
+                        directory
+                            .hosted()
+                            .iter()
+                            .map(|hosted| {
+                                let progress = hosted.host.progress();
+                                focal_client::admin::AdminHostedPartition {
+                                    partition: hex(&hosted.plan.partition().0),
+                                    group: hex(&hosted.plan.group().0),
+                                    host: hosted.plan.host(),
+                                    leader: progress.leader,
+                                    term: progress.term,
+                                    applied_index: progress.applied_index,
+                                    stopped: progress.stopped,
+                                    authority_installed_index: hosted.authority.installed_index,
+                                    authority_refused: hosted.authority.refused.clone(),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let partitions_pending = self
+                    .partitions
+                    .as_ref()
+                    .map(|directory| {
+                        directory
+                            .pending()
+                            .into_iter()
+                            .map(|(partition, attempt)| {
+                                focal_client::admin::AdminPendingPartition {
+                                    partition: hex(&partition.0),
+                                    group: hex(&attempt.group),
+                                    host: attempt.host,
+                                    attempts: attempt.attempts,
+                                    last_refusal: attempt.last_refusal,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(OperatorReply::Health(AdminNodeHealth {
                     node: self.identity.node,
                     root_stopped: root.stopped,
@@ -173,6 +218,8 @@ impl LocalNetworkAdmin {
                     installed: fleet.installed,
                     running: fleet.running,
                     placement,
+                    partitions,
+                    partitions_pending,
                 }))
             }
             OperatorRead::Replica { session } => {
@@ -426,6 +473,18 @@ impl LocalNetworkAdmin {
             });
         }
         let node = self.identity.node;
+        // Serving is the owners running: the root's and every installed
+        // session's — a session stopped on a failure leaves the fleet's
+        // running count below its installed count, a planned stop the same
+        // — with no leadership or quorum asked of them. A host says of
+        // itself that it stopped before its stop is answered; the fleet's
+        // count follows a round later, so both are asked (a Windows run of
+        // 2026-10-02 found a stopped owner still serving by the count).
+        let fleet_status = fleet.status();
+        let serving = !root.stopped
+            && !fleet_status.stopped
+            && fleet_status.running == fleet_status.installed
+            && fleet.stopped_hosts() == 0;
         let leads_root = root.leader == node && !root.stopped;
         let authoritative = leads_root
             || sessions
@@ -440,7 +499,37 @@ impl LocalNetworkAdmin {
                     && !session.import_pending
                     && !session.custody_pending
             });
+        // The control plane holds the committed policy too (the audit's
+        // F24): the root's voters tolerate the failures the node's own
+        // policy promises, by the rule the sessions are measured by. A
+        // node without a committed policy, or one whose root could not be
+        // observed, does not satisfy it.
+        let committed = crate::config::policy::read_committed(&self.directory)
+            .ok()
+            .flatten();
+        let control_satisfied = placement
+            .as_ref()
+            .and_then(|reply| reply.placement.control.as_ref())
+            .zip(committed.as_ref())
+            .is_some_and(|(control, policy)| {
+                // The root and every partition group: a session is routed
+                // and placed by both.
+                std::iter::once(&control.root)
+                    .chain(&control.partitions)
+                    .all(|group| {
+                        let tolerates = match policy.intent.durability.survive {
+                            crate::config::FailureDomain::Node => group.tolerates_node,
+                            crate::config::FailureDomain::Zone => group.tolerates_zone,
+                            crate::config::FailureDomain::Region => group.tolerates_region,
+                        };
+                        group.blocked_by.is_empty()
+                            && tolerates.is_some_and(|tolerates| {
+                                tolerates >= policy.intent.durability.max_failures
+                            })
+                    })
+            });
         let policy_satisfied = !truncated
+            && control_satisfied
             && sessions.iter().all(|session| {
                 session.blocked_by.is_empty()
                     && match (session.desired_max_failures, session.achieved_max_failures) {
@@ -448,17 +537,32 @@ impl LocalNetworkAdmin {
                         _ => false,
                     }
             });
+        let mut peers = Vec::new();
+        if peers.try_reserve_exact(root.peers.len()).is_ok() {
+            peers.extend(
+                root.peers
+                    .iter()
+                    .map(|peer| focal_client::admin::AdminPeerProgress {
+                        node: peer.node,
+                        matched: peer.matched,
+                        recent_active: peer.recent_active,
+                    }),
+            );
+        }
         Ok(AdminReadiness {
             node,
             alive: true,
+            serving,
             catching_up: following && !authoritative,
             authoritative,
             policy_satisfied,
+            control_satisfied,
             root: AdminRootProgress {
                 leader: root.leader,
                 term: root.term,
                 applied_index: root.applied_index,
                 stopped: root.stopped,
+                peers,
             },
             sessions,
             truncated,

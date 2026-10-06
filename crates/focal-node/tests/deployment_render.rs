@@ -110,7 +110,7 @@ fn the_checked_in_kubernetes_manifests_are_the_renderer_output() {
         "prepare-volume",
         "\"--invite-file\"",
         "publishNotReadyAddresses: true",
-        "\"--check\", \"alive\"",
+        "\"--probe\", \"alive\"",
         "topology.kubernetes.io/zone",
         "terminationGracePeriodSeconds: 45",
     ] {

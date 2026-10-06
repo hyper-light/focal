@@ -671,3 +671,51 @@ fn owner_snapshot_facade_pins_only_committed_facts_and_expires_retained_pages() 
     );
     assert_eq!(owner.pending_len(), 0);
 }
+
+/// The admission check rests on this bound (rule 2): what a checkpoint of the
+/// committed root with every pending candidate published projects is never
+/// less than what that checkpoint actually encodes to, in rows or bytes.
+#[test]
+fn a_checkpoint_projection_bounds_the_checkpoint_it_projects() {
+    use crate::native::record_codec::{EncodingLimits, checkpoint::EncodingPlan};
+    let core = core();
+    let mut owner = NativeOwner::new(core).unwrap();
+    let mut staged = Vec::new();
+    for id in 1..=24u128 {
+        staged.push(stage(
+            &mut owner,
+            u64::try_from(id).unwrap(),
+            creation(id, id, &[(ValidationMode::Required, false)], None),
+        ));
+    }
+    let projection = owner.checkpoint_projection().unwrap();
+    for (candidate, outcome) in staged {
+        assert_eq!(owner.publish_after_durable(candidate).unwrap(), outcome);
+    }
+    assert_eq!(owner.pending_len(), 0);
+    let plan = EncodingPlan::prepare(
+        owner.committed_core(),
+        EncodingLimits {
+            bytes: usize::MAX,
+            visits: usize::MAX,
+            rows: usize::MAX,
+        },
+    )
+    .unwrap();
+    let actual = plan.quote();
+    assert!(
+        projection.rows >= actual.rows,
+        "projected {} rows, encoded {}",
+        projection.rows,
+        actual.rows
+    );
+    assert!(
+        projection.bytes >= actual.bytes,
+        "projected {} bytes, encoded {}",
+        projection.bytes,
+        actual.bytes
+    );
+    // Published, the projection is the committed root alone and still bounds it.
+    let after = owner.checkpoint_projection().unwrap();
+    assert!(after.rows >= actual.rows && after.bytes >= actual.bytes);
+}

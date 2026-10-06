@@ -15,6 +15,14 @@
 //! fixed its details from the paper, the authors' reference implementation
 //! and mvfst, and found by measurement that RFC 9002 §7.8 must bound only
 //! the window's growth: a window the sender does not fill still shrinks.
+//!
+//! An explicit mark (ECN-CE, RFC 9002 §7.1) is a signal Copa's paper does
+//! not answer: a queue manager on the path judged its queue longer than it
+//! wants it. It is never random, so Copa answers it as a classic sender
+//! answers congestion ([`Copa::on_mark`]), and after a mark past slow start
+//! grows as one for ten seconds: the manager keeps the queue short for
+//! every sender, and its marks are what Copa sees of the others.
+//!
 //! It is integer arithmetic throughout, reads the caller's clock, and keeps
 //! three samples for each of its four windows.
 //!
@@ -59,6 +67,26 @@ pub const DEFAULT_INV_DELTA: u64 = 2;
 /// most: at 100 Mbit/s and 100 ms 95% of the path where the whole carries
 /// 67%.
 pub const DEFAULT_STRIDE: u64 = 2;
+/// What a mark multiplies the window by: a classic sender's answer to
+/// congestion, which a sender of ECT(0) gives a mark (RFC 3168 §5; RFC 9002
+/// §B.2's `kLossReductionFactor`). Of the backoffs the RFCs give (RFC 3168
+/// and RFC 9002: 1/2; RFC 9438: 7/10; RFC 8511's experimental β_ecn: 4/5),
+/// the gentler ones were measured to leave NewReno and CUBIC under CoDel
+/// less than nine tenths of what they carry beside their own kind or CUBIC
+/// — at 1 Mbit/s, 100 ms over eight seeds, 7/10 left NewReno 0.84 of it and
+/// 4/5 left CUBIC 0.79 (`tests/congestion.rs`,
+/// `the_mark_backoff_of_the_law_is_the_one_that_was_measured`).
+pub const DEFAULT_MARK_BACKOFF: MarkBackoff = MarkBackoff {
+    numerator: 1,
+    denominator: 2,
+};
+/// A fraction the window is multiplied by: `numerator/denominator`, at
+/// most one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkBackoff {
+    pub numerator: u64,
+    pub denominator: u64,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Sample {
@@ -192,6 +220,16 @@ pub struct Copa {
     step_remainder: u64,
     last_loss_update: u64,
     last_increase_update: u64,
+    /// When the last mark was answered: a mark of what was sent before
+    /// then is part of the round trip it answered (RFC 9002 §7.3.2).
+    mark_recovery: Option<u64>,
+    /// When a mark last came after slow start: what the window grows as a
+    /// classic sender's for (`grows_as_a_classic_sender`).
+    marked_after_slow_start: Option<u64>,
+    /// Whether a round trip went down since `1/δ` was last raised, or the
+    /// competitive mode began: the target held the window back.
+    held_back: bool,
+    mark_backoff: MarkBackoff,
 }
 impl Copa {
     pub fn new(datagram: u64, inv_delta: u64) -> Self {
@@ -200,6 +238,11 @@ impl Copa {
     /// A law whose window a round trip moves by a `stride`th of itself at
     /// most.
     pub fn with_stride(datagram: u64, inv_delta: u64, stride: u64) -> Self {
+        Self::with(datagram, inv_delta, stride, DEFAULT_MARK_BACKOFF)
+    }
+    /// A law of the stride given whose window a mark multiplies by
+    /// `mark_backoff`.
+    pub fn with(datagram: u64, inv_delta: u64, stride: u64, mark_backoff: MarkBackoff) -> Self {
         let datagram = datagram.max(1);
         let initial = INITIAL_WINDOW_DATAGRAMS.saturating_mul(datagram);
         Self {
@@ -223,6 +266,10 @@ impl Copa {
             step_remainder: 0,
             last_loss_update: 0,
             last_increase_update: 0,
+            mark_recovery: None,
+            marked_after_slow_start: None,
+            held_back: false,
+            mark_backoff,
         }
     }
     pub fn window(&self) -> u64 {
@@ -337,11 +384,18 @@ impl Copa {
             self.same_direction = 0;
             self.direction_mark = Some((now, self.window));
         }
-        // `v/(δ·cwnd)` packets for a packet acknowledged, in bytes.
+        // `v/(δ·cwnd)` packets for a packet acknowledged, in bytes; for ten
+        // seconds after a mark past slow start, a classic sender's datagram a
+        // round trip (RFC 9002 §B.5's `max_datagram_size · acked / cwnd`,
+        // `grows_as_a_classic_sender`).
+        let gain = if increase && self.grows_as_a_classic_sender(now) {
+            1
+        } else {
+            self.velocity.saturating_mul(self.inv_delta)
+        };
         let numerator = u128::from(bytes)
             .saturating_mul(u128::from(self.datagram))
-            .saturating_mul(u128::from(self.velocity))
-            .saturating_mul(u128::from(self.inv_delta))
+            .saturating_mul(u128::from(gain))
             .saturating_add(u128::from(self.step_remainder));
         let denominator = u128::from(self.window.max(1));
         let step = numerator
@@ -374,6 +428,9 @@ impl Copa {
         } else {
             Direction::Down
         };
+        if self.window < window_then {
+            self.held_back = true;
+        }
         if direction == self.direction {
             self.same_direction = self.same_direction.saturating_add(1);
             if self.same_direction >= VELOCITY_DIRECTION_THRESHOLD {
@@ -407,17 +464,51 @@ impl Copa {
         if !self.competitive {
             self.competitive = true;
             self.last_increase_update = now;
+            self.held_back = false;
         }
+        // While the window grows as a classic sender's, a datagram a round
+        // trip, the target grows only after a round trip it held the window
+        // back. Raised a packet a round trip beside it, the target is never
+        // reached, the window never falls, and the queue Copa keeps never
+        // empties for the mode to see Copa alone: alone at 100 Mbit/s, 20 ms
+        // under CoDel, Copa took itself for competing (§2.2's test misjudges
+        // Copa's own queue now and then), raised `1/δ` to 58 and filled the
+        // queue to CoDel's target, a mark every three to six seconds
+        // (2026-10-03, 27 §7). Held back, the window falls by Copa's own
+        // step, which empties the queue Copa alone keeps.
         if now.saturating_sub(self.last_increase_update) > srtt
             && now.saturating_sub(self.last_loss_update) > srtt
+            && (self.held_back || !self.grows_as_a_classic_sender(now))
         {
             self.inv_delta = self.inv_delta.saturating_add(1);
             self.last_increase_update = now;
+            self.held_back = false;
         }
     }
+    /// Whether the window grows as a classic sender's does, a datagram a
+    /// round trip: within the window Copa keeps its least round trip over
+    /// (Copa §2.1, ten seconds) of a mark that came after slow start. A
+    /// queue manager keeps the queue short for every sender, so the senders
+    /// filling it to the manager's target leave Copa's queue nearly empty
+    /// and its competing mode unseen; the marks are what Copa sees of them,
+    /// and Copa's own growth, `v/δ` datagrams a round trip, took back after
+    /// every mark the share a classic sender regrows a datagram a round trip
+    /// — more of it the longer the round trip (F39's measurement, 27 §7).
+    /// So in either mode: competing, Copa's own growth after its marks left
+    /// NewReno and CUBIC 0.89 of what they carry beside their own kind at
+    /// 1 Mbit/s, 100 ms under CoDel. A mark in slow start is Copa's own
+    /// doubling past the manager's target, which ending slow start answers.
+    /// A window of four round trips (the mode's) let Copa grow by its own
+    /// step between the marks of a long path and take from NewReno more than
+    /// CUBIC does (2026-10-03).
+    fn grows_as_a_classic_sender(&self, now: u64) -> bool {
+        self.marked_after_slow_start
+            .is_some_and(|answered| now.saturating_sub(answered) <= MIN_RTT_WINDOW_NS)
+    }
     /// A loss halves `1/δ` while Copa competes, once a round trip at most;
-    /// otherwise it is no signal. Persistent congestion leaves the least
-    /// window.
+    /// otherwise it is no signal (§2.2: a loss may be noise, and a mode
+    /// judged competing on a lossy path is no proof of a competitor).
+    /// Persistent congestion leaves the least window.
     pub fn on_loss(&mut self, now: u64, srtt: u64, persistent: bool) {
         if self.competitive && now.saturating_sub(self.last_loss_update) > srtt {
             self.inv_delta = self
@@ -432,6 +523,64 @@ impl Copa {
             self.slow_start = false;
         }
     }
+    /// A mark (ECN-CE) of what was sent at `sent`: a queue manager on the
+    /// path judged its queue longer than it wants it. A loss Copa may take
+    /// for noise (§2.2), but a mark is never random: it is congestion, and a
+    /// sender that marks its datagrams ECN-capable (quinn: ECT(0)) answers
+    /// it as a classic sender answers congestion (RFC 3168 §5, RFC 9002
+    /// §7.1). A mark of what was sent before the last one was answered is
+    /// part of that round trip (RFC 9002 §7.3.2); otherwise slow start ends
+    /// (§7.3.1), `1/δ` halves while Copa competes, a direction Up turns Down
+    /// at velocity one, and the window is multiplied by the law's backoff
+    /// ([`DEFAULT_MARK_BACKOFF`]), never below the least window, the next
+    /// round trip's direction judged from there; after a mark past slow
+    /// start the window grows as a classic sender's for ten seconds
+    /// (`grows_as_a_classic_sender`). Marks round trip after round trip
+    /// halve the window each round trip until they stop or the window is
+    /// the least: the response to persistent marking.
+    pub fn on_mark(&mut self, now: u64, sent: u64) {
+        if self.mark_recovery.is_some_and(|answered| sent <= answered) {
+            return;
+        }
+        self.mark_recovery = Some(now);
+        // A mark in slow start is Copa's own doubling past the manager's
+        // target, which ending slow start answers; one after it says the
+        // manager's queue stands above its target while Copa aims at its
+        // own short queue — other senders fill it.
+        if !self.slow_start {
+            self.marked_after_slow_start = Some(now);
+        }
+        self.slow_start = false;
+        if self.competitive {
+            // Competing, Copa also halves `1/δ`, its own rule for
+            // congestion there.
+            self.inv_delta = self
+                .inv_delta
+                .checked_div(2)
+                .unwrap_or(0)
+                .max(self.default_inv_delta);
+            self.last_loss_update = now;
+        }
+        if self.direction == Direction::Up && self.velocity > 1 {
+            self.direction = Direction::Down;
+            self.velocity = 1;
+            self.same_direction = 0;
+        }
+        self.back_off(self.mark_backoff);
+        // The next round trip's direction is the law's own, judged from the
+        // window the mark left.
+        self.direction_mark = Some((now, self.window));
+    }
+    /// The window multiplied by `backoff`, never above what it was nor
+    /// below the least window.
+    fn back_off(&mut self, backoff: MarkBackoff) {
+        let backed_off = u128::from(self.window)
+            .saturating_mul(u128::from(backoff.numerator))
+            .checked_div(u128::from(backoff.denominator))
+            .and_then(|window| u64::try_from(window).ok())
+            .unwrap_or(self.window);
+        self.window = backed_off.min(self.window).max(self.minimum_window());
+    }
 }
 
 /// How Copa is set for a connection.
@@ -442,19 +591,27 @@ pub struct CopaConfig {
     /// What part of the window a round trip moves it by at most, as its
     /// inverse.
     pub stride: u64,
+    /// What a mark multiplies the window by.
+    pub mark_backoff: MarkBackoff,
 }
 impl Default for CopaConfig {
     fn default() -> Self {
         Self {
             inv_delta: DEFAULT_INV_DELTA,
             stride: DEFAULT_STRIDE,
+            mark_backoff: DEFAULT_MARK_BACKOFF,
         }
     }
 }
 impl ControllerFactory for CopaConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(CopaController {
-            law: Copa::with_stride(u64::from(current_mtu), self.inv_delta, self.stride),
+            law: Copa::with(
+                u64::from(current_mtu),
+                self.inv_delta,
+                self.stride,
+                self.mark_backoff,
+            ),
             began: now,
             srtt: 0,
         })
@@ -500,15 +657,23 @@ impl Controller for CopaController {
         };
         self.law.on_ack(acked);
     }
+    /// quinn raises an explicit mark with no bytes lost and no persistence
+    /// (`Connection::process_ecn`), once for each acknowledgement whose
+    /// count of marks grew, naming the latest packet it acknowledges as
+    /// `sent`; a loss names the bytes it lost.
     fn on_congestion_event(
         &mut self,
         now: Instant,
-        _sent: Instant,
+        sent: Instant,
         is_persistent_congestion: bool,
-        _lost_bytes: u64,
+        lost_bytes: u64,
     ) {
-        let now = self.at(now);
-        self.law.on_loss(now, self.srtt, is_persistent_congestion);
+        let at = self.at(now);
+        if lost_bytes == 0 && !is_persistent_congestion {
+            self.law.on_mark(at, self.at(sent));
+        } else {
+            self.law.on_loss(at, self.srtt, is_persistent_congestion);
+        }
     }
     fn on_mtu_update(&mut self, new_mtu: u16) {
         self.law.set_datagram(u64::from(new_mtu));
@@ -672,6 +837,7 @@ mod tests {
                         window_limited,
                     });
                     law.on_loss(now, srtt, window_limited);
+                    law.on_mark(now, rtt);
                     assert!(law.window() >= 2);
                 }
             }
@@ -712,6 +878,198 @@ mod tests {
         assert_eq!(controller.metrics().congestion_window, 2_800);
         let copy = controller.clone_box();
         assert_eq!(copy.window(), 2_800);
+        let law = controller.into_any().downcast::<CopaController>().unwrap();
+        assert!(!law.law().in_slow_start());
+    }
+    #[test]
+    fn a_mark_ends_slow_start_and_steps_the_window_down_once_a_round_trip() {
+        let mut law = Copa::new(DATAGRAM, 2);
+        for step in 0..=25 {
+            ack(&mut law, step * 10 * MS, 100 * MS, true);
+        }
+        assert!(law.in_slow_start());
+        let before = law.window();
+        // The backoff of a mark: half the window.
+        law.on_mark(300 * MS, 250 * MS);
+        assert!(!law.in_slow_start());
+        assert_eq!(law.window(), before / 2);
+        // A mark of what was sent before that answer is the same round trip.
+        law.on_mark(320 * MS, 300 * MS);
+        assert_eq!(law.window(), before / 2);
+        // One of what was sent after it is the next.
+        law.on_mark(420 * MS, 310 * MS);
+        assert_eq!(law.window(), before / 4);
+        // Never below the least window.
+        for round in 0..100 {
+            law.on_mark(500 * MS + round * 100 * MS, 450 * MS + round * 100 * MS);
+            assert!(law.window() >= 2 * DATAGRAM);
+        }
+        assert_eq!(law.window(), 2 * DATAGRAM);
+    }
+    #[test]
+    fn a_mark_while_competing_halves_the_target_and_the_window_as_a_classic_sender_does() {
+        let mut law = Copa::new(DATAGRAM, 2);
+        ack(&mut law, 0, 100 * MS, true);
+        for step in 1..=200 {
+            let rtt = if step % 2 == 0 { 180 * MS } else { 220 * MS };
+            ack(&mut law, 500 * MS + step * 10 * MS, rtt, true);
+        }
+        assert!(law.competitive());
+        let raised = law.inv_delta();
+        assert!(raised > 2, "{raised}");
+        let window = law.window();
+        law.on_mark(3_000 * MS, 2_900 * MS);
+        assert_eq!(law.inv_delta(), (raised / 2).max(2));
+        // Copa halves its window as a classic sender does for a mark (RFC
+        // 9002 §B.2).
+        assert_eq!(law.window(), (window / 2).max(2 * DATAGRAM));
+        // The same round trip says nothing more.
+        law.on_mark(3_010 * MS, 2_950 * MS);
+        assert_eq!(law.inv_delta(), (raised / 2).max(2));
+        assert_eq!(law.window(), (window / 2).max(2 * DATAGRAM));
+    }
+    #[test]
+    fn marks_held_round_trip_after_round_trip_take_the_window_down_by_the_backoff_to_the_least() {
+        // A law whose queue empties (the default mode), marked once each
+        // round trip: the declared response to persistent marking halves
+        // the window each round trip, to the least window.
+        let mut law = Copa::new(DATAGRAM, 2);
+        for step in 0..=40 {
+            ack(&mut law, step * 10 * MS, 100 * MS, true);
+        }
+        assert!(!law.competitive());
+        let mut window = law.window();
+        for round in 0..40_u64 {
+            let begins = 1_000 * MS + round * 100 * MS;
+            law.on_mark(begins + 99 * MS, begins);
+            window = (window / 2).max(2 * DATAGRAM);
+            assert_eq!(law.window(), window, "round {round}");
+        }
+        assert_eq!(law.window(), 2 * DATAGRAM);
+        assert!(!law.in_slow_start() && !law.competitive());
+    }
+    #[test]
+    fn after_a_mark_past_slow_start_the_window_grows_a_datagram_a_round_trip_for_ten_seconds() {
+        // What a round trip of acknowledgements, the window's bytes from
+        // `from`, grows the window by.
+        fn round_trip(law: &mut Copa, from: u64) -> u64 {
+            let before = law.window();
+            let whole = before / DATAGRAM;
+            for step in 0..whole {
+                ack(law, from + step * MS, 100 * MS, true);
+            }
+            law.on_ack(Acked {
+                now: from + whole * MS,
+                rtt: 100 * MS,
+                srtt: 100 * MS,
+                bytes: before % DATAGRAM,
+                window_limited: true,
+            });
+            law.window() - before
+        }
+        let mut law = Copa::new(DATAGRAM, 2);
+        for step in 0..=80 {
+            ack(&mut law, step * 10 * MS, 100 * MS, true);
+        }
+        assert_eq!(law.window(), 80 * DATAGRAM);
+        // A mark in slow start is Copa's own doubling past the manager's
+        // target: slow start ends and Copa grows by its own step after it,
+        // `v/δ` datagrams a round trip, more than a classic sender's one.
+        law.on_mark(900 * MS, 850 * MS);
+        assert!(!law.in_slow_start());
+        let grown = round_trip(&mut law, 1_000 * MS);
+        assert!(grown > DATAGRAM + DATAGRAM / 10, "Copa's own step: {grown}");
+        // One after slow start: for ten seconds a datagram a round trip.
+        law.on_mark(1_100 * MS, 1_050 * MS);
+        let grown = round_trip(&mut law, 1_200 * MS);
+        assert!(
+            (DATAGRAM - DATAGRAM / 10..=DATAGRAM + DATAGRAM / 10).contains(&grown),
+            "a datagram a round trip: {grown}"
+        );
+        let grown = round_trip(&mut law, 11_000 * MS);
+        assert!(
+            (DATAGRAM - DATAGRAM / 10..=DATAGRAM + DATAGRAM / 10).contains(&grown),
+            "a datagram a round trip: {grown}"
+        );
+        // Past ten seconds from it, Copa's own step again.
+        let grown = round_trip(&mut law, 11_200 * MS);
+        assert!(grown > DATAGRAM + DATAGRAM / 10, "Copa's own step: {grown}");
+    }
+    #[test]
+    fn competing_as_a_classic_sender_copa_raises_its_target_only_after_a_round_trip_held_back() {
+        let mut law = Copa::new(DATAGRAM, 2);
+        ack(&mut law, 0, 100 * MS, true);
+        // A mark in slow start ends it, and begins no classic growth.
+        law.on_mark(10 * MS, 5 * MS);
+        // A queue a millisecond or three over the least that never nearly
+        // empties: Copa competes, and raises `1/δ` a round trip.
+        let low = |step: u64| {
+            if step.is_multiple_of(2) {
+                101 * MS
+            } else {
+                103 * MS
+            }
+        };
+        for step in 2..=150 {
+            ack(&mut law, step * 10 * MS, low(step), true);
+        }
+        assert!(law.competitive());
+        let raised = law.inv_delta();
+        assert!(raised > 4, "{raised}");
+        // A mark past slow start: `1/δ` halves, and for ten seconds the
+        // window grows as a classic sender's.
+        law.on_mark(1_510 * MS, 1_505 * MS);
+        let halved = law.inv_delta();
+        assert_eq!(halved, (raised / 2).max(2));
+        // Below its target the window grows round trip after round trip and
+        // the target stays: raised a packet a round trip beside a window
+        // that grows a datagram a round trip, it would never be reached, and
+        // the queue never empty (F39, 27 §7). A queue at most ten
+        // milliseconds over the least keeps the mode competing as the
+        // samples rise.
+        for step in 152..=300 {
+            let rtt = match step {
+                ..=260 => low(step),
+                _ if step.is_multiple_of(2) => 109 * MS,
+                _ => 110 * MS,
+            };
+            ack(&mut law, step * 10 * MS, rtt, true);
+            assert!(law.competitive(), "{step}");
+            assert_eq!(law.inv_delta(), halved, "{step}");
+        }
+        // The queue rises past what the target allows: a round trip goes
+        // down, and the round trip after it `1/δ` rises by one.
+        let before = law.window();
+        for step in 301..=360_u64 {
+            let rtt = if step.is_multiple_of(2) {
+                170 * MS
+            } else {
+                180 * MS
+            };
+            ack(&mut law, step * 10 * MS, rtt, true);
+            assert!(law.competitive(), "{step}");
+            if law.inv_delta() > halved {
+                assert!(law.window() < before, "{} {before}", law.window());
+                assert_eq!(law.inv_delta(), halved + 1);
+                return;
+            }
+        }
+        panic!("held back, and `1/δ` stayed {}", law.inv_delta());
+    }
+    #[test]
+    fn the_controller_takes_an_event_without_lost_bytes_for_a_mark() {
+        let began = Instant::now();
+        let mut controller = Arc::new(CopaConfig::default()).build(began, 1_200);
+        let window = controller.window();
+        let later = began + Duration::from_millis(100);
+        controller.on_congestion_event(later, began, false, 0);
+        assert_eq!(controller.window(), window / 2);
+        // The same round trip again: nothing more.
+        controller.on_congestion_event(later + Duration::from_millis(1), began, false, 0);
+        assert_eq!(controller.window(), window / 2);
+        // A loss in the default mode is still no signal.
+        controller.on_congestion_event(later + Duration::from_millis(200), later, false, 1_200);
+        assert_eq!(controller.window(), window / 2);
         let law = controller.into_any().downcast::<CopaController>().unwrap();
         assert!(!law.law().in_slow_start());
     }

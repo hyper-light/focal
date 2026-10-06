@@ -6,7 +6,7 @@ its connections.
 **Symptoms.** `cluster placement` on any node shows the node's `credential: retired`
 (the registry no longer authorizes it; `active` for every other node); the founder's
 `cluster credentials get --invitation ID` shows `expires_at` in the past or the invitation
-revoked; the node's own `cluster node health` shows the placement agent's `last_error`
+revoked; the node's own `diagnose node --health` shows the placement agent's `last_error`
 naming `unauthorized`; `focal_credential_expires_at_seconds` in its metrics is past. Its
 peers close its connections and admit no new ones, so it learns nothing more: `cluster
 node readiness` on it shows `catching_up: false` and `authoritative: false`, and a node
@@ -21,13 +21,18 @@ probes for a while, so `alive` can lag: the credential field, not liveness, is t
 ```sh
 focal --data-dir FOUNDER cluster invitations list
 focal --data-dir FOUNDER cluster credentials get --invitation ID
-focal --data-dir NODE cluster node health
+focal --data-dir NODE diagnose node --health
 ```
 
-**Preconditions.** A node renews its own credential ten days ahead of expiry
-([24 §11](../archictecutre/24-placement-execution-and-fleet-control.md)); a credential is
+**Preconditions.** A node renews its own credential in the last third of its lifetime
+(thirty days by default, `node.credential_lifetime_seconds` committed at genesis;
+[24 §11](../archictecutre/24-placement-execution-and-fleet-control.md)); a credential is
 past its lifetime only when the node could not reach the founder for that long, or its
-invitation was revoked.
+invitation was revoked. The founder renews its own the same way, through the enrollment
+host it runs. The issuer the credentials chain to succeeds itself as well, in the last
+third of its committed lifetime (`node.issuer_lifetime_seconds`) or on `cluster
+credentials rotate-issuer`; `cluster credentials issuers` shows the one issuing, one
+staged and one retiring, and the upgrade fence the succession waits on.
 
 **Commands.** Within the grace the sponsor allows: `focal --data-dir NODE cluster
 credentials renew` on the node (the same key under a fresh certificate). Beyond it, or
@@ -46,8 +51,9 @@ copies: add capacity first.
 **Verification.** The old node is gone from `cluster nodes list`; the re-enrolled host is
 alive and eligible; every session's `achieved` equals `desired`.
 
-**Escalation.** A founder whose credential expired cannot be renewed by anyone: restore it
-from backup.
+**Escalation.** A founder renews its own credential like any node; one whose credential
+nonetheless expired (down for the last third of the lifetime and longer) can no longer
+sign a renewal request and cannot be renewed by anyone: restore it from backup.
 
 **Executed test.** `runbook_expired_credentials`: a host's invitation is revoked on the
 founder (revocation models expiry beyond the grace; a real lifetime is thirty days); the

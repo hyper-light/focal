@@ -94,6 +94,11 @@ fn limits() -> WireLimits {
         ..Default::default()
     }
 }
+/// What a test server's listener funds its bodies from: sixty-four frames
+/// of the default limit, a quarter of them kept for the completion lane.
+fn budget() -> MemoryBudget {
+    MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap()
+}
 
 #[derive(Clone)]
 struct AccountedDownload {
@@ -221,32 +226,31 @@ async fn unix_slow_response_keeps_output_charge_until_write_finishes_or_disconne
         .await
         .unwrap();
         stream.shutdown().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        // The response's header arriving is the server's write begun; this
+        // client reads no further, so the write cannot finish, and its
+        // output charge is still held.
+        let header = unfrozen(
+            "the response never began",
+            read_frame_header(&mut stream, FrameKind::Response, limits().max_frame_bytes),
+        )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(budget.stats().used >= 900 * 1024 * 3);
         if !disconnect {
-            let response: ResponseEnvelope =
-                read_frame(&mut stream, FrameKind::Response, limits().max_frame_bytes)
-                    .await
-                    .unwrap();
+            let mut buffer = vec![0; header.payload_bytes()];
+            let payload = read_frame_payload_into(&mut stream, header, &mut buffer)
+                .await
+                .unwrap();
+            let response: ResponseEnvelope = decode_payload(payload).unwrap();
             assert!(
                 matches!(response.result, Response::Content(ContentChunk { bytes, .. }) if bytes.len() == 900 * 1024)
             );
         }
         drop(stream);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used != 0 {
-                tokio::task::yield_now().await;
-            }
+        settles("the output charge was never given back", || {
+            budget.stats().used == 0
         })
-        .await
-        .unwrap();
+        .await;
     }
     server.close();
     task.await.unwrap().unwrap();
@@ -311,20 +315,22 @@ async fn quic_flow_control_keeps_response_permit_until_ack_or_connection_loss() 
         .await
         .unwrap();
         send.finish().unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        // The response's header arriving is the server's write begun; this
+        // client reads no further, so the write cannot finish, and its
+        // output charge is still held.
+        let header = unfrozen(
+            "the response never began",
+            read_frame_header(&mut receive, FrameKind::Response, limits().max_frame_bytes),
+        )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(budget.stats().used >= 900 * 1024 * 3);
         if !disconnect {
-            let response: ResponseEnvelope =
-                read_frame(&mut receive, FrameKind::Response, limits().max_frame_bytes)
-                    .await
-                    .unwrap();
+            let mut buffer = vec![0; header.payload_bytes()];
+            let payload = read_frame_payload_into(&mut receive, header, &mut buffer)
+                .await
+                .unwrap();
+            let response: ResponseEnvelope = decode_payload(payload).unwrap();
             assert!(
                 matches!(response.result, Response::Content(ContentChunk { bytes, .. }) if bytes.len() == 900 * 1024)
             );
@@ -335,13 +341,10 @@ async fn quic_flow_control_keeps_response_permit_until_ack_or_connection_loss() 
                 b"test disconnect while response is flow controlled",
             );
         }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while budget.stats().used != 0 {
-                tokio::task::yield_now().await;
-            }
+        settles("the output charge was never given back", || {
+            budget.stats().used == 0
         })
-        .await
-        .unwrap();
+        .await;
         connection.close(0u8.into(), b"done");
     }
     server.close();
@@ -355,6 +358,17 @@ async fn server(
     Arc<QuicServer>,
     tokio::task::JoinHandle<Result<(), WireError>>,
 ) {
+    server_at(pki, registry, handler, "127.0.0.1:0".parse().unwrap()).await
+}
+async fn server_at(
+    pki: &Pki,
+    registry: PeerRegistry,
+    handler: Arc<dyn RequestHandler>,
+    address: std::net::SocketAddr,
+) -> (
+    Arc<QuicServer>,
+    tokio::task::JoinHandle<Result<(), WireError>>,
+) {
     let (certificate, key) = pki.issue(true);
     let tls = server_tls(
         TlsIdentity::from_pkcs8(vec![certificate], key),
@@ -362,9 +376,7 @@ async fn server(
         &limits(),
     )
     .unwrap();
-    let server = Arc::new(
-        QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, registry, limits()).unwrap(),
-    );
+    let server = Arc::new(QuicServer::bind(address, tls, registry, limits(), budget()).unwrap());
     let running = server.clone();
     let task = tokio::spawn(async move { running.serve(handler).await });
     (server, task)
@@ -417,10 +429,14 @@ async fn mutual_tls_tenant_isolation_live_revocation_and_independent_streams() {
     let slow_remote = remote.clone();
     let slow = tokio::spawn(async move { slow_remote.request(&request(1)).await });
     slow_started.notified().await;
-    let fast = tokio::time::timeout(Duration::from_secs(1), remote.request(&request(2)))
-        .await
-        .unwrap()
-        .unwrap();
+    // The slow request is held until the fast one is answered: a fast one
+    // queued behind it would wait for ever.
+    let fast = unfrozen(
+        "the fast request waited behind the slow one",
+        remote.request(&request(2)),
+    )
+    .await
+    .unwrap();
     assert_eq!(fast, response(&request(2)));
     release.notify_one();
     slow.await.unwrap().unwrap();
@@ -434,6 +450,197 @@ async fn mutual_tls_tenant_isolation_live_revocation_and_independent_streams() {
     registry.revoke(fingerprint).unwrap();
     assert!(remote.request(&request(4)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// A raw connection through the Hello, for streams a client would not
+/// send: a request header alone, or a body in pieces.
+async fn raw_connection(
+    pki: &Pki,
+    certificate: Vec<u8>,
+    key: Vec<u8>,
+    to: std::net::SocketAddr,
+) -> quinn::Connection {
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &limits(),
+    )
+    .unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(tls);
+    let connection = endpoint.connect(to, "localhost").unwrap().await.unwrap();
+    let (mut send, mut receive) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        FrameKind::Hello,
+        &Hello {
+            versions: vec![PROTOCOL_VERSION],
+            max_frame_bytes: limits().max_frame_bytes,
+            max_items: limits().max_items,
+        },
+        4096,
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    let _: HelloReply = read_frame(&mut receive, FrameKind::HelloReply, 4096)
+        .await
+        .unwrap();
+    require_end(&mut receive).await.unwrap();
+    connection
+}
+/// A request frame's header announcing `payload` bytes.
+fn request_header(payload: u32) -> [u8; HEADER_BYTES] {
+    let mut header = [0; HEADER_BYTES];
+    header[..8].copy_from_slice(b"FOCALQ01");
+    header[8..10].copy_from_slice(&1u16.to_be_bytes());
+    header[10..12].copy_from_slice(&(FrameKind::Request as u16).to_be_bytes());
+    header[12..].copy_from_slice(&payload.to_be_bytes());
+    header
+}
+/// A wait on the listener's admission, charged to its changes.
+/// How long what a wait observes may make no progress before the wait is
+/// over: a wedge, not slowness (27 §3.1 P8). The in-process servers and
+/// peers these tests wait on report no period, so where no counter is
+/// observed this window is the wait's only bound.
+const FROZEN: Duration = Duration::from_secs(60);
+
+/// What `future` yields, unless it yields nothing for [`FROZEN`].
+async fn unfrozen<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    match tokio::time::timeout(FROZEN, future).await {
+        Ok(output) => output,
+        Err(_) => panic!("{what}: nothing for {FROZEN:?}"),
+    }
+}
+
+/// Polls until `settled` holds, unless it does not for [`FROZEN`].
+async fn settles(what: &str, settled: impl Fn() -> bool) {
+    unfrozen(what, async {
+        while !settled() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+async fn admission_settles(
+    server: &QuicServer,
+    settled: impl Fn(&AdmissionStats) -> bool,
+) -> AdmissionStats {
+    let mut wait =
+        focal_timing::ProgressDeadline::begin(&[server.admission().changes], u64::MAX, FROZEN);
+    loop {
+        let stats = server.admission();
+        if settled(&stats) {
+            return stats;
+        }
+        if let Err(spent) = wait.check(&[stats.changes]) {
+            panic!("the admission never settled: {spent}: {stats:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The audit's F35: a grant revoked while a request's body is still
+/// arriving. The request is refused when it is complete — what is
+/// dispatched is authorized by the grant current then — and the
+/// revocation closes the certificate's connection, so nothing more is
+/// received on it and what waited for the body ends with it.
+#[tokio::test]
+async fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connection() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let fingerprint = registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async move { response(verified.request()) }
+    });
+    let (server, task) = server(&pki, registry.clone(), handler).await;
+    let connection = raw_connection(&pki, certificate, key, server.local_addr().unwrap()).await;
+    assert_eq!(registry.live_connections(fingerprint), 1);
+    let body = encode_payload(&request(1), limits().max_frame_bytes).unwrap();
+    let (mut send, mut receive) = connection.open_bi().await.unwrap();
+    send.write_all(&request_header(body.len() as u32))
+        .await
+        .unwrap();
+    send.write_all(&body[..body.len() / 2]).await.unwrap();
+    // The half body is held under its permit before the revocation.
+    admission_settles(&server, |stats| stats.bytes == body.len()).await;
+    registry.revoke(fingerprint).unwrap();
+    // The connection is closed by the revocation: the rest of the body
+    // has nowhere to go, and the permit it held is given back.
+    // Bounded by the connection's idle timeout (the test limits'): a close
+    // that never came would end it as TimedOut, which is refused below.
+    let closed = connection.closed().await;
+    assert!(
+        matches!(
+            &closed,
+            quinn::ConnectionError::ApplicationClosed(close) if close.reason.as_ref() == b"revoked"
+        ),
+        "{closed:?}"
+    );
+    assert!(send.write_all(&body[body.len() / 2..]).await.is_err());
+    assert!(receive.read_to_end(64).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(registry.live_connections(fingerprint), 0);
+    let stats =
+        admission_settles(&server, |stats| stats.bytes == 0 && stats.connections == 0).await;
+    assert_eq!(stats.bytes, 0);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// The audit's F35, the other order: a body that completes after the
+/// grant was withdrawn but before the close reaches its stream is refused
+/// at dispatch by the grant current then. The registry is asked again
+/// once the whole request has arrived; the early check alone would have
+/// dispatched it.
+#[tokio::test]
+async fn a_complete_request_is_authorized_by_the_grant_current_at_dispatch() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let fingerprint = registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let revoking = registry.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    // The handler is where a dispatched request lands; the registry's
+    // grant is withdrawn by the first request while it runs, and the
+    // second request, sent on the same connection before the close, must
+    // never land.
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        let revoking = revoking.clone();
+        async move {
+            if verified.request().request_id == RequestId::from_u128(1) {
+                revoking.revoke(fingerprint).unwrap();
+            }
+            response(verified.request())
+        }
+    });
+    let (server, task) = server(&pki, registry.clone(), handler).await;
+    let connector = connector(&pki, certificate, key);
+    let remote = connector
+        .connect(server.local_addr().unwrap(), "localhost")
+        .await
+        .unwrap();
+    // The first request revokes the grant from inside the handler: its
+    // own answer is lost with the connection, and nothing after it is
+    // served.
+    let first = remote.request(&request(1)).await;
+    assert!(first.is_err(), "{first:?}");
+    assert!(remote.request(&request(2)).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.live_connections(fingerprint), 0);
     server.close();
     task.await.unwrap().unwrap();
 }
@@ -959,7 +1166,9 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
         assert_eq!(recorded.len(), 3);
         assert!(recorded.iter().all(|request| request == &packet));
     }
-    assert_eq!(pool.stats().connections_opened, 2);
+    // The first message was answered `Unavailable` and asked again: on the
+    // connection that carried the refusal, not on a new one.
+    assert_eq!(pool.stats().connections_opened, 1);
     assert_eq!(pool.stats().cached_connections, 1);
     // Two replication messages and two probes.
     assert_eq!(pool.stats().delivered, 4);
@@ -979,6 +1188,205 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Closed));
     server.close();
     task.await.unwrap().unwrap();
+}
+
+/// One operation that its peer refuses, or cannot say the outcome of, or
+/// never answers, takes no other exchange with it (the audit's F37: the
+/// pool closed the connection for it, and every exchange with the peer —
+/// other groups' messages, probes, content under way — was lost with it,
+/// and paid a handshake and a congestion window learned again). A request
+/// held by the peer while another is refused is answered; one in flight
+/// while another times out is answered; what the caller is told of a
+/// refusal is that the peer refused; and one connection is opened through
+/// all of it.
+#[tokio::test]
+async fn an_operation_refused_or_unanswered_takes_no_other_exchange_with_its_connection() {
+    use std::collections::BTreeMap;
+    use tokio::sync::{Notify, Semaphore};
+    const HELD: u128 = 101;
+    const REFUSED: u128 = 102;
+    const UNKNOWN: u128 = 103;
+    const SILENT: u128 = 104;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    let held = Arc::new(Notify::new());
+    let silent = Arc::new(Notify::new());
+    let (release, entered, asked) = (gate.clone(), held.clone(), silent.clone());
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let (release, entered, asked) = (release.clone(), entered.clone(), asked.clone());
+        async move {
+            let id = u128::from_be_bytes(verified.request().request_id.0);
+            let answer = match id {
+                _ if matches!(verified.request().operation, Operation::Probe { .. }) => {
+                    Response::Probe(vec![1])
+                }
+                HELD => {
+                    entered.notify_one();
+                    release.acquire().await.unwrap().forget();
+                    Response::PeerAccepted
+                }
+                REFUSED => Response::Error(AccessError::Unavailable),
+                UNKNOWN => Response::Error(AccessError::OutcomeUnknown),
+                SILENT => {
+                    asked.notify_one();
+                    std::future::pending().await
+                }
+                _ => Response::PeerAccepted,
+            };
+            verified.request().reply(answer)
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    // An exchange is given two seconds; a request is asked twice.
+    let wire = WireLimits {
+        request_timeout: Duration::from_secs(2),
+        ..limits()
+    };
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap(),
+            PeerPoolLimits {
+                attempts: 2,
+                retry_backoff: Duration::ZERO,
+                timeout: Duration::from_secs(10),
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let message = |id: u128| {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7, 8, 9],
+        };
+        packet
+    };
+    let send = |id: u128| {
+        let pool = pool.clone();
+        let packet = message(id);
+        tokio::spawn(async move { pool.send(2, &packet).await })
+    };
+    pool.send(2, &message(100)).await.unwrap();
+    assert_eq!(pool.stats().connections_opened, 1);
+
+    // A request the peer holds, while it refuses two others.
+    let waiting = send(HELD);
+    held.notified().await;
+    assert_eq!(
+        pool.send(2, &message(REFUSED)).await,
+        Err(PeerSendError::Rejected(AccessError::Unavailable))
+    );
+    assert_eq!(
+        pool.send(2, &message(UNKNOWN)).await,
+        Err(PeerSendError::Rejected(AccessError::OutcomeUnknown))
+    );
+    gate.add_permits(1);
+    assert_eq!(waiting.await.unwrap(), Ok(()));
+    assert_eq!(pool.stats().connections_opened, 1);
+
+    // A request the peer's handler never answers. The peer answers probes
+    // meanwhile, as it does a node's liveness. The request ends when the
+    // peer gives its handler up and says so, is asked again on the same
+    // connection, and ends the same way. A second request is sent a second
+    // into the first, held by the peer, and let go once the first has been
+    // asked again: it was in flight across that, and is answered.
+    let probing = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut probe = request(200);
+            probe.operation = Operation::Probe {
+                request: vec![1, 2, 3],
+            };
+            loop {
+                assert_eq!(pool.send_probe(2, &probe).await, Ok(vec![1]));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    let unanswered = send(SILENT);
+    silent.notified().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let waiting = send(HELD);
+    held.notified().await;
+    // Asked again: its first exchange ended without what it asked for.
+    silent.notified().await;
+    gate.add_permits(1);
+    assert_eq!(waiting.await.unwrap(), Ok(()));
+    // Told at last that it is not to be had, or never told: lost to its
+    // caller either way, and to no one else.
+    let unanswered = unanswered.await.unwrap();
+    assert!(
+        matches!(
+            unanswered,
+            Err(PeerSendError::Lost | PeerSendError::Rejected(AccessError::Unavailable))
+        ),
+        "{unanswered:?}"
+    );
+    probing.abort();
+    let _ = probing.await;
+    pool.send(2, &message(105)).await.unwrap();
+    assert_eq!(pool.stats().connections_opened, 1);
+    assert_eq!(pool.stats().cached_connections, 1);
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// When an exchange fails on the wire, its connection is closed for it only
+/// if the connection is what failed. A stream that timed out, ended early
+/// or could not be read while the peer answered other exchanges on the same
+/// connection failed alone; with no answer at all since it was sent there
+/// is no evidence the connection carries anything; and a connection that
+/// has ended, could not be trusted, or on which the peer did not speak the
+/// protocol, is closed whatever else was answered.
+#[test]
+fn a_connection_is_closed_for_an_exchange_only_when_the_connection_failed() {
+    use crate::peers::connection_failed;
+    let stream = || {
+        [
+            WireError::Timeout,
+            WireError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            WireError::Allocation,
+        ]
+    };
+    for failure in stream() {
+        assert!(!connection_failed(false, &failure, true), "{failure:?}");
+        assert!(connection_failed(false, &failure, false), "{failure:?}");
+        assert!(connection_failed(true, &failure, true), "{failure:?}");
+    }
+    for failure in [
+        WireError::Connection,
+        WireError::Authentication,
+        WireError::InvalidFrame,
+    ] {
+        assert!(connection_failed(false, &failure, true), "{failure:?}");
+    }
 }
 
 #[tokio::test]
@@ -1123,25 +1531,21 @@ async fn peer_pool_reaches_a_peer_that_moved_behind_its_name_while_every_caller_
         group: [2; 16],
         message: vec![1],
     };
-    // Every caller allows far less than the dead address's deadline.
-    let started = std::time::Instant::now();
-    let mut delivered = false;
-    while started.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(200), pool.send(2, &packet)).await {
-            Ok(Ok(_)) => {
-                delivered = true;
-                break;
+    // Every caller allows far less than the dead address's deadline. The
+    // one dial ends by that deadline: a caller is answered through the
+    // name's fresh address before it, or the caller after it fails.
+    unfrozen("no caller ever reached the moved peer", async {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), pool.send(2, &packet)).await {
+                Ok(Ok(_)) => break,
+                Ok(Err(error)) => panic!("the send failed rather than timing out: {error}"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             }
-            Ok(Err(error)) => panic!("the send failed rather than timing out: {error}"),
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
-    }
-    assert!(delivered, "no caller ever reached the moved peer");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the moved peer was reached only after {:?}",
-        started.elapsed()
-    );
+    })
+    .await;
+    // One dial, bounded by the dead address's deadline, delivered: the
+    // name's fresh address won it.
     let stats = pool.stats();
     assert_eq!(stats.dials, 1, "one dial served every caller");
     assert_eq!(stats.connections_opened, 1);
@@ -1210,23 +1614,20 @@ async fn peer_pool_callers_that_give_up_share_one_dial_whose_outcome_is_still_re
         }
     }
     assert_eq!(pool.stats().dials, 1, "the callers shared one dial");
-    // The dial decides on its own after the callers left; wait for it.
-    let deadline = std::time::Instant::now() + limits().request_timeout + Duration::from_secs(2);
-    loop {
-        let started = std::time::Instant::now();
-        let result = pool.send(2, &packet).await;
+    // The dial decides on its own after the callers left, by its deadline.
+    // A send joins it and ends with its outcome, which marks the peer
+    // unreachable before anyone is told; the next send is refused at once.
+    for _ in 0..2 {
+        let result = unfrozen("a send outlived the dial", pool.send(2, &packet)).await;
         assert_eq!(result, Err(PeerSendError::Lost));
-        if started.elapsed() < Duration::from_millis(50) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the abandoned dial never marked the peer unreachable"
-        );
     }
+    let stats = pool.stats();
+    assert!(
+        stats.refused_unreachable >= 1,
+        "the abandoned dial never marked the peer unreachable: {stats:?}"
+    );
     assert_eq!(
-        pool.stats().dials,
-        1,
+        stats.dials, 1,
         "the recorded outcome spared every later caller a dial"
     );
     pool.close();
@@ -1283,15 +1684,12 @@ async fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadl
         };
         let sending = pool.clone();
         let pending = tokio::spawn(async move { sending.send(2, &packet).await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .unwrap();
-        let asked = std::time::Instant::now();
+        unfrozen("the request never reached the peer", started.notified()).await;
         pool.replace_routes(revision + 1, BTreeMap::new()).unwrap();
-        let ended = tokio::time::timeout(deadline / 2, pending)
+        let ended = unfrozen("the request outlived its retired route", pending)
             .await
-            .expect("the request waited out its deadline")
             .unwrap();
+        // Ended by the retirement: its deadline would have ended it as Lost.
         assert!(
             matches!(
                 ended,
@@ -1299,7 +1697,6 @@ async fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadl
             ),
             "{ended:?}"
         );
-        assert!(asked.elapsed() < deadline / 2);
         assert_eq!(pool.stats().inflight, 0);
         assert_eq!(pool.stats().cached_connections, 0);
     }
@@ -1354,9 +1751,8 @@ async fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
             tokio::task::yield_now().await;
         }
         pool.replace_routes(revision + 1, BTreeMap::new()).unwrap();
-        let ended = tokio::time::timeout(Duration::from_secs(30), pending)
+        let ended = unfrozen("a send outlived its retired route", pending)
             .await
-            .expect("a send outlived its retired route")
             .unwrap();
         if ended.is_err() {
             retired_in_flight += 1;
@@ -1369,6 +1765,108 @@ async fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
     pool.replace_routes(1_000, BTreeMap::from([(2, endpoint)]))
         .unwrap();
     assert_eq!(pool.send(2, &packet).await, Ok(()));
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+#[test]
+fn the_lanes_of_a_connection_are_derived_from_the_consensus_window_and_the_path() {
+    // Thirteen streams carry what the reference path holds (27 §7).
+    assert_eq!(content_streams(), 13);
+    let limits = WireLimits::for_consensus(128);
+    assert_eq!(
+        (limits.control_streams, limits.streams_per_connection),
+        (128, 142)
+    );
+    limits.validate().unwrap();
+    let pool = PeerPoolLimits::for_consensus(128);
+    assert_eq!(pool.per_peer_inflight, 128);
+    assert_eq!(
+        pool.max_inflight,
+        128 * PeerPoolLimits::default().max_connections
+    );
+    // A control lane wider than the connection is refused.
+    let mut wrong = WireLimits::default();
+    wrong.control_streams = wrong.streams_per_connection + 1;
+    assert!(wrong.validate().is_err());
+}
+
+/// A group's messages to a peer beyond its lane wait their turn and are all
+/// carried, in order: none is refused for the lane being full at that
+/// instant, which cost a vote a whole election timeout.
+#[tokio::test]
+async fn a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counted, released, seen) = (arrived.clone(), release.clone(), order.clone());
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let (counted, released, seen) = (counted.clone(), released.clone(), seen.clone());
+        async move {
+            seen.lock().unwrap().push(verified.request().request_id.0);
+            counted.add_permits(1);
+            released.notified().await;
+            verified.request().reply(Response::PeerAccepted)
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            connector(&pki, certificate, key),
+            PeerPoolLimits {
+                per_peer_inflight: 1,
+                attempts: 1,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let mut sends = Vec::new();
+    for id in 0..3u128 {
+        let mut packet = request(90 + id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7, 8, 9],
+        };
+        let sending = pool.clone();
+        sends.push(tokio::spawn(async move { sending.send(2, &packet).await }));
+    }
+    // One reaches the peer at a time; the others wait on the lane, refused
+    // by no one, and each is released once it has arrived.
+    for _ in 0..3 {
+        arrived.acquire_many(1).await.unwrap().forget();
+        assert_eq!(pool.stats().busy, 0);
+        release.notify_one();
+    }
+    for send in sends {
+        assert_eq!(send.await.unwrap(), Ok(()));
+    }
+    assert_eq!(pool.stats().busy, 0);
+    assert_eq!(pool.stats().delivered, 3);
+    let seen = order.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
     pool.close();
     server.close();
     task.await.unwrap().unwrap();
@@ -1431,9 +1929,7 @@ async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connect
     let sent = packet.clone();
     let sending = pool.clone();
     let pending = tokio::spawn(async move { sending.send(2, &sent).await });
-    tokio::time::timeout(Duration::from_secs(1), started.notified())
-        .await
-        .unwrap();
+    unfrozen("the request never reached the peer", started.notified()).await;
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Busy));
     assert_eq!(pool.stats().inflight, 1);
     assert_eq!(pool.stats().busy, 1);
@@ -1451,18 +1947,52 @@ async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connect
     task.await.unwrap().unwrap();
 }
 
-/// A path between a client and `server` that carries `bits` in a second
-/// each way: a datagram waits its turn behind those before it, and one
-/// that finds `QUEUE` waiting is dropped.
-async fn narrow(
+/// A path between a client and a server, as a relay shapes it.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    /// What the path carries in a second toward the server, and back.
+    up_bits: u64,
+    down_bits: u64,
+    /// How long a datagram travels once it has left the bottleneck, each
+    /// way, and how much longer at most (drawn for each datagram).
+    delay: Duration,
+    jitter: Duration,
+    /// Datagrams lost in a million, each way.
+    loss_ppm: u32,
+    /// The datagrams the bottleneck holds; one more is dropped.
+    queue: usize,
+    /// A time, from the relay's start, in which nothing is carried.
+    outage: Option<(Duration, Duration)>,
+    seed: u64,
+}
+impl Shape {
+    fn even(bits: u64) -> Self {
+        Self {
+            up_bits: bits,
+            down_bits: bits,
+            delay: Duration::ZERO,
+            jitter: Duration::ZERO,
+            loss_ppm: 0,
+            queue: 32,
+            outage: None,
+            seed: 1,
+        }
+    }
+}
+
+/// A path between a client and `server` shaped as `shape` says: a datagram
+/// waits its turn at the bottleneck behind those before it, one that finds
+/// the queue full is dropped, and what leaves the bottleneck travels its
+/// delay.
+async fn shaped(
     server: std::net::SocketAddr,
-    bits: u64,
+    shape: Shape,
 ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
-    const QUEUE: usize = 32;
     let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let address = front.local_addr().unwrap();
     let client = Arc::new(std::sync::Mutex::new(None::<std::net::SocketAddr>));
+    let began = tokio::time::Instant::now();
     let mut tasks = Vec::new();
     for up in [true, false] {
         let (from, to) = if up {
@@ -1470,7 +2000,8 @@ async fn narrow(
         } else {
             (back.clone(), front.clone())
         };
-        let (queue, mut waiting) = tokio::sync::mpsc::channel::<Vec<u8>>(QUEUE);
+        let bits = if up { shape.up_bits } else { shape.down_bits };
+        let (queue, mut waiting) = tokio::sync::mpsc::channel::<Vec<u8>>(shape.queue);
         let known = client.clone();
         tasks.push(tokio::spawn(async move {
             let mut datagram = vec![0u8; 65_536];
@@ -1483,18 +2014,46 @@ async fn narrow(
         }));
         let known = client.clone();
         tasks.push(tokio::spawn(async move {
+            let mut random = shape.seed ^ if up { 0x9E37_79B9_7F4A_7C15 } else { 0 };
+            let mut draw = move || {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                random
+            };
             let mut free = tokio::time::Instant::now();
             while let Some(datagram) = waiting.recv().await {
                 free = free.max(tokio::time::Instant::now())
                     + Duration::from_nanos(datagram.len() as u64 * 8 * 1_000_000_000 / bits);
                 tokio::time::sleep_until(free).await;
+                let lost = draw() % 1_000_000 < u64::from(shape.loss_ppm);
+                let out = shape.outage.is_some_and(|(from, length)| {
+                    let at = began.elapsed();
+                    at >= from && at < from + length
+                });
                 let target = if up {
                     Some(server)
                 } else {
                     *known.lock().unwrap()
                 };
-                if let Some(target) = target {
+                let Some(target) = target else { continue };
+                if lost || out {
+                    continue;
+                }
+                let travel = shape.delay
+                    + Duration::from_nanos(
+                        draw() % (shape.jitter.as_nanos() as u64).saturating_add(1),
+                    );
+                if travel.is_zero() {
                     let _ = to.send_to(&datagram, target).await;
+                } else {
+                    // No more travel at once than the bottleneck lets out
+                    // in the longest travel.
+                    let to = to.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(travel).await;
+                        let _ = to.send_to(&datagram, target).await;
+                    });
                 }
             }
         }));
@@ -1502,9 +2061,171 @@ async fn narrow(
     (address, tasks)
 }
 
+/// A path that carries `bits` in a second each way, and nothing else of it
+/// shaped.
+async fn narrow(
+    server: std::net::SocketAddr,
+    bits: u64,
+) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
+    shaped(server, Shape::even(bits)).await
+}
+
+/// A payload that keeps arriving is never given up, however slowly it
+/// comes against the path's round trip, and one that stops is given up
+/// within a judgement (`Arriving`, the port's finding). It was priced by
+/// its residency — two datagrams a probe timeout of the longest round trip
+/// the path showed while it arrived — which a sender limited by its path
+/// alone keeps and one that writes as it has, shares its connection or is
+/// short of CPU does not: a datagram every five milliseconds on a path of
+/// one millisecond, three times slower than that pace, was given up with
+/// most of the payload arriving.
+#[tokio::test(start_paused = true)]
+async fn a_payload_that_keeps_arriving_is_never_given_up_and_one_that_stops_is() {
+    const PAYLOAD: usize = 256 * 1024;
+    const EVERY: Duration = Duration::from_millis(5);
+    let wait = Duration::from_millis(100);
+    // A datagram every five milliseconds, `stop_after` of them at most.
+    let send = |mut writer: tokio::io::DuplexStream, stop_after: usize| async move {
+        use tokio::io::AsyncWriteExt;
+        let datagram = [7u8; LEAST_PROGRESS];
+        let mut left = PAYLOAD;
+        let mut sent = 0usize;
+        while left > 0 && sent < stop_after {
+            let take = left.min(datagram.len());
+            if writer.write_all(&datagram[..take]).await.is_err() {
+                return;
+            }
+            left -= take;
+            sent += 1;
+            tokio::time::sleep(EVERY).await;
+        }
+        // Stopped: the stream stays open and silent.
+        std::future::pending::<()>().await;
+    };
+    let read = |stop_after: usize| async move {
+        let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let sender = tokio::spawn(send(writer, stop_after));
+        let frame = read_frame_header(
+            &mut &request_header(PAYLOAD as u32)[..],
+            FrameKind::Request,
+            PAYLOAD as u32,
+        )
+        .await
+        .unwrap();
+        let began = tokio::time::Instant::now();
+        let alone = crate::frame::AloneDelivery::default();
+        let arrived: Result<Vec<u8>, WireError> = read_payload_arriving(
+            &mut reader,
+            frame,
+            wait,
+            || Duration::from_millis(1),
+            &alone,
+            0,
+        )
+        .await;
+        sender.abort();
+        (arrived.map(|_| ()), began.elapsed(), alone)
+    };
+    // Sent to the end: the payload arrives, 1.1 s after it began, three
+    // times the residency it was given before. It is not a frame's encoding,
+    // so it is read as far as its decoding, which the path does not answer
+    // for; and the delivery it was declared to has nothing of it left owed.
+    let (arrived, took, alone) = read(usize::MAX).await;
+    assert!(
+        !matches!(arrived, Err(WireError::Timeout)),
+        "given up after {took:?}"
+    );
+    assert!(took >= Duration::from_secs(1), "{took:?}");
+    assert_eq!(alone.backlog(0), 0);
+    assert_eq!(alone.delivered(0), PAYLOAD as u64);
+    // Stopped a third of the way in: given up at the first judgement that
+    // brought less than a datagram, one wait after the last datagram, and
+    // what was not read is released.
+    let stop_after = PAYLOAD / LEAST_PROGRESS / 3;
+    let (given_up, after, alone) = read(stop_after).await;
+    assert!(matches!(given_up, Err(WireError::Timeout)), "{given_up:?}");
+    let sent = EVERY * stop_after as u32;
+    assert!(
+        after >= sent && after <= sent + wait * 2,
+        "{after:?} for {sent:?}"
+    );
+    assert_eq!(alone.backlog(0), 0);
+    assert_eq!(alone.delivered(0), (stop_after * LEAST_PROGRESS) as u64);
+}
+
+/// The judgement a body's arrival is charged by, apart from any stream
+/// (`Arriving`): what hyper-raft's port of the law tests of its own.
+#[test]
+fn a_bodys_arrival_is_charged_with_what_arrives_against_what_is_owed() {
+    use crate::frame::{Arriving, Moved};
+    const PERIOD: Duration = Duration::from_millis(100);
+    let moved = |received: u64, delivered: u64| Moved {
+        received,
+        delivered,
+    };
+    let start = tokio::time::Instant::now();
+    // A megabyte at 12,000 bytes a period, 84 periods: never cut off while
+    // bytes keep arriving, however short the path's round trip.
+    let mut body = Arriving::begin(start, moved(0, 0), 1_000_000, 1_000_000, PERIOD);
+    for period in 1..=83u32 {
+        let arrived = 12_000 * u64::from(period);
+        body.judge(
+            start + PERIOD * period,
+            moved(arrived, arrived),
+            1_000_000 - arrived,
+            PERIOD,
+        )
+        .unwrap();
+        body.arrived(12_000);
+    }
+    // One that stops arriving ends at the period that brought less than a
+    // datagram; one not yet due is not judged.
+    let mut body = Arriving::begin(start, moved(0, 0), 24_000, 24_000, PERIOD);
+    body.judge(start + PERIOD / 2, moved(0, 0), 24_000, PERIOD)
+        .unwrap();
+    assert_eq!(
+        body.judge(start + PERIOD, moved(100, 100), 24_000, PERIOD),
+        Err(crate::frame::GiveUp::Quiet)
+    );
+    // A body of fewer bytes than a datagram needs only itself.
+    let mut tail = Arriving::begin(start, moved(0, 0), 300, 300, PERIOD);
+    tail.arrived(300);
+    tail.judge(start + PERIOD, moved(300, 300), 0, PERIOD)
+        .unwrap();
+    // A body the peer withholds while it delivers others: a more urgent
+    // class's megabyte is not charged; the other bodies owed are; a period
+    // after everything owed was delivered, still busy and still not this
+    // body, it ends.
+    let mut withheld = Arriving::begin(start, moved(0, 0), 10_000, 60_000, PERIOD);
+    withheld
+        .judge(start + PERIOD, moved(1_000_000, 0), 60_000, PERIOD)
+        .unwrap();
+    withheld
+        .judge(start + PERIOD * 2, moved(1_050_000, 50_000), 20_000, PERIOD)
+        .unwrap();
+    withheld
+        .judge(start + PERIOD * 3, moved(1_060_000, 60_000), 10_000, PERIOD)
+        .unwrap();
+    assert_eq!(
+        withheld.judge(start + PERIOD * 4, moved(2_000_000, 60_000), 10_000, PERIOD),
+        Err(crate::frame::GiveUp::Withheld)
+    );
+    // The judgement stretches with the path: a period that the longest
+    // round trip's probe timeout exceeds is that probe timeout — three
+    // round trips and the acknowledgement delay the peer may take.
+    assert_eq!(
+        crate::frame::judgement(PERIOD, Duration::from_millis(10)),
+        PERIOD
+    );
+    assert_eq!(
+        crate::frame::judgement(PERIOD, Duration::from_millis(50)),
+        Duration::from_millis(175)
+    );
+}
+
 /// A megabyte over a path that takes longer to carry it than a request is
 /// given is carried, each way: an exchange waits as long as the path takes
-/// (`carried`, `read_payload_arriving`), and no longer for a peer that
+/// (`Carriage`, `read_payload_arriving`), and no longer for a peer that
 /// does not answer than the path would have taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
@@ -1556,7 +2277,14 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
     )
     .unwrap();
     let server = Arc::new(
-        QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, registry, wire.clone()).unwrap(),
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            wire.clone(),
+            budget(),
+        )
+        .unwrap(),
     );
     let running = server.clone();
     let task = tokio::spawn(async move { running.serve(handler).await });
@@ -1620,7 +2348,14 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
     let received = began.elapsed();
     assert!(received >= least, "{received:?}");
     // A peer that does not answer what it was asked: the path has
-    // carried what was asked within one wait.
+    // carried what was asked within one wait. The peer is given its
+    // period and what the path takes to carry the first of an answer
+    // (`Carriage`); on a path whose round trip the megabyte stretched,
+    // that can outlast the peer's own time for its handler (one second
+    // here), and then the peer says it gave the request up: `Unavailable`
+    // when it had not begun, `OutcomeUnknown` when its handler was given
+    // up on (a cancel is a mutation; `dispatch_accounted`). Which of the
+    // two is the peer's scheduling (the Windows run saw the second).
     let began = std::time::Instant::now();
     let unanswered = remote
         .request_within(
@@ -1629,7 +2364,14 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
         )
         .await;
     assert!(
-        matches!(unanswered, Err(WireError::Timeout)),
+        matches!(
+            &unanswered,
+            Err(WireError::Timeout)
+                | Ok(ResponseEnvelope {
+                    result: Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown),
+                    ..
+                })
+        ),
         "{unanswered:?}"
     );
     assert!(began.elapsed() >= Duration::from_millis(300));
@@ -2042,6 +2784,7 @@ async fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
                 server_tls,
                 registry,
                 limits(),
+                budget(),
             )
             .unwrap(),
         );
@@ -2094,6 +2837,7 @@ fn quic_server_bind_contains_missing_driver_failure() {
                     tls,
                     PeerRegistry::new(1).unwrap(),
                     limits(),
+                    budget(),
                 )
             })
         }));
@@ -2431,15 +3175,15 @@ async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_res
     };
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
     assert_eq!(pool.stats().dials, 1, "the first send dialed");
-    let started = std::time::Instant::now();
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
     assert_eq!(
         pool.stats().dials,
         1,
         "a send within the cooldown does not dial"
     );
-    assert!(
-        started.elapsed() < cooldown,
+    assert_eq!(
+        pool.stats().refused_unreachable,
+        1,
         "the send failed at once, not after a dial deadline"
     );
     tokio::time::sleep(cooldown).await;
@@ -2451,6 +3195,100 @@ async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_res
     );
     assert_eq!(pool.stats().connections_opened, 0);
     pool.close();
+}
+
+/// A liveness probe is never refused for a dial cooldown, and a peer that
+/// answers ends its cooldown. A send refused in the cooldown never reached
+/// the peer, so for the failure detector it is no probe at all: the detector
+/// read the instant `Lost` as a probe unanswered, and a node that came back
+/// from a pause, dialed in vain while it was gone, was suspected and
+/// declared dead again while it ran (the zone stage on macOS CI). The probe
+/// dials; its connection then carries replication at once.
+#[tokio::test]
+async fn a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    // An address nothing answers at yet: a UDP socket bound and dropped.
+    let address = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    // A cooldown longer than the test: only an answer can end it.
+    let pool = PeerConnectionPool::new(
+        connector(&pki, certificate.clone(), key),
+        PeerPoolLimits {
+            attempts: 1,
+            retry_backoff: Duration::ZERO,
+            timeout: Duration::from_secs(10),
+            unreachable_cooldown: Duration::from_secs(60),
+            ..PeerPoolLimits::default()
+        },
+    )
+    .unwrap();
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address,
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let mut packet = request(85);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(
+        pool.stats().dials,
+        1,
+        "the peer was dialed and did not answer"
+    );
+    // The peer comes back where it was.
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(|verified: VerifiedRequest| async move {
+        let answer = if matches!(verified.request().operation, Operation::Probe { .. }) {
+            Response::Probe(vec![1])
+        } else {
+            Response::PeerAccepted
+        };
+        verified.request().reply(answer)
+    });
+    let (server, task) = server_at(&pki, registry, handler, address).await;
+    // Replication within the cooldown is still spared its dial...
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(pool.stats().refused_unreachable, 1);
+    assert_eq!(pool.stats().dials, 1);
+    // ...but a probe dials, and is answered.
+    let mut probe = request(86);
+    probe.operation = Operation::Probe {
+        request: vec![1, 2, 3],
+    };
+    assert_eq!(pool.send_probe(2, &probe).await, Ok(vec![1]));
+    assert_eq!(
+        pool.stats().dials,
+        2,
+        "the probe dialed through the cooldown"
+    );
+    // The peer answered: replication goes at once on the probe's connection.
+    let mut after = request(87);
+    after.operation = packet.operation.clone();
+    pool.send(2, &after).await.unwrap();
+    assert_eq!(pool.stats().refused_unreachable, 1, "the cooldown ended");
+    assert_eq!(pool.stats().connections_opened, 1);
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
 }
 
 /// What an exchange with a peer is expected to take (27 §3.1 P1): measured
@@ -2553,9 +3391,7 @@ async fn an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take() {
         let sending = pool.clone();
         let packet = ask(730 + id);
         let pending = tokio::spawn(async move { sending.send_placement(2, &packet).await });
-        tokio::time::timeout(Duration::from_secs(10), started.notified())
-            .await
-            .unwrap();
+        unfrozen("the exchange never reached the peer", started.notified()).await;
         pending.abort();
         let _ = pending.await;
         expected *= 2;
@@ -2601,6 +3437,7 @@ mod admission {
                 registry,
                 limits(),
                 admission,
+                budget(),
             )
             .unwrap(),
         );
@@ -2614,6 +3451,7 @@ mod admission {
         AdmissionLimits {
             pending: 8,
             identities: 8,
+            connections: 16,
             per_node: 4,
             per_participant: 2,
         }
@@ -2646,17 +3484,23 @@ mod admission {
     #[test]
     fn pending_places_are_bounded_and_given_back() {
         assert_eq!(
-            Admission::new(AdmissionLimits {
-                pending: 0,
-                ..bounds()
-            })
+            Admission::new(
+                AdmissionLimits {
+                    pending: 0,
+                    ..bounds()
+                },
+                budget()
+            )
             .err(),
             Some(AdmissionRefusal::InvalidLimits)
         );
-        let admission = Admission::new(AdmissionLimits {
-            pending: 2,
-            ..bounds()
-        })
+        let admission = Admission::new(
+            AdmissionLimits {
+                pending: 2,
+                ..bounds()
+            },
+            budget(),
+        )
         .unwrap();
         let first = admission.begin().unwrap();
         let second = admission.begin().unwrap();
@@ -2674,11 +3518,139 @@ mod admission {
             AdmissionLimits {
                 pending: 32,
                 identities: 128,
+                connections: 128,
                 per_node: 4,
                 per_participant: 16,
             }
         );
         assert_eq!(AdmissionLimits::for_connections(1).pending, 1);
+    }
+
+    /// The audit's F20: the connections held in all are bounded after the
+    /// replacement rule. With the listener full, an identity at its own
+    /// bound still reaches its replacement; only a connection that would
+    /// be one more is refused, typed and counted.
+    #[tokio::test]
+    async fn a_full_listener_still_replaces_an_identity_s_own_connection() {
+        let pki = Pki::new();
+        let (first_certificate, first_key) = pki.issue(false);
+        let (second_certificate, second_key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&first_certificate, grant())
+            .unwrap();
+        let mut second = grant();
+        second.principal = ParticipantId::from_u128(2);
+        registry
+            .register_certificate(&second_certificate, second)
+            .unwrap();
+        // Three connections in all; a participant holds two.
+        let (server, task) = admitting(
+            &pki,
+            registry,
+            AdmissionLimits {
+                connections: 3,
+                ..bounds()
+            },
+        )
+        .await;
+        let address = server.local_addr().unwrap();
+        let first = connector(&pki, first_certificate, first_key);
+        let second = connector(&pki, second_certificate, second_key);
+        let first_a = first.connect(address, "localhost").await.unwrap();
+        let first_b = first.connect(address, "localhost").await.unwrap();
+        let second_a = second.connect(address, "localhost").await.unwrap();
+        assert!(
+            serves(&first_a, 1).await && serves(&first_b, 2).await && serves(&second_a, 3).await
+        );
+        assert_eq!(held(&server, 3).await.connections, 3);
+        // The second identity, under its own bound, would be one more:
+        // refused at its handshake, and the three it did not displace
+        // serve on.
+        assert!(second.connect(address, "localhost").await.is_err());
+        let stats = held(&server, 3).await;
+        assert_eq!(stats.refused_connections, 1);
+        assert!(serves(&first_a, 5).await && serves(&second_a, 6).await);
+        // The first identity, at its bound, replaces the connection it
+        // used least recently although the listener is full.
+        let first_c = first.connect(address, "localhost").await.unwrap();
+        assert!(serves(&first_c, 7).await);
+        let stats = held(&server, 3).await;
+        assert_eq!(stats.replaced, 1);
+        assert!(!serves(&first_b, 8).await, "the least used was replaced");
+        assert!(serves(&first_a, 9).await);
+        drop((first_a, first_b, first_c, second_a));
+        held(&server, 0).await;
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    /// The audit's F03: a body is permitted before it is allocated, within
+    /// its identity's share of the listener's budget. A header announcing
+    /// the largest frame holds a permit for it while nothing arrives; a
+    /// second such header from the same identity is refused for its share,
+    /// typed and counted, and the permit is given back with the stream.
+    #[tokio::test]
+    async fn a_body_is_permitted_before_it_is_allocated_within_the_identity_s_share() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let frame = limits().max_frame_bytes;
+        // A budget of one frame and a little: one body's permit fits it,
+        // and one identity's share of it is the frame.
+        let (tls_certificate, tls_key) = pki.issue(true);
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(vec![tls_certificate], tls_key),
+            vec![pki.ca.der().to_vec()],
+            &limits(),
+        )
+        .unwrap();
+        let budget = MemoryBudget::new(frame as usize + 64 * 1024, 0).unwrap();
+        let server = Arc::new(
+            QuicServer::bind_admitting(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry,
+                limits(),
+                bounds(),
+                budget.clone(),
+            )
+            .unwrap(),
+        );
+        let running = server.clone();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let task = tokio::spawn(async move { running.serve(handler).await });
+        let connection = raw_connection(&pki, certificate, key, server.local_addr().unwrap()).await;
+        let (mut first, _first_receive) = connection.open_bi().await.unwrap();
+        first.write_all(&request_header(frame)).await.unwrap();
+        let stats = admission_settles(&server, |stats| stats.bytes == frame as usize).await;
+        assert_eq!(stats.refused_bytes, 0);
+        // The permit is what the budget holds for the body, before a byte
+        // of it arrived.
+        assert!(
+            budget.stats().used >= frame as usize,
+            "{:?}",
+            budget.stats()
+        );
+        // A second body of a frame would take more than the identity's
+        // share: refused before any allocation, the stream reset.
+        let (mut second, mut second_receive) = connection.open_bi().await.unwrap();
+        second.write_all(&request_header(frame)).await.unwrap();
+        let stats = admission_settles(&server, |stats| stats.refused_bytes == 1).await;
+        assert_eq!(stats.bytes, frame as usize);
+        assert!(second_receive.read_to_end(64).await.is_err());
+        // The first stream ends without its body: its permit is given back.
+        drop(first);
+        let stats = admission_settles(&server, |stats| stats.bytes == 0).await;
+        assert_eq!(stats.refused_bytes, 1);
+        assert!(budget.stats().used < frame as usize);
+        drop(connection);
+        server.close();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2848,4 +3820,2061 @@ fn every_operation_has_its_class_and_control_goes_first() {
     assert_eq!(raft.class(), TrafficClass::Control);
     assert_eq!(Operation::Summary.class(), TrafficClass::Exchange);
     assert_eq!(download_request(1).operation.class(), TrafficClass::Bulk);
+}
+
+/// The audit's F60: twenty-four cold calls to one route dial once and share
+/// the connection — none is replaced under a dispatched call; a failure
+/// reported for a generation no longer cached forgets nothing; a caller that
+/// gives up under its own deadline does not abandon the dial.
+#[tokio::test]
+async fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler: Arc<dyn RequestHandler> = {
+        let calls = calls.clone();
+        Arc::new(move |verified: VerifiedRequest| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Long enough for the cold calls to overlap on the wire.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                response(verified.request())
+            }
+        })
+    };
+    let (server, task) = server(&pki, registry, handler).await;
+    let connector = connector(&pki, certificate, key);
+    let address = server.local_addr().unwrap().to_string();
+    let routes = Arc::new(RouteConnections::new(connector, 1).unwrap());
+    let mut waves = tokio::task::JoinSet::new();
+    for id in 1..=24u128 {
+        let routes = routes.clone();
+        let address = address.clone();
+        waves.spawn(async move {
+            let connected = routes.connect(&address, "localhost").await?;
+            connected
+                .remote
+                .request(&request(id))
+                .await
+                .map(|reply| (id, reply))
+        });
+    }
+    let mut answered = 0;
+    while let Some(joined) = waves.join_next().await {
+        let (id, reply) = joined.unwrap().unwrap();
+        assert_eq!(reply, response(&request(id)));
+        answered += 1;
+    }
+    assert_eq!(answered, 24);
+    assert_eq!(calls.load(Ordering::SeqCst), 24);
+    assert_eq!(routes.dials(), 1, "one dial for every cold call");
+    let stats = server.admission();
+    assert_eq!((stats.admitted, stats.replaced), (1, 0), "{stats:?}");
+    // A failure reported for a generation no longer cached forgets nothing;
+    // one for the cached generation lets the route be dialed again.
+    let current = routes.connect(&address, "localhost").await.unwrap();
+    routes.forget(&address, "localhost", current.generation.wrapping_add(1));
+    assert_eq!(
+        routes
+            .connect(&address, "localhost")
+            .await
+            .unwrap()
+            .generation,
+        current.generation
+    );
+    assert_eq!(routes.dials(), 1);
+    routes.forget(&address, "localhost", current.generation);
+    let fresh = routes.connect(&address, "localhost").await.unwrap();
+    assert_ne!(fresh.generation, current.generation);
+    assert_eq!(routes.dials(), 2);
+    // A caller that gives up under its own deadline does not abandon the
+    // dial: the next caller finds it, and no third dial is started.
+    routes.forget(&address, "localhost", fresh.generation);
+    let gave_up = tokio::time::timeout(
+        Duration::from_micros(10),
+        routes.connect(&address, "localhost"),
+    )
+    .await;
+    let next = routes.connect(&address, "localhost").await.unwrap();
+    assert_eq!(routes.dials(), 3, "gave up: {}", gave_up.is_ok());
+    assert!(next.generation > fresh.generation);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// The audit's F64: a peer pause is spread over its second half — never
+/// shorter than half the configured pause, never longer than the whole.
+#[test]
+fn a_peer_pause_is_spread_over_its_second_half() {
+    let pause = Duration::from_millis(600);
+    assert_eq!(crate::peers::spread(pause, 0), Duration::from_millis(300));
+    let whole = crate::peers::spread(pause, u64::MAX);
+    assert!(
+        whole <= pause && whole >= pause - Duration::from_nanos(1),
+        "{whole:?}"
+    );
+    let middle = crate::peers::spread(pause, u64::MAX / 2);
+    assert!(
+        middle >= Duration::from_millis(450) - Duration::from_nanos(1)
+            && middle <= Duration::from_millis(450),
+        "{middle:?}"
+    );
+    assert_eq!(
+        crate::peers::spread(Duration::ZERO, u64::MAX),
+        Duration::ZERO
+    );
+}
+
+/// A certificate of `key` valid from the given day: what the registry
+/// compares is the key and the start of validity (the listener verifies
+/// the chain).
+fn certificate_valid_from(key: &KeyPair, day: u8) -> Vec<u8> {
+    let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    params.not_before = rcgen::date_time_ymd(2026, 1, day);
+    params.self_signed(key).unwrap().der().to_vec()
+}
+
+#[test]
+fn a_renewal_of_an_enrolled_key_is_admitted_until_the_projection_names_or_drops_it() {
+    let key = KeyPair::generate().unwrap();
+    let known = certificate_valid_from(&key, 10);
+    let renewal = certificate_valid_from(&key, 20);
+    let older = certificate_valid_from(&key, 5);
+    let foreign = certificate_valid_from(&KeyPair::generate().unwrap(), 20);
+    let (enrolled, not_before) = certificate_key(&known).unwrap();
+    assert_eq!(certificate_key(&renewal).unwrap().0, enrolled);
+    assert!(certificate_key(&renewal).unwrap().1 > not_before);
+    assert_ne!(certificate_key(&foreign).unwrap().0, enrolled);
+    assert!(matches!(
+        certificate_key(b"not a certificate"),
+        Err(AccessError::Unauthorized)
+    ));
+    let grant = PeerGrant {
+        principal: ParticipantId::from_u128(7),
+        tenants: BTreeSet::from([TenantId::from_u128(1)]),
+        role: PeerRole::Node { node_id: 3 },
+    };
+    let keys = |not_before: i64| {
+        std::collections::BTreeMap::from([(
+            enrolled,
+            EnrolledKey {
+                grant: grant.clone(),
+                not_before,
+            },
+        )])
+    };
+    let named = |certificate: &[u8]| {
+        std::collections::BTreeMap::from([(certificate_fingerprint(certificate), grant.clone())])
+    };
+    let registry = PeerRegistry::new(8).unwrap();
+    registry
+        .replace_projection(named(&known), keys(not_before))
+        .unwrap();
+    // The certificate the projection names is granted as it always was.
+    let peer = registry.authenticate_certificate(&known).unwrap();
+    assert!(peer.renewal_of().is_none());
+    // A later certificate of the same key is a renewal this node has not
+    // applied yet: admitted under the key's grant, and known as such at
+    // dispatch.
+    let peer = registry.authenticate_certificate(&renewal).unwrap();
+    assert_eq!(peer.renewal_of(), Some(enrolled));
+    assert_eq!(
+        peer.certificate_fingerprint(),
+        Some(certificate_fingerprint(&renewal))
+    );
+    assert_eq!(peer.role(), PeerRole::Node { node_id: 3 });
+    assert_eq!(
+        registry
+            .authenticate(certificate_fingerprint(&renewal))
+            .unwrap()
+            .renewal_of(),
+        Some(enrolled)
+    );
+    registry.granted(certificate_fingerprint(&renewal)).unwrap();
+    // A certificate of the key from before the one named, and one of a key
+    // no enrollment holds, are refused.
+    for refused in [&older, &foreign] {
+        assert!(matches!(
+            registry.authenticate_certificate(refused),
+            Err(AccessError::Unauthorized)
+        ));
+    }
+    // The projection catches up and names the renewal: it is an ordinary
+    // grant, and the certificate it replaced — no longer named, and not
+    // later than the one that is — is refused.
+    let (_, renewed_from) = certificate_key(&renewal).unwrap();
+    registry
+        .replace_projection(named(&renewal), keys(renewed_from))
+        .unwrap();
+    assert!(
+        registry
+            .authenticate_certificate(&renewal)
+            .unwrap()
+            .renewal_of()
+            .is_none()
+    );
+    assert!(matches!(
+        registry.authenticate_certificate(&known),
+        Err(AccessError::Unauthorized)
+    ));
+    // A renewal admitted while the projection still enrolls its key keeps
+    // the grant across a replacement; one whose key the projection drops
+    // (the enrollment revoked) loses it.
+    let next = certificate_valid_from(&key, 25);
+    registry.authenticate_certificate(&next).unwrap();
+    registry
+        .replace_projection(named(&renewal), keys(renewed_from))
+        .unwrap();
+    assert_eq!(
+        registry
+            .authenticate(certificate_fingerprint(&next))
+            .unwrap()
+            .renewal_of(),
+        Some(enrolled)
+    );
+    registry
+        .replace_projection(named(&renewal), std::collections::BTreeMap::new())
+        .unwrap();
+    assert!(matches!(
+        registry.authenticate(certificate_fingerprint(&next)),
+        Err(AccessError::Unauthorized)
+    ));
+    assert!(matches!(
+        registry.authenticate_certificate(&next),
+        Err(AccessError::Unauthorized)
+    ));
+    // A projection without keys admits only what it names.
+    registry.replace_grants(named(&known)).unwrap();
+    assert!(registry.authenticate_certificate(&known).is_ok());
+    assert!(matches!(
+        registry.authenticate_certificate(&renewal),
+        Err(AccessError::Unauthorized)
+    ));
+}
+
+/// What became of an exchange whose stream its peer never read, while
+/// other exchanges went on over the same connection.
+struct Unread {
+    stalled: Result<ResponseEnvelope, WireError>,
+    after: Duration,
+    /// The longest round trip the connection measured meanwhile.
+    longest: Duration,
+    /// The other exchanges answered while it waited.
+    answered: u64,
+}
+const UNREAD_PERIOD: Duration = Duration::from_millis(500);
+const UNREAD_OTHER: usize = 4 * 1024;
+const UNREAD_EVERY: Duration = Duration::from_millis(100);
+/// Ask a peer that answers what is small and never reads what is not, over
+/// `shape` or directly, for `stalled`, while four kilobytes are sent to it
+/// ten times a second; then once more for something small.
+async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let wire = WireLimits {
+        request_timeout: UNREAD_PERIOD,
+        max_frame_bytes: 4 * 1024 * 1024,
+        max_cost: 16 * 1024 * 1024,
+        ..Default::default()
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let (server_certificate, server_key) = pki.issue(true);
+    let config = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut address = endpoint.local_addr().unwrap();
+    let limits = wire.clone();
+    let peer = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await.unwrap();
+        write_frame(
+            &mut send,
+            FrameKind::HelloReply,
+            &HelloReply::Accepted(limits.negotiate(&hello).unwrap()),
+            4096,
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+        let mut unread = Vec::new();
+        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let header = read_frame_header(&mut recv, FrameKind::Request, limits.max_frame_bytes)
+                .await
+                .unwrap();
+            if header.payload_bytes() > 1024 * 1024 {
+                unread.push((send, recv));
+                continue;
+            }
+            tokio::spawn(async move {
+                let alone = crate::frame::AloneDelivery::default();
+                let asked: RequestEnvelope = read_payload_arriving(
+                    &mut recv,
+                    header,
+                    UNREAD_PERIOD,
+                    || Duration::from_millis(1),
+                    &alone,
+                    0,
+                )
+                .await
+                .unwrap();
+                write_frame(
+                    &mut send,
+                    FrameKind::Response,
+                    &asked.reply(Response::PeerAccepted),
+                    4096,
+                )
+                .await
+                .unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+            });
+        }
+    });
+    let mut relays = Vec::new();
+    if let Some(shape) = shape {
+        (address, relays) = shaped(address, shape).await;
+    }
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let remote = connector.connect(address, "localhost").await.unwrap();
+    fn other(id: u128) -> RequestEnvelope {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7; UNREAD_OTHER],
+        };
+        packet
+    }
+    let answered = Arc::new(AtomicU64::new(0));
+    let others = {
+        let (remote, answered) = (remote.clone(), answered.clone());
+        tokio::spawn(async move {
+            for id in 1_000.. {
+                remote
+                    .request_within(&other(id), UNREAD_PERIOD)
+                    .await
+                    .unwrap();
+                answered.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(UNREAD_EVERY).await;
+            }
+        })
+    };
+    let began = std::time::Instant::now();
+    let stalled = remote.request_within(&stalled, UNREAD_PERIOD).await;
+    let after = began.elapsed();
+    // The round trip the exchange was judged by: the longest any carriage
+    // on the connection saw while it waited (a sampler of the test's own
+    // misses what the carriage's own waits see — a Windows runner showed
+    // 5.85 s against a bound of 5.77 s from a sampled 2.0 ms, 2026-10-02).
+    let longest = remote.longest_round_trip();
+    let during = answered.load(Ordering::Relaxed);
+    // The others are answered after it as before, on the same connection.
+    remote
+        .request_within(&other(2), UNREAD_PERIOD)
+        .await
+        .unwrap();
+    assert!(!remote.closed());
+    assert!(!others.is_finished());
+    others.abort();
+    assert!(others.await.unwrap_err().is_cancelled());
+    remote.close();
+    let _ = peer.await;
+    for relay in relays {
+        relay.abort();
+    }
+    Unread {
+        stalled,
+        after,
+        longest,
+        answered: during,
+    }
+}
+
+/// A stream its peer does not read ends by what its own bytes are given,
+/// whatever else the connection carries meanwhile (the audit's F38).
+/// Charged with what the connection sent, it was kept for as long as the
+/// other exchanges moved a datagram a period, until they had sent as much
+/// as it had to: two megabytes at twenty kilobytes a period here, fifty
+/// periods on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries() {
+    const STALLED: usize = 2 * 1024 * 1024;
+    let mut packet = request(1);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![7; STALLED],
+    };
+    let unread = unread(None, packet).await;
+    assert!(
+        matches!(unread.stalled, Err(WireError::Timeout)),
+        "{:?}",
+        unread.stalled
+    );
+    assert!(unread.after >= UNREAD_PERIOD, "{:?}", unread.after);
+    // It ends by its own bytes' residency at the longest round trip the
+    // path showed, what was held to send beside it being no more than the
+    // others' one message at a time, a period more for the wait that finds
+    // the time spent — a bound in the path's terms, as the lossy variant
+    // states it (a Windows runner's loopback showed a round trip that
+    // took the stalled exchange 8.6 s where a fixed eighth of the old wait
+    // allowed 6.4 s, 2026-10-02).
+    let given = crate::frame::residency(STALLED + 2 * UNREAD_OTHER, unread.longest)
+        .max(UNREAD_PERIOD)
+        + UNREAD_PERIOD;
+    assert!(
+        unread.after <= given,
+        "{:?} of {given:?} at {:?}",
+        unread.after,
+        unread.longest
+    );
+    // And less than the others would have kept it under the old wait: what
+    // they send in a period, and the periods it would have taken them to
+    // send what the stalled exchange had to. On a loopback the law's bound
+    // is the acknowledgement delay's — a probe timeout is three round
+    // trips and the 25 ms a peer may hold an acknowledgement (RFC 9002
+    // §6.2.1), two datagrams of the least size each — 27 s here for two
+    // megabytes on a Windows runner's 1.75 ms loopback, where the old wait
+    // was 51 s and the claim of under half of it held only while the
+    // probe timeout counted the round trips alone (Windows CI, 2026-10-03).
+    let moved = UNREAD_OTHER as u32 * (UNREAD_PERIOD.as_millis() / UNREAD_EVERY.as_millis()) as u32;
+    let kept = UNREAD_PERIOD * (STALLED as u32 / moved);
+    assert!(kept >= UNREAD_PERIOD * 100);
+    assert!(
+        given < kept,
+        "{given:?} of {kept:?} at {:?}",
+        unread.longest
+    );
+    println!(
+        "a stalled stream of {STALLED} bytes ended after {:?}, given {given:?} at a longest round trip of {:?}; the old wait kept it {kept:?}",
+        unread.after, unread.longest
+    );
+    assert!(unread.answered >= 1, "{}", unread.answered);
+}
+
+/// The same over a path that loses a datagram in a hundred and delivers
+/// out of order, the stalled exchange content and the others a group's
+/// messages, which go before it: it ends when what the path is given to
+/// carry its bytes is spent — the least a live path delivers, at the longest
+/// round trip this one showed — and the others are answered throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_its_peer_does_not_read_ends_on_a_path_that_loses_and_reorders() {
+    // More than the megabyte a stream is let send ahead of its reader.
+    const STALLED: usize = 1024 * 1024 + 256 * 1024;
+    let mut packet = request(1);
+    packet.operation = Operation::Custody(CustodyRequest::Chunk {
+        transfer: [1; 16],
+        index: 3,
+        bytes: vec![7; STALLED],
+    });
+    let shape = Shape {
+        delay: Duration::from_millis(1),
+        jitter: Duration::from_millis(1),
+        loss_ppm: 10_000,
+        ..Shape::even(100_000_000)
+    };
+    let unread = unread(Some(shape), packet).await;
+    assert!(
+        matches!(unread.stalled, Err(WireError::Timeout)),
+        "{:?}",
+        unread.stalled
+    );
+    assert!(unread.after >= UNREAD_PERIOD, "{:?}", unread.after);
+    // What was held to send beside it is no more than the others' one
+    // message at a time; a period more for the wait that finds the time
+    // spent.
+    let given = crate::frame::residency(STALLED + 2 * UNREAD_OTHER, unread.longest)
+        .max(UNREAD_PERIOD)
+        + UNREAD_PERIOD;
+    assert!(
+        unread.after <= given,
+        "{:?} of {given:?} at {:?}",
+        unread.after,
+        unread.longest
+    );
+    assert!(unread.answered >= 1, "{}", unread.answered);
+}
+
+/// The time a peer is given to answer begins when it has what was asked:
+/// when the request's stream is acknowledged whole (the audit's F38).
+/// Thirty-two kilobytes over a path that carries eight in a second take
+/// four seconds, and the peer answers four tenths of a second after it has
+/// them, inside its half-second. Counted from when the connection had
+/// *sent* as much as the request, the half-second began while the last
+/// window of it, more than a second of this path, was still on its way,
+/// and ended before the peer had the request at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peers_time_to_answer_begins_when_it_has_what_was_asked() {
+    const BITS: u64 = 64_000;
+    const SIZE: usize = 32 * 1024;
+    const PERIOD: Duration = Duration::from_millis(500);
+    let wire = WireLimits {
+        max_frame_bytes: 2 * 1024 * 1024,
+        max_cost: 8 * 1024 * 1024,
+        ..Default::default()
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        tokio::time::sleep(PERIOD * 4 / 5).await;
+        verified.request().reply(Response::PeerAccepted)
+    });
+    let (server_certificate, server_key) = pki.issue(true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            wire.clone(),
+            budget(),
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let serving = tokio::spawn(async move { running.serve(handler).await });
+    let (path, relays) = shaped(
+        server.local_addr().unwrap(),
+        Shape {
+            delay: Duration::from_millis(10),
+            ..Shape::even(BITS)
+        },
+    )
+    .await;
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let remote = connector.connect(path, "localhost").await.unwrap();
+    let mut packet = request(1);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![7; SIZE],
+    };
+    let began = std::time::Instant::now();
+    let answered = remote.request_within(&packet, PERIOD).await;
+    let took = began.elapsed();
+    assert!(
+        matches!(&answered, Ok(answer) if answer.result == Response::PeerAccepted),
+        "{answered:?} in {took:?}"
+    );
+    // No sooner than the path carries it, which is many of its periods.
+    let least = Duration::from_millis(SIZE as u64 * 8 * 1_000 / BITS);
+    assert!(least >= PERIOD * 8);
+    assert!(took >= least, "{took:?}");
+    server.close();
+    for relay in relays {
+        relay.abort();
+    }
+    let _ = serving.await;
+}
+
+/// A pool, as a node's limits are but for `pool`, and a peer that accepts
+/// what it is sent, with a path shaped as `shape` between them.
+struct SlowRig {
+    pool: PeerConnectionPool,
+    server: Arc<QuicServer>,
+    serving: tokio::task::JoinHandle<Result<(), WireError>>,
+    relays: Vec<tokio::task::JoinHandle<()>>,
+}
+impl SlowRig {
+    async fn new(shape: Shape, pool: PeerPoolLimits) -> Self {
+        use std::collections::BTreeMap;
+        let wire = WireLimits {
+            max_frame_bytes: 10 * 1024 * 1024,
+            max_cost: 40 * 1024 * 1024,
+            ..WireLimits::for_consensus(128)
+        };
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(move |verified: VerifiedRequest| async move {
+                verified.request().reply(Response::PeerAccepted)
+            });
+        let (server_certificate, server_key) = pki.issue(true);
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+            vec![pki.ca.der().to_vec()],
+            &wire,
+        )
+        .unwrap();
+        let server = Arc::new(
+            QuicServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry,
+                wire.clone(),
+                budget(),
+            )
+            .unwrap(),
+        );
+        let running = server.clone();
+        let serving = tokio::spawn(async move { running.serve(handler).await });
+        let (path, relays) = shaped(server.local_addr().unwrap(), shape).await;
+        let tls = client_tls(
+            TlsIdentity::from_pkcs8(vec![certificate], key),
+            vec![pki.ca.der().to_vec()],
+            &wire,
+        )
+        .unwrap();
+        let pool = PeerConnectionPool::new(
+            QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap(),
+            pool,
+        )
+        .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: path,
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        Self {
+            pool,
+            server,
+            serving,
+            relays,
+        }
+    }
+    fn message(id: u128, size: usize) -> RequestEnvelope {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7; size],
+        };
+        packet
+    }
+    async fn close(self) {
+        self.pool.close();
+        self.server.close();
+        for relay in self.relays {
+            relay.abort();
+        }
+        let _ = self.serving.await;
+    }
+}
+
+/// A group's message is carried for as long as its path takes (the audit's
+/// F36): sixty-four kilobytes over a path that carries thirty-two in a
+/// second, by a pool whose every wait is one second. An exchange was given
+/// that one time whatever it carried, so a path that carried less than the
+/// message in it carried none of the message, at the first attempt or at
+/// any later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_groups_message_is_carried_for_as_long_as_its_path_takes() {
+    const BITS: u64 = 256_000;
+    const SIZE: usize = 64 * 1024;
+    let limits = PeerPoolLimits {
+        timeout: Duration::from_secs(1),
+        ..PeerPoolLimits::for_consensus(128)
+    };
+    let least = Duration::from_millis(SIZE as u64 * 8 * 1_000 / BITS);
+    assert!(least >= limits.timeout * 2);
+    let rig = SlowRig::new(
+        Shape {
+            delay: Duration::from_millis(10),
+            ..Shape::even(BITS)
+        },
+        limits.clone(),
+    )
+    .await;
+    let began = std::time::Instant::now();
+    assert_eq!(rig.pool.send(2, &SlowRig::message(1, SIZE)).await, Ok(()));
+    let took = began.elapsed();
+    assert!(took >= least, "{took:?}");
+    let stats = rig.pool.stats();
+    assert_eq!((stats.dials, stats.connections_opened), (1, 1));
+    rig.close().await;
+}
+
+/// A dial is given what a handshake is given and not what one exchange is
+/// (the audit's F36): over a path that takes longer to connect than the
+/// pool's callers wait, the callers are told the peer was not reached, the
+/// dial goes on, and the next caller has its connection. The dial was
+/// given the callers' time, failed with them, and was begun again from
+/// nothing by the next: such a path was never connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_is_given_a_handshakes_time_and_outlives_the_callers_that_asked_for_it() {
+    let limits = PeerPoolLimits {
+        timeout: Duration::from_millis(500),
+        retry_backoff: Duration::from_millis(10),
+        ..PeerPoolLimits::for_consensus(128)
+    };
+    // Sixteen kilobits a second: the two handshakes are some seven
+    // kilobytes, three seconds and more.
+    let rig = SlowRig::new(
+        Shape {
+            delay: Duration::from_millis(10),
+            ..Shape::even(16_000)
+        },
+        limits.clone(),
+    )
+    .await;
+    let began = std::time::Instant::now();
+    let mut lost = 0_u32;
+    // Charged to the dial: one more try for every caller's time it takes,
+    // and as many as a handshake is given at most.
+    let tries =
+        (WireLimits::default().request_timeout.as_millis() * 2 / limits.timeout.as_millis()) as u32;
+    loop {
+        match rig.pool.send(2, &SlowRig::message(1, 64)).await {
+            Ok(()) => break,
+            Err(PeerSendError::Lost) => lost += 1,
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(lost < tries, "{lost} tries in {:?}", began.elapsed());
+    }
+    assert!(lost >= 1, "connected within a caller's time");
+    assert!(began.elapsed() >= limits.timeout * 2);
+    let stats = rig.pool.stats();
+    assert_eq!((stats.dials, stats.connections_opened), (1, 1));
+    rig.close().await;
+}
+
+/// What the pool does with a group's message of `size` over a path shaped
+/// as `shape`, as a node's limits are: the outcome of sending it, and of
+/// sending it again, each given `cap` at most, and what the pool counted.
+type SlowCase = (
+    Result<Result<(), PeerSendError>, tokio::time::error::Elapsed>,
+    Duration,
+    Result<Result<(), PeerSendError>, tokio::time::error::Elapsed>,
+    Duration,
+    PeerPoolStats,
+);
+async fn slow_case(shape: Shape, size: usize, cap: Duration) -> SlowCase {
+    let rig = SlowRig::new(shape, PeerPoolLimits::for_consensus(128)).await;
+    let packet = SlowRig::message(u128::from(shape.up_bits) * 1_000_000 + size as u128, size);
+    let began = std::time::Instant::now();
+    let first = tokio::time::timeout(cap, rig.pool.send(2, &packet)).await;
+    let took = began.elapsed();
+    // A second message, on the connection the first opened, if it did.
+    let again = std::time::Instant::now();
+    let second = tokio::time::timeout(cap, rig.pool.send(2, &packet)).await;
+    let then = again.elapsed();
+    let stats = rig.pool.stats();
+    rig.close().await;
+    (first, took, second, then, stats)
+}
+fn slow_row(label: &str, case: &SlowCase) {
+    let say =
+        |outcome: &Result<Result<(), PeerSendError>, tokio::time::error::Elapsed>| match outcome {
+            Ok(Ok(())) => "delivered".to_string(),
+            Ok(Err(error)) => format!("{error:?}"),
+            Err(_) => "capped".to_string(),
+        };
+    let (first, took, second, then, stats) = case;
+    println!(
+        "{label:<44} {:<12} {:>6.1}s  {:<12} {:>6.1}s  {:>5} {:>6}",
+        say(first),
+        took.as_secs_f64(),
+        say(second),
+        then.as_secs_f64(),
+        stats.dials,
+        stats.connections_opened
+    );
+}
+fn slow_cap() -> Duration {
+    Duration::from_secs(
+        std::env::var("FOCAL_SLOW_PATH_CAP")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120),
+    )
+}
+const SLOW_HEAD: &str = "path, bytes                                  first            in  second           in  dials opened";
+
+/// What the pool does with a group's message of each size over paths of
+/// each rate: a measurement, printed, which asserts nothing.
+/// `FOCAL_SLOW_PATH_CAP` is the seconds a send is given (default 120).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn slow_paths_measured() {
+    let cap = slow_cap();
+    let mut cases = Vec::new();
+    for bits in [100_u64, 1_000, 8_000, 64_000, 256_000] {
+        for size in [64_usize, 4 * 1024, 64 * 1024, 1024 * 1024] {
+            let shape = Shape {
+                delay: Duration::from_millis(25),
+                ..Shape::even(bits)
+            };
+            cases.push((
+                format!("{bits} bit/s, {size}"),
+                tokio::spawn(slow_case(shape, size, cap)),
+            ));
+        }
+    }
+    println!("{SLOW_HEAD}");
+    for (label, case) in cases {
+        slow_row(&label, &case.await.unwrap());
+    }
+}
+
+/// The same over paths that lose, delay unevenly, carry less one way, and
+/// stop for a while: a measurement, printed, which asserts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn adverse_paths_measured() {
+    let cap = slow_cap();
+    let base = |bits: u64| Shape {
+        delay: Duration::from_millis(25),
+        ..Shape::even(bits)
+    };
+    let seconds = Duration::from_secs;
+    let mut shapes: Vec<(String, Shape)> = Vec::new();
+    for bits in [64_000_u64, 256_000] {
+        shapes.push((
+            format!("{bits} bit/s, loss 2%"),
+            Shape {
+                loss_ppm: 20_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, loss 10%"),
+            Shape {
+                loss_ppm: 100_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, jitter 50 ms"),
+            Shape {
+                jitter: Duration::from_millis(50),
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s up, 8000 down"),
+            Shape {
+                down_bits: 8_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("8000 bit/s up, {bits} down"),
+            Shape {
+                up_bits: 8_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, out 3 s at 4 s"),
+            Shape {
+                outage: Some((seconds(4), seconds(3))),
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, out 8 s at 4 s"),
+            Shape {
+                outage: Some((seconds(4), seconds(8))),
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, out 15 s at 4 s"),
+            Shape {
+                outage: Some((seconds(4), seconds(15))),
+                ..base(bits)
+            },
+        ));
+    }
+    let mut cases = Vec::new();
+    for (label, shape) in shapes {
+        for size in [4 * 1024_usize, 64 * 1024, 256 * 1024] {
+            cases.push((
+                format!("{label}, {size}"),
+                tokio::spawn(slow_case(shape, size, cap)),
+            ));
+        }
+    }
+    println!("{SLOW_HEAD}");
+    for (label, case) in cases {
+        slow_row(&label, &case.await.unwrap());
+    }
+}
+
+/// One exchange with a peer over a path shaped as `shape`, each part of it
+/// given `period`: `size` bytes sent to the peer, or asked of it (`down`).
+async fn direct_case(
+    shape: Shape,
+    size: usize,
+    down: bool,
+    period: Duration,
+) -> (Result<(), WireError>, Duration) {
+    let wire = WireLimits {
+        max_frame_bytes: 10 * 1024 * 1024,
+        max_cost: 40 * 1024 * 1024,
+        ..WireLimits::for_consensus(128)
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        let reply = match &verified.request().operation {
+            Operation::Custody(CustodyRequest::ReadChunk {
+                index, max_bytes, ..
+            }) => Response::Custody(CustodyReply::Chunk {
+                index: *index,
+                bytes: vec![7; *max_bytes as usize],
+            }),
+            _ => Response::PeerAccepted,
+        };
+        verified.request().reply(reply)
+    });
+    let (server_certificate, server_key) = pki.issue(true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            wire.clone(),
+            budget(),
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let serving = tokio::spawn(async move { running.serve(handler).await });
+    let (path, relays) = shaped(server.local_addr().unwrap(), shape).await;
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let outcome = match connector.connect(path, "localhost").await {
+        Err(error) => (Err(error), Duration::ZERO),
+        Ok(remote) => {
+            let mut packet = request(9);
+            packet.operation = if down {
+                Operation::Custody(CustodyRequest::ReadChunk {
+                    transfer: [1; 16],
+                    index: 4,
+                    max_bytes: size as u32,
+                })
+            } else {
+                Operation::Raft {
+                    group: [2; 16],
+                    message: vec![7; size],
+                }
+            };
+            let sent = std::time::Instant::now();
+            let outcome = remote.request_within(&packet, period).await;
+            (outcome.map(|_| ()), sent.elapsed())
+        }
+    };
+    server.close();
+    for relay in relays {
+        relay.abort();
+    }
+    let _ = serving.await;
+    outcome
+}
+
+/// Exchanges each way over the narrowest paths that connect, with and
+/// without loss, each part given five seconds: a measurement, printed,
+/// which asserts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn narrow_lossy_paths_measured() {
+    let mut cases = Vec::new();
+    for bits in [4_000_u64, 8_000, 16_000] {
+        for loss_ppm in [0_u32, 20_000, 100_000] {
+            for size in [16 * 1024_usize, 64 * 1024] {
+                for down in [false, true] {
+                    let shape = Shape {
+                        delay: Duration::from_millis(25),
+                        loss_ppm,
+                        ..Shape::even(bits)
+                    };
+                    cases.push((
+                        format!(
+                            "{bits} bit/s, loss {}%, {size} {}",
+                            loss_ppm / 10_000,
+                            if down { "asked" } else { "sent" }
+                        ),
+                        (size as u64 * 8).div_ceil(bits),
+                        tokio::spawn(direct_case(shape, size, down, Duration::from_secs(5))),
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "path, bytes                              outcome              in   at the path's rate"
+    );
+    for (label, least, case) in cases {
+        let (outcome, took) = case.await.unwrap();
+        println!(
+            "{label:<40} {:<14} {:>7.1}s   {least:>5}s",
+            match outcome {
+                Ok(()) => "answered".to_string(),
+                Err(error) => format!("{error:?}"),
+            },
+            took.as_secs_f64()
+        );
+    }
+}
+
+/// One exchange over one shaped path, told as it goes: a diagnostic.
+/// `FOCAL_SLOW_PATH_BITS`, `_BYTES`, `_PERIOD_MS`, `_LOSS_PPM`, and `_DOWN`
+/// for bytes asked of the peer instead of sent to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a diagnostic; run by name"]
+async fn slow_path_one() {
+    let read = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let bits = read("FOCAL_SLOW_PATH_BITS", 8_000);
+    let size = read("FOCAL_SLOW_PATH_BYTES", 65_536) as usize;
+    let period = Duration::from_millis(read("FOCAL_SLOW_PATH_PERIOD_MS", 5_000));
+    let shape = Shape {
+        delay: Duration::from_millis(25),
+        loss_ppm: read("FOCAL_SLOW_PATH_LOSS_PPM", 0) as u32,
+        ..Shape::even(bits)
+    };
+    let down = read("FOCAL_SLOW_PATH_DOWN", 0) == 1;
+    let began = std::time::Instant::now();
+    let (outcome, took) = direct_case(shape, size, down, period).await;
+    println!(
+        "{bits} bit/s, {size} bytes {}, period {period:?}: {outcome:?} in {took:?} ({:?} in all)",
+        if down { "asked" } else { "sent" },
+        began.elapsed()
+    );
+}
+
+/// How a paced peer answers one request: the reply's bytes, written whole
+/// in pieces behind the replies before it, or its header alone.
+#[derive(Clone, Copy)]
+enum PacedReply {
+    Whole(u32),
+    Withheld(u32),
+}
+const PACED_PIECE: usize = 64 * 1024;
+const PACED_EVERY: Duration = Duration::from_millis(50);
+/// A peer that reads every request and answers each download as `policy`
+/// says: every reply's header leaves as soon as its request is read, and
+/// the bodies leave one after another in the order the requests came, a
+/// piece every `PACED_EVERY` — a peer whose owner writes as it has, behind
+/// the replies before it. A withheld reply's header leaves and its body
+/// never does; the stream stays open.
+async fn paced_peer(
+    wire: WireLimits,
+    policy: impl Fn(u128) -> PacedReply + Send + Sync + 'static,
+) -> (QuicRemote, tokio::task::JoinHandle<()>) {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let (server_certificate, server_key) = pki.issue(true);
+    let config = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let limits = wire.clone();
+    let peer = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await.unwrap();
+        write_frame(
+            &mut send,
+            FrameKind::HelloReply,
+            &HelloReply::Accepted(limits.negotiate(&hello).unwrap()),
+            4096,
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+        // Bodies in the order their requests came, one at a time.
+        let (queue, mut bodies) =
+            tokio::sync::mpsc::unbounded_channel::<(quinn::SendStream, Vec<u8>)>();
+        let writer = tokio::spawn(async move {
+            while let Some((mut send, body)) = bodies.recv().await {
+                for piece in body.chunks(PACED_PIECE) {
+                    if send.write_all(piece).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(PACED_EVERY).await;
+                }
+                let _ = send.finish();
+                let _ = send.stopped().await;
+            }
+        });
+        let mut withheld = Vec::new();
+        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let header = read_frame_header(&mut recv, FrameKind::Request, limits.max_frame_bytes)
+                .await
+                .unwrap();
+            let alone = crate::frame::AloneDelivery::default();
+            let asked: RequestEnvelope = read_payload_arriving(
+                &mut recv,
+                header,
+                limits.request_timeout,
+                || Duration::from_millis(1),
+                &alone,
+                0,
+            )
+            .await
+            .unwrap();
+            let id = u128::from_be_bytes(asked.request_id.0);
+            let (bytes, whole) = match policy(id) {
+                PacedReply::Whole(bytes) => (bytes, true),
+                PacedReply::Withheld(bytes) => (bytes, false),
+            };
+            let reply = asked.reply(Response::Content(ContentChunk {
+                offset: 0,
+                eof: true,
+                bytes: vec![7; bytes as usize],
+            }));
+            let body = encode_payload(&reply, limits.max_frame_bytes).unwrap();
+            let mut frame = [0u8; HEADER_BYTES];
+            frame[..8].copy_from_slice(b"FOCALQ01");
+            frame[8..10].copy_from_slice(&1u16.to_be_bytes());
+            frame[10..12].copy_from_slice(&(FrameKind::Response as u16).to_be_bytes());
+            frame[12..16].copy_from_slice(&(body.len() as u32).to_be_bytes());
+            send.write_all(&frame).await.unwrap();
+            if whole {
+                queue.send((send, body)).unwrap();
+            } else {
+                withheld.push(send);
+            }
+        }
+        drop(queue);
+        let _ = writer.await;
+        drop(withheld);
+    });
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let remote = connector.connect(address, "localhost").await.unwrap();
+    (remote, peer)
+}
+fn paced_download(id: u128, bytes: u32) -> RequestEnvelope {
+    let mut request = download_request(bytes);
+    request.request_id = RequestId::from_u128(id);
+    request
+}
+
+/// A reply queued behind the peer's other replies is not refused while the
+/// connection carries them: sixteen downloads of 128 KiB, their headers at
+/// once and their bodies one after another at 64 KiB every 50 ms, so the
+/// last body begins a second and a half after its header, five times the
+/// 300 ms the exchange is given. Before, a body was given its residency
+/// from its header — on loopback, the period — and the first judgement
+/// after it refused a body not yet begun, however much the connection
+/// carried (hyper-raft's port: a 64 KiB reply refused with none of it read
+/// while its period brought 464 KB, 3 of 24 loaded macOS runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_queued_behind_the_peers_others_is_not_refused_while_they_arrive() {
+    const REPLIES: u128 = 16;
+    const BYTES: u32 = 128 * 1024;
+    let wire = WireLimits {
+        request_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let (remote, peer) = paced_peer(wire.clone(), |_| PacedReply::Whole(BYTES)).await;
+    let began = std::time::Instant::now();
+    let asked: Vec<_> = (0..REPLIES)
+        .map(|id| {
+            let remote = remote.clone();
+            async move {
+                remote
+                    .request_within(&paced_download(id, BYTES), wire.request_timeout)
+                    .await
+            }
+        })
+        .collect();
+    let answers = futures_util::future::join_all(asked).await;
+    let took = began.elapsed();
+    for (id, answer) in answers.iter().enumerate() {
+        match answer {
+            Ok(ResponseEnvelope {
+                result: Response::Content(chunk),
+                ..
+            }) => assert_eq!(chunk.bytes.len(), BYTES as usize, "reply {id}"),
+            other => panic!("reply {id}: {other:?} after {took:?}"),
+        }
+    }
+    // The bodies took their turns: the last began at least fifteen
+    // pieces' pacing after the first.
+    assert!(took >= PACED_EVERY * 30, "{took:?}");
+    drop(remote);
+    peer.abort();
+}
+
+/// A peer that answers with a header, declares a body and never sends it,
+/// while it keeps the connection busy with the replies to the requests that
+/// follow, is still given up, and the others arrive. `Arriving::judge`
+/// gives a body up by either of two rules, and the connection says which
+/// (`QuicRemote::given_up`): a judgement that brought less than
+/// `LEAST_PROGRESS` of the connection (a pause of the peer's own on a
+/// machine that starves it — a CI runner that ran the pacing at six times
+/// its interval gave the body up half a second before the last of the
+/// others, and was right to), or the connection delivering everything the
+/// peer owed of the body's class with the body not among it — which the
+/// headers' order decides: where the others' headers came after the first
+/// judgements, the most the peer owed at any judgement is less than the
+/// others' bytes, and their delivery ends the withheld body a judgement
+/// after (a macOS runner, 2026-10-03; the rule was taken for unreachable
+/// here). A quiet give-up is held to what the connection's received bytes,
+/// sampled as the rule reads them, cannot rule out — a judgement before
+/// it, the samples' own gaps included — never to the clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_the_peer_withholds_while_it_sends_others_is_given_up() {
+    const OTHERS: u128 = 12;
+    const OTHER_BYTES: u32 = 256 * 1024;
+    const WITHHELD_BYTES: u32 = 64 * 1024;
+    let wire = WireLimits {
+        request_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let (remote, peer) = paced_peer(wire.clone(), |id| {
+        if id == 0 {
+            PacedReply::Withheld(WITHHELD_BYTES)
+        } else {
+            PacedReply::Whole(OTHER_BYTES)
+        }
+    })
+    .await;
+    let began = std::time::Instant::now();
+    let asked: Vec<_> = (0..=OTHERS)
+        .map(|id| {
+            let remote = remote.clone();
+            async move {
+                let bytes = if id == 0 { WITHHELD_BYTES } else { OTHER_BYTES };
+                let answer = remote
+                    .request_within(&paced_download(id, bytes), wire.request_timeout)
+                    .await;
+                (answer, began.elapsed())
+            }
+        })
+        .collect();
+    // What the connection received, sampled at a sixteenth of a judgement
+    // while the exchanges run: how a give-up is told from the connection's
+    // quiet (`quiet_before`).
+    let sample_every = wire.request_timeout / 16;
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let sampler = tokio::spawn({
+        let remote = remote.clone();
+        async move {
+            let mut samples = Vec::new();
+            loop {
+                samples.push((began.elapsed(), remote.received()));
+                if samples.len() >= RECEIVED_SAMPLES {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    () = tokio::time::sleep(sample_every) => {}
+                }
+            }
+            samples
+        }
+    });
+    let answers = futures_util::future::join_all(asked).await;
+    let _ = stop.send(());
+    let samples = sampler.await.unwrap();
+    // The others arrive, one after another.
+    let mut last_other = Duration::ZERO;
+    for (id, (answer, at)) in answers.iter().enumerate().skip(1) {
+        assert!(
+            matches!(
+                answer,
+                Ok(ResponseEnvelope {
+                    result: Response::Content(_),
+                    ..
+                })
+            ),
+            "reply {id}: {answer:?} at {at:?}"
+        );
+        last_other = last_other.max(*at);
+    }
+    let pieces = u32::try_from(OTHERS).unwrap() * OTHER_BYTES.div_ceil(PACED_PIECE as u32);
+    assert!(last_other >= PACED_EVERY * pieces, "{last_other:?}");
+    // The withheld body is given up, by one of the two rules and once; a
+    // quiet give-up only where the samples cannot rule out a judgement's
+    // quiet before it. And it goes within three judgements of the last of
+    // the others.
+    let (withheld, at) = &answers[0];
+    assert!(
+        matches!(withheld, Err(WireError::Timeout)),
+        "{withheld:?} at {at:?}"
+    );
+    let judgement = crate::frame::judgement(wire.request_timeout, remote.longest_round_trip());
+    let given_up = remote.given_up();
+    assert_eq!(given_up.quiet + given_up.withheld, 1, "{given_up:?}");
+    if given_up.quiet == 1 {
+        assert!(
+            quiet_before(&samples, judgement, *at),
+            "given up at {at:?} while the connection carried on (the others' last at {last_other:?}): {:?}",
+            samples
+                .iter()
+                .filter(|(when, _)| *when + judgement * 2 >= *at && *when <= *at + judgement)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        *at <= last_other + judgement * 3,
+        "{at:?} long after the others' {last_other:?} (a judgement of {judgement:?})"
+    );
+    drop(remote);
+    peer.abort();
+}
+/// The sampler's bound: at a sixteenth of a judgement, five minutes of a
+/// run whose exchanges end sooner by their own give-ups.
+const RECEIVED_SAMPLES: usize = 16_384;
+/// The first span of `window` at least, ending by `until`, in which the
+/// sampled connection received less than `LEAST_PROGRESS` bytes: the quiet
+/// that gives a body up (`Arriving::judge`), as a sampler sees it — a
+/// judgement's window has a sample within one interval of either end, so
+/// a window of a judgement less two intervals is asked of the samples.
+/// Whether the connection's received bytes, sampled at `samples`, leave room
+/// for a window of `judgement` ending by `until` in which the connection
+/// received less than the least progress: two samples between which it did,
+/// whose span, with the gaps to the samples beside them — where the bytes
+/// counted at the far sample may have come at its end — reaches a
+/// judgement. The samples' own spacing is what they say, however a loaded
+/// machine spaced them.
+fn quiet_before(samples: &[(Duration, u64)], judgement: Duration, until: Duration) -> bool {
+    let least = u64::try_from(crate::frame::LEAST_PROGRESS).unwrap();
+    for (first, (from, received_from)) in samples.iter().enumerate() {
+        let opens = first
+            .checked_sub(1)
+            .and_then(|before| samples.get(before))
+            .map_or(Duration::ZERO, |(when, _)| *when);
+        for (last, (to, received_to)) in samples.iter().enumerate().skip(first) {
+            if *to > until || received_to - received_from >= least {
+                break;
+            }
+            let closes = samples
+                .get(last + 1)
+                .map_or(until, |(when, _)| (*when).min(until));
+            if closes.saturating_sub(opens) >= judgement && *to >= *from {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A peer whose issuer succeeded one the verifier knows is admitted through
+/// the predecessor's endorsement (24 §11): a CA certificate for the
+/// successor's key under the predecessor's signature, presented beside the
+/// successor's own — an ordinary intermediate to path building. Without
+/// it, or endorsed by a stranger, the chain is refused — in both
+/// directions.
+#[tokio::test]
+async fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_endorsement() {
+    fn issuer_params(name: &str) -> CertificateParams {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params
+    }
+    fn constrained(name: &str) -> (Certificate, KeyPair) {
+        let key = KeyPair::generate().unwrap();
+        let ca = issuer_params(name).self_signed(&key).unwrap();
+        (ca, key)
+    }
+    fn issue(ca: &Certificate, key: &KeyPair, server: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.extended_key_usages = vec![if server {
+            ExtendedKeyUsagePurpose::ServerAuth
+        } else {
+            ExtendedKeyUsagePurpose::ClientAuth
+        }];
+        let leaf = KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&leaf, ca, key).unwrap();
+        (certificate.der().to_vec(), leaf.serialize_der())
+    }
+    // The genesis issuer, with a path length of zero as the cluster's has;
+    // its successor, endorsed by it; a stranger.
+    let (genesis, genesis_key) = constrained("genesis");
+    let (successor, successor_key) = constrained("successor");
+    let endorsement = issuer_params("successor")
+        .signed_by(&successor_key, &genesis, &genesis_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    let (stranger, stranger_key) = constrained("stranger");
+    let forged = issuer_params("successor")
+        .signed_by(&successor_key, &stranger, &stranger_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    let roots = vec![genesis.der().to_vec()];
+    // A client issued under the successor, dialing a server that trusts the
+    // genesis issuer alone.
+    let (client_leaf, client_key) = issue(&successor, &successor_key, false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&client_leaf, grant())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async move { response(verified.request()) }
+    });
+    let (server_leaf, server_key) = issue(&genesis, &genesis_key, true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_leaf, genesis.der().to_vec()], server_key),
+        roots.clone(),
+        &limits(),
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            limits(),
+            budget(),
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let task = tokio::spawn(async move { running.serve(handler).await });
+    let address = server.local_addr().unwrap();
+    let dial = |chain: Vec<Vec<u8>>| {
+        QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_tls(
+                TlsIdentity::from_pkcs8(chain, client_key.clone()),
+                roots.clone(),
+                &limits(),
+            )
+            .unwrap(),
+            limits(),
+        )
+        .unwrap()
+    };
+    // Without the endorsement: refused before any dispatch.
+    assert!(
+        dial(vec![client_leaf.clone(), successor.der().to_vec()])
+            .connect(address, "localhost")
+            .await
+            .is_err()
+    );
+    // Endorsed by a stranger: refused.
+    assert!(
+        dial(vec![
+            client_leaf.clone(),
+            successor.der().to_vec(),
+            forged.clone()
+        ])
+        .connect(address, "localhost")
+        .await
+        .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // With the endorsement: admitted, and its requests dispatch.
+    let remote = dial(vec![
+        client_leaf.clone(),
+        successor.der().to_vec(),
+        endorsement.clone(),
+    ])
+    .connect(address, "localhost")
+    .await
+    .unwrap();
+    let reply = remote.request(&request(1)).await.unwrap();
+    assert_eq!(reply.request_id, request(1).request_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.close();
+    task.await.unwrap().unwrap();
+    // The other direction: a server issued under the successor, dialed by
+    // a client that trusts the genesis issuer alone.
+    let (server_leaf, server_key) = issue(&successor, &successor_key, true);
+    let (client_leaf, client_key) = issue(&genesis, &genesis_key, false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&client_leaf, grant())
+        .unwrap();
+    let serve = |chain: Vec<Vec<u8>>| {
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(chain, server_key.clone()),
+            vec![genesis.der().to_vec(), successor.der().to_vec()],
+            &limits(),
+        )
+        .unwrap();
+        Arc::new(
+            QuicServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry.clone(),
+                limits(),
+                budget(),
+            )
+            .unwrap(),
+        )
+    };
+    let connector = QuicConnector::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_tls(
+            TlsIdentity::from_pkcs8(vec![client_leaf, genesis.der().to_vec()], client_key),
+            roots.clone(),
+            &limits(),
+        )
+        .unwrap(),
+        limits(),
+    )
+    .unwrap();
+    for (chain, admitted) in [
+        (vec![server_leaf.clone(), successor.der().to_vec()], false),
+        (
+            vec![
+                server_leaf.clone(),
+                successor.der().to_vec(),
+                forged.clone(),
+            ],
+            false,
+        ),
+        (
+            vec![
+                server_leaf.clone(),
+                successor.der().to_vec(),
+                endorsement.clone(),
+            ],
+            true,
+        ),
+    ] {
+        let server = serve(chain);
+        let running = server.clone();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let task = tokio::spawn(async move { running.serve(handler).await });
+        let outcome = connector
+            .connect(server.local_addr().unwrap(), "localhost")
+            .await;
+        assert_eq!(outcome.is_ok(), admitted, "{:?}", outcome.as_ref().err());
+        if let Ok(remote) = outcome {
+            let reply = remote.request(&request(2)).await.unwrap();
+            assert_eq!(reply.request_id, request(2).request_id);
+        }
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+}
+
+/// What path building does with a trust anchor's own length constraint:
+/// an endorsement of a successor's key, signed by an anchor issued with a
+/// path length of zero, is an ordinary intermediate to a verifier that
+/// holds the anchor — the anchor's constraints are not applied (RFC 5280
+/// §6.1.1 leaves them to policy; webpki applies none).
+#[test]
+fn webpki_crosses_a_zero_length_anchor_through_an_endorsement() {
+    use rustls::client::danger::ServerCertVerifier;
+    fn issuer_params(name: &str) -> CertificateParams {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params
+    }
+    let genesis_key = KeyPair::generate().unwrap();
+    let genesis = issuer_params("genesis").self_signed(&genesis_key).unwrap();
+    let successor_key = KeyPair::generate().unwrap();
+    let successor = issuer_params("successor")
+        .self_signed(&successor_key)
+        .unwrap();
+    let endorsement = issuer_params("successor")
+        .signed_by(&successor_key, &genesis, &genesis_key)
+        .unwrap();
+    let mut leaf_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &successor, &successor_key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(genesis.der().clone()).unwrap();
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+    )
+    .build()
+    .unwrap();
+    let now = rustls::pki_types::UnixTime::now();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let with_endorsement = verifier.verify_server_cert(
+        leaf.der(),
+        &[successor.der().clone(), endorsement.der().clone()],
+        &name,
+        &[],
+        now,
+    );
+    let without =
+        verifier.verify_server_cert(leaf.der(), &[successor.der().clone()], &name, &[], now);
+    assert!(with_endorsement.is_ok(), "{with_endorsement:?}");
+    assert!(without.is_err(), "{without:?}");
+}
+
+/// The ordered profile tops the ladder (27 §12): offered by a handler that
+/// steps a peer's frames in their order and asked for by every connector,
+/// it is negotiated where both sides have it and the native profile where
+/// one does not; a connection that negotiated it admits every request
+/// below it, and one that did not admits no ordered frame. A connector made
+/// to offer an older binary's profiles never reaches it.
+#[tokio::test]
+async fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
+    let limits = WireLimits::default();
+    let hello = |versions: &[u16]| Hello {
+        versions: versions.to_vec(),
+        max_frame_bytes: limits.max_frame_bytes,
+        max_items: limits.max_items,
+    };
+    let all = hello(&OFFERED_PROTOCOLS);
+    assert_eq!(
+        limits
+            .negotiate_ordered(&all, true, true, true, true)
+            .unwrap()
+            .protocol,
+        ORDERED_PROTOCOL_VERSION
+    );
+    // A handler that does not step frames in order, or a connector that
+    // does not ask for it, stays at the native profile.
+    assert_eq!(
+        limits
+            .negotiate_ordered(&all, true, true, true, false)
+            .unwrap()
+            .protocol,
+        NATIVE_PROTOCOL_VERSION
+    );
+    let older = hello(&[
+        NATIVE_PROTOCOL_VERSION,
+        PEER_PROTOCOL_VERSION,
+        MANAGED_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
+    ]);
+    assert_eq!(
+        limits
+            .negotiate_ordered(&older, true, true, true, true)
+            .unwrap()
+            .protocol,
+        NATIVE_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        limits
+            .negotiate_native(&all, true, true, true)
+            .unwrap()
+            .protocol,
+        NATIVE_PROTOCOL_VERSION
+    );
+    let ordered = Negotiated {
+        protocol: ORDERED_PROTOCOL_VERSION,
+        max_frame_bytes: 1024,
+        max_items: 1,
+    };
+    for requested in OFFERED_PROTOCOLS {
+        assert!(ordered.accepts_protocol(requested), "{requested}");
+    }
+    assert!(!ordered.accepts_protocol(6));
+    let native = Negotiated {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ..ordered
+    };
+    assert!(!native.accepts_protocol(ORDERED_PROTOCOL_VERSION));
+    // The ordered frame: a registered tag of its own, carried as control.
+    let frame = Operation::RaftOrdered {
+        group: [3; 16],
+        epoch: 9,
+        sequence: 4,
+        message: vec![1, 2, 3],
+    };
+    assert_eq!(frame.registered_tag(), 33);
+    assert_eq!(frame.class(), TrafficClass::Control);
+    let bytes = postcard::to_allocvec(&frame).unwrap();
+    assert_eq!(postcard::from_bytes::<Operation>(&bytes).unwrap(), frame);
+    // A connector offers what it is told, within what this binary speaks
+    // and always with the base profile.
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let connector = || {
+        QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_tls(
+                TlsIdentity::from_pkcs8(vec![certificate.clone()], key.clone()),
+                vec![pki.ca.der().to_vec()],
+                &limits,
+            )
+            .unwrap(),
+            limits.clone(),
+        )
+        .unwrap()
+    };
+    assert!(connector().offering(&[PROTOCOL_VERSION]).is_ok());
+    assert!(
+        connector()
+            .offering(&[PEER_PROTOCOL_VERSION, PROTOCOL_VERSION])
+            .is_ok()
+    );
+    assert!(connector().offering(&[]).is_err());
+    assert!(connector().offering(&[MANAGED_PROTOCOL_VERSION]).is_err());
+    assert!(connector().offering(&[PROTOCOL_VERSION, 6]).is_err());
+    // A receiver holds an ordered frame to the ordered profile, and a
+    // plain frame to the base one; a node sends either.
+    let node = || {
+        AuthenticatedPeer::local(PeerGrant {
+            principal: ParticipantId::from_u128(2),
+            tenants: BTreeSet::from([TenantId::from_u128(1)]),
+            role: PeerRole::Node { node_id: 2 },
+        })
+        .unwrap()
+    };
+    let envelope = |protocol: u16, operation: Operation| RequestEnvelope {
+        protocol,
+        ledger: LedgerId {
+            tenant: TenantId::from_u128(1),
+            session: SessionId::from_u128(2),
+        },
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(77),
+        operation,
+    };
+    let plain = || Operation::Raft {
+        group: [3; 16],
+        message: vec![1],
+    };
+    assert!(
+        verify_request(
+            node(),
+            envelope(ORDERED_PROTOCOL_VERSION, frame.clone()),
+            &limits
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        verify_request(node(), envelope(PROTOCOL_VERSION, frame.clone()), &limits),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    assert!(verify_request(node(), envelope(PROTOCOL_VERSION, plain()), &limits).is_ok());
+    assert!(matches!(
+        verify_request(node(), envelope(ORDERED_PROTOCOL_VERSION, plain()), &limits),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    // An ask of what a copy holds is of the ordered profile and nothing
+    // else (the audit's F50); the old ask stays with the base. Both new
+    // variants take the tags after the last of their enums.
+    // The content's domain is the request's tenant, as every custody
+    // request's must be.
+    let content = ContentRef {
+        domain: ContentDomainId::from_u128(1),
+        class: ContentClass::Evidence,
+        root: ContentHash([5; 32]),
+        length: 16,
+    };
+    let held = Operation::Custody(CustodyRequest::OpenHeld {
+        transfer: [6; 16],
+        policy_revision: 1,
+        content: content.clone(),
+        manifest: vec![7; 8],
+    });
+    let open = Operation::Custody(CustodyRequest::Open {
+        transfer: [6; 16],
+        policy_revision: 1,
+        content,
+        manifest: vec![7; 8],
+    });
+    assert!(ordered_profile_operation(&held));
+    assert!(!ordered_profile_operation(&open));
+    assert!(
+        verify_request(
+            node(),
+            envelope(ORDERED_PROTOCOL_VERSION, held.clone()),
+            &limits
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        verify_request(node(), envelope(PROTOCOL_VERSION, held.clone()), &limits),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    assert!(verify_request(node(), envelope(PROTOCOL_VERSION, open.clone()), &limits).is_ok());
+    assert!(matches!(
+        verify_request(
+            node(),
+            envelope(ORDERED_PROTOCOL_VERSION, open.clone()),
+            &limits
+        ),
+        Err(AccessError::UnsupportedProtocol)
+    ));
+    let bytes = postcard::to_allocvec(&held).unwrap();
+    assert_eq!(postcard::from_bytes::<Operation>(&bytes).unwrap(), held);
+    let reply = CustodyReply::OpenedHeld {
+        chunks: 70,
+        held: vec![u64::MAX, 0b11_1111],
+    };
+    let bytes = postcard::to_allocvec(&reply).unwrap();
+    assert_eq!(postcard::from_bytes::<CustodyReply>(&bytes).unwrap(), reply);
+    // The tags: the variants come after every one before them.
+    let tag = |bytes: &[u8]| bytes.first().copied().unwrap();
+    assert_eq!(
+        tag(&postcard::to_allocvec(&CustodyRequest::OpenHeld {
+            transfer: [0; 16],
+            policy_revision: 0,
+            content: ContentRef {
+                domain: ContentDomainId::from_u128(0),
+                class: ContentClass::Evidence,
+                root: ContentHash([0; 32]),
+                length: 0,
+            },
+            manifest: Vec::new(),
+        })
+        .unwrap()),
+        10
+    );
+    assert_eq!(
+        tag(&postcard::to_allocvec(&CustodyReply::OpenedHeld {
+            chunks: 0,
+            held: Vec::new(),
+        })
+        .unwrap()),
+        9
+    );
+}
+
+/// A part of a chunk is what the path delivered in an exchange's time
+/// (`part_for`, the audit's F49): one window's worth before the peer
+/// answered any bulk exchange — not the cold window over the cold round
+/// trip stretched over the whole time, which sized a first part at 307 KiB
+/// for a path of 128 kbit/s — then the last answered bulk exchange's rate,
+/// never more than the law holds in flight over a round trip, a datagram
+/// at least and the chunk at most.
+#[test]
+fn a_part_is_what_the_path_delivered_in_an_exchange_time() {
+    use crate::peers::part_for;
+    let timeout = Duration::from_millis(1070);
+    let chunk = 1024 * 1024;
+    // Cold: a window of 11,552 bytes over a 40 ms round trip would have
+    // made 307 KiB; the first part is the window.
+    assert_eq!(
+        part_for(11_552, Duration::from_millis(40), None, timeout, chunk),
+        11_552
+    );
+    // Measured: 11,552 bytes answered in 1 s is 12,360 in 1.07 s.
+    assert_eq!(
+        part_for(
+            11_552,
+            Duration::from_millis(40),
+            Some((11_552, 1_000_000_000)),
+            timeout,
+            chunk
+        ),
+        12_360
+    );
+    // The law bounds what a measurement claims: a window of 2,948 over a
+    // 414 ms round trip holds 7,619 in the time, whatever the last
+    // exchange delivered.
+    assert_eq!(
+        part_for(
+            2_948,
+            Duration::from_millis(414),
+            Some((1_000_000, 1_000_000)),
+            timeout,
+            chunk
+        ),
+        7_619
+    );
+    // A fast path reaches the whole chunk after one window: 11,552 bytes
+    // in 3 ms.
+    assert_eq!(
+        part_for(
+            1 << 20,
+            Duration::from_micros(500),
+            Some((11_552, 3_000_000)),
+            timeout,
+            chunk
+        ),
+        chunk
+    );
+    // A datagram at least, the chunk at most.
+    assert_eq!(
+        part_for(100, Duration::from_secs(1), None, timeout, chunk),
+        crate::frame::LEAST_PROGRESS
+    );
+    assert_eq!(
+        part_for(1 << 30, Duration::from_micros(1), None, timeout, 4096),
+        4096
+    );
+}
+
+/// Every connection focal makes exchanges its keys post-quantum
+/// (`crypto`): a client that offers only a classical exchange is refused at
+/// the handshake, as is one whose traffic would be sealed with a 128-bit
+/// key, while one that offers the hybrid is served; and a focal client
+/// refuses a server that speaks only a classical exchange.
+#[tokio::test]
+async fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
+    use rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256;
+    use rustls::crypto::aws_lc_rs::kx_group::{X25519, X25519MLKEM768};
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(4).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> =
+        Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+    let (server, task) = server(&pki, registry, handler).await;
+    let client = |groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+                  suites: Option<Vec<rustls::SupportedCipherSuite>>| {
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.kx_groups = groups;
+        if let Some(suites) = suites {
+            provider.cipher_suites = suites;
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(pki.ca.der().to_vec()))
+            .unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![CertificateDer::from(certificate.clone())],
+                PrivatePkcs8KeyDer::from(key.clone()).into(),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        ))
+    };
+    let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = server.local_addr().unwrap();
+    let refused = endpoint
+        .connect_with(client(vec![X25519], None), address, "localhost")
+        .unwrap()
+        .await;
+    assert!(refused.is_err(), "a classical exchange was accepted");
+    let short_key = endpoint
+        .connect_with(
+            client(vec![X25519MLKEM768], Some(vec![TLS13_AES_128_GCM_SHA256])),
+            address,
+            "localhost",
+        )
+        .unwrap()
+        .await;
+    assert!(short_key.is_err(), "a 128-bit traffic key was accepted");
+    let served = endpoint
+        .connect_with(
+            client(vec![X25519MLKEM768, X25519], None),
+            address,
+            "localhost",
+        )
+        .unwrap()
+        .await;
+    assert!(served.is_ok(), "{served:?}");
+    // A server that speaks only a classical exchange, to a focal client.
+    let (server_certificate, server_key) = pki.issue(true);
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![X25519];
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(server_certificate)],
+            PrivatePkcs8KeyDer::from(server_key).into(),
+        )
+        .unwrap();
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let classical = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        )),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let accepting = classical.clone();
+    tokio::spawn(async move {
+        if let Some(incoming) = accepting.accept().await {
+            let _ = incoming.await;
+        }
+    });
+    let focal = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate.clone()], key.clone()),
+        vec![pki.ca.der().to_vec()],
+        &limits(),
+    )
+    .unwrap();
+    let to_classical = endpoint
+        .connect_with(focal, classical.local_addr().unwrap(), "localhost")
+        .unwrap()
+        .await;
+    assert!(
+        to_classical.is_err(),
+        "a focal client accepted a classical exchange"
+    );
+    classical.close(0u8.into(), b"done");
+    server.close();
+    task.await.unwrap().unwrap();
 }

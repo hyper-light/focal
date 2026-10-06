@@ -65,6 +65,12 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_native_requests(&self) -> bool {
         false
     }
+    /// The handler steps a peer's bulk frames in the order they left it
+    /// ([`Operation::RaftOrdered`], 27 §12): the node's replication
+    /// handlers, which hold a frame that overtook the one before it.
+    fn supports_ordered_replication(&self) -> bool {
+        false
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a>;
     fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
@@ -124,6 +130,19 @@ pub async fn dispatch_accounted(
     request: RequestEnvelope,
     limits: &WireLimits,
 ) -> OwnedResponse {
+    dispatch_accounted_by(handler, peer, request, limits, std::time::Duration::ZERO).await
+}
+/// [`dispatch_accounted`] for a request that came by a path whose round
+/// trip is `path`, as the serving connection measures it: what a handler
+/// holds a frame that overtook another for (27 §12). Zero where there is
+/// no path.
+pub async fn dispatch_accounted_by(
+    handler: &dyn RequestHandler,
+    peer: AuthenticatedPeer,
+    request: RequestEnvelope,
+    limits: &WireLimits,
+    path: std::time::Duration,
+) -> OwnedResponse {
     if let Err(error) = limits.validate() {
         return OwnedResponse::new(request.reply(Response::Error(error)));
     }
@@ -142,7 +161,7 @@ pub async fn dispatch_accounted(
         request.request_id,
     );
     let verified = match verify_request(peer, request, limits) {
-        Ok(value) => value,
+        Ok(value) => value.with_path(path),
         Err(error) => {
             return OwnedResponse::new(ResponseEnvelope {
                 protocol,
@@ -477,6 +496,20 @@ pub fn validate_response(
             {
                 return Err(WireError::InvalidFrame);
             }
+            // The page is at the prefix the request pinned or at least at
+            // the one it named, as every other fixed-prefix read is.
+            match &read.consistency {
+                ReadConsistency::Exact(token) if page.token != *token => {
+                    return Err(WireError::InvalidFrame);
+                }
+                ReadConsistency::AtLeast(token)
+                    if token.ledger != request.ledger || page.token.sequence < token.sequence =>
+                {
+                    return Err(WireError::InvalidFrame);
+                }
+                _ => {}
+            }
+            validate_native_page(&read.query, page)?;
         }
         Response::NativeListed(page) => {
             let Operation::NativeList(list) = &request.operation else {
@@ -670,7 +703,12 @@ pub fn validate_response(
                 return Err(WireError::Limit);
             }
         }
-        Response::PeerAccepted if !matches!(request.operation, Operation::Raft { .. }) => {
+        Response::PeerAccepted
+            if !matches!(
+                request.operation,
+                Operation::Raft { .. } | Operation::RaftOrdered { .. }
+            ) =>
+        {
             return Err(WireError::InvalidFrame);
         }
         Response::Stream(reply) => {
@@ -713,6 +751,11 @@ pub fn validate_response(
                         next_missing,
                     },
                 ) => next_missing <= chunks,
+                // The inventory: a word for every sixty-four chunks.
+                (CustodyRequest::OpenHeld { .. }, CustodyReply::OpenedHeld { chunks, held }) => {
+                    usize::try_from(*chunks)
+                        .is_ok_and(|chunks| held.len() == chunks.div_ceil(u64::BITS as usize))
+                }
                 (
                     CustodyRequest::Chunk { index, .. },
                     CustodyReply::ChunkStored { index: stored },
@@ -761,6 +804,31 @@ pub fn validate_response(
                     CustodyRequest::SeedChunk { hash, max_bytes },
                     CustodyReply::SeedChunk { hash: read, bytes },
                 ) => hash == read && !bytes.is_empty() && bytes.len() <= *max_bytes as usize,
+                (
+                    CustodyRequest::ChunkPart { index, .. },
+                    CustodyReply::PartStored { index: stored, .. }
+                    | CustodyReply::ChunkStored { index: stored },
+                ) => index == stored,
+                (
+                    CustodyRequest::ReadChunkPart {
+                        index,
+                        offset,
+                        max_bytes,
+                        ..
+                    },
+                    CustodyReply::ChunkPart {
+                        index: read,
+                        offset: at,
+                        length,
+                        bytes,
+                    },
+                ) => {
+                    index == read
+                        && offset == at
+                        && !bytes.is_empty()
+                        && bytes.len() <= *max_bytes as usize
+                        && u64::from(*at).saturating_add(bytes.len() as u64) <= u64::from(*length)
+                }
                 _ => false,
             };
             if !valid {
@@ -839,6 +907,129 @@ fn validate_object_selection(
         if !remaining.any(|reference| reference.kind == kind && reference.id == id) {
             return Err(WireError::InvalidFrame);
         }
+    }
+    Ok(())
+}
+/// The shape a native page must have for its query: an evaluation page holds
+/// the declaration's evaluations in strictly increasing key order after the
+/// request's cursor and continues only forward; a selection holds one tie
+/// set the selector names; a resumed claim expansion never repeats the claim
+/// and its continuation advances. A missing definition is the one other
+/// answer, alone and final.
+fn validate_native_page(query: &NativeReadQuery, page: &NativeReadPage) -> Result<(), WireError> {
+    let missing_definition = |validation: ValidationId| {
+        matches!(
+            page.objects.as_slice(),
+            [NativeObject::Missing(NativeObjectRef::Definition(missing))] if *missing == validation
+        )
+    };
+    match query {
+        NativeReadQuery::Evaluations {
+            claim,
+            validation,
+            after,
+        } => {
+            if missing_definition(*validation) {
+                return if page.next.is_none() {
+                    Ok(())
+                } else {
+                    Err(WireError::InvalidFrame)
+                };
+            }
+            let mut previous = *after;
+            for object in &page.objects {
+                let NativeObject::Evaluation(evaluation) = object else {
+                    return Err(WireError::InvalidFrame);
+                };
+                let key = evaluation.key;
+                if key.claim != *claim
+                    || key.validation != *validation
+                    || previous.is_some_and(|prior| key <= prior)
+                {
+                    return Err(WireError::InvalidFrame);
+                }
+                previous = Some(key);
+            }
+            match page.next {
+                None => {}
+                // The cursor is the last consumed key: of this declaration,
+                // never behind the last object shown nor the cursor sent.
+                Some(NativeContinuation::Evaluations(next)) => {
+                    if next.claim != *claim
+                        || next.validation != *validation
+                        || previous.is_some_and(|last| next < last)
+                        || after.is_some_and(|after| next <= after)
+                    {
+                        return Err(WireError::InvalidFrame);
+                    }
+                }
+                Some(_) => return Err(WireError::InvalidFrame),
+            }
+        }
+        NativeReadQuery::SelectEvaluation(query) => {
+            if page.next.is_some() {
+                return Err(WireError::InvalidFrame);
+            }
+            if missing_definition(query.validation) {
+                return Ok(());
+            }
+            let mut generation = None;
+            for object in &page.objects {
+                let NativeObject::Evaluation(evaluation) = object else {
+                    return Err(WireError::InvalidFrame);
+                };
+                let key = evaluation.key;
+                if key.claim != query.claim
+                    || key.validation != query.validation
+                    || !query.selector.selects(key.target)
+                    || query
+                        .generation
+                        .is_some_and(|wanted| key.generation != wanted)
+                    || generation.is_some_and(|tied| tied != key.generation)
+                    || (query.live && evaluation.state.is_terminal())
+                {
+                    return Err(WireError::InvalidFrame);
+                }
+                generation = Some(key.generation);
+            }
+        }
+        NativeReadQuery::Claim { id, after, .. } => {
+            if after.is_some()
+                && page
+                    .objects
+                    .iter()
+                    .any(|object| matches!(object, NativeObject::Claim(_)))
+            {
+                return Err(WireError::InvalidFrame);
+            }
+            let advances = match (after, page.next) {
+                (_, None) => true,
+                (_, Some(NativeContinuation::Evaluations(next))) if next.claim != *id => false,
+                (
+                    Some(NativeContinuation::Evaluations(prior)),
+                    Some(NativeContinuation::Evaluations(next)),
+                ) => next > *prior,
+                // The responses precede the evaluations; a continuation
+                // never steps back into them.
+                (
+                    Some(NativeContinuation::Evaluations(_)),
+                    Some(NativeContinuation::Responses { .. }),
+                ) => false,
+                (
+                    Some(NativeContinuation::Responses { cycle: prior }),
+                    Some(NativeContinuation::Responses { cycle: next }),
+                ) => next < *prior,
+                (
+                    None | Some(NativeContinuation::Responses { .. }),
+                    Some(NativeContinuation::Responses { .. } | NativeContinuation::Evaluations(_)),
+                ) => true,
+                (_, Some(_)) => false,
+            };
+            if !advances {
+                return Err(WireError::InvalidFrame);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

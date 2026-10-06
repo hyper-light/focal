@@ -47,6 +47,10 @@ pub struct PartitionPlan {
     /// The digest of the sealed image a split destination bootstraps from;
     /// none for the first partition, which starts empty.
     image: Option<ContentHash>,
+    /// The node that opens this replica of the group: its founder, or a
+    /// member the root seated since (24 §13; the audit's F24). The genesis
+    /// is the founder's whoever hosts.
+    host: u64,
     /// The control genesis of the bootstrap state, fixed at planning so the
     /// identity never depends on re-deriving the image.
     genesis: [u8; 32],
@@ -78,6 +82,7 @@ impl PartitionPlan {
             delegation,
             image: None,
             genesis: [0; 32],
+            host: founder_node,
         };
         plan.genesis = plan.bootstrap(None)?.identity(&plan.options())?.genesis;
         Ok(plan)
@@ -112,6 +117,7 @@ impl PartitionPlan {
             delegation,
             image: Some(digest),
             genesis: [0; 32],
+            host: founder_node,
         };
         plan.genesis = plan
             .bootstrap(Some(image.clone()))?
@@ -119,8 +125,61 @@ impl PartitionPlan {
             .genesis;
         Ok(plan)
     }
+    /// The plan of a seated member of a split destination (24 §13): the
+    /// group's identity from the root's grant (its genesis) and the image's
+    /// digest from the delegation's fence, no image — the member opens with
+    /// the group's identity and no state, and is brought up by snapshot
+    /// (`ControlOptions::founded_elsewhere`).
+    pub fn split_member(
+        cluster: [u8; 16],
+        founder_node: u64,
+        delegation: Delegation,
+        genesis: [u8; 32],
+        image: ContentHash,
+        host: u64,
+    ) -> Result<Self, DirectoryBootstrapError> {
+        if cluster == [0; 16]
+            || founder_node == 0
+            || host == 0
+            || host == founder_node
+            || genesis == [0; 32]
+            || delegation.activation.is_none()
+        {
+            return Err(DirectoryBootstrapError::Unauthorized);
+        }
+        Ok(Self {
+            cluster,
+            founder_node,
+            partition: delegation.partition,
+            group: delegation.log_group,
+            namespace: rpc_namespace(cluster)?,
+            delegation,
+            image: Some(image),
+            genesis,
+            host,
+        })
+    }
+    /// The group's genesis as this plan carries it.
+    pub fn genesis(&self) -> [u8; 32] {
+        self.genesis
+    }
+    /// Whether this plan is a seated member's of a group founded on an image
+    /// elsewhere: it holds the image's digest and not the image.
+    pub fn founded_elsewhere(&self) -> bool {
+        self.image.is_some() && self.host != self.founder_node
+    }
     pub fn range(&self) -> NamespaceRange {
         self.delegation.namespace
+    }
+    /// The same plan opened by `node`, a member the root seated in the
+    /// group: it joins the founder's log as a learner and takes the seats
+    /// the log's configuration gives it.
+    pub fn hosted_by(mut self, node: u64) -> Self {
+        self.host = node;
+        self
+    }
+    pub fn host(&self) -> u64 {
+        self.host
     }
     pub fn image(&self) -> Option<ContentHash> {
         self.image
@@ -156,18 +215,23 @@ impl PartitionPlan {
         &self,
         image: Option<PartitionCheckpoint>,
     ) -> Result<ControlBootstrap, DirectoryBootstrapError> {
+        let empty = || PartitionCheckpoint {
+            schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
+            cluster: ClusterId(self.cluster),
+            delegation: self.delegation,
+            revision: 0,
+            sealed: None,
+            nodes: std::sync::Arc::new(BTreeMap::new()),
+            sessions: std::sync::Arc::new(BTreeMap::new()),
+            routes: std::sync::Arc::new(std::collections::VecDeque::new()),
+            routes_from: 0,
+        };
         let directory = match (self.image, image) {
-            (None, None) => PartitionCheckpoint {
-                schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
-                cluster: ClusterId(self.cluster),
-                delegation: self.delegation,
-                revision: 0,
-                sealed: None,
-                nodes: std::sync::Arc::new(BTreeMap::new()),
-                sessions: std::sync::Arc::new(BTreeMap::new()),
-                routes: std::sync::Arc::new(std::collections::VecDeque::new()),
-                routes_from: 0,
-            },
+            (None, None) => empty(),
+            // A seated member of a split destination holds no image: it
+            // opens on nothing, with the group's identity, and its state
+            // comes by snapshot (`ControlOptions::founded_elsewhere`).
+            (Some(_), None) if self.founded_elsewhere() => empty(),
             (Some(expected), Some(image)) => {
                 let digest = focal_directory::partition_checkpoint_digest(&image)
                     .map_err(|_| DirectoryBootstrapError::Inconsistent)?;
@@ -192,11 +256,20 @@ impl PartitionPlan {
         })
     }
     fn options(&self) -> ControlOptions {
-        ControlOptions::new(NodeConfig::single(
-            self.founder_node,
+        // The founder alone founded the log; a later host replays the
+        // membership changes since from it (as a root learner does) — or,
+        // for a group founded on an image, is brought up by snapshot.
+        let mut options = ControlOptions::new(NodeConfig::joining(
+            self.host,
             self.cluster,
             self.group.0,
-        ))
+            vec![self.founder_node],
+            Vec::new(),
+        ));
+        if self.founded_elsewhere() {
+            options.founded_elsewhere = Some(self.genesis);
+        }
+        options
     }
     fn client(&self) -> Result<[u8; 16], DirectoryBootstrapError> {
         derived_id("focal.directory.authority-install-client.v1", self.cluster)
@@ -261,16 +334,21 @@ fn validate_destination(
     replica: &ControlReplica,
     plan: FirstDirectoryPlan,
 ) -> Result<(), DirectoryBootstrapError> {
-    if replica.identity() != plan.identity()? || replica.status().node_id != plan.founder_node {
+    if replica.identity() != plan.identity()? || replica.status().node_id != plan.host {
         return Err(DirectoryBootstrapError::Unauthorized);
     }
     let partition = replica
         .partition()
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
     let configuration = replica.configuration().configuration;
+    // The log's configuration names its host, or is still the founder's
+    // alone: a learner opened before it applied the change that seated it
+    // (F24). A change in progress is finished before the authority is
+    // refreshed on it.
+    let founders_alone =
+        configuration.voters.as_slice() == [plan.founder_node] && configuration.learners.is_empty();
     if !plan.accepts(partition.checkpoint())
-        || configuration.voters.as_slice() != [plan.founder_node]
-        || !configuration.learners.is_empty()
+        || !(configuration.contains(plan.host) || founders_alone)
         || !configuration.voters_outgoing.is_empty()
         || !configuration.learners_next.is_empty()
         || configuration.auto_leave
@@ -441,6 +519,14 @@ impl BootstrappedDirectory {
 /// Invoke in the root owner immediately after a fresh ReadIndex barrier. This
 /// synchronous validation reads one already-published owner prefix; it cannot
 /// turn a previously decoded snapshot or a Node certificate into authority.
+/// The root replica this node runs mints it, leading or following: the
+/// barrier is the leader's commit, asked through it where this replica
+/// follows (27 §5), and the facts behind it — the delegation, the group's
+/// grant, the founder's enrollment — are committed state, the same on every
+/// member that applied it. Before, the permit demanded that this replica
+/// lead, so a founder whose root followed another voter after a restart
+/// could not reopen the partition it hosts, never reported `Ready`, and
+/// served no placement (the first root with three voters, 2026-10-02).
 pub(crate) fn authorize_first_directory(
     owner: &ControlReplica,
     plan: FirstDirectoryPlan,
@@ -461,7 +547,6 @@ pub(crate) fn authorize_first_directory(
     if owner.identity().scope != ControlScope::Root
         || owner.identity().cluster.0 != plan.cluster
         || owner.identity().group != crate::network_state::root_group(plan.cluster)
-        || status.role != StateRole::Leader
         || status.applied_index != owner.applied_index()
         || status.committed_index != owner.applied_index()
         || owner.applied_index() == 0
@@ -489,11 +574,20 @@ pub(crate) fn authorize_first_directory(
         .enrollment()
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
     let node = authority
-        .node(plan.founder_node)
+        .node(plan.host)
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
     let group = authority
         .group(plan.group)
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
+    // A seat belongs to the node at the generation it was granted, and the
+    // same node re-granted since (a rotated key, a changed topology, an
+    // undrain; 24 §19) holds every seat at or below its current generation.
+    // The host holds a voter's seat or a learner's: the founder's at the
+    // genesis, a member's once the root seated it (F24).
+    let seat = group
+        .voters
+        .get(&plan.host)
+        .or_else(|| group.learners.get(&plan.host));
     if authority.checkpoint().clock > now
         || authority.applied_index() > owner.applied_index()
         || authority.revision() == 0
@@ -504,21 +598,26 @@ pub(crate) fn authorize_first_directory(
                 partition: plan.partition,
                 namespace: plan.range(),
             })
-        || group.membership_epoch != 1
-        || group.voters.len() != 1
-        || group.voters.get(&plan.founder_node) != Some(&node.enrollment.generation)
+        || group.membership_epoch == 0
+        || group.voters.is_empty()
+        || seat.is_none_or(|seat| *seat > node.enrollment.generation)
         || !group.outgoing_voters.is_empty()
-        || !group.learners.is_empty()
-        || !node.enrollment.eligible
-        || group.expires_at <= now
-        || node.expires_at < group.expires_at
+        // The group is authorized while its voter is: the founder's grant,
+        // extended as its credential is renewed (24 §11).
+        || authority.checkpoint().group_expires_at(group) <= now
     {
         return Err(DirectoryBootstrapError::Unauthorized);
     }
+    // The permit admits a seat, and a drain does not unseat: a drained host
+    // keeps its vote (the control plane loses no quorum at a drain) and,
+    // where it leads, keeps installing the root's authority — the drain
+    // among it, which its own agent then records (24 §19). Requiring the
+    // host eligible here left a drained leader unable to install the very
+    // grant that drained it, so nothing healed (2026-10-02).
     let certificate = enrollment
         .enrollments()
         .find(|receipt| {
-            receipt.identity.node_id == Some(plan.founder_node)
+            receipt.identity.node_id == Some(plan.host)
                 && receipt.identity.principal == node.principal
                 && ContentHash(receipt.public_key) == node.enrollment.identity
         })
@@ -527,12 +626,12 @@ pub(crate) fn authorize_first_directory(
         .authorize_certificate(&certificate.certificate, now)
         .map_err(|_| DirectoryBootstrapError::Unauthorized)?;
     if identity.role != focal_enrollment::EnrollmentRole::Node
-        || identity.node_id != Some(plan.founder_node)
-        || certificate.expires_at < group.expires_at
+        || identity.node_id != Some(plan.host)
+        || certificate.expires_at < authority.checkpoint().group_expires_at(group)
     {
         return Err(DirectoryBootstrapError::Unauthorized);
     }
-    let expires_at = group.expires_at;
+    let expires_at = authority.checkpoint().group_expires_at(group);
     let ControlReadResult::Authority(Some(snapshot)) = owner.read_local(&ControlRead::Authority)?
     else {
         return Err(DirectoryBootstrapError::Unauthorized);
@@ -691,8 +790,7 @@ pub(crate) fn next_first_directory_command(
             || existing.voters != grant.voters
             || !existing.outgoing_voters.is_empty()
             || !existing.learners.is_empty()
-            || existing.expires_at <= now
-            || existing.expires_at > node.expires_at
+            || authority.group_expires_at(existing) <= now
         {
             return Err(DirectoryBootstrapError::Unauthorized);
         }
@@ -735,6 +833,36 @@ impl PartitionBootstrapPermit {
             budget.clone(),
             wal,
         )?;
+        // The founder's group while it is the founder alone is bootstrapped
+        // here: its barrier, its activation, its authority. A group with
+        // other members — the founder reopening one that grew (F24), or a
+        // member's replica of it, which is a learner of the founder's log
+        // until it applies its seat — campaigns for nothing and installs
+        // nothing in this thread: the activation and every install are in
+        // the log, the leader among them refreshes the authority once it
+        // runs, and a follower cannot hold a barrier before it hears its
+        // leader, which it does only once its owner runs.
+        let configuration = replica.configuration().configuration;
+        let founders_alone = configuration.voters.as_slice() == [plan.founder_node]
+            && configuration.learners.is_empty()
+            && configuration.voters_outgoing.is_empty()
+            && configuration.learners_next.is_empty()
+            && !configuration.auto_leave;
+        if plan.host != plan.founder_node || !founders_alone {
+            if !founders_alone && !configuration.contains(plan.host) {
+                return Err(DirectoryBootstrapError::Unauthorized);
+            }
+            // Recovery alone: what the replica had durable is published;
+            // what it lacks, its leader sends once it runs.
+            drop(replica.drain(&crate::cluster::NoDirectoryAuthority)?);
+            let recovered = replica
+                .partition()
+                .ok_or(DirectoryBootstrapError::Inconsistent)?;
+            if !plan.accepts(recovered.checkpoint()) {
+                return Err(DirectoryBootstrapError::Unauthorized);
+            }
+            return Ok(BootstrappedDirectory { replica, plan });
+        }
         // Single-voter recovery settles any previous unknown activation before
         // inspecting its durable receipt or selecting its successor sequence.
         establish_barrier(&mut replica, plan)?;
@@ -801,14 +929,28 @@ impl PartitionBootstrapPermit {
                 .checked_add(1)
                 .ok_or(DirectoryBootstrapError::Capacity)?,
         };
-        replica.submit(
-            ControlRequest {
-                id,
-                acknowledged_through: previous_sequence,
-                command,
-            },
-            &crate::cluster::NoDirectoryAuthority,
-        )?;
+        let request = ControlRequest {
+            id,
+            acknowledged_through: previous_sequence,
+            command,
+        };
+        // A refusal that changes nothing (its log's room, a write still to
+        // persist) is asked again after the next drain, within the rounds
+        // startup has; any other refusal ends startup, by its name.
+        let mut submitted = false;
+        for _ in 0..STARTUP_ROUNDS {
+            match replica.submit(request.clone(), &crate::cluster::NoDirectoryAuthority) {
+                Ok(_) => {
+                    submitted = true;
+                    break;
+                }
+                Err(error) if transient(&error) => drain_single(&mut replica, plan)?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !submitted {
+            return Err(DirectoryBootstrapError::NotReady);
+        }
         for _ in 0..STARTUP_ROUNDS {
             drain_single(&mut replica, plan)?;
             if replica.receipt(id)?.is_some() {
@@ -820,6 +962,19 @@ impl PartitionBootstrapPermit {
     }
 }
 
+/// A refusal of a submission that changed nothing and passes as the log
+/// drains: its uncommitted room, a write still to persist, its queue.
+fn transient(error: &ControlError) -> bool {
+    matches!(
+        error,
+        ControlError::NotReady
+            | ControlError::Busy
+            | ControlError::Consensus(
+                focal_consensus::ConsensusError::Capacity
+                    | focal_consensus::ConsensusError::PersistencePending
+            )
+    )
+}
 fn drain_single(
     replica: &mut ControlReplica,
     plan: FirstDirectoryPlan,

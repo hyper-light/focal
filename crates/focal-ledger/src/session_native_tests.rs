@@ -3,7 +3,7 @@
 //! checkpoint, restart, legacy refusal, and a replicated group where a replica
 //! without native hosting refuses native history at ingress until it hosts it.
 use super::*;
-use crate::native_session::tests::{ledger, limits as native_limits, store};
+use crate::native_session::tests::{ledger, limits as native_limits, limits_with_outcomes, store};
 use focal_consensus::{MessageType, SnapshotStatus};
 use focal_core::native::fixtures as fx;
 use focal_model::lifecycle::Binding;
@@ -119,6 +119,12 @@ struct Cluster {
     /// Replicas whose host is not sealing legacy payloads or pulling seed
     /// chunks yet: their retained delivery makes no progress.
     no_seal: Vec<u64>,
+    /// A replica whose appends and snapshots are held back (`held`) until
+    /// released: the way to make an answer overtake the entries it names.
+    hold_appends_to: Option<u64>,
+    held: Vec<Message>,
+    /// Every native read boundary a poll returned: (node, correlation, index).
+    boundaries: Vec<(u64, crate::ReadCorrelation, u64)>,
 }
 impl Cluster {
     fn new(size: u64, hosted: &[bool]) -> Self {
@@ -151,6 +157,9 @@ impl Cluster {
             refusals: Vec::new(),
             sealed: Vec::new(),
             no_seal: Vec::new(),
+            hold_appends_to: None,
+            held: Vec::new(),
+            boundaries: Vec::new(),
         }
     }
     fn node_ref(&self, id: u64) -> &Session {
@@ -179,6 +188,36 @@ impl Cluster {
         );
         self.nodes[id as usize - 1] = Some(node);
     }
+    /// A node that joins the group later, opened as a copy that knows the
+    /// voters of the moment: the placement agent's `open_copy`, in process.
+    fn join(&mut self, id: u64, hosted: bool) {
+        assert_eq!(id as usize, self.nodes.len() + 1);
+        let config = NodeConfig::joining(
+            id,
+            CLUSTER,
+            ledger().session.0,
+            self.voters.clone(),
+            Vec::new(),
+        );
+        // The writer creates the content directory the reader opens.
+        self.stores.push(writer(self.dir.path(), id));
+        let path = self.dir.path().join(format!("wal-{id}"));
+        let node = if hosted {
+            Session::open_hosted(
+                path,
+                ledger(),
+                config,
+                SessionLimits::default(),
+                hosting_with(self.dir.path(), id, self.limits),
+            )
+            .unwrap()
+        } else {
+            Session::open(path, ledger(), config, SessionLimits::default()).unwrap()
+        };
+        self.hosted.push(hosted);
+        self.nodes.push(Some(node));
+        self.voters.push(id);
+    }
     fn pump(&mut self, isolated: &[u64]) {
         for _ in 0..400 {
             if self.round(isolated) {
@@ -193,6 +232,8 @@ impl Cluster {
         {
             let mut messages = Vec::new();
             let mut progressed = false;
+            let mut recorded = Vec::new();
+            let mut delivered = false;
             for id in self.live() {
                 let node = self.node(id);
                 match node.poll() {
@@ -200,6 +241,12 @@ impl Cluster {
                         progressed |= !events.committed.is_empty()
                             || !events.native_committed.is_empty()
                             || !events.native_read_boundaries.is_empty();
+                        recorded.extend(
+                            events
+                                .native_read_boundaries
+                                .iter()
+                                .map(|boundary| (id, boundary.correlation, boundary.raft_index)),
+                        );
                         messages.extend(events.messages);
                     }
                     Err(LedgerError::Retry) => {
@@ -229,6 +276,7 @@ impl Cluster {
                     Err(error) => panic!("poll {id}: {error:?}"),
                 }
             }
+            self.boundaries.extend(recorded);
             if messages.is_empty() && !progressed {
                 return true;
             }
@@ -240,7 +288,15 @@ impl Cluster {
                 if !self.live().contains(&to) {
                     continue;
                 }
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                if self.hold_appends_to == Some(to)
+                    && (message.msg_type == MessageType::MsgAppend
+                        || message.msg_type == MessageType::MsgSnapshot)
+                {
+                    self.held.push(message);
+                    continue;
+                }
+                delivered = true;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 match self.node(to).step(message) {
                     Ok(()) => {}
                     Err(LedgerError::NativeUnsupported) => {
@@ -259,8 +315,19 @@ impl Cluster {
                         .unwrap();
                 }
             }
+            if !delivered && !progressed {
+                return true;
+            }
         }
         false
+    }
+    /// Deliver the held appends and snapshots, in the order they were sent.
+    fn release_held(&mut self) {
+        self.hold_appends_to = None;
+        for message in std::mem::take(&mut self.held) {
+            let to = message.to;
+            self.node(to).step(message).unwrap();
+        }
     }
     fn settle(&mut self, isolated: &[u64]) {
         for _ in 0..8 {
@@ -714,6 +781,101 @@ fn a_voter_without_native_hosting_blocks_activation_and_a_downgraded_replica_can
     let sequences = cluster.native_sequences();
     assert!(
         sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(2))),
+        "{sequences:?}"
+    );
+}
+
+/// A voter added after the activation was proposed never promised the
+/// successor decoder: its copy replays the founder's log, activation record
+/// included, and must promise as it meets the record and apply it once the
+/// promise is durable — as the ingress fence does for native history — and
+/// never fail closed (the KIND campaign of 2026-09-29, D2: both hosts added
+/// by `deployment apply` after `activate-native` stopped with Corrupt, the
+/// session stuck in Catchup for good).
+#[test]
+fn a_voter_added_after_a_genesis_activation_promises_the_successor_and_applies_it() {
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+    cluster.join(2, true);
+    // The leader admits a learner only once it has recorded the learner's
+    // durable promise of the successor decoder: the node's `ManagedSupport`
+    // probe, in process, asked again until the copy's promise is durable
+    // (the managed floor persists first, the successor's after it).
+    for _ in 0..8 {
+        cluster.exchange_support(&[]);
+        if cluster.node(2).native_support_ready() {
+            break;
+        }
+    }
+    cluster.exchange_support(&[]);
+    assert!(cluster.node(2).native_support_ready());
+    let learner = membership_request(
+        cluster.node_ref(1),
+        1,
+        MembershipChange::AddLearner { node: 2 },
+    );
+    cluster.node(1).propose_membership(&learner).unwrap();
+    for _ in 0..16 {
+        cluster.settle(&[]);
+        if cluster.node(2).activation().is_native() {
+            break;
+        }
+    }
+    assert!(
+        cluster.node(2).activation().is_native(),
+        "the joined copy never applied the activation: {:?}",
+        cluster.node(2).activation()
+    );
+    assert!(cluster.node(2).native_support_ready());
+    assert_eq!(
+        cluster.node(2).native_outcome(created.invocation).unwrap(),
+        Some(created)
+    );
+    // Promoted, it votes, and follows what the group commits natively. The
+    // addition invalidated the promises recorded under the configuration
+    // before it; the members state theirs again under the new one, as the
+    // node's probes do.
+    cluster.exchange_support(&[]);
+    let promotion = membership_request(
+        cluster.node_ref(1),
+        2,
+        MembershipChange::Promote { node: 2 },
+    );
+    cluster.node(1).propose_membership(&promotion).unwrap();
+    cluster.settle(&[]);
+    assert!(cluster.node(1).status().voters.contains(&2));
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    cluster.settle(&[]);
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(2))),
+        "{sequences:?}"
+    );
+    // Restarted, the copy opens with the bootstrap it was installed with —
+    // immutable, checked against its identity record — and replays its log
+    // from the start, activation record included: the record is judged
+    // against the configuration of its own index, not the latest.
+    cluster.stop(2);
+    let reopened = Session::open_hosted(
+        cluster.dir.path().join("wal-2"),
+        ledger(),
+        NodeConfig::joining(2, CLUSTER, ledger().session.0, vec![1], Vec::new()),
+        SessionLimits::default(),
+        hosting_with(cluster.dir.path(), 2, cluster.limits),
+    )
+    .unwrap();
+    cluster.nodes[1] = Some(reopened);
+    assert!(cluster.node(2).activation().is_native());
+    let third = creation(cluster.next(PARTIES.issuer), 3);
+    cluster.commit(1, PARTIES.issuer, third, &[]);
+    cluster.settle(&[]);
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(3))),
         "{sequences:?}"
     );
 }
@@ -1785,6 +1947,130 @@ fn native_records_stream_as_schema_two_deltas_on_the_continuous_sequence_line() 
     );
 }
 
+/// The node's own cursor entries on a native ledger: a lease whose cursor
+/// stands past the legacy prefix is renewed past its half-life, and its
+/// expiry advances the clock — both judged on the stream line, where the
+/// cursor's position is, and both replayed from the log by a restart.
+#[test]
+fn a_native_cursor_is_renewed_and_expired_by_the_nodes_own_entries_across_a_restart() {
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let stream = ancillary::stream_register(&mut cluster, 1);
+    let consumer = focal_stream::ConsumerId::from_u128(1);
+    let managed = |session: &Session, ordinal: u64, operation| {
+        let input = ancillary::cursor_input(session, 7_000 + u128::from(ordinal), operation);
+        ManagedCursorInput {
+            key: ManagedRequestKey {
+                stream,
+                ordinal,
+                id: RequestId::from_u128(7_000 + u128::from(ordinal)),
+            },
+            intent_hash: input.intent_hash,
+            command: input.command,
+        }
+    };
+    let submit = |cluster: &mut Cluster, input: ManagedCursorInput| match cluster
+        .node(1)
+        .propose_managed_cursor(&input, false)
+        .unwrap()
+    {
+        ManagedSubmission::Committed(_) => {}
+        ManagedSubmission::Pending(_) => cluster.pump(&[]),
+        ManagedSubmission::Domain(outcome) => panic!("{outcome:?}"),
+    };
+    let registration = managed(
+        cluster.node(1),
+        1,
+        focal_stream::CursorOperation::Register {
+            consumer,
+            scope: ContentHash([8; 32]),
+            filter: focal_stream::DeltaFilter::All,
+            start: focal_stream::Position::origin(ledger()),
+            expires_at: 1_000,
+        },
+    );
+    submit(&mut cluster, registration);
+    // Two native records, and the cursor acknowledges the second: its
+    // position is past the legacy prefix, which a genesis ledger ends at zero.
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let post = fx::post(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, post, &[]);
+    assert_eq!(cluster.node(1).sequence(), SessionSeq(0));
+    assert_eq!(cluster.node(1).stream_published(), SessionSeq(2));
+    let token = cluster.node(1).cursor(consumer).unwrap().token;
+    let position = focal_stream::Position::resolved(ledger(), SessionSeq(2));
+    let acknowledge = managed(
+        cluster.node(1),
+        2,
+        focal_stream::CursorOperation::Acknowledge {
+            token: focal_stream::CursorToken { position, ..token },
+        },
+    );
+    submit(&mut cluster, acknowledge);
+    let row = cluster.node(1).cursor(consumer).unwrap().clone();
+    assert_eq!(row.token.position, position);
+    assert_eq!(row.expires_at, 1_000);
+
+    // In its first half the lease is not renewed; past the half it is, by
+    // one entry of the node's own, and the cursor stays where it stands.
+    let generation = row.token.generation;
+    assert_eq!(
+        cluster
+            .node(1)
+            .propose_cursor_renewal(consumer, generation, 499, 1_499)
+            .unwrap(),
+        None
+    );
+    let target = cluster
+        .node(1)
+        .propose_cursor_renewal(consumer, generation, 600, 1_600)
+        .unwrap()
+        .expect("a lease past its half-life is renewed");
+    cluster.pump(&[]);
+    assert_eq!(cluster.node(1).cursor_revision(), target.revision);
+    assert_eq!(cluster.node(1).cursor_clock(), 600);
+    let renewed = cluster.node(1).cursor(consumer).unwrap().clone();
+    assert_eq!(renewed.expires_at, 1_600);
+    assert_eq!(renewed.token, row.token);
+
+    // The lease runs out: the clock advances through the log, the floor
+    // stays, and the cursor is released where it stood.
+    assert_eq!(cluster.node(1).next_cursor_expiry(), Some(1_600));
+    assert_eq!(cluster.node(1).propose_cursor_clock(1_599).unwrap(), None);
+    let target = cluster
+        .node(1)
+        .propose_cursor_clock(1_600)
+        .unwrap()
+        .expect("a due lease advances the clock");
+    cluster.pump(&[]);
+    assert_eq!(cluster.node(1).cursor_revision(), target.revision);
+    assert_eq!(cluster.node(1).cursor_clock(), 1_600);
+    assert_eq!(cluster.node(1).next_cursor_expiry(), None);
+    assert_eq!(cluster.node(1).stream_bounds().floor, SessionSeq(0));
+
+    // A restart replays both entries from the log to the same registry.
+    let before = (
+        cluster.node(1).cursor_revision(),
+        cluster.node(1).cursor_clock(),
+        cluster.node(1).cursor(consumer).cloned(),
+    );
+    cluster.stop(1);
+    cluster.reopen(1, true);
+    cluster.elect(1, &[]);
+    assert_eq!(
+        (
+            cluster.node(1).cursor_revision(),
+            cluster.node(1).cursor_clock(),
+            cluster.node(1).cursor(consumer).cloned(),
+        ),
+        before
+    );
+    assert_eq!(cluster.node(1).stream_published(), SessionSeq(2));
+}
+
 /// Retirement through the hosted session (26 §4): the authority applies
 /// the record it proposed through its committed core and is reconstructed
 /// at once, so linearizable reads answer with the continuation right after,
@@ -1877,44 +2163,254 @@ fn a_hosted_authority_retires_a_family_and_stays_authoritative() {
     assert_eq!(cluster.node(1).native_retention().unwrap().retired, 1);
 }
 
-/// The simulated disk as a backup medium: every install step is one
-/// operation the qualification can cut.
-struct SimMedium(focal_sim::disk::Disk);
-impl SimMedium {
-    fn io(error: focal_sim::disk::DiskError) -> std::io::Error {
-        std::io::Error::other(error.to_string())
-    }
+/// A follower's read answered by the leader above the follower's applied
+/// index (the audit's F55): the answer can reach the follower before the
+/// append that carries the index — replication lag, never corruption. The
+/// read is held, bounded and funded, the delivery goes on so the entries can
+/// arrive, and once they are applied the reader is answered at a prefix no
+/// older than the leader's commit at the time it asked.
+#[test]
+fn a_follower_read_answered_ahead_of_its_log_waits_for_the_entries_and_stays_live() {
+    let mut cluster = Cluster::new(3, &[true, true, true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let first = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.pump(&[]);
+    assert_eq!(cluster.status(2, 1), Some(ClaimStatus::Generated));
+    // The leader commits a second claim with node 3 while node 2's appends
+    // are held back.
+    cluster.hold_appends_to = Some(2);
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    assert_eq!(cluster.status(2, 2), None);
+    let leader_applied = cluster.node(1).status().applied_index;
+    // Node 2 asks a linearizable read. The leader confirms its commit
+    // index — beyond node 2's log — and the answer reaches node 2 while the
+    // appends are still held: the read waits and the replica stays live.
+    let correlation = crate::ReadCorrelation([21; 16]);
+    cluster.node(2).native_read_index(correlation).unwrap();
+    cluster.pump(&[]);
+    assert!(
+        !cluster
+            .boundaries
+            .iter()
+            .any(|(node, c, _)| *node == 2 && *c == correlation),
+        "{:?}",
+        cluster.boundaries
+    );
+    assert_eq!(cluster.node(2).reads_parked(), 1);
+    assert_eq!(cluster.node(2).reads_dropped(), 0);
+    assert_eq!(cluster.status(2, 2), None);
+    // The appends arrive: node 2 applies them and answers the read at the
+    // leader's prefix.
+    cluster.release_held();
+    cluster.settle(&[]);
+    cluster.pump(&[]);
+    let (_, _, index) = cluster
+        .boundaries
+        .iter()
+        .find(|(node, c, _)| *node == 2 && *c == correlation)
+        .copied()
+        .unwrap_or_else(|| panic!("{:?}", cluster.boundaries));
+    assert!(index >= leader_applied, "{index} < {leader_applied}");
+    assert!(cluster.node(2).status().applied_index >= index);
+    assert_eq!(cluster.status(2, 2), Some(ClaimStatus::Generated));
+    // Caught up, the next read is answered without waiting.
+    let again = crate::ReadCorrelation([22; 16]);
+    cluster.node(2).native_read_index(again).unwrap();
+    cluster.pump(&[]);
+    assert!(
+        cluster
+            .boundaries
+            .iter()
+            .any(|(node, c, _)| *node == 2 && *c == again),
+        "{:?}",
+        cluster.boundaries
+    );
+    assert_eq!(cluster.node(2).reads_parked(), 1);
 }
-impl backup::BackupMedium for SimMedium {
-    fn create_dir(&mut self, _: &Path) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn create(&mut self, path: &Path) -> std::io::Result<()> {
-        self.0.create(path).map_err(Self::io)
-    }
-    fn write(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        let offset = self.0.read(path).map_err(Self::io)?.len();
-        self.0.write(path, offset, bytes).map_err(Self::io)
-    }
-    fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
-        self.0.sync_file(path).map_err(Self::io)
-    }
-    fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
-        self.0.sync_dir(path).map_err(Self::io)
-    }
-    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-        self.0.rename(from, to).map_err(Self::io)
-    }
-    fn exists(&self, path: &Path) -> bool {
-        self.0.read(path).is_ok()
-    }
-    fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
-        let bytes = self.0.read(path).map_err(Self::io)?;
-        if bytes.len() > limit {
-            return Err(std::io::Error::other("bound"));
+
+/// A reconstruction refused after the retirement record applied (memory):
+/// the record stays applied once, the poll is retried — never failed as
+/// corruption because the resumed delivery met an entry already applied —
+/// and the next poll rebuilds the authority, which admits work again.
+#[test]
+fn a_reconstruction_refused_after_the_record_applied_is_retried_without_reapplying_it() {
+    use focal_core::native::NativeCommand;
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, cancel, &[]);
+    let expected = cluster.claim(1, 1);
+    let release = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::ReleaseScope { expected },
+    };
+    cluster.commit(1, PARTIES.issuer, release, &[]);
+    let (bundle, length, through) = {
+        let node = cluster.node(1);
+        let limits = node.native_encoding_limits().unwrap();
+        let core = node.native_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core.archive_family_quote(&family, through, limits).unwrap();
+        (quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .native_propose_retirement(ClaimId::from_u128(1), bundle, length, through)
+        .unwrap();
+    cluster.node(1).refuse_next_reconstruction_for_test();
+    let mut polls = Vec::new();
+    for _ in 0..32 {
+        match cluster.node(1).poll() {
+            Ok(_) => polls.push("ok"),
+            Err(LedgerError::Retry) => polls.push("retry"),
+            Err(error) => panic!("{error:?} after {polls:?}"),
         }
-        Ok(bytes.to_vec())
+        if cluster.node(1).native_authoritative()
+            && !cluster.node(1).native_retention().unwrap().retiring
+        {
+            break;
+        }
     }
+    assert!(polls.contains(&"retry"), "{polls:?}");
+    assert!(cluster.node(1).native_authoritative(), "{polls:?}");
+    let report = cluster.node(1).native_retention().unwrap();
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(!report.retiring);
+    assert_eq!(cluster.status(1, 1), None);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(4));
+    // Admission continues on the rebuilt authority.
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    assert_eq!(cluster.status(1, 2), Some(ClaimStatus::Generated));
+}
+
+/// The hosted authority at the outcome bound (26 §4): one under it the
+/// retirement is allowed and the authority, reconstructed over the retired
+/// core at once, stays authoritative and admits nothing fresh past the
+/// bound; at it the retirement is refused before proposal, nothing is in
+/// flight and the authority stays authoritative.
+#[test]
+fn a_hosted_authority_retires_under_the_outcome_bound_and_is_refused_at_it() {
+    use focal_core::native::NativeCommand;
+    use focal_core::native::retirement::RetirementRefusal;
+    fn finished(cluster: &mut Cluster) -> NativeOutcome {
+        let create = creation(cluster.next(PARTIES.issuer), 1);
+        let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+        let expected = cluster.claim(1, 1);
+        let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+        cluster.commit(1, PARTIES.issuer, cancel, &[]);
+        let expected = cluster.claim(1, 1);
+        let release = NativeInput {
+            request: cluster.next(PARTIES.issuer),
+            command: NativeCommand::ReleaseScope { expected },
+        };
+        cluster.commit(1, PARTIES.issuer, release, &[]);
+        created
+    }
+    // One under the bound: allowed.
+    let mut cluster = Cluster::with_limits(1, &[true], limits_with_outcomes(4));
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let created = finished(&mut cluster);
+    let request = created.invocation;
+    let (bundle, length, through) = {
+        let node = cluster.node(1);
+        let limits = node.native_encoding_limits().unwrap();
+        let core = node.native_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core.archive_family_quote(&family, through, limits).unwrap();
+        (quote.hash, quote.bytes as u64, through)
+    };
+    cluster.node(1).native_check_retirement().unwrap();
+    cluster
+        .node(1)
+        .native_propose_retirement(ClaimId::from_u128(1), bundle, length, through)
+        .unwrap();
+    assert!(cluster.node(1).native_retention().unwrap().retiring);
+    cluster.pump(&[]);
+    let report = cluster.node(1).native_retention().unwrap();
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(!report.retiring);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(4));
+    assert_eq!(cluster.node(1).native_retirements_inert().unwrap(), 0);
+    assert!(
+        cluster.node(1).native_authoritative(),
+        "the owner rebuilds under the bound right after the record applies"
+    );
+    assert_eq!(cluster.status(1, 1), None);
+    let focal_core::native::NativeInvocation::Request(request) = request else {
+        panic!("a creation is a request")
+    };
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    let store = &mut cluster.stores[0];
+    assert_eq!(
+        cluster.nodes[0]
+            .as_mut()
+            .unwrap()
+            .propose_native(
+                context(PARTIES.issuer, clock),
+                creation(request, 1),
+                NativeCustody::Store(store)
+            )
+            .unwrap(),
+        NativeSubmission::Committed(created)
+    );
+    // Nothing fresh fits past the bound, and the authority says so itself.
+    let fresh = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    let store = &mut cluster.stores[0];
+    assert!(matches!(
+        cluster.nodes[0].as_mut().unwrap().propose_native(
+            context(PARTIES.issuer, clock),
+            fresh,
+            NativeCustody::Store(store)
+        ),
+        Err(LedgerError::Native(NativeSessionError::Owner(
+            NativeOwnerError::Native(focal_core::native::NativeError::Capacity("outcomes"))
+        )))
+    ));
+    assert!(cluster.node(1).native_authoritative());
+    // At the bound: refused, nothing in flight, the authority untouched.
+    let mut cluster = Cluster::with_limits(1, &[true], limits_with_outcomes(3));
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    finished(&mut cluster);
+    let through = cluster.node(1).native_sequence().unwrap();
+    assert!(matches!(
+        cluster.node(1).native_check_retirement(),
+        Err(LedgerError::Native(NativeSessionError::Retirement(
+            RetirementRefusal::OutcomeCapacity
+        )))
+    ));
+    assert!(matches!(
+        cluster.node(1).native_propose_retirement(
+            ClaimId::from_u128(1),
+            ContentHash([9; 32]),
+            1,
+            through
+        ),
+        Err(LedgerError::Native(NativeSessionError::Retirement(
+            RetirementRefusal::OutcomeCapacity
+        )))
+    ));
+    let report = cluster.node(1).native_retention().unwrap();
+    assert!(!report.retiring, "{report:?}");
+    assert_eq!(report.retired, 0);
+    assert!(cluster.node(1).native_authoritative());
+    cluster.pump(&[]);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(3));
+    assert_eq!(cluster.status(1, 1), Some(ClaimStatus::Cancelled));
 }
 
 /// A hosted session with a work artifact whose payload the node sealed,
@@ -1995,7 +2491,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     let decoder = backup::decoder_pair();
     let root = Path::new("/backup");
     // The complete write.
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     let report = backup::write(
         &mut medium,
         root,
@@ -2043,17 +2539,17 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     // Every durable cut before the manifest leaves no backup; the survivors
     // are whole files or absent.
     let operations = {
-        let mut probe = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+        let mut probe = focal_sim::disk::Disk::new(64 * 1024 * 1024);
         backup::write(
             &mut probe, root, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
         )
         .unwrap();
-        probe.0.operations()
+        probe.operations()
     };
     assert!(operations > 5);
     for cut in 1..=operations {
-        let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
-        medium.0.fail_before(Some(cut));
+        let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
+        medium.fail_before(Some(cut));
         let result = backup::write(
             &mut medium,
             root,
@@ -2065,7 +2561,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
             &budget,
             1_000,
         );
-        medium.0.crash();
+        medium.crash();
         match result {
             Ok(_) => {
                 assert_eq!(cut, operations + 1, "a cut inside the write cannot succeed");
@@ -2080,7 +2576,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         }
     }
     // A tampered chunk and a tampered envelope are named.
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     backup::write(
         &mut medium,
         root,
@@ -2095,7 +2591,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     .unwrap();
     let chunk = report.manifest.content[0].chunks[0].hash;
     let path = root.join("content").join(format!("{chunk}.chunk"));
-    medium.0.write(&path, 0, &[0xff]).unwrap();
+    medium.write(&path, 0, &[0xff]).unwrap();
     let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
     assert!(!tampered.complete());
     assert!(
@@ -2106,7 +2602,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         "{:?}",
         tampered.problems
     );
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     backup::write(
         &mut medium,
         root,
@@ -2119,7 +2615,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         1_000,
     )
     .unwrap();
-    medium.0.write(root.join("checkpoint"), 3, &[0xff]).unwrap();
+    medium.write(root.join("checkpoint"), 3, &[0xff]).unwrap();
     let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
     assert!(!tampered.checkpoint_verified && !tampered.inventory_matches);
     // The real filesystem medium writes the same backup.
@@ -2147,7 +2643,7 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
     let decoder = backup::decoder_pair();
     let root = Path::new("/backup");
-    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
     let report = backup::write(
         &mut medium,
         root,
@@ -2164,7 +2660,6 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     for chunk in &report.manifest.seeds {
         assert!(
             medium
-                .0
                 .read(root.join("seeds").join(format!("{}.seed", chunk.hash)))
                 .is_ok()
         );
@@ -2175,7 +2670,7 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     // A missing seed chunk is named and the envelope cannot be rebuilt.
     let first = report.manifest.seeds[0].hash;
     let path = root.join("seeds").join(format!("{first}.seed"));
-    medium.0.rename(&path, root.join("gone")).unwrap();
+    medium.rename(&path, root.join("gone")).unwrap();
     let broken = backup::verify(&medium, root, decoder.1, &budget).unwrap();
     assert!(!broken.complete());
     assert!(
@@ -2456,7 +2951,7 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
                         | ContentRoot::Inline { pointer, .. } => {
                             protection.protect_object(domain, pointer.root).unwrap();
                         }
-                        ContentRoot::Bundle { root, .. } => {
+                        ContentRoot::Bundle { root, .. } | ContentRoot::Seal { root, .. } => {
                             protection.protect_object(domain, root).unwrap();
                         }
                     }
@@ -2594,4 +3089,18 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
     assert_eq!(written.manifest.retired_families, ROUNDS as u64);
     let verified = backup::verify(&files, &dir, backup::decoder_pair().1, &budget).unwrap();
     assert!(verified.complete(), "{:?}", verified.problems);
+}
+
+fn membership_request(
+    session: &Session,
+    id: u8,
+    change: MembershipChange,
+) -> SessionMembershipRequest {
+    let view = session.membership().unwrap();
+    SessionMembershipRequest {
+        id: [id; 16],
+        expected_index: view.configuration_index,
+        expected: view.configuration,
+        change,
+    }
 }

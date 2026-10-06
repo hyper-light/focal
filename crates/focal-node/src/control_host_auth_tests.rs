@@ -100,13 +100,13 @@ async fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_
     let revoke = revocation(&network);
     let group = network.control.identity().group;
     let mut message = focal_consensus::Message::default();
-    message.set_msg_type(focal_consensus::MessageType::MsgHeartbeatResponse);
+    message.msg_type = focal_consensus::MessageType::MsgHeartbeatResponse;
     message.from = network.directory.identity().node;
     message.to = message.from;
     message.term = network.control.status().term;
     let raft_operation = Operation::Raft {
         group,
-        message: message.write_to_bytes().unwrap(),
+        message: focal_consensus::encode_message(&message).unwrap(),
     };
     // Both requests pass transport verification before revocation. The registry
     // intentionally remains stale: only the owner sees the committed change.
@@ -175,6 +175,13 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
             applied_index: network.control.applied_index(),
             revisions: network.control.revisions(),
             dropped_replication: 0,
+            peers_unreachable: 0,
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
+            peer_reports_coalesced: 0,
+            peer_reports_dropped: 0,
             stopped: false,
             snapshot_index: 0,
             peers: Vec::new(),
@@ -182,7 +189,9 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         },
         _allocation: None,
     });
+    let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
     let mut owner = Owner {
+        stopping: None,
         replica: network.control,
         initial: None,
         verifier: NoDirectoryAuthority,
@@ -197,6 +206,23 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         progress,
         nonce: 0,
         dropped: 0,
+        ordered: std::collections::BTreeMap::new(),
+        resequencer: crate::resequence::Resequencer::new(
+            focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+            crate::fleet::LOST_PEERS,
+        ),
+        stepped: Vec::new(),
+        appends_rejected: 0,
+        frames_held: 0,
+        frames_let_go: 0,
+        frames_stale: 0,
+        took_turn: false,
+        unreachable: 0,
+        lost_sender: lost.0,
+        lost: lost.1,
+        lost_peers: Vec::new(),
+        lost_coalesced: 0,
+        lost_dropped: 0,
         failure: None,
         pace: Default::default(),
     };

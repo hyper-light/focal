@@ -229,7 +229,12 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
     // The controller installs committed grants on its bounded refresh loop.
     // Keep using the same MCP connector/QUIC connection until that projection
     // observes the revoke, then require its next request to remain denied.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Charged to the founder's root periods: its root applies the revoke,
+    // and the controller refreshes on the root's next applied index.
+    let mut wait = super::progress::Progress::begin(
+        vec![Box::new(root_periods(founder.path()))],
+        Duration::from_secs(5),
+    );
     loop {
         let result = mcp.response("claim.list", json!({}));
         if result["isError"] == true {
@@ -242,10 +247,9 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
             );
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "revoked grant was retained"
-        );
+        if let Some(spent) = wait.spent() {
+            panic!("revoked grant was retained: {spent}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(mcp.response("claim.list", json!({}))["isError"], true);

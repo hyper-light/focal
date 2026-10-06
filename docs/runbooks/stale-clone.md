@@ -6,16 +6,16 @@ restored snapshot started beside the original), or runs instead of it from an ol
 **Symptoms.** The clone starts and publishes readiness but never leaves `catching_up`: its
 contact announcement is refused because the original still answers at the committed
 address ([24 §24](../archictecutre/24-placement-execution-and-fleet-control.md)),
-`cluster placement` keeps showing the original's `advertise`, and the clone's `cluster node
-health` shows the placement agent idle with no root leader. An older image started
+`cluster placement` keeps showing the original's `advertise`, and the clone's `diagnose node
+--health` shows the placement agent idle with no root leader. An older image started
 *instead* of the node rejoins as a follower and replays forward from the leader.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir CLONE cluster node identity        # the same node id as the original
+focal --data-dir CLONE diagnose node --identity        # the same node id as the original
 focal --data-dir FOUNDER cluster placement          # whose advertise the root holds
-focal --data-dir CLONE cluster node readiness       # catching_up stays false, authoritative false
+focal --data-dir CLONE diagnose node --readiness       # catching_up stays false, authoritative false
 ```
 
 **Preconditions.** A node's identity is its enrolled key: two processes with one key are one

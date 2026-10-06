@@ -222,7 +222,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     let session = identity["session"].as_str().unwrap().to_owned();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let alice = enroll(root, client.path(), "alice");
@@ -286,7 +286,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise_b = address();
     let server_b = start(root_b, &advertise_b);
-    let identity_b = admin(root_b, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity_b =
+        admin(root_b, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
     assert_ne!(identity_b["cluster"], identity["cluster"]);
     let admitted = admin(
         root_b,

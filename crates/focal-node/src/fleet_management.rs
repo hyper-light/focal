@@ -23,6 +23,14 @@ pub struct FleetIncarnation {
     owner: OwnerId,
     sequence: u64,
 }
+impl FleetIncarnation {
+    /// The installation's place in its manager's sequence: no two
+    /// installations of one manager share it, so a session installed again
+    /// has another.
+    pub(crate) fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FleetStatus {
     pub latest_sequence: u64,
@@ -154,7 +162,7 @@ pub(in crate::fleet) enum ManagementWork {
         _permit: ManagementPermit,
     },
 }
-struct ManagementState {
+pub(crate) struct ManagementState {
     status: FleetStatus,
     quiesced: bool,
     // The sole bounded installation registry doubles as the read-only routing
@@ -171,7 +179,7 @@ struct ManagementState {
 }
 #[derive(Clone)]
 pub struct FleetManager {
-    sender: mpsc::SyncSender<FleetInput>,
+    sender: OwnerQueue,
     state: watch::Receiver<ManagementState>,
     budget: MemoryBudget,
     slots: MemoryBudget,
@@ -181,8 +189,25 @@ impl FleetManager {
         let state = self.state.borrow();
         (state.node, state.cluster)
     }
+    /// What the fleet is, as it changes: for a driver that waits on an
+    /// install or a removal instead of asking at intervals.
+    pub(crate) fn changes(&self) -> watch::Receiver<ManagementState> {
+        self.state.clone()
+    }
     pub fn status(&self) -> FleetStatus {
         self.state.borrow().status
+    }
+    /// How many installed hosts say of themselves that they stopped: a
+    /// host publishes it before its stop is answered, where the fleet's
+    /// `running` follows a round of the worker later. What asks whether
+    /// the owners run (readiness's `serving`, 24 §15) asks the hosts.
+    pub fn stopped_hosts(&self) -> usize {
+        self.state
+            .borrow()
+            .entries
+            .values()
+            .filter(|entry| entry.host.progress().stopped)
+            .count()
     }
     /// Trusted in-process routing lookup. The caller must authorize the tenant
     /// before calling. A short watch borrow clones only the current fenced host;
@@ -195,7 +220,12 @@ impl FleetManager {
         ledger: LedgerId,
     ) -> Result<([u8; 16], ReplicaHost), FleetError> {
         let state = self.state.borrow();
-        if state.status.stopped || state.quiesced {
+        // A quiesced fleet installs nothing and lists nothing, but it still
+        // routes to the sessions it holds while they stop one at a time: a
+        // stopping leader hands its log off (27 §5), which is its peers'
+        // messages until the log leads elsewhere, and each session refuses
+        // for itself what a stop must refuse.
+        if state.status.stopped {
             return Err(FleetError::Unavailable);
         }
         let entry = state.entries.get(&ledger).ok_or(FleetError::Unavailable)?;
@@ -262,8 +292,25 @@ impl FleetManager {
         state
             .entries
             .range((lower, std::ops::Bound::Unbounded))
-            .find(|(_, entry)| !entry.host.progress().stopped)
+            .find(|(_, entry)| !entry.host.observe(|progress| progress.stopped))
             .map(|(ledger, entry)| (*ledger, entry.host.clone()))
+    }
+    /// Visits every installed replica in ledger order, stopped ones too,
+    /// with its installation's incarnation and without copying a host: the
+    /// hosted set a view over all sessions covers (the audit's F26). Nothing while the fleet stops or
+    /// quiesces, as `next_host`. The visit holds the fleet's registry for
+    /// its length, so `visit` asks nothing of the fleet.
+    pub(crate) fn visit_hosted(
+        &self,
+        mut visit: impl FnMut(LedgerId, FleetIncarnation, &ReplicaHost),
+    ) {
+        let state = self.state.borrow();
+        if state.status.stopped || state.quiesced {
+            return;
+        }
+        for (ledger, entry) in &state.entries {
+            visit(*ledger, entry.incarnation, &entry.host);
+        }
     }
     fn permit(&self) -> Result<ManagementPermit, FleetError> {
         if self.status().stopped {
@@ -300,9 +347,10 @@ impl FleetManager {
             || candidate.session.status().node_id != state.node
             || candidate.session.cluster_id() != state.cluster
             || !candidate.session.is_budgeted_within(tenant)
-            || !state
-                .writers
-                .contains(&candidate.session.shared_wal().writer_id())
+            || !candidate
+                .session
+                .shared_wal()
+                .is_ok_and(|wal| state.writers.contains(&wal.writer_id()))
             || candidate.config.queue_items < 4
             || candidate
                 .session
@@ -336,7 +384,7 @@ impl FleetManager {
             permit,
         });
         if let Err(error) = self.sender.try_send(input) {
-            let (error, input) = match error {
+            let (error, input) = match *error {
                 mpsc::TrySendError::Full(input) => (FleetError::Capacity, input),
                 mpsc::TrySendError::Disconnected(input) => (FleetError::Unavailable, input),
             };
@@ -389,7 +437,7 @@ impl FleetManager {
     fn send(&self, work: ManagementWork) -> Result<(), FleetError> {
         self.sender
             .try_send(FleetInput::Management(work))
-            .map_err(|error| match error {
+            .map_err(|error| match *error {
                 mpsc::TrySendError::Full(_) => FleetError::Capacity,
                 mpsc::TrySendError::Disconnected(_) => FleetError::Unavailable,
             })
@@ -447,7 +495,10 @@ impl FleetManager {
     /// after shutdown admission; its proposals retain unknown outcomes. Canceling
     /// this future leaves the fleet quiesced: resume it or call shutdown, then
     /// join the owner. The embedding service supplies its overall grace deadline.
-    pub async fn stop_all(&self) -> Result<(), FleetError> {
+    /// Stops every session; how many this node led at the stop and how
+    /// many of those it handed off (27 §5).
+    pub async fn stop_all(&self) -> Result<FleetStopReport, FleetError> {
+        let mut report = FleetStopReport::default();
         let permit = self.permit()?;
         let (reply, receive) = oneshot::channel();
         self.send(ManagementWork::Quiesce {
@@ -474,10 +525,16 @@ impl FleetManager {
             if host.stop().await.is_err() {
                 complete = false;
             }
+            if let Some(hand_off) = host.progress().stop_hand_off {
+                report.sessions_led = report.sessions_led.saturating_add(1);
+                if hand_off.completed {
+                    report.sessions_handed_off = report.sessions_handed_off.saturating_add(1);
+                }
+            }
         }
         self.shutdown().await?;
         if complete {
-            Ok(())
+            Ok(report)
         } else {
             Err(FleetError::Unavailable)
         }
@@ -498,13 +555,20 @@ enum Latest {
     Installed(Box<FleetInstallation>),
     Removed(FleetRemoval),
 }
+/// What a fleet's stop handed off: the sessions this node led when the stop
+/// began, and those whose log led elsewhere before their replica stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FleetStopReport {
+    pub sessions_led: u32,
+    pub sessions_handed_off: u32,
+}
 pub(super) struct ManagementOwner {
     state: watch::Sender<ManagementState>,
     latest: Option<Latest>,
     sequence: u64,
     owner: OwnerId,
     max_sessions: usize,
-    sender: mpsc::SyncSender<FleetInput>,
+    sender: OwnerQueue,
     outbound: async_mpsc::Sender<ReplicationFrame>,
     /// The queue-slot allowance every tenant's per-session slots descend from.
     items: MemoryBudget,
@@ -613,7 +677,10 @@ impl ManagementOwner {
             if previous.ledger == ledger
                 && previous.group == replica.session.group_id()
                 && previous.config == replica.config
-                && previous.writer == replica.session.shared_wal().writer_id()
+                && replica
+                    .session
+                    .shared_wal()
+                    .is_ok_and(|wal| previous.writer == wal.writer_id())
             {
                 return Ok(previous);
             }
@@ -656,7 +723,11 @@ impl ManagementOwner {
             owner: self.owner,
             sequence,
         };
-        let writer = replica.session.shared_wal().writer_id();
+        let writer = replica
+            .session
+            .shared_wal()
+            .map_err(|_| FleetError::InvalidSession)?
+            .writer_id();
         let id = replica.session.group_id();
         let config = replica.config.clone();
         let sender = HostSender::Group {
@@ -681,6 +752,10 @@ impl ManagementOwner {
             .send_modify(|progress| progress._allocation = Some(allocation));
         session.incarnation = sequence;
         session.nonblocking = true;
+        session.batching = true;
+        session
+            .session
+            .notify_persisted(Some(self.sender.persisted(ledger)));
         let now = Instant::now();
         session.next_tick = now;
         session.wake_at = now;
@@ -885,6 +960,7 @@ impl ReplicaFleet {
         }
         let shared_bytes = size_of::<FleetInput>()
             .checked_add(size_of::<ReplicationFrame>())
+            .and_then(|size| size.checked_add(size_of::<Signal>()))
             .and_then(|size| size.checked_add(128))
             .and_then(|size| QUEUED.checked_mul(size))
             .and_then(|bytes| bytes.checked_add(policy_bytes))
@@ -921,7 +997,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, receiver) = mpsc::sync_channel(QUEUED);
+        let (sender, (receiver, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
@@ -959,6 +1035,9 @@ impl ReplicaFleet {
             sessions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             scheduler,
+            signals,
+            overflows,
+            unwoken: std::collections::BTreeSet::new(),
             nonce: 0,
             management: Some(management),
             _wal_owners: writers,

@@ -9,7 +9,7 @@ pub(super) use history_assembly::visit_history;
 
 #[path = "original_plan.rs"]
 mod original_plan;
-pub(super) use original_plan::{OriginalPlan, SealedChanges};
+pub(super) use original_plan::{Admitted, OriginalPlan, SealedChanges};
 
 #[derive(Clone, Copy)]
 pub(super) struct History {
@@ -88,15 +88,27 @@ fn record_fact(
 pub(super) fn changes(
     plan: transactions::Plan,
     extras: Extras,
-    meta: Meta,
+    mut meta: Meta,
     outcome: NativeOutcome,
     view: &View<'_>,
     limits: NativeLimits,
     allowance: usize,
     scratch: &mut Scratch,
 ) -> Result<Vec<Change<Key, Row>>, NativeError> {
-    original_plan::OriginalPlan::check(plan, extras, meta, outcome, view, limits, scratch)?
-        .into_changes(allowance, scratch)
+    let window = super::epochs::staged(view, &mut meta, outcome, limits);
+    original_plan::OriginalPlan::check(
+        plan,
+        extras,
+        Admitted {
+            meta,
+            outcome,
+            window,
+        },
+        view,
+        limits,
+        scratch,
+    )?
+    .into_changes(allowance, scratch)
 }
 
 fn append_rows(

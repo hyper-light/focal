@@ -78,9 +78,19 @@ impl Fleet {
                 return;
             }
             if let Err(spent) = wait.check(&self.periods()) {
+                // Each replica's progress, and its owner's periods: run, run
+                // without the replica's tick, and the longest.
                 panic!(
                     "leadership never reached {node}: {spent}; {:?}",
-                    self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
+                    self.hosts
+                        .iter()
+                        .map(|host| (
+                            host.progress(),
+                            host.periods(),
+                            host.refused_periods(),
+                            host.longest_period()
+                        ))
+                        .collect::<Vec<_>>()
                 );
             }
             tokio::time::sleep(TICK).await;

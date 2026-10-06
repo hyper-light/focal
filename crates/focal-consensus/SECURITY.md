@@ -1,17 +1,32 @@
 # Raft codec boundary
 
-The wire and log types are those of `raft-proto` with `prost-codec` alone, on the [audited immutable upstream revision](../../docs/dependencies/raft-upstream.md); the core that uses them is `focal-raft`, and `raft` itself is a test dependency of that crate. Native upstream `protocompat` delegates decoding to Prost. The affected Rust `protobuf` 2.28 runtime and unmaintained `fxhash` are removed from the workspace graph; no advisory is suppressed. Build-only `protobuf-src` C++ compiler sources are a separate dependency included in the inventory.
+The core is hyper-raft, vendored from the shared repository (`vendor/hyper-raft/SNAPSHOT`); its
+messages, entries, hard states and snapshots are its own types, with typed kinds. focal's WAL and
+wire hold them in raft-rs 0.7's protocol-buffer encoding, as they always have, through focal's own
+codec (`src/envelope.rs`). No protocol-buffer runtime ships: neither Prost nor the Rust `protobuf`
+runtime is in the shipped graph, and `raft-proto` is a test dependency only, the oracle the codec is
+held to.
 
-Every retained entry, hard state, snapshot, configuration-change payload, and peer message uses bounded `merge_from_bytes` decoding. `decode_message` enforces a nine MiB input limit. Network adapters additionally enforce framing limits before allocation and use `step_authenticated` to bind the decoded sender to the verified certificate. Authentication does not replace resource limits.
+Every retained entry, hard state, snapshot, configuration-change payload and peer message is read by
+the envelope's bounded reader: every length and varint is checked against the bytes that remain
+before anything is taken, every buffer is reserved fallibly at its exact size, and a field number
+outside 1 to 2^29 − 1, a known field of another wire type, a varint past ten bytes, a group (proto3
+has none, and no raft-rs message holds one) and a kind the core does not name are refused before
+the core sees them. `decode_message` enforces a nine MiB input limit and reports every refusal as
+`MalformedMessage`. Network adapters additionally enforce framing limits before allocation and use
+`step_authenticated` to bind the decoded sender to the verified certificate. Authentication does not
+replace resource limits.
 
-Tests exercise 100,000 nested unknown groups, fixed original protobuf encoder fixtures, and actual recovery from old protobuf snapshot/hard-state WAL records. The original snapshot encoder uses unpacked voters; Prost may write packed voters, and both recover to the same typed state. Application canonical hashing is independent of protobuf serialization.
+`src/envelope_tests.rs` holds the codec to raft-proto: 4,096 generated values of each type written to
+raft-proto's own bytes exactly and read back, every prefix and one-byte mutation of generated
+messages read as raft-proto reads them, and the refusals above. `src/tests.rs` keeps the fixed
+original protobuf encoder fixtures (read, and written again byte for byte), actual recovery from old
+protobuf snapshot/hard-state WAL records, and 100,000 nested groups. The original snapshot encoder
+uses unpacked voters; the envelope writes them packed, as Prost does, and both recover to the same
+typed state. Application canonical hashing is independent of the envelope.
 
-The adapter rejects malformed append sequences, unknown message, entry,
-configuration-change and transition enum values, changes that do not decode, and
-exhausted term/index counters before invoking the core. The accessors the wire
-types generate for their enumerations unwind on a value they do not know; they
-are forbidden in production by lint (`clippy.toml`, `disallowed-methods`), and
-the core reads those values as options.
+The adapter rejects malformed append sequences, changes that do not read, and exhausted term/index
+counters before invoking the core.
 
 The core returns what it refuses and never asserts. A refusal, and a peer's
 message that contradicts what the member holds, change nothing and stop no one.

@@ -165,7 +165,7 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    let health = command(root, &["cluster", "node", "health"]);
+    let health = command(root, &["diagnose", "node", "--health"]);
     panic!(
         "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -271,7 +271,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
             assert!(
                 deadline.open(),
                 "registration did not happen; host agent: {}",
-                String::from_utf8_lossy(&command(host_a, &["cluster", "node", "health"]).stdout)
+                String::from_utf8_lossy(&command(host_a, &["diagnose", "node", "--health"]).stdout)
             );
             std::thread::sleep(Duration::from_millis(150));
         }
@@ -311,32 +311,26 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     // it is authoritative and not catching up; the policy holds once the
     // expansion activated; host A leads the new session.
     let readiness =
-        success(founder, &["cluster", "node", "readiness"])["result"]["readiness"].clone();
+        success(founder, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone();
     assert_eq!(readiness["alive"], true, "{readiness}");
     assert_eq!(readiness["authoritative"], true);
     assert_eq!(readiness["catching_up"], false);
     assert_eq!(readiness["policy_satisfied"], true, "{readiness}");
     assert!(
-        command(founder, &["cluster", "node", "probe", "--check", "alive"])
+        command(founder, &["diagnose", "node", "--probe", "alive"])
             .status
             .success()
     );
     assert!(
-        command(
-            founder,
-            &["cluster", "node", "probe", "--check", "authoritative"]
-        )
-        .status
-        .success()
+        command(founder, &["diagnose", "node", "--probe", "authoritative"])
+            .status
+            .success()
     );
-    let output = command(
-        founder,
-        &["cluster", "node", "probe", "--check", "catching-up"],
-    );
+    let output = command(founder, &["diagnose", "node", "--probe", "catching-up"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("[probe_failed]"));
     let host_readiness =
-        success(host_a, &["cluster", "node", "readiness"])["result"]["readiness"].clone();
+        success(host_a, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone();
     assert_eq!(host_readiness["authoritative"], true, "{host_readiness}");
     assert!(
         host_readiness["sessions"]
@@ -349,7 +343,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
         "{host_readiness}"
     );
     // The founder still holds no copy: its replica list does not name the session.
-    let health = success(founder, &["cluster", "node", "health"])["result"]["health"].clone();
+    let health = success(founder, &["diagnose", "node", "--health"])["result"]["health"].clone();
     assert!(
         !health["placement"]["installed"]
             .as_array()

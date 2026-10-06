@@ -31,7 +31,25 @@ pub(super) struct ConstructionBudget {
     /// The due-timer rows among `max_index_rows` this operation can retire:
     /// the deletions a write envelope must admit beyond status moves.
     pub(super) max_timer_rows: usize,
+    /// The scratch the principal's window copy takes (F12): its ranges at
+    /// the bound; zero for a timer, which writes no window.
+    pub(super) window_bytes: usize,
 }
+
+/// Whether the operation is a trusted timer's: no request generation, no
+/// window row.
+pub(super) fn timer(operation: NativeOperation) -> bool {
+    matches!(
+        operation,
+        NativeOperation::EvaluationDeadline
+            | NativeOperation::ClaimDeadline
+            | NativeOperation::MonitorDeadline
+    )
+}
+/// The rows every request's record carries beside its own: the meta, its
+/// outcome and its principal's window (F12). A timer's carries two.
+pub(super) const REQUEST_CONTROL_ROWS: usize = 3;
+pub(super) const TIMER_CONTROL_ROWS: usize = 2;
 
 fn changes_bytes(
     max_changes: usize,
@@ -62,9 +80,17 @@ impl ConstructionBudget {
             // Import never prepares a mutation; it is a one-time translation
             // (23 §5). A retirement is a session decision applied through the
             // core, never an admitted mutation (26 §4).
-            NativeOperation::Import | NativeOperation::Retire => {
+            NativeOperation::Import | NativeOperation::Retire | NativeOperation::Seal => {
                 return Err(focal_model::lifecycle::ContractError::InvalidTransition.into());
             }
+            // The window's copy on scratch; its row, the meta and the outcome.
+            NativeOperation::AdvanceEpochFloor => (
+                super::epochs::window_bytes(limits)?.min(limits.preparation_bytes),
+                0,
+                3.min(batch),
+                0,
+                0,
+            ),
             NativeOperation::AdoptReceipt => (
                 limits.preparation_bytes,
                 1.min(limits.plan_nodes),
@@ -198,6 +224,18 @@ impl ConstructionBudget {
                 batch,
             ),
         };
+        // A request writes its principal's window beside the meta and its
+        // outcome (F12); a timer writes none.
+        let max_changes = if timer(operation) {
+            max_changes
+        } else {
+            add(max_changes, 1)?.min(batch)
+        };
+        let window_bytes = if timer(operation) {
+            0
+        } else {
+            super::epochs::window_bytes(limits)?
+        };
         // Extras grows by constructing a replacement before dropping the old
         // vector. Keep both maximum buffers charged, including their separate
         // allocator bookkeeping; nested row heaps consume Scratch instead.
@@ -228,6 +266,7 @@ impl ConstructionBudget {
             max_events,
             max_index_rows,
             max_timer_rows,
+            window_bytes,
         };
         // Detect overflow of the complete reservation before any allocation.
         budget.pending_bytes()?;
@@ -245,7 +284,7 @@ impl ConstructionBudget {
     pub(super) fn temporary_bytes(self) -> Result<usize, NativeError> {
         add(
             add(self.scratch_bytes, self.changes_bytes)?,
-            self.extras_bytes,
+            add(self.extras_bytes, self.window_bytes)?,
         )
     }
 
@@ -281,9 +320,14 @@ impl ConstructionBudget {
             )?)
             .min(limits.range.max_batch_entries);
         self.max_timer_rows = add(self.max_timer_rows, graph_timers)?.min(self.max_index_rows);
+        let control = if timer(self.operation) {
+            TIMER_CONTROL_ROWS
+        } else {
+            REQUEST_CONTROL_ROWS
+        };
         self.max_changes = self.max_changes.max(add(
             add(self.max_claim_rows, self.max_extra_rows)?,
-            add(add(self.max_events, 2)?, self.max_index_rows)?,
+            add(add(self.max_events, control)?, self.max_index_rows)?,
         )?);
         super::prepare::within(self.max_claim_rows, limits.plan_nodes)?;
         super::prepare::within(self.max_changes, limits.range.max_batch_entries)?;
@@ -347,6 +391,11 @@ impl ConstructionBudget {
         events: usize,
         index: usize,
     ) -> Result<(), NativeError> {
+        let control = if timer(self.operation) {
+            TIMER_CONTROL_ROWS
+        } else {
+            REQUEST_CONTROL_ROWS
+        };
         if claims > self.max_claim_rows {
             return Err(NativeError::Capacity("construction claim rows"));
         }
@@ -359,7 +408,7 @@ impl ConstructionBudget {
         if index > self.max_index_rows {
             return Err(NativeError::Capacity("construction index rows"));
         }
-        let changes = add(add(claims, extras)?, add(add(events, 2)?, index)?)?;
+        let changes = add(add(claims, extras)?, add(add(events, control)?, index)?)?;
         if changes > self.max_changes {
             return Err(NativeError::Capacity("construction changes"));
         }

@@ -43,7 +43,7 @@ fn gauge(text: &str, name: &str) -> Option<u64> {
 fn metrics(node: &Node) -> String {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     loop {
-        let output = fleet::run(node, None, &["cluster", "node", "metrics"]);
+        let output = fleet::run(node, None, &["diagnose", "node", "--metrics"]);
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             if text.contains("focal_memory_used_bytes") {
@@ -142,9 +142,9 @@ fn a_sustained_workload_stays_within_budget_and_keeps_the_guarantee() {
             "focal",
             "--data-dir",
             "<founder>",
-            "cluster",
+            "diagnose",
             "node",
-            "metrics",
+            "--metrics",
         ],
     );
     let limit = gauge(&text, "focal_memory_limit_bytes").expect("memory limit gauge");

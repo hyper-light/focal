@@ -14,6 +14,35 @@ in this tree.
 | `aws-lc-rs` | 1.18.1 | `b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e` | 2026-09-29 | The cryptographic provider behind rustls, quinn and rcgen, and the ECDSA verification of enrollment statements ([07](../docs/archictecutre/07-decisions-and-traceability.md)) |
 | `aws-lc-sys` | 0.45.0 | `9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27` | 2026-09-29 | AWS-LC 5.7.0 itself (C and assembly, with the pre-generated bindings for every target focal ships), built by `aws-lc-rs` |
 
+## Shared crates
+
+The `hyper-*` crates are not crates.io archives. They come from the repository focal shares with
+mantle and slates (<https://github.com/hyper-light/hyper-raft>), taken from it whole at one
+revision, which `SNAPSHOT` in each names:
+- focal's consensus core and its election law, which moved there
+  ([27](../docs/archictecutre/27-consensus-roadmap-and-slates-port.md) §14);
+- the durable shell around the core, with the log, the block layer and the liveness stream it
+  builds on (27 §15). Each is that revision's `crates/<name>/src`, `ORIGIN.md` (and `README.md`) and the
+repository's `LICENSE`, unchanged, with one file of focal's: a `Cargo.toml` of its own that states
+what the shared repository's workspace gave it (version, edition, dependencies) and makes it a
+workspace root of its own, outside focal's, and that sets `rust-version` to focal's toolchain, which
+the snapshot builds on. Its suites, benchmarks and lint wall run in the shared repository on all six
+targets; a change to it is made there first and taken here by a new snapshot, never edited here.
+
+| Crate | Version | Revision | Taken | Why it is here |
+|---|---|---|---|---|
+| `hyper-block` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
+| `hyper-durable` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The durable shell a group's replica becomes (27 §15) |
+| `hyper-liveness` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
+| `hyper-log` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
+| `hyper-raft` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The consensus core every group runs |
+| `hyper-timing` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The election law's draw the core takes its delays from |
+
+A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
+crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to
+`<name> <revision> crates/<name>`, the manifest kept, and the table above, `Cargo.lock` and
+`docs/dependencies/inventory.tsv` (the revision is the source it lists) brought up to date.
+
 These directories hold third-party code under their own licenses (`LICENSE`
 in each); the release notices and SBOM list them from `Cargo.lock` like any
 other dependency, with the archive checksum above as their provenance

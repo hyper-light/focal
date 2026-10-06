@@ -57,6 +57,7 @@ zeroize = "1.8"
 
 [dev-dependencies]
 focal-node = { version = "0.1.0", path = ".", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 focal-sim = { version = "0.1.0", path = "../focal-sim" }
 focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-support"] }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }

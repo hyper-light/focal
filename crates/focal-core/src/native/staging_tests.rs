@@ -323,7 +323,8 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
         + changes
         + containers(limits.plan_nodes).unwrap()
         + event_containers(limits.range.max_batch_entries).unwrap()
-        + index;
+        + index
+        + crate::native::epochs::window_bytes(limits).unwrap();
     // Leave every descriptor and all but one container byte available. No
     // candidate may enter semantic execution under this incomplete reservation.
     let pressure = budget

@@ -82,6 +82,31 @@ impl NativeVerificationBudget {
         })
     }
 
+    /// The largest verification any schema may declare: the maximum
+    /// `for_schema` admits, with its peak. What a recovery envelope charges
+    /// per artifact row before it knows the row's schema.
+    pub fn ceiling() -> Self {
+        let retained = size_of::<VerifiedNativeArtifact>();
+        let maximum = MAX_TRANSFER_MANIFEST_BYTES;
+        Self {
+            schema: ContentHash([0; 32]),
+            maximum,
+            peak: retained
+                .saturating_add(STORE_WORKSPACE)
+                .saturating_add(maximum),
+            retained,
+        }
+    }
+    /// The model work a custody recovery under this budget is charged:
+    /// bounded content reads and hashes, the byte comparison and the schema
+    /// traversal under the declared maximum (64 visits a byte), the peak
+    /// workspace and a fixed descent.
+    pub fn recovery_work(self) -> usize {
+        self.maximum
+            .saturating_mul(64)
+            .saturating_add(self.peak)
+            .saturating_add(4096)
+    }
     pub fn schema(self) -> ContentHash {
         self.schema
     }

@@ -26,6 +26,11 @@ pub enum NativeExposure {
     Activation,
     /// A retirement every replica applies; never a tool (26 §4).
     Retirement,
+    /// A seal of closed outcomes every replica applies; never a tool (F12).
+    Seal,
+    /// A participant frame the client's own journal protocol issues (F12:
+    /// the request generation floor), never an authored tool.
+    ClientProtocol,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeCoverage {
@@ -99,9 +104,13 @@ pub const fn frame_tags(operation: NativeOperationKind) -> &'static [u8] {
         K::RegisterMonitor => &[24],
         K::RebindMonitor => &[25],
         K::CancelMonitor => &[26],
-        K::MonitorDeadline | K::EvaluationDeadline | K::ClaimDeadline | K::Import | K::Retire => {
-            &[]
-        }
+        K::AdvanceEpochFloor => &[28],
+        K::MonitorDeadline
+        | K::EvaluationDeadline
+        | K::ClaimDeadline
+        | K::Import
+        | K::Retire
+        | K::Seal => &[],
     }
 }
 pub const fn native_coverage(operation: NativeOperationKind) -> NativeCoverage {
@@ -397,10 +406,29 @@ pub const fn native_coverage(operation: NativeOperationKind) -> NativeCoverage {
             "",
             E::Retirement,
         ),
+        K::AdvanceEpochFloor => row(
+            operation,
+            None,
+            A::Issuer,
+            "",
+            "Committed receipt; the principal's generations below the floor are closed",
+            "The client's own journal: every operation of the closed generations delivered",
+            E::ClientProtocol,
+        ),
+        K::Seal => row(
+            operation,
+            None,
+            A::Internal,
+            "",
+            "Closed outcomes sealed into a bundle under custody",
+            "",
+            E::Seal,
+        ),
     }
 }
-pub fn native_coverage_table() -> [NativeCoverage; 32] {
-    let mut rows = [native_coverage(NativeOperationKind::Import); 32];
+pub const OPERATIONS: usize = NativeOperationKind::ALL.len();
+pub fn native_coverage_table() -> [NativeCoverage; OPERATIONS] {
+    let mut rows = [native_coverage(NativeOperationKind::Import); OPERATIONS];
     for (slot, kind) in rows.iter_mut().zip(NativeOperationKind::ALL) {
         *slot = native_coverage(kind);
     }

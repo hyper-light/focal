@@ -55,6 +55,7 @@ fn refusal(error: LedgerError) -> ControlFailure {
         LedgerError::OutcomeUnknown => ControlFailure::OutcomeUnknown,
         LedgerError::Consensus(
             focal_consensus::ConsensusError::LearnerBehind
+            | focal_consensus::ConsensusError::MembershipPending
             | focal_consensus::ConsensusError::LeaderLeaving,
         ) => ControlFailure::NotReady,
         LedgerError::MembershipConflict | LedgerError::PlacementConflict => {

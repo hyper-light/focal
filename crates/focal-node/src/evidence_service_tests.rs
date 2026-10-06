@@ -391,16 +391,27 @@ async fn control_mailbox_replaces_policy_while_all_transfer_slots_are_blocked() 
             ));
             let mut request = std::pin::pin!(request);
             let mut datagram = [0; 2048];
-            tokio::time::timeout(Duration::from_secs(2), async {
-                tokio::select! {
-                    result=blackhole.recv(&mut datagram)=>{assert!(result.unwrap()>0);}
-                    _=&mut request=>panic!("custody unexpectedly completed without a peer"),
-                }
-            })
+            // No owner runs either: the request reaches the path, and the
+            // placement is replaced while it stays stuck there, or the wait
+            // is wedged — bounded by the frozen window alone
+            // (`crate::test_waits`).
+            crate::test_waits::charged(
+                Vec::new,
+                Duration::from_secs(2),
+                Duration::from_millis(10),
+                async {
+                    tokio::select! {
+                        result=blackhole.recv(&mut datagram)=>{assert!(result.unwrap()>0);}
+                        _=&mut request=>panic!("custody unexpectedly completed without a peer"),
+                    }
+                },
+            )
             .await
             .unwrap();
-            tokio::time::timeout(
+            crate::test_waits::charged(
+                Vec::new,
                 Duration::from_secs(1),
+                Duration::from_millis(10),
                 coordinator.replace_placement(Some(first.scope()), next.clone()),
             )
             .await
@@ -987,6 +998,7 @@ async fn a_transfer_keeps_as_many_chunks_in_flight_as_the_path_holds() {
     let result = striped(
         || 8,
         5..300,
+        |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
             if index == 5 {
@@ -1009,6 +1021,33 @@ async fn a_transfer_keeps_as_many_chunks_in_flight_as_the_path_holds() {
     assert_eq!(moved.answered, (5..300).collect());
 }
 
+/// A chunk the copy holds is not moved (the audit's F50): the held are
+/// passed over in their place, and what remains goes in full.
+#[tokio::test]
+async fn a_transfer_moves_only_the_chunks_the_copy_lacks() {
+    let moved = std::cell::RefCell::new(Moved::default());
+    let result = striped(
+        || 4,
+        0..30,
+        |index| index % 3 == 0,
+        async |index: u32| {
+            moved.borrow_mut().begin(index);
+            tokio::task::yield_now().await;
+            moved.borrow_mut().end(index, true);
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    let moved = moved.into_inner();
+    assert!(moved.most <= 4);
+    assert_eq!(moved.begun.len(), 20);
+    assert_eq!(
+        moved.answered,
+        (0..30).filter(|index| index % 3 != 0).collect()
+    );
+}
+
 /// What a copy has room for is found as a sender finds what a path
 /// carries: half as many on a refusal, one more for every round answered.
 #[tokio::test]
@@ -1018,6 +1057,7 @@ async fn a_chunk_refused_the_room_is_moved_again_and_the_room_is_found() {
     let result = striped(
         || 8,
         0..400,
+        |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
             tokio::task::yield_now().await;
@@ -1050,6 +1090,7 @@ async fn a_transfer_that_is_refused_the_room_throughout_is_refused_and_ends() {
         let result = striped(
             || width,
             0..1000,
+            |_| false,
             async |index: u32| {
                 moved.borrow_mut().begin(index);
                 tokio::task::yield_now().await;
@@ -1068,6 +1109,7 @@ async fn a_transfer_that_is_refused_the_room_throughout_is_refused_and_ends() {
     let result = striped(
         || 4,
         0..32,
+        |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
             tokio::task::yield_now().await;
@@ -1093,6 +1135,7 @@ async fn a_copy_that_takes_chunks_in_their_order_only_is_sent_them_one_after_ano
     let result = striped(
         || 8,
         3..40,
+        |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
             tokio::task::yield_now().await;
@@ -1119,11 +1162,26 @@ async fn a_copy_that_takes_chunks_in_their_order_only_is_sent_them_one_after_ano
     let from = moved.begun.iter().rposition(|index| *index == 3).unwrap();
     assert!(moved.begun[from..].iter().copied().eq(3..40));
     // A refusal that has nothing to do with order ends the transfer.
-    let result = striped(|| 1, 0..4, async |_| Err(AccessError::InvalidRequest)).await;
+    let result = striped(
+        || 1,
+        0..4,
+        |_| false,
+        async |_| Err(AccessError::InvalidRequest),
+    )
+    .await;
     assert_eq!(result, Err(AccessError::InvalidRequest));
-    let result = striped(|| 8, 0..4, async |_| Err(AccessError::Unauthorized)).await;
+    let result = striped(
+        || 8,
+        0..4,
+        |_| false,
+        async |_| Err(AccessError::Unauthorized),
+    )
+    .await;
     assert_eq!(result, Err(AccessError::Unauthorized));
-    assert_eq!(striped(|| 8, 4..4, async |_| Ok(())).await, Ok(()));
+    assert_eq!(
+        striped(|| 8, 4..4, |_| false, async |_| Ok(())).await,
+        Ok(())
+    );
 }
 
 #[tokio::test]
@@ -1137,15 +1195,20 @@ async fn a_transfer_goes_by_as_many_streams_as_the_path_holds_when_a_chunk_is_be
         _ => 2,
     };
     let seen = std::cell::RefCell::new(Vec::new());
-    let result = striped(width, 0..64, async |index: u32| {
-        moved.borrow_mut().begin(index);
-        let answered = moved.borrow().answered.len();
-        let flying = moved.borrow().flying;
-        seen.borrow_mut().push((answered, flying));
-        tokio::task::yield_now().await;
-        moved.borrow_mut().end(index, true);
-        Ok(())
-    })
+    let result = striped(
+        width,
+        0..64,
+        |_| false,
+        async |index: u32| {
+            moved.borrow_mut().begin(index);
+            let answered = moved.borrow().answered.len();
+            let flying = moved.borrow().flying;
+            seen.borrow_mut().push((answered, flying));
+            tokio::task::yield_now().await;
+            moved.borrow_mut().end(index, true);
+            Ok(())
+        },
+    )
     .await;
     assert_eq!(result, Ok(()));
     let seen = seen.into_inner();

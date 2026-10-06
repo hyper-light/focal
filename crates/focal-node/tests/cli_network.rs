@@ -13,6 +13,8 @@
 mod client_context;
 #[path = "support/cli_cluster.rs"]
 mod cluster;
+#[path = "support/progress.rs"]
+mod progress;
 #[path = "support/cli_replicas.rs"]
 mod replicas;
 use focal_node::network_join::NodeInvitation;
@@ -31,6 +33,18 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+/// The periods the root owner of the node at `root` has run, read from its
+/// metrics as an operator reads them: what a wait on it is charged in
+/// (`progress`). None while the node does not answer.
+fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
+    move || {
+        let output = command(root, &["diagnose", "node", "--metrics"]);
+        if !output.status.success() {
+            return None;
+        }
+        progress::periods_in(&String::from_utf8_lossy(&output.stdout))
     }
 }
 fn command(root: &Path, args: &[&str]) -> Output {
@@ -234,7 +248,7 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     );
     assert!(peer.path().join("focal-admin.sock").exists());
     assert_eq!(
-        success(peer.path(), &["cluster", "node", "identity"]).0["result"]["identity"]["node"],
+        success(peer.path(), &["diagnose", "node", "--identity"]).0["result"]["identity"]["node"],
         joined["node"]
     );
     let refused = command(

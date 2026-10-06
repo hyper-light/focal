@@ -147,10 +147,15 @@ async fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_
         .unwrap();
     commit(&mut network.control, 6, ControlCommand::Enrollment(revoke));
     let permit = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    let receipt = tokio::time::timeout(Duration::from_secs(5), host.refresh_directory(permit))
-        .await
-        .unwrap()
-        .unwrap();
+    let receipt = crate::test_waits::charged(
+        || vec![host.periods()],
+        Duration::from_secs(5),
+        crate::test_waits::CONTROL_TICK,
+        host.refresh_directory(permit),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(receipt.root_index, network.control.applied_index());
     assert_eq!(receipt.receipt.request.sequence, 2);
     assert!(receipt.applied_index >= receipt.receipt.committed_index);
@@ -207,6 +212,13 @@ fn owner(
             applied_index: replica.applied_index(),
             revisions: replica.revisions(),
             dropped_replication: 0,
+            peers_unreachable: 0,
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
+            peer_reports_coalesced: 0,
+            peer_reports_dropped: 0,
             stopped: false,
             snapshot_index: 0,
             peers: Vec::new(),
@@ -214,7 +226,9 @@ fn owner(
         },
         _allocation: None,
     });
+    let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
     Owner {
+        stopping: None,
         replica,
         initial: None,
         verifier: NoDirectoryAuthority,
@@ -229,6 +243,23 @@ fn owner(
         progress,
         nonce: 0,
         dropped: 0,
+        ordered: std::collections::BTreeMap::new(),
+        resequencer: crate::resequence::Resequencer::new(
+            focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+            crate::fleet::LOST_PEERS,
+        ),
+        stepped: Vec::new(),
+        appends_rejected: 0,
+        frames_held: 0,
+        frames_let_go: 0,
+        frames_stale: 0,
+        took_turn: false,
+        unreachable: 0,
+        lost_sender: lost.0,
+        lost: lost.1,
+        lost_peers: Vec::new(),
+        lost_coalesced: 0,
+        lost_dropped: 0,
         failure: None,
         pace: Default::default(),
     }
@@ -395,7 +426,8 @@ async fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commi
     ));
     owner
         .replica
-        .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall);
+        .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall)
+        .unwrap();
     assert!(owner.drain().is_err());
     drop(owner);
     drop(network);

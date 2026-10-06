@@ -10,7 +10,7 @@ trip in the write path ([08 §7](../archictecutre/08-stepped-complexity-and-depl
 
 ```sh
 focal --data-dir DIR cluster placement          # nodes with region, sessions' residency and achieved level
-focal --data-dir DIR cluster node readiness
+focal --data-dir DIR diagnose node --readiness
 ```
 
 **Preconditions.** The policy was `survive: region` with enough `max_failures`; the residency

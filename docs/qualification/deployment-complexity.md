@@ -109,7 +109,7 @@ focal --config <founder>/focal.yaml --data-dir <founder> cluster invitations rev
 focal --data-dir <revoked> start --advertise <address> --invite-file <revoked>/host-r.invite
 focal --config <founder>/focal.yaml --data-dir <founder> cluster placement
 focal --data-dir <founder> --config <founder>/node-1.yaml deployment plan --output <founder>/node-1.plan
-focal --config <founder>/focal.yaml --data-dir <founder> deployment apply --plan-file <founder>/node-1.plan --wait 180
+focal --config <founder>/focal.yaml --data-dir <founder> deployment apply --plan-file <founder>/node-1.plan --wait 300
 focal --config <founder>/focal.yaml --data-dir <founder> get claim <id> --format json
 focal --config <founder>/focal.yaml --data-dir <founder> get artifact <id> --format json
 focal --config <founder>/focal.yaml --data-dir <founder> submit claim --json <document> --format json
@@ -310,9 +310,9 @@ focal --data-dir <client> --client-context alice artifact submit --claim <id> --
 focal --data-dir <founder> get claim <id> --format json
 focal --data-dir <founder> get artifact <id> --format json
 focal --data-dir <founder> cluster upgrade status
-focal --data-dir <host> cluster upgrade activate --fence 1
+focal --data-dir <host> cluster upgrade activate --fence 3
+focal --data-dir <founder> cluster upgrade activate --fence 3
 focal --data-dir <founder> cluster upgrade activate --fence 2
-focal --data-dir <founder> cluster upgrade activate --fence 1
 focal --data-dir <founder> get claim <id> --format json
 focal --data-dir <founder> get artifact <id> --format json
 focal --data-dir <host> start --advertise <address>

@@ -66,7 +66,7 @@ pub fn joined_unix_principal(
         payload(&key_bytes)?,
         payload(&receipt_bytes)?,
         identity.cluster,
-        &bundle.invitation.trust().ca_certificate,
+        bundle.invitation.trust().issuers.iter(),
         now,
     )?;
     if receipt.request != pin.request

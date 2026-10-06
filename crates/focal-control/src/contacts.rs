@@ -305,6 +305,31 @@ pub fn authorize_node_contact(
     }
     Ok(identity)
 }
+/// A node peer admitted under its enrolled key rather than a certificate
+/// the registry names: a renewal this replica has not applied yet (24 §11).
+/// The listener verified the certificate's chain to the cluster's CA and
+/// that it was issued after the one the registry names; here the key must
+/// be the one the node's unrevoked enrollment holds now.
+pub fn authorize_enrolled_key(
+    enrollment: &EnrollmentRegistry,
+    node: u64,
+    principal: [u8; 16],
+    key: [u8; 32],
+) -> Result<focal_enrollment::AssignedIdentity, ControlError> {
+    let receipt = enrollment
+        .enrollments()
+        .find(|receipt| {
+            receipt.identity.role == EnrollmentRole::Node
+                && receipt.identity.node_id == Some(node)
+                && receipt.identity.principal == principal
+                && receipt.public_key == key
+        })
+        .ok_or(focal_enrollment::EnrollmentError::Unauthorized)?;
+    if !matches!(enrollment.invitation_revoked(receipt.invitation), Ok(false)) {
+        return Err(focal_enrollment::EnrollmentError::Revoked.into());
+    }
+    Ok(receipt.identity.clone())
+}
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 /// One bounded root table. Preparation copies its sorted rows under an owned
@@ -791,6 +816,7 @@ mod tests {
             1,
             [32; 16],
             EnrollmentLimits::default(),
+            0,
             NOW,
         )
         .unwrap();
@@ -815,6 +841,24 @@ mod tests {
     }
     fn budget() -> MemoryBudget {
         MemoryBudget::new(1024 * 1024, 512 * 1024).unwrap()
+    }
+    /// A peer admitted under its enrolled key (a renewal this replica has
+    /// not applied) is the node whose unrevoked enrollment holds that key.
+    #[test]
+    fn an_enrolled_key_authorizes_the_node_that_holds_it_and_no_other() {
+        let (_disk, registry, _command) = fixture();
+        let receipt = registry.enrollments().next().unwrap().clone();
+        assert_eq!(
+            authorize_enrolled_key(&registry, 1, [32; 16], receipt.public_key).unwrap(),
+            receipt.identity
+        );
+        for (node, principal, key) in [
+            (2, [32; 16], receipt.public_key),
+            (1, [33; 16], receipt.public_key),
+            (1, [32; 16], [9; 32]),
+        ] {
+            assert!(authorize_enrolled_key(&registry, node, principal, key).is_err());
+        }
     }
     /// Retirement frees a removed node's slot exactly, and never a live
     /// node's: the record of a node the registry still enrolls stays.

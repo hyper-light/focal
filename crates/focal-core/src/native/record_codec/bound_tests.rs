@@ -907,3 +907,93 @@ fn the_bound_is_monotone_and_refuses_shapes_beyond_the_encoding_limits() {
         .is_err()
     );
 }
+
+/// A restore's work stays within the envelope its checkpoint's declared shape
+/// allows (the audit's F57), measured on the recorded workflows at authored
+/// maxima: the per-row and per-byte ceilings in `recovery::Work::for_shape`
+/// are pinned here — a restore that outgrows one fails this test, and the
+/// ceiling is raised from the measurement it prints.
+#[test]
+fn a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares() {
+    use super::recovery::{self, Work, tests as checkpoint};
+    let mut projection = Lab::new(NativeContentProfile::ProjectionOnly);
+    projection_workflow(&mut projection);
+    let mut authored = Lab::new(NativeContentProfile::AuthoredV1);
+    authored_workflow(&mut authored);
+    for (name, lab) in [("projection", &projection), ("authored", &authored)] {
+        let core = lab.owner.committed_core();
+        let bytes = checkpoint::encode(core);
+        let structural = checkpoint::inspect(&bytes);
+        let quote = structural.quote();
+        // Measured under an ample allowance, so the figure is the work and
+        // not the refusal.
+        let ample = Work {
+            parsing: usize::MAX / 4,
+            source: usize::MAX / 4,
+            model: usize::MAX / 4,
+            lookup: usize::MAX / 4,
+        };
+        let mut unbounded = checkpoint::limits(core.limits);
+        unbounded.work = ample;
+        let (restored, measured) = recovery::restore_with_work(
+            &structural,
+            RangeId(9),
+            unbounded,
+            checkpoint::budget(),
+            &lab.store,
+            &BuiltinNativeSchemas,
+            focal_memory::BudgetLane::Completion,
+            ample,
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        checkpoint::compare(core, &restored);
+        let used = measured.used;
+        let artifacts = structural
+            .rows(usize::MAX)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|row| matches!(row.key, Key::Artifact(_)))
+            .count();
+        let custody = artifacts * Work::custody_per_artifact();
+        let scans = quote.visits * 9;
+        eprintln!(
+            "{name}: rows {} bytes {} visits {} artifacts {artifacts} used {used:?}; \
+             per row: source {} model {} lookup {}; per byte: source {} model {} \
+             body parsing {}",
+            quote.rows,
+            quote.bytes,
+            quote.visits,
+            used.source / quote.rows,
+            used.model.saturating_sub(custody) / quote.rows,
+            used.lookup / quote.rows,
+            used.source / quote.bytes,
+            used.model.saturating_sub(custody) / quote.bytes,
+            used.parsing.saturating_sub(scans) / quote.bytes,
+        );
+        let envelope =
+            Work::for_shape(quote.visits, quote.bytes, quote.rows).extended_for_test(custody);
+        assert!(
+            used.within(envelope),
+            "{name}: used {used:?} exceeds the envelope {envelope:?} of rows {} bytes {} visits {}",
+            quote.rows,
+            quote.bytes,
+            quote.visits
+        );
+        // The envelope, under the test configuration's ceiling, restores it
+        // too, and is what a restore reports.
+        let limits = checkpoint::limits(core.limits);
+        let (_, under) = recovery::restore_measured(
+            &structural,
+            RangeId(10),
+            limits,
+            checkpoint::budget(),
+            &lab.store,
+            &BuiltinNativeSchemas,
+            focal_memory::BudgetLane::Completion,
+        )
+        .unwrap_or_else(|error| panic!("{name} under its envelope: {error:?}"));
+        assert!(under.allowed.within(envelope));
+        assert!(under.allowed.within(limits.work));
+        assert_eq!(under.used, used);
+    }
+}

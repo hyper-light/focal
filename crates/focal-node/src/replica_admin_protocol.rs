@@ -127,6 +127,11 @@ impl LocalNetworkAdmin {
         self.fleet = Some(fleet);
         Ok(self)
     }
+    /// Administer the partition groups this node hosts (F24).
+    pub fn with_directory(mut self, directory: crate::network_service::DirectoryHandle) -> Self {
+        self.partitions = Some(directory);
+        self
+    }
     /// The exclusive content writer, needed to seal inline legacy payloads
     /// before a populated ledger's import is proposed.
     pub fn with_content(mut self, content: crate::content_host::ContentHost) -> Self {
@@ -331,7 +336,9 @@ fn failure(error: LedgerError) -> ControlFailure {
         LedgerError::MembershipConflict => ControlFailure::CompareFailed,
         LedgerError::Consensus(
             focal_consensus::ConsensusError::LearnerBehind
-            | focal_consensus::ConsensusError::LeaderLeaving,
+            | focal_consensus::ConsensusError::MembershipPending
+            | focal_consensus::ConsensusError::LeaderLeaving
+            | focal_consensus::ConsensusError::PersistencePending,
         ) => ControlFailure::NotReady,
         LedgerError::Managed(_) => ControlFailure::NotReady,
         LedgerError::Consensus(focal_consensus::ConsensusError::NotLeader { leader }) => {

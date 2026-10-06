@@ -317,7 +317,7 @@ fn begin_requires_failure_write_capacity_and_checks_actor_first() {
     // status rows (doc 22 §7): eighteen in all. A smaller batch cannot hold
     // any failed report, so admission is refused by shape.
     let minimum = crate::native::index_rows::MINIMUM_FAILED_REPORT_ROWS;
-    assert_eq!(minimum, 18);
+    assert_eq!(minimum, 19);
     for capacity in 4..minimum {
         core.limits.range.max_batch_entries = capacity;
         assert!(matches!(

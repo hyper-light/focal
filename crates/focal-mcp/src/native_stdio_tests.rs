@@ -239,6 +239,8 @@ fn the_probe_selects_the_native_catalogue_and_frames_are_journaled_and_acknowled
                 "request.retry",
                 "request.pending",
                 "request.acknowledge",
+                "code.run",
+                "code.search",
             ]
             .map(String::from),
         )
@@ -476,6 +478,59 @@ fn the_probe_selects_the_native_catalogue_and_frames_are_journaled_and_acknowled
     let inspected =
         application(&mcp.tool(2, "request.inspect", json!({"operation_id": second_id})));
     assert_eq!(inspected.condition, "Committed");
+    mcp.running.stop();
+}
+
+/// The generated native example (`focal schema example claim.submit
+/// --native`, `focal_client::operations::example`) is what the adapter's
+/// `claim.submit` tool accepts as it stands: it compiles to one exact frame,
+/// is journaled, sent and committed, with the identities the frame minted.
+#[test]
+fn the_generated_native_example_commits_through_the_adapter_unchanged() {
+    use focal_client::operations::{WireProfile, example};
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("native");
+    let mut mcp = NativeRunning::start(root.path(), &journal, Probe::Native);
+    let document = example(WireProfile::Native, "claim.submit").unwrap();
+    assert_ne!(document["target"], "self");
+    mcp.running.tool(1, "claim.submit", document.clone());
+    let committed = mcp.commit(NativeOperationKind::Create);
+    let result = application(&mcp.running.response(1));
+    assert_eq!(result.condition, "Committed", "{result:?}");
+    let OperationOutput::Native { receipt, created } = &result.result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(*receipt, committed);
+    // The receipt-only claim mints the claim and its one validation.
+    assert_eq!(created.len(), 2);
+    assert_eq!(
+        created[0].kind,
+        focal_client::native_store::NativeIdentityKind::Claim
+    );
+    assert_eq!(
+        created[1].kind,
+        focal_client::native_store::NativeIdentityKind::Validation
+    );
+    // A read example goes to the owner as a read, and an `operation_id` on
+    // a read is a forged field, not an adapter envelope.
+    let standing_read = example(WireProfile::Native, "ledger.standing").unwrap();
+    mcp.running.tool(2, "ledger.standing", standing_read);
+    let observed = mcp.running.observed();
+    let reply = page(&observed.request, vec![NativeObject::Standing(standing())]);
+    observed
+        .response
+        .send(Ok(observed.request.reply(reply)))
+        .unwrap();
+    assert_eq!(application(&mcp.running.response(2)).condition, "Read");
+    let forged = mcp.running.tool_response(
+        3,
+        "claim.get",
+        json!({"id": "00000000000000000000000000000010", "operation_id": "n1:000000000000000000000000000000ab"}),
+    );
+    assert!(
+        forged["error"].is_object() || forged["result"]["isError"] == true,
+        "{forged}"
+    );
     mcp.running.stop();
 }
 

@@ -92,7 +92,9 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
                 held.push((sender, frame));
                 continue;
             }
-            let Operation::Raft { message, .. } = frame.request.operation else {
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                frame.request.operation
+            else {
                 panic!("Raft")
             };
             fixture.owners[frame.target as usize - 1]
@@ -107,7 +109,9 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
             .any(|owner| owner.session.is_authoritative())
     );
     for (sender, frame) in held {
-        let Operation::Raft { message, .. } = frame.request.operation else {
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            frame.request.operation
+        else {
             panic!("Raft")
         };
         fixture.owners[0]

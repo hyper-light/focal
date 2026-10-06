@@ -503,6 +503,20 @@ fn process<O: Objects, C: evidence::Custody>(
             })?;
             evidence_plan!(plan, value_quote, 0)
         }
+        Key::Epochs(_) => {
+            let plan = parse(body, context.parsing, |c| {
+                read_rows::EpochsPlan::read(encoded.key, c, context.limits.native.seals)
+            })?;
+            let quote = quoted(plan.heap_bytes()?, 0, build)?;
+            let row = if build.is_some() {
+                let visits = plan.build_visits();
+                debit(context.model, visits)?;
+                Some(plan.build(quote.heap_bytes, visits)?.0)
+            } else {
+                None
+            };
+            Ok((quote, row))
+        }
         Key::Event(..) => {
             let plan = parse(body, context.parsing, |c| {
                 read_rows::EventPlan::read(encoded.key, c, ledger)
@@ -548,7 +562,8 @@ fn process<O: Objects, C: evidence::Custody>(
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
         | Key::DueTimer(..)
-        | Key::ByObject(..) => {
+        | Key::ByObject(..)
+        | Key::Seal(_) => {
             let row = parse(body, context.parsing, |c| {
                 read_rows::read_fixed(encoded.key, c, ledger)
             })?

@@ -137,7 +137,7 @@ impl MembershipChange {
         next.validate()?;
         Ok(next)
     }
-    fn encode(self, context: Vec<u8>) -> ConfChangeV2 {
+    pub(crate) fn encode(self, context: Vec<u8>) -> ConfChangeV2 {
         let mut change = ConfChangeV2 {
             context,
             ..Default::default()
@@ -149,12 +149,10 @@ impl MembershipChange {
             Self::LeaveJoint => None,
         };
         if let Some((node_id, kind)) = member {
-            let mut member = ConfChangeSingle {
+            change.changes.push(ConfChangeSingle {
+                change_type: kind,
                 node_id,
-                ..Default::default()
-            };
-            member.set_change_type(kind);
-            change.changes.push(member);
+            });
         }
         change
     }
@@ -168,7 +166,7 @@ pub struct AppliedMembership {
     pub before: MembershipConfiguration,
     pub after: MembershipConfiguration,
 }
-impl DurableNode {
+impl LogNode {
     pub fn membership_configuration(&self) -> MembershipConfiguration {
         MembershipConfiguration::from_conf(&self.raw.store().conf_state)
     }

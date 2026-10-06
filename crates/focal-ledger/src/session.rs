@@ -179,6 +179,7 @@ struct SnapshotEnvelope {
     schema: u16,
     ledger: LedgerId,
     raft_index: u64,
+    #[serde(with = "focal_memory::serde_bytes")]
     core: Vec<u8>,
 }
 
@@ -264,6 +265,17 @@ pub struct Session {
     /// the same refusal.
     seed_progress: bool,
     retained: Option<PendingDelivery>,
+    /// Read barriers a leader answered above this copy's applied index (27
+    /// §5, follower reads; the audit's F55): held, bounded by the reads the
+    /// core keeps in flight and charged once for that bound, until the
+    /// entries they name are applied. An answer that arrives before the
+    /// append that carries its index is replication lag, never corruption.
+    parked_reads: Vec<focal_consensus::ReadBarrier>,
+    parked_charge: Option<Allocation>,
+    /// Barriers parked, and barriers dropped at the parked bound, since
+    /// this session opened.
+    reads_parked: u64,
+    reads_dropped: u64,
 }
 
 impl Session {
@@ -418,7 +430,7 @@ impl Session {
             .reserve(
                 BudgetKind::ReadPins,
                 BudgetLane::Completion,
-                reference_charge(&cursor_meta)?,
+                metadata_charge(&cursor_meta)?,
             )?
             .commit();
         let consensus_cluster = consensus.cluster_id();
@@ -476,6 +488,10 @@ impl Session {
             seed_progress: false,
             custody_pending: None,
             retained: None,
+            parked_reads: Vec::new(),
+            parked_charge: None,
+            reads_parked: 0,
+            reads_dropped: 0,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
         // A delivery retained at startup (an import waiting for its host to seal
@@ -495,9 +511,26 @@ impl Session {
     }
     /// Requests a transfer to an existing voter. Success means the request was
     /// accepted locally; callers observe status to learn whether it completed.
+    /// The fields beyond raft-rs's this group's member reads and writes from now on
+    /// (`focal_consensus::Wire`): raised by focal-node once the upgrade fence opens
+    /// `RAFT_KEPT_LEVEL`, before a member opened under that fence sends. Under `Wire::Kept` the
+    /// member reads a refusal's `kept` and `lost` and keeps what arrives ahead of a hole (R17).
+    pub fn set_raft_wire(&mut self, wire: focal_consensus::Wire) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_raft_wire(wire)?;
+        Ok(())
+    }
+    /// What this group's messages are encoded under (`focal_consensus::encode_message_in`).
+    pub fn wire(&self) -> focal_consensus::Wire {
+        self.consensus.wire()
+    }
+    /// The bounds this group's core holds its queues to (`focal_consensus::CoreLimits`).
+    pub fn limits(&self) -> focal_consensus::CoreLimits {
+        self.consensus.limits()
+    }
     pub fn transfer_leader(&mut self, target: u64) -> Result<(), LedgerError> {
         self.check()?;
-        if target == 0 || !self.status().voters.contains(&target) {
+        if target == 0 || !self.members().voters.contains(&target) {
             return Err(ConsensusError::Configuration("transfer target must be a voter").into());
         }
         self.consensus.transfer_leader(target)?;
@@ -545,6 +578,14 @@ impl Session {
         self.check()?;
         self.consensus
             .report_snapshot_at(node, term, index, status)?;
+        Ok(())
+    }
+    /// Trusted transport feedback: an exchange with `node` was lost — a dial
+    /// that failed, an answer that never came. The core probes the member
+    /// instead of streaming to it (27 §3.3).
+    pub fn report_unreachable(&mut self, node: u64) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.report_unreachable(node)?;
         Ok(())
     }
     pub fn step_authenticated(
@@ -622,10 +663,24 @@ impl Session {
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
     }
+    /// The status's scalars, copied (the audit's F53).
+    pub fn scalars(&self) -> focal_consensus::NodeScalars {
+        self.consensus.scalars()
+    }
+    /// The members as the node holds them, borrowed: the voters and the
+    /// learners of its configuration (`membership()` is the ledger's
+    /// committed membership, answered to a request).
+    pub fn members(&self) -> focal_consensus::MembershipView<'_> {
+        self.consensus.membership()
+    }
+    /// The messages the core lets one peer have in flight at once.
+    pub fn inflight_window(&self) -> usize {
+        self.consensus.inflight_window()
+    }
     /// Current-term authority has crossed the committed ReadIndex barrier.
     /// Recovered workers must check this before dispatch, even without a write.
     pub fn is_authoritative(&self) -> bool {
-        let status = self.status();
+        let status = self.scalars();
         !self.failed && status.role == StateRole::Leader && self.ready_term == Some(status.term)
     }
     pub fn sequence(&self) -> SessionSeq {
@@ -701,13 +756,37 @@ impl Session {
         self.consensus.persistence_pending()
     }
     /// Node ownership retains the physical writer across logical-session removal.
-    pub fn shared_wal(&self) -> focal_consensus::SharedWal {
-        self.consensus.shared_wal()
+    pub fn shared_wal(&self) -> Result<focal_consensus::SharedWal, LedgerError> {
+        Ok(self.consensus.shared_wal()?)
     }
     /// Includes unstarted Ready work, such as the internal leadership ReadIndex
     /// queued by the last publication. Idle owners need not poll their sessions.
     pub fn has_ready(&self) -> bool {
         self.consensus.has_ready() || self.retained.is_some()
+    }
+    /// The bytes of entries `peer` is sent ahead of its answers while this
+    /// replica leads (`DurableNode::set_inflight_bytes`).
+    pub fn set_inflight_bytes(&mut self, peer: u64, bytes: u64) -> Result<bool, LedgerError> {
+        Ok(self.consensus.set_inflight_bytes(peer, bytes)?)
+    }
+    /// The bytes of entries in flight to `peer` and the bound on them
+    /// (`DurableNode::inflight_bytes`).
+    pub fn inflight_bytes(&self, peer: u64) -> Option<(u64, u64)> {
+        self.consensus.inflight_bytes(peer)
+    }
+    /// The bytes of entries one message carries (`DurableNode::page_bytes`).
+    pub fn page_bytes(&self) -> u64 {
+        self.consensus.page_bytes()
+    }
+    /// A read asked here waits for a round that leaves with the next poll
+    /// (`DurableNode::reads_unasked`): an owner takes what else is queued
+    /// for it first.
+    pub fn reads_unasked(&self) -> bool {
+        self.consensus.reads_unasked()
+    }
+    /// The reads asked here that wait for a quorum to confirm them.
+    pub fn reads_waiting(&self) -> usize {
+        self.consensus.reads_waiting()
     }
     fn clear_pending(&mut self) {
         self.pending_rows.clear();
@@ -755,7 +834,7 @@ impl Session {
     }
     fn propose_inner(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
         self.check()?;
-        let status = self.status();
+        let status = self.scalars();
         if status.role != StateRole::Leader || self.ready_term != Some(status.term) {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
@@ -934,8 +1013,9 @@ impl Session {
     /// Convenience for embedded one-voter operation. For a fleet, transport pumps
     /// poll/step and matches the durable receipt asynchronously instead.
     pub fn submit_local(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
-        let status = self.status();
-        if status.voters != [status.node_id] || !status.learners.is_empty() {
+        let status = self.scalars();
+        let members = self.members();
+        if members.voters != [status.node_id] || !members.learners.is_empty() {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
             });
@@ -956,6 +1036,7 @@ impl Session {
 
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), LedgerError> {
         self.check()?;
+        self.refuse_at_parked_bound()?;
         self.consensus.read_index(context)?;
         Ok(())
     }
@@ -1006,6 +1087,36 @@ impl Session {
                 self.finish_poll(Err(error)).map(Some)
             }
         }
+    }
+    /// The Raft messages that may be sent while the replica's write is in
+    /// flight (`DurableNode::sendable`): a leader's, which its members
+    /// persist for themselves, so its write and theirs overlap. Asked after
+    /// a `try_poll` that gave nothing; the events of a poll are given
+    /// whole, as before.
+    pub fn sendable(&mut self) -> Result<Option<focal_consensus::NodeEvents>, LedgerError> {
+        self.check()?;
+        Ok(self.consensus.sendable()?)
+    }
+    /// Tell this session's owner when a write of its replica is answered
+    /// (`DurableNode::notify_persisted`).
+    pub fn notify_persisted(&mut self, signal: Option<focal_consensus::PersistedSignal>) {
+        self.consensus.notify_persisted(signal);
+    }
+    /// Whether the log tells this session's owner when what the replica
+    /// waits for is answered (`DurableNode::wakes_owner`). A delivery that
+    /// is retained waits for no write: its owner asks again.
+    pub fn wakes_owner(&self) -> bool {
+        self.retained.is_none() && self.consensus.wakes_owner()
+    }
+    /// Waits for the write the replica has in flight, when it has one
+    /// (`DurableNode::wait_persisted`): an owner on its own thread waits
+    /// here once it has sent what `sendable` gave, and polls after.
+    pub fn wait_persisted(&mut self) -> Result<bool, LedgerError> {
+        self.check()?;
+        if self.retained.is_some() || self.consensus.checkpoint_pending() {
+            return Ok(false);
+        }
+        Ok(self.consensus.wait_persisted()?)
     }
     /// What a drain failed with. One the node refused before it took
     /// anything, for the room or for what it still persists, left the node
@@ -1060,6 +1171,15 @@ impl Session {
     pub fn snapshot_index(&self) -> u64 {
         self.consensus.snapshot_index()
     }
+    /// The index of the last entry the Raft log holds, durable or not.
+    pub fn last_log_index(&self) -> Result<u64, LedgerError> {
+        Ok(self.consensus.last_index()?)
+    }
+    /// Whether the stored checkpoint can seed every member of the
+    /// configuration in force (`DurableNode::snapshot_names_every_member`).
+    pub fn snapshot_names_every_member(&self) -> bool {
+        self.consensus.snapshot_names_every_member()
+    }
     /// A retained delivery is waiting for seed chunks no host has pulled yet.
     pub fn seed_waiting(&self) -> bool {
         self.retained.is_some() && self.seed_pending.is_some() && !self.seed_progress
@@ -1085,8 +1205,8 @@ impl Session {
             Err(error) => Err(error),
         }
     }
-    fn observe_authority(&mut self) -> (NodeStatus, bool) {
-        let status = self.status();
+    fn observe_authority(&mut self) -> (focal_consensus::NodeScalars, bool) {
+        let status = self.scalars();
         let leader = status.role == StateRole::Leader;
         if self.last_term != status.term || self.was_leader != leader {
             self.clear_pending();
@@ -1257,7 +1377,11 @@ impl Session {
             delivery.native = Some(NativeOutput::reserve(
                 &self.budget,
                 delivery.events.committed.len(),
-                delivery.events.read_states.len(),
+                delivery
+                    .events
+                    .read_states
+                    .len()
+                    .saturating_add(self.parked_reads.len()),
             )?);
         }
         let applied_index = delivery.events.applied_index;
@@ -1292,7 +1416,11 @@ impl Session {
                     delivery.native = Some(NativeOutput::reserve(
                         &self.budget,
                         delivery.events.committed.len().saturating_sub(next),
-                        delivery.events.read_states.len(),
+                        delivery
+                            .events
+                            .read_states
+                            .len()
+                            .saturating_add(self.parked_reads.len()),
                     )?);
                 }
                 continue;
@@ -1308,16 +1436,19 @@ impl Session {
                     }
                     return Err(error.into());
                 }
+                self.applied_raft = entry.index;
+                delivery.entry = next;
                 // A retirement record (26 §4) applies through the committed
                 // core on an authority too; past this term's readiness
                 // barrier every earlier entry is applied, so the owner is
-                // reconstructed here instead of at a later barrier.
+                // reconstructed here instead of at a later barrier — after
+                // the cursor passed the entry: a reconstruction refused for
+                // memory is retried at the end of every delivery, and the
+                // resumed delivery never meets an entry already applied.
                 if leader && self.ready_term == Some(status.term) && engine.reconstruction_needed()
                 {
                     engine.promote(status.term, &self.consensus)?;
                 }
-                self.applied_raft = entry.index;
-                delivery.entry = next;
                 continue;
             }
             if self.apply_managed_entry(&entry.data, entry.index, &mut delivery.result)? {
@@ -1385,29 +1516,31 @@ impl Session {
         if let Some(engine) = self.native.as_deref_mut() {
             engine.finish_entries(applied_index)?;
         }
+        // Barriers parked by an earlier delivery that may be answered now,
+        // in the order they were parked, each removed only once it is
+        // answered: a retryable refusal leaves it parked.
+        self.release_parked_reads(leader, &status, delivery)?;
+        let bound = self.consensus.pending_reads();
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
-            if barrier.index > self.applied_raft {
-                return Err(LedgerError::Corrupt);
+            if self.read_waits(barrier, leader, &status) {
+                // Answered by a leader ahead of this copy (27 §5, F55):
+                // replication lag, never corruption. The read waits for
+                // the entries it names; the delivery goes on so they can
+                // arrive. Or answered to a leader before its readiness of
+                // the term: it waits for that (`Session::read_waits`). A
+                // parked set that is full drops the barrier, counted,
+                // rather than hold back this delivery.
+                self.park_read(barrier, bound)?;
+                delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
             }
-            if barrier.context == readiness_context(status.term) {
-                self.ready_term = Some(status.term);
-                if leader && let Some(engine) = self.native.as_deref_mut() {
-                    engine.promote(status.term, &self.consensus)?;
-                }
-            } else if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(
-                &barrier.context,
-            ) {
-                let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
-                let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
-                engine.apply_correlated_read(barrier, output)?;
-            } else {
-                delivery
-                    .result
-                    .read_barriers
-                    .push((barrier.context.clone(), self.core.sequence()));
-            }
+            let barrier = barrier.clone();
+            self.complete_read(&barrier, leader, &status, delivery)?;
             delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
         }
+        // The readiness of the term, answered in this delivery, releases
+        // the reads it held, parked above or before it.
+        self.release_parked_reads(leader, &status, delivery)?;
         if leader
             && self.consensus.has_committed_current_term()
             && self.ready_term != Some(status.term)
@@ -1415,6 +1548,16 @@ impl Session {
         {
             self.consensus.read_index(readiness_context(status.term))?;
             self.readiness_requested = Some(status.term);
+        }
+        // An authority whose owner still waits to be rebuilt — a
+        // reconstruction refused for memory after the entry that needed it
+        // applied — rebuilds it here, once per delivery, until it can.
+        if leader
+            && self.ready_term == Some(status.term)
+            && let Some(engine) = self.native.as_deref_mut()
+            && engine.reconstruction_needed()
+        {
+            engine.promote(status.term, &self.consensus)?;
         }
         if let Some(engine) = self.native.as_deref_mut() {
             engine.settle(&status, &mut self.consensus)?;
@@ -1432,6 +1575,150 @@ impl Session {
             delivery.result._native_allocation = Some(allocation);
         }
         Ok(())
+    }
+
+    /// Whether a read barrier waits before it is answered: until this copy
+    /// has applied the entries it names (27 §5, F55), and, at a leader,
+    /// until the leader's readiness of its term is answered. A leader
+    /// answers a read only once it is authoritative (`is_authoritative`), so
+    /// that what the read promises — this leader leads this term, with
+    /// everything committed before it applied — holds for what is asked of
+    /// it next. The readiness barrier is asked once the term's first entry
+    /// is committed, at the end of the delivery that finds it so, while a
+    /// read asked before that delivery leaves with its round: answered a
+    /// round ahead of the readiness, it was answered by a leader whose
+    /// membership read, asked next, was refused `NotReady` (the gate on
+    /// 9b4c6bd). A read held here is answered no later than in the
+    /// delivery that answers the readiness, at a prefix no older than its
+    /// barrier.
+    fn read_waits(
+        &self,
+        barrier: &focal_consensus::ReadBarrier,
+        leader: bool,
+        status: &focal_consensus::NodeScalars,
+    ) -> bool {
+        barrier.index > self.applied_raft
+            || (leader
+                && self.ready_term != Some(status.term)
+                && readiness_term(&barrier.context) != Some(status.term))
+    }
+    /// Answer the parked barriers that wait no longer, in the order they
+    /// were parked.
+    fn release_parked_reads(
+        &mut self,
+        leader: bool,
+        status: &focal_consensus::NodeScalars,
+        delivery: &mut PendingDelivery,
+    ) -> Result<(), LedgerError> {
+        while let Some(position) = self
+            .parked_reads
+            .iter()
+            .position(|barrier| !self.read_waits(barrier, leader, status))
+        {
+            let barrier = self
+                .parked_reads
+                .get(position)
+                .cloned()
+                .ok_or(LedgerError::Corrupt)?;
+            self.complete_read(&barrier, leader, status, delivery)?;
+            self.parked_reads.remove(position);
+        }
+        Ok(())
+    }
+    /// Answer one read barrier this copy has applied up to: the readiness
+    /// barrier of this term, a native correlated read, or a legacy read.
+    fn complete_read(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        leader: bool,
+        status: &focal_consensus::NodeScalars,
+        delivery: &mut PendingDelivery,
+    ) -> Result<(), LedgerError> {
+        if readiness_term(&barrier.context) == Some(status.term) {
+            self.ready_term = Some(status.term);
+            if leader && let Some(engine) = self.native.as_deref_mut() {
+                engine.promote(status.term, &self.consensus)?;
+            }
+        } else if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(&barrier.context)
+        {
+            let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
+            let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
+            engine.apply_correlated_read(barrier, output)?;
+        } else {
+            delivery
+                .result
+                .read_barriers
+                .push((barrier.context.clone(), self.core.sequence()));
+        }
+        Ok(())
+    }
+    /// Hold a barrier answered above the applied index until the entries it
+    /// names are applied. The set is bounded by the reads the core holds in
+    /// flight and charged once for that bound; at the bound the barrier is
+    /// dropped and counted — never a retained delivery, which would hold
+    /// back the very entries the parked reads wait for — and new reads are
+    /// refused at the request (`refuse_at_parked_bound`).
+    fn park_read(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        bound: usize,
+    ) -> Result<(), LedgerError> {
+        if self.parked_reads.len() >= bound {
+            self.reads_dropped = self.reads_dropped.saturating_add(1);
+            return Ok(());
+        }
+        if self.parked_charge.is_none() {
+            let bytes = std::mem::size_of::<focal_consensus::ReadBarrier>()
+                .checked_mul(bound)
+                .ok_or(LedgerError::Capacity)?;
+            let permit = self
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?;
+            self.parked_reads
+                .try_reserve_exact(bound)
+                .map_err(|_| LedgerError::Capacity)?;
+            self.parked_charge = Some(permit.commit());
+        }
+        let mut context = Vec::new();
+        context
+            .try_reserve_exact(barrier.context.len())
+            .map_err(|_| LedgerError::Capacity)?;
+        context.extend_from_slice(&barrier.context);
+        self.parked_reads.push(focal_consensus::ReadBarrier {
+            index: barrier.index,
+            context,
+        });
+        self.reads_parked = self.reads_parked.saturating_add(1);
+        Ok(())
+    }
+    /// A copy whose parked reads are at their bound is too far behind to
+    /// take another: the read is refused here, typed, rather than dropped
+    /// when its answer comes.
+    fn refuse_at_parked_bound(&self) -> Result<(), LedgerError> {
+        if self.parked_reads.len() >= self.consensus.pending_reads() {
+            return Err(LedgerError::Capacity);
+        }
+        Ok(())
+    }
+    /// Read barriers held before they were answered, since this session
+    /// opened: answered above this copy's applied index and held until it
+    /// caught up (27 §5, follower reads), or answered to a leader before
+    /// its readiness of the term and held for it (`Session::read_waits`).
+    pub fn reads_parked(&self) -> u64 {
+        self.reads_parked
+    }
+    /// Read barriers dropped at the parked bound since this session opened.
+    pub fn reads_dropped(&self) -> u64 {
+        self.reads_dropped
+    }
+
+    /// The next reconstruction of the native owner is refused as memory:
+    /// the tests of a refused reconstruction after an applied entry.
+    #[cfg(test)]
+    pub(crate) fn refuse_next_reconstruction_for_test(&mut self) {
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.refuse_reconstructions = engine.refuse_reconstructions.saturating_add(1);
+        }
     }
 
     pub fn deltas_after(
@@ -1507,10 +1794,30 @@ pub fn mutation_lane(command: &Command) -> BudgetLane {
     }
 }
 
+/// What a readiness barrier's context begins with; the term follows it.
+const READINESS_PREFIX: &[u8] = b"focal.leader-ready\0";
+/// The context of the readiness barrier of `term`, built once for the
+/// request that asks it (the audit's F53: a comparison builds none).
 fn readiness_context(term: u64) -> Vec<u8> {
-    let mut bytes = b"focal.leader-ready\0".to_vec();
-    bytes.extend_from_slice(&term.to_be_bytes());
+    let mut bytes = Vec::new();
+    // A context of twenty-seven bytes; a reservation that fails leaves a
+    // shorter one, which no barrier matches and the request refuses.
+    if bytes
+        .try_reserve_exact(READINESS_PREFIX.len().saturating_add(size_of::<u64>()))
+        .is_ok()
+    {
+        bytes.extend_from_slice(READINESS_PREFIX);
+        bytes.extend_from_slice(&term.to_be_bytes());
+    }
     bytes
+}
+/// The term a readiness barrier's context names; `None` for any other
+/// context. Read in place: comparing a barrier to the readiness marker
+/// allocated a marker to compare with, for every barrier completed.
+fn readiness_term(context: &[u8]) -> Option<u64> {
+    let term = context.strip_prefix(READINESS_PREFIX)?;
+    let bytes: [u8; 8] = term.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
 }
 
 include!("native_hosting.rs");
@@ -1532,6 +1839,130 @@ mod native_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A readiness barrier is told by its context in place (the audit's
+    /// F53): the marker of a term reads back as that term, and a context a
+    /// byte or a length away from it — a caller's correlated read among
+    /// them — is no readiness barrier.
+    #[test]
+    fn a_readiness_marker_is_read_in_place() {
+        for term in [0, 1, 7, u64::MAX] {
+            let context = readiness_context(term);
+            assert_eq!(context.len(), READINESS_PREFIX.len() + 8);
+            assert_eq!(readiness_term(&context), Some(term));
+        }
+        let mut other = readiness_context(5);
+        other[0] ^= 1;
+        assert_eq!(readiness_term(&other), None);
+        let mut longer = readiness_context(5);
+        longer.push(0);
+        assert_eq!(readiness_term(&longer), None);
+        let shorter = &readiness_context(5)[..READINESS_PREFIX.len() + 7];
+        assert_eq!(readiness_term(shorter), None);
+        assert_eq!(readiness_term(&[7; 16]), None);
+        assert_eq!(readiness_term(&[]), None);
+    }
+    /// A leader answers a read only once it is authoritative in its term.
+    /// A read asked between the commit of the term's first entry and the
+    /// poll that delivers it leaves with that poll's round, a round ahead
+    /// of the readiness barrier asked at the delivery's end: its barrier is
+    /// held until the readiness is answered and then answered in the same
+    /// delivery. Before, it was answered by a leader not yet authoritative,
+    /// and a membership read asked next was refused `NotReady` (fleet_quic's
+    /// trusted membership test, the gate on 9b4c6bd).
+    #[test]
+    fn a_leader_answers_a_read_only_once_it_is_ready_in_its_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions: Vec<Session> = (1..=3)
+            .map(|id| {
+                let mut cfg = config();
+                cfg.node_id = id;
+                cfg.voters = vec![1, 2, 3];
+                Session::open(
+                    dir.path().join(id.to_string()),
+                    identity(),
+                    cfg,
+                    SessionLimits::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        // One poll of every session, its messages carried, but those `held`
+        // keeps: what the leader is sent, held back, is returned.
+        fn carry(sessions: &mut [Session], held: impl Fn(&Message) -> bool) -> Vec<Message> {
+            let mut messages = Vec::new();
+            for session in sessions.iter_mut() {
+                messages.extend(session.poll().unwrap().messages);
+            }
+            let mut kept = Vec::new();
+            for message in messages {
+                if held(&message) {
+                    kept.push(message);
+                } else {
+                    sessions[message.to as usize - 1].step(message).unwrap();
+                }
+            }
+            kept
+        }
+        sessions[0].campaign().unwrap();
+        for _ in 0..40 {
+            if sessions[0].status().role == StateRole::Leader {
+                break;
+            }
+            carry(&mut sessions, |_| false);
+        }
+        assert_eq!(sessions[0].status().role, StateRole::Leader);
+        // The followers' answers to the leader's first entry, held back.
+        let mut answers = Vec::new();
+        for _ in 0..40 {
+            answers = carry(&mut sessions, |message| {
+                message.to == 1
+                    && message.msg_type == focal_consensus::MessageType::MsgAppendResponse
+            });
+            if !answers.is_empty() {
+                break;
+            }
+        }
+        assert!(!answers.is_empty(), "the first entry's answers");
+        // The answers commit the term's first entry; a read is asked before
+        // the leader polls.
+        for answer in answers {
+            sessions[0].step(answer).unwrap();
+        }
+        sessions[0]
+            .read_index(b"a participant's read".to_vec())
+            .unwrap();
+        let mut answered = None;
+        for round in 0..40 {
+            let events = sessions[0].poll().unwrap();
+            if events
+                .read_barriers
+                .iter()
+                .any(|(context, _)| context.as_slice() == b"a participant's read")
+            {
+                assert!(
+                    sessions[0].is_authoritative(),
+                    "the read was answered by a leader not yet authoritative in its term"
+                );
+                answered = Some(round);
+                break;
+            }
+            for message in events.messages {
+                sessions[message.to as usize - 1].step(message).unwrap();
+            }
+            let mut back = Vec::new();
+            for session in &mut sessions[1..] {
+                back.extend(session.poll().unwrap().messages);
+            }
+            for message in back {
+                sessions[message.to as usize - 1].step(message).unwrap();
+            }
+        }
+        assert!(answered.is_some(), "the read was answered");
+        assert!(
+            sessions[0].reads_parked() > 0,
+            "the read waited for readiness"
+        );
+    }
     fn identity() -> LedgerId {
         LedgerId {
             tenant: TenantId::from_u128(1),
@@ -1863,11 +2294,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.pending_count(), 1);
         assert!(s.memory_stats().used > baseline);
-        let mut heartbeat = Message::default();
-        heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
-        heartbeat.from = 2;
-        heartbeat.to = 1;
-        heartbeat.term = s.status().term + 1;
+        let heartbeat = Message {
+            msg_type: focal_consensus::MessageType::MsgHeartbeat,
+            from: 2,
+            to: 1,
+            term: s.status().term + 1,
+            ..Message::default()
+        };
         s.step(heartbeat).unwrap();
         drop(s.poll().unwrap());
         assert_eq!(s.status().role, StateRole::Follower);

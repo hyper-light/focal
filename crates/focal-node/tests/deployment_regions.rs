@@ -43,7 +43,7 @@ fn regional(view: &Value, id: u64, region: &str) -> bool {
 fn wait_for_peer_rtt(founder: &Node) -> String {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
-        let output = fleet::run(founder, None, &["cluster", "node", "metrics"]);
+        let output = fleet::run(founder, None, &["diagnose", "node", "--metrics"]);
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             if text.contains("focal_peer_rtt_ms{") {
@@ -154,9 +154,9 @@ fn the_region_stage_spans_regions_shows_latency_and_fences_residency() {
             "focal",
             "--data-dir",
             "<founder>",
-            "cluster",
+            "diagnose",
             "node",
-            "metrics",
+            "--metrics",
         ],
     );
     // ---- DC11: lose region r3 (pause its host; it returns with its disk).
