@@ -194,7 +194,8 @@ impl DurableNode {
     ///
     /// A lower priority is voted for all the same when its log is more
     /// current than the voter's, by its last term and then its length
-    /// (`hyper_raft::Precedence::Log`): a voter that refuses for priority
+    /// (hyper-raft's one rule since 38140c1; raft-rs's, which refused it,
+    /// livelocked a group and is kept only to test against): a voter that refuses for priority
     /// could then have been elected itself, so priority never leaves a group
     /// that can elect without a leader.
     pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {

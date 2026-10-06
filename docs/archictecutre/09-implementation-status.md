@@ -14023,3 +14023,33 @@ repository's line, each with its six targets green:
   covers it.
 - focal uses neither `Precedence` nor `Config::precedence`; two doc comments that named
   `Precedence::Log` are reworded in focal's next commit.
+
+### 2026-10-05 — focal on hyper-raft 38140c1: proposals held until released, the classic commit on the kept wire
+
+38140c1 closes the livelock b5e372d had (a voter refused, for priority, a candidate whose log was
+more current; raft-rs's rule, now test-only) and holds what a member approved by itself on the
+fast track until it knows the index committed by a classic quorum (d8578be, design A). focal's
+side:
+
+- **Storage holds a proposal until a `Ready` releases it.** `RamLog` dropped a proposal once its
+  log reached the index, and recovery and checkpoints did the same. The core now forbids that:
+  storage drops a proposal only at or below `Ready::released`, never because the log reached it,
+  nor at a snapshot or compaction. `prepare_with` carries the release, `publish` applies it before
+  the `Ready`'s own proposals, recovery gives back every proposal record, and a checkpoint writes
+  every proposal storage holds. focal's log keeps no record of a release, so
+  `InitialState::released` is zero at open. The core's contract makes that safe: a member is given
+  back every proposal its log still holds and holds them until it learns their commit again, which
+  costs the core's bounded room. The shell's `FloorStore` delegates `released` to its store.
+- **The classic commit on the wire.** A member releases only through the classic commit its leader
+  states (`Message::classic`, set on every append, heartbeat and snapshot). focal's wire had no
+  field for it, so the fast-track tests' followers held their proposals for good. It is field 19,
+  written with its presence and only under `Wire::Kept`. Below the fence it is left out, not
+  refused, because a message without it says nothing known; a reader below the fence skips it.
+  The fast track needs it, so a group has the fast track only above the fence, which focal
+  withholds outside tests in any case (`NodeConfig::validate`).
+  `the_classic_commit_travels_only_on_the_kept_wire_with_its_presence` checks both wires and
+  `Some(0)`. The fast-track tests run their members on the kept wire, and the fast-quorum test
+  beats until each follower learns the classic commit and releases, within four heartbeat
+  periods.
+- **Precedence.** `hyper_raft::Precedence` and `Config::precedence` are gone. focal used neither;
+  two doc comments that named `Precedence::Log` are reworded.

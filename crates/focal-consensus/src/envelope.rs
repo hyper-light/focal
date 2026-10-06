@@ -159,6 +159,10 @@ fn varint_field_len(field: u64, value: u64) -> usize {
         varint_len(key(field, VARINT)).saturating_add(varint_len(value))
     }
 }
+/// The bytes of a varint field written with its presence: zero included.
+fn present_varint_field_len(field: u64, value: u64) -> usize {
+    varint_len(key(field, VARINT)).saturating_add(varint_len(value))
+}
 
 /// The bytes of a length-delimited field of `length` bytes, present or not.
 fn delimited_len(field: u64, length: usize) -> Result<usize> {
@@ -534,6 +538,13 @@ pub enum Wire {
 const KEPT_FIELD: u64 = 17;
 /// Field 18 of a message: a refusal for entries lost at rest (`Message::lost`).
 const LOST_FIELD: u64 = 18;
+/// Field 19 of a message: the index through which the leader knows its log committed by a
+/// classic quorum (`Message::classic`). Written with its presence, zero included, and only under
+/// `Wire::Kept`; below the fence a reader skips it as raft-rs skips a field it does not know, and
+/// a message without it says nothing known, which never releases what a member holds (hyper-raft
+/// `docs/raft.md`, "Releasing what a member holds"). The fast track needs it, so a group has the
+/// fast track only above the fence.
+const CLASSIC_FIELD: u64 = 19;
 
 fn layout(message: &Message, wire: Wire) -> Result<Layout<'_>> {
     if wire == Wire::Frozen {
@@ -585,6 +596,11 @@ fn layout(message: &Message, wire: Wire) -> Result<Layout<'_>> {
         length,
         varint_field_len(LOST_FIELD, u64::from(message.lost)),
     )?;
+    if wire == Wire::Kept
+        && let Some(classic) = message.classic
+    {
+        length = add(length, present_varint_field_len(CLASSIC_FIELD, classic))?;
+    }
     Ok(Layout {
         entries,
         snapshot,
@@ -633,6 +649,12 @@ pub fn encode_message_in(message: &Message, wire: Wire) -> Result<Vec<u8>> {
     put_varint_field(&mut out, 16, int64(message.priority));
     put_varint_field(&mut out, KEPT_FIELD, u64::from(message.kept));
     put_varint_field(&mut out, LOST_FIELD, u64::from(message.lost));
+    if wire == Wire::Kept
+        && let Some(classic) = message.classic
+    {
+        put_varint(&mut out, key(CLASSIC_FIELD, VARINT));
+        put_varint(&mut out, classic);
+    }
     Ok(out)
 }
 
@@ -1071,6 +1093,13 @@ pub fn decode_message_in(bytes: &[u8], wire: Wire) -> Result<Message> {
                     return Err(EnvelopeError::Unstated("a member's mark"));
                 }
                 message.lost = lost;
+            }
+            CLASSIC_FIELD => {
+                let classic = varint_of("Message", field, value)?;
+                // Below the fence, skipped: nothing known.
+                if wire == Wire::Kept {
+                    message.classic = Some(classic);
+                }
             }
             _ => {}
         }

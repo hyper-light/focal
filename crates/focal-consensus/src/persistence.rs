@@ -535,6 +535,7 @@ impl LogNode {
                         ready.entries(),
                         ready.snapshot(),
                         ready.proposals(),
+                        ready.released(),
                     )?;
                     pending.phase = Phase::Ready(Box::new(ReadyPhase {
                         ready,

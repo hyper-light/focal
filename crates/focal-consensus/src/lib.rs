@@ -1004,7 +1004,8 @@ impl LogNode {
     ///
     /// A lower priority is voted for all the same when its log is more
     /// current than the voter's, by its last term and then its length
-    /// (`hyper_raft::Precedence::Log`): a voter that refuses for priority
+    /// (hyper-raft's one rule since 38140c1; raft-rs's, which refused it,
+    /// livelocked a group and is kept only to test against): a voter that refuses for priority
     /// could then have been elected itself, so priority never leaves a group
     /// that can elect without a leader.
     /// The fields beyond raft-rs's this member's peers carry, from now on (`Wire`): under
@@ -1709,10 +1710,11 @@ fn replay_record(
             {
                 return Err(ConsensusError::Corruption("proposal envelope mismatch"));
             }
-            // What the log has reached since is set aside.
-            if entry.index > storage.last_index()? {
-                storage.hold_proposal(entry)?;
-            }
+            // Every proposal the log still holds is given back, whatever the
+            // log has reached since: the core holds it until it learns its
+            // index committed by a classic quorum (hyper-raft
+            // `InitialState::released`).
+            storage.hold_proposal(entry)?;
         }
         RecordKind::DecoderFloor => {
             if config.is_none() || required_decoder.is_some() {
