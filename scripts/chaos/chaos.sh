@@ -54,6 +54,28 @@ done
 focal fc-founder cluster replicas activate-native >/dev/null 2>&1 || true
 echo "session placed on three voters"
 
+# The writer: the founder's own local principal through its socket, or
+# (WRITER=client) a participant enrolled at the cluster that writes over
+# QUIC from a container of its own and follows the session's route.
+WRITER=${WRITER:-founder}
+client() {
+  docker run --rm --network focal-chaos -v fc-client:/c --entrypoint /focal "$IMAGE" \
+    --data-dir /c/data "$@"
+}
+if [ "$WRITER" = client ]; then
+  focal fc-founder cluster client invite --name alice --output /var/lib/focal/alice.invite >/dev/null
+  docker cp fc-founder:/var/lib/focal/alice.invite "$OUT/alice.invite"
+  docker volume rm fc-client >/dev/null 2>&1 || true
+  docker run --rm -i -v fc-client:/c alpine:3.20 sh -c \
+    'mkdir -p /c/data /c/invite && cat > /c/invite/alice.invite && chown -R 65532:65532 /c && chmod 700 /c/data /c/invite && chmod 600 /c/invite/alice.invite' \
+    < "$OUT/alice.invite"
+  client context enroll alice --invite-file /c/invite/alice.invite >/dev/null || { echo "client never enrolled"; exit 1; }
+  echo "writer: participant alice, enrolled over QUIC"
+fi
+write() {
+  if [ "$WRITER" = client ]; then client --client-context alice "$@"; else focal fc-founder "$@"; fi
+}
+
 # Faults: loss and delay on every node, from a sidecar in its namespace.
 # The sidecar image holds tc already: a node cut off cannot fetch packages,
 # and its reconnection must not depend on its own network.
@@ -82,7 +104,7 @@ for i in $(seq 1 "$CLAIMS"); do
   fi
   doc="{\"target\":\"self\",\"action\":\"handoff\",\"description\":\"chaos $i\",\"validations\":[{\"kind\":\"receipt\",\"description\":\"Receive the report testament\",\"deadline\":{\"at\":$FAR}}]}"
   t0=$(now_ms)
-  out=$(focal fc-founder submit claim --json "$doc" 2>&1); code=$?
+  out=$(write submit claim --json "$doc" 2>&1); code=$?
   claim=$(echo "$out" | awk -F'\t' '$1=="CREATED" && $2=="claim" {print $3; exit}')
   if [ $code -eq 0 ] && [ -n "$claim" ]; then
     # The committed creation is the replicated, durable claim; posting it
