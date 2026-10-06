@@ -77,6 +77,31 @@ The fault sidecar is a local image with `tc` already installed (`scripts/chaos/t
 A sidecar that installed it at run time would fetch over the node's own network, and a node cut
 off could never be reconnected.
 
+### The session's leader cut off: refused, never lost, resolved exactly once
+
+`bash scripts/chaos/chaos.sh focal:chaos-6c56b29 120 5 50 leader`: the founder, which leads the
+session and is the node the CLI writes through, loses every packet from claim 40 to claim 80.
+
+| claims | outcome |
+|---|---|
+| 1–39 | acknowledged |
+| 40–79 (founder cut off) | all 40 refused `unavailable`; none acknowledged |
+| 80–82 (at reconnection) | `RequestUnconfirmed`, `route_changed`: the session's route moved to epoch 2 while the founder was away; the CLI names `request retry --operation-id n1:…` for each |
+| 83–120 | acknowledged |
+
+After the run:
+
+- **Every acknowledged claim (77) reads back on all three nodes;** none missing, none duplicated.
+- **Each unconfirmed operation resolves exactly once.** `request retry` answered each `Committed`
+  at sequences 78, 79 and 80, and a second retry answered the same sequence and the same claim.
+  Each of the three reads back on all three nodes.
+- **No refused write committed behind the client.** The 77 acknowledged claims and the three
+  retried ones are sequences 1–80 exactly, so none of the 40 `unavailable` writes was committed.
+
+While the founder was cut off, the other two voters still made a majority. Writes stopped
+because the CLI here writes through the founder's own local socket. A client enrolled at the
+cluster would follow the route to the new leader; that is the next run.
+
 ## What the first two runs taught (harness, not focal)
 
 - A claim targeting the node itself with the action `work` is refused at creation
@@ -89,7 +114,7 @@ off could never be reconnected.
 
 - Killing the founder, through which the CLI writes. A client enrolled at the cluster, writing to
   whichever node leads, is the next step (`focal-load` over QUIC, 19d1c27).
-- A partition that isolates the session's leader, and a kill of the leader while it is not the
-  founder.
+- Writes through an enrolled client that follows the route while the founder is cut off, and a
+  kill of the session's leader while it is not the founder.
 - Artifacts, testaments and validations under the same faults.
 - Dozens of nodes. This host's Docker VM holds three comfortably.

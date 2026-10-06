@@ -9,6 +9,10 @@
 #   kill:      SIGKILL fc-host-a for the middle third, then restart it.
 #   partition: cut fc-host-b off both ways (100% loss) for the middle third,
 #              then reconnect it; the node stays up throughout.
+#   leader:    cut the founder, the session's leader and the node the CLI
+#              writes through, off both ways for the middle third. Writes
+#              then are refused or of unknown outcome, never acknowledged
+#              and lost; after it reconnects, writes are acknowledged again.
 set -uo pipefail
 IMAGE=${1:?image}; CLAIMS=${2:-120}; LOSS=${3:-5}; DELAY=${4:-50}; MODE=${5:-kill}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -72,8 +76,9 @@ for i in $(seq 1 "$CLAIMS"); do
     [ "$i" -eq "$KILL_AT" ] && { docker kill -s KILL fc-host-a >/dev/null; echo "claim $i: SIGKILL fc-host-a"; }
     [ "$i" -eq "$START_AT" ] && { docker start fc-host-a >/dev/null; echo "claim $i: restarted fc-host-a"; }
   else
-    [ "$i" -eq "$KILL_AT" ] && { netem fc-host-b "loss 100%"; echo "claim $i: fc-host-b cut off"; }
-    [ "$i" -eq "$START_AT" ] && { netem fc-host-b "delay ${DELAY}ms $((DELAY/2))ms loss ${LOSS}%"; echo "claim $i: fc-host-b reconnected"; }
+    cut=fc-host-b; [ "$MODE" = leader ] && cut=fc-founder
+    [ "$i" -eq "$KILL_AT" ] && { netem "$cut" "loss 100%"; echo "claim $i: $cut cut off"; }
+    [ "$i" -eq "$START_AT" ] && { netem "$cut" "delay ${DELAY}ms $((DELAY/2))ms loss ${LOSS}%"; echo "claim $i: $cut reconnected"; }
   fi
   doc="{\"target\":\"self\",\"action\":\"handoff\",\"description\":\"chaos $i\",\"validations\":[{\"kind\":\"receipt\",\"description\":\"Receive the report testament\",\"deadline\":{\"at\":$FAR}}]}"
   t0=$(now_ms)
