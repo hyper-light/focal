@@ -47,6 +47,18 @@ through `docker exec`, on a host at load 50–65, with 50 ± 25 ms added to ever
 recorded to bound the run, not to compare. The measured comparison is the
 [competitive p99 plan](../competitive-p99.md), on a Linux host.
 
+### Harsher: 20% loss, 100 ± 50 ms on every node
+
+`bash scripts/chaos/chaos.sh focal:chaos-6c56b29 120 20 100`, the same kill and restart:
+
+| | |
+|---|---|
+| acknowledged | 120 of 120 |
+| refused or outcome unknown | 0 |
+| missing on any of the three nodes, the restarted one included | 0 |
+| duplicates | 0 |
+| end-to-end per claim | p50 1,543 ms, p99 2,291 ms, max 2,351 ms |
+
 ## What the first two runs taught (harness, not focal)
 
 - A claim targeting the node itself with the action `work` is refused at creation
