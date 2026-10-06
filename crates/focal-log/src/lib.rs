@@ -206,6 +206,9 @@ pub enum LogError {
 
 pub struct Wal {
     directory: PathBuf,
+    /// The fence's file and its staging file, joined once at open: a fence is installed on every group
+    /// commit, and joining the paths there grew two path buffers per commit.
+    fence: FencePaths,
     options: WalOptions,
     _lock: focal_platform::FileLock,
     active: File,
@@ -276,7 +279,8 @@ impl Wal {
                 LogError::Io(e)
             }
         })?;
-        let current = directory.join("CURRENT");
+        let fence_paths = FencePaths::of(&directory);
+        let current = fence_paths.current.clone();
         let (position, base) = if current.exists() {
             let fence = read_fence(&current)?;
             if fence.version != FENCE_VERSION || fence.identity != options.identity {
@@ -301,7 +305,13 @@ impl Wal {
                 fs::remove_file(&path)?;
             }
             create_segment(&directory, &options, position, 0)?;
-            install_fence(&directory, &options, position, DurableBase::default())?;
+            install_fence(
+                &fence_paths,
+                &directory,
+                &options,
+                position,
+                DurableBase::default(),
+            )?;
             let sentinel = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -338,6 +348,7 @@ impl Wal {
         cleanup_segments(&directory, base, position)?;
         Ok(Self {
             directory,
+            fence: fence_paths,
             options,
             _lock: lock,
             active,
@@ -452,7 +463,13 @@ impl Wal {
             self.base = DurableBase::default();
             let position = self.append_encoded(&encoded)?;
             if encoded.is_empty() {
-                install_fence(&self.directory, &self.options, position, self.base)?;
+                install_fence(
+                    &self.fence,
+                    &self.directory,
+                    &self.options,
+                    position,
+                    self.base,
+                )?;
             }
             scan(&self.directory, &self.options, self.base, position, |_| {
                 Ok(())
@@ -637,7 +654,13 @@ impl Wal {
         self.fail_at(FaultPoint::AfterAppend)?;
         self.active.sync_all()?;
         self.fail_at(FaultPoint::AfterDataSync)?;
-        install_fence(&self.directory, &self.options, self.position, self.base)?;
+        install_fence(
+            &self.fence,
+            &self.directory,
+            &self.options,
+            self.position,
+            self.base,
+        )?;
         self.fail_at(FaultPoint::AfterFenceInstall)?;
         Ok(self.position)
     }
@@ -751,29 +774,67 @@ fn segment_base(
     })
 }
 
+/// The fence's file and the file it is staged in before the atomic replace.
+#[derive(Debug)]
+struct FencePaths {
+    current: PathBuf,
+    temp: PathBuf,
+}
+
+impl FencePaths {
+    fn of(directory: &Path) -> FencePaths {
+        FencePaths {
+            current: directory.join("CURRENT"),
+            temp: directory.join("CURRENT.tmp"),
+        }
+    }
+}
+
+/// Derived: the longest postcard encoding of a [`Fence`]. Varints take at most 5 bytes for a `u32` and 10 for
+/// a `u64`, and a `[u8; 16]` is its 16 bytes: the version (5), the identity (16 + 10 + 5), the position
+/// (4 × 10 + 5) and the base (3 × 10 + 5).
+const FENCE_BODY_MAX: usize = 5 + (16 + 10 + 5) + (4 * 10 + 5) + (3 * 10 + 5);
+/// Derived: the fence file at its longest: the magic, the body and its CRC-32.
+const FENCE_FILE_MAX: usize = FENCE_MAGIC.len() + FENCE_BODY_MAX + 4;
+
+/// Installs the durability fence: the magic, the encoded fence and its CRC-32, built in one stack buffer and
+/// written at once, then synced and atomically replaced (the bytes are as before; the encoding no longer
+/// grows a heap buffer a byte at a time, and the file takes one write instead of three).
 fn install_fence(
+    paths: &FencePaths,
     directory: &Path,
     options: &WalOptions,
     position: DurablePosition,
     base: DurableBase,
 ) -> Result<(), LogError> {
-    let data = postcard::to_stdvec(&Fence {
-        version: FENCE_VERSION,
-        identity: options.identity,
-        position,
-        base,
-    })?;
-    let temp = directory.join("CURRENT.tmp");
+    let mut file_bytes = [0u8; FENCE_FILE_MAX];
+    let (magic, rest) = file_bytes.split_at_mut(FENCE_MAGIC.len());
+    magic.copy_from_slice(FENCE_MAGIC);
+    let body_len = postcard::to_slice(
+        &Fence {
+            version: FENCE_VERSION,
+            identity: options.identity,
+            position,
+            base,
+        },
+        rest,
+    )?
+    .len();
+    let crc_at = FENCE_MAGIC.len().saturating_add(body_len);
+    let checksum = crc32fast::hash(file_bytes.get(FENCE_MAGIC.len()..crc_at).unwrap_or(&[]));
+    let end = crc_at.saturating_add(4);
+    file_bytes
+        .get_mut(crc_at..end)
+        .ok_or(LogError::Capacity)?
+        .copy_from_slice(&checksum.to_le_bytes());
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(&temp)?;
-    file.write_all(FENCE_MAGIC)?;
-    file.write_all(&data)?;
-    file.write_all(&crc32fast::hash(&data).to_le_bytes())?;
+        .open(&paths.temp)?;
+    file.write_all(file_bytes.get(..end).ok_or(LogError::Capacity)?)?;
     file.sync_all()?;
-    focal_platform::fs::atomic_replace(&temp, &directory.join("CURRENT"))?;
+    focal_platform::fs::atomic_replace(&paths.temp, &paths.current)?;
     sync_dir(directory)
 }
 
@@ -1183,6 +1244,72 @@ fn cleanup_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fence written from a stack buffer is byte for byte the fence as it was written from a heap encode:
+    /// the magic, postcard's encoding and its CRC-32. A reader of either reads the other.
+    #[test]
+    fn a_fence_is_written_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = WalOptions::new(WalIdentity {
+            cluster: [7; 16],
+            node: 3,
+            stream: 9,
+        });
+        let position = DurablePosition {
+            generation: 2,
+            segment: 5,
+            byte: 4_096,
+            sequence: 77,
+            checksum: 0xDEAD_BEEF,
+        };
+        let base = DurableBase {
+            segment: 1,
+            byte: HEADER_LEN,
+            sequence: 3,
+            checksum: 9,
+        };
+        install_fence(&FencePaths::of(dir.path()), dir.path(), &options, position, base).unwrap();
+        let body = postcard::to_stdvec(&Fence {
+            version: FENCE_VERSION,
+            identity: options.identity,
+            position,
+            base,
+        })
+        .unwrap();
+        let mut expected = FENCE_MAGIC.to_vec();
+        expected.extend_from_slice(&body);
+        expected.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        assert_eq!(std::fs::read(dir.path().join("CURRENT")).unwrap(), expected);
+        let read = read_fence(&dir.path().join("CURRENT")).unwrap();
+        assert_eq!((read.position, read.base), (position, base));
+    }
+
+    /// The derived bound holds: a fence with every field at its longest encoding fits the stack buffer.
+    #[test]
+    fn the_longest_fence_fits_its_bound() {
+        let longest = Fence {
+            version: u32::MAX,
+            identity: WalIdentity {
+                cluster: [u8::MAX; 16],
+                node: u64::MAX,
+                stream: u32::MAX,
+            },
+            position: DurablePosition {
+                generation: u64::MAX,
+                segment: u64::MAX,
+                byte: u64::MAX,
+                sequence: u64::MAX,
+                checksum: u32::MAX,
+            },
+            base: DurableBase {
+                segment: u64::MAX,
+                byte: u64::MAX,
+                sequence: u64::MAX,
+                checksum: u32::MAX,
+            },
+        };
+        assert_eq!(postcard::to_stdvec(&longest).unwrap().len(), FENCE_BODY_MAX);
+    }
     #[test]
     fn appended_transition_preserves_all_floor_era_ordinals_and_refuses_its_decoder() {
         #[derive(Serialize, Deserialize)]

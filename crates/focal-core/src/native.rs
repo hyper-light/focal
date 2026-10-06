@@ -1134,6 +1134,11 @@ fn page_partition(key: &Key) -> u64 {
         | Key::ByCreated(..)
         | Key::DueTimer(..)
         | Key::ByObject(..) => 6,
+        // The session's counters are rewritten by every mutation. Sharing class 0 with the events put them on
+        // the oldest events' page, so every mutation deep-copied that page's rows (the 2026-09-29 allocation
+        // audit's R4: about a hundred 504-byte event copies a claim). On a page of their own a rewrite copies
+        // one row.
+        Key::Meta => 7,
         _ => 0,
     }
 }

@@ -412,3 +412,50 @@ Not mine: `git status` at the end also shows `crates/focal-timing/src/round.rs`,
 Gates run on the touched crates: `cargo fmt --all --check` clean for the files above (`rustfmt --check` on the seven files exits 0; the workspace-wide `cargo fmt --all --check` currently fails on the other agent's in-progress `crates/focal-node/tests` — "failed to resolve mod `support`: tests/support.rs does not exist" — which is unrelated to this audit); `python3 scripts/check-contracts.py` clean; `cargo clippy -p focal-memory -p focal-wire -p focal-log -p focal-core -p focal-raft -p focal-load --all-targets --locked -- -D warnings`: clean (exit 0 after the final edits; the first pass flagged two `manual_is_multiple_of` lints in the allocator, fixed). The whole-workspace gates were not run (another agent owns the build).
 
 Run: `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --bench allocs -p <crate>` then `target/release/deps/allocs-<hash>` (env: `FOCAL_BENCH_ITERS`, `FOCAL_ALLOC_SAMPLE`, `FOCAL_ALLOC_REALLOC_SAMPLE`, `FOCAL_ALLOC_SAMPLE_BUDGET`; `FOCAL_RAFT_FIFO=1`; `FOCAL_LOAD_CLAIMS`/`FOCAL_LOAD_READS`/`FOCAL_LOAD_SEED`/`FOCAL_LOAD_TOP`). `cargo bench -p <crate> --bench allocs` works too (bench profile).
+
+## 7. Follow-up, 2026-10-06 (macOS arm64, focal `chaos` at 72d9950 plus this change)
+
+Measured with the same end-to-end bench (`tools/load/benches/allocs.rs`, 1,000 claims and reads,
+line tables on). What changed since the audit: R3 (the RamLog grows to the power of two it is charged
+for) and one durable group commit per committed claim (R1) are in the tree.
+
+| path | then (2026-09-29) | before this change | after this change |
+|---|---|---|---|
+| claim: allocs / reallocs per op | 356.9 / 12.0 | 333.8 / 5.04 | **260.8 / 0.04** |
+| claim: bytes requested per op | 574 KB | 505 KB | **443 KB** |
+| claim: live growth per op | 9.4 KB | 9.5 KB | 9.5 KB |
+| read (linearizable): allocs / reallocs | 27 / 1 | 20 / 0 | 20 / 0 |
+
+This change:
+
+- **The WAL fence is encoded in a stack buffer and its paths are joined once** (`focal-log`,
+  `install_fence`, `FencePaths`). Its encoding pushed the 16-byte identity and the varints into a heap
+  `Vec` a byte at a time (3 reallocations), and `directory.join("CURRENT.tmp")` and `join("CURRENT")`
+  grew two path buffers (2 more) on every group commit. The buffer's bound is derived
+  (`FENCE_BODY_MAX`, 116 bytes: the longest varints of each field, pinned by a test), the bytes on disk
+  are unchanged (a test compares them to the heap encoding), and the file takes one write instead of
+  three. −5 reallocations per committed claim.
+- **`Key::Meta` has a page class of its own** (`focal-core`, `page_partition`), the first half of R4.
+  The session's counters are rewritten by every mutation; sharing class 0 with the events put them on
+  the oldest events' page, which every mutation then deep-copied. Pages are not persisted (hydration
+  rebuilds them from rows with the classifier; checkpoints carry rows in key order), so no stored or
+  wire byte changes. −73 allocations and −62 KB requested per committed claim.
+
+**Page size, measured, not changed.** `page_entries` (128) was swept at 16/32/64/128 over 2,000 claims:
+bytes requested per claim fall from 447 KB to 219 KB at 16 and allocations from 262 to 212, with live
+heap within 0.5%. Over 3,000 claims and 3,000 reads, user CPU (2.0–2.25 s), peak RSS (58–59 MB),
+minor faults (≈3,800; no major faults) and read p50 did not separate from noise, and write latency is
+the durable sync (p50 ≈ 12.8 ms at every size). Allocator traffic alone does not justify a new
+constant; it stays until a measurement under load shows a cost.
+
+**What remains**, in order of effect:
+
+1. The durable sync is the write path's latency: each group commit issues three `F_FULLFSYNC`s on macOS
+   (segment, fence staging file, directory). R2 (an in-place fence slot or a commit frame in the
+   segment) takes it to one or two. It changes the on-disk format, so it needs a design decision.
+2. Each committed claim rebuilds about 11 pages copy-on-write. Every neighbour row is deep-copied
+   (declarations ≈ 37, events ≈ 34, claim rows ≈ 20, obligations ≈ 16 allocations a claim), with a
+   15.8 KB entry vector per page (≈ 180 KB of the 443 KB requested). Sharing unchanged rows between
+   page versions makes a neighbour a reference, not a copy. That needs either a reference count per
+   row (doc 10's shared-immutable case) or epoch reclamation over the store's existing pins, so it
+   needs a design decision.
