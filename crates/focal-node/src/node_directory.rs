@@ -168,6 +168,15 @@ fn acquire(settings: &Settings) -> Result<(PathBuf, focal_platform::FileLock), N
     settings.validate()?;
     let root = settings.data_dir()?;
     durable_dir(&root)?;
+    // A directory the node made is private (`durable_dir`); one it found, a
+    // mounted volume, may be another user's or writable by others. Refused
+    // here, before anything is kept in it, by the rule the cluster
+    // administration's journals hold it to (`cluster_admin::initialize_named`).
+    if focal_platform::fs::owner_at(&root)? != focal_platform::fs::current_owner()?
+        || !focal_platform::fs::dir_not_writable_by_others(&root)?
+    {
+        return Err(NodeError::NotPrivate(root));
+    }
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -196,6 +205,32 @@ fn save(path: &Path, identity: &NodeIdentity) -> Result<(), NodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A data directory others may write to is refused at start, typed,
+    /// before anything is kept in it; one others may only read (a `mkdir`
+    /// under the default umask, a volume left 0755) is the node's.
+    #[cfg(unix)]
+    #[test]
+    fn a_data_directory_others_may_write_is_refused_at_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("volume");
+        std::fs::create_dir(&root).unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.clone());
+        for mode in [0o777, 0o775, 0o757] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(
+                    NodeDirectory::open(&settings),
+                    Err(NodeError::NotPrivate(ref path)) if *path == root
+                ),
+                "mode {mode:o}"
+            );
+            assert!(!root.join("IDENTITY").exists(), "nothing kept in it");
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(NodeDirectory::open(&settings).unwrap());
+    }
     #[test]
     fn expansion_keeps_identity_and_enrollment_cannot_replace_or_race_it() {
         let root = tempfile::tempdir().unwrap();

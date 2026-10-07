@@ -57,6 +57,14 @@ pub enum ClusterAdminError {
     Renewal(#[from] crate::credential_renewal::RenewalError),
     #[error("admin journal is missing, corrupt, or belongs to another physical node")]
     Corrupt,
+    /// The data directory is not this user's, or another user may write to
+    /// it and so replace what the journals hold: the rule the node's start
+    /// applies to it, and OpenSSH's `StrictModes` to a key's directory.
+    #[error(
+        "data directory {} must be this user's and writable by no other user (`focal prepare-volume --owner UID:GID`)",
+        .0.display()
+    )]
+    NotPrivate(PathBuf),
     #[error(
         "an earlier admin request remains pending; inspect and retry it before creating another"
     )]
@@ -816,9 +824,10 @@ impl ClusterAdmin {
                     let owner = focal_platform::fs::current_owner()?;
                     let private_root = focal_platform::fs::private_dir_owner(&admin.root)?
                         .is_some_and(|found| found == owner);
-                    if !private_root
-                        || focal_platform::fs::owner_at(&admin.root.join(ADMIN_SOCKET))? != owner
-                    {
+                    if !private_root {
+                        return Err(ClusterAdminError::NotPrivate(admin.root.clone()));
+                    }
+                    if focal_platform::fs::owner_at(&admin.root.join(ADMIN_SOCKET))? != owner {
                         return Err(ClusterAdminError::Corrupt);
                     }
                 }
@@ -2041,7 +2050,18 @@ fn initialize_named(
     directory: &str,
     marker: &str,
 ) -> Result<bool> {
-    let owner = focal_platform::fs::private_dir_owner(root)?.ok_or(ClusterAdminError::Corrupt)?;
+    // The journals' files are opened private (`open_private`), so what they
+    // hold is this user's whatever the directory's mode; the directory must
+    // only be this user's and writable by no one else, so that no other user
+    // replaces an entry. A directory others may read but not write — a
+    // volume left 0755, a `mkdir` under the default umask — is the node's,
+    // by the rule its start holds the directory to (`node_directory::acquire`).
+    let owner = focal_platform::fs::current_owner()?;
+    if focal_platform::fs::owner_at(root)? != owner
+        || !focal_platform::fs::dir_not_writable_by_others(root)?
+    {
+        return Err(ClusterAdminError::NotPrivate(root.to_path_buf()));
+    }
     let path = root.join(marker);
     let expected = postcard::to_allocvec(identity).map_err(|_| ClusterAdminError::Capacity)?;
     match fs::symlink_metadata(&path) {

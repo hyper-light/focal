@@ -100,8 +100,17 @@ report carries its drain time. Remaining before the measured runs:
   enrolled transport and an open-loop mode, timed from each request's intended send
   into an HdrHistogram and reported in this generator's schema. Its present
   closed-loop driver times from the actual send, which is not comparable.
-- **The cluster.** Three `focal:bench` containers on the bench network (the image
-  builds: 62.6 MB, static), founded with native activation, hosts joined by invitation,
-  one session placed on all three, and a client enrolled for the generator.
+- **The cluster.** Done (2026-10-07): `docker compose --profile focal up -d` and
+  `focal-bootstrap.sh` (`tools/compare/compose`) found three `focal:bench` containers (both
+  binaries, musl, on Alpine for `tc`; 107 MB), one zone each under the competitors' limits;
+  the hosts join by invitation, the root, its partition and the session are placed on all
+  three surviving a zone (`deployment plan`/`apply`, asked again until the joined hosts
+  have reported their load, since a plan made before records the capacity missing and only
+  its apply refuses), the ledger is activated natively, and a client is enrolled in the
+  generator's container over QUIC. Founding it found a defect, fixed at its cause: a data
+  directory left 0755 by Docker started, then failed administration as a corrupt journal
+  (focal `2d12e5a`). A first smoke run, not a result: 2,000 authored claims offered at
+  200/s over four callers, all committed (none refused or unknown), p50 5.2 ms, p99
+  12.2 ms, p99.9 60.9 ms, max 65.9 ms, beside the workspace gate.
 - **The generator in a container** on the bench network, and a Linux host with real
   disks.

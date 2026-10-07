@@ -307,9 +307,25 @@ impl Rig {
         let mut answered: Vec<Option<ControlFailure>> = vec![None; self.hosts.len()];
         // Every ask is a new one.
         let mut asked = 0u128;
+        // Each host's term and leader as they changed during the wait, with
+        // the host's periods then: whether a leader stepped down in its
+        // term (its quorum check) or a follower's term rose first (its
+        // campaign). The last 64 changes.
+        let mut seen: Vec<(u64, u64)> = vec![(0, 0); self.hosts.len()];
+        let mut changes: std::collections::VecDeque<(u64, u64, u64, u64)> =
+            std::collections::VecDeque::with_capacity(64);
         loop {
             for (index, host) in self.hosts.iter().enumerate() {
                 let status = host.progress();
+                if let Some(last) = seen.get_mut(index)
+                    && *last != (status.term, status.leader)
+                {
+                    *last = (status.term, status.leader);
+                    if changes.len() == 64 {
+                        changes.pop_front();
+                    }
+                    changes.push_back((status.node, host.periods(), status.term, status.leader));
+                }
                 if status.node != exclude && status.leader == status.node {
                     asked += 1;
                     match host
@@ -331,7 +347,7 @@ impl Rig {
             }
             if let Err(spent) = wait.check(&self.periods()) {
                 panic!(
-                    "no leader that answers: {spent}; last read answers {answered:?}; periods {:?} refused {:?} longest {:?} pace {:?}; {:?}",
+                    "no leader that answers: {spent}; last read answers {answered:?}; (node, period, term, leader) as they changed {changes:?}; periods {:?} refused {:?} longest {:?} pace {:?}; {:?}",
                     self.periods(),
                     self.hosts
                         .iter()
@@ -984,7 +1000,26 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
     );
     // The transport may hold this value while a slow peer consumes its bytes.
     drop(response);
-    assert_eq!(memory.stats(), before);
+    // What the answer held is given back the moment it is dropped.
+    assert_eq!(
+        memory.stats().by_kind[BudgetKind::Control as usize],
+        before.by_kind[BudgetKind::Control as usize]
+    );
+    // And nothing is kept: the budget comes back to where it was. Not at
+    // once: the owner goes on leading, and a write of its own in flight (a
+    // beat, a commit it settles) holds its `Pending` until written — under
+    // sixteen copies at once one held 464 bytes at the moment of the drop.
+    // Waited for in the owner's periods.
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 100, FROZEN);
+    while memory.stats() != before {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the budget never came back: {spent}; {:?} against {before:?}",
+                memory.stats()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     host.stop().await.unwrap();
     owner.join().unwrap();
 }
@@ -1702,21 +1737,23 @@ async fn a_follower_read_answered_ahead_of_what_it_applied_waits_and_never_fails
     let follower = (leader + 1) % 3;
     let follower_node = rig.hosts[follower].progress().node;
     rig.withheld.store(follower_node, Ordering::SeqCst);
-    // The other two commit what the follower is not sent.
+    // The other two commit what the follower is not sent. Leadership may
+    // move between them under load; the follower, behind, cannot take it,
+    // and the asks follow whichever of the two leads.
     let mut index = leader;
     for sequence in 1..=3 {
-        let revision = rig.hosts[leader].progress().revisions.root;
+        let revision = rig.hosts[index].progress().revisions.root;
         rig.definite(
             &mut index,
             PeerRole::Runtime,
             &request(sequence, region(revision, u128::from(9_000 + sequence))),
-            None,
+            Some(follower_node),
         )
         .await
         .unwrap();
     }
     assert!(
-        rig.hosts[follower].progress().applied_index < rig.hosts[leader].progress().applied_index
+        rig.hosts[follower].progress().applied_index < rig.hosts[index].progress().applied_index
     );
     // The follower's read is answered by the leader with a commit it has
     // not applied: the read waits, and the replica goes on.
@@ -1782,11 +1819,15 @@ async fn a_follower_answers_a_read_through_its_leader() {
     .unwrap();
     let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
     rig.hosts[0].campaign().await.unwrap();
-    let leader = rig.leader(0).await;
-    let follower = (leader + 1) % 3;
     let mut wait = rig.deadline();
     let mut asked = 930u128;
-    let answered = loop {
+    // A read asked of a member that does not lead. Under load leadership
+    // may move between finding the leader and the answer, and a member that
+    // came to lead answers its own read: that answer is true, and is not the
+    // case this test asks for, so it asks a member that follows again.
+    let (follower, answered) = loop {
+        let leader = rig.leader(0).await;
+        let follower = (leader + 1) % 3;
         asked += 1;
         match rig.hosts[follower]
             .read(
@@ -1796,7 +1837,12 @@ async fn a_follower_answers_a_read_through_its_leader() {
             )
             .await
         {
-            Ok(ControlReadResult::Membership(membership)) => break membership,
+            Ok(ControlReadResult::Membership(membership))
+                if membership.leader != membership.node =>
+            {
+                break (follower, membership);
+            }
+            Ok(ControlReadResult::Membership(_)) => {}
             Ok(other) => panic!("{other:?}"),
             Err(error) => {
                 if let Err(spent) = wait.check(&rig.periods()) {
@@ -1804,11 +1850,15 @@ async fn a_follower_answers_a_read_through_its_leader() {
                 }
             }
         }
+        if let Err(spent) = wait.check(&rig.periods()) {
+            panic!("no member that follows answered: {spent}");
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert_eq!(answered.node, rig.hosts[follower].progress().node);
-    assert_eq!(answered.leader, rig.hosts[leader].progress().node);
-    assert_ne!(answered.node, answered.leader);
+    // Answered through a leader: one of the voters and not the follower.
+    assert_ne!(answered.leader, 0, "{answered:?}");
+    assert!(answered.voters.contains(&answered.leader), "{answered:?}");
     assert_eq!(answered.voters.len(), 3, "{answered:?}");
     rig.stop().await;
 }
