@@ -87,10 +87,8 @@ impl Member {
         let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
         let node = DurableNode::open_on_shell(
             self.config.clone(),
-            self.dir.path(),
-            &log.opener(),
+            &crate::node_storage::test_shell(self.dir.path(), &log, disk),
             &self.budget,
-            disk,
             self.needs,
         )
         .unwrap();
@@ -373,10 +371,8 @@ fn what_is_focal_logs_alone_is_refused_on_the_shell() {
     assert!(matches!(
         DurableNode::open_on_shell(
             fast,
-            member.dir.path(),
-            &log.opener(),
+            &crate::node_storage::test_shell(member.dir.path(), log, disk.clone()),
             &budget,
-            disk.clone(),
             no_needs
         ),
         Err(ConsensusError::Configuration(_))
@@ -389,10 +385,8 @@ fn what_is_focal_logs_alone_is_refused_on_the_shell() {
     assert!(matches!(
         DurableNode::open_on_shell(
             large,
-            member.dir.path(),
-            &log.opener(),
+            &crate::node_storage::test_shell(member.dir.path(), log, disk),
             &budget,
-            disk,
             no_needs
         ),
         Err(ConsensusError::Configuration(
@@ -487,10 +481,12 @@ fn restore(
     let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
     DurableNode::restore_on_shell(
         config(1),
-        dir,
-        &log.opener(),
+        &crate::node_storage::test_shell(
+            dir,
+            log,
+            DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap(),
+        ),
         &budget,
-        DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap(),
         no_needs,
         image,
     )

@@ -6,7 +6,8 @@ use super::*;
 
 impl DurableNode {
     /// A member over hyper-durable's shell ([27] §15.7): its log one group of the node's
-    /// hyper-log log, claimed through `log` (`Log::opener`, which an owner holds for its life), its records and image under the data directory `root`, its memory
+    /// hyper-log log, claimed through `storage` (`ShellStorage`, which an owner holds for its life,
+    /// with the log's opener, the data directory `root` and the disk envelope `disk`), its records and image under the data directory `root`, its memory
     /// charged within `parent_budget` and its disk within `disk`. `needs` names the decoder an
     /// entry of the owner's needs, where it needs one the group's baseline does not give: a write
     /// holding such an entry waits until the group's records state that decoder durable
@@ -14,16 +15,12 @@ impl DurableNode {
     /// fence never does (27 §15.8).
     pub fn open_on_shell(
         config: NodeConfig,
-        root: &Path,
-        log: &ShellLogOpener,
+        storage: &ShellStorage,
         parent_budget: &MemoryBudget,
-        disk: DiskBudget,
         needs: fn(&[u8]) -> Option<[u8; 32]>,
     ) -> Result<Self, ConsensusError> {
-        shell_node::ShellNode::open(config, root, log, parent_budget, disk, needs).map(|node| {
-            Self {
-                backend: Backend::Shell(node),
-            }
+        shell_node::ShellNode::open(config, storage, parent_budget, needs).map(|node| Self {
+            backend: Backend::Shell(node),
         })
     }
     /// A member over the shell whose log begins at a restored image (26 §6), as
@@ -33,10 +30,8 @@ impl DurableNode {
     /// track, so a group with it is refused.
     pub fn restore_on_shell(
         config: NodeConfig,
-        root: &Path,
-        log: &ShellLogOpener,
+        storage: &ShellStorage,
         parent_budget: &MemoryBudget,
-        disk: DiskBudget,
         needs: fn(&[u8]) -> Option<[u8; 32]>,
         image: RestoredLog,
     ) -> Result<Self, ConsensusError> {
@@ -47,8 +42,8 @@ impl DurableNode {
                 "the fast track is not on the durable shell yet",
             ));
         }
-        convert::restore_group(&config, root, log, &image)?;
-        Self::open_on_shell(config, root, log, parent_budget, disk, needs)
+        convert::restore_group(&config, storage.root(), storage.opener(), &image)?;
+        Self::open_on_shell(config, storage, parent_budget, needs)
     }
     pub fn group_id(&self) -> [u8; 16] {
         dispatch!(inner = &self.backend => inner.group_id())
@@ -554,6 +549,14 @@ impl DurableNode {
     }
     pub fn shared_wal(&self) -> Result<SharedWal, ConsensusError> {
         dispatch!(inner = &self.backend => inner.shared_wal())
+    }
+    /// The writer this member's durable state goes through (`NodeStorage::writer`): an owner
+    /// admits only members of the storage it was given.
+    pub fn storage_writer(&self) -> Result<StorageWriter, ConsensusError> {
+        match &self.backend {
+            Backend::Log(node) => Ok(StorageWriter::Wal(node.shared_wal()?.writer_id())),
+            Backend::Shell(node) => node.storage_writer(),
+        }
     }
     /// True from Ready acquisition until its full output prefix is released.
     /// Mutations return PersistencePending in this state; no Raft input is lost.

@@ -94,8 +94,14 @@ fn open(config: NodeConfig, dir: &Path) -> (Store, DurableNode) {
     let log = Log::create(file, log_config(), 0x0062_656e_6368).unwrap();
     let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
     let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
-    let node =
-        DurableNode::open_on_shell(config, dir, &log.opener(), &budget, disk, no_needs).unwrap();
+    let identity = focal_log::WalIdentity {
+        cluster: config.cluster_id,
+        node: config.node_id,
+        stream: 0,
+    };
+    let storage =
+        focal_consensus::ShellStorage::new(dir, &log, disk, identity, budget.clone()).unwrap();
+    let node = DurableNode::open_on_shell(config, &storage, &budget, no_needs).unwrap();
     (Store::Shell(log), node)
 }
 

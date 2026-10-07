@@ -13,7 +13,7 @@
 //!   whole period after the applied index ran past it, as focal-log's `settle_commit` writes it.
 //!
 //! [27]: ../../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::task::{Wake, Waker};
@@ -177,6 +177,8 @@ pub(crate) struct ShellNode {
     /// The group's own directory: its records and its image.
     dir: PathBuf,
     disk: DiskBudget,
+    /// The writer of the node's log this member was opened through (`ShellStorage::writer`).
+    writer: crate::LogWriterId,
     /// What the node's own box takes, held under its group's budget for as long as it lives.
     _boxed: Allocation,
 }
@@ -222,12 +224,11 @@ impl ShellNode {
     /// shell yet ([27] §15.7).
     pub(crate) fn open(
         config: NodeConfig,
-        root: &Path,
-        log: &hyper_log::LogOpener<DeviceFile>,
+        storage: &crate::ShellStorage,
         parent_budget: &MemoryBudget,
-        disk: DiskBudget,
         needs: Needs,
     ) -> Result<Box<Self>, ConsensusError> {
+        let (root, log, disk) = (storage.root(), storage.opener(), storage.disk().clone());
         config.validate()?;
         if config.fast {
             return Err(ConsensusError::Configuration(
@@ -364,6 +365,7 @@ impl ShellNode {
             failed: false,
             dir,
             disk,
+            writer: storage.writer(),
             _boxed: boxed,
         });
         // Rebuild committed membership before elections or network messages can run. The
@@ -890,6 +892,10 @@ impl ShellNode {
         Err(ConsensusError::Configuration(
             "a member on the durable shell has no shared WAL",
         ))
+    }
+    /// The writer of the node's log this member was opened through.
+    pub fn storage_writer(&self) -> Result<crate::StorageWriter, ConsensusError> {
+        Ok(crate::StorageWriter::Log(self.writer))
     }
     /// Readies are taken ahead of their writes: nothing is ever refused for a write out.
     pub fn persistence_pending(&self) -> bool {

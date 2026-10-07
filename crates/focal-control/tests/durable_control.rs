@@ -847,6 +847,25 @@ fn unbounded_disk() -> focal_memory::DiskBudget {
     focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::unbounded()).unwrap()
 }
 
+/// The handle the node's control owners reach `log` through, with groups' files under `dir`.
+fn shell_storage(
+    dir: &std::path::Path,
+    log: &focal_consensus::ShellLog,
+) -> focal_consensus::ShellStorage {
+    focal_consensus::ShellStorage::new(
+        dir,
+        log,
+        unbounded_disk(),
+        focal_log::WalIdentity {
+            cluster: CLUSTER,
+            node: 1,
+            stream: 0,
+        },
+        budget(),
+    )
+    .unwrap()
+}
+
 /// 27 §15.6–15.7: control groups over the shell. Do: two partition groups share one hyper-log, each
 /// commits an enrollment, one checkpoints, both are let go and reopened on the shell. Expect: each
 /// reopens with its own receipt and no other's, the checkpointed one from its image.
@@ -862,9 +881,7 @@ fn independent_partition_groups_share_one_hyper_log_without_sharing_control_auth
                 options,
                 bootstrap,
                 budget(),
-                dir.path(),
-                &log.opener(),
-                unbounded_disk(),
+                &shell_storage(dir.path(), &log),
             )
             .unwrap()
         };
@@ -884,9 +901,7 @@ fn independent_partition_groups_share_one_hyper_log_without_sharing_control_auth
             options,
             bootstrap,
             budget(),
-            dir.path(),
-            &log.opener(),
-            unbounded_disk(),
+            &shell_storage(dir.path(), &log),
         )
         .unwrap()
     };

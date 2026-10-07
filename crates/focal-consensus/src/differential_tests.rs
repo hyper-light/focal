@@ -99,10 +99,8 @@ impl Member {
                 let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
                 let node = DurableNode::open_on_shell(
                     self.config.clone(),
-                    self.dir.path(),
-                    &log.opener(),
+                    &crate::node_storage::test_shell(self.dir.path(), &log, disk),
                     &self.budget,
-                    disk,
                     no_needs,
                 )
                 .unwrap();

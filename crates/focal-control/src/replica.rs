@@ -262,20 +262,18 @@ impl ControlReplica {
     }
 
     /// A control group's member over hyper-durable's shell (27 §15.7): its log one group of the
-    /// node's hyper-log `log`, its records and image under the data directory `root`, its disk
-    /// charged to `disk`. A control group's entries need no decoder beyond its baseline, so no
+    /// node's hyper-log log, its records and image under the data directory, its disk charged to
+    /// the envelope, all as `storage` names them. A control group's entries need no decoder beyond its baseline, so no
     /// write is held for a record. It applies on a commit its log holds, as over focal-log
     /// (`StateMachine::acts_at_start` for every entry, 27 §15.6).
     pub fn open_on_shell(
         options: ControlOptions,
         bootstrap: ControlBootstrap,
         budget: MemoryBudget,
-        root: &Path,
-        log: &focal_consensus::ShellLogOpener,
-        disk: focal_memory::DiskBudget,
+        storage: &focal_consensus::ShellStorage,
     ) -> Result<Self, ControlError> {
         Self::open_with(options, bootstrap, budget, |config, budget| {
-            DurableNode::open_on_shell(config, root, log, budget, disk, |_| None)
+            DurableNode::open_on_shell(config, storage, budget, |_| None)
         })
     }
 

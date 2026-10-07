@@ -26,6 +26,8 @@ pub use membership::*;
 mod checkpoint;
 pub mod convert;
 pub mod node_log;
+mod node_storage;
+pub use node_storage::{LogWriterId, NodeStorage, ShellStorage, StorageWriter};
 /// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.
 pub type ShellLog = hyper_log::Log<hyper_block::file::DeviceFile>;
 /// A handle on the node's [`ShellLog`] that claims its groups from any thread (`Log::opener`): what
