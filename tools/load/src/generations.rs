@@ -13,6 +13,7 @@
 use crate::error::LoadError;
 use focal_client::native_store::NativeStoreLimits;
 use focal_model::RequestEpoch;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// Requests issued in one generation before the next opens: what the CLI's
@@ -32,9 +33,11 @@ struct State {
     floor: u64,
     /// Requests issued in `epoch`.
     issued: u32,
-    /// Requests in flight in `epoch`, and in the generation below it.
-    filling: u32,
-    draining: u32,
+    /// Requests in flight, by the generation each was issued in: one entry
+    /// a generation with one out, so at most as many as there are callers.
+    /// What a refusal by name teaches never clears it — every request out
+    /// is still answered — so the floor never advances past one in flight.
+    in_flight: BTreeMap<u64, u32>,
     /// A worker is sending the floor advance.
     advancing: bool,
     rotation: u32,
@@ -70,6 +73,13 @@ impl Default for Generations {
     }
 }
 
+impl State {
+    /// Whether a request issued below `epoch` is still in flight.
+    fn out_below(&self, epoch: u64) -> bool {
+        self.in_flight.range(..epoch).next().is_some()
+    }
+}
+
 impl Generations {
     pub fn new() -> Self {
         Self {
@@ -77,8 +87,7 @@ impl Generations {
                 epoch: 1,
                 floor: 1,
                 issued: 0,
-                filling: 0,
-                draining: 0,
+                in_flight: BTreeMap::new(),
                 advancing: false,
                 rotation: rotation(),
                 advances: 0,
@@ -96,19 +105,22 @@ impl Generations {
     /// the generation below has drained (two are open at most).
     pub fn mint(&self) -> Result<Minted, LoadError> {
         let mut state = self.locked()?;
-        if state.issued >= state.rotation && state.floor == state.epoch && state.draining == 0 {
+        if state.issued >= state.rotation
+            && state.floor == state.epoch
+            && !state.out_below(state.epoch)
+        {
             state.epoch = state
                 .epoch
                 .checked_add(1)
                 .ok_or(LoadError::Bound("request generations"))?;
             state.issued = 0;
-            state.draining = state.filling;
-            state.filling = 0;
         }
         state.issued = state.issued.saturating_add(1);
-        state.filling = state.filling.saturating_add(1);
+        let epoch = state.epoch;
+        let out = state.in_flight.entry(epoch).or_insert(0);
+        *out = out.saturating_add(1);
         Ok(Minted {
-            epoch: RequestEpoch(state.epoch),
+            epoch: RequestEpoch(epoch),
         })
     }
     /// A request of `epoch` was answered, committed or refused: it is no
@@ -116,12 +128,13 @@ impl Generations {
     /// drained and the floor stands under it, the floor advances.
     pub fn finish(&self, epoch: RequestEpoch) -> Result<Finished, LoadError> {
         let mut state = self.locked()?;
-        if epoch.0 == state.epoch {
-            state.filling = state.filling.saturating_sub(1);
-        } else if epoch.0.checked_add(1) == Some(state.epoch) {
-            state.draining = state.draining.saturating_sub(1);
+        if let Some(out) = state.in_flight.get_mut(&epoch.0) {
+            *out = out.saturating_sub(1);
+            if *out == 0 {
+                state.in_flight.remove(&epoch.0);
+            }
         }
-        if state.floor < state.epoch && state.draining == 0 && !state.advancing {
+        if state.floor < state.epoch && !state.out_below(state.epoch) && !state.advancing {
             state.advancing = true;
             return Ok(Finished::Advance {
                 epoch: RequestEpoch(state.epoch),
@@ -161,9 +174,8 @@ impl Generations {
         }
         .max(state.floor);
         state.issued = 0;
-        state.filling = 0;
-        state.draining = 0;
-        state.advancing = false;
+        // What is in flight is still answered, and an advance in flight is
+        // answered too: neither is forgotten here.
         state.expired = state.expired.saturating_add(1);
         Ok(())
     }
@@ -250,5 +262,40 @@ mod tests {
         generations.learn(RequestEpoch(9), &[]).unwrap();
         assert_eq!(generations.mint().unwrap().epoch, RequestEpoch(9));
         assert_eq!(generations.counts().unwrap(), (0, 3));
+    }
+
+    /// A refusal by name one caller met teaches the window, and forgets
+    /// nothing the other callers have out: the floor does not advance past a
+    /// request still in flight below it, nor while an advance is answered.
+    #[test]
+    fn a_refusal_by_name_forgets_no_request_in_flight() {
+        let generations = Generations::new();
+        let out = generations.mint().unwrap();
+        assert_eq!(out.epoch, RequestEpoch(1));
+        // Another caller's request is refused by name: the owner holds 1 and
+        // 2 open, and fresh requests go to 2.
+        generations
+            .learn(RequestEpoch(1), &[RequestEpoch(1), RequestEpoch(2)])
+            .unwrap();
+        let fresh = generations.mint().unwrap();
+        assert_eq!(fresh.epoch, RequestEpoch(2));
+        // Answered in 2 while one of 1 is still out: no advance past it.
+        assert_eq!(generations.finish(fresh.epoch).unwrap(), Finished::Idle);
+        // Answered in 1: nothing below 2 is out, and the floor advances.
+        assert_eq!(
+            generations.finish(out.epoch).unwrap(),
+            Finished::Advance {
+                epoch: RequestEpoch(2),
+                minimum: RequestEpoch(2)
+            }
+        );
+        // While that advance is out, a refusal by name does not send another.
+        generations
+            .learn(RequestEpoch(1), &[RequestEpoch(1), RequestEpoch(2)])
+            .unwrap();
+        let more = generations.mint().unwrap();
+        assert_eq!(generations.finish(more.epoch).unwrap(), Finished::Idle);
+        generations.advanced(RequestEpoch(2)).unwrap();
+        assert_eq!(generations.counts().unwrap(), (1, 2));
     }
 }
