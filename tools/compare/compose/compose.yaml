@@ -4,6 +4,8 @@
 #   NATS_SYNC=always | 2m      KAFKA_FLUSH=1 | 9223372036854775807
 #   REDIS_AOF=yes | no         REDIS_FSYNC=always | everysec
 # One system at a time: `docker compose --profile nats up -d`.
+# focal: `docker build -f focal.Dockerfile -t focal:bench ../../..`, then
+# `docker compose --profile focal up -d` and `sh focal-bootstrap.sh`.
 x-limits: &limits
   cpus: "2"
   mem_limit: 2g
@@ -38,6 +40,11 @@ x-redis: &redis
   <<: *limits
   image: redis:8.2-alpine
   profiles: [redis]
+
+x-focal: &focal
+  <<: *limits
+  image: focal:bench
+  profiles: [focal]
 
 services:
   nats1: { <<: *nats, environment: { NAME: nats1, SYNC: "${NATS_SYNC:-2m}" }, ports: ["14221:4222"] }
@@ -80,5 +87,34 @@ services:
     <<: *redis
     command: ["redis-server", "--appendonly", "${REDIS_AOF:-no}", "--appendfsync", "${REDIS_FSYNC:-everysec}", "--replicaof", "redis1", "6379"]
 
+  # focal: the founder starts at once; each host waits for the invitation the
+  # bootstrap issues on the founder, a bounded wait, then joins with it.
+  focal1:
+    <<: *focal
+    command: ["focal", "--config", "/etc/focal/focal1.yaml", "--data-dir", "/data", "start", "--listen", "0.0.0.0:7443", "--advertise", "focal1:7443"]
+    volumes: ["./focal1.yaml:/etc/focal/focal1.yaml:ro", "focal1:/data", "invites:/invite"]
+  focal2:
+    <<: *focal
+    command: ["sh", "-c", "n=0; until [ -s /invite/focal2.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal2.yaml --data-dir /data start --listen 0.0.0.0:7443 --advertise focal2:7443 --invite-file /invite/focal2.invite"]
+    volumes: ["./focal2.yaml:/etc/focal/focal2.yaml:ro", "focal2:/data", "invites:/invite"]
+  focal3:
+    <<: *focal
+    command: ["sh", "-c", "n=0; until [ -s /invite/focal3.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal3.yaml --data-dir /data start --listen 0.0.0.0:7443 --advertise focal3:7443 --invite-file /invite/focal3.invite"]
+    volumes: ["./focal3.yaml:/etc/focal/focal3.yaml:ro", "focal3:/data", "invites:/invite"]
+  # The generator, on the bench network as every system's generator runs.
+  focal-load:
+    <<: *limits
+    image: focal:bench
+    profiles: [focal]
+    command: ["sleep", "86400"]
+    volumes: ["./focal-target.yaml:/etc/focal/target.yaml:ro", "invites:/invite", "focal-client:/client"]
+
 networks:
   bench: {}
+
+volumes:
+  focal1: {}
+  focal2: {}
+  focal3: {}
+  invites: {}
+  focal-client: {}

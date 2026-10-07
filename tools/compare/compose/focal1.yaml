@@ -1,0 +1,8 @@
+# focal1 of the comparison's three nodes: one zone each, one region.
+version: 1
+topology:
+  region: "bench"
+  zone: "a"
+durability:
+  survive: node
+  max_failures: 0
