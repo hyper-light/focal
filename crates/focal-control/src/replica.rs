@@ -271,7 +271,7 @@ impl ControlReplica {
         bootstrap: ControlBootstrap,
         budget: MemoryBudget,
         root: &Path,
-        log: &focal_consensus::ShellLog,
+        log: &focal_consensus::ShellLogOpener,
         disk: focal_memory::DiskBudget,
     ) -> Result<Self, ControlError> {
         Self::open_with(options, bootstrap, budget, |config, budget| {

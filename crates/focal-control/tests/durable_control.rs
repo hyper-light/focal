@@ -863,7 +863,7 @@ fn independent_partition_groups_share_one_hyper_log_without_sharing_control_auth
                 bootstrap,
                 budget(),
                 dir.path(),
-                &log,
+                &log.opener(),
                 unbounded_disk(),
             )
             .unwrap()
@@ -885,7 +885,7 @@ fn independent_partition_groups_share_one_hyper_log_without_sharing_control_auth
             bootstrap,
             budget(),
             dir.path(),
-            &log,
+            &log.opener(),
             unbounded_disk(),
         )
         .unwrap()

@@ -94,7 +94,8 @@ fn open(config: NodeConfig, dir: &Path) -> (Store, DurableNode) {
     let log = Log::create(file, log_config(), 0x0062_656e_6368).unwrap();
     let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
     let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
-    let node = DurableNode::open_on_shell(config, dir, &log, &budget, disk, no_needs).unwrap();
+    let node =
+        DurableNode::open_on_shell(config, dir, &log.opener(), &budget, disk, no_needs).unwrap();
     (Store::Shell(log), node)
 }
 

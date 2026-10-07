@@ -100,7 +100,7 @@ impl Member {
                 let node = DurableNode::open_on_shell(
                     self.config.clone(),
                     self.dir.path(),
-                    &log,
+                    &log.opener(),
                     &self.budget,
                     disk,
                     no_needs,

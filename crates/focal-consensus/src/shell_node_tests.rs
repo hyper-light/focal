@@ -4,6 +4,7 @@ use super::*;
 use focal_memory::DiskBudgetConfig;
 use hyper_block::buf::Alignment;
 use hyper_block::file::CachingRequest;
+use hyper_log::Log;
 use hyper_log::{Config as LogConfig, Waits};
 use tempfile::TempDir;
 
@@ -87,7 +88,7 @@ impl Member {
         let node = DurableNode::open_on_shell(
             self.config.clone(),
             self.dir.path(),
-            &log,
+            &log.opener(),
             &self.budget,
             disk,
             self.needs,
@@ -373,7 +374,7 @@ fn what_is_focal_logs_alone_is_refused_on_the_shell() {
         DurableNode::open_on_shell(
             fast,
             member.dir.path(),
-            log,
+            &log.opener(),
             &budget,
             disk.clone(),
             no_needs
@@ -386,7 +387,14 @@ fn what_is_focal_logs_alone_is_refused_on_the_shell() {
     large.group_id = [6; 16];
     large.max_entry_bytes = 4 * ENTRY;
     assert!(matches!(
-        DurableNode::open_on_shell(large, member.dir.path(), log, &budget, disk, no_needs),
+        DurableNode::open_on_shell(
+            large,
+            member.dir.path(),
+            &log.opener(),
+            &budget,
+            disk,
+            no_needs
+        ),
         Err(ConsensusError::Configuration(
             "the node's log cannot hold the group's largest entry in one frame"
         ))

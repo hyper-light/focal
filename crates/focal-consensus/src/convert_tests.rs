@@ -113,8 +113,15 @@ fn two_groups_with_a_floor_a_checkpoint_and_a_tail_move_whole() {
             .unwrap();
     assert_eq!(records.decoder_floor, Some(HASH));
     let disk = || DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
-    let mut floored =
-        DurableNode::open_on_shell(config(2), new.path(), &log, &budget, disk(), no_needs).unwrap();
+    let mut floored = DurableNode::open_on_shell(
+        config(2),
+        new.path(),
+        &log.opener(),
+        &budget,
+        disk(),
+        no_needs,
+    )
+    .unwrap();
     assert_eq!(floored.required_decoder(), Some(HASH));
     floored.confirm_decoder(HASH).unwrap();
     let mut snapshot = None;
@@ -129,8 +136,15 @@ fn two_groups_with_a_floor_a_checkpoint_and_a_tail_move_whole() {
     }
     assert_eq!(snapshot.unwrap().data, b"image");
     assert_eq!(committed, tail);
-    let mut plain =
-        DurableNode::open_on_shell(config(3), new.path(), &log, &budget, disk(), no_needs).unwrap();
+    let mut plain = DurableNode::open_on_shell(
+        config(3),
+        new.path(),
+        &log.opener(),
+        &budget,
+        disk(),
+        no_needs,
+    )
+    .unwrap();
     let mut data = Vec::new();
     for _ in 0..100 {
         let events = plain.drain().unwrap();
@@ -291,8 +305,15 @@ fn a_data_directory_converts_whole_and_once() {
     .unwrap();
     let (log, _) = Log::open(file, log_config(), log_id(identity())).unwrap();
     let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
-    let mut floored =
-        DurableNode::open_on_shell(config(2), root.path(), &log, &budget, disk, no_needs).unwrap();
+    let mut floored = DurableNode::open_on_shell(
+        config(2),
+        root.path(),
+        &log.opener(),
+        &budget,
+        disk,
+        no_needs,
+    )
+    .unwrap();
     floored.confirm_decoder(HASH).unwrap();
     let mut committed = Vec::new();
     for _ in 0..100 {

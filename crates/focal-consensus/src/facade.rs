@@ -6,7 +6,7 @@ use super::*;
 
 impl DurableNode {
     /// A member over hyper-durable's shell ([27] §15.7): its log one group of the node's
-    /// hyper-log log `log`, its records and image under the data directory `root`, its memory
+    /// hyper-log log, claimed through `log` (`Log::opener`, which an owner holds for its life), its records and image under the data directory `root`, its memory
     /// charged within `parent_budget` and its disk within `disk`. `needs` names the decoder an
     /// entry of the owner's needs, where it needs one the group's baseline does not give: a write
     /// holding such an entry waits until the group's records state that decoder durable
@@ -15,7 +15,7 @@ impl DurableNode {
     pub fn open_on_shell(
         config: NodeConfig,
         root: &Path,
-        log: &hyper_log::Log<hyper_block::file::DeviceFile>,
+        log: &ShellLogOpener,
         parent_budget: &MemoryBudget,
         disk: DiskBudget,
         needs: fn(&[u8]) -> Option<[u8; 32]>,

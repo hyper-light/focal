@@ -27,6 +27,10 @@ mod checkpoint;
 pub mod convert;
 /// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.
 pub type ShellLog = hyper_log::Log<hyper_block::file::DeviceFile>;
+/// A handle on the node's [`ShellLog`] that claims its groups from any thread (`Log::opener`): what
+/// an owner spawned for the node's life holds, since the log owns its threads and no owner holds
+/// it in an `Arc`.
+pub type ShellLogOpener = hyper_log::LogOpener<hyper_block::file::DeviceFile>;
 mod core_state;
 mod decoder;
 pub mod envelope;

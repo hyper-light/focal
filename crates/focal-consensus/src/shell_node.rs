@@ -25,7 +25,6 @@ use hyper_durable::{
     Budget, Cause, ClaimError, GroupStore, LogStore, OpenError, Output, Replica, ReplicaError,
     Settings, StateMachine,
 };
-use hyper_log::Log;
 use hyper_raft::Elections;
 
 use super::*;
@@ -224,7 +223,7 @@ impl ShellNode {
     pub(crate) fn open(
         config: NodeConfig,
         root: &Path,
-        log: &Log<DeviceFile>,
+        log: &hyper_log::LogOpener<DeviceFile>,
         parent_budget: &MemoryBudget,
         disk: DiskBudget,
         needs: Needs,
