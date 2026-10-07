@@ -7,6 +7,7 @@ exclude = [
     "vendor/hyper-liveness",
     "vendor/hyper-log",
     "vendor/hyper-raft",
+    "vendor/hyper-seal",
     "vendor/hyper-timing",
 ]
 resolver = "3"

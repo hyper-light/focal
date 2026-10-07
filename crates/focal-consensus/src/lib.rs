@@ -1653,6 +1653,16 @@ pub(crate) fn conf_of(metadata: &SnapshotMetadata) -> &ConfState {
     metadata.conf_state.as_ref().unwrap_or(&NO_CONF)
 }
 
+/// Says that the proposals at or below `through` are held no more (`RecordKind::Released`).
+pub(crate) fn released_record(config: &NodeConfig, through: u64) -> Record {
+    Record {
+        log: LogicalLogId(config.group_id),
+        kind: RecordKind::Released,
+        index: through,
+        term: 0,
+        payload: Vec::new(),
+    }
+}
 /// Says that the group has the fast track.
 fn fast_track_record(config: &NodeConfig) -> Record {
     Record {
@@ -1700,10 +1710,16 @@ fn replay_record(
             {
                 return Err(ConsensusError::Corruption("proposal envelope mismatch"));
             }
-            // What the log has reached since is set aside.
-            if entry.index > storage.last_index()? {
-                storage.hold_proposal(entry)?;
+            // Held whatever the log reached since: only a release ends it.
+            storage.hold_proposal(entry)?;
+        }
+        RecordKind::Released => {
+            if !*fast || record.term != 0 || !record.payload.is_empty() {
+                return Err(ConsensusError::Corruption(
+                    "a release in a group that has no fast track, or one that states more",
+                ));
             }
+            storage.release(record.index);
         }
         RecordKind::DecoderFloor => {
             if config.is_none() || required_decoder.is_some() {

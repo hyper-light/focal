@@ -104,6 +104,8 @@ impl LogNode {
                 .count()
                 .checked_add(3)
                 .and_then(|count| count.checked_add(self.raw.store().proposals.len()))
+                // The fast track's record, and its release.
+                .and_then(|count| count.checked_add(usize::from(self.config.fast)))
                 .and_then(|count| count.checked_add(usize::from(self.config.fast)))
                 .and_then(|count| count.checked_add(usize::from(self.decoders.required.is_some())))
                 .and_then(|count| {
@@ -145,13 +147,15 @@ impl LogNode {
                     entry,
                 )?);
             }
-            for (proposal, _) in self
-                .raw
-                .store()
-                .proposals
-                .iter()
-                .filter(|(proposal, _)| proposal.index > index)
-            {
+            // The release the stream stated, then every proposal held: a checkpoint ends none
+            // (hyper-raft `Ready::released`), so the member opens holding what it held.
+            if self.config.fast && self.raw.store().released > 0 {
+                records.push(crate::released_record(
+                    &self.config,
+                    self.raw.store().released,
+                ));
+            }
+            for (proposal, _) in self.raw.store().proposals.iter() {
                 records.push(proto_record(
                     self.config.group_id,
                     RecordKind::Proposal,

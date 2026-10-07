@@ -415,6 +415,10 @@ impl<L: LogStore> LogStore for FloorStore<L> {
         self.inner.proposals(into)
     }
 
+    fn released(&self) -> Result<u64, StorageError> {
+        self.inner.released()
+    }
+
     fn room(&self) -> bool {
         self.inner.room()
     }

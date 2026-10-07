@@ -233,6 +233,24 @@ equivalence passed pinned to one core 200 times and unpinned 50.
 - Entries read from the file wait behind a frame's write and flush: one I/O at a time.
 - mantle's replica shell on this crate (D-1), and mantle and focal consuming it (F-1).
 
+## Openers (focal 27 §15.8)
+
+`Log::opener` gives a `LogOpener`: the log's inbox and parameters, `Clone + Send + Sync`, without
+the log's two threads, so an owner thread spawned for the node's life claims groups from it as
+from the log (`group`, `groups`, `write_waiting`, `entry_room`, `frame_room`, `config`). `Log`'s
+own calls and the opener's share one implementation of each. Once the log has closed every call
+answers `Closed`. hyper-durable's `GroupStore::claim` and `remove` take either through
+`LogGroups`.
+
+### Tests
+
+- `an_opener_claims_as_the_log_does_from_any_thread`: a handle claimed through an opener on another
+  thread writes and reads its group; a second opener, and the log, are refused `Claimed` while it
+  holds the group, and claim it once it is dropped.
+- `an_opener_after_its_log_closed_answers_closed`.
+
+The equivalence files are unchanged.
+
 ## For the durable shell (hyper-durable D-1)
 
 - **A write sent behind a refused one is refused** (`LogError::Behind`). A group's handle keeps an

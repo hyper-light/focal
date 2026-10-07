@@ -289,6 +289,8 @@ fn write_new(
                 }),
                 hard_state: None,
                 proposals: &[],
+                // A group on the fast track is refused: there is nothing to release.
+                released: None,
             };
             store
                 .write_now(&write)
@@ -310,6 +312,7 @@ fn write_new(
         entries: None,
         hard_state: (storage.hard_state != HardState::default()).then_some(storage.hard_state),
         proposals: &[],
+        released: None,
     };
     if !write.is_empty() {
         store

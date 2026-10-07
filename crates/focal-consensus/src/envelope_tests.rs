@@ -319,6 +319,8 @@ fn message(rng: &mut Seeded) -> Message {
         reject: rng.below(2) == 1,
         lost: false,
         kept: false,
+        // Below the fence, which these round trips read under, a classic commit is not carried.
+        classic: None,
         reject_hint: number(rng),
         context: bytes(rng),
         priority,

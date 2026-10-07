@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::task::Waker;
 
 use hyper_block::block::BlockFile;
-use hyper_log::{Fetched, GroupLog, Log, LogError, Proposal, Start, Update};
+use hyper_log::{Fetched, GroupLog, Log, LogError, LogOpener, Proposal, Start, Update};
 use hyper_raft::StorageError;
 use hyper_raft::proto::{Entry, EntryType, HardState};
 
@@ -80,9 +80,44 @@ pub enum ClaimError {
     Log(LogError),
 }
 
+/// What claims and writes a log's groups: the [`Log`] itself, or a [`LogOpener`] an owner holds on
+/// another thread (focal 27 §15.8), which claims as the log does.
+pub trait LogGroups<F: BlockFile + 'static> {
+    /// The handle through which `group` is written and read: [`Log::group`].
+    fn group(&self, group: u128) -> Result<GroupLog<F>, LogError>;
+    /// The parameters the log runs with.
+    fn config(&self) -> hyper_log::Config;
+    /// Submits `update` for `group` and waits until it is durable: [`Log::write_waiting`].
+    fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError>;
+}
+
+impl<F: BlockFile + 'static> LogGroups<F> for Log<F> {
+    fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
+        Log::group(self, group)
+    }
+    fn config(&self) -> hyper_log::Config {
+        Log::config(self)
+    }
+    fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
+        Log::write_waiting(self, group, update)
+    }
+}
+
+impl<F: BlockFile + 'static> LogGroups<F> for LogOpener<F> {
+    fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
+        LogOpener::group(self, group)
+    }
+    fn config(&self) -> hyper_log::Config {
+        LogOpener::config(self)
+    }
+    fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
+        LogOpener::write_waiting(self, group, update)
+    }
+}
+
 impl<F: BlockFile + 'static> GroupStore<F> {
     /// Claims `group` of `log`: from here the group is written through this store alone.
-    pub fn claim(log: &Log<F>, group: u128) -> Result<Self, ClaimError> {
+    pub fn claim(log: &impl LogGroups<F>, group: u128) -> Result<Self, ClaimError> {
         match log.group(group) {
             Ok(handle) => Ok(Self::new(handle, log.config().segment_bytes)),
             Err(LogError::Damaged(_)) => Err(ClaimError::Damaged),
@@ -92,7 +127,7 @@ impl<F: BlockFile + 'static> GroupStore<F> {
 
     /// Removes every record of `group` from `log`: a damaged group's, before a member under a new
     /// identity opens in its place.
-    pub fn remove(log: &Log<F>, group: u128) -> Result<(), LogError> {
+    pub fn remove(log: &impl LogGroups<F>, group: u128) -> Result<(), LogError> {
         log.write_waiting(
             group,
             Update {
@@ -308,6 +343,7 @@ fn update_of(write: &Write<'_>) -> Result<Update, Fault> {
         entries,
         hard_state: write.hard_state.map(hard_to_log),
         proposals,
+        released: write.released,
         remove: false,
     })
 }
@@ -451,6 +487,11 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
             into.push(copy);
         }
         Ok(())
+    }
+
+    fn released(&self) -> Result<u64, StorageError> {
+        let view = self.group.view().map_err(|e| storage(&e))?;
+        Ok(view.map_or(0, |view| view.released))
     }
 
     fn room(&self) -> bool {

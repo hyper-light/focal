@@ -50,12 +50,12 @@ pub mod wire;
 
 pub use catchup::CatchUp;
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
-pub use error::{Error, Result, StorageError};
+pub use error::{Dropped, Error, Result, StorageError};
 pub use mutant::Mutant;
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
 pub use raft::{
-    Ahead, Config, Elections, FastStats, HeartbeatAnswers, Limits, Lost, Outgoing, Precedence,
+    Ahead, CampaignState, Config, Elections, FastStats, HeartbeatAnswers, Limits, Lost, Outgoing,
     Raft, ReadRounds, SoftState, StateRole, Stated,
 };
 pub use read::ReadState;

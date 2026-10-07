@@ -512,7 +512,7 @@ its sources; `docs/raft.md` §3).
   `Raft::settle_lost` (at open and at every notice, from storage: `Lost::resolved_by`, hyper-log's
   rule), `Raft::claim` (what a member answers for in an election). mantle's rules for a marked
   member, until now the shell's, are the core's: `step_vote` judges by the claim (the vote and
-  `Precedence`), `hup` refuses (`Error::Lost`) and forgets the leader that asked it to campaign by
+  the precedence that priority yields to), `hup` refuses (`Error::Lost`) and forgets the leader that asked it to campaign by
   its silence, `deadline` and `wake_follower` arm no campaign, and `step_vote` refuses no one for
   priority while marked.
 - **The word** (`src/proto.rs`, `src/wire.rs`): `Message::lost`, flag bit 2 of the message body; an

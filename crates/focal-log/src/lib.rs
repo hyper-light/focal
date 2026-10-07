@@ -89,8 +89,9 @@ pub enum RecordKind {
     /// knows no fast track refuses the stream and never joins such a group
     /// by the classic rules.
     FastTrack,
-    /// An entry a member approved by itself, held beside its log until the
-    /// log reaches its index. Variant 9.
+    /// An entry a member approved by itself, held beside its log until a
+    /// write releases it ([`RecordKind::Released`]), whatever the log reaches.
+    /// Variant 9.
     Proposal,
     /// The physical layer's own record: every frame of `log` whose origin
     /// is before the sequence in `index` is dead — a checkpoint of the
@@ -106,6 +107,14 @@ pub enum RecordKind {
     /// the payload is the record as it was first encoded, which is what a
     /// group's replay is given. Variant 11.
     Moved,
+    /// The proposals a member approved by itself at or below `index` are held
+    /// no more: it knew its log committed through `index` by a classic quorum
+    /// (hyper-raft `Ready::released`). Written before the proposals of the same
+    /// write, which it does not end, and given back at opening so the member
+    /// holds again only what it never released. Only in a group with the fast
+    /// track. Variant 12, so a binary that knows no release refuses the stream
+    /// rather than holding every proposal it ever approved.
+    Released,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1810,7 +1819,11 @@ mod tests {
                 postcard::to_allocvec(&old).unwrap()
             );
         }
-        for (kind, ordinal) in [(RecordKind::FastTrack, 8u8), (RecordKind::Proposal, 9)] {
+        for (kind, ordinal) in [
+            (RecordKind::FastTrack, 8u8),
+            (RecordKind::Proposal, 9),
+            (RecordKind::Released, 12),
+        ] {
             let record = Record {
                 log: LogicalLogId([1; 16]),
                 kind,

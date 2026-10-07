@@ -25,11 +25,16 @@ pub const ENTRY_FIXED_BYTES: usize = 1 + 8 + 8 + 4 + 4;
 /// Bytes of a message's body besides its context, entries and snapshot: the kind, the flags,
 /// nine `u64`, the priority, the entry count and the context length.
 pub const MESSAGE_FIXED_BYTES: usize = 1 + 1 + 9 * 8 + 8 + 4 + 4;
-/// Bytes of a message's record besides its context, entries and snapshot: its body's fixed part,
-/// the record's header and its checksum. A leader's append carries no context, so what it costs the
-/// path is this and its entries' bodies, the bytes a member's window is charged
-/// (`progress::Inflights`).
-pub const MESSAGE_RECORD_FIXED_BYTES: usize = HEADER_BYTES + MESSAGE_FIXED_BYTES + CHECKSUM_BYTES;
+/// Bytes of a message's classic commit ([`Message::classic`]), after its body's other parts when
+/// it states one.
+pub const MESSAGE_CLASSIC_BYTES: usize = 8;
+/// Bytes of a leader's append's record besides its entries: its body's fixed part, its classic
+/// commit, the record's header and its checksum. A leader's append carries no context and always
+/// states its classic commit, so what it costs the path is this and its entries' bodies, the bytes
+/// a member's window is charged (`progress::Inflights`), and no message of the core's has more
+/// fixed bytes.
+pub const MESSAGE_RECORD_FIXED_BYTES: usize =
+    HEADER_BYTES + MESSAGE_FIXED_BYTES + MESSAGE_CLASSIC_BYTES + CHECKSUM_BYTES;
 
 /// Flag bit of a message: the request is refused.
 const REJECT: u8 = 1;
@@ -41,6 +46,9 @@ const LOST: u8 = 1 << 2;
 /// Flag bit of a message: a refused append's answer from a member that kept the append ahead of a
 /// hole in its log (core step R-3's R17).
 const KEPT: u8 = 1 << 3;
+/// Flag bit of a message: its classic commit follows its body's other parts. A decoder that does
+/// not know it refuses the record, so an owner sends it only to members that do.
+const CLASSIC: u8 = 1 << 4;
 /// Presence bit of a snapshot: its metadata follows.
 const HAS_METADATA: u8 = 1;
 /// Presence bit of a snapshot: the metadata's configuration follows its index and term.
@@ -487,6 +495,7 @@ impl Record for Message {
             .saturating_add(self.context.len())
             .saturating_add(entries)
             .saturating_add(self.snapshot.as_deref().map_or(0, Record::body_len))
+            .saturating_add(self.classic.map_or(0, |_| MESSAGE_CLASSIC_BYTES))
     }
     fn put_body(&self, out: &mut Vec<u8>) {
         out.push(message_kind(self.msg_type));
@@ -502,6 +511,9 @@ impl Record for Message {
         }
         if self.kept {
             flags |= KEPT;
+        }
+        if self.classic.is_some() {
+            flags |= CLASSIC;
         }
         out.push(flags);
         for field in [
@@ -527,11 +539,14 @@ impl Record for Message {
         if let Some(snapshot) = &self.snapshot {
             snapshot.put_body(out);
         }
+        if let Some(classic) = self.classic {
+            out.extend_from_slice(&classic.to_le_bytes());
+        }
     }
     fn take_body(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let msg_type = take_message_kind(reader.byte()?)?;
         let flags = reader.byte()?;
-        if flags & !(REJECT | HAS_SNAPSHOT | LOST | KEPT) != 0 {
+        if flags & !(REJECT | HAS_SNAPSHOT | LOST | KEPT | CLASSIC) != 0 {
             return Err(DecodeError::Unknown {
                 what: "message flags",
                 value: flags,
@@ -571,6 +586,11 @@ impl Record for Message {
         } else {
             None
         };
+        let classic = if flags & CLASSIC != 0 {
+            Some(reader.u64()?)
+        } else {
+            None
+        };
         Ok(Self {
             msg_type,
             to,
@@ -589,6 +609,7 @@ impl Record for Message {
             reject_hint,
             context,
             priority,
+            classic,
         })
     }
 }
@@ -794,6 +815,23 @@ mod tests {
             reject_hint: 39,
             context: b"read".to_vec(),
             priority: -5,
+            classic: None,
+        }
+    }
+
+    /// A leader's append that states its classic commit.
+    fn classic() -> Message {
+        Message {
+            msg_type: MessageType::MsgAppend,
+            to: 3,
+            from: 1,
+            term: 7,
+            log_term: 6,
+            index: 41,
+            entries: vec![entry()],
+            commit: 42,
+            classic: Some(40),
+            ..Message::default()
         }
     }
 
@@ -915,6 +953,26 @@ mod tests {
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(kept().encode_to_vec(), sealed(1, &body));
+
+        // A leader's append that states its classic commit: the classic flag, and the commit
+        // after the entries.
+        let mut body = vec![3, CLASSIC];
+        for field in [3u64, 1, 7, 6, 41, 42, 0, 0, 0] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        entry().put_body(&mut body);
+        body.extend_from_slice(&40u64.to_le_bytes());
+        let encoded = classic().encode_to_vec();
+        assert_eq!(encoded, sealed(1, &body));
+        assert_eq!(encoded.len(), classic().encoded_len());
+        assert_eq!(
+            encoded.len(),
+            MESSAGE_RECORD_FIXED_BYTES + entry().body_len(),
+            "an append's fixed bytes are what its window is charged"
+        );
     }
 
     /// A record and whether bytes read back to its value.
@@ -928,6 +986,7 @@ mod tests {
             (message().encode_to_vec(), |b| round(b, &message())),
             (lost().encode_to_vec(), |b| round(b, &lost())),
             (kept().encode_to_vec(), |b| round(b, &kept())),
+            (classic().encode_to_vec(), |b| round(b, &classic())),
             (entry().encode_to_vec(), |b| round(b, &entry())),
             (snapshot().encode_to_vec(), |b| round(b, &snapshot())),
             (change().encode_to_vec(), |b| round(b, &change())),
@@ -1033,7 +1092,7 @@ mod tests {
             Message::decode(&sealed(1, &body)),
             Err(DecodeError::Unknown { .. })
         ));
-        let mut body = vec![3, 1 << 4];
+        let mut body = vec![3, 1 << 5];
         body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
         assert!(matches!(
             Message::decode(&sealed(1, &body)),

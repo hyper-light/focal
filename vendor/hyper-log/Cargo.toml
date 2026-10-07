@@ -11,6 +11,8 @@ repository = "https://github.com/hyper-light/hyper-raft"
 crc32c = "0.6"
 getrandom = "0.4"
 hyper-block = { version = "0.1.0", path = "../hyper-block" }
+# The sealed log's keys, MACs and tags (`Log::create_sealed`, hyper-raft docs/seal.md).
+hyper-seal = { version = "0.1.0", path = "../hyper-seal" }
 # The histograms the log's statistics keep (`LogStats`, hyper-raft docs/durable.md §13.1).
 hyper-timing = { version = "0.1.0", path = "../hyper-timing" }
 thiserror = "2.0"

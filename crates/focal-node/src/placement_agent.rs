@@ -3172,7 +3172,12 @@ impl PlacementAgent {
             || (ledger == handles.directory.namespace()
                 && handles.directory.host_of_group(group).is_some());
         if voters.contains(&node) && hosts {
-            let permit = crate::placement_control::prepare_session_fact(
+            // Its own refusal is one voter's, as a remote voter's is: the
+            // majority decides, never one node. A member its group removed
+            // and never told (hyper-raft 83f193a: a leader stops sending to
+            // it once its log holds the change) cannot witness the change
+            // that removed it, and the others still can.
+            let local = match crate::placement_control::prepare_session_fact(
                 &handles.fleet,
                 &handles.control,
                 &handles.directory,
@@ -3180,9 +3185,15 @@ impl PlacementAgent {
                 fact.clone(),
                 window,
             )
-            .await?;
-            let local = permit.sign(&self.credentials)?;
-            if collected.merge(local.proof().clone())? {
+            .await
+            {
+                Ok(permit) => Some(permit.sign(&self.credentials)?),
+                Err(PlacementProofError::Unauthorized | PlacementProofError::Unavailable) => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(local) = local
+                && collected.merge(local.proof().clone())?
+            {
                 return collected.finish();
             }
         }

@@ -190,6 +190,8 @@ pub(crate) struct Owner<F> {
     fenced: bool,
     /// The device, while no thread does I/O with it.
     device: Option<Device<F>>,
+    /// A sealed log's keys: its sessions, their openers and its framing MAC (`crate::seal`).
+    seal: Option<crate::seal::Sealer>,
     /// I/O waiting for the device, in the order asked: at most [`crate::device::JOBS`].
     io: VecDeque<Waiting<F>>,
     /// Where jobs come back, with the device, from the thread that did them; read before every
@@ -250,6 +252,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         room: Room,
         restores: Vec<Submission>,
         wiring: Wiring<F>,
+        seal: Option<crate::seal::Sealer>,
     ) -> Self {
         let Wiring {
             device,
@@ -274,6 +277,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             buffers: Buffers::new(),
             fenced: false,
             device: Some(device),
+            seal,
             io: VecDeque::new(),
             returns,
             tokens: Some(tokens),

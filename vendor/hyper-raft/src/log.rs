@@ -26,7 +26,7 @@ use crate::{
 /// <= end`: the entries before it were given by a `Ready` whose write is
 /// out, and stay here until it is durable. A replacement below it moves it
 /// back, so the next `Ready` gives what replaced them.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Unstable {
     pub(crate) snapshot: Option<Snapshot>,
     /// Whether a write of the snapshot was issued.
@@ -168,7 +168,7 @@ fn counted(entries: &[Entry], used: u64) -> (u64, usize) {
 /// A page of entries copied out of the log, what their buffers hold by
 /// capacity ([`payload_of`]), and the bytes of their encodings by the
 /// page's rule, counted as the page was chosen.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Page {
     pub(crate) entries: Vec<Entry>,
     pub(crate) payload: usize,
@@ -398,6 +398,7 @@ struct AppendPlan {
 
 /// The log of one member: storage, what follows it in memory, and the
 /// committed, persisted and applied indexes.
+#[derive(Clone)]
 pub struct Log<S> {
     pub(crate) store: S,
     pub(crate) unstable: Unstable,
@@ -1188,6 +1189,7 @@ pub(crate) mod tests {
                 hard_state: self.hard_state,
                 configuration: self.configuration.clone(),
                 proposals: self.proposals.clone(),
+                released: 0,
             })
         }
         fn entries(

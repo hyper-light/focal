@@ -13858,3 +13858,51 @@ session to a 200-row bound: the next creation is refused typed and retryable, th
 checkpoint succeeds, and an exact retry is answered. Without the admission check, 200
 rows never refuse. The ledger that had stopped opens Ready on the fixed binary,
 checkpoints, and commits new claims (sequence 4,622).
+
+### 2026-10-06 — The shared crates at hyper-raft b118def; what the new core asked of focal
+
+The six `hyper-*` snapshots move to `b118def` (hyper-raft main, with the `LogOpener` of PR #1), and
+`hyper-seal` joins them: hyper-log's sealed log takes its keys, MACs and tags from it (AES-256-KW
+key wrapping, ML-KEM-1024 to send a key to another machine). `vendor/README.md` and
+`docs/dependencies/inventory.tsv` name the revision. Two of the core's changes since `4c4a199` are
+fixes focal had to meet, and both found defects on focal's side:
+
+- **A fast-track proposal is held until a classic commit releases it** (hyper-raft d8578be, the fix
+  the 2026-10-05 entry waited for). focal's WAL backend ended a proposal when the log reached its
+  index, at a checkpoint (it kept only those above the snapshot) and at replay: the rule the fix
+  removed. `RamLog` now ends proposals only at `Ready::released`; a proposal given again replaces the
+  one held at its index; a checkpoint keeps every held proposal. The release is durable, in a
+  record of its own (`RecordKind::Released`, variant 12, written only in a group with the fast
+  track, so a classic group's stream is as it was), because the core refuses at opening more held
+  proposals than its bound: a stream that never recorded a release would bring every proposal back.
+  A follower learns the classic commit from its leader (`Message::classic`), which focal's
+  envelope carries as field 19 on the raised wire (`Wire::Kept`) and leaves out below it, where a
+  member reads nothing known and releases nothing: room, never safety. The fast track stays
+  withheld (`NodeConfig::validate`): it now needs the raised wire, which the capability fence does
+  not open yet. Tests:
+  `a_proposal_the_log_reached_is_held_until_released_and_the_release_outlives_a_restart` (fails
+  with the old publish-time drop restored), `a_leaders_classic_commit_is_field_19_and_nothing_below_the_fence`,
+  and the fast-track suite on the raised wire, its followers releasing on the next heartbeat.
+- **Elections and commitment count by the newest configuration in a member's log** (hyper-raft
+  83f193a, after its random walk elected two leaders of one term; Ongaro's thesis §4.1, §4.2.2). A
+  leader now stops sending to a member as soon as its log holds the change that removes it, so the
+  removed member is never told. In `cli_nodes`'
+  `a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capacity_is_refused`, the
+  drained host leads the partition and collects the session's membership proof; it cannot witness
+  the change that removed it, and its own refusal aborted the round although the three other voters
+  were a majority, so the heal stalled for good (twice, 240 s; the old core passes in 79 s). A
+  collector's own refusal is now one voter's, as a remote voter's is (`PlacementAgent::collect`):
+  the majority decides, never one node. The test passes in 85 s. Two consensus tests restated for
+  the rule: the removal of the other of two voters commits on the leader's own write, and the fence
+  is kept by a twin that adds a learner (`an_added_learner_is_applied_only_once_the_log_holds_its_commit`,
+  which fails with the fence disabled); a member removed by another never leads a group it is not in
+  (`a_removed_member_never_told_never_leads_a_group_it_is_not_in`).
+
+`inventory.tsv` was also stale by 75 crates since the competitor comparison (03197c1): rows added
+from `cargo metadata`, and `notices.py` renders again. The README named a `--check` flag that
+script does not have; it now names the call.
+
+Gates on the final tree (macOS arm64): `cargo fmt --all --check`, `python3 scripts/check-contracts.py`,
+`clippy --workspace --all-targets --locked -D warnings`, `scripts/check-production.sh`,
+`cargo deny check advisories bans licenses sources`, and `cargo test --workspace --locked --
+--test-threads=4`: 158 test binaries, 3,134 passed, 0 failed, 12 ignored.

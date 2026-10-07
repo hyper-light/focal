@@ -31,12 +31,13 @@ targets; a change to it is made there first and taken here by a new snapshot, ne
 
 | Crate | Version | Revision | Taken | Why it is here |
 |---|---|---|---|---|
-| `hyper-block` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
-| `hyper-durable` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The durable shell a group's replica becomes (27 §15) |
-| `hyper-liveness` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
-| `hyper-log` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
-| `hyper-raft` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The consensus core every group runs |
-| `hyper-timing` | 0.1.0 | `4c4a19949094cb87e3794317ac8c282b42e73e70` | 2026-10-04 | The election law's draw the core takes its delays from |
+| `hyper-block` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
+| `hyper-durable` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | The durable shell a group's replica becomes (27 §15) |
+| `hyper-liveness` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
+| `hyper-log` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
+| `hyper-raft` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | The consensus core every group runs |
+| `hyper-timing` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | The election law's draw the core takes its delays from |
+| `hyper-seal` | 0.1.0 | `b118defdc3ca548a68c5636b4fdc4b64188ce691` | 2026-10-06 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
 
 A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
 crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to
@@ -61,7 +62,7 @@ crates keep their own.
    edit the sources; a change focal needs before upstream releases it is a
    separate, documented patch commit on top of the verbatim import.
 3. Update the table above, `Cargo.lock`, `docs/dependencies/inventory.tsv`
-   (`python3 scripts/release/notices.py --check`), and record the reason in
+   (`python3 scripts/release/notices.py <scratch directory>`, which refuses a stale roster), and record the reason in
    `docs/archictecutre/09-implementation-status.md`.
 4. Run the six gates; the dependency audit (`cargo deny`) covers the vendored
    crates' licenses through `Cargo.lock`.

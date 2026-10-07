@@ -288,7 +288,7 @@ impl LogNode {
                         .rev()
                         .take_while(|entry| entry.index > delivered),
                 )
-                .filter(|entry| proto::changes_configuration(entry))
+                .filter(|entry| changes_configuration(entry))
                 .fold(0usize, |added, entry| {
                     added.saturating_add(memory::members_added(entry, tracker))
                 })
@@ -472,15 +472,16 @@ impl LogNode {
                         (None, None) => None,
                     };
                     let mut records = Vec::new();
-                    // The record count is known: entries plus an optional snapshot
-                    // and hard state. Reserve once so the ready cycle never grows.
+                    // The record count is known: entries and proposals plus an optional
+                    // snapshot, release and hard state. Reserve once so the ready cycle never
+                    // grows.
                     records
                         .try_reserve_exact(
                             ready
                                 .entries()
                                 .len()
                                 .saturating_add(ready.proposals().len())
-                                .saturating_add(2),
+                                .saturating_add(3),
                         )
                         .map_err(|_| ConsensusError::Capacity)?;
                     if let Some(snapshot) = ready.snapshot() {
@@ -500,6 +501,12 @@ impl LogNode {
                             entry.term,
                             entry,
                         )?);
+                    }
+                    // The release before this write's proposals, which it does not end; written
+                    // only where proposals are, so a classic group's stream stays as it was.
+                    let released = ready.released();
+                    if let Some(through) = released.filter(|_| self.config.fast) {
+                        records.push(crate::released_record(&self.config, through));
                     }
                     // What the member approved by itself is durable before it
                     // says that it holds it (27 §4.4).
@@ -528,6 +535,7 @@ impl LogNode {
                         ready.entries(),
                         ready.snapshot(),
                         ready.proposals(),
+                        released,
                     )?;
                     pending.phase = Phase::Ready(Box::new(ReadyPhase {
                         ready,
@@ -680,7 +688,7 @@ impl LogNode {
     fn fenced(&self, entries: &[Entry]) -> bool {
         entries.iter().any(|entry| {
             entry.index > self.commit_durable
-                && (self.written_commit || proto::changes_configuration(entry))
+                && (self.written_commit || changes_configuration(entry))
         })
     }
     /// What follows `advance_append`: what the `Ready` committed is given
@@ -826,4 +834,9 @@ impl LogNode {
         self.raw.advance_apply_to(*delivered)?;
         Ok(())
     }
+}
+
+/// Whether the entry changes the configuration, by either encoding.
+fn changes_configuration(entry: &Entry) -> bool {
+    entry.entry_type != hyper_raft::proto::EntryType::EntryNormal
 }
