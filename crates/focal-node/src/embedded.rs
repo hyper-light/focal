@@ -69,6 +69,9 @@ pub enum NodeError {
     Locked,
     #[error("node identity or stored policy is corrupt or incompatible")]
     Identity,
+    /// A record of the data directory that is there and does not read whole.
+    #[error("corrupt node record: {0}")]
+    Corrupt(&'static str),
     #[error("deployment cannot satisfy its configured guarantee: {0}")]
     Placement(String),
     #[error("this embedded owner requires local operation; use the network host for peers")]

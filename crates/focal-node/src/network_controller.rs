@@ -55,6 +55,9 @@ pub enum ControllerError {
     Encoding(#[from] postcard::Error),
     #[error("network controller journal: {0}")]
     Io(#[from] std::io::Error),
+    /// The record of the fence's level this node's next start reads (`storage_level`).
+    #[error("storage level record: {0}")]
+    StorageLevel(#[from] crate::embedded::NodeError),
     #[error(
         "the cluster's upgrade fence is at level {fence} and this binary announces level {announced}; run a binary at the fence's level or above (24 §21)"
     )]
@@ -983,6 +986,9 @@ pub struct NetworkController {
     receipt: EnrollmentReceipt,
     credentials: CredentialMaterial,
     root: PathBuf,
+    /// The fence level last recorded for the next start (`storage_level`), so a fence that has
+    /// not moved writes nothing.
+    recorded_level: u32,
     admission: Option<RootAdmission>,
     routes: BTreeMap<u64, PeerEndpoint>,
     route_revision: u64,
@@ -1109,6 +1115,9 @@ impl NetworkController {
             receipt,
             credentials,
             root,
+            // Nothing recorded by this controller yet: the first observation writes the record
+            // only if it rises past what the data directory holds (`storage_level::record`).
+            recorded_level: 0,
             admission,
             routes: BTreeMap::new(),
             route_revision: 0,
@@ -1770,6 +1779,13 @@ impl NetworkController {
         // once, as a binary behind the fence does (24 §11; runbooks/expired-credentials).
         if credential_retired(&enrollment, self.state.node, &self.receipt, now) {
             return Err(ControllerError::Retired);
+        }
+        // The level the committed fence opens, for the next start to choose where the node's
+        // groups live (27 §15.8): recorded durably once it rises, never lowered.
+        let level = enrollment.fence().level;
+        if level > self.recorded_level {
+            crate::storage_level::record(&self.root, level)?;
+            self.recorded_level = level;
         }
         self.publish_local_grant(&enrollment);
         let grants = active_grants(&enrollment, &self.state, now)?;

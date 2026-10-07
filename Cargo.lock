@@ -884,6 +884,7 @@ dependencies = [
  "blake3",
  "clap",
  "clap_complete",
+ "crc32fast",
  "focal-client",
  "focal-consensus",
  "focal-control",
