@@ -12,10 +12,13 @@
 )]
 //! A node-local, multiplexed, durable physical write-ahead log.
 //!
-//! The checksummed `CURRENT` file is a durability fence, not an application redo
-//! log. Appends flush segment data before atomically installing and flushing that
-//! fence. Recovery therefore never guesses whether a damaged frame was acknowledged:
-//! every byte before the fence must validate; only the suffix after it is discarded.
+//! A group commit's frames are flushed, then a commit frame is written after them and
+//! flushed: a commit on disk proves its batch reached the disk first, and the batch is
+//! durable once its commit is (docs/archictecutre/28-commit-frames.md). The
+//! checksummed `CURRENT` file is a durability fence written rarely: when a generation
+//! begins, when the base passes a segment boundary, and at open. Every byte before it
+//! must validate; past it, recovery follows the chain to the last commit frame and
+//! drops a torn tail, but fails closed on damage a crash does not leave.
 //! A failed write permanently poisons the writer until it is reopened and recovered.
 //!
 //! The fence also names the base: where the durable prefix starts. A group's
@@ -38,6 +41,20 @@ use std::{
 use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"FOCALW01";
+/// Format: a segment whose frames end at the fence (no commit frames).
+const SEGMENT_FENCED: u32 = 1;
+/// Format: a segment whose group commits end with commit frames (doc 28).
+const SEGMENT_COMMITTED: u32 = 2;
+/// Format: the bit of a frame's length field that marks a commit frame. A record's length stays below it.
+const COMMIT_FLAG: u32 = 1 << 31;
+/// Format: a commit frame's payload when the base moved since the last commit: the durable base (segment u64,
+/// byte u64, sequence u64, checksum u32). A commit whose base stayed carries none.
+const COMMIT_PAYLOAD: usize = 8 + 8 + 8 + 4;
+/// Derived: a commit frame's bytes on disk at most, its header and a base: what a group commit adds.
+const COMMIT_FRAME_BYTES: usize = FRAME_HEADER + COMMIT_PAYLOAD;
+/// Cited: the unit a drive writes atomically, so a write cut short leaves whole unwritten sectors (etcd's
+/// `minSectorSize`, the 512-byte logical sector every drive exposes).
+const SECTOR: u64 = 512;
 const FENCE_MAGIC: &[u8; 8] = b"FOCALF01";
 const HEADER_LEN: u64 = 72;
 const FRAME_HEADER: usize = 20;
@@ -214,6 +231,14 @@ pub struct Wal {
     active: File,
     position: DurablePosition,
     base: DurableBase,
+    /// What the installed fence names: recovery checks every frame up to it strictly, and no segment behind its
+    /// base is removed.
+    fence_position: DurablePosition,
+    fence_base: DurableBase,
+    /// The commit frame the last group commit wrote, for the writer's index to count.
+    last_commit: Option<FrameLocation>,
+    /// The base the last commit frame carried (or the fence's): a commit carries the base only when it moved.
+    committed_base: DurableBase,
     failed: bool,
     fault: Option<FaultPoint>,
 }
@@ -255,7 +280,8 @@ impl Wal {
         mut visitor: impl FnMut(ScanEvent) -> Result<(), LogError>,
     ) -> Result<Self, LogError> {
         if options.max_record_bytes == 0
-            || options.max_record_bytes > u32::MAX as usize
+            // A frame's length stays below the commit flag (doc 28).
+            || frame_limit(&options) >= COMMIT_FLAG as usize
             || options.max_batch_bytes < options.max_record_bytes
             || options.segment_bytes
                 < HEADER_LEN
@@ -320,6 +346,9 @@ impl Wal {
             sync_dir(&directory)?;
             (position, DurableBase::default())
         };
+        let (fence_position, fence_base) = (position, base);
+        // Past the fence, the chain runs to the last commit frame; its base is the durable base (doc 28).
+        let (position, base) = discover_commit(&directory, &options, position, base)?;
         visitor(ScanEvent::Base(base))?;
         scan_headers(&directory, &options, base, position, |header, sequence| {
             visitor(ScanEvent::Header(header, sequence))
@@ -338,14 +367,39 @@ impl Wal {
             sentinel.sync_all()?;
             sync_dir(&directory)?;
         }
+        // A later commit than the fence names is fenced before anything behind its base is removed.
+        if (position, base) != (fence_position, fence_base) {
+            install_fence(&fence_paths, &directory, &options, position, base)?;
+        }
         let path = segment_path(&directory, position.generation, position.segment);
-        let mut active = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut active = OpenOptions::new().read(true).write(true).open(&path)?;
         if active.metadata()?.len() != position.byte {
             active.set_len(position.byte)?;
             active.sync_all()?;
         }
-        active.seek(SeekFrom::Start(position.byte))?;
         cleanup_segments(&directory, base, position)?;
+        // A log written before commit frames rolls to a segment that has them before its first append, so no
+        // segment mixes the two formats (doc 28 §3).
+        let mut header = [0u8; HEADER_LEN as usize];
+        active.seek(SeekFrom::Start(0))?;
+        active.read_exact(&mut header)?;
+        let (active, position) =
+            if segment_version(&header, &options, position.generation, position.segment)
+                == Some(SEGMENT_FENCED)
+            {
+                let next = DurablePosition {
+                    segment: position.segment.checked_add(1).ok_or(LogError::Capacity)?,
+                    byte: HEADER_LEN,
+                    ..position
+                };
+                let active = create_segment(&directory, &options, next, position.checksum)?;
+                install_fence(&fence_paths, &directory, &options, next, base)?;
+                (active, next)
+            } else {
+                (active, position)
+            };
+        let mut active = active;
+        active.seek(SeekFrom::Start(position.byte))?;
         Ok(Self {
             directory,
             fence: fence_paths,
@@ -354,6 +408,10 @@ impl Wal {
             active,
             position,
             base,
+            fence_position: position,
+            fence_base: base,
+            last_commit: None,
+            committed_base: base,
             failed: false,
             fault: None,
         })
@@ -461,20 +519,12 @@ impl Wal {
             self.position = position;
             // The replacement generation starts its own prefix.
             self.base = DurableBase::default();
+            // A new generation is due a fence, so this commit installs one.
             let position = self.append_encoded(&encoded)?;
-            if encoded.is_empty() {
-                install_fence(
-                    &self.fence,
-                    &self.directory,
-                    &self.options,
-                    position,
-                    self.base,
-                )?;
-            }
             scan(&self.directory, &self.options, self.base, position, |_| {
                 Ok(())
             })?;
-            cleanup_segments(&self.directory, self.base, position)?;
+            cleanup_segments(&self.directory, self.fence_base, position)?;
             Ok(position)
         })();
         if result.is_err() {
@@ -502,14 +552,16 @@ impl Wal {
         Ok(())
     }
     /// Remove the segments before the base the fence names (a crash before
-    /// this leaves them for the next open to remove).
+    /// this leaves them for the next open to remove). Only the fenced base's:
+    /// a base a commit frame carried has no fence yet, and recovery starts
+    /// from the fence's.
     fn retire_segments(&mut self) -> Result<(), LogError> {
         if self.failed {
             return Err(LogError::Failed);
         }
         let result = (|| {
             self.fail_at(FaultPoint::AfterBaseFence)?;
-            cleanup_segments(&self.directory, self.base, self.position)
+            cleanup_segments(&self.directory, self.fence_base, self.position)
         })();
         if result.is_err() {
             self.failed = true;
@@ -583,6 +635,36 @@ impl Wal {
 
     /// Write one frame at the tail. Its origin is its own sequence.
     fn write_frame(&mut self, data: &[u8]) -> Result<FrameLocation, LogError> {
+        let field = u32::try_from(data.len()).map_err(|_| LogError::Capacity)?;
+        if field & COMMIT_FLAG != 0 {
+            return Err(LogError::Capacity);
+        }
+        self.write_frame_with(field, data)
+    }
+
+    /// Ends the group commit written so far with a commit frame (doc 28): its header alone when the base
+    /// stayed where the last commit left it, and the base after it when the base moved.
+    fn write_commit(&mut self) -> Result<FrameLocation, LogError> {
+        if self.base == self.committed_base {
+            return self.write_frame_with(COMMIT_FLAG, &[]);
+        }
+        let mut payload = [0u8; COMMIT_PAYLOAD];
+        let (segment, rest) = payload.split_at_mut(8);
+        segment.copy_from_slice(&self.base.segment.to_le_bytes());
+        let (byte, rest) = rest.split_at_mut(8);
+        byte.copy_from_slice(&self.base.byte.to_le_bytes());
+        let (sequence, checksum) = rest.split_at_mut(8);
+        sequence.copy_from_slice(&self.base.sequence.to_le_bytes());
+        checksum.copy_from_slice(&self.base.checksum.to_le_bytes());
+        // The payload's length is fixed and below the flag.
+        let field = COMMIT_FLAG | (COMMIT_PAYLOAD as u32);
+        let location = self.write_frame_with(field, &payload)?;
+        self.committed_base = self.base;
+        Ok(location)
+    }
+
+    /// Writes one frame at the tail with `field` as its length word: a record's length, or a commit frame's.
+    fn write_frame_with(&mut self, field: u32, data: &[u8]) -> Result<FrameLocation, LogError> {
         {
             let frame_bytes = FRAME_HEADER
                 .checked_add(data.len())
@@ -614,12 +696,11 @@ impl Wal {
                 .sequence
                 .checked_add(1)
                 .ok_or(LogError::Capacity)?;
-            let len = u32::try_from(data.len()).map_err(|_| LogError::Capacity)?;
-            // A fixed-size stack header (len u32, sequence u64, previous CRC u32,
-            // then this frame's CRC u32) avoids a per-record heap allocation; the
+            // A fixed-size stack header (length word u32, sequence u64, previous CRC
+            // u32, then this frame's CRC u32) avoids a per-record heap allocation; the
             // byte layout is identical to the frozen frame format.
             let mut header = [0u8; FRAME_HEADER];
-            header[0..4].copy_from_slice(&len.to_le_bytes());
+            header[0..4].copy_from_slice(&field.to_le_bytes());
             header[4..12].copy_from_slice(&sequence.to_le_bytes());
             header[12..16].copy_from_slice(&self.position.checksum.to_le_bytes());
             let mut hash = crc32fast::Hasher::new();
@@ -650,10 +731,32 @@ impl Wal {
         }
     }
 
+    /// Closes the group commit (doc 28): the batch's data is flushed, then a commit frame carrying the base is
+    /// written and flushed, so a commit on disk proves its batch's data reached the disk before it. The fence
+    /// is installed only when it is due: a new generation, or a base past the fenced base's segment (whose
+    /// segments may then be removed).
     fn finish_append(&mut self) -> Result<DurablePosition, LogError> {
         self.fail_at(FaultPoint::AfterAppend)?;
-        self.active.sync_all()?;
+        self.active.sync_data()?;
         self.fail_at(FaultPoint::AfterDataSync)?;
+        let commit = self.write_commit()?;
+        self.active.sync_all()?;
+        self.last_commit = Some(commit);
+        if self.fence_due() {
+            self.install_fence_here()?;
+        }
+        self.fail_at(FaultPoint::AfterFenceInstall)?;
+        Ok(self.position)
+    }
+
+    /// Whether the fence must move: a generation it does not name, or a base past its base's segment.
+    fn fence_due(&self) -> bool {
+        self.position.generation != self.fence_position.generation
+            || self.base.segment > self.fence_base.segment
+    }
+
+    /// Installs the fence at the current position and base.
+    fn install_fence_here(&mut self) -> Result<(), LogError> {
         install_fence(
             &self.fence,
             &self.directory,
@@ -661,8 +764,14 @@ impl Wal {
             self.position,
             self.base,
         )?;
-        self.fail_at(FaultPoint::AfterFenceInstall)?;
-        Ok(self.position)
+        self.fence_position = self.position;
+        self.fence_base = self.base;
+        Ok(())
+    }
+
+    /// The commit frame the last group commit wrote, taken once (the shared writer counts its bytes).
+    pub(crate) fn take_commit(&mut self) -> Option<FrameLocation> {
+        self.last_commit.take()
     }
 }
 
@@ -719,7 +828,8 @@ fn create_segment(
 ) -> Result<File, LogError> {
     let mut header = Vec::with_capacity(HEADER_LEN as usize);
     header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&1u32.to_le_bytes());
+    // Every segment written now ends its group commits with commit frames.
+    header.extend_from_slice(&SEGMENT_COMMITTED.to_le_bytes());
     header.extend_from_slice(&options.identity.cluster);
     header.extend_from_slice(&options.identity.node.to_le_bytes());
     header.extend_from_slice(&options.identity.stream.to_le_bytes());
@@ -754,24 +864,34 @@ fn segment_base(
     let mut file = File::open(&path)?;
     let mut header = [0u8; HEADER_LEN as usize];
     file.read_exact(&mut header)?;
-    if header.get(..8) != Some(MAGIC.as_slice())
-        || read_u32(&header, 8..12)? != 1
-        || header.get(12..28) != Some(options.identity.cluster.as_slice())
-        || read_u64(&header, 28..36)? != options.identity.node
-        || read_u32(&header, 36..40)? != options.identity.stream
-        || read_u64(&header, 40..48)? != generation
-        || read_u64(&header, 48..56)? != segment
-        || read_u32(&header, 68..72)?
-            != crc32fast::hash(header.get(..68).ok_or(LogError::Capacity)?)
-    {
-        return Err(corrupt(&path, 0, "segment header mismatch"));
-    }
+    segment_version(&header, options, generation, segment)
+        .ok_or_else(|| corrupt(&path, 0, "segment header mismatch"))?;
     Ok(DurableBase {
         segment,
         byte: HEADER_LEN,
         sequence: read_u64(&header, 56..64)?,
         checksum: read_u32(&header, 64..68)?,
     })
+}
+
+/// The format version of a segment header that names this log's identity, generation and segment and
+/// checks out; `None` for any other header.
+fn segment_version(
+    header: &[u8; HEADER_LEN as usize],
+    options: &WalOptions,
+    generation: u64,
+    segment: u64,
+) -> Option<u32> {
+    let version = read_u32(header, 8..12).ok()?;
+    let matches = header.get(..8) == Some(MAGIC.as_slice())
+        && (version == SEGMENT_FENCED || version == SEGMENT_COMMITTED)
+        && header.get(12..28) == Some(options.identity.cluster.as_slice())
+        && read_u64(header, 28..36).ok()? == options.identity.node
+        && read_u32(header, 36..40).ok()? == options.identity.stream
+        && read_u64(header, 40..48).ok()? == generation
+        && read_u64(header, 48..56).ok()? == segment
+        && read_u32(header, 68..72).ok()? == crc32fast::hash(header.get(..68)?);
+    matches.then_some(version)
 }
 
 /// The fence's file and the file it is staged in before the atomic replace.
@@ -906,6 +1026,235 @@ fn frame_limit(options: &WalOptions) -> usize {
     options.max_record_bytes.saturating_add(MOVED_OVERHEAD)
 }
 
+/// Follows the chain past the fence (doc 28): every frame from the fenced position on, through the last
+/// commit frame of segments that have them. Answers the last commit's position and the base it carried,
+/// or the fence's when no commit follows it. At the first frame that does not validate, the rest is a
+/// torn tail only when the frame is torn as an interrupted write leaves it ([`torn`]) and no later segment
+/// exists; anything else is corruption and fails closed (Alagappan et al., FAST 2018).
+fn discover_commit(
+    directory: &Path,
+    options: &WalOptions,
+    fence: DurablePosition,
+    fence_base: DurableBase,
+) -> Result<(DurablePosition, DurableBase), LogError> {
+    let mut committed = (fence, fence_base);
+    let generation = fence.generation;
+    let mut segment = fence.segment;
+    let mut sequence = fence.sequence;
+    let mut previous = fence.checksum;
+    let mut data = Vec::new();
+    loop {
+        let path = segment_path(directory, generation, segment);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            // The fenced segment is read by the strict scan, which says what is missing.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(committed),
+            Err(error) => return Err(error.into()),
+        };
+        let end = file.metadata()?.len();
+        let mut header = [0u8; HEADER_LEN as usize];
+        if end < HEADER_LEN {
+            // A segment whose creation was cut short: torn only as the last one.
+            return later_segment(directory, generation, segment, &path, committed);
+        }
+        file.read_exact(&mut header)?;
+        let Some(version) = segment_version(&header, options, generation, segment) else {
+            return Err(corrupt(&path, 0, "segment header mismatch"));
+        };
+        if version == SEGMENT_FENCED {
+            // Nothing past the fence is admitted in a segment without commit frames.
+            return Ok(committed);
+        }
+        let mut offset = if segment == fence.segment {
+            fence.byte
+        } else {
+            if read_u64(&header, 56..64)? != sequence || read_u32(&header, 64..68)? != previous {
+                return Err(corrupt(&path, 0, "segment header or predecessor mismatch"));
+            }
+            HEADER_LEN
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        while offset < end {
+            let remaining = end.checked_sub(offset).ok_or(LogError::Capacity)?;
+            let mut frame = [0u8; FRAME_HEADER];
+            if remaining < FRAME_HEADER as u64 {
+                // A header the end of the file cut.
+                return later_segment(directory, generation, segment, &path, committed);
+            }
+            file.read_exact(&mut frame)?;
+            let field = read_u32(&frame, 0..4)?;
+            let commit = field & COMMIT_FLAG != 0;
+            let len = (field & !COMMIT_FLAG) as usize;
+            let next = sequence.checked_add(1).ok_or(LogError::Capacity)?;
+            let body_room = remaining.saturating_sub(FRAME_HEADER as u64);
+            let shaped = (if commit {
+                len == 0 || len == COMMIT_PAYLOAD
+            } else {
+                len <= frame_limit(options)
+            }) && read_u64(&frame, 4..12)? == next
+                && read_u32(&frame, 12..16)? == previous;
+            let valid = shaped && len as u64 <= body_room && {
+                data.clear();
+                data.try_reserve_exact(len)
+                    .map_err(|_| LogError::Capacity)?;
+                data.resize(len, 0);
+                file.read_exact(&mut data)?;
+                let mut hash = crc32fast::Hasher::new();
+                hash.update(frame.get(..16).ok_or(LogError::Capacity)?);
+                hash.update(&data);
+                hash.finalize() == read_u32(&frame, 16..20)?
+            };
+            if !valid {
+                let torn = frame == [0u8; FRAME_HEADER]
+                    || (shaped && len as u64 > body_room)
+                    || (shaped && torn(&mut file, offset, len, end)?);
+                // A commit is written only after its batch's data is flushed, so a commit past the damage
+                // proves the damaged bytes had reached the disk: corruption, never a torn tail.
+                if !torn || commits_after(&mut file, offset, end, sequence)? {
+                    return Err(corrupt(&path, offset, "durable frame checksum mismatch"));
+                }
+                return later_segment(directory, generation, segment, &path, committed);
+            }
+            sequence = next;
+            previous = read_u32(&frame, 16..20)?;
+            offset = offset
+                .checked_add(FRAME_HEADER as u64)
+                .and_then(|value| value.checked_add(len as u64))
+                .ok_or(LogError::Capacity)?;
+            if commit {
+                // A commit without a payload kept the base the last one named.
+                let base = if len == 0 {
+                    committed.1
+                } else {
+                    DurableBase {
+                        segment: read_u64(&data, 0..8)?,
+                        byte: read_u64(&data, 8..16)?,
+                        sequence: read_u64(&data, 16..24)?,
+                        checksum: read_u32(&data, 24..28)?,
+                    }
+                };
+                if (base.segment, base.byte) < (committed.1.segment, committed.1.byte)
+                    || base.sequence < committed.1.sequence
+                    || base.sequence > sequence
+                {
+                    return Err(corrupt(&path, offset, "commit names a base out of order"));
+                }
+                committed = (
+                    DurablePosition {
+                        generation,
+                        segment,
+                        byte: offset,
+                        sequence,
+                        checksum: previous,
+                    },
+                    base,
+                );
+            }
+        }
+        segment = segment.checked_add(1).ok_or(LogError::Capacity)?;
+    }
+}
+
+/// Whether a valid commit frame lies past `offset` in this segment with a sequence after `sequence`.
+/// A commit frame verifies on its own: its checksum covers its header (length word, sequence, predecessor)
+/// and its payload, so one is found at any byte offset without walking the chain the damage broke.
+fn commits_after(file: &mut File, offset: u64, end: u64, sequence: u64) -> Result<bool, LogError> {
+    /// Format: the commit flag's byte in a length word as it lies on disk (little-endian: its last byte).
+    const FLAG_BYTE: u8 = (COMMIT_FLAG >> 24) as u8;
+    /// Derived: a commit frame's bytes at most.
+    const FRAME: usize = COMMIT_FRAME_BYTES;
+    /// Shape: bytes read at once while searching; a frame straddling two reads is kept by overlap.
+    const CHUNK: usize = 64 * 1024;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(CHUNK)
+        .map_err(|_| LogError::Capacity)?;
+    buffer.resize(CHUNK, 0);
+    let mut at = offset.saturating_add(1);
+    while at < end {
+        let want = usize::try_from(end.saturating_sub(at))
+            .unwrap_or(usize::MAX)
+            .min(CHUNK);
+        let window = buffer.get_mut(..want).ok_or(LogError::Capacity)?;
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(window)?;
+        let mut index = 0usize;
+        while let Some(candidate) = window.get(index..).and_then(|rest| {
+            rest.windows(4)
+                .position(|bytes| {
+                    bytes.get(3) == Some(&FLAG_BYTE)
+                        && read_u32(bytes, 0..4).is_ok_and(|word| {
+                            word == COMMIT_FLAG || word == COMMIT_FLAG | COMMIT_PAYLOAD as u32
+                        })
+                })
+                .map(|place| place.saturating_add(index))
+        }) {
+            let payload = window
+                .get(candidate..candidate.saturating_add(4))
+                .and_then(|word| read_u32(word, 0..4).ok())
+                .map_or(0, |word| (word & !COMMIT_FLAG) as usize);
+            let length = FRAME_HEADER.saturating_add(payload).min(FRAME);
+            if let Some(frame) = window.get(candidate..candidate.saturating_add(length)) {
+                let later = read_u64(frame, 4..12).is_ok_and(|found| found > sequence);
+                let mut hash = crc32fast::Hasher::new();
+                hash.update(frame.get(..16).unwrap_or(&[]));
+                hash.update(frame.get(FRAME_HEADER..).unwrap_or(&[]));
+                if later && read_u32(frame, 16..20).is_ok_and(|stored| stored == hash.finalize()) {
+                    return Ok(true);
+                }
+            }
+            index = candidate.saturating_add(1);
+        }
+        if want < CHUNK {
+            break;
+        }
+        // Step back one frame less a byte so a commit frame cut by this read is read whole by the next.
+        at = at.saturating_add((CHUNK - (FRAME - 1)) as u64);
+    }
+    Ok(false)
+}
+
+/// A torn tail ends the log only if no segment follows it: a segment is flushed whole before the next is
+/// created, so damage followed by a segment is damage to flushed data.
+fn later_segment(
+    directory: &Path,
+    generation: u64,
+    segment: u64,
+    path: &Path,
+    committed: (DurablePosition, DurableBase),
+) -> Result<(DurablePosition, DurableBase), LogError> {
+    let next = segment.checked_add(1).ok_or(LogError::Capacity)?;
+    if segment_path(directory, generation, next).exists() {
+        return Err(corrupt(path, 0, "damaged segment followed by another"));
+    }
+    Ok(committed)
+}
+
+/// Whether the frame at `offset` of `len` body bytes holds a 512-byte sector that is all zero: what a write
+/// cut short leaves, since a sector is written whole and unwritten sectors past the old end read as zero
+/// (etcd's `isTornEntry`). Bit rot and misdirected writes leave non-zero bytes instead.
+fn torn(file: &mut File, offset: u64, len: usize, end: u64) -> Result<bool, LogError> {
+    let frame_end = offset
+        .checked_add(FRAME_HEADER as u64)
+        .and_then(|value| value.checked_add(len as u64))
+        .ok_or(LogError::Capacity)?
+        .min(end);
+    let mut sector = offset.div_ceil(SECTOR).saturating_mul(SECTOR);
+    let mut bytes = [0u8; SECTOR as usize];
+    while sector
+        .checked_add(SECTOR)
+        .is_some_and(|stop| stop <= frame_end)
+    {
+        file.seek(SeekFrom::Start(sector))?;
+        file.read_exact(&mut bytes)?;
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Ok(true);
+        }
+        sector = sector.saturating_add(SECTOR);
+    }
+    Ok(false)
+}
+
 fn scan(
     directory: &Path,
     options: &WalOptions,
@@ -1016,18 +1365,8 @@ fn scan_frames(
         }
         let mut header = [0u8; HEADER_LEN as usize];
         file.read_exact(&mut header)?;
-        if header.get(..8) != Some(MAGIC.as_slice())
-            || read_u32(&header, 8..12)? != 1
-            || header.get(12..28) != Some(options.identity.cluster.as_slice())
-            || read_u64(&header, 28..36)? != options.identity.node
-            || read_u32(&header, 36..40)? != options.identity.stream
-            || read_u64(&header, 40..48)? != fence.generation
-            || read_u64(&header, 48..56)? != segment
-            || read_u32(&header, 68..72)?
-                != crc32fast::hash(header.get(..68).ok_or(LogError::Capacity)?)
-        {
-            return Err(corrupt(&path, 0, "segment header or predecessor mismatch"));
-        }
+        let version = segment_version(&header, options, fence.generation, segment)
+            .ok_or_else(|| corrupt(&path, 0, "segment header or predecessor mismatch"))?;
         // A base inside its segment starts past that segment's first
         // frames: the chain state there is the fence's, not the header's.
         let inside = segment == base.segment && base.byte > HEADER_LEN;
@@ -1050,8 +1389,14 @@ fn scan_frames(
             }
             let mut header = [0u8; FRAME_HEADER];
             file.read_exact(&mut header)?;
-            let len = read_u32(&header, 0..4)? as usize;
-            if len > frame_limit(options)
+            let field = read_u32(&header, 0..4)?;
+            // A commit frame (doc 28) closes a group commit: it continues the chain and carries the base, and
+            // is no record.
+            let commit = version == SEGMENT_COMMITTED && field & COMMIT_FLAG != 0;
+            let len = (field & !COMMIT_FLAG) as usize;
+            if (commit && len != 0 && len != COMMIT_PAYLOAD)
+                || (!commit && field & COMMIT_FLAG != 0)
+                || len > frame_limit(options)
                 || len as u64
                     > remaining
                         .checked_sub(FRAME_HEADER as u64)
@@ -1079,20 +1424,22 @@ fn scan_frames(
             if checksum != read_u32(&header, 16..20)? {
                 return Err(corrupt(&path, offset, "durable frame checksum mismatch"));
             }
-            on_frame(
-                &data,
-                FrameLocation {
-                    generation: fence.generation,
-                    segment,
-                    byte: offset,
-                    length: len,
-                    sequence: next,
-                    origin: next,
-                    previous,
-                    checksum,
-                },
-                &path,
-            )?;
+            if !commit {
+                on_frame(
+                    &data,
+                    FrameLocation {
+                        generation: fence.generation,
+                        segment,
+                        byte: offset,
+                        length: len,
+                        sequence: next,
+                        origin: next,
+                        previous,
+                        checksum,
+                    },
+                    &path,
+                )?;
+            }
             sequence = next;
             previous = checksum;
             offset = offset
@@ -1268,7 +1615,14 @@ mod tests {
             sequence: 3,
             checksum: 9,
         };
-        install_fence(&FencePaths::of(dir.path()), dir.path(), &options, position, base).unwrap();
+        install_fence(
+            &FencePaths::of(dir.path()),
+            dir.path(),
+            &options,
+            position,
+            base,
+        )
+        .unwrap();
         let body = postcard::to_stdvec(&Fence {
             version: FENCE_VERSION,
             identity: options.identity,
@@ -1579,6 +1933,8 @@ mod tests {
             })
             .unwrap();
             assert_eq!(records[0], record(1, 1));
+            // A batch whose commit frame was flushed is durable (doc 28); one cut before its commit frame
+            // was written is not.
             assert_eq!(
                 records.len(),
                 if point == FaultPoint::AfterFenceInstall {
@@ -1589,30 +1945,200 @@ mod tests {
             );
         }
     }
+    /// Options with segments large enough to hold whole 512-byte sectors of frames.
+    fn wide() -> WalOptions {
+        let mut o = options();
+        o.segment_bytes = 1 << 20;
+        o
+    }
+
+    fn replayed(dir: &Path, options: WalOptions) -> Result<Vec<Record>, LogError> {
+        let wal = Wal::open(dir, options)?;
+        let mut records = Vec::new();
+        wal.replay(|r| {
+            records.push(r);
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
+    fn damage(dir: &Path, p: DurablePosition, at: u64, bytes: &[u8]) {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(segment_path(dir, p.generation, p.segment))
+            .unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    /// Doc 28: a crash may cut the last group commit anywhere. Do: cut the file at every byte of the last
+    /// batch. Expect: recovery finds the commit before it, with every earlier record, and appends again.
     #[test]
-    fn durable_truncation_and_checksum_damage_fail_closed() {
-        for truncate in [true, false] {
+    fn a_cut_anywhere_in_the_last_batch_recovers_the_commit_before_it() {
+        let template = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(template.path(), wide()).unwrap();
+        wal.append(&[record(1, 1), record(1, 2)]).unwrap();
+        let before = wal.position();
+        wal.append(&[record(1, 3), record(1, 4)]).unwrap();
+        let after = wal.position();
+        drop(wal);
+        assert_eq!(
+            before.segment, after.segment,
+            "the test's batches share a segment"
+        );
+        for cut in before.byte..after.byte {
             let dir = tempfile::tempdir().unwrap();
-            let mut wal = Wal::open(dir.path(), options()).unwrap();
-            wal.append(&[record(1, 1)]).unwrap();
-            let p = wal.position();
-            drop(wal);
-            let mut f = OpenOptions::new()
-                .write(true)
-                .open(segment_path(dir.path(), p.generation, p.segment))
-                .unwrap();
-            if truncate {
-                f.set_len(p.byte - 1).unwrap();
-            } else {
-                f.seek(SeekFrom::Start(p.byte - 1)).unwrap();
-                f.write_all(&[0]).unwrap();
+            for entry in std::fs::read_dir(template.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name() != "LOCK" {
+                    std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+                }
             }
-            f.sync_all().unwrap();
-            assert!(matches!(
-                Wal::open(dir.path(), options()),
-                Err(LogError::Corruption { .. })
-            ));
+            OpenOptions::new()
+                .write(true)
+                .open(segment_path(dir.path(), after.generation, after.segment))
+                .unwrap()
+                .set_len(cut)
+                .unwrap();
+            let records = replayed(dir.path(), wide()).unwrap();
+            assert_eq!(records, vec![record(1, 1), record(1, 2)], "cut at {cut}");
+            let mut wal = Wal::open(dir.path(), wide()).unwrap();
+            wal.append(&[record(1, 5)]).unwrap();
         }
+    }
+
+    /// A damaged frame that a crash cannot leave fails closed: non-zero bytes changed in a batch committed
+    /// before the last, a zeroed sector with commits after it (in the last batch too: its commit was
+    /// written only after its data was flushed, so the sector was lost after acknowledgement), damage
+    /// before the fence, and garbage past the last commit.
+    #[test]
+    fn damage_a_crash_cannot_leave_fails_closed() {
+        let corrupt = |result: Result<Vec<Record>, LogError>| {
+            assert!(
+                matches!(result, Err(LogError::Corruption { .. })),
+                "{result:?}"
+            );
+        };
+        let big = |index: u64| Record {
+            payload: vec![42; 1500],
+            ..record(1, index)
+        };
+        // A flipped byte in a committed batch with commits after it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        let start = wal.position();
+        wal.append(&[big(1)]).unwrap();
+        wal.append(&[big(2)]).unwrap();
+        wal.append(&[big(3)]).unwrap();
+        let p = wal.position();
+        drop(wal);
+        damage(dir.path(), p, start.byte + 100, &[0x55]);
+        corrupt(replayed(dir.path(), wide()));
+        // A zeroed sector in an early batch, two commits after it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        wal.append(&[big(1)]).unwrap();
+        wal.append(&[big(2)]).unwrap();
+        wal.append(&[big(3)]).unwrap();
+        let p = wal.position();
+        drop(wal);
+        damage(dir.path(), p, 512, &[0; 512]);
+        corrupt(replayed(dir.path(), wide()));
+        // A zeroed sector in the last batch, its own commit after it: a write lost after it was acknowledged.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        wal.append(&[big(1)]).unwrap();
+        let last = wal.position();
+        wal.append(&[big(2)]).unwrap();
+        let p = wal.position();
+        drop(wal);
+        let sector = (last.byte + FRAME_HEADER as u64).div_ceil(512) * 512;
+        assert!(sector + 512 <= last.byte + (FRAME_HEADER + 1500) as u64);
+        damage(dir.path(), p, sector, &[0; 512]);
+        corrupt(replayed(dir.path(), wide()));
+        // Damage before the fence: the reopen fenced the batch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        let start = wal.position();
+        wal.append(&[record(1, 1)]).unwrap();
+        drop(wal);
+        let wal = Wal::open(dir.path(), wide()).unwrap();
+        let p = wal.position();
+        assert_eq!(read_fence(&dir.path().join("CURRENT")).unwrap().position, p);
+        drop(wal);
+        damage(dir.path(), p, start.byte + 30, &[0]);
+        corrupt(replayed(dir.path(), wide()));
+        // Garbage past the last commit.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        wal.append(&[record(1, 1)]).unwrap();
+        let p = wal.position();
+        drop(wal);
+        damage(dir.path(), p, p.byte, &[0x5A; 64]);
+        corrupt(replayed(dir.path(), wide()));
+    }
+
+    /// Doc 28 §3: a log written before commit frames keeps its records and appends after the upgrade. Do:
+    /// write a version-1 segment with frames and a fence as the old format did, open it, append, reopen.
+    /// Expect: every record, the old segment untouched at version 1, and the appends in a version-2 one.
+    #[test]
+    fn a_fenced_log_upgrades_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        let p = wal.position();
+        // Rewrite the segment's header as version 1.
+        let path = segment_path(dir.path(), p.generation, p.segment);
+        let mut header = std::fs::read(&path).unwrap();
+        header[8..12].copy_from_slice(&SEGMENT_FENCED.to_le_bytes());
+        let crc = crc32fast::hash(&header[..68]);
+        header[68..72].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &header).unwrap();
+        wal.active = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        wal.active.seek(SeekFrom::Start(p.byte)).unwrap();
+        // Frames as version 1 wrote them: records, then the fence; no commit frame.
+        let encoded = wal.encode_batch(&[record(1, 1), record(1, 2)]).unwrap();
+        wal.write_encoded(&encoded).unwrap();
+        wal.active.sync_all().unwrap();
+        install_fence(&wal.fence, dir.path(), &wal.options, wal.position, wal.base).unwrap();
+        drop(wal);
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        assert_eq!(
+            wal.position().segment,
+            p.segment + 1,
+            "rolled to a new segment"
+        );
+        wal.append(&[record(1, 3)]).unwrap();
+        drop(wal);
+        assert_eq!(
+            replayed(dir.path(), wide()).unwrap(),
+            vec![record(1, 1), record(1, 2), record(1, 3)]
+        );
+        let old = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32(&old, 8..12).unwrap(), SEGMENT_FENCED);
+        let new = std::fs::read(segment_path(dir.path(), p.generation, p.segment + 1)).unwrap();
+        assert_eq!(read_u32(&new, 8..12).unwrap(), SEGMENT_COMMITTED);
+    }
+
+    /// Doc 28: a group commit takes one flush and no fence while the base stays in its segment. Do: append
+    /// batches. Expect: the fence still names the position the open fenced.
+    #[test]
+    fn a_commit_installs_no_fence_until_one_is_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), wide()).unwrap();
+        let fenced = read_fence(&dir.path().join("CURRENT")).unwrap().position;
+        for index in 1..=10 {
+            wal.append(&[record(1, index)]).unwrap();
+        }
+        assert_eq!(
+            read_fence(&dir.path().join("CURRENT")).unwrap().position,
+            fenced
+        );
+        assert!(wal.position().sequence > fenced.sequence);
     }
     #[test]
     fn checkpoint_generation_retains_supplied_recovery_suffix() {

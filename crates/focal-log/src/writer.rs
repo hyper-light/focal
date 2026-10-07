@@ -977,6 +977,8 @@ impl SharedWal {
             .and_then(|n| n.checked_add(512))
             .ok_or(LogError::Capacity)?;
         let allocation = reserve(&self.0.budget, BudgetKind::Pending, lane, amount)?;
+        // An append may be the batch that closes its group commit, so it promises that commit frame too (doc
+        // 28); a checkpoint's is promised with its floor, since a checkpoint always closes its own.
         let disk = self.disk_reserve(
             if checkpoint {
                 DiskKind::Checkpoint
@@ -984,7 +986,13 @@ impl SharedWal {
                 DiskKind::Wal
             },
             lane,
-            bytes,
+            if checkpoint {
+                bytes
+            } else {
+                bytes
+                    .checked_add(COMMIT_FRAME_BYTES)
+                    .ok_or(LogError::Capacity)?
+            },
         )?;
         let mut encoded = Vec::new();
         encoded
@@ -1542,6 +1550,7 @@ impl Writer {
             let cleaned = self.clean(self.credit)?;
             if record_count != 0 || cleaned.from != self.wal.base {
                 self.wal.finish_append()?;
+                self.count_commit()?;
             }
             self.stats.appended_records = appended_records;
             self.stats.group_commits = group_commits;
@@ -1613,7 +1622,7 @@ impl Writer {
                 .reserve(
                     DiskKind::Checkpoint,
                     BudgetLane::Completion,
-                    floor_bytes as u64,
+                    floor_bytes.saturating_add(COMMIT_FRAME_BYTES) as u64,
                 )
                 .map_err(|_| LogError::Capacity)?;
             Ok((chunk, first, floor, bytes, disk))
@@ -1640,6 +1649,7 @@ impl Writer {
             self.earn(bytes);
             let cleaned = self.clean(self.credit)?;
             let position = self.wal.finish_append()?;
+            self.count_commit()?;
             Ok((position, cleaned))
         })();
         match written {
@@ -1684,6 +1694,14 @@ impl Writer {
         self.index.physical_bytes.saturating_sub(live)
             > live.saturating_add(self.wal.options.segment_bytes)
     }
+    /// The commit frame the group commit just wrote is the segment's bytes, live in nothing.
+    fn count_commit(&mut self) -> Result<(), LogError> {
+        match self.wal.take_commit() {
+            Some(commit) => self.index.wrote(&commit, false),
+            None => Ok(()),
+        }
+    }
+
     /// One bounded step of cleaning: the base moves toward the tail over
     /// frames the last fence made durable. A segment that holds nothing
     /// live is left without being read. While the log is due, the frames
@@ -1749,6 +1767,19 @@ impl Writer {
             };
             let location = frame.location;
             let total = frame_bytes(location.length);
+            if frame.commit {
+                // A commit frame closed a group commit the base has passed: nothing in it lives.
+                self.index.passed(location.segment, total);
+                self.stats.reclaimed_bytes = self.stats.reclaimed_bytes.saturating_add(total);
+                read = read.saturating_sub(total);
+                cursor = DurableBase {
+                    segment: location.segment,
+                    byte: location.byte.checked_add(total).ok_or(LogError::Capacity)?,
+                    sequence: location.sequence,
+                    checksum: location.checksum,
+                };
+                continue;
+            }
             let (header, _) = postcard::take_from_bytes::<FrameHeader>(&frame.bytes)?;
             let origin = if header.kind == RecordKind::Moved {
                 header.index
@@ -1850,6 +1881,7 @@ impl Writer {
                 return Ok(None);
             }
             self.wal.finish_append()?;
+            self.count_commit()?;
             Ok(Some(cleaned))
         })();
         match step {
@@ -1900,6 +1932,8 @@ impl Writer {
 struct RecoveredFrame {
     location: FrameLocation,
     bytes: Vec<u8>,
+    /// A commit frame (doc 28): it closes a group commit and is no record.
+    commit: bool,
     _allocation: Allocation,
 }
 /// The group's floor as a frame: every frame of `log` whose origin is
@@ -1989,6 +2023,7 @@ fn read_frame(
     Ok(RecoveredFrame {
         location: *location,
         bytes,
+        commit: false,
         _allocation: allocation,
     })
 }
@@ -2015,9 +2050,12 @@ fn read_at(
     file.seek(SeekFrom::Start(base.byte))?;
     let mut header = [0; FRAME_HEADER];
     file.read_exact(&mut header)?;
-    let length = read_u32(&header, 0..4)? as usize;
+    let field = read_u32(&header, 0..4)?;
+    let commit = field & COMMIT_FLAG != 0;
+    let length = (field & !COMMIT_FLAG) as usize;
     let sequence = base.sequence.checked_add(1).ok_or(LogError::Capacity)?;
-    if length > crate::frame_limit(options)
+    if (commit && length != 0 && length != COMMIT_PAYLOAD)
+        || length > crate::frame_limit(options)
         || length as u64 > room
         || read_u64(&header, 4..12)? != sequence
         || read_u32(&header, 12..16)? != base.checksum
@@ -2048,6 +2086,7 @@ fn read_at(
             checksum,
         },
         bytes,
+        commit,
         _allocation: allocation,
     }))
 }

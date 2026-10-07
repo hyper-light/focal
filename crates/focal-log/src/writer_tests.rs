@@ -103,7 +103,8 @@ async fn queued_groups_share_flush_without_acknowledging_before_fence() {
     let first = first.await.unwrap();
     assert_eq!(second.await.unwrap(), first);
     assert_eq!(third.await.unwrap(), first);
-    assert_eq!(first.sequence, 3);
+    // Three records and the commit frame that closed them (doc 28).
+    assert_eq!(first.sequence, 4);
     assert_eq!(shared.stats().unwrap().group_commits, 1);
     assert_eq!(records(&a), vec![record(1, 1), record(1, 2)]);
     assert_eq!(records(&b), vec![record(2, 1)]);
@@ -168,6 +169,8 @@ async fn every_affected_receipt_fails_on_ambiguous_flush_and_recovery_uses_fence
         let recovered = SharedWal::open(dir.path(), options()).unwrap();
         let a = recovered.lease(LogicalLogId([1; 16])).unwrap();
         let b = recovered.lease(LogicalLogId([2; 16])).unwrap();
+        // A commit whose frame was flushed is durable without a fence (doc 28); the frame is written only
+        // after the data's flush.
         if point == FaultPoint::AfterFenceInstall {
             assert_eq!(records(&a), vec![record(1, 1), record(1, 2)]);
             assert_eq!(records(&b), vec![record(2, 1)]);
@@ -862,7 +865,12 @@ fn a_checkpoint_writes_what_its_group_keeps_and_its_floor_and_asks_the_volume_fo
         kept.push(record(2, index));
     }
     let before = shared.stats().unwrap();
-    assert_eq!(before.physical_bytes, before.live_bytes);
+    // What is on disk and not live is the commit frames, one a group commit, each its header alone while the
+    // base stays (doc 28).
+    assert_eq!(
+        before.physical_bytes - before.live_bytes,
+        before.group_commits * FRAME_HEADER as u64
+    );
     assert_eq!(before.checkpoint_bytes, 0);
     // The volume has room for the checkpoint's own frames and no more: a
     // fraction of the log, which holds two groups' histories.
@@ -870,28 +878,37 @@ fn a_checkpoint_writes_what_its_group_keeps_and_its_floor_and_asks_the_volume_fo
     let floor = frame(&Record {
         log: LogicalLogId([1; 16]),
         kind: RecordKind::Floor,
-        index: before.appended_records + 1,
+        // The floor names the sequence after the tail: every record and every commit frame took one.
+        index: before.appended_records + before.group_commits + 1,
         term: 1,
         payload: Vec::new(),
     });
     let own = frame(&checkpoint) + floor;
+    // The checkpoint's commit is one commit frame more on the volume (doc 28).
+    let commit = COMMIT_FRAME_BYTES as u64;
     assert!(own * 20 < before.physical_bytes);
-    disk.observe(own - 1);
+    disk.observe(own + commit - 1);
     assert!(matches!(
         a.rewrite_checkpoint_in(std::slice::from_ref(&checkpoint), BudgetLane::Completion),
         Err(LogError::Capacity)
     ));
     assert_eq!(disk.stats().outstanding, 0);
     assert_eq!(records(&a).len(), 60);
-    disk.observe(own);
+    disk.observe(own + commit);
     a.rewrite_checkpoint_in(std::slice::from_ref(&checkpoint), BudgetLane::Completion)
         .unwrap();
     let after = shared.stats().unwrap();
     assert_eq!(after.checkpoint_bytes, own);
     assert_eq!(after.relocated_bytes, 0);
     // The other group's frames were not read, moved or written: the log
-    // grew by the checkpoint alone, and what the group held before is dead.
-    assert_eq!(after.physical_bytes, before.physical_bytes + own);
+    // grew by the checkpoint and its commit, less what the base passed of
+    // the dead frames at its head (commit frames among them, doc 28), and
+    // what the group held before is dead.
+    // The checkpoint's commit frame carries the base when its cleaning moved it.
+    let grown = after.physical_bytes + (after.reclaimed_bytes - before.reclaimed_bytes)
+        - before.physical_bytes
+        - own;
+    assert!(grown == FRAME_HEADER as u64 || grown == commit, "{grown}");
     assert_eq!(after.live_bytes, before.live_bytes / 2 + frame(&checkpoint));
     assert_eq!(after.indexed_records, 61);
     assert_eq!(records(&a), vec![checkpoint.clone()]);
@@ -1153,12 +1170,12 @@ fn a_crash_at_every_cut_of_a_cleaning_commit_recovers_every_group() {
         let hot = shared.lease(LogicalLogId([2; 16])).unwrap();
         assert_eq!(records(&cold), cold_records, "{point:?}");
         match point {
-            // The fence was not installed: the commit is not there.
+            // The commit frame was not written: the commit is not there.
             FaultPoint::AfterAppend | FaultPoint::AfterDataSync => {
                 assert!(cut_at.is_some());
                 assert_eq!(records(&hot), kept, "{point:?}")
             }
-            // The fence was installed and the caller was not told.
+            // The commit frame was flushed and the caller was not told: it is there (doc 28).
             FaultPoint::AfterFenceInstall => {
                 assert_eq!(Some(records(&hot)), cut_at, "{point:?}")
             }
