@@ -24,6 +24,7 @@ mod membership;
 mod memory;
 pub use membership::*;
 mod checkpoint;
+pub mod convert;
 mod core_state;
 mod decoder;
 pub mod envelope;

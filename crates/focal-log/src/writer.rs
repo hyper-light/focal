@@ -289,6 +289,7 @@ enum Command {
     Replay(LogicalLogId, u64, mpsc::SyncSender<ReplayItem>, Allocation),
     Fault(FaultPoint, Reply<()>, Allocation),
     Stats(Reply<WalWriterStats>, Allocation),
+    Logs(Reply<Vec<LogicalLogId>>, Allocation),
     #[cfg(any(test, feature = "test-support"))]
     Pause(mpsc::SyncSender<()>, mpsc::Receiver<()>),
     /// Clean until the base can move no further, then answer.
@@ -364,6 +365,14 @@ struct RecoveryIndex {
     records: usize,
 }
 impl RecoveryIndex {
+    /// The logs the index holds, in order.
+    fn logs(&self) -> Result<Vec<LogicalLogId>, LogError> {
+        let mut logs = Vec::new();
+        logs.try_reserve_exact(self.groups.len())
+            .map_err(|_| LogError::Capacity)?;
+        logs.extend(self.groups.keys().copied());
+        Ok(logs)
+    }
     fn new(budget: MemoryBudget, max_groups: usize) -> Self {
         Self {
             scan_start: 1,
@@ -942,6 +951,15 @@ impl SharedWal {
         ))?;
         receiver.recv().map_err(|_| LogError::Failed)?
     }
+    /// Every logical log the durable prefix holds a frame of, in order: what a reader of the whole
+    /// WAL visits, a log at a time (the conversion to hyper-log, 27 §15.8). At most the writer's
+    /// `max_groups`, the index's own bound.
+    pub fn logs(&self) -> Result<Vec<LogicalLogId>, LogError> {
+        reject_replay_reentry()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.send(Command::Logs(Reply::Blocking(sender), self.control_slot()?))?;
+        receiver.recv().map_err(|_| LogError::Failed)?
+    }
     pub fn lease(&self, log: LogicalLogId) -> Result<WalLease, LogError> {
         reject_replay_reentry()?;
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -1411,6 +1429,14 @@ impl Writer {
                         Err(LogError::Failed)
                     } else {
                         Ok(self.wal.options.identity)
+                    });
+                }
+                Command::Logs(reply, slot) => {
+                    drop(slot);
+                    reply.finish(if self.wal.failed {
+                        Err(LogError::Failed)
+                    } else {
+                        self.index.logs()
                     });
                 }
                 Command::Stats(reply, slot) => {
