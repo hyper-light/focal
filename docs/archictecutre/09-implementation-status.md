@@ -13906,3 +13906,33 @@ Gates on the final tree (macOS arm64): `cargo fmt --all --check`, `python3 scrip
 `clippy --workspace --all-targets --locked -D warnings`, `scripts/check-production.sh`,
 `cargo deny check advisories bans licenses sources`, and `cargo test --workspace --locked --
 --test-threads=4`: 158 test binaries, 3,134 passed, 0 failed, 12 ignored.
+
+### 2026-10-07 — The shared crates at hyper-raft b483a13; the node's log from its facts
+
+The seven `hyper-*` snapshots move to `b483a13`, hyper-raft main once PRs #2, #3 and #4 landed:
+`Config::derive`, a commit that moved alone written with the next write that holds anything, and
+the admission test's hold. Two things on focal's side:
+
+- **The differential's oracle states what the shell may differ in.** On the shell a member's
+  answers to its leader (appends and heartbeats) state the commit it holds durably, which a commit
+  that moved alone reaches only at its next write; focal-log writes the commit at once. A leader
+  commits by what its members match, never by the commit they state, so the backends may differ
+  there and nowhere else: the oracle sets that field aside, and fails where the shell states more
+  than focal-log (`answered`, `stated_past`). The four differential tests pass on it.
+- **The node's log configuration** (`node_log::config`, 27 §15.3) is `hyper_log::Config::derive`
+  from what focal already states: a frame holds the largest entry any group may take
+  (`MAX_ENTRY_BYTES`, the bound `NodeConfig::validate` admits, with the shell's record); a group
+  retains two of the longest checkpoint cadence's entries at their largest and the core's
+  uncommitted bytes with one entry past them, at least `ENTRY_FIXED_BYTES` each, as the core's own
+  limits count them; the device's block is what the system reports (`device_block`,
+  `hyper_block::file::preferred_block`). Facts that cannot hold the log are refused typed
+  (`ConsensusError::LogFacts`).
+
+Found on the way, in the shared crates: hyper-log takes its layout block from the file's transfer
+alignment, one byte for a file opened buffered, so no log can be created on a file system that
+refuses direct I/O (tmpfs, many FUSE file systems); reported to hyper-raft with the reproduction.
+focal opens its log `PreferDirect`, which its CI and development volumes accept.
+
+Gates on the final tree (macOS arm64): fmt, contracts, clippy `-D warnings`, production, `cargo
+deny`, and `cargo test --workspace --locked -- --test-threads=4`: 158 test binaries, 3,138 passed,
+0 failed, 12 ignored.

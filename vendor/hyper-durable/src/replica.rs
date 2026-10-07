@@ -1431,6 +1431,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             && raft.log().last_term().is_ok_and(|term| term == raft.term())
     }
 
+    /// Whether an entry waits behind the fence that no write out states the commit of: the next
+    /// write states it (§4.1).
+    fn fence_needs_commit(&self) -> bool {
+        self.behind_fence()
+            .is_some_and(|(_, last)| !self.fence_covered(last))
+    }
+
     /// Whether a write out states a commit through `index`.
     fn fence_covered(&self, index: u64) -> bool {
         self.durable_commit() >= index
@@ -1470,6 +1477,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
         let readied = self.node.ready_in_place();
         let mut ready = self.must(readied)?;
+        // A commit that moved alone rides a later write (§4.1), unless the fence needs `C_d`
+        // for an entry no write out states: the core then vouches for no commit from this one,
+        // and holds the answers among its messages, not yet taken, to the durable commit.
+        if !self.fence_needs_commit() {
+            let deferred = self.node.defer_commit(&mut ready);
+            self.must(deferred)?;
+        }
         self.emit(ready.take_messages(), out);
         for read in ready.take_read_states() {
             self.reads.push_back((read.index, read.request_ctx));
@@ -1477,7 +1491,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let number = ready.number();
         let messages = ready.take_persisted_messages();
         let range = ready.committed_range();
-        let (hard, vote) = self.hard_of(ready.hard_state())?;
+        let carries = {
+            let persist = self.node.to_persist();
+            !persist.entries.is_empty()
+                || persist
+                    .snapshot
+                    .is_some_and(|s| !proto::snapshot_is_empty(s))
+        } || !ready.proposals().is_empty();
+        let (hard, vote) = self.hard_of(ready.hard_state(), carries)?;
         let installs = self
             .node
             .raft
@@ -1538,22 +1559,25 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// The hard state a `Ready`'s write states: its term and vote, and the commit of
-    /// [`Replica::stated_commit`]; none when neither moved since the last write. With it,
-    /// whether the term or vote moved: the write's flush is then a vote's.
+    /// [`Replica::stated_commit`]; none when nothing it must state moved since the last write.
+    /// With it, whether the term or vote moved: the write's flush is then a vote's.
+    ///
+    /// A commit costs no write of its own (§4.1, focal F17): it is stated by a write that
+    /// `carries` something else (entries, a start or proposals), or when the commit fence needs
+    /// `C_d` for an entry no write out states. A commit that moved alone is volatile (Ongaro's
+    /// thesis, figure 3.1); etcd's `MustSync` likewise syncs only for entries, a term or a vote.
+    /// It rides the next write that carries anything, and the quiet write states it for a member
+    /// that goes quiet.
     fn hard_of(
         &self,
         given: Option<&HardState>,
+        carries: bool,
     ) -> Result<(Option<HardState>, bool), ReplicaError> {
         let (term, vote) = given.map_or((self.issued.term, self.issued.vote), |h| (h.term, h.vote));
         let commit = self.stated_commit()?.max(self.issued.commit);
         let moved = (term, vote) != (self.issued.term, self.issued.vote);
-        // A `Ready`'s hard state is written whenever it gives one, its commit with it (the
-        // core reads `C_d` from its notice); the commit stated is never less than it gives.
-        let hard = (given.is_some() || moved || commit > self.issued.commit).then_some(HardState {
-            term,
-            vote,
-            commit,
-        });
+        let states_commit = commit > self.issued.commit && (carries || self.fence_needs_commit());
+        let hard = (moved || states_commit).then_some(HardState { term, vote, commit });
         Ok((hard, moved))
     }
 

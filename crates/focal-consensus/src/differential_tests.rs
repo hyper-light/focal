@@ -178,7 +178,7 @@ impl Seen {
 
     /// The first part the two differ in, named.
     fn difference(&self, other: &Self) -> Option<String> {
-        let parts: [(&str, String, String); 6] = [
+        let parts: [(&str, String, String); 7] = [
             (
                 "committed",
                 format!("{:?}", self.committed),
@@ -191,8 +191,13 @@ impl Seen {
             ),
             (
                 "messages",
-                format!("{:?}", self.messages),
-                format!("{:?}", other.messages),
+                format!("{:?}", answered(&self.messages)),
+                format!("{:?}", answered(&other.messages)),
+            ),
+            (
+                "answers' commit",
+                String::new(),
+                stated_past(&self.messages, &other.messages),
             ),
             (
                 "snapshots",
@@ -215,6 +220,43 @@ impl Seen {
             .find(|(_, log, shell)| log != shell)
             .map(|(part, log, shell)| format!("{part}: focal-log {log}, shell {shell}"))
     }
+}
+
+/// Whether `message` is a member's answer to its leader, which states the member's durable commit
+/// (core step R-6): to an append or to a heartbeat.
+fn answers(message: &Message) -> bool {
+    matches!(
+        message.msg_type,
+        MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+    )
+}
+
+/// `messages` with the commit a member's answer states set aside. On the shell a commit that moved
+/// alone is not written until a write that holds anything (hyper-raft durable.md §4.1, PR #2), and
+/// an answer states only the commit the member holds durably; focal-log writes the commit at once.
+/// A leader commits by what its members match, never by the commit they state, so the two differ
+/// only there, and [`stated_past`] holds the shell to the safe side of it.
+fn answered(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if answers(&message) {
+                message.commit = 0;
+            }
+            message
+        })
+        .collect()
+}
+
+/// The answers whose commit, on the shell, is past focal-log's for the same answer: none may be,
+/// since the shell states no more than it holds durably and focal-log holds its commit at once.
+fn stated_past(log: &[Message], shell: &[Message]) -> String {
+    log.iter()
+        .zip(shell)
+        .filter(|(log, shell)| answers(log) && shell.commit > log.commit)
+        .map(|(log, shell)| format!("shell {} past focal-log {}; ", shell.commit, log.commit))
+        .collect()
 }
 
 /// The same members on both backends, driven by one input stream.

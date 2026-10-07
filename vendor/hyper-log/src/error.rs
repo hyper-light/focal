@@ -79,6 +79,9 @@ pub enum LogError {
     /// A configuration the log cannot run with.
     #[error("the log's configuration is invalid: {0}")]
     Config(&'static str),
+    /// Facts from which no configuration derives (`Config::derive`).
+    #[error("no log configuration derives from these facts: {0}")]
+    Unfit(crate::Unfit),
     /// A sealed log's bytes whose CRC held and whose MAC or tag does not: changed by someone who
     /// could recompute a CRC, never a torn write (hyper-raft docs/seal.md §5.1). The log serves
     /// nothing from such a file.

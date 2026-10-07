@@ -25,6 +25,7 @@ mod memory;
 pub use membership::*;
 mod checkpoint;
 pub mod convert;
+pub mod node_log;
 /// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.
 pub type ShellLog = hyper_log::Log<hyper_block::file::DeviceFile>;
 /// A handle on the node's [`ShellLog`] that claims its groups from any thread (`Log::opener`): what
@@ -101,6 +102,9 @@ pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// The most bytes of the application's state a snapshot, a checkpoint or a
 /// restored image holds.
 pub(crate) const IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// The largest entry any group may be configured to take (`NodeConfig::max_entry_bytes`): what a
+/// frame of the node's log holds alone, whichever group writes it.
+pub const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 /// The most members a group's configuration names, voters and learners together. It is the bound
 /// focal has held since before its core moved to hyper-raft, and it sizes the group files' records
 /// (`group_files::META_BOUND`), so it is carried unchanged and no file's bounds move. focal states
@@ -197,7 +201,7 @@ impl NodeConfig {
             || self.election_tick <= self.heartbeat_tick
             || self.election_tick > 1_000_000
             || self.max_entry_bytes == 0
-            || self.max_entry_bytes > 8 * 1024 * 1024
+            || self.max_entry_bytes > MAX_ENTRY_BYTES
             || self.max_uncommitted_bytes < (self.max_entry_bytes as u64).saturating_add(1024)
             || self.max_inflight_messages == 0
             || self.max_inflight_messages > 65536
@@ -231,6 +235,10 @@ pub enum ConsensusError {
     Encoding(#[from] postcard::Error),
     #[error("configuration: {0}")]
     Configuration(&'static str),
+    /// The node's facts give no hyper-log configuration (27 §15.3): the device, the disk budget
+    /// or the groups it admits cannot hold the log.
+    #[error("the node's log: {0}")]
+    LogFacts(hyper_log::Unfit),
     #[error("inconsistent durable Raft state: {0}")]
     Corruption(&'static str),
     #[error("replica is not leader (known leader: {leader})")]

@@ -4385,3 +4385,71 @@ fn a_voter_of_higher_priority_grants_a_log_more_current_however_short() {
     assert!(!asked(false).reject);
     assert!(asked(true).reject);
 }
+
+/// `RawNode::defer_commit` (`docs/durable.md` §4.1). Do: a follower takes an append of no
+/// entries that moves its commit, defers that `Ready`'s commit, then takes an append with an entry,
+/// and separately defers after taking a `Ready`'s messages. Expect: the deferred `Ready` gives no
+/// hard state, its answer states no commit past the durable one, and its write vouches for none;
+/// the next `Ready` with an entry must sync, is not deferred, and states the commit; a deferral
+/// after the messages were taken is refused.
+#[test]
+fn a_deferred_commit_vouches_for_nothing_and_its_answers_state_the_durable_commit() {
+    let mut node = follower();
+    drain(&mut node);
+    let durable = node.durable_commit();
+    assert_eq!(durable, 2);
+    let append = |index: u64, entries: Vec<Entry>, commit: u64| Message {
+        index,
+        log_term: 1,
+        entries,
+        commit,
+        ..answer(MessageType::MsgAppend, 1, 2, 1)
+    };
+    node.step(append(3, Vec::new(), 3)).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(!ready.must_sync());
+    assert_eq!(ready.hard_state().map(|hard| hard.commit), Some(3));
+    assert!(node.defer_commit(&mut ready).unwrap());
+    assert!(ready.hard_state().is_none());
+    let answers = ready.take_persisted_messages();
+    assert!(
+        answers
+            .iter()
+            .any(|m| m.msg_type == MessageType::MsgAppendResponse)
+    );
+    for m in &answers {
+        assert!(
+            m.commit <= durable,
+            "{m:?} states commit {} with {durable} durable",
+            m.commit
+        );
+    }
+    // The commit comes back as the notice's: the owner writes it with what it writes next.
+    let light = node.advance_append(ready).unwrap();
+    assert_eq!(light.commit_index(), Some(3));
+    assert_eq!(
+        node.durable_commit(),
+        durable,
+        "a deferred write vouched for a commit"
+    );
+    // The next `Ready` holding an entry must sync and is never deferred; the owner states the
+    // commit in its write and says so once it is durable.
+    node.step(append(3, vec![entry(4, 1)], 3)).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(ready.must_sync());
+    assert!(!node.defer_commit(&mut ready).unwrap());
+    node.store_mut().append(ready.entries());
+    node.store_mut().hard_state.commit = 3;
+    node.advance_append(ready).unwrap();
+    node.commit_durable(3).unwrap();
+    assert_eq!(node.durable_commit(), 3);
+    // Deferred once its messages were taken: refused, nothing deferred.
+    node.step(append(4, Vec::new(), 4)).unwrap();
+    let mut ready = node.ready().unwrap();
+    ready.take_persisted_messages();
+    assert!(matches!(
+        node.defer_commit(&mut ready),
+        Err(Error::Invariant(_))
+    ));
+    assert!(ready.hard_state().is_some());
+}

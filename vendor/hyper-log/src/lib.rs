@@ -29,6 +29,7 @@
     )
 )]
 pub mod codec;
+mod derive;
 mod device;
 mod error;
 pub mod format;
@@ -49,6 +50,7 @@ use std::thread::JoinHandle;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{Alignment, Pool};
 
+pub use derive::{Facts, Unfit};
 pub use error::LogError;
 pub use format::{HardState, Start};
 pub use group::GroupLog;
