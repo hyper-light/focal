@@ -1800,11 +1800,15 @@ async fn a_follower_answers_a_read_through_its_leader() {
     .unwrap();
     let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
     rig.hosts[0].campaign().await.unwrap();
-    let leader = rig.leader(0).await;
-    let follower = (leader + 1) % 3;
     let mut wait = rig.deadline();
     let mut asked = 930u128;
-    let answered = loop {
+    // A read asked of a member that does not lead. Under load leadership
+    // may move between finding the leader and the answer, and a member that
+    // came to lead answers its own read: that answer is true, and is not the
+    // case this test asks for, so it asks a member that follows again.
+    let (follower, answered) = loop {
+        let leader = rig.leader(0).await;
+        let follower = (leader + 1) % 3;
         asked += 1;
         match rig.hosts[follower]
             .read(
@@ -1814,7 +1818,12 @@ async fn a_follower_answers_a_read_through_its_leader() {
             )
             .await
         {
-            Ok(ControlReadResult::Membership(membership)) => break membership,
+            Ok(ControlReadResult::Membership(membership))
+                if membership.leader != membership.node =>
+            {
+                break (follower, membership);
+            }
+            Ok(ControlReadResult::Membership(_)) => {}
             Ok(other) => panic!("{other:?}"),
             Err(error) => {
                 if let Err(spent) = wait.check(&rig.periods()) {
@@ -1822,11 +1831,15 @@ async fn a_follower_answers_a_read_through_its_leader() {
                 }
             }
         }
+        if let Err(spent) = wait.check(&rig.periods()) {
+            panic!("no member that follows answered: {spent}");
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert_eq!(answered.node, rig.hosts[follower].progress().node);
-    assert_eq!(answered.leader, rig.hosts[leader].progress().node);
-    assert_ne!(answered.node, answered.leader);
+    // Answered through a leader: one of the voters and not the follower.
+    assert_ne!(answered.leader, 0, "{answered:?}");
+    assert!(answered.voters.contains(&answered.leader), "{answered:?}");
     assert_eq!(answered.voters.len(), 3, "{answered:?}");
     rig.stop().await;
 }
