@@ -251,6 +251,9 @@ pub(crate) struct State {
     pub(crate) durable: u64,
     /// The tail the last frame flushed names.
     pub(crate) durable_tail: u64,
+    /// The slots the file may grow to as its owner admitted them (`crate::growth`), at most
+    /// `Config::max_segments`; `u32::MAX` for a log whose owner states no admission.
+    pub(crate) ceiling: u32,
 }
 
 impl State {

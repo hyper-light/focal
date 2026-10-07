@@ -264,3 +264,29 @@ The equivalence files are unchanged.
   equivalence transcripts are unchanged: no write of theirs follows a refusal of its group.
 - `GroupLog::depth`, the log's `PIPELINE_FRAMES`: the writes a replica keeps out at once; and
   `GroupLog::has_room`, the handle's own bound, before which a write is never refused `Busy`.
+
+## The file grows as its owner admits
+
+mantle's log grows its file to its quota (`docs/design/raft-log.md` §5, "up to its quota"), which a
+device of its own makes the whole story. An owner whose log shares a volume with other writers
+cannot state that quota up front: a volume that filled before it failed the write that grew the
+file, and the log fenced. `Growth` is the owner's admission, asked before a frame opens a slot past
+the file's end, two slots ahead at most; a refusal is the quota reached (`Full`, compaction,
+sweeps), never a fence. Admissions are whole segments, committed once their slot is durable,
+released when the growing write fails or the log ends unused, and the owner is told what the
+file's slots take at open. Without a `Growth` the log is mantle's.
+
+### Tests
+
+- `a_refused_slot_is_the_bound_reached_never_a_fence`: a gate admitting four slots answers the
+  fifth `Full`, never `Fenced`, counted, the file within what was admitted.
+- `a_compaction_frees_slots_and_writes_resume_as_under_the_bound`: after a compaction, exactly as
+  many writes resume as under `max_segments` alone at the slots admitted, with no admission more.
+- `a_failed_growth_gives_its_admission_back_and_fences`: a volume that ends where the next slot
+  begins fails the write, the admission goes back, and the log fences.
+- `a_reopened_log_tells_its_owner_what_its_slots_take`: whole segments, at least the file's
+  length and less than a segment past it.
+- `a_new_log_refused_its_first_slot_writes_nothing`.
+- `a_gate_that_admits_everything_writes_as_no_gate`: the same frames and file across a reopen;
+  without the admission ahead of the sweep decision, the reopened log sweeps segments it has room
+  beside and the file differs.

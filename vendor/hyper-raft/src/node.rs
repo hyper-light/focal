@@ -286,7 +286,10 @@ impl Ready {
         self.light.committed_range()
     }
     /// To send at once: a leader's, while the term and vote it leads in
-    /// are durable.
+    /// are durable. Lent, not taken, so a commit may still be deferred
+    /// ([`RawNode::defer_commit`]) after reading them, and the answers among
+    /// them are then restated with the durable commit: a caller that sends
+    /// what it reads here, rather than what it takes, defers first.
     pub fn messages(&self) -> &[Message] {
         if self.after_persisting {
             &[]
@@ -305,7 +308,9 @@ impl Ready {
     }
     /// To send once what this `Ready` persists is durable, and every write
     /// issued before it: every message of a member that does not lead, and
-    /// a leader's while its term or vote is not durable yet.
+    /// a leader's while its term or vote is not durable yet. Lent, not taken,
+    /// as [`Ready::messages`] are: a caller that sends what it reads here
+    /// defers a commit ([`RawNode::defer_commit`]) before it reads them.
     pub fn persisted_messages(&self) -> &[Message] {
         if self.after_persisting {
             self.light.messages()

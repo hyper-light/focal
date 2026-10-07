@@ -546,6 +546,17 @@ pub struct Raft<S> {
     /// ticks and not by a longer tick, so nothing else the member counts
     /// in ticks grows with it.
     patience: usize,
+    /// Ticks this leader waits beyond its election timeout before it asks whether a quorum heard
+    /// it (`MsgCheckQuorum`): its quorum patience, given by its owner for what it has measured of
+    /// its voters' answers (`docs/raft.md` §3.6). A leader cannot tell followers whose owners
+    /// stall from followers that are gone, and the check is a liveness device only (no read is
+    /// answered by a lease): checking later deposes no sound leader whose followers answer late,
+    /// and lets one that is cut off take requests a little longer.
+    quorum_patience: usize,
+    /// Ticks since this leader last asked whether a quorum heard it: the check's own counter,
+    /// apart from the election timer a transfer's give-up counts (`tick_heartbeat`). Started again
+    /// where that timer was: at a new role or term, and as a transfer starts.
+    quorum_elapsed: usize,
     /// What this member keeps of its leader's appends that arrived ahead of
     /// a hole in its log ([`Ahead::Kept`]).
     early: Early,
@@ -1207,6 +1218,8 @@ impl<S: Storage> Raft<S> {
             pending_conf_index: 0,
             pending_request_snapshot: 0,
             election_elapsed: 0,
+            quorum_patience: 0,
+            quorum_elapsed: 0,
             silence: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick,
@@ -1611,6 +1624,29 @@ impl<S: Storage> Raft<S> {
     pub fn set_patience(&mut self, ticks: usize) {
         self.patience = ticks;
     }
+    /// Ticks this leader waits beyond its election timeout before it asks whether a quorum heard
+    /// it.
+    pub fn quorum_patience(&self) -> usize {
+        self.quorum_patience
+    }
+    /// Give this leader `ticks` beyond its election timeout before it asks whether a quorum heard
+    /// it, for what its owner measured of its voters' answers (`docs/raft.md` §3.6). Refused,
+    /// typed, where the election timeout and it pass what a tick counts. Under elections by
+    /// suspicion it is kept and changes nothing: those take no ticks, and the owner's detectors
+    /// depose.
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<()> {
+        if self.config.election_tick.checked_add(ticks).is_none() {
+            return Err(Error::Settings("a quorum patience past what a tick counts"));
+        }
+        self.quorum_patience = ticks;
+        Ok(())
+    }
+    /// The ticks after which this leader asks whether a quorum heard it.
+    fn quorum_due(&self) -> usize {
+        self.config
+            .election_tick
+            .saturating_add(self.quorum_patience)
+    }
     /// For a harness that orders elections.
     pub fn set_randomized_election_timeout(&mut self, ticks: usize) -> Result<()> {
         if ticks < self.config.election_tick || ticks >= self.config.election_tick.saturating_mul(2)
@@ -1698,7 +1734,7 @@ impl<S: Storage> Raft<S> {
         self.watch.is_none()
             && self.state == StateRole::Leader
             && (self.heartbeat_elapsed.saturating_add(1) >= self.config.heartbeat_tick
-                || self.election_elapsed.saturating_add(1) >= self.config.election_tick)
+                || self.quorum_elapsed.saturating_add(1) >= self.quorum_due())
     }
 
     pub(crate) fn send(&mut self, message: Message) -> Result<()> {
@@ -1889,6 +1925,7 @@ impl<S: Storage> Raft<S> {
         self.term_start = 0;
         self.reset_randomized_election_timeout();
         self.election_elapsed = 0;
+        self.quorum_elapsed = 0;
         self.silence = 0;
         self.heartbeat_elapsed = 0;
         if let Some(watch) = self.watch.as_mut() {
@@ -2079,15 +2116,23 @@ impl<S: Storage> Raft<S> {
         self.ticks = self.ticks.saturating_add(1);
         self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);
         self.election_elapsed = self.election_elapsed.saturating_add(1);
+        self.quorum_elapsed = self.quorum_elapsed.saturating_add(1);
         let mut ready = false;
-        if self.election_elapsed >= self.config.election_tick {
-            self.election_elapsed = 0;
+        // The quorum check on its own counter: one election timeout and the leader's quorum
+        // patience. The members it judges are those heard from at any point since the last
+        // check, the marks being cleared only by the check (`ProgressTracker::quorum_recently_active`),
+        // so a longer window counts every answer within it.
+        if self.quorum_elapsed >= self.quorum_due() {
+            self.quorum_elapsed = 0;
             if self.config.check_quorum {
                 ready = true;
                 self.local(MessageType::MsgCheckQuorum)?;
             }
-            // A transfer that did not finish within an election timeout
-            // is given up.
+        }
+        // A transfer that did not finish within an election timeout is given up, whatever the
+        // quorum patience.
+        if self.election_elapsed >= self.config.election_tick {
+            self.election_elapsed = 0;
             if self.state == StateRole::Leader {
                 self.lead_transferee = None;
             }
@@ -3381,8 +3426,11 @@ impl<S: Storage> Raft<S> {
         if target == self.id {
             return Ok(());
         }
-        // A transfer finishes within an election timeout or is given up.
+        // A transfer finishes within an election timeout or is given up. The quorum check's
+        // counter starts again with it, as when the two shared one counter, so a leader of no
+        // quorum patience checks exactly when it did.
         self.election_elapsed = 0;
+        self.quorum_elapsed = 0;
         if let Some(watch) = self.watch.as_mut() {
             watch.transfer = Arm::Unset { round: false };
         }

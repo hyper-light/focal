@@ -210,6 +210,17 @@ pub(crate) enum Job<F> {
 pub(crate) struct Frame {
     pub(crate) frame: AlignedBuf,
     pub(crate) at: u64,
+    /// Where the frame opens a slot past the file's last: the slot, written whole with zeros
+    /// before the frame, under the frame's own flush. The file's blocks in it are then written and
+    /// its length covers it, so every later frame in the slot is an overwrite the file system need
+    /// not log: a flush of the device's cache alone, and a confirmation that is one FUA write where
+    /// the device has FUA. On ext4 and XFS a write into an unwritten extent converts it, a change
+    /// the journal must commit (fallocate(2), "Allocating disk space"; the kernel's
+    /// fs/iomap/direct-io.c takes no FUA path for an unwritten extent or a write past the file's
+    /// size), so allocating the slot is not enough: it is written. Zeros past the last frame read as
+    /// no frame, as the end of the file does (`recover::Reader::frame_at`: neither magic has a zero
+    /// byte).
+    pub(crate) zero: Option<(u64, u64)>,
     pub(crate) record: AlignedBuf,
     pub(crate) record_at: u64,
     /// The frame's sequence.
@@ -351,6 +362,9 @@ pub(crate) struct Device<F> {
     pub(crate) file: F,
     /// Buffers for reading entries back, kept between reads.
     pool: Pool,
+    /// A segment of zeros, written over each slot the file grows by (`Device::zero_fill`): made at
+    /// the first and kept.
+    zeros: Option<AlignedBuf>,
     segment_bytes: u64,
     /// The owner's word that another frame follows the one with this sequence.
     more: Receiver<u64>,
@@ -387,6 +401,7 @@ impl<F: BlockFile> Device<F> {
         Self {
             file,
             pool,
+            zeros: None,
             segment_bytes,
             more,
             flushed,
@@ -418,7 +433,7 @@ impl<F: BlockFile> Device<F> {
                 record_at,
                 mut these,
             } => {
-                let (result, timing) = self.write_then_flush((&mut record, record_at), None);
+                let (result, timing) = self.write_durable(&mut record, record_at);
                 if result.is_ok() {
                     answers.append(&mut these);
                 }
@@ -457,8 +472,11 @@ impl<F: BlockFile> Device<F> {
     /// A frame, its record and one flush; the frame before answered; this one confirmed and
     /// answered unless another frame follows.
     fn frame(&mut self, mut f: Frame, answers: &mut Vec<Answering>) -> Completion {
-        let (result, timing) =
-            self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
+        let (result, timing) = self.write_then_flush(
+            f.zero,
+            (&mut f.frame, f.at),
+            Some((&mut f.record, f.record_at)),
+        );
         let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
         if result.is_ok() {
             // This frame's record confirms the frame before.
@@ -502,7 +520,7 @@ impl<F: BlockFile> Device<F> {
                 answering.durable();
             }
         }
-        let (result, timing) = self.write_then_flush((&mut f.confirm, f.record_at), None);
+        let (result, timing) = self.write_durable(&mut f.confirm, f.record_at);
         if result.is_ok() {
             answers.append(&mut f.these);
         }
@@ -530,14 +548,19 @@ impl<F: BlockFile> Device<F> {
     /// once: nothing after a failed write, and a failed flush never retried (mantle
     /// docs/design/raft-log.md §3). The writes and the flush are timed apart.
     fn write_then_flush(
-        &self,
+        &mut self,
+        zero: Option<(u64, u64)>,
         first: (&mut AlignedBuf, u64),
         second: Option<(&mut AlignedBuf, u64)>,
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
+        let zero = zero.filter(|_| self.file.fills_new_space());
         let wrote = guarded(|| {
-            bytes = self.write(first.0, first.1)?;
+            if let Some((at, len)) = zero {
+                bytes = self.zero_fill(at, len)?;
+            }
+            bytes = bytes.saturating_add(self.write(first.0, first.1)?);
             if let Some((buf, at)) = second {
                 bytes = bytes.saturating_add(self.write(buf, at)?);
             }
@@ -550,6 +573,8 @@ impl<F: BlockFile> Device<F> {
             flush_ns: None,
             bytes,
             flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
         };
         if wrote.is_err() {
             return (wrote, timing);
@@ -560,6 +585,68 @@ impl<F: BlockFile> Device<F> {
         timing.flush_ns = Some(stats::nanos(written, ended));
         timing.flushed_at = flushed.is_ok().then_some(ended);
         (flushed, timing)
+    }
+
+    /// Writes a confirmation, `buf` at `at`, durable before it returns: on its own where the file
+    /// can (`BlockFile::write_durable_at`, a FUA write on Linux), so the device's cache is not
+    /// flushed for one record; otherwise a write and a flush. The confirmation is written only after
+    /// its frame's flush returned, so the frame needs nothing of this write but to be durable (mantle
+    /// docs/design/raft-log.md §6, step 5).
+    fn write_durable(&self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let mut timing = Timing {
+            took_ns: 0,
+            write_ns: 0,
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
+        };
+        let written = guarded(|| {
+            let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
+            timing.bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            self.file
+                .write_durable_at(bytes, at)
+                .map_err(LogError::from)
+        });
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.write_ns = timing.took_ns;
+        let result = match written {
+            Ok(hyper_block::block::Durable::Written) => {
+                timing.durable_write = true;
+                Ok(())
+            }
+            Ok(hyper_block::block::Durable::Flushed) => {
+                timing.flush_ns = Some(timing.took_ns);
+                timing.durable_fallback = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        timing.flushed_at = result.is_ok().then_some(ended);
+        (result, timing)
+    }
+
+    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write:
+    /// a segment, the log's largest write, from a zeroed buffer of a segment the device makes at the
+    /// first slot it fills and keeps for the log's life, so a slot costs no allocation and no page
+    /// fault after the first. The bytes written.
+    fn zero_fill(&mut self, at: u64, len: u64) -> Result<u64, LogError> {
+        let size = usize::try_from(len).map_err(|_| LogError::Damaged("a slot past usize"))?;
+        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() != size) {
+            let mut zeros = AlignedBuf::zeroed(size, self.file.layout_block())
+                .map_err(|e| LogError::Disk(e.into()))?;
+            zeros.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
+            self.zeros = Some(zeros);
+        }
+        let zeros = self
+            .zeros
+            .as_ref()
+            .ok_or(LogError::Damaged("no zeros to fill a slot with"))?;
+        self.file.write_all_at(zeros.as_slice(), at)?;
+        Ok(len)
     }
 
     /// Writes `buf`, padded with zeros to the file's alignment, at `at`: the bytes written.
@@ -574,7 +661,7 @@ impl<F: BlockFile> Device<F> {
     fn sweep(&self, segment: Segment, offset: u64, end: u64) -> Result<Vec<Swept>, LogError> {
         let mut reader = Reader::new(
             &self.file,
-            self.file.alignment(),
+            self.file.layout_block(),
             self.segment_bytes,
             self.mac.clone(),
         )?;

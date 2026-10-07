@@ -263,8 +263,10 @@ pub(crate) fn nonce_of(state: &State, slot: u32) -> u64 {
 }
 
 /// Segments a frame could open now: free ones a durable frame has released, and those the
-/// file may still grow by.
+/// file may still grow by: up to `max_segments`, and no further than its owner admitted
+/// (`State::ceiling`, `crate::growth`).
 pub(crate) fn usable_segments(state: &State, max_segments: u32) -> u64 {
+    let max_segments = max_segments.min(state.ceiling);
     let free = state
         .segments
         .free

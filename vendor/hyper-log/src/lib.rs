@@ -34,6 +34,7 @@ mod device;
 mod error;
 pub mod format;
 mod group;
+mod growth;
 mod owner;
 mod recover;
 mod room;
@@ -54,6 +55,7 @@ pub use derive::{Facts, Unfit};
 pub use error::LogError;
 pub use format::{HardState, Start};
 pub use group::GroupLog;
+pub use growth::Growth;
 pub use seal::Sealing;
 pub use stats::LogStats;
 pub use ticket::{Fetching, Pending};
@@ -470,6 +472,17 @@ pub(crate) fn frame_room(
 /// ([`GroupLog::depth`]; hyper-raft docs/durable.md §6).
 pub(crate) const PIPELINE_FRAMES: usize = 3;
 
+/// What a log is made or opened with besides its file, its configuration and its id
+/// ([`Log::create_with`], [`Log::open_with`]).
+#[derive(Default)]
+pub struct With {
+    /// The log's keys, where it is sealed (hyper-raft docs/seal.md).
+    pub sealing: Option<Sealing>,
+    /// The owner's admission for the file to grow past its slots ([`Growth`]); without one the
+    /// file grows to `Config::max_segments`.
+    pub growth: Option<Box<dyn Growth>>,
+}
+
 /// What starting a log needs besides its file and its state.
 struct Prepared {
     p: Params,
@@ -527,7 +540,7 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Formats a new log as [`Log::create`] does, giving the file back with a refusal.
     pub fn try_create(file: F, config: Config, id: u128) -> Result<Self, Refused<F>> {
-        Self::make(file, config, id, None)
+        Self::make(file, config, id, None, None)
     }
 
     /// Formats a new sealed log `id` in `file`, which must be empty (hyper-raft docs/seal.md §5):
@@ -553,7 +566,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Ok(sealer) => sealer,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        Self::make(file, config, id, Some(sealer))
+        Self::make(file, config, id, Some(sealer), None)
     }
 
     fn make(
@@ -561,13 +574,66 @@ impl<F: BlockFile + 'static> Log<F> {
         config: Config,
         id: u128,
         mut sealer: Option<seal::Sealer>,
+        growth: Option<Box<dyn Growth>>,
     ) -> Result<Self, Refused<F>> {
+        // A new log takes its persist area and its first slot: admitted before they are written,
+        // refused as the bound reached, and held once the log is made.
+        let first = recover::persist_area(&config).checked_add(config.segment_bytes);
+        let mut gate = match (growth, first) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Refused::with(LogError::Config("a file past u64"), file));
+            }
+            (Some(growth), Some(first)) => {
+                let mut gate = growth::Gate::new(growth, config.segment_bytes, 0);
+                if !gate.take(first) {
+                    return Err(Refused::with(LogError::Full, file));
+                }
+                Some(gate)
+            }
+        };
         let state = match recover::create(&file, &config, id, sealer.as_mut()) {
             Ok(state) => state,
-            Err(error) => return Err(Refused::with(error, file)),
+            Err(error) => {
+                if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
+                    gate.give(first);
+                }
+                return Err(Refused::with(error, file));
+            }
         };
-        let (log, _) = Self::start(file, config, id, state, Vec::new(), sealer)?;
+        if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
+            gate.hold(first);
+        }
+        let (log, _) = Self::start(file, config, id, state, Vec::new(), sealer, gate)?;
         Ok(log)
+    }
+
+    /// Formats a new log in `file`, which must be empty, with what `with` states: its keys, where
+    /// it is sealed, and its owner's admission for the file to grow (`Growth`), where it states
+    /// one. [`Log::create`] and [`Log::create_sealed`] are this with one or neither.
+    pub fn create_with(file: F, config: Config, id: u128, with: With) -> Result<Self, Refused<F>> {
+        let sealer = match with.sealing.map(|sealing| seal::Sealer::new(sealing, id)) {
+            None => None,
+            Some(Ok(sealer)) => Some(sealer),
+            Some(Err(error)) => return Err(Refused::with(error, file)),
+        };
+        Self::make(file, config, id, sealer, with.growth)
+    }
+
+    /// Opens log `id` in `file` with what `with` states, and recovers it as [`Log::open`] does.
+    /// An owner's `Growth` is told what the file's slots already take before it admits more.
+    pub fn open_with(
+        file: F,
+        config: Config,
+        id: u128,
+        with: With,
+    ) -> Result<(Self, Recovery), Refused<F>> {
+        let sealer = match with.sealing.map(|sealing| seal::Sealer::new(sealing, id)) {
+            None => None,
+            Some(Ok(sealer)) => Some(sealer),
+            Some(Err(error)) => return Err(Refused::with(error, file)),
+        };
+        Self::reopen(file, config, id, sealer, with.growth)
     }
 
     /// Opens log `id` in `file` and recovers it (mantle docs/design/raft-log.md §6). What a
@@ -580,7 +646,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Opens a log as [`Log::open`] does, giving the file back with a refusal: what recovery
     /// found damaged stays for whoever repairs or replaces it.
     pub fn try_open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), Refused<F>> {
-        Self::reopen(file, config, id, None)
+        Self::reopen(file, config, id, None, None)
     }
 
     /// Opens sealed log `id` in `file` with the keys it was created with, and recovers it as
@@ -606,7 +672,7 @@ impl<F: BlockFile + 'static> Log<F> {
             Ok(sealer) => sealer,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        Self::reopen(file, config, id, Some(sealer))
+        Self::reopen(file, config, id, Some(sealer), None)
     }
 
     fn reopen(
@@ -614,6 +680,7 @@ impl<F: BlockFile + 'static> Log<F> {
         config: Config,
         id: u128,
         mut sealer: Option<seal::Sealer>,
+        growth: Option<Box<dyn Growth>>,
     ) -> Result<(Self, Recovery), Refused<F>> {
         let (state, recovery, restores) = match recover::open(&file, &config, id, sealer.as_mut()) {
             Ok(opened) => opened,
@@ -622,7 +689,23 @@ impl<F: BlockFile + 'static> Log<F> {
         if let Some(sealer) = sealer.as_mut() {
             sealer.retain(|inc| state.is_live(inc));
         }
-        let (mut log, pending) = Self::start(file, config, id, state, restores, sealer)?;
+        // What the file's slots take, each a whole segment, told before any admission: the bytes
+        // the file reaches as its last slot fills, so a restart neither counts them twice nor
+        // admits past the volume.
+        let gate = match growth {
+            None => None,
+            Some(growth) => {
+                let held = u64::try_from(state.segments.incarnation.len())
+                    .ok()
+                    .and_then(|slots| slots.checked_mul(config.segment_bytes))
+                    .and_then(|slots| slots.checked_add(recover::persist_area(&config)));
+                match held {
+                    Some(held) => Some(growth::Gate::new(growth, config.segment_bytes, held)),
+                    None => return Err(Refused::with(LogError::Config("a file past u64"), file)),
+                }
+            }
+        };
+        let (mut log, pending) = Self::start(file, config, id, state, restores, sealer, gate)?;
         for p in pending {
             if let Err(error) = p.wait() {
                 return Err(Refused {
@@ -643,8 +726,9 @@ impl<F: BlockFile + 'static> Log<F> {
         state: state::State,
         restores: Vec<recover::Restore>,
         sealer: Option<seal::Sealer>,
+        gate: Option<growth::Gate>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
-        match Self::prepare(file.alignment(), config, id, restores, sealer.is_some()) {
+        match Self::prepare(file.layout_block(), config, id, restores, sealer.is_some()) {
             Ok(prepared) => {
                 let log = Self::spawn(
                     file,
@@ -653,6 +737,7 @@ impl<F: BlockFile + 'static> Log<F> {
                     prepared.room,
                     prepared.first,
                     sealer,
+                    gate,
                 )?;
                 Ok((log, prepared.pending))
             }
@@ -744,6 +829,7 @@ impl<F: BlockFile + 'static> Log<F> {
         room: room::Room,
         first: Vec<Submission>,
         sealer: Option<seal::Sealer>,
+        gate: Option<growth::Gate>,
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
@@ -810,7 +896,7 @@ impl<F: BlockFile + 'static> Log<F> {
             tokens,
             requests,
         };
-        let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer));
+        let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer, gate));
         // The owner's thread waits with room for the owner. Should the send fail, the owner, and
         // the file in it, ended with the thread.
         if to_owner.send(owner).is_err() {
@@ -916,6 +1002,11 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Asks the owner and waits for its answer.
     fn ask(&self, query: Query) -> Result<Answer, LogError> {
         ask(&self.inbox, query)
+    }
+
+    /// The log's id: what it was created with, and what its file must name to open.
+    pub fn id(&self) -> u128 {
+        self.p.id
     }
 
     /// The parameters the log runs with.
@@ -1299,6 +1390,20 @@ impl<F: BlockFile + 'static> LogOpener<F> {
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
         groups(&self.inbox)
+    }
+
+    /// What the log has measured: as [`Log::stats`], for an owner that holds only an opener and
+    /// exports the log's counts.
+    pub fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {
+        match ask(&self.inbox, Query::Stats(into))? {
+            Answer::Stats(stats) => Ok(stats),
+            _ => Err(LogError::Closed),
+        }
+    }
+
+    /// The log's id: what it was created with, and what its file must name to open.
+    pub fn id(&self) -> u128 {
+        self.p.id
     }
 
     /// The parameters the log runs with.

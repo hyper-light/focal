@@ -357,8 +357,8 @@ pub(crate) fn write_record<F: BlockFile>(
         let mac = sealer.mac(&bytes)?;
         bytes.extend_from_slice(&mac);
     }
-    let mut buf =
-        AlignedBuf::zeroed(bytes.len(), file.alignment()).map_err(|e| LogError::Disk(e.into()))?;
+    let mut buf = AlignedBuf::zeroed(bytes.len(), file.layout_block())
+        .map_err(|e| LogError::Disk(e.into()))?;
     buf.extend_from_slice(&bytes)
         .map_err(|e| LogError::Disk(e.into()))?;
     let padded = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
@@ -389,7 +389,7 @@ pub(crate) fn create<F: BlockFile>(
     id: u128,
     mut sealer: Option<&mut Sealer>,
 ) -> Result<State, LogError> {
-    let align = file.alignment();
+    let align = file.layout_block();
     check(config, align, sealer.is_some())?;
     if !file.is_empty()? {
         return Err(LogError::Foreign("a new log needs an empty file"));
@@ -443,6 +443,15 @@ pub(crate) fn create<F: BlockFile>(
         .map_err(|e| LogError::Disk(e.into()))?;
     let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;
     let written = u64::try_from(bytes.len()).map_err(|_| LogError::Config("frame"))?;
+    // The first slot is written whole with zeros before its header and frame, under the same flush,
+    // as every slot the file grows by is (`device::Frame::zero`): its later frames are overwrites.
+    if file.fills_new_space() {
+        let slot =
+            usize::try_from(config.segment_bytes).map_err(|_| LogError::Config("segment"))?;
+        let mut zeros = AlignedBuf::zeroed(slot, align).map_err(|e| LogError::Disk(e.into()))?;
+        zeros.set_len(slot).map_err(|e| LogError::Disk(e.into()))?;
+        file.write_all_at(zeros.as_slice(), at)?;
+    }
     file.write_all_at(bytes, at)?;
     file.sync_data()?;
     Ok(State {
@@ -465,6 +474,7 @@ pub(crate) fn create<F: BlockFile>(
         next_incarnation: 2,
         durable: 0,
         durable_tail: 1,
+        ceiling: u32::MAX,
     })
 }
 
@@ -502,7 +512,7 @@ struct Shape {
 
 impl Shape {
     fn of<F: BlockFile>(file: &F, config: &Config, id: u128) -> Result<Self, LogError> {
-        let block = block_of(file.alignment())?;
+        let block = block_of(file.layout_block())?;
         let len = file.len()?;
         if len == 0 {
             return Err(LogError::Foreign("the file is empty"));
@@ -598,7 +608,7 @@ fn headers<F: BlockFile>(
     shape: &Shape,
     mut sealer: Option<&mut Sealer>,
 ) -> Result<Headers, LogError> {
-    let align = file.alignment();
+    let align = file.layout_block();
     let count = usize::try_from(shape.slots).unwrap_or(0);
     let mut heads = Headers {
         incarnation: vec![0u64; count],
@@ -994,7 +1004,7 @@ fn erase<F: BlockFile>(
     if heads.highest != last.incarnation {
         erasures.push((last.after, shape.end_of(heads.slot(last.incarnation)?)?));
     }
-    let align = file.alignment();
+    let align = file.layout_block();
     let mut zeros = AlignedBuf::zeroed(align.get(), align).map_err(|e| LogError::Disk(e.into()))?;
     zeros
         .set_len(align.get())
@@ -1017,11 +1027,11 @@ pub(crate) fn open<F: BlockFile>(
     id: u128,
     mut sealer: Option<&mut Sealer>,
 ) -> Result<(State, Recovery, Vec<Restore>), LogError> {
-    check(config, file.alignment(), sealer.is_some())?;
+    check(config, file.layout_block(), sealer.is_some())?;
     let shape = Shape::of(file, config, id)?;
     let heads = headers(file, &shape, sealer.as_deref_mut())?;
     let mac = sealer.as_deref().map(Sealer::frame_mac);
-    let mut reader = Reader::new(file, file.alignment(), shape.segment, mac)?;
+    let mut reader = Reader::new(file, file.layout_block(), shape.segment, mac)?;
     let last = last_frame(&mut reader, &shape, &heads)?;
     lost_headers(&mut reader, &shape, &heads)?;
     if last.tail > last.incarnation {
@@ -1139,6 +1149,7 @@ impl Opened {
                 .ok_or(LogError::Damaged("incarnations past u64"))?,
             durable: last.sequence,
             durable_tail: last.tail,
+            ceiling: u32::MAX,
         };
         let mut all: Vec<u128> = self
             .damaged
@@ -1190,7 +1201,7 @@ fn restores<F: BlockFile>(
     let Some(sequence) = last.checked_add(1) else {
         return Ok((Vec::new(), None));
     };
-    let align = file.alignment();
+    let align = file.layout_block();
     let slot = persist_slot(config, align, sealer.is_some())?;
     let size = usize::try_from(slot).map_err(|_| LogError::Config("a persist slot"))?;
     let mut records = Vec::with_capacity(2);

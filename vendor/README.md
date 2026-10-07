@@ -31,13 +31,13 @@ targets; a change to it is made there first and taken here by a new snapshot, ne
 
 | Crate | Version | Revision | Taken | Why it is here |
 |---|---|---|---|---|
-| `hyper-block` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
-| `hyper-durable` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | The durable shell a group's replica becomes (27 §15) |
-| `hyper-liveness` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
-| `hyper-log` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
-| `hyper-raft` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | The consensus core every group runs |
-| `hyper-timing` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | The election law's draw the core takes its delays from |
-| `hyper-seal` | 0.1.0 | `b483a13e96ce1db1894a5e132717736fed99892d` | 2026-10-07 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
+| `hyper-block` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
+| `hyper-durable` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | The durable shell a group's replica becomes (27 §15) |
+| `hyper-liveness` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
+| `hyper-log` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
+| `hyper-raft` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | The consensus core every group runs |
+| `hyper-timing` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | The election law's draw the core takes its delays from |
+| `hyper-seal` | 0.1.0 | `756bfaaa1e6767dea9fb52cbcbedd6ae889cdf48` | 2026-10-07 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
 
 A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
 crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to

@@ -46,6 +46,8 @@ pub struct DeviceFile {
     path: PathBuf,
     caching: Caching,
     align: Alignment,
+    /// The block a writer lays the file out in ([`DeviceFile::layout_block`]).
+    layout: Alignment,
     /// A device node rather than a regular file.
     node: bool,
 }
@@ -84,11 +86,16 @@ impl DeviceFile {
         };
         let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
         refuse_zones(path, &file, node)?;
+        let layout = match caching {
+            Caching::Direct => align,
+            Caching::Buffered => layout_of(&file, path, align)?,
+        };
         Ok(Self {
             file,
             path: path.to_path_buf(),
             caching,
             align,
+            layout,
             node,
         })
     }
@@ -112,6 +119,7 @@ impl DeviceFile {
             path: self.path.clone(),
             caching: self.caching,
             align: self.align,
+            layout: self.layout,
             node: self.node,
         })
     }
@@ -124,6 +132,50 @@ impl DeviceFile {
     /// The alignment every transfer's offset and length must meet (one byte when buffered).
     pub fn alignment(&self) -> Alignment {
         self.align
+    }
+
+    /// The block a writer lays the file out in: the transfer alignment when direct, which a
+    /// direct file's layout always was; when buffered, the device's write unit
+    /// ([`preferred_block`]), since a buffered file's alignment of one byte is no block a log can
+    /// lay out a header or a persist slot in. Taken once, at open.
+    pub fn layout_block(&self) -> Alignment {
+        self.layout
+    }
+
+    /// Whether new space is written with zeros before use (`BlockFile::fills_new_space`): a direct
+    /// file on Linux, where it was measured to remove the journal's flush from every write after a
+    /// slot's first (hyper-raft docs/benchmarks.md, "a slot written whole before its frames").
+    pub fn fills_new_space(&self) -> bool {
+        cfg!(target_os = "linux") && self.caching == Caching::Direct
+    }
+
+    /// Writes all of `buf` at `offset` and makes that write durable before it returns. On Linux a
+    /// direct file's write goes with `RWF_DSYNC` (pwritev2(2)): the block layer issues it as a FUA
+    /// write where the device advertises FUA (`/sys/block/<dev>/queue/fua`) and the write is an
+    /// overwrite the file system need not log, and otherwise writes and flushes, so the device's
+    /// whole cache is not flushed for one write. Elsewhere, and where the kernel does not take the
+    /// flag, a write and [`DeviceFile::sync_data`] (macOS has no durable write of its own:
+    /// `F_BARRIERFSYNC` orders and does not persist).
+    pub fn write_durable_at(
+        &self,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<crate::block::Durable, DiskError> {
+        #[cfg(target_os = "linux")]
+        if self.caching == Caching::Direct {
+            self.check_alignment(offset, buf.len())?;
+            self.check_address(buf.as_ptr().addr(), offset, buf.len())?;
+            match sys::write_durable_at(&self.file, buf, offset) {
+                Ok(()) => return Ok(crate::block::Durable::Written),
+                // A kernel before 4.7 takes no flag: nothing was written.
+                Err(e) if e.raw_os_error() == Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()) => {
+                }
+                Err(e) => return Err(self.io_error("write durable", e)),
+            }
+        }
+        self.write_all_at(buf, offset)?;
+        self.sync_data()?;
+        Ok(crate::block::Durable::Flushed)
     }
 
     /// Writes all of `buf` at `offset`.
@@ -386,6 +438,22 @@ pub fn preferred_block(file: &File, path: &Path) -> Result<usize, DiskError> {
     Ok(bytes)
 }
 
+/// A buffered file's layout block: the device's write unit, and no less than `align`. A write unit
+/// that is no power of two within the alignment bound is no block to lay a file out in, and is
+/// refused rather than rounded: rounded, a block would no longer be a write the device takes whole.
+fn layout_of(file: &File, path: &Path, align: Alignment) -> Result<Alignment, DiskError> {
+    let unit = preferred_block(file, path)?;
+    let unit = Alignment::new(unit).map_err(|_| DiskError::Unsupported {
+        path: path.to_path_buf(),
+        reason: "a file whose device's write unit is no power of two within the alignment bound",
+    })?;
+    Ok(if unit.get() >= align.get() {
+        unit
+    } else {
+        align
+    })
+}
+
 /// Flushes a directory so entries created or renamed in it survive a crash (Pillai et al.,
 /// OSDI 2014: a new file's directory entry is durable only after its directory is synced).
 pub fn sync_dir(dir: &Path) -> Result<(), DiskError> {
@@ -411,6 +479,26 @@ mod sys {
 
     pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(buf, offset)
+    }
+
+    /// All of `buf` at `offset` with `RWF_DSYNC`: each part durable before the call returns.
+    #[cfg(target_os = "linux")]
+    pub(super) fn write_durable_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+        use rustix::io::{ReadWriteFlags, pwritev2};
+        let mut done = 0usize;
+        while let Some(rest) = buf.get(done..).filter(|r| !r.is_empty()) {
+            let at = u64::try_from(done)
+                .ok()
+                .and_then(|done| offset.checked_add(done))
+                .ok_or(io::ErrorKind::InvalidInput)?;
+            let wrote = pwritev2(file, &[io::IoSlice::new(rest)], at, ReadWriteFlags::DSYNC)
+                .map_err(io::Error::from)?;
+            if wrote == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            done = done.saturating_add(wrote);
+        }
+        Ok(())
     }
 
     pub(super) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -562,6 +650,30 @@ mod tests {
             file.write_all_at(empty.as_slice(), 0).unwrap();
             file.read_exact_at(empty.as_mut_capacity(), 0).unwrap();
             assert_eq!(file.read_at(empty.as_mut_capacity(), 0).unwrap(), 0);
+        }
+    }
+
+    /// A buffered file is laid out in the device's write unit, its alignment of one byte being no
+    /// block; a direct one in its transfer alignment, as a direct file always was, so the layout of
+    /// a log already on it is unchanged.
+    #[test]
+    fn a_buffered_file_is_laid_out_in_the_write_unit_and_a_direct_one_in_its_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buffered");
+        let buffered = DeviceFile::open(&path, true, CachingRequest::Buffered, align()).unwrap();
+        assert_eq!(buffered.alignment(), Alignment::BYTE);
+        let unit = preferred_block(buffered.std_file(), &path).unwrap();
+        assert_eq!(buffered.layout_block().get(), unit);
+        assert_eq!(buffered.try_clone().unwrap().layout_block().get(), unit);
+        let direct = DeviceFile::open(
+            &dir.path().join("direct"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        if direct.caching() == Caching::Direct {
+            assert_eq!(direct.layout_block(), direct.alignment());
         }
     }
 

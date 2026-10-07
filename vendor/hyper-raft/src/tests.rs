@@ -4453,3 +4453,175 @@ fn a_deferred_commit_vouches_for_nothing_and_its_answers_state_the_durable_commi
     ));
     assert!(ready.hard_state().is_some());
 }
+
+// A leader's quorum patience (`docs/raft.md` §3.6): ticks beyond its election timeout before it
+// asks whether a quorum heard it.
+
+/// Ticks `node` `n` times, taking what each tick sends.
+fn ticked(node: &mut RawNode<Memory>, n: usize) {
+    for _ in 0..n {
+        node.tick().unwrap();
+        drain(node);
+    }
+}
+
+/// With no quorum patience a leader that hears from no one steps down at its election timeout,
+/// exactly as before the check had a counter of its own.
+#[test]
+fn a_leader_of_no_quorum_patience_checks_at_its_election_timeout() {
+    let mut node = leader();
+    assert_eq!(node.raft.quorum_patience(), 0);
+    ticked(&mut node, 9);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.term, 1, "a step-down is no new term");
+}
+
+/// Followers that answer late, past the election timeout and within the patience, keep the
+/// leader its term; a window in which none answers deposes it at the window's end.
+#[test]
+fn a_leader_whose_followers_answer_within_its_quorum_patience_keeps_its_term() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(10).unwrap();
+    ticked(&mut node, 15);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Leader,
+        "past the election timeout"
+    );
+    node.step(answer(MessageType::MsgHeartbeatResponse, 2, 1, 1))
+        .unwrap();
+    drain(&mut node);
+    ticked(&mut node, 5);
+    assert_eq!(node.raft.state(), StateRole::Leader, "its quorum heard it");
+    ticked(&mut node, 19);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Follower,
+        "a window none answered in"
+    );
+}
+
+/// The check judges every follower heard at any point in its window: one heard once, early in
+/// a long window, still counts at the window's end.
+#[test]
+fn a_follower_heard_early_in_a_long_window_counts_at_its_end() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(30).unwrap();
+    ticked(&mut node, 1);
+    node.step(answer(MessageType::MsgHeartbeatResponse, 3, 1, 1))
+        .unwrap();
+    drain(&mut node);
+    ticked(&mut node, 39);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Leader,
+        "heard at tick 1 of 40"
+    );
+    ticked(&mut node, 39);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Follower,
+        "heard in no window since"
+    );
+}
+
+/// Past its patience a leader none answered steps down.
+#[test]
+fn a_leader_unheard_past_its_quorum_patience_steps_down() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(5).unwrap();
+    ticked(&mut node, 14);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(node.raft.state(), StateRole::Follower);
+}
+
+/// A transfer that does not finish is given up at the election timeout, whatever the quorum
+/// patience: the two deadlines have their own counters.
+#[test]
+fn a_transfer_is_given_up_at_the_election_timeout_whatever_the_quorum_patience() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(20).unwrap();
+    node.transfer_leader(2).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.lead_transferee(), Some(2));
+    ticked(&mut node, 9);
+    assert_eq!(node.raft.lead_transferee(), Some(2));
+    ticked(&mut node, 1);
+    assert_eq!(
+        node.raft.lead_transferee(),
+        None,
+        "given up at the election timeout"
+    );
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Leader,
+        "its quorum check is later"
+    );
+}
+
+/// The followers' side is untouched: while a patient old leader still believes it leads, the
+/// others may elect another. It commits nothing in that window, having no quorum, and steps down
+/// at the first newer term it hears.
+#[test]
+fn a_patient_leader_commits_nothing_alone_and_yields_to_a_newer_term() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(50).unwrap();
+    let committed = node.raft.log().committed();
+    node.propose(vec![], b"alone".to_vec()).unwrap();
+    drain(&mut node);
+    ticked(&mut node, 20);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    assert_eq!(
+        node.raft.log().committed(),
+        committed,
+        "no quorum, no commit"
+    );
+    node.step(answer(MessageType::MsgHeartbeat, 2, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.term, 2);
+    assert_eq!(node.raft.log().committed(), committed);
+}
+
+/// A patience the election timeout and it overflow is refused, typed, and the one in force
+/// stays.
+#[test]
+fn a_quorum_patience_past_what_a_tick_counts_is_refused() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(7).unwrap();
+    assert!(matches!(
+        node.raft.set_quorum_patience(usize::MAX),
+        Err(Error::Settings(_))
+    ));
+    assert_eq!(node.raft.quorum_patience(), 7);
+    let most = usize::MAX - node.raft.config.election_tick;
+    node.raft.set_quorum_patience(most).unwrap();
+    assert_eq!(node.raft.quorum_patience(), most);
+}
+
+/// Under elections by suspicion, which take no ticks and whose detectors depose, a quorum patience
+/// is kept and changes nothing: a tick is still refused.
+#[test]
+fn under_elections_by_suspicion_a_quorum_patience_changes_nothing() {
+    let suspicion = Config {
+        elections: crate::Elections::Suspicion,
+        ..config(2)
+    };
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    store.hard_state = HardState {
+        term: 1,
+        vote: 1,
+        commit: 0,
+    };
+    let mut node = RawNode::new(&suspicion, store).unwrap();
+    node.raft.set_quorum_patience(9).unwrap();
+    assert_eq!(node.raft.quorum_patience(), 9);
+    assert!(matches!(node.tick(), Err(Error::Settings(_))));
+}
