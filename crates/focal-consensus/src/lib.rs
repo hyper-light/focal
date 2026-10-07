@@ -1156,6 +1156,14 @@ impl LogNode {
         self.raw.raft.set_patience(ticks);
         Ok(())
     }
+    /// The ticks this member, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`hyper_raft::Raft::set_quorum_patience`): what its owner
+    /// measured of its voters' answers (27 §8.4).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        self.raw.raft.set_quorum_patience(ticks)?;
+        Ok(())
+    }
     /// The priority this node was given; in force once it has a term.
     pub fn priority(&self) -> i64 {
         self.priority

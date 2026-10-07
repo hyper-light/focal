@@ -1888,6 +1888,17 @@ impl NetworkService {
                         .filter_map(|voter| self.pool.path(*voter))
                         .collect();
                     self.handles.control.pace(paths.iter());
+                    // What the root's commits wait on among its voters: how
+                    // late each answers the group's messages, which it does
+                    // once its owner has taken and persisted them, or the
+                    // age of one still out where that is more (27 §8.4).
+                    let voters = &observation.configuration().configuration.voters;
+                    let tails: Vec<Duration> = voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.replication_lateness(*voter))
+                        .collect();
+                    self.handles.control.quorum(tails, voters.len());
                 }
                 // Every hosted session paces itself by its own voters: a
                 // session whose voters are near keeps the configured period
@@ -1902,6 +1913,15 @@ impl NetworkService {
                         .filter_map(|voter| self.pool.path(*voter))
                         .collect();
                     host.pace(paths.iter());
+                    // How late the session's other voters answer its
+                    // messages (27 §8.4), as the root's.
+                    let tails: Vec<Duration> = progress
+                        .voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.replication_lateness(*voter))
+                        .collect();
+                    host.quorum(tails, progress.voters.len());
                     // And what each path holds in flight bounds the bytes
                     // a leader sends its peer ahead of its answers (27 §11):
                     // the voters, and the members the directory admitted,

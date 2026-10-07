@@ -587,6 +587,11 @@ impl ShellNode {
         self.replica.set_patience(ticks);
         Ok(())
     }
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        let set = self.replica.set_quorum_patience(ticks);
+        self.heard(set)
+    }
     pub fn priority(&self) -> i64 {
         self.priority
     }

@@ -259,6 +259,11 @@ struct Exchange {
     /// nanoseconds it took — the rate the path showed, which sizes the
     /// next part sent it ([`PeerConnectionPool::part_bytes`]).
     delivered: Option<(u64, u64)>,
+    /// What the peer takes to answer a group's message (`Operation::Raft`,
+    /// `RaftOrdered`): answered once the peer's owner has taken it and
+    /// persisted it, so a peer whose owner stalls answers late here and
+    /// nowhere else (27 §8.4). Not the path, which probes alone measure.
+    replicated: focal_timing::ExchangeRtt,
 }
 /// The most doublings an estimate takes.
 const MAX_BACKOFF: u32 = 6;
@@ -323,10 +328,52 @@ struct Asked<'a> {
     /// exchange says the path delivered in the time it took.
     bytes: u64,
     bulk: bool,
+    /// Whether it is a group's message, and the serial its attempt in
+    /// flight is registered under (`State::outstanding`).
+    replication: bool,
+    serial: Option<u64>,
 }
 impl Asked<'_> {
+    /// An attempt leaves at `sent`: a group message's is registered, in
+    /// place of an earlier attempt's.
+    fn sent(&mut self, sent: std::time::Instant) {
+        if !self.replication {
+            return;
+        }
+        if let Ok(mut state) = self.pool.state.lock() {
+            if let Some(serial) = self.serial.take() {
+                state.outstanding.remove(&(self.target, serial));
+            }
+            let serial = state.serial;
+            state.serial = serial.wrapping_add(1);
+            state.outstanding.insert((self.target, serial), sent);
+            self.serial = Some(serial);
+        }
+    }
+    /// The attempt in flight ended: its registration goes.
+    fn settled(&mut self) {
+        if let Some(serial) = self.serial.take()
+            && let Ok(mut state) = self.pool.state.lock()
+        {
+            state.outstanding.remove(&(self.target, serial));
+        }
+    }
     fn answered(&mut self, taken: Duration) {
         self.answered = true;
+        if self.replication {
+            self.settled();
+            if let Ok(mut state) = self.pool.state.lock()
+                && state.routes.contains_key(&self.target)
+            {
+                let nanos = u64::try_from(taken.as_nanos()).unwrap_or(u64::MAX);
+                state
+                    .exchanges
+                    .entry(self.target)
+                    .or_default()
+                    .replicated
+                    .on_sample(nanos);
+            }
+        }
         if !self.measured {
             return;
         }
@@ -350,6 +397,7 @@ impl Asked<'_> {
 }
 impl Drop for Asked<'_> {
     fn drop(&mut self) {
+        self.settled();
         if self.answered || !self.measured {
             return;
         }
@@ -378,6 +426,14 @@ struct State {
     /// answered, and how many in a row were given up on. Dropped with the
     /// peer's route.
     exchanges: BTreeMap<u64, Exchange>,
+    /// When each group message out to a peer was sent, by peer and serial:
+    /// an exchange still unanswered has taken at least its age, which a
+    /// stall in progress shows before its answer can. One entry an
+    /// exchange in flight, which the pool's permits bound, removed when the
+    /// exchange ends, however it ends.
+    outstanding: BTreeMap<(u64, u64), std::time::Instant>,
+    /// The serial the next group message out is registered under.
+    serial: u64,
     clock: u64,
     closed: bool,
 }
@@ -452,6 +508,8 @@ impl PeerConnectionPool {
                 cached: BTreeMap::new(),
                 paths: BTreeMap::new(),
                 exchanges: BTreeMap::new(),
+                outstanding: BTreeMap::new(),
+                serial: 0,
                 clock: 0,
                 closed: false,
             }),
@@ -608,6 +666,28 @@ impl PeerConnectionPool {
         let tail = exchange.taken.tail_ns()?;
         let factor = 1u64.checked_shl(exchange.abandoned.min(MAX_BACKOFF))?;
         Some(Duration::from_nanos(tail.saturating_mul(factor)))
+    }
+    /// How late `target` answers a group's message, at least: the tail of
+    /// the ones it answered, or the age of the oldest still unanswered where
+    /// that is more, so a peer whose owner stalls is seen late while the
+    /// stall lasts and not only once it ends (27 §8.4). `None` while
+    /// nothing was measured or is out.
+    pub fn replication_lateness(&self, target: u64) -> Option<Duration> {
+        let state = self.state.lock().ok()?;
+        let completed = state
+            .exchanges
+            .get(&target)
+            .and_then(|exchange| exchange.replicated.tail_ns())
+            .map(Duration::from_nanos);
+        let outstanding = state
+            .outstanding
+            .range((target, 0)..=(target, u64::MAX))
+            .map(|(_, sent)| sent.elapsed())
+            .max();
+        match (completed, outstanding) {
+            (Some(completed), Some(age)) => Some(completed.max(age)),
+            (completed, age) => completed.or(age),
+        }
     }
     /// How long one of `asked` peers that are asked one after another
     /// within `round` is waited for: its share of the round, so that each
@@ -963,6 +1043,11 @@ impl PeerConnectionPool {
             answered: false,
             bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
             bulk,
+            replication: matches!(
+                request.operation,
+                Operation::Raft { .. } | Operation::RaftOrdered { .. }
+            ),
+            serial: None,
         };
         let _inflight = if probe {
             &self.probe_inflight
@@ -1031,6 +1116,7 @@ impl PeerConnectionPool {
                     }
                 };
                 let sent = std::time::Instant::now();
+                asked.sent(sent);
                 let before = slot.answered.load(Ordering::Acquire);
                 // An ordered frame goes as it is on a connection that admits
                 // the ordered profile, and as a plain frame on one that does

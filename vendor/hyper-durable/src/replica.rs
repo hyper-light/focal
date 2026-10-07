@@ -1021,6 +1021,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.node.raft.set_patience(ticks);
     }
 
+    /// Ticks this member, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`hyper_raft::Raft::set_quorum_patience`, `docs/raft.md` §3.6):
+    /// what its owner measured of its voters' answers. Refused, nothing changed, where the
+    /// election timeout and it pass what a tick counts.
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ReplicaError> {
+        self.node
+            .raft
+            .set_quorum_patience(ticks)
+            .map_err(ReplicaError::Refused)
+    }
+
     /// What the member does with an append that arrives ahead of a hole
     /// (`hyper_raft::RawNode::set_ahead`): policy its owner sets once every peer can read a kept
     /// refusal, never part of what is durable.

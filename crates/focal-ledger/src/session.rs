@@ -648,6 +648,14 @@ impl Session {
         self.consensus.set_patience(ticks)?;
         Ok(())
     }
+    /// The ticks the replica, while it leads, waits beyond its election
+    /// timeout before it asks whether a quorum heard it
+    /// (`DurableNode::set_quorum_patience`).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_quorum_patience(ticks)?;
+        Ok(())
+    }
     /// What this leader tracks of one member's replication.
     pub fn peer(&self, node: u64) -> Option<focal_consensus::PeerProgress> {
         self.consensus.peer(node)

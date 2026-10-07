@@ -304,6 +304,12 @@ impl DurableNode {
     pub fn set_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.set_patience(ticks))
     }
+    /// The ticks this member, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`hyper_raft::Raft::set_quorum_patience`): what its owner
+    /// measured of its voters' answers (27 §8.4).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        dispatch!(inner = &mut self.backend => inner.set_quorum_patience(ticks))
+    }
     /// The priority this node was given; in force once it has a term.
     pub fn priority(&self) -> i64 {
         dispatch!(inner = &self.backend => inner.priority())

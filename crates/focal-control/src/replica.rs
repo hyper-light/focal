@@ -387,6 +387,13 @@ impl ControlReplica {
         self.node.set_patience(ticks)?;
         Ok(())
     }
+    /// The ticks the replica, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`DurableNode::set_quorum_patience`).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.set_quorum_patience(ticks)?;
+        Ok(())
+    }
     pub fn configuration_index(&self) -> u64 {
         self.configuration_index
     }
