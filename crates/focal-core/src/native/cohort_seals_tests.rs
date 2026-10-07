@@ -156,6 +156,8 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
 
 fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcome {
     let outcome = changes.outcome;
+    let encoded_added =
+        crate::native::encoded_added(changes.changes.iter(), core.state.ledger).unwrap();
     let range = core
         .state
         .rows
@@ -170,6 +172,7 @@ fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcom
         fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
+        encoded_added,
     })
     .unwrap()
 }

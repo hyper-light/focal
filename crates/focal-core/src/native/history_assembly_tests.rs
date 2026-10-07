@@ -148,6 +148,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         &mut scratch,
     )
     .unwrap();
+    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
     let range = core
         .state
         .rows
@@ -162,6 +163,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
+        encoded_added,
     })
     .unwrap();
     assert_eq!(fixture::events(core, outcome), facts);

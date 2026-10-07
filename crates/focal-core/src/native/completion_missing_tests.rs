@@ -88,6 +88,7 @@ fn altered(
         })
         .collect::<Vec<_>>();
     assert!(changes.len() <= core.limits.range.max_batch_entries);
+    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
     let range = core
         .state
         .rows
@@ -102,6 +103,7 @@ fn altered(
         fragments: range,
         outcome: original.outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
+        encoded_added,
     }
 }
 

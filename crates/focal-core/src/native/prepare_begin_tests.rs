@@ -196,6 +196,7 @@ fn altered(
             heap,
         )));
     }
+    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
     let range = core
         .state
         .rows
@@ -214,6 +215,7 @@ fn altered(
         fragments: range,
         outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
+        encoded_added,
     }
 }
 

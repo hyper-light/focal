@@ -260,6 +260,11 @@ pub struct NativeState {
     profile: NativeContentProfile,
     rows: ranges::NativeRanges,
     budget: MemoryBudget,
+    /// What the rows take in a checkpoint, exactly (`record_codec::checkpoint::row_bytes`
+    /// summed): kept as each mutation publishes, and summed once where a root is built whole.
+    /// What admission projects a checkpoint to is this and the frame, never a bound inferred
+    /// from the memory the rows are charged.
+    encoded_rows: usize,
 }
 impl std::fmt::Debug for NativeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1354,6 +1359,9 @@ pub struct NativePrepared {
     fragments: ranges::Fragments,
     outcome: NativeOutcome,
     writes: mutation::WriteSet,
+    /// What the rows this mutation puts take in a checkpoint: its whole addition, before what
+    /// it replaces or deletes is taken away at publication.
+    encoded_added: usize,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1626,6 +1634,7 @@ impl Core<NativeState> {
                 profile,
                 rows,
                 budget,
+                encoded_rows: 0,
             },
             limits,
         })
@@ -1829,10 +1838,18 @@ impl Core<NativeState> {
         &mut self,
         prepared: NativePrepared,
     ) -> Result<NativeOutcome, NativePublishError> {
+        // What the rows take in a checkpoint after this mutation: what it puts, less what it
+        // replaces or deletes as the committed root holds it now, every predecessor published.
+        // Computed before anything is published, so a refusal leaves the root as it was.
+        let encoded = match self.encoded_after(&prepared) {
+            Ok(encoded) => encoded,
+            Err(error) => return Err(NativePublishError { error, prepared }),
+        };
         let NativePrepared {
             fragments,
             outcome,
             writes,
+            encoded_added,
         } = prepared;
         self.state
             .rows
@@ -1843,9 +1860,68 @@ impl Core<NativeState> {
                     fragments,
                     outcome,
                     writes,
+                    encoded_added,
                 },
             })?;
+        self.state.encoded_rows = encoded;
         Ok(outcome)
+    }
+    /// What the rows take in a checkpoint once `prepared` publishes.
+    fn encoded_after(&self, prepared: &NativePrepared) -> Result<usize, MemoryError> {
+        let unencodable = |_| MemoryError::InvalidConfiguration("a committed row does not encode");
+        let mut removed = 0usize;
+        for (key, _) in prepared.writes.entries() {
+            if let Some(row) = self.state.rows.get(&key) {
+                removed = removed
+                    .checked_add(
+                        record_codec::checkpoint::row_bytes(key, row, self.state.ledger)
+                            .map_err(unencodable)?,
+                    )
+                    .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))?;
+            }
+        }
+        self.state
+            .encoded_rows
+            .checked_sub(removed)
+            .and_then(|rest| rest.checked_add(prepared.encoded_added))
+            .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))
+    }
+    /// What the rows take in a checkpoint once `changes` are published straight to the root (a
+    /// seal's): each put's row added, every touched key's committed row taken away.
+    pub(in crate::native) fn encoded_after_changes(
+        &self,
+        changes: &[focal_memory::Change<Key, Row>],
+    ) -> Result<usize, NativeError> {
+        let mut removed = 0usize;
+        for change in changes {
+            let key = match change {
+                focal_memory::Change::Put(entry) => entry.key,
+                focal_memory::Change::Delete(key) => *key,
+            };
+            if let Some(row) = self.state.rows.get(&key) {
+                removed = removed
+                    .checked_add(
+                        record_codec::checkpoint::row_bytes(key, row, self.state.ledger).map_err(
+                            |_| NativeError::Capacity("a committed row does not encode"),
+                        )?,
+                    )
+                    .ok_or(NativeError::Capacity("checkpoint bytes"))?;
+            }
+        }
+        self.state
+            .encoded_rows
+            .checked_sub(removed)
+            .and_then(|rest| {
+                rest.checked_add(encoded_added(changes.iter(), self.state.ledger).ok()?)
+            })
+            .ok_or(NativeError::Capacity("checkpoint bytes"))
+    }
+    /// What a checkpoint of the committed root encodes to, exactly: its frame and its rows.
+    pub fn checkpoint_bytes(&self) -> Result<usize, NativeError> {
+        record_codec::checkpoint::frame_bytes(&self.state)
+            .map_err(|_| NativeError::Capacity("checkpoint frame"))?
+            .checked_add(self.state.encoded_rows)
+            .ok_or(NativeError::Capacity("checkpoint bytes"))
     }
     pub fn pin_native(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
         self.state.rows.pin(now, ttl).map(|lease| NativeRead {
@@ -2132,4 +2208,34 @@ impl NativeRead {
             })
             .map(Option::flatten)
     }
+}
+
+/// What `rows` take in a checkpoint, summed row by row: for a root built whole (a checkpoint
+/// restored, an archive read), whose rows were never published one mutation at a time.
+pub(in crate::native) fn encoded_rows_of(
+    rows: &ranges::NativeRanges,
+    ledger: LedgerId,
+) -> Result<usize, NativeError> {
+    rows.entries().try_fold(0usize, |sum, entry| {
+        let bytes = record_codec::checkpoint::row_bytes(entry.key, &entry.value, ledger)
+            .map_err(|_| NativeError::Capacity("a restored row does not encode"))?;
+        sum.checked_add(bytes)
+            .ok_or(NativeError::Capacity("checkpoint bytes"))
+    })
+}
+
+/// What the rows `changes` put take in a checkpoint: each put's row, as it will be written.
+pub(in crate::native) fn encoded_added<'a>(
+    mut changes: impl Iterator<Item = &'a focal_memory::Change<Key, Row>>,
+    ledger: LedgerId,
+) -> Result<usize, NativeError> {
+    changes.try_fold(0usize, |sum, change| match change {
+        focal_memory::Change::Put(entry) => {
+            let bytes = record_codec::checkpoint::row_bytes(entry.key, &entry.value, ledger)
+                .map_err(|_| NativeError::Capacity("a row that does not encode"))?;
+            sum.checked_add(bytes)
+                .ok_or(NativeError::Capacity("checkpoint bytes"))
+        }
+        focal_memory::Change::Delete(_) => Ok(sum),
+    })
 }

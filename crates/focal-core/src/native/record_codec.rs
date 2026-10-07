@@ -12,10 +12,9 @@ pub mod seal;
 pub use buffer::FundedRecord;
 #[cfg(test)]
 pub(in crate::native) use buffer::future_quote as future_record_quote;
-pub(in crate::native) use buffer::{
-    HEAP_EXPANSION, PendingRecord, future as future_record_bytes, header_fixed_bytes,
-    row_fixed_bytes,
-};
+#[cfg(test)]
+pub(in crate::native) use buffer::{HEAP_EXPANSION, header_fixed_bytes, row_fixed_bytes};
+pub(in crate::native) use buffer::{PendingRecord, future as future_record_bytes};
 mod events;
 mod evidence;
 mod fixed;

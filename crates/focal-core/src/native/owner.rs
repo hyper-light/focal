@@ -965,32 +965,19 @@ impl NativeOwner {
                 rows.checked_add(pending.prepared.mutation_count())
             })
             .ok_or_else(|| capacity(()))?;
-        // The rows' variable bodies: a page is charged its entries inline and
-        // their heap (`RangeStore`'s page charge), so the pages' charge less
-        // the committed rows' inline size bounds the committed heap from
-        // above; a pending candidate's rows are charged as pending. Neither
-        // counts the indexes, recovery or allocator bookkeeping a root also
-        // charges, which a checkpoint does not carry.
-        let stats = self.core.native_budget();
-        let committed_inline = self
-            .core
-            .state
-            .rows
-            .len()
-            .checked_mul(super::NATIVE_ENTRY_BYTES)
-            .ok_or_else(|| capacity(()))?;
-        let heap = stats
-            .used_by(focal_memory::BudgetKind::Pages)
-            .saturating_sub(committed_inline)
-            .checked_add(stats.used_by(focal_memory::BudgetKind::Pending))
-            .ok_or_else(|| capacity(()))?;
-        let bytes = rows
-            .checked_mul(record_codec::row_fixed_bytes())
-            .and_then(|fixed| {
-                heap.checked_mul(record_codec::HEAP_EXPANSION)
-                    .and_then(|heap| fixed.checked_add(heap))
+        // What the committed root encodes to, exactly (its frame and the rows' running total,
+        // `Core::checkpoint_bytes`), and every row a pending candidate puts, whole: what a
+        // candidate replaces or deletes is not taken away, so with every candidate published
+        // the checkpoint is at most this. The bound it replaced inferred the rows' bodies from
+        // the memory their pages are charged and quadrupled it: twenty-two times what a
+        // checkpoint of authored claims encodes to, and admission refused at a twentieth of
+        // what a checkpoint holds.
+        let bytes = self
+            .pending
+            .iter()
+            .try_fold(self.core.checkpoint_bytes()?, |bytes, pending| {
+                bytes.checked_add(pending.prepared.encoded_added)
             })
-            .and_then(|body| body.checked_add(record_codec::header_fixed_bytes()))
             .ok_or_else(|| capacity(()))?;
         Ok(CheckpointProjection { rows, bytes })
     }

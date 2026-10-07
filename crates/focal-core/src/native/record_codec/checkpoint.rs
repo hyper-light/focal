@@ -1019,6 +1019,41 @@ fn frame_entries<'a>(
     Ok(digest)
 }
 
+/// What one row adds to a checkpoint, exactly: its tag, its key, its body's length and its body,
+/// as [`put_row`] writes them. Kept as a running total over a root's rows
+/// (`NativeState::encoded_rows`), so what admission projects a checkpoint to is what it encodes
+/// to, never a bound inferred from memory.
+pub(in crate::native) fn row_bytes(
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+) -> Result<usize, CodecError> {
+    let mut sink = CountingSink::new(usize::MAX, usize::MAX);
+    put_row(&mut sink, key, row, ledger)?;
+    Ok(sink.len())
+}
+
+/// What a checkpoint of `state` takes besides its rows, exactly: the frame's header, its range
+/// layout and the trailing digest, written by the calls [`frame_entries`] makes. The prefix and
+/// the row count are fixed-width, so this depends on the layout alone.
+pub(in crate::native) fn frame_bytes(state: &NativeState) -> Result<usize, CodecError> {
+    let mut sink = CountingSink::new(usize::MAX, usize::MAX);
+    write_raw(&mut sink, &MAGIC)?;
+    write_u16(&mut sink, VERSION)?;
+    write_u8(&mut sink, 0)?;
+    types::ledger(&mut sink, state.ledger)?;
+    write_raw(&mut sink, &state.rows.id().0.to_le_bytes())?;
+    write_u64(&mut sink, state.rows.prefix())?;
+    write_u64(&mut sink, 0)?;
+    write_layout(
+        &mut sink,
+        state.rows.layout().epoch(),
+        state.rows.layout().members(),
+    )?;
+    write_raw(&mut sink, &[0u8; 32])?;
+    Ok(sink.len())
+}
+
 fn put_row(sink: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) -> Result<(), CodecError> {
     write_u8(sink, 1)?;
     fixed::key(sink, key)?;

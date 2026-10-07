@@ -805,11 +805,14 @@ impl Core<NativeState> {
             0,
         )));
         let left = plan.keys.len();
+        // The seal publishes straight to the root: its rows' running total moves with it.
+        let encoded = self.encoded_after_changes(&changes)?;
         self.state.rows.publish_changes(
             sequence.0,
             changes,
             focal_memory::BudgetLane::Completion,
         )?;
+        self.state.encoded_rows = encoded;
         Ok(left)
     }
 }

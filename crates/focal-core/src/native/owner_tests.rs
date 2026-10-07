@@ -674,7 +674,8 @@ fn owner_snapshot_facade_pins_only_committed_facts_and_expires_retained_pages() 
 
 /// The admission check rests on this bound (rule 2): what a checkpoint of the
 /// committed root with every pending candidate published projects is never
-/// less than what that checkpoint actually encodes to, in rows or bytes.
+/// less than what that checkpoint actually encodes to, in rows or bytes; with
+/// nothing pending it is exactly what it encodes to.
 #[test]
 fn a_checkpoint_projection_bounds_the_checkpoint_it_projects() {
     use crate::native::record_codec::{EncodingLimits, checkpoint::EncodingPlan};
@@ -715,7 +716,8 @@ fn a_checkpoint_projection_bounds_the_checkpoint_it_projects() {
         projection.bytes,
         actual.bytes
     );
-    // Published, the projection is the committed root alone and still bounds it.
+    // Published, the projection is the committed root alone, and exactly what it encodes to:
+    // the rows' running total and the frame are the checkpoint, byte for byte.
     let after = owner.checkpoint_projection().unwrap();
-    assert!(after.rows >= actual.rows && after.bytes >= actual.bytes);
+    assert_eq!((after.rows, after.bytes), (actual.rows, actual.bytes));
 }
