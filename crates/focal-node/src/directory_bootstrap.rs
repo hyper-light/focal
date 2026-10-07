@@ -1,6 +1,6 @@
 //! Trusted first-directory bootstrap from committed root metadata. A plan is
 //! descriptive; only the actual root owner can mint an activation permit.
-use focal_consensus::{NodeConfig, SharedWal, StateRole};
+use focal_consensus::{NodeConfig, NodeStorage, StateRole};
 use focal_control::{
     AuthorityActivation, AuthorityInstallation, ControlAuthoritySnapshot, ControlBootstrap,
     ControlCommand, ControlError, ControlIdentity, ControlOptions, ControlRead, ControlReadResult,
@@ -805,12 +805,12 @@ pub(crate) fn next_first_directory_command(
 }
 
 impl PartitionBootstrapPermit {
-    /// Open the one assigned initial group on the existing physical WAL. The
+    /// Open the one assigned initial group on the node's storage. The
     /// caller must hold its bounded owner slot; this function creates no worker
     /// or actor. Expanded/reassigned groups require their placement controller.
     pub fn open(
         self,
-        wal: SharedWal,
+        storage: NodeStorage,
         budget: &MemoryBudget,
         image: Option<PartitionCheckpoint>,
     ) -> Result<BootstrappedDirectory, DirectoryBootstrapError> {
@@ -827,11 +827,11 @@ impl PartitionBootstrapPermit {
         } = self;
         let source = snapshot.source;
         let source_index = snapshot.source_index;
-        let mut replica = ControlReplica::open_on_wal(
+        let mut replica = ControlReplica::open_on_storage(
             plan.options(),
             plan.bootstrap(image)?,
             budget.clone(),
-            wal,
+            &storage,
         )?;
         // The founder's group while it is the founder alone is bootstrapped
         // here: its barrier, its activation, its authority. A group with

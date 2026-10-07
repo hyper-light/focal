@@ -31,8 +31,13 @@ async fn directory_owner_is_registered_before_blocking_recovery_and_retains_esca
         paused.resume().unwrap();
         immediate
     });
-    let (host, owner, outgoing) =
-        ControlHost::spawn_directory(permit, network.wal.clone(), budget.clone(), None).unwrap();
+    let (host, owner, outgoing) = ControlHost::spawn_directory(
+        permit,
+        focal_consensus::NodeStorage::Wal(network.wal.clone()),
+        budget.clone(),
+        None,
+    )
+    .unwrap();
     let before = host.progress();
     returned.send(()).unwrap();
     assert!(
@@ -107,8 +112,13 @@ async fn directory_startup_failure_closes_ingress_and_preserves_host_charge_afte
         }),
     )
     .unwrap();
-    let (host, owner, outgoing) =
-        ControlHost::spawn_directory(permit, wrong, budget.clone(), None).unwrap();
+    let (host, owner, outgoing) = ControlHost::spawn_directory(
+        permit,
+        focal_consensus::NodeStorage::Wal(wrong),
+        budget.clone(),
+        None,
+    )
+    .unwrap();
     // A stopped owner runs no more periods: its close is bounded by the
     // frozen window alone.
     crate::test_waits::charged(

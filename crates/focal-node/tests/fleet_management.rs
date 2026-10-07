@@ -54,7 +54,7 @@ fn fixture(path: &std::path::Path, max_sessions: usize, management_queue: usize)
     let (manager, owner, outgoing) = ReplicaFleet::spawn_managed(
         1,
         CLUSTER,
-        vec![wal.clone()],
+        vec![focal_consensus::NodeStorage::Wal(wal.clone())],
         vec![FleetTenant {
             tenant: ledger(1).tenant,
             weight: 1,
@@ -540,7 +540,10 @@ async fn removing_final_session_on_stalled_writer_does_not_block_live_installati
     let (manager, owner, outgoing) = ReplicaFleet::spawn_managed(
         1,
         CLUSTER,
-        vec![first_wal.clone(), second_wal.clone()],
+        vec![
+            focal_consensus::NodeStorage::Wal(first_wal.clone()),
+            focal_consensus::NodeStorage::Wal(second_wal.clone()),
+        ],
         vec![FleetTenant {
             tenant: ledger(1).tenant,
             weight: 1,

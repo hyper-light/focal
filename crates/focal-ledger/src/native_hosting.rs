@@ -274,12 +274,23 @@ type RestoredNative = (
     Vec<u8>,
 );
 
+/// The decoder a session's entry needs beyond its group's baseline: the native successor for an
+/// activation record or a native entry, which a replica must not persist before that floor is
+/// durable (18 §4–§5); none for any other. What a member on the shell holds a write for until its
+/// group's records state the floor (27 §15.5, O2).
+pub fn entry_needs(data: &[u8]) -> Option<[u8; 32]> {
+    (data.starts_with(ACTIVATION_MAGIC)
+        || engine::NativeEngine::<BuiltinNativeSchemas>::is_native_entry(data))
+    .then(native_format_hash)
+}
+
 /// A native entry, activation record or native checkpoint that a replica must
 /// not persist before its own successor decoder floor is durable.
 fn carries_native_history(message: &Message) -> bool {
-    message.entries.iter().any(|entry| {
-        entry.data.starts_with(ACTIVATION_MAGIC) || engine::NativeEngine::<BuiltinNativeSchemas>::is_native_entry(&entry.data)
-    }) || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V6_MAGIC))
+    message
+        .entries
+        .iter()
+        .any(|entry| entry_needs(&entry.data).is_some()) || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V6_MAGIC))
         || message.snapshot.as_deref().is_some_and(|snapshot| snapshot.data.starts_with(SNAPSHOT_V7_MAGIC))
 }
 

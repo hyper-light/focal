@@ -2,7 +2,7 @@
 //! receipts are process-local: callers reconcile durable placement before
 //! constructing sessions after a restart or an unknown installation outcome.
 use super::*;
-use focal_log::{SharedWal, WalWriterId};
+use focal_consensus::{NodeStorage, StorageWriter};
 use focal_memory::OwnerId;
 
 #[derive(Clone, Copy, Debug)]
@@ -80,7 +80,7 @@ pub struct FleetInstallation {
     group: [u8; 16],
     incarnation: FleetIncarnation,
     config: ReplicaConfig,
-    writer: WalWriterId,
+    writer: StorageWriter,
     host: ReplicaHost,
 }
 impl FleetInstallation {
@@ -172,7 +172,7 @@ pub(crate) struct ManagementState {
     cluster: [u8; 16],
     limits: WireLimits,
     tenants: BTreeMap<TenantId, (MemoryBudget, MemoryBudget)>,
-    writers: Vec<WalWriterId>,
+    writers: Vec<StorageWriter>,
     // This is the same physical queue lease held by grouped hosts and egress.
     // A removed session's watch cannot own storage shared by other sessions.
     _backing: std::sync::Arc<Allocation>,
@@ -349,8 +349,8 @@ impl FleetManager {
             || !candidate.session.is_budgeted_within(tenant)
             || !candidate
                 .session
-                .shared_wal()
-                .is_ok_and(|wal| state.writers.contains(&wal.writer_id()))
+                .storage_writer()
+                .is_ok_and(|writer| state.writers.contains(&writer))
             || candidate.config.queue_items < 4
             || candidate
                 .session
@@ -679,8 +679,8 @@ impl ManagementOwner {
                 && previous.config == replica.config
                 && replica
                     .session
-                    .shared_wal()
-                    .is_ok_and(|wal| previous.writer == wal.writer_id())
+                    .storage_writer()
+                    .is_ok_and(|writer| previous.writer == writer)
             {
                 return Ok(previous);
             }
@@ -725,9 +725,8 @@ impl ManagementOwner {
         };
         let writer = replica
             .session
-            .shared_wal()
-            .map_err(|_| FleetError::InvalidSession)?
-            .writer_id();
+            .storage_writer()
+            .map_err(|_| FleetError::InvalidSession)?;
         let id = replica.session.group_id();
         let config = replica.config.clone();
         let sender = HostSender::Group {
@@ -907,7 +906,7 @@ impl ReplicaFleet {
     pub fn spawn_managed(
         node: u64,
         cluster: [u8; 16],
-        writers: Vec<SharedWal>,
+        writers: Vec<NodeStorage>,
         tenants: Vec<FleetTenant>,
         budget: MemoryBudget,
         limits: WireLimits,
@@ -952,11 +951,11 @@ impl ReplicaFleet {
             if identity.node != node
                 || identity.cluster != cluster
                 || !writer.is_budgeted_within(&budget)
-                || writer_ids.contains(&writer.writer_id())
+                || writer_ids.contains(&writer.writer())
             {
                 return Err(LedgerError::Capacity);
             }
-            writer_ids.push(writer.writer_id());
+            writer_ids.push(writer.writer());
         }
         let shared_bytes = size_of::<FleetInput>()
             .checked_add(size_of::<ReplicationFrame>())

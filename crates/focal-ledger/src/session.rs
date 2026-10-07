@@ -759,6 +759,10 @@ impl Session {
     pub fn shared_wal(&self) -> Result<focal_consensus::SharedWal, LedgerError> {
         Ok(self.consensus.shared_wal()?)
     }
+    /// The writer the session's durable state goes through, whichever backend holds it.
+    pub fn storage_writer(&self) -> Result<focal_consensus::StorageWriter, LedgerError> {
+        Ok(self.consensus.storage_writer()?)
+    }
     /// Includes unstarted Ready work, such as the internal leadership ReadIndex
     /// queued by the last publication. Idle owners need not poll their sessions.
     pub fn has_ready(&self) -> bool {

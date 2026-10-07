@@ -24,7 +24,7 @@ use crate::{
     quorum_enrollment::{QuorumEnrollmentDriver, QuorumEnrollmentHost},
     replication::{drive_control_replication, drive_fleet_replication},
 };
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
 use focal_control::{
     ControlEvents, ControlOptions, ControlRead, ControlReadResult, ControlReplica,
 };
@@ -667,12 +667,14 @@ impl NetworkService {
             directory,
         } = prepared;
         owners.hold(directory, wal.clone())?;
+        // Every owner of the node's groups opens them through one handle (27 §15.11).
+        let storage = focal_consensus::NodeStorage::Wal(wal.clone());
         let founder = identity.node == state.genesis.founder.node;
         let (directory, directory_startup) = DirectoryStartup::new(
             identity.node,
             state.genesis.founder.cluster,
             state.genesis.founder.node,
-            wal.clone(),
+            storage.clone(),
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
             root.clone(),
         )?;
@@ -815,7 +817,7 @@ impl NetworkService {
         // durable owner of the data directory.
         let (content, session) = {
             let root = root.clone();
-            let wal = wal.clone();
+            let storage = storage.clone();
             let identity = identity.clone();
             let tenant = tenant.clone();
             tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
@@ -828,24 +830,24 @@ impl NetworkService {
                         chunk_bytes: 1024 * 1024,
                         max_manifest_bytes: 1024 * 1024,
                     },
-                    wal.disk_budget(),
+                    storage.disk_budget(),
                 )?;
                 let session = if founder {
-                    let consensus = DurableNode::open_on_wal_in(
+                    let consensus = storage.open_member(
                         NodeConfig::single(
                             identity.node,
                             identity.cluster,
                             identity.ledger.session.0,
                         ),
-                        wal.clone(),
                         &tenant,
+                        focal_ledger::entry_needs,
                     )?;
                     Some(Session::from_node_in_hosted(
                         identity.ledger,
                         consensus,
                         SessionLimits::default(),
                         &tenant,
-                        native_hosting(&root, &identity, wal.disk_budget())
+                        native_hosting(&root, &identity, storage.disk_budget())
                             .map_err(NodeError::Content)?,
                     )?)
                 } else {
@@ -921,7 +923,7 @@ impl NetworkService {
                     identity.ledger.tenant,
                     tenant.clone(),
                 ),
-                wal: wal.clone(),
+                storage: storage.clone(),
                 jobs: agent_jobs,
             },
             budget.child(64 * 1024 * 1024, 16 * 1024 * 1024)?,
@@ -1046,7 +1048,7 @@ impl NetworkService {
         let (fleet, owner, ledger_output) = ReplicaFleet::spawn_managed(
             identity.node,
             identity.cluster,
-            vec![wal.clone()],
+            vec![storage.clone()],
             vec![FleetTenant {
                 tenant: identity.ledger.tenant,
                 weight: 1,

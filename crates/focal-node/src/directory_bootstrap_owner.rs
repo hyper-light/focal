@@ -4,7 +4,6 @@
 use super::*;
 use crate::directory_bootstrap::{DirectoryBootstrapError, PartitionBootstrapPermit};
 use focal_directory::PartitionCheckpoint;
-use focal_log::SharedWal;
 
 const DIRECTORY_STACK_BYTES: usize = 2 * 1024 * 1024;
 
@@ -33,7 +32,7 @@ impl ControlHost {
     /// marks progress stopped and closes queued callers without granting success.
     pub fn spawn_directory(
         permit: PartitionBootstrapPermit,
-        wal: SharedWal,
+        storage: focal_consensus::NodeStorage,
         budget: MemoryBudget,
         image: Option<PartitionCheckpoint>,
     ) -> Result<(Self, ControlOwner, DirectoryReplication), DirectoryBootstrapError> {
@@ -107,7 +106,7 @@ impl ControlHost {
             .spawn(move || {
                 let _outcome = catch_unwind(AssertUnwindSafe(
                     || -> Result<(), DirectoryBootstrapError> {
-                        let opened = permit.open(wal, &budget, image)?;
+                        let opened = permit.open(storage, &budget, image)?;
                         let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
                         let owner = Owner {
                             replica: opened.into_replica(),

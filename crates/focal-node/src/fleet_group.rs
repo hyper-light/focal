@@ -285,12 +285,14 @@ impl ReplicaFleet {
                 .ok()
                 .and_then(|count| count.checked_add(1))
                 .ok_or(LedgerError::Capacity)?;
-            let writer = replica.session.shared_wal()?;
-            if !wal_owners
-                .iter()
-                .any(|retained| writer.is_same_writer(retained))
+            // A member on focal-log keeps its WAL's writer here past every removal; a member on
+            // the shell writes the node's log, which the node owns past the fleet.
+            if let Ok(writer) = replica.session.shared_wal()
+                && !wal_owners.iter().any(|retained: &focal_consensus::NodeStorage| {
+                    matches!(retained, focal_consensus::NodeStorage::Wal(wal) if writer.is_same_writer(wal))
+                })
             {
-                wal_owners.push(writer);
+                wal_owners.push(focal_consensus::NodeStorage::Wal(writer));
             }
             let ledger = replica.session.ledger();
             ReplicaHost::validate(&replica.config, &limits)?;
@@ -380,7 +382,7 @@ struct GroupOwner {
     // Physical writers outlive every logical-session removal. A final handle
     // may join its disk thread only after the entire fleet has stopped; one
     // stalled session cannot block another by dropping the last writer handle.
-    _wal_owners: Vec<focal_log::SharedWal>,
+    _wal_owners: Vec<focal_consensus::NodeStorage>,
     _allocation: Allocation,
     _backing: std::sync::Arc<Allocation>,
 }

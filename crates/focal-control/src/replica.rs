@@ -277,6 +277,24 @@ impl ControlReplica {
         })
     }
 
+    /// A control group's member through the node's storage handle (27 §15.11): on focal-log as
+    /// [`ControlReplica::open_on_wal`], on the shell as [`ControlReplica::open_on_shell`].
+    pub fn open_on_storage(
+        options: ControlOptions,
+        bootstrap: ControlBootstrap,
+        budget: MemoryBudget,
+        storage: &focal_consensus::NodeStorage,
+    ) -> Result<Self, ControlError> {
+        match storage {
+            focal_consensus::NodeStorage::Wal(wal) => {
+                Self::open_on_wal(options, bootstrap, budget, wal.clone())
+            }
+            focal_consensus::NodeStorage::Shell(shell) => {
+                Self::open_on_shell(options, bootstrap, budget, shell)
+            }
+        }
+    }
+
     fn open_with(
         options: ControlOptions,
         bootstrap: ControlBootstrap,
