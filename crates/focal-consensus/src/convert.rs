@@ -439,6 +439,176 @@ pub fn verify(
     Ok(())
 }
 
+/// Format: focal-log's directory under a node's data directory, never removed ([27] §15.3).
+pub const WAL_DIR: &str = "wal";
+/// Format: hyper-log's directory under a node's data directory.
+pub const RAFT_DIR: &str = "raft";
+/// Format: hyper-log's file, every group of the data directory on its device.
+pub const LOG_FILE: &str = "raft/log";
+/// Format: where the converted WAL's segments wait for the operator to remove them.
+pub const CONVERTED_DIR: &str = "wal-converted";
+
+/// The log a conversion writes: its configuration (from the device and the node, [27] §15.3) and
+/// the file's alignment.
+#[derive(Clone, Copy, Debug)]
+pub struct LogPlan {
+    pub config: hyper_log::Config,
+    pub align: hyper_block::buf::Alignment,
+}
+
+/// Why a data directory was not converted. Every refusal leaves the WAL the node's log.
+#[derive(Debug, thiserror::Error)]
+pub enum ConvertError {
+    /// The volume cannot hold the new log beside the WAL (step 1): nothing was written.
+    #[error("the conversion needs {needed} bytes free beside the WAL, and the volume has {free}")]
+    Disk { needed: u64, free: u64 },
+    #[error("conversion: {0}")]
+    Consensus(#[from] ConsensusError),
+    #[error("conversion's WAL: {0}")]
+    Wal(#[from] focal_log::LogError),
+    #[error("conversion's hyper-log: {0}")]
+    Log(hyper_log::LogError),
+    #[error("conversion I/O: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// What a conversion of a data directory did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Converted now: what was copied, and the segments moved aside.
+    Converted { copied: Converted, moved: usize },
+    /// Already past the commit point; the segments a crash left behind it were moved.
+    Finished { moved: usize },
+}
+
+/// The hyper-log log's id for the node `identity` names: the same for every attempt, so a
+/// conversion repeated after a crash names the log the first one would have.
+pub fn log_id(identity: focal_log::WalIdentity) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"focal.hyper-log.v1");
+    hasher.update(&identity.cluster);
+    hasher.update(&identity.node.to_le_bytes());
+    hasher.update(&identity.stream.to_le_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(hasher.finalize().as_bytes().get(..16).unwrap_or(&[0; 16]));
+    u128::from_le_bytes(id)
+}
+
+/// The bytes a conversion writes beside the WAL, at most: every live byte of the WAL once more,
+/// and for each write a frame's header and its padding to a block, and each group's records.
+/// Writes: the entries' frames (the live bytes over a frame's room, and one more), and each
+/// group's start and hard state alone.
+fn needed_bytes(
+    live: u64,
+    groups: usize,
+    plan: &LogPlan,
+    frame_room: usize,
+) -> Result<u64, ConvertError> {
+    let block = u64::try_from(plan.align.get()).map_err(|_| ConsensusError::Capacity)?;
+    let room = u64::try_from(frame_room.max(1)).map_err(|_| ConsensusError::Capacity)?;
+    let groups = u64::try_from(groups).map_err(|_| ConsensusError::Capacity)?;
+    let frames = live
+        .checked_div(room)
+        .ok_or(ConsensusError::Capacity)?
+        .checked_add(1)
+        .and_then(|n| n.checked_add(groups.checked_mul(2)?))
+        .ok_or(ConsensusError::Capacity)?;
+    let meta = u64::try_from(group_files::META_BOUND).map_err(|_| ConsensusError::Capacity)?;
+    frames
+        .checked_mul(block.checked_mul(2).ok_or(ConsensusError::Capacity)?)
+        .and_then(|n| n.checked_add(live))
+        .and_then(|n| n.checked_add(groups.checked_mul(meta.checked_add(block)?)?))
+        .ok_or(ConvertError::Consensus(ConsensusError::Capacity))
+}
+
+fn open_log_file(path: &Path, plan: &LogPlan) -> Result<DeviceFile, ConvertError> {
+    DeviceFile::open(
+        path,
+        true,
+        hyper_block::file::CachingRequest::PreferDirect,
+        plan.align,
+    )
+    .map_err(|error| ConvertError::Io(std::io::Error::other(error.to_string())))
+}
+
+/// Converts the data directory `root` from focal-log's WAL (`root/wal`) to hyper-log and the group
+/// files (`root/raft`): [27] §15.8, steps 1 to 7, in order, the WAL untouched until the commit point.
+/// The WAL must be closed; this holds its lock while it reads it. A directory already past the
+/// commit point has only its segments moved (step 7), as after a crash.
+pub fn convert_data_dir(
+    root: &Path,
+    identity: focal_log::WalIdentity,
+    plan: &LogPlan,
+    budget: &MemoryBudget,
+) -> Result<Outcome, ConvertError> {
+    let wal_dir = root.join(WAL_DIR);
+    let converted_dir = root.join(CONVERTED_DIR);
+    let id = log_id(identity);
+    match focal_log::conversion::storage(&wal_dir)? {
+        focal_log::conversion::Storage::Converted { log } if log == id => {
+            let moved = focal_log::conversion::move_segments(&wal_dir, &converted_dir)?;
+            return Ok(Outcome::Finished { moved });
+        }
+        focal_log::conversion::Storage::Converted { .. } => {
+            return Err(focal_log::LogError::Identity.into());
+        }
+        focal_log::conversion::Storage::Wal => {}
+    }
+    let wal = SharedWal::open_with_budget(
+        &wal_dir,
+        focal_log::WalOptions::new(identity),
+        focal_log::WalWriterLimits::default(),
+        budget.clone(),
+    )?;
+    // Step 1: the new store fits beside the old, or nothing is written.
+    let groups = wal.logs()?.len();
+    let live = wal.stats()?.live_bytes;
+    let raft = root.join(RAFT_DIR);
+    // A frame holds a segment less its header block and the frame's header (hyper-log's
+    // `frame_room`); a segment less two blocks is at most that, so the frames are not undercounted.
+    let block = u64::try_from(plan.align.get()).map_err(|_| ConsensusError::Capacity)?;
+    let frame_room = plan
+        .config
+        .segment_bytes
+        .checked_sub(block.checked_mul(2).ok_or(ConsensusError::Capacity)?)
+        .and_then(|room| usize::try_from(room).ok())
+        .ok_or(ConsensusError::Configuration(
+            "a segment of the new log holds no frame",
+        ))?;
+    let needed = needed_bytes(live, groups, plan, frame_room)?;
+    let free = focal_platform::available_space(root).unwrap_or(0);
+    if free < needed {
+        return Err(ConvertError::Disk { needed, free });
+    }
+    // Step 2: an earlier attempt's store is removed whole; the fence is still version 2, so nothing
+    // in it was acknowledged.
+    if raft.exists() {
+        std::fs::remove_dir_all(&raft)?;
+        focal_platform::sync_dir(root)?;
+    }
+    focal_log::create_durable_directory(&raft)?;
+    // Steps 3 and 4: every group copied, durable as written.
+    let log_path = root.join(LOG_FILE);
+    let log = hyper_log::Log::create(open_log_file(&log_path, plan)?, plan.config, id)
+        .map_err(ConvertError::Log)?;
+    focal_platform::sync_dir(&raft)?;
+    let copied = copy_groups(&wal, root, &log, budget)?;
+    log.close().map_err(ConvertError::Log)?;
+    if raft.join("groups").exists() {
+        focal_platform::sync_dir(&raft.join("groups"))?;
+    }
+    // Step 5: opened as a restart opens it, and compared.
+    let (log, _) = hyper_log::Log::open(open_log_file(&log_path, plan)?, plan.config, id)
+        .map_err(ConvertError::Log)?;
+    verify(&wal, root, &log, budget)?;
+    log.close().map_err(ConvertError::Log)?;
+    drop(wal);
+    // Step 6: the commit point. Step 7: the old segments aside.
+    focal_log::conversion::commit(&wal_dir, identity, id)?;
+    let moved = focal_log::conversion::move_segments(&wal_dir, &converted_dir)?;
+    Ok(Outcome::Converted { copied, moved })
+}
+
 #[cfg(test)]
 #[cfg_attr(
     test,

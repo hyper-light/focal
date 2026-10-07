@@ -205,3 +205,130 @@ fn a_group_on_the_fast_track_is_refused() {
         Err(ConsensusError::Configuration(_))
     ));
 }
+
+fn identity() -> WalIdentity {
+    WalIdentity {
+        node: 1,
+        cluster: [1; 16],
+        stream: 0,
+    }
+}
+
+fn plan() -> LogPlan {
+    LogPlan {
+        config: log_config(),
+        align: Alignment::new(4096).unwrap(),
+    }
+}
+
+/// A node's data directory whose `wal/` holds `recorded()`'s two groups, closed.
+fn node_dir() -> (tempfile::TempDir, Vec<CommittedEntry>) {
+    let (old, tail) = recorded();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(WAL_DIR)).unwrap();
+    for entry in std::fs::read_dir(old.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "LOCK" {
+            std::fs::copy(
+                entry.path(),
+                root.path().join(WAL_DIR).join(entry.file_name()),
+            )
+            .unwrap();
+        }
+    }
+    (root, tail)
+}
+
+fn segments(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".seg")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// 27 §15.8, steps 1 to 7. Do: convert a node's data directory, open its groups on the shell, and
+/// convert it again. Expect: the fence names the log, the segments are aside, no WAL writer opens,
+/// the shell hands over what the WAL held, and the repeat copies nothing.
+#[test]
+fn a_data_directory_converts_whole_and_once() {
+    let (root, tail) = node_dir();
+    let held = segments(&root.path().join(WAL_DIR));
+    let budget = budget();
+    let Outcome::Converted { copied, moved } =
+        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap()
+    else {
+        panic!("converted now");
+    };
+    assert_eq!((copied.groups, moved), (2, held));
+    assert_eq!(
+        focal_log::conversion::storage(&root.path().join(WAL_DIR)).unwrap(),
+        focal_log::conversion::Storage::Converted {
+            log: log_id(identity())
+        }
+    );
+    assert_eq!(segments(&root.path().join(WAL_DIR)), 0);
+    assert_eq!(segments(&root.path().join(CONVERTED_DIR)), held);
+    assert!(matches!(
+        SharedWal::open(root.path().join(WAL_DIR), WalOptions::new(identity())),
+        Err(focal_log::LogError::Converted)
+    ));
+    let align = Alignment::new(4096).unwrap();
+    let file = DeviceFile::open(
+        &root.path().join(LOG_FILE),
+        true,
+        CachingRequest::PreferDirect,
+        align,
+    )
+    .unwrap();
+    let (log, _) = Log::open(file, log_config(), log_id(identity())).unwrap();
+    let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
+    let mut floored =
+        DurableNode::open_on_shell(config(2), root.path(), &log, &budget, disk, no_needs).unwrap();
+    floored.confirm_decoder(HASH).unwrap();
+    let mut committed = Vec::new();
+    for _ in 0..100 {
+        committed.extend(floored.drain().unwrap().committed);
+        if !floored.has_ready() {
+            break;
+        }
+    }
+    assert_eq!(committed, tail);
+    drop(floored);
+    drop(log);
+    assert_eq!(
+        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap(),
+        Outcome::Finished { moved: 0 }
+    );
+}
+
+/// After a crash. Do: leave an earlier attempt's partial store, convert; and separately commit by
+/// hand and stop before the move, then convert. Expect: the partial store is replaced and the
+/// conversion completes; past the commit point only the move is finished.
+#[test]
+fn a_conversion_resumes_where_a_crash_left_it() {
+    let budget = budget();
+    let (root, _) = node_dir();
+    std::fs::create_dir_all(root.path().join(RAFT_DIR).join("groups")).unwrap();
+    std::fs::write(root.path().join(LOG_FILE), b"a torn earlier attempt").unwrap();
+    assert!(matches!(
+        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap(),
+        Outcome::Converted { .. }
+    ));
+    let (root, _) = node_dir();
+    let held = segments(&root.path().join(WAL_DIR));
+    focal_log::conversion::commit(&root.path().join(WAL_DIR), identity(), log_id(identity()))
+        .unwrap();
+    assert_eq!(
+        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap(),
+        Outcome::Finished { moved: held }
+    );
+}

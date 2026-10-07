@@ -643,6 +643,7 @@ dependencies = [
 name = "focal-consensus"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crc32fast",
  "focal-log",
  "focal-memory",
