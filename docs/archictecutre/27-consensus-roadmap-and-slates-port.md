@@ -1691,3 +1691,49 @@ R17's timed measurement at focal's level.
   across groups; a checkpoint here pays a file flush and a directory flush. The measurement records
   the cost of a checkpoint and the node's flushes a second. If the files do not hold, the
   alternative is a per-device image store, measured against them.
+
+### 15.11 As built: the conversion (2026-10-07)
+
+Steps 5 and 6 of §15.1, built on the branch `storage-shell`:
+
+- **The copy** (`focal_consensus::convert::copy_groups`): each group read through focal-log's
+  replay by the rules a member opens on (its identity record first, every other replayed as
+  `open_on_wal_in` does), one group held at a time, and written as the shell opens it: `meta`
+  first (O1), the image before the log's start moves (O3), the entries a frame at a time, the hard
+  state last. A group on the fast track is refused: the shell does not carry it yet.
+- **The verification** (`verify`): the log reopened as a restart opens it, each group compared with
+  the old replay (records, image and point, bounds, hard state, every entry, no proposals), and no
+  group in the log that the WAL does not hold.
+- **The commit point** (`focal_log::conversion`): fence version 3, version 2's fields and the log's
+  id. A version 2 binary decodes it as its own fields and refuses it (`LogError::Identity`) before
+  any replica opens; this binary refuses it as `LogError::Converted`. The segments move to
+  `wal-converted/` only past it, and are removed only as a directory of segments.
+- **The pass** (`convert_data_dir`): steps 1 to 7 in order. Step 1's bound is derived from the WAL's
+  own live bytes, a frame's header and padding for every write (a segment less two blocks bounds a
+  frame's room from below), and each group's records; a volume that cannot hold it is refused,
+  naming both numbers. The log's id is derived from the node's identity, so a repeat names the same
+  log; a directory past its commit point finishes step 7 only.
+- **The start** (`convert::start`) and `upgrade::STORAGE_LEVEL` (4), staged as `RAFT_KEPT_LEVEL` is.
+
+Evidence so far: the differential converts every member of a running three-member group (one
+checkpointed) and each opens on the shell where focal-log reopens it, every round after alike; a
+WAL of two groups (a decoder floor, a checkpoint, a tail) moves whole; verification refuses a
+changed record and a stray group; a partial earlier store is replaced; a crash between the commit
+and the move resumes with the move.
+
+**Measured on the shell before the switch** (`benches/commits.rs`, `FOCAL_BENCH_BACKEND=shell`,
+macOS, a loaded machine, to be repeated quiet against focal-log at the same commit): one voter, an
+entry at a time, 2.00 flushes a commit, about 9 ms; three voters 43–47 ms at the median, and 35,000
+to 54,000 entries a second pipelined. A commit alone pays two flushes on both backends (focal-log's
+commit frame after its data, hyper-log's confirming record); under load hyper-log's next frame
+confirms the last.
+
+**Open before the switch:**
+- hyper-log's `LogOpener` (hyper-raft PR #1, reviewed): owners spawned for the node's life claim
+  their groups through it, since the `Log` owns its threads and no owner holds it in an `Arc`.
+- The node's hyper-log `Config` from the device and the node (§15.3): a frame holds the largest
+  entry; a group retains twice its owner's checkpoint cadence (the control host's
+  `checkpoint_interval`, a session's `checkpoint_after_entries`) and what is uncommitted, and an
+  owner the log refuses for room checkpoints (durable.md §2.4).
+- `ControlReplica` over the shell, the owners' wiring through one storage handle, the commands
+  (`focal storage convert`, `remove-converted`), and §15.10's crash cuts and qualification.
