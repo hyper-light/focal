@@ -1729,6 +1729,18 @@ commit frame after its data, hyper-log's confirming record); under load hyper-lo
 confirms the last.
 
 **Open before the switch:**
+- **The log's growth needs the volume's admission** (found 2026-10-07). §15.3 takes `max_segments`
+  from "the node's disk budget for `DiskKind::Wal`", but focal's `DiskBudget` is a volume envelope
+  with a watermark and no per-kind quota. focal-log reserves from it before every write, so a full
+  volume refuses typed, before any acknowledgement. hyper-log grows its file a slot at a time up to
+  `max_segments` with no such reservation: a volume that fills first fails the growth write and
+  fences the log, stopping the node. A fixed quota cannot stand in for it: one sized to the free
+  space at open changes between starts (and a file past a smaller later quota must still open), and
+  one sized to the volume ignores the volume's other owners. Proposed to hyper-raft: a growth gate
+  the owner passes the log, asked for a segment before the file grows, whose refusal reads as the
+  quota reached (`Full`, the groups compact) and never as an I/O error; focal's gate is its
+  `DiskBudget`. The node's start (`storage_level`, `convert::start`, `node_log::config`,
+  `NodeStorage`) is wired once it lands.
 - hyper-log's `LogOpener` (hyper-raft PR #1, reviewed): owners spawned for the node's life claim
   their groups through it, since the `Log` owns its threads and no owner holds it in an `Arc`.
 - The node's hyper-log `Config` from the device and the node (§15.3): a frame holds the largest
