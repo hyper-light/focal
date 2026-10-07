@@ -71,6 +71,17 @@ pub(crate) fn available_space(path: &Path) -> Option<u64> {
     (ok != 0).then_some(available)
 }
 
+pub(crate) fn total_space(path: &Path) -> Option<u64> {
+    let wide = wide(path);
+    let mut total: u64 = 0;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `total` is a
+    // live aligned u64 written only on success; the two free counts we do not
+    // need are null. On failure the function returns 0 and leaves `total` at 0.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), ptr::null_mut(), &mut total, ptr::null_mut()) };
+    (ok != 0).then_some(total)
+}
+
 /// The current process user's SID bytes.
 pub(crate) fn current_owner() -> io::Result<Vec<u8>> {
     let mut token: HANDLE = ptr::null_mut();

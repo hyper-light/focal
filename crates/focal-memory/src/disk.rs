@@ -316,6 +316,25 @@ impl DiskReservation {
         let bytes = std::mem::replace(&mut self.bytes, 0);
         self.budget.release(self.kind, self.lane, bytes, true);
     }
+    /// Carve `bytes` of this promise into a reservation of its own, of the
+    /// same kind and lane, leaving the rest here: for an owner that admitted
+    /// several writes as they came and finishes them one at a time. Refused,
+    /// nothing changed, past what this one holds.
+    pub fn split_off(&mut self, bytes: u64) -> Result<DiskReservation, MemoryError> {
+        let rest = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(MemoryError::InvalidConfiguration(
+                "a disk reservation split past what it holds",
+            ))?;
+        self.bytes = rest;
+        Ok(DiskReservation {
+            budget: self.budget.clone(),
+            kind: self.kind,
+            lane: self.lane,
+            bytes,
+        })
+    }
     /// Keep only `bytes` of the promise (a write that turned out smaller).
     pub fn shrink_to(&mut self, bytes: u64) -> Result<(), MemoryError> {
         let released = self

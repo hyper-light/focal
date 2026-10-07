@@ -25,6 +25,8 @@ mod memory;
 pub use membership::*;
 mod checkpoint;
 pub mod convert;
+mod disk_growth;
+pub use disk_growth::DiskGrowth;
 mod log_metrics;
 pub mod node_log;
 pub use log_metrics::{LogLatency, LogMetrics};
