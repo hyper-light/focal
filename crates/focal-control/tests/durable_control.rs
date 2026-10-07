@@ -809,3 +809,97 @@ fn a_checkpoint_refused_while_raft_has_work_outstanding_leaves_the_replica_servi
     assert_eq!(cluster.nodes[2].root().unwrap().revision(), 2);
     cluster.nodes[0].checkpoint().unwrap();
 }
+
+/// The node's hyper-log in `dir`, made the first time (27 §15.3).
+fn shell_log(dir: &std::path::Path) -> focal_consensus::ShellLog {
+    let path = dir.join("raft.log");
+    let fresh = !path.exists();
+    let align = hyper_block::buf::Alignment::new(4096).unwrap();
+    let file = hyper_block::file::DeviceFile::open(
+        &path,
+        true,
+        hyper_block::file::CachingRequest::PreferDirect,
+        align,
+    )
+    .unwrap();
+    // A frame holds a control group's largest entry: segments of 16 MiB hold the 8 MiB most a
+    // group's entry may be (`NodeConfig::validate`), with the frame's header and block.
+    let config = hyper_log::Config {
+        segment_bytes: 16 * 1024 * 1024,
+        max_segments: 16,
+        max_groups: 4,
+        group_entries: 1 << 12,
+        group_bytes: 8 << 20,
+        group_cache: 1 << 16,
+        queue_submissions: 64,
+        waits: hyper_log::Waits::Never,
+    };
+    if fresh {
+        hyper_log::Log::create(file, config, 0x0063_6f6e_7472_6f6c).unwrap()
+    } else {
+        hyper_log::Log::open(file, config, 0x0063_6f6e_7472_6f6c)
+            .unwrap()
+            .0
+    }
+}
+
+fn unbounded_disk() -> focal_memory::DiskBudget {
+    focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::unbounded()).unwrap()
+}
+
+/// 27 §15.6–15.7: control groups over the shell. Do: two partition groups share one hyper-log, each
+/// commits an enrollment, one checkpoints, both are let go and reopened on the shell. Expect: each
+/// reopens with its own receipt and no other's, the checkpointed one from its image.
+#[test]
+fn independent_partition_groups_share_one_hyper_log_without_sharing_control_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_bootstrap = partition_bootstrap(1);
+    let second_bootstrap = partition_bootstrap(2);
+    let (first_receipt, second_receipt) = {
+        let log = shell_log(dir.path());
+        let open = |options, bootstrap| {
+            ControlReplica::open_on_shell(
+                options,
+                bootstrap,
+                budget(),
+                dir.path(),
+                &log,
+                unbounded_disk(),
+            )
+            .unwrap()
+        };
+        let mut first = open(partition_options(1), first_bootstrap.clone());
+        let mut second = open(partition_options(2), second_bootstrap.clone());
+        leader(&mut first);
+        leader(&mut second);
+        let first_receipt = commit(&mut first, request(1, 1, 0, enroll(1)));
+        assert_eq!(second.partition().unwrap().revision(), 0);
+        let second_receipt = commit(&mut second, request(1, 1, 0, enroll(2)));
+        first.checkpoint().unwrap();
+        (first_receipt, second_receipt)
+    };
+    let log = shell_log(dir.path());
+    let open = |options, bootstrap| {
+        ControlReplica::open_on_shell(
+            options,
+            bootstrap,
+            budget(),
+            dir.path(),
+            &log,
+            unbounded_disk(),
+        )
+        .unwrap()
+    };
+    let mut first = open(partition_options(1), first_bootstrap);
+    let mut second = open(partition_options(2), second_bootstrap);
+    first.drain(&Evidence).unwrap();
+    second.drain(&Evidence).unwrap();
+    assert_eq!(
+        first.receipt(first_receipt.request).unwrap(),
+        Some(first_receipt)
+    );
+    assert_eq!(
+        second.receipt(second_receipt.request).unwrap(),
+        Some(second_receipt)
+    );
+}

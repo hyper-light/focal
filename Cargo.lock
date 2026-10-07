@@ -673,6 +673,8 @@ dependencies = [
  "focal-log",
  "focal-memory",
  "focal-model",
+ "hyper-block",
+ "hyper-log",
  "postcard",
  "serde",
  "tempfile",

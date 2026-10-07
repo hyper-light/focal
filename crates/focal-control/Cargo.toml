@@ -19,6 +19,8 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 focal-log = { version = "0.1.0", path = "../focal-log" }
+hyper-block.workspace = true
+hyper-log.workspace = true
 
 [lints]
 workspace = true

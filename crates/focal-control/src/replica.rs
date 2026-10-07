@@ -256,12 +256,44 @@ impl ControlReplica {
         budget: MemoryBudget,
         wal: SharedWal,
     ) -> Result<Self, ControlError> {
+        Self::open_with(options, bootstrap, budget, |config, budget| {
+            DurableNode::open_on_wal_in(config, wal, budget)
+        })
+    }
+
+    /// A control group's member over hyper-durable's shell (27 §15.7): its log one group of the
+    /// node's hyper-log `log`, its records and image under the data directory `root`, its disk
+    /// charged to `disk`. A control group's entries need no decoder beyond its baseline, so no
+    /// write is held for a record. It applies on a commit its log holds, as over focal-log
+    /// (`StateMachine::acts_at_start` for every entry, 27 §15.6).
+    pub fn open_on_shell(
+        options: ControlOptions,
+        bootstrap: ControlBootstrap,
+        budget: MemoryBudget,
+        root: &Path,
+        log: &focal_consensus::ShellLog,
+        disk: focal_memory::DiskBudget,
+    ) -> Result<Self, ControlError> {
+        Self::open_with(options, bootstrap, budget, |config, budget| {
+            DurableNode::open_on_shell(config, root, log, budget, disk, |_| None)
+        })
+    }
+
+    fn open_with(
+        options: ControlOptions,
+        bootstrap: ControlBootstrap,
+        budget: MemoryBudget,
+        open: impl FnOnce(
+            focal_consensus::NodeConfig,
+            &MemoryBudget,
+        ) -> Result<DurableNode, focal_consensus::ConsensusError>,
+    ) -> Result<Self, ControlError> {
         options.validate()?;
         let identity = bootstrap.identity(&options)?;
         let founded_from_image = bootstrap.is_image();
         let machine = Machine::restore(bootstrap, &options, &budget)?;
         let retries = RetryState::restore(BTreeMap::new(), &options.limits, &budget, 0)?;
-        let mut node = DurableNode::open_on_wal_in(options.consensus.clone(), wal, &budget)?;
+        let mut node = open(options.consensus.clone(), &budget)?;
         // As `open`: a control group applies on a commit its log holds.
         node.apply_on_written_commit();
         Ok(Self {

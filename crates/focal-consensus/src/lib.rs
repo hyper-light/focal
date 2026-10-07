@@ -25,6 +25,8 @@ mod memory;
 pub use membership::*;
 mod checkpoint;
 pub mod convert;
+/// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.
+pub type ShellLog = hyper_log::Log<hyper_block::file::DeviceFile>;
 mod core_state;
 mod decoder;
 pub mod envelope;
