@@ -1,6 +1,7 @@
 //! The node's storage handle over both backends: a member opened through it names the handle's
 //! writer, two handles on one log are two writers, and the handle restores as it opens.
 use super::*;
+use crate::LogMetrics;
 use focal_log::WalOptions;
 use focal_memory::DiskBudgetConfig;
 use hyper_block::buf::Alignment;
@@ -128,5 +129,46 @@ fn the_handle_restores_a_group_on_either_backend() {
     assert_eq!(restored.snapshot_index(), 9);
     assert_eq!(restored.storage_writer().unwrap(), shell.writer());
     drop(restored);
+    drop(log.close().unwrap());
+}
+
+/// The node log's counts as focal reports them (doc 27 §15.10): what the log measured, its
+/// quantiles in order, and no flush in progress once every write was answered.
+#[test]
+fn the_node_log_reports_what_it_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = log_in(dir.path());
+    let quiet = LogMetrics::of(&log.stats(None).unwrap());
+    assert_eq!(quiet.flush.p50_ns, None, "nothing timed reads as nothing");
+    for index in 1..=8u64 {
+        log.write(
+            1,
+            hyper_log::Update {
+                entries: Some(hyper_log::Entries {
+                    first: index,
+                    entries: vec![hyper_log::Entry {
+                        term: 1,
+                        bytes: vec![1; 512],
+                    }],
+                }),
+                ..hyper_log::Update::default()
+            },
+        )
+        .unwrap();
+    }
+    let stats = log.stats(None).unwrap();
+    let metrics = LogMetrics::of(&stats);
+    assert_eq!(metrics.frames, stats.frames);
+    assert_eq!(metrics.updates, 8);
+    assert_eq!(metrics.flushes, stats.flushes);
+    assert_eq!(metrics.flush.count, stats.flush.count());
+    assert_eq!(metrics.commit_wait.count, 8);
+    let (p50, p99, p999) = (
+        metrics.commit_wait.p50_ns.unwrap(),
+        metrics.commit_wait.p99_ns.unwrap(),
+        metrics.commit_wait.p999_ns.unwrap(),
+    );
+    assert!(p50 <= p99 && p99 <= p999);
+    assert_eq!(metrics.flushing_ns, None);
     drop(log.close().unwrap());
 }

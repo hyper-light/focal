@@ -7,9 +7,9 @@
 //! first), so a node never runs the old WAL behind the converted log. This binary refuses it too,
 //! `LogError::Converted`: past the commit point the WAL is read only by the conversion's reader.
 //!
-//! **The old segments** stay until the operator removes them ([`move_segments`], then `focal storage
-//! remove-converted`): never removed by the conversion, so an old binary never finds a WAL directory
-//! with no fence and makes a fresh, empty WAL — a voter that forgot what it acknowledged.
+//! **The old segments** stay until the operator removes them ([`move_segments`], then `focal remove
+//! converted-storage`): never removed by the conversion, so an old binary never finds a WAL
+//! directory with no fence and makes a fresh, empty WAL — a voter that forgot what it acknowledged.
 use super::*;
 
 /// Format: the fence's version once the groups moved to hyper-log.
@@ -170,7 +170,7 @@ pub fn move_segments(directory: &Path, converted: &Path) -> Result<usize, LogErr
     Ok(moved)
 }
 
-/// Removes `converted`, the segments the conversion moved there (`focal storage remove-converted`): only
+/// Removes `converted`, the segments the conversion moved there (`focal remove converted-storage`): only
 /// past the commit point of `directory`, and only a directory that holds nothing but segments, so a wrong
 /// path is refused rather than emptied.
 pub fn remove_segments(directory: &Path, converted: &Path) -> Result<usize, LogError> {

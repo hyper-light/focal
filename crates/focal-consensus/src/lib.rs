@@ -25,7 +25,9 @@ mod memory;
 pub use membership::*;
 mod checkpoint;
 pub mod convert;
+mod log_metrics;
 pub mod node_log;
+pub use log_metrics::{LogLatency, LogMetrics};
 mod node_storage;
 pub use node_storage::{LogWriterId, NodeStorage, ShellStorage, StorageWriter};
 /// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.

@@ -1545,7 +1545,11 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
-            wal: self.wal.stats().ok(),
+            storage: self
+                .wal
+                .stats()
+                .ok()
+                .map(crate::metrics::StorageMetrics::Wal),
             fleet: self.handles.fleet.status(),
             root: RootMetrics {
                 peer_aggregates: members,

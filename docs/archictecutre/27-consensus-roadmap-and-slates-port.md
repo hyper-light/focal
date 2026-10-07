@@ -1340,7 +1340,7 @@ The commits in focal, in order:
    `hyper_durable::StateMachine`.
 4. **The shell on hyper-log** (§15.7), opened by a constructor that only the simulations and tests
    use at first. focal-consensus's simulation and election suites run on it.
-5. **The conversion** (§15.8): one code path, run by `focal storage convert` and at start, with
+5. **The conversion** (§15.8): one code path, run by `focal convert storage` and at start, with
    every ordering edge cut.
 6. **The level**: `STORAGE_LEVEL`, the switch at start, and the old binary's refusal qualified.
 7. **Measurements and documents** (§15.10).
@@ -1541,7 +1541,7 @@ reproduce exactly stops the work and reopens the question for that owner alone.
 **Never remove the old WAL directory.** An old binary that opens a directory with no `CURRENT` and
 no `INITIALIZED` makes a fresh, empty WAL: a voter that forgot what it acknowledged.
 
-**One code path**, run by `focal storage convert` and at start. It holds `wal/LOCK` throughout.
+**One code path**, run by `focal convert storage` and at start. It holds `wal/LOCK` throughout.
 
 1. **Charge the disk budget.** The new store is written beside the old WAL, so its bytes are
    checked first. A store that does not fit is refused, typed, naming the bytes it needs and the
@@ -1574,7 +1574,7 @@ no `INITIALIZED` makes a fresh, empty WAL: a voter that forgot what it acknowled
    preserved binary actually answers.
 7. **Move the old segments** to `wal-converted/`, then flush both directories.
    - `wal-converted/` stays charged to the disk budget until it is removed.
-   - It is removed by `focal storage remove-converted`, never by a bare `rm`. The command
+   - It is removed by `focal remove converted-storage`, never by a bare `rm`. The command
      refuses unless `CURRENT` is version 3 and hyper-log opens and verifies.
 
 **After a crash.**
@@ -1596,7 +1596,7 @@ without `raft/`.
   assumes.
 - A node converts at its first start after the fence opens at `STORAGE_LEVEL` (24 §21; 08: stepped
   complexity), or at a later start if the read cannot answer. A rollout costs each node one restart.
-- `focal storage convert` runs offline under the lock and refuses unless the fence is open. It is
+- `focal convert storage` runs offline under the lock and refuses unless the fence is open. It is
   for rehearsals and staged rollouts, like `cluster replicas activate-native`.
 - A start below the fence never converts: the binary runs `DurableNode` on focal-log, unchanged.
 - A cluster founded at `STORAGE_LEVEL` starts on hyper-log.
@@ -1769,5 +1769,12 @@ terminating goal's tenth condition), so the switch is measured on flushes as wel
   entry; a group retains twice its owner's checkpoint cadence (the control host's
   `checkpoint_interval`, a session's `checkpoint_after_entries`) and what is uncommitted, and an
   owner the log refuses for room checkpoints (durable.md §2.4).
+- The node's storage metrics name their backend (`metrics::StorageMetrics`): focal-log's writer
+  exports `focal_wal_*`, the node log under the shell `focal_log_*` (frames, updates, bytes and
+  flushes as counters; each flush, each frame's writes and each update's wait for its flush as a
+  summary in nanoseconds with its 0.5, 0.99 and 0.999 quantiles; and how long the flush in
+  progress has run, so a stalled device shows before any histogram hears of it), taken from
+  hyper-log's statistics by `focal_consensus::LogMetrics`. An owner that holds only the log's
+  opener reads them through `LogOpener::stats` (hyper-raft `log-preallocate-followups`).
 - `ControlReplica` over the shell, the owners' wiring through one storage handle, the commands
-  (`focal storage convert`, `remove-converted`), and §15.10's crash cuts and qualification.
+  (`focal convert storage`, `focal remove converted-storage`), and §15.10's crash cuts and qualification.

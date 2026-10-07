@@ -610,7 +610,9 @@ impl MetricsSnapshot {
             }),
             staged_uploads: wide,
             staged_bytes: wide,
-            wal: Some(focal_log::WalWriterStats::default()),
+            storage: Some(crate::metrics::StorageMetrics::Wal(
+                focal_log::WalWriterStats::default(),
+            )),
             fleet: FleetStatus {
                 latest_sequence: wide,
                 installed: usize::MAX,
