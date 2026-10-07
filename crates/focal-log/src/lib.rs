@@ -219,6 +219,8 @@ pub enum LogError {
     ReceiptConsumed,
     #[error("WAL holds moved frames; its groups replay through the shared writer's index")]
     Relocated,
+    #[error("WAL was converted to hyper-log; its groups are read there (27 §15.8)")]
+    Converted,
 }
 
 pub struct Wal {
@@ -243,6 +245,7 @@ pub struct Wal {
     fault: Option<FaultPoint>,
 }
 
+pub mod conversion;
 mod writer;
 #[cfg(feature = "test-support")]
 pub use writer::{MAX_QUEUE_ITEMS, WalPause};
@@ -309,6 +312,9 @@ impl Wal {
         let current = fence_paths.current.clone();
         let (position, base) = if current.exists() {
             let fence = read_fence(&current)?;
+            if fence.version == conversion::FENCE_CONVERTED {
+                return Err(LogError::Converted);
+            }
             if fence.version != FENCE_VERSION || fence.identity != options.identity {
                 return Err(LogError::Identity);
             }
@@ -958,7 +964,8 @@ fn install_fence(
     sync_dir(directory)
 }
 
-fn read_fence(path: &Path) -> Result<Fence, LogError> {
+/// The fence's payload, its magic, length and checksum checked: what every version's fields are read from.
+fn fence_payload(path: &Path) -> Result<Vec<u8>, LogError> {
     let file = File::open(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_FENCE_BYTES.saturating_add(1))
@@ -987,6 +994,17 @@ fn read_fence(path: &Path) -> Result<Fence, LogError> {
     if crc32fast::hash(payload) != checksum {
         return Err(corrupt(path, 0, "fence checksum mismatch"));
     }
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(payload.len())
+        .map_err(|_| LogError::Capacity)?;
+    owned.extend_from_slice(payload);
+    Ok(owned)
+}
+
+fn read_fence(path: &Path) -> Result<Fence, LogError> {
+    let bytes = fence_payload(path)?;
+    let payload = bytes.as_slice();
     let (version, _) = postcard::take_from_bytes::<u32>(payload)
         .map_err(|_| corrupt(path, 0, "invalid fence payload"))?;
     if version == 1 {
