@@ -332,3 +332,37 @@ fn a_conversion_resumes_where_a_crash_left_it() {
         Outcome::Finished { moved: held }
     );
 }
+
+/// 27 §15.8, "When it runs". Do: ask what a start opens, below and at the level, for a node's WAL,
+/// an empty directory, a converted one, and the stores the fence does not name. Expect: the WAL below
+/// the level; a conversion at it; the shell for a store founded there and for a converted one; and a
+/// refusal for a `raft/` with no commit point, a commit point with no log, and another node's log.
+#[test]
+fn a_start_opens_what_the_fence_and_the_directory_state() {
+    let (root, _) = node_dir();
+    assert_eq!(start(root.path(), identity(), false).unwrap(), Start::Wal);
+    assert_eq!(
+        start(root.path(), identity(), true).unwrap(),
+        Start::Convert
+    );
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(start(empty.path(), identity(), false).unwrap(), Start::Wal);
+    assert_eq!(start(empty.path(), identity(), true).unwrap(), Start::Shell);
+    // A store the fence does not name, below the level.
+    std::fs::create_dir_all(root.path().join(RAFT_DIR)).unwrap();
+    assert!(start(root.path(), identity(), false).is_err());
+    std::fs::remove_dir_all(root.path().join(RAFT_DIR)).unwrap();
+    // Converted: the shell, at the level or (never lowered) below it.
+    let budget = budget();
+    convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap();
+    assert_eq!(start(root.path(), identity(), true).unwrap(), Start::Shell);
+    assert_eq!(start(root.path(), identity(), false).unwrap(), Start::Shell);
+    // Another node's commit point, and a commit point whose log is gone.
+    let other = WalIdentity {
+        node: 2,
+        ..identity()
+    };
+    assert!(start(root.path(), other, true).is_err());
+    std::fs::remove_file(root.path().join(LOG_FILE)).unwrap();
+    assert!(start(root.path(), identity(), true).is_err());
+}

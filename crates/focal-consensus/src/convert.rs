@@ -609,6 +609,63 @@ pub fn convert_data_dir(
     Ok(Outcome::Converted { copied, moved })
 }
 
+/// What a node's start opens its groups on ([27] §15.8, "When it runs").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// focal-log's WAL, as before: the fence does not open the level.
+    Wal,
+    /// Convert first ([`convert_data_dir`]), then the shell.
+    Convert,
+    /// The shell over hyper-log: converted already, or a store founded at the level.
+    Shell,
+}
+
+/// What node `identity`'s start opens its groups on, from what its data directory `root` holds and
+/// whether the upgrade fence opens the storage level (`fence_open`). A directory that holds a store
+/// the fence does not name is refused, never opened as either: a `raft/` with no commit point (an
+/// interrupted conversion is finished only by a conversion, when the fence is open), or a commit
+/// point with no `raft/`, or one naming another log.
+pub fn start(
+    root: &Path,
+    identity: focal_log::WalIdentity,
+    fence_open: bool,
+) -> Result<Start, ConvertError> {
+    let wal_dir = root.join(WAL_DIR);
+    let raft = root.join(RAFT_DIR);
+    match focal_log::conversion::storage(&wal_dir)? {
+        focal_log::conversion::Storage::Converted { log } => {
+            if log != log_id(identity) {
+                return Err(focal_log::LogError::Identity.into());
+            }
+            if !raft.join("log").exists() {
+                return Err(ConsensusError::Corruption(
+                    "the WAL is converted and the converted log is missing",
+                )
+                .into());
+            }
+            Ok(Start::Shell)
+        }
+        focal_log::conversion::Storage::Wal => {
+            let holds_wal =
+                wal_dir.join("CURRENT").exists() || wal_dir.join("INITIALIZED").exists();
+            if !fence_open {
+                if raft.exists() {
+                    return Err(ConsensusError::Corruption(
+                        "a converted store the WAL's fence does not name",
+                    )
+                    .into());
+                }
+                return Ok(Start::Wal);
+            }
+            if holds_wal {
+                Ok(Start::Convert)
+            } else {
+                Ok(Start::Shell)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(
     test,
