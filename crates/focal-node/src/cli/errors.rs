@@ -121,6 +121,18 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
         {
             return Failure::error("permission_denied", 2);
         }
+        // A data directory other users may write to: the mode to fix, not
+        // corruption to look for.
+        if let Some(focal_node::embedded::NodeError::NotPrivate(_)) =
+            current.downcast_ref::<focal_node::embedded::NodeError>()
+        {
+            return Failure::error("permission_denied", 2);
+        }
+        if let Some(focal_node::cluster_admin::ClusterAdminError::NotPrivate(_)) =
+            current.downcast_ref::<focal_node::cluster_admin::ClusterAdminError>()
+        {
+            return Failure::error("permission_denied", 2);
+        }
         cause = current.source();
     }
     if let Some(error) = error.downcast_ref::<serde_json::Error>() {

@@ -65,6 +65,15 @@ pub enum NodeError {
     Encoding(#[from] postcard::Error),
     #[error("canonical content: {0}")]
     Canonical(#[from] focal_model::CanonicalError),
+    /// The data directory is not this user's, or another user may write to
+    /// it and so replace the node's identity or a journal's entry: refused
+    /// at start, before anything is kept there. One others may read is the
+    /// node's: what it keeps private it opens private.
+    #[error(
+        "data directory {} must be this user's and writable by no other user (`focal prepare-volume --owner UID:GID`)",
+        .0.display()
+    )]
+    NotPrivate(std::path::PathBuf),
     #[error("data directory already has a live owner")]
     Locked,
     #[error("node identity or stored policy is corrupt or incompatible")]
