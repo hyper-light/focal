@@ -95,7 +95,7 @@ fn limits() -> Limits {
 }
 fn wire(key: Key, row: &Row) -> Vec<u8> {
     let mut body = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut body, row, f::binding(1).ledger).unwrap();
+    rows::value(&mut body, key, row, f::binding(1).ledger).unwrap();
     let write = |sink: &mut dyn bytes::Sink| -> Result<(), CodecError> {
         // Sized adapter avoids allocating a body buffer between measurement and
         // enclosing framing; this test intentionally exercises actual writers.
@@ -112,7 +112,7 @@ fn wire(key: Key, row: &Row) -> Vec<u8> {
         write_u8(&mut sink, 1)?;
         fixed::key(&mut sink, key)?;
         write_count(&mut sink, body.len())?;
-        rows::value(&mut sink, row, f::binding(1).ledger)
+        rows::value(&mut sink, key, row, f::binding(1).ledger)
     };
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
     write(&mut size).unwrap();

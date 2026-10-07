@@ -1263,7 +1263,7 @@ impl<'a> NativeView<'a> {
         }
     }
     pub fn recorded(&self, invocation: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.0.get(Key::Outcome(invocation.into())))
+        self.0.outcome(invocation.into())
     }
     pub fn definition(&self, id: ValidationId) -> Option<&'a validation::Declaration> {
         as_definition(self.0.get(Key::Definition(id)))

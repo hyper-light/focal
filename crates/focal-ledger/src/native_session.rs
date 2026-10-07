@@ -149,6 +149,14 @@ impl NativeSessionLimits {
                 native: focal_core::native::NativeLimits {
                     range: focal_memory::RangeConfig {
                         page_entries: 128,
+                        // A leaf is a memory page (a B-tree node sized to the unit the
+                        // system moves, Bayer and McCreight 1972): a mutation rebuilds its
+                        // touched leaves whole, so a leaf's bytes are what each costs to
+                        // copy, and the page is what the copy faults in. Measured on
+                        // macOS at 16 KiB against the 64 KiB it replaced: 35% fewer
+                        // allocations and 38% fewer bytes per committed claim, the
+                        // same live heap (docs/qualification/allocations-2026-09-29.md §9).
+                        page_bytes: focal_platform::memory_page_bytes().unwrap_or(usize::MAX),
                         max_batch_entries: 256,
                         ..focal_memory::RangeConfig::default()
                     },

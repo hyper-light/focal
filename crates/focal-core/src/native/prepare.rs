@@ -547,7 +547,7 @@ impl Core<NativeState> {
             state: &self.state,
             tail: pending.next_back(),
         };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.key().into()))) {
+        if let Some(outcome) = view.outcome(input.key().into()) {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,
@@ -641,7 +641,7 @@ impl Core<NativeState> {
             state: &self.state,
             tail: pending.next_back(),
         };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(request.into()))) {
+        if let Some(outcome) = view.outcome(request.into()) {
             return if outcome.intent == intent {
                 Ok(RequestCheck::Existing {
                     outcome,
@@ -708,7 +708,7 @@ impl Core<NativeState> {
             state: &self.state,
             tail: pending.next_back(),
         };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.key().into()))) {
+        if let Some(outcome) = view.outcome(input.key().into()) {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,

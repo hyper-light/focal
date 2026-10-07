@@ -1,4 +1,4 @@
-use super::{affinity, family};
+use super::{affinity, family, order_key};
 use crate::native::*;
 use std::cmp::Ordering;
 
@@ -162,6 +162,17 @@ fn the_order_is_total_agrees_with_equality_and_ends_at_the_sentinel() {
                     assert!(a < c, "{a:?} < {b:?} < {c:?}");
                 }
             }
+        }
+    }
+}
+
+/// The comparison that stops at the first deciding field is the full order key's, on every pair of the corpus.
+#[test]
+fn the_early_comparison_is_the_order_keys() {
+    let keys = corpus();
+    for a in &keys {
+        for b in &keys {
+            assert_eq!(a.cmp(b), order_key(a).cmp(&order_key(b)), "{a:?} vs {b:?}");
         }
     }
 }

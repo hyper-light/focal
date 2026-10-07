@@ -159,6 +159,12 @@ impl Default for RangeConfig {
 }
 
 impl RangeConfig {
+    /// The full charge of a leaf of `page_entries` entries that own no heap: what a full leaf of inline
+    /// entries costs, its bookkeeping included.
+    pub fn inline_leaf_bytes<K, V>(&self) -> Result<usize, MemoryError> {
+        page_charge::<K, V>(self.page_entries, 0)
+    }
+
     fn validate(self) -> Result<Self, MemoryError> {
         if self.page_entries == 0
             || self.page_bytes == 0

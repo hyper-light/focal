@@ -178,7 +178,7 @@ fn altered(
         Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)),
         Change::Put(Entry::new(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(outcome),
+            Row::Outcome(OutcomeRow::stored(&outcome, outcome.ledger).unwrap()),
             0,
         )),
         Change::Put(Entry::new(

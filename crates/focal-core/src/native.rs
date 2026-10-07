@@ -643,6 +643,73 @@ pub struct NativeOutcome {
     pub result_testaments: u32,
     pub events: u32,
 }
+/// An outcome as its row holds it: the ledger is its store's and the invocation is its row's key, so the row
+/// keeps neither. A whole outcome is 232 bytes and set the size of every row of every family (a unit index
+/// row among them); this is under half of it. The record and checkpoint bytes are unchanged: the codec
+/// writes the whole outcome, expanded from the key and the store's ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OutcomeRow {
+    pub(super) sequence: SessionSeq,
+    pub(super) logical_time: u64,
+    pub(super) operation: NativeOperation,
+    pub(super) intent: ContentHash,
+    pub(super) created: u32,
+    pub(super) changed: u32,
+    pub(super) definitions: u32,
+    pub(super) evaluations: u32,
+    pub(super) artifacts: u32,
+    pub(super) results: u32,
+    pub(super) receipts: u32,
+    pub(super) responses: u32,
+    pub(super) result_testaments: u32,
+    pub(super) events: u32,
+}
+impl OutcomeRow {
+    /// The row of `outcome` in a store of `ledger`; an outcome of another ledger is refused, never kept as
+    /// this one's.
+    pub(super) fn stored(outcome: &NativeOutcome, ledger: LedgerId) -> Result<Self, ContractError> {
+        if outcome.ledger != ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        Ok(Self {
+            sequence: outcome.sequence,
+            logical_time: outcome.logical_time,
+            operation: outcome.operation,
+            intent: outcome.intent,
+            created: outcome.created,
+            changed: outcome.changed,
+            definitions: outcome.definitions,
+            evaluations: outcome.evaluations,
+            artifacts: outcome.artifacts,
+            results: outcome.results,
+            receipts: outcome.receipts,
+            responses: outcome.responses,
+            result_testaments: outcome.result_testaments,
+            events: outcome.events,
+        })
+    }
+    /// The whole outcome, from the store's ledger and the row's key.
+    pub(super) fn expand(&self, ledger: LedgerId, invocation: NativeInvocation) -> NativeOutcome {
+        NativeOutcome {
+            ledger,
+            invocation,
+            sequence: self.sequence,
+            logical_time: self.logical_time,
+            operation: self.operation,
+            intent: self.intent,
+            created: self.created,
+            changed: self.changed,
+            definitions: self.definitions,
+            evaluations: self.evaluations,
+            artifacts: self.artifacts,
+            results: self.results,
+            receipts: self.receipts,
+            responses: self.responses,
+            result_testaments: self.result_testaments,
+            events: self.events,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEventKind {
     Monitor(NativeMonitorEvent),
@@ -1264,7 +1331,7 @@ enum Row {
     Response(OwnedResponse),
     ResultTestament(OwnedResultTestament),
     ClaimResultTestament(TestamentId),
-    Outcome(NativeOutcome),
+    Outcome(OutcomeRow),
     Event(OwnedEvent),
     ClaimContent(OwnedClaimContent),
     ClaimIdentity(ClaimId),
@@ -1328,7 +1395,12 @@ impl NativePrepared {
         as_result(self.fragments.get(&Key::Accepted(key)))
     }
     pub fn recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.fragments.get(&Key::Outcome(key.into())))
+        let invocation = key.into();
+        as_outcome(
+            self.fragments.get(&Key::Outcome(invocation)),
+            self.outcome.ledger,
+            invocation,
+        )
     }
     pub fn definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
         as_definition(self.fragments.get(&Key::Definition(id)))
@@ -1377,6 +1449,8 @@ impl std::error::Error for NativePublishError {}
 #[derive(Debug)]
 pub struct NativeRead {
     lease: ranges::RangeLeases,
+    /// The store's ledger, which an outcome row does not repeat.
+    ledger: LedgerId,
 }
 impl NativeRead {
     pub fn sequence(&self) -> SessionSeq {
@@ -1404,11 +1478,12 @@ impl NativeRead {
         request: impl Into<NativeInvocation>,
         now: u64,
     ) -> Result<Option<NativeOutcome>, MemoryError> {
-        let key = Key::Outcome(request.into());
+        let invocation = request.into();
+        let key = Key::Outcome(invocation);
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 (entry.key == key)
-                    .then(|| as_outcome(Some(&entry.value)))
+                    .then(|| as_outcome(Some(&entry.value), self.ledger, invocation))
                     .flatten()
             })
             .map(Option::flatten)
@@ -1497,7 +1572,10 @@ fn checked_native_limits(
         )?,
         size_of::<focal_memory::Entry<Key, Row>>(),
     )?;
-    limits.range.page_bytes = limits.range.page_bytes.min(64 * 1024);
+    // Without a tighter bound from the node, a leaf of rows with heap costs no more to rebuild than a full
+    // leaf of inline rows.
+    let inline_leaf = limits.range.inline_leaf_bytes::<Key, Row>()?;
+    limits.range.page_bytes = limits.range.page_bytes.min(inline_leaf);
     limits.range.max_entry_bytes = limits.range.max_entry_bytes.min(entry_ceiling);
     Ok(limits)
 }
@@ -1584,7 +1662,12 @@ impl Core<NativeState> {
         as_claim(self.state.rows.get(&Key::Claim(id)))
     }
     pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.state.rows.get(&Key::Outcome(request.into())))
+        let invocation = request.into();
+        as_outcome(
+            self.state.rows.get(&Key::Outcome(invocation)),
+            self.state.ledger,
+            invocation,
+        )
     }
     /// Every committed native outcome (the retry-dedup records that survive a
     /// checkpoint) in native-sequence order — one per committed record. The
@@ -1596,8 +1679,10 @@ impl Core<NativeState> {
             .state
             .rows
             .entries()
-            .filter_map(|entry| match &entry.value {
-                Row::Outcome(outcome) => Some(*outcome),
+            .filter_map(|entry| match (&entry.key, &entry.value) {
+                (Key::Outcome(invocation), Row::Outcome(outcome)) => {
+                    Some(outcome.expand(self.state.ledger, *invocation))
+                }
                 _ => None,
             })
             .collect();
@@ -1763,10 +1848,10 @@ impl Core<NativeState> {
         Ok(outcome)
     }
     pub fn pin_native(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
-        self.state
-            .rows
-            .pin(now, ttl)
-            .map(|lease| NativeRead { lease })
+        self.state.rows.pin(now, ttl).map(|lease| NativeRead {
+            lease,
+            ledger: self.state.ledger,
+        })
     }
     pub fn release_native(&mut self, read: &NativeRead) -> Result<(), MemoryError> {
         self.state.rows.release(&read.lease)
@@ -1841,9 +1926,13 @@ fn as_claim(row: Option<&Row>) -> Option<&ClaimState> {
         _ => None,
     }
 }
-fn as_outcome(row: Option<&Row>) -> Option<NativeOutcome> {
+fn as_outcome(
+    row: Option<&Row>,
+    ledger: LedgerId,
+    invocation: NativeInvocation,
+) -> Option<NativeOutcome> {
     match row {
-        Some(Row::Outcome(outcome)) => Some(*outcome),
+        Some(Row::Outcome(outcome)) => Some(outcome.expand(ledger, invocation)),
         _ => None,
     }
 }
@@ -1869,6 +1958,14 @@ impl<'a> View<'a> {
             Some(tail) => tail.fragments.get(&key),
             None => self.state.rows.get(&key),
         }
+    }
+    /// The outcome recorded for `invocation`, whole.
+    fn outcome(&self, invocation: NativeInvocation) -> Option<NativeOutcome> {
+        as_outcome(
+            self.get(Key::Outcome(invocation)),
+            self.state.ledger,
+            invocation,
+        )
     }
     fn meta(&self) -> Meta {
         match self.get(Key::Meta) {

@@ -47,9 +47,12 @@ pub(super) fn read_fixed(
     cursor: &mut Cursor<'_>,
     ledger: LedgerId,
 ) -> Result<Option<Row>, NativeError> {
-    let row = match decode_fixed(key, cursor).map_err(codec)? {
-        Some(row) => row,
-        None => return Ok(None),
+    let row = match key {
+        Key::Outcome(invocation) => outcome_row(invocation, cursor, ledger)?,
+        _ => match decode_fixed(key, cursor).map_err(codec)? {
+            Some(row) => row,
+            None => return Ok(None),
+        },
     };
     cursor.visit(FIXED_CHECK_VISITS).map_err(codec)?;
     if ledger.tenant.is_zero() || ledger.session.is_zero() {
@@ -57,6 +60,21 @@ pub(super) fn read_fixed(
     }
     check_fixed(key, &row, ledger)?;
     Ok(Some(row))
+}
+
+/// An outcome row from its record bytes, which carry the whole outcome: the ledger must be the store's and
+/// the invocation the row's key, since the row keeps neither (`OutcomeRow`).
+fn outcome_row(
+    invocation: NativeInvocation,
+    cursor: &mut Cursor<'_>,
+    ledger: LedgerId,
+) -> Result<Row, NativeError> {
+    let outcome = fixed::read_outcome(cursor).map_err(codec)?;
+    let row = OutcomeRow::stored(&outcome, ledger)?;
+    if outcome.invocation != invocation {
+        return Err(invalid());
+    }
+    Ok(Row::Outcome(row))
 }
 
 fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError> {
@@ -142,7 +160,8 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
         }),
         Key::WorkSlot(..) => Row::WorkSlot(ArtifactId(c.fixed()?)),
         Key::ClaimResultTestament(_) => Row::ClaimResultTestament(TestamentId(c.fixed()?)),
-        Key::Outcome(_) => Row::Outcome(fixed::read_outcome(c)?),
+        // Read by `outcome_row`, which checks what the row does not keep.
+        Key::Outcome(_) => return Err(CodecError::InvalidTag("outcome row")),
         Key::ClaimIdentity(..) => Row::ClaimIdentity(ClaimId(c.fixed()?)),
         Key::DefinitionIdentity(..) => Row::DefinitionIdentity(ValidationId(c.fixed()?)),
         Key::ByIssuer(..)
@@ -326,9 +345,8 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
             !claim.is_zero() && !id.is_zero()
         }
         (Key::Outcome(key), Row::Outcome(row)) => {
-            if row.ledger != ledger {
-                return Err(ContractError::WrongLedger.into());
-            }
+            // The row's ledger is its store's and its invocation is `key` (`OutcomeRow`); bytes naming
+            // another were refused by `outcome_row`.
             let namespace = match key {
                 NativeInvocation::Request(_) => !matches!(
                     row.operation,
@@ -358,11 +376,7 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                     row.operation == NativeOperation::Seal && row.events == 0
                 }
             };
-            key == row.invocation
-                && invocation(key)
-                && row.sequence.0 != 0
-                && row.intent.0 != [0; 32]
-                && namespace
+            invocation(key) && row.sequence.0 != 0 && row.intent.0 != [0; 32] && namespace
         }
         (Key::ClaimIdentity(schema, hash), Row::ClaimIdentity(id)) => {
             schema != 0 && hash.0 != [0; 32] && !id.is_zero()

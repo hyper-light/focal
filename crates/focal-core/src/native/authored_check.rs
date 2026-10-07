@@ -511,8 +511,7 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 if entry.heap_bytes != result.heap_charge()? {
                     return Err(ContractError::InvalidPolicy.into());
                 }
-                let outcome =
-                    as_outcome(view.get(Key::Outcome(*key))).ok_or(ContractError::InvalidPolicy)?;
+                let outcome = view.outcome(*key).ok_or(ContractError::InvalidPolicy)?;
                 if outcome.operation != NativeOperation::Create || outcome.invocation != *key {
                     return Err(ContractError::InvalidPolicy.into());
                 }

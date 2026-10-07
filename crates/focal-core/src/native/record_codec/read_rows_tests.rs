@@ -46,12 +46,15 @@ fn outcome(invocation: NativeInvocation, operation: NativeOperation) -> NativeOu
         events: 1,
     }
 }
-fn encode(row: &Row) -> Vec<u8> {
+fn outcome_row(invocation: NativeInvocation, operation: NativeOperation) -> Row {
+    Row::Outcome(OutcomeRow::stored(&outcome(invocation, operation), ledger()).unwrap())
+}
+fn encode(key: Key, row: &Row) -> Vec<u8> {
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut size, row, ledger()).unwrap();
+    rows::value(&mut size, key, row, ledger()).unwrap();
     let mut bytes = vec![0; size.len()];
     let mut sink = SliceSink::new(&mut bytes, usize::MAX);
-    rows::value(&mut sink, row, ledger()).unwrap();
+    rows::value(&mut sink, key, row, ledger()).unwrap();
     sink.finish().unwrap();
     bytes
 }
@@ -210,7 +213,7 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::Outcome(request),
-            Row::Outcome(outcome(request, NativeOperation::Create)),
+            outcome_row(request, NativeOperation::Create),
         ),
         (
             Key::ClaimIdentity(1, ContentHash([1; 32])),
@@ -226,12 +229,12 @@ fn values() -> Vec<(Key, Row)> {
 #[test]
 fn every_fixed_family_roundtrips_exact_bytes_with_bounded_decoding_and_no_heap_build() {
     for (key, row) in values() {
-        let bytes = encode(&row);
+        let bytes = encode(key, &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let restored = read_fixed(key, &mut cursor, ledger()).unwrap().unwrap();
         let visits = cursor.visits_used();
         cursor.finish().unwrap();
-        assert_eq!(encode(&restored), bytes, "key {key:?}");
+        assert_eq!(encode(key, &restored), bytes, "key {key:?}");
         let mut cursor = Cursor::new(&bytes, bytes.len(), visits).unwrap();
         assert!(read_fixed(key, &mut cursor, ledger()).unwrap().is_some());
         let mut cursor = Cursor::new(&bytes, bytes.len(), visits - 1).unwrap();
@@ -331,11 +334,11 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
         ),
         (
             Key::Outcome(request),
-            Row::Outcome(outcome(request, NativeOperation::ClaimDeadline)),
+            outcome_row(request, NativeOperation::ClaimDeadline),
         ),
     ];
     for (key, row) in invalid_rows {
-        let bytes = encode(&row);
+        let bytes = encode(key, &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         assert!(
             read_fixed(key, &mut cursor, ledger()).is_err(),
@@ -343,7 +346,7 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
         );
     }
     for (key, row) in values() {
-        let bytes = encode(&row);
+        let bytes = encode(key, &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let mut foreign = ledger();
         foreign.session = focal_model::SessionId::from_u128(999);
@@ -394,14 +397,22 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
         (monitor_deadline.into(), NativeOperation::MonitorDeadline),
     ] {
         let expected = outcome(invocation, operation);
-        let bytes = encode(&Row::Outcome(expected));
+        let bytes = encode(
+            Key::Outcome(invocation),
+            &outcome_row(invocation, operation),
+        );
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let Some(Row::Outcome(actual)) =
             read_fixed(Key::Outcome(invocation), &mut cursor, ledger()).unwrap()
         else {
             panic!("expected an outcome");
         };
-        assert_eq!(actual, expected);
+        assert_eq!(actual.expand(ledger(), invocation), expected);
+        // The row keeps neither its invocation nor its ledger, so bytes naming another invocation than the
+        // key are refused, not taken as the key's.
+        let other = NativeInvocation::Seal(77);
+        let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
+        assert!(read_fixed(Key::Outcome(other), &mut cursor, ledger()).is_err());
     }
     #[cfg(target_pointer_width = "64")]
     {
@@ -410,7 +421,7 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
             head: Some(claim(1)),
             count: large,
         });
-        let bytes = encode(&row);
+        let bytes = encode(Key::IncomingHead(claim(2)), &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let Some(Row::IncomingHead(actual)) =
             read_fixed(Key::IncomingHead(claim(2)), &mut cursor, ledger()).unwrap()
@@ -424,10 +435,10 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
         epoch: RequestEpoch(0),
         id: RequestId::from_u128(1),
     });
-    let bytes = encode(&Row::Outcome(outcome(
-        zero_request,
-        NativeOperation::Create,
-    )));
+    let bytes = encode(
+        Key::Outcome(zero_request),
+        &outcome_row(zero_request, NativeOperation::Create),
+    );
     let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
     assert!(read_fixed(Key::Outcome(zero_request), &mut cursor, ledger()).is_err());
 }
@@ -448,7 +459,7 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         .entries()
         .filter(|entry| matches!(entry.key, Key::Event(..)))
     {
-        let bytes = encode(&entry.value);
+        let bytes = encode(entry.key, &entry.value);
         let before = budget.stats();
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let plan = EventPlan::read(entry.key, &mut cursor, ledger()).unwrap();
@@ -475,7 +486,7 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
             .unwrap();
         let (restored, actual) = plan.build(heap, work).unwrap();
         assert_eq!(actual, heap);
-        assert_eq!(encode(&restored), bytes);
+        assert_eq!(encode(entry.key, &restored), bytes);
         drop(restored);
         drop(permit);
         assert_eq!(budget.stats(), before);

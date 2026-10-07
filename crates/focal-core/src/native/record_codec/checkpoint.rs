@@ -1023,11 +1023,11 @@ fn put_row(sink: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) -> Resul
     write_u8(sink, 1)?;
     fixed::key(sink, key)?;
     let mut measure = RowSize { sink, bytes: 0 };
-    rows::value(&mut measure, row, ledger)?;
+    rows::value(&mut measure, key, row, ledger)?;
     let size = measure.bytes;
     if size == 0 {
         return Err(CodecError::InvalidTag("empty checkpoint body"));
     }
     write_count(sink, size)?;
-    rows::value(sink, row, ledger)
+    rows::value(sink, key, row, ledger)
 }

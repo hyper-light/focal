@@ -125,7 +125,8 @@ fn published(
         _ => None,
     }
     .ok_or(ContractError::MissingEvidence)?;
-    let outcome = as_outcome(view.get(Key::Outcome(event.invocation)))
+    let outcome = view
+        .outcome(event.invocation)
         .ok_or(ContractError::MissingEvidence)?;
     if event.fact != fact
         || event.sequence != sequence

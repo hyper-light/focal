@@ -459,3 +459,60 @@ constant; it stays until a measurement under load shows a cost.
    page versions makes a neighbour a reference, not a copy. That needs either a reference count per
    row (doc 10's shared-immutable case) or epoch reclamation over the store's existing pins, so it
    needs a design decision.
+
+## 9. Follow-up, 2026-10-06 (macOS arm64, focal `f26-metrics` at b0e2be2 plus this change)
+
+`tools/load/benches/allocs.rs`, 1,000 claims and 1,000 linearizable reads, seed 1:
+
+| path | before this change | after this change |
+|---|---|---|
+| claim: allocs / reallocs per op | 260.65 / 0.04 | **180.09 / 0.04** |
+| claim: bytes requested per op | 442 KB | **252 KB** |
+| claim: live heap growth, 1,000 claims | 9.50 MB | **8.66 MB** |
+| read (linearizable): allocs / bytes | 20 / 11.1 KB | 20 / 11.1 KB |
+
+`focal-load`, 3,000 claims and 3,000 reads, one worker, eight alternating runs of each binary on an
+otherwise quiet machine (four with each binary first; the binaries built from b0e2be2 and from this
+change's tree):
+
+| | before | after |
+|---|---|---|
+| instructions retired | 17.0–17.1 G | **11.6–11.7 G** |
+| user CPU | 1.27–1.70 s | **0.94–1.25 s** (lower in every pair) |
+| peak RSS | 58.4–59.3 MB | **52.8–53.2 MB** |
+| minor faults | ≈3,810 | **≈3,440** (no major faults) |
+| write p50 / p99 | 8.46–10.25 / 11.5–17.4 ms | 8.42–8.66 / 12.6–17.5 ms (the flushes; doc 28) |
+| read p99 | 17.7–33.8 µs | 12.8–55.0 µs (lower in 2 of 4 pairs measured) |
+
+Write p99 followed the order of the pair, not the binary: higher for whichever ran second. Both
+binaries show a write p99.9 near 150 ms in about half the runs, against 16–23 ms in the others: a
+periodic stall outside this change, taken up next.
+
+This change:
+
+- **A leaf is a memory page.** The native store bounded a leaf at 64 KiB, a number with no source. A
+  mutation rebuilds its touched leaves whole, deep-copying every neighbour row, so a leaf's bytes are what
+  each rebuild costs. The node now bounds a leaf by the platform's memory page
+  (`focal_platform::memory_page_bytes`: `sysconf(_SC_PAGESIZE)` through rustix on Unix, 16 KiB on Apple
+  arm64 and 4 KiB on Linux x86_64; 4 KiB on Windows), the classical sizing of a B-tree node to the unit the
+  system moves (Bayer and McCreight, 1972). Without a node's bound, the core takes a full leaf of inline
+  rows (`RangeConfig::inline_leaf_bytes`). Swept with this change's rows: 64 KiB 277 allocations and
+  406 KB per claim, 32 KiB 209 / 343 KB, 16 KiB 180 / 252 KB, 8 KiB 177 / 206 KB, 4 KiB 186 / 185 KB,
+  with live heap within 1.5%.
+- **An outcome row keeps neither its ledger nor its invocation** (`OutcomeRow`). The ledger is the store's
+  and the invocation is the row's key; a whole outcome was 232 bytes and set the size of every row of every
+  family. A row is now 160 bytes and an entry 280 (was 352). The record and checkpoint bytes are
+  unchanged: the codec writes the whole outcome, expanded from the key and the ledger, and decoding checks
+  both against the bytes before it keeps the row.
+- **Two keys compare field by field and stop at the first that differs.** The order built both keys' whole
+  order (affinity, family and up to ten slots) for every comparison, the write path's largest CPU cost in a
+  sampled profile. A test compares the two on every pair of the layout corpus.
+
+**What remains**, in order of effect:
+
+1. Neighbour rows are still deep-copied when a leaf is rebuilt (declarations and creation results most).
+   Sharing them between leaf versions needs storage that the owner writes while readers on other threads
+   read it, which means `unsafe` outside `focal-platform/src/windows.rs` or a reference count per row or
+   per chunk. That needs a decision.
+2. `Meta` (152 bytes) now sets a row's size. It is one row, rewritten by every mutation; holding it out of
+   line needs a fallible boxed allocation.

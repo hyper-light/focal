@@ -144,7 +144,10 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
                 require(*after == expected)?;
             }
             (Key::Outcome(invocation), Row::Outcome(value)) => {
-                require(invocation == read.outcome.invocation && *value == read.outcome)?;
+                require(
+                    invocation == read.outcome.invocation
+                        && value.expand(read.ledger, invocation) == read.outcome,
+                )?;
                 counts.outcome = true;
             }
             (Key::Event(sequence, ordinal), Row::Event(value)) => {

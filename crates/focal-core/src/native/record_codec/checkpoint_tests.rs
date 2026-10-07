@@ -456,24 +456,30 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
     for row in [
         None,
         Some(Row::Meta(Meta::default())),
-        Some(Row::Outcome(NativeOutcome {
-            ledger: fixture::binding(1).ledger,
-            invocation: fixture::request(fixture::ISSUER, 1).into(),
-            sequence: SessionSeq(1),
-            logical_time: 1,
-            operation: NativeOperation::Post,
-            intent: ContentHash([0; 32]),
-            created: 0,
-            changed: 0,
-            definitions: 0,
-            evaluations: 0,
-            artifacts: 0,
-            results: 0,
-            receipts: 0,
-            responses: 0,
-            result_testaments: 0,
-            events: 0,
-        })),
+        Some(Row::Outcome(
+            OutcomeRow::stored(
+                &NativeOutcome {
+                    ledger: fixture::binding(1).ledger,
+                    invocation: fixture::request(fixture::ISSUER, 1).into(),
+                    sequence: SessionSeq(1),
+                    logical_time: 1,
+                    operation: NativeOperation::Post,
+                    intent: ContentHash([0; 32]),
+                    created: 0,
+                    changed: 0,
+                    definitions: 0,
+                    evaluations: 0,
+                    artifacts: 0,
+                    results: 0,
+                    receipts: 0,
+                    responses: 0,
+                    result_testaments: 0,
+                    events: 0,
+                },
+                fixture::binding(1).ledger,
+            )
+            .unwrap(),
+        )),
     ] {
         let mut core = fixture::core();
         let initial = if row.is_none() { 1 } else { 0 };
@@ -490,7 +496,7 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
         .unwrap();
         if let Some(row) = row {
             let key = match &row {
-                Row::Outcome(v) => Key::Outcome(v.invocation),
+                Row::Outcome(_) => Key::Outcome(fixture::request(fixture::ISSUER, 1).into()),
                 _ => Key::Meta,
             };
             let prepared = core

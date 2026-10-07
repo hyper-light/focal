@@ -119,6 +119,26 @@ pub fn available_space(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
+/// The operating system's memory page: the unit its virtual memory maps, faults in and reclaims. `None` where
+/// it is not known, and the caller keeps its own bound.
+#[cfg(unix)]
+pub fn memory_page_bytes() -> Option<usize> {
+    // rustix reads it from the auxiliary vector or `sysconf(_SC_PAGESIZE)`, safely.
+    Some(rustix::param::page_size())
+}
+
+/// Windows pages are 4 KiB on every architecture it runs on: x86, x64 and ARM64 (Microsoft, *Memory
+/// Management: Large-Page Support*, which names the small page beside the large one).
+#[cfg(windows)]
+pub fn memory_page_bytes() -> Option<usize> {
+    Some(4096)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn memory_page_bytes() -> Option<usize> {
+    None
+}
+
 /// A path's bytes in a form that round-trips back through [path_from_bytes] on
 /// the same platform: the operating system's own byte encoding on Unix, and
 /// UTF-16LE on Windows (where a path is a sequence of 16-bit code units).

@@ -214,6 +214,7 @@ enum Slot {
     N(u64),
 }
 const SLOTS: usize = 10;
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct OrderKey {
     affinity: [u8; 16],
@@ -306,15 +307,19 @@ impl Fields {
             TimerTarget::Monitor(claim, monitor) => self.n(2).id(claim.0).id(monitor.0),
         }
     }
-    fn finish(self, key: &Key) -> OrderKey {
-        OrderKey {
-            affinity: affinity(key),
-            family: family(key),
-            slots: self.slots,
-        }
+}
+
+/// The complete order of one key as one value: what [`Key`]'s order is, compared field by field.
+#[cfg(test)]
+fn order_key(key: &Key) -> OrderKey {
+    OrderKey {
+        affinity: affinity(key),
+        family: family(key),
+        slots: slots(key),
     }
 }
-fn order_key(key: &Key) -> OrderKey {
+/// A key's fields in declaration order, nested enums tagged: its order within its affinity and family.
+fn slots(key: &Key) -> [Slot; SLOTS] {
     let fields = Fields::new();
     let fields = match key {
         Key::IncomingHead(c)
@@ -366,7 +371,7 @@ fn order_key(key: &Key) -> OrderKey {
         Key::ByObject(kind, object) => fields.n(u64::from(*kind)).id(object.0),
         Key::End => fields,
     };
-    fields.finish(key)
+    fields.slots
 }
 impl PartialOrd for Key {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -374,8 +379,15 @@ impl PartialOrd for Key {
     }
 }
 impl Ord for Key {
+    /// Affinity, then family, then the fields, decided as early as it can be: most keys a search compares
+    /// already differ in affinity, so the slots are built only for keys of one affinity and family. A
+    /// 2026-10-06 profile of committed claims spent most of the write path's CPU building both keys' whole
+    /// order (affinity, family and slots) for every comparison.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        order_key(self).cmp(&order_key(other))
+        affinity(self)
+            .cmp(&affinity(other))
+            .then_with(|| family(self).cmp(&family(other)))
+            .then_with(|| slots(self).cmp(&slots(other)))
     }
 }
 

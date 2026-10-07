@@ -21,7 +21,7 @@ impl Core<NativeState> {
             state: &self.state,
             tail: pending.next_back(),
         };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.key().into()))) {
+        if let Some(outcome) = view.outcome(input.key().into()) {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,

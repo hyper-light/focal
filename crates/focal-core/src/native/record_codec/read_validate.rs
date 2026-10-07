@@ -320,7 +320,7 @@ pub(super) fn validate(
         let row = &entry.value;
         read.charge(1024)?;
         match (key, row) {
-            (Key::Outcome(_), Row::Outcome(value)) => {
+            (Key::Outcome(invocation), Row::Outcome(value)) => {
                 read_rows::check_fixed(key, row, ledger)?;
                 sequences.mark(value.sequence, value.logical_time, prefix, &read)?;
                 if value.sequence > prefix || value.logical_time > expected.logical_time {
@@ -329,7 +329,7 @@ pub(super) fn validate(
                 // Resident is what is open (F12): a request's generation at
                 // or above its principal's sealed floor; a timer's claim
                 // not retired (its outcome left with the family).
-                match value.invocation {
+                match invocation {
                     NativeInvocation::Request(request) => {
                         let Some(Row::Epochs(window)) = read.get(Key::Epochs(request.principal))?
                         else {
@@ -368,7 +368,7 @@ pub(super) fn validate(
                     match read.get(Key::Event(value.sequence, ordinal))? {
                         Some(Row::Event(row)) => {
                             let event = row.get().ok_or_else(invalid)?.expand(ledger);
-                            if event.invocation != value.invocation
+                            if event.invocation != invocation
                                 || event.sequence != value.sequence
                                 || event.ordinal != ordinal
                             {
@@ -382,7 +382,7 @@ pub(super) fn validate(
                 if profile == NativeContentProfile::AuthoredV1
                     && value.operation == NativeOperation::Create
                     && !matches!(
-                        read.require(Key::CreationResult(value.invocation))?,
+                        read.require(Key::CreationResult(invocation))?,
                         Row::CreationResult(_)
                     )
                 {

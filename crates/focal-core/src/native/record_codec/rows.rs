@@ -26,7 +26,7 @@ fn optional_cycle(s: &mut impl Sink, value: Option<NativeCycleKey>) -> Result<()
         }
     }
 }
-pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<(), Error> {
+pub(super) fn value(s: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) -> Result<(), Error> {
     // Row body schemas version independently from both input and V1 envelopes.
     // No body uses serde enum order or process-local allocation capacities.
     match row {
@@ -130,7 +130,13 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::Response(v) => evidence::response(s, v),
         Row::ResultTestament(v) => lifecycle::result_testament(s, v),
         Row::ClaimResultTestament(id) => raw(s, &id.0),
-        Row::Outcome(v) => fixed::outcome(s, *v),
+        // The record carries the whole outcome; the row keeps neither its ledger nor its invocation.
+        Row::Outcome(v) => {
+            let Key::Outcome(invocation) = key else {
+                return Err(Error::InvalidTag("outcome row key"));
+            };
+            fixed::outcome(s, v.expand(ledger, invocation))
+        }
         Row::Event(v) => events::event(
             s,
             v.get()

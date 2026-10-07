@@ -260,7 +260,8 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
                     meta = true;
                 }
                 if key == Key::Outcome(outcome.invocation) {
-                    if !matches!(value, Row::Outcome(row) if *row == outcome) {
+                    if !matches!(value, Row::Outcome(row) if row.expand(outcome.ledger, outcome.invocation) == outcome)
+                    {
                         return Err(CodecError::InvalidTag("record outcome"));
                     }
                     recorded = true;
@@ -269,10 +270,10 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
                     sink: &mut hashed,
                     bytes: 0,
                 };
-                rows::value(&mut measure, value, outcome.ledger)?;
+                rows::value(&mut measure, key, value, outcome.ledger)?;
                 let size = measure.bytes;
                 write_count(&mut hashed, size)?;
-                rows::value(&mut hashed, value, outcome.ledger)?;
+                rows::value(&mut hashed, key, value, outcome.ledger)?;
             }
             _ => return Err(CodecError::InvalidTag("record mutation")),
         }

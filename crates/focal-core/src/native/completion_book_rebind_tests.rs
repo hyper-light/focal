@@ -227,7 +227,9 @@ fn with_seals(
     for change in &mut changes {
         if let RangeChange::Put(entry) = change {
             match &mut entry.value {
-                Row::Outcome(value) => *value = outcome,
+                Row::Outcome(value) => {
+                    *value = OutcomeRow::stored(&outcome, outcome.ledger).unwrap()
+                }
                 Row::Meta(value) => *value = meta,
                 _ => {}
             }

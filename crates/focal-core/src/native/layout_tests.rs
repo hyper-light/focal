@@ -58,7 +58,9 @@ fn native_default_layout_has_finite_page_and_complete_owned_entry_caps() {
         + OwnedEvent::container_charge()
         + size_of::<Entry<Key, Row>>();
     let core = new_core(original);
-    assert_eq!(core.limits.range.page_bytes, 64 * 1024);
+    // Without a node's bound, a leaf costs at most a full leaf of inline rows.
+    let inline_leaf = original.range.inline_leaf_bytes::<Key, Row>().unwrap();
+    assert_eq!(core.limits.range.page_bytes, inline_leaf);
     assert_eq!(core.limits.range.max_entry_bytes, expected);
     assert_eq!(core.native_sequence(), SessionSeq(0));
     check_entries(&core);
@@ -69,8 +71,9 @@ fn tighter_supplied_page_and_entry_caps_are_preserved_while_wider_caps_are_clamp
     for page_bytes in [2048, 4096, 64 * 1024, usize::MAX] {
         let mut config = limits(page_bytes);
         config.range.max_entry_bytes = 32 * 1024;
+        let inline_leaf = config.range.inline_leaf_bytes::<Key, Row>().unwrap();
         let mut core = new_core(config);
-        assert_eq!(core.limits.range.page_bytes, page_bytes.min(64 * 1024));
+        assert_eq!(core.limits.range.page_bytes, page_bytes.min(inline_leaf));
         assert_eq!(core.limits.range.max_entry_bytes, 32 * 1024);
         publish(&mut core, 10, creation(1, 1, &[], None));
         check_entries(&core);

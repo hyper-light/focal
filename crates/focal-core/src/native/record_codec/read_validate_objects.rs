@@ -433,7 +433,8 @@ pub(super) fn legacy(
     let Row::Outcome(outcome) = read.require(Key::Outcome(NativeInvocation::Import))? else {
         return Err(invalid());
     };
-    if outcome.operation != NativeOperation::Import || outcome.ledger != read.ledger {
+    // The row's ledger is the store's (`OutcomeRow`).
+    if outcome.operation != NativeOperation::Import {
         return Err(invalid());
     }
     let claim = match key {

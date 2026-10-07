@@ -280,7 +280,7 @@ impl Lab {
                 .find(|entry| entry.key == key)
                 .unwrap_or_else(|| panic!("{step}: written {family:?} row is present"));
             let mut body = CountingSink::new(usize::MAX, usize::MAX);
-            rows::value(&mut body, &entry.value, ledger).unwrap();
+            rows::value(&mut body, entry.key, &entry.value, ledger).unwrap();
             write_count(&mut fixed_part, body.len()).unwrap();
             let encoded = fixed_part.len() + body.len();
             let allowed = row_fixed_bytes() + HEAP_EXPANSION * entry.heap_bytes;

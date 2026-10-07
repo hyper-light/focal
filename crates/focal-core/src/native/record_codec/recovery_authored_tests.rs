@@ -57,12 +57,12 @@ fn replace_body(bytes: &[u8], key: Key, replacement: &[u8]) -> Vec<u8> {
     checksum(&mut value);
     value
 }
-fn encode_row(row: &Row, ledger: LedgerId) -> Vec<u8> {
+fn encode_row(key: Key, row: &Row, ledger: LedgerId) -> Vec<u8> {
     let mut count = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut count, row, ledger).unwrap();
+    rows::value(&mut count, key, row, ledger).unwrap();
     let mut value = vec![0; count.len()];
     let mut sink = SliceSink::new(&mut value, count.visits_used());
-    rows::value(&mut sink, row, ledger).unwrap();
+    rows::value(&mut sink, key, row, ledger).unwrap();
     sink.finish().unwrap();
     value
 }
@@ -253,7 +253,11 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
             2 => replace_body(
                 &bytes,
                 Key::Definition(ValidationId::from_u128(1)),
-                &encode_row(&legacy_row, core.state.ledger),
+                &encode_row(
+                    Key::Definition(ValidationId::from_u128(1)),
+                    &legacy_row,
+                    core.state.ledger,
+                ),
             ),
             3 => replace_body(
                 &bytes,
@@ -268,7 +272,11 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
             _ => replace_body(
                 &bytes,
                 Key::CreationResult(request(3).into()),
-                &encode_row(&mapping_row, core.state.ledger),
+                &encode_row(
+                    Key::CreationResult(request(3).into()),
+                    &mapping_row,
+                    core.state.ledger,
+                ),
             ),
         };
         // The checksum/framing still pass; decoder/root validation must refuse
