@@ -1776,5 +1776,22 @@ terminating goal's tenth condition), so the switch is measured on flushes as wel
   progress has run, so a stalled device shows before any histogram hears of it), taken from
   hyper-log's statistics by `focal_consensus::LogMetrics`. An owner that holds only the log's
   opener reads them through `LogOpener::stats` (hyper-raft `log-preallocate-followups`).
+- The start (2026-10-07, at hyper-raft 756bfaa). `focal_consensus::storage_open::open_node_storage`,
+  called by the service and the founding bootstrap through focal-node's `storage_start`: below the
+  storage level the node last recorded it opens focal-log's WAL as before; at it a directory that
+  still holds the WAL is converted first (`convert_data_dir`), and the node's groups live in one
+  hyper-log log, created or reopened with `DiskGrowth` (hyper-log's growth gate over the node's
+  `DiskBudget`: each slot a `DiskKind::Wal` reservation on the completion lane, committed when
+  durable, refused at the watermark as the bound reached). The log's configuration comes from
+  facts that do not change between starts: the device's block (read from `IDENTITY`, on the log's
+  volume before the log is), the volume's whole size (`focal_platform::total_space`; a file is
+  never larger than its volume, and recovery refuses one past its quota), the group bound (the
+  fleet's sessions, the root and every partition a plan may place: 1,058) and the longest
+  checkpoint cadence. Its cache is the storage envelope's completion reserve, 64 MiB, charged for
+  the log's life: stated, not yet measured. The owner registry closes the log after every owner
+  that writes through it has joined. Not yet: the offline readers (`history`, the embedded node,
+  cluster administration's reads) open the WAL only, and refuse a converted directory, typed,
+  rather than read it; sealing at rest awaits the node's key source (hyper-raft `docs/seal.md`
+  §1: a key file off the data device, the keychain or a TPM, or a key service).
 - `ControlReplica` over the shell, the owners' wiring through one storage handle, the commands
   (`focal convert storage`, `focal remove converted-storage`), and §15.10's crash cuts and qualification.

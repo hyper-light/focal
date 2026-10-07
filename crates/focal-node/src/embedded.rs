@@ -57,6 +57,10 @@ pub enum NodeError {
     Ledger(#[from] LedgerError),
     #[error("consensus: {0}")]
     Consensus(#[from] focal_consensus::ConsensusError),
+    /// Boxed: what opening the storage refuses carries the log's and the conversion's errors,
+    /// which every other `NodeError` need not be the size of.
+    #[error("the node's storage: {0}")]
+    Storage(Box<focal_consensus::storage_open::OpenError>),
     #[error("WAL: {0}")]
     Wal(#[from] focal_log::LogError),
     #[error("content: {0}")]
@@ -80,6 +84,11 @@ pub enum NodeError {
     Entropy(String),
     #[error("domain refused the operation: {0}")]
     Domain(String),
+}
+impl From<focal_consensus::storage_open::OpenError> for NodeError {
+    fn from(error: focal_consensus::storage_open::OpenError) -> Self {
+        Self::Storage(Box::new(error))
+    }
 }
 
 pub struct EmbeddedNode {

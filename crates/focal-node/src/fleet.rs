@@ -47,7 +47,7 @@ mod range_owner;
 use evidence_owner::{EvidenceCall, PendingEvidenceCall};
 pub use grouped::management::{
     FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
-    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, ManagedFleetConfig,
+    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, MAX_SESSIONS, ManagedFleetConfig,
 };
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
 pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};
@@ -89,6 +89,9 @@ mod evidence_tests;
 #[path = "fleet_admission_tests.rs"]
 mod admission_tests;
 
+/// Entries a session applies past its last checkpoint before it checkpoints again
+/// ([`ReplicaConfig::checkpoint_after_entries`]'s default).
+pub const CHECKPOINT_AFTER_ENTRIES: u64 = 4096;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaConfig {
     pub root: RootCommandId,
@@ -134,7 +137,7 @@ impl ReplicaConfig {
             tick: Duration::from_millis(100),
             tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
-            checkpoint_after_entries: 4096,
+            checkpoint_after_entries: CHECKPOINT_AFTER_ENTRIES,
             #[cfg(test)]
             checkpoint_observer: None,
         }

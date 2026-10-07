@@ -31,7 +31,7 @@ use focal_control::{
 use focal_enrollment::{CredentialMaterial, EnrollmentReceipt};
 use focal_evidence::{ContentStore, StoreLimits};
 use focal_ledger::{Session, SessionLimits};
-use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
+use focal_log::WalIdentity;
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget, MemoryError,
 };
@@ -345,7 +345,7 @@ struct OwnerGate {
     finished: oneshot::Receiver<Result<(), ServiceError>>,
 }
 struct OwnerRegistration {
-    storage: Option<(NodeDirectory, SharedWal)>,
+    storage: Option<(NodeDirectory, focal_consensus::storage_open::OpenedStorage)>,
     owner: Option<PhysicalOwner>,
 }
 impl OwnerGate {
@@ -388,8 +388,23 @@ impl OwnerGate {
                         result = Err(error);
                     }
                 }
-                if let Some((directory, wal)) = storage {
-                    drop(wal);
+                // Every owner has stopped: nothing writes through the storage any longer, and
+                // the shell's log closes before its directory's lock is let go.
+                if let Some((directory, opened)) = storage {
+                    let focal_consensus::storage_open::OpenedStorage {
+                        storage,
+                        log,
+                        cache,
+                    } = opened;
+                    drop(storage);
+                    if let Some(log) = log
+                        && let Err(error) = log.close()
+                    {
+                        result = Err(ServiceError::Node(
+                            focal_consensus::storage_open::OpenError::Log(error).into(),
+                        ));
+                    }
+                    drop(cache);
                     drop(directory);
                 }
                 let _ = done.send(result);
@@ -409,12 +424,16 @@ impl OwnerGate {
             })
             .map_err(|_| ServiceError::Owner("owner registry stopped"))
     }
-    fn hold(&self, directory: NodeDirectory, wal: SharedWal) -> Result<(), ServiceError> {
+    fn hold(
+        &self,
+        directory: NodeDirectory,
+        storage: focal_consensus::storage_open::OpenedStorage,
+    ) -> Result<(), ServiceError> {
         self.sender
             .as_ref()
             .ok_or(ServiceError::Owner("closed owner registry"))?
             .send(OwnerRegistration {
-                storage: Some((directory, wal)),
+                storage: Some((directory, storage)),
                 owner: None,
             })
             .map_err(|_| ServiceError::Owner("owner registry stopped"))
@@ -459,8 +478,8 @@ pub struct NetworkService {
     /// The cluster this node belongs to, for restoring the enrollment
     /// registry the metrics sampler reads the fence from.
     cluster: [u8; 16],
-    /// The WAL writer, for its statistics in the metrics snapshot.
-    wal: SharedWal,
+    /// The node's storage, for its statistics in the metrics snapshot.
+    storage: focal_consensus::NodeStorage,
     /// The fixed labels of this node's metrics and the latest snapshot the
     /// sampler published (24 §23).
     metrics_labels: crate::metrics::MetricLabels,
@@ -482,7 +501,8 @@ struct Prepared {
     control: ControlReplica,
     recovered: ControlEvents,
     budget: MemoryBudget,
-    wal: SharedWal,
+    /// The node's storage as its start opened it (`storage_start`).
+    storage: focal_consensus::storage_open::OpenedStorage,
     allocation: Allocation,
     directory: NodeDirectory,
 }
@@ -515,16 +535,14 @@ impl Prepared {
             let allocation = budget
                 .reserve(BudgetKind::Recovery, BudgetLane::Completion, 256 * 1024)?
                 .commit();
-            let wal = SharedWal::open_with_budgets(
-                joined.directory.root().join("wal"),
-                WalOptions::new(WalIdentity {
+            let storage = crate::storage_start::open(
+                joined.directory.root(),
+                WalIdentity {
                     cluster: state.genesis.founder.cluster,
                     node: state.node,
                     stream: 0,
-                }),
-                WalWriterLimits::default(),
-                budget.child(256 * 1024 * 1024, 64 * 1024 * 1024)?,
-                disk_budget()?,
+                },
+                &budget,
             )?;
             let options = ControlOptions::new(NodeConfig::joining(
                 state.node,
@@ -533,11 +551,11 @@ impl Prepared {
                 vec![state.genesis.founder.node],
                 vec![],
             ));
-            let mut control = ControlReplica::open_on_wal(
+            let mut control = ControlReplica::open_on_storage(
                 options,
                 state.genesis.bootstrap.clone(),
                 budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
-                wal.clone(),
+                &storage.storage,
             )?;
             if control.identity() != state.genesis.root {
                 return Err(NodeError::Identity.into());
@@ -555,7 +573,7 @@ impl Prepared {
                 control,
                 recovered,
                 budget,
-                wal,
+                storage,
                 allocation,
                 directory: joined.directory,
             })
@@ -570,7 +588,7 @@ impl Prepared {
                 enrollment,
                 enrollment_driver,
                 budget,
-                wal,
+                storage,
                 _bootstrap_allocation,
                 directory,
             } = FoundingNetwork::prepare(settings).await?;
@@ -584,7 +602,7 @@ impl Prepared {
                 control,
                 recovered,
                 budget,
-                wal,
+                storage,
                 allocation: _bootstrap_allocation,
                 directory,
             })
@@ -662,13 +680,14 @@ impl NetworkService {
             control,
             recovered,
             budget,
-            wal,
+            storage: opened,
             allocation,
             directory,
         } = prepared;
-        owners.hold(directory, wal.clone())?;
-        // Every owner of the node's groups opens them through one handle (27 §15.11).
-        let storage = focal_consensus::NodeStorage::Wal(wal.clone());
+        // Every owner of the node's groups opens them through one handle (27 §15.11); the
+        // registry holds what was opened, and closes the shell's log after every owner.
+        let storage = opened.storage.clone();
+        owners.hold(directory, opened)?;
         let founder = identity.node == state.genesis.founder.node;
         let (directory, directory_startup) = DirectoryStartup::new(
             identity.node,
@@ -1173,7 +1192,7 @@ impl NetworkService {
             budget,
             _configuration: allocation,
             cluster: identity.cluster,
-            wal,
+            storage: storage.clone(),
             metrics_labels,
             metrics,
             metrics_listener,
@@ -1545,11 +1564,14 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
-            storage: self
-                .wal
-                .stats()
-                .ok()
-                .map(crate::metrics::StorageMetrics::Wal),
+            storage: match &self.storage {
+                focal_consensus::NodeStorage::Wal(wal) => {
+                    wal.stats().ok().map(crate::metrics::StorageMetrics::Wal)
+                }
+                focal_consensus::NodeStorage::Shell(shell) => shell.log_stats().map(|stats| {
+                    crate::metrics::StorageMetrics::Log(focal_consensus::LogMetrics::of(&stats))
+                }),
+            },
             fleet: self.handles.fleet.status(),
             root: RootMetrics {
                 peer_aggregates: members,

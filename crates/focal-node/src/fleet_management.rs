@@ -5,6 +5,8 @@ use super::*;
 use focal_consensus::{NodeStorage, StorageWriter};
 use focal_memory::OwnerId;
 
+/// Sessions a node's fleet admits ([`ManagedFleetConfig::max_sessions`]'s default).
+pub const MAX_SESSIONS: usize = 1024;
 #[derive(Clone, Copy, Debug)]
 pub struct ManagedFleetConfig {
     pub max_sessions: usize,
@@ -13,7 +15,7 @@ pub struct ManagedFleetConfig {
 impl Default for ManagedFleetConfig {
     fn default() -> Self {
         Self {
-            max_sessions: 1024,
+            max_sessions: MAX_SESSIONS,
             management_queue: 64,
         }
     }

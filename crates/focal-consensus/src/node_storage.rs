@@ -39,6 +39,11 @@ pub struct ShellStorage {
 }
 
 impl ShellStorage {
+    /// What the node's log has measured, read through this handle's opener: none once the log
+    /// has closed.
+    pub fn log_stats(&self) -> Option<Box<hyper_log::LogStats>> {
+        self.opener.stats(None).ok()
+    }
     /// The handle on `log`, opened for node `identity` with its groups' files under `root`, its
     /// disk drawn from `disk` and its memory charged within `budget`.
     pub fn new(

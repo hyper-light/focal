@@ -15,7 +15,7 @@ use focal_enrollment::{
     BootstrapAuthority, CredentialMaterial, FoundingEnrollmentDraft, JoinKey, PrivateJournal,
     ServerTrust, server_fingerprint,
 };
-use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
+use focal_log::WalIdentity;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::ParticipantId;
 use std::{
@@ -71,7 +71,8 @@ pub struct FoundingNetwork {
     pub enrollment: QuorumEnrollmentHost,
     pub enrollment_driver: QuorumEnrollmentDriver,
     pub budget: MemoryBudget,
-    pub wal: SharedWal,
+    /// The node's storage as its start opened it (`storage_start`).
+    pub storage: focal_consensus::storage_open::OpenedStorage,
     // Bootstrap metadata is bounded and retained with its owner, not separately
     // shared. The signer and control owner account for their own retained state.
     pub(crate) _bootstrap_allocation: Allocation,
@@ -295,22 +296,20 @@ impl FoundingNetwork {
             state.install(&directory)?;
         }
         state.validate(identity)?;
-        let wal = SharedWal::open_with_budgets(
-            directory.root().join("wal"),
-            WalOptions::new(WalIdentity {
+        let storage = crate::storage_start::open(
+            directory.root(),
+            WalIdentity {
                 cluster: identity.cluster,
                 node: identity.node,
                 stream: 0,
-            }),
-            WalWriterLimits::default(),
-            budget.child(256 * 1024 * 1024, 64 * 1024 * 1024)?,
-            crate::network_service::disk_budget().map_err(NodeError::Content)?,
+            },
+            &budget,
         )?;
-        let mut control = ControlReplica::open_on_wal(
+        let mut control = ControlReplica::open_on_storage(
             options,
             bootstrap,
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
-            wal.clone(),
+            &storage.storage,
         )?;
         if control.identity() != state.genesis.root {
             return Err(NodeError::Identity.into());
@@ -416,7 +415,7 @@ impl FoundingNetwork {
             enrollment,
             enrollment_driver,
             budget,
-            wal,
+            storage,
             _bootstrap_allocation: bootstrap_allocation,
             directory,
         })

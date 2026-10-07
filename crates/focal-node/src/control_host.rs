@@ -15,6 +15,9 @@ use std::{
 };
 use tokio::sync::{mpsc as async_mpsc, oneshot, watch};
 
+/// Entries a control group applies past its last checkpoint before it checkpoints again
+/// ([`ControlHostConfig::checkpoint_interval`]'s default).
+pub const CHECKPOINT_INTERVAL: u64 = 1024;
 #[derive(Debug, Clone)]
 pub struct ControlHostConfig {
     /// Dedicated server-owned metadata namespace; never inferred from a request.
@@ -48,7 +51,7 @@ impl ControlHostConfig {
             tick: Duration::from_millis(100),
             tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
-            checkpoint_interval: 1024,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
             enrollment_authority: None,
         }
     }

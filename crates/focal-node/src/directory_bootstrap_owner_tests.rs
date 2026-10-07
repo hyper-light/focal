@@ -21,7 +21,9 @@ async fn directory_owner_is_registered_before_blocking_recovery_and_retains_esca
     let permit =
         authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
     let source_index = permit.root_index();
-    let paused = network.wal.pause_for_test().unwrap();
+    let paused = crate::storage_start::test_wal(&network.storage.storage)
+        .pause_for_test()
+        .unwrap();
     let (returned, observed) = std::sync::mpsc::sync_channel(1);
     // A real blocked WAL catches accidental synchronous open in the constructor.
     // The watchdog always resumes it, even if that regression occurs, so no
@@ -33,7 +35,7 @@ async fn directory_owner_is_registered_before_blocking_recovery_and_retains_esca
     });
     let (host, owner, outgoing) = ControlHost::spawn_directory(
         permit,
-        focal_consensus::NodeStorage::Wal(network.wal.clone()),
+        network.storage.storage.clone(),
         budget.clone(),
         None,
     )
