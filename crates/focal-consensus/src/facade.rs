@@ -26,6 +26,30 @@ impl DurableNode {
             }
         })
     }
+    /// A member over the shell whose log begins at a restored image (26 §6), as
+    /// [`DurableNode::restore_on_wal_in`] begins one on focal-log: the same images are refused, a
+    /// group that holds anything but this restore is refused, and one this restore was cut in is
+    /// finished, then the member opens as a restart would. The shell does not carry the fast
+    /// track, so a group with it is refused.
+    pub fn restore_on_shell(
+        config: NodeConfig,
+        root: &Path,
+        log: &ShellLogOpener,
+        parent_budget: &MemoryBudget,
+        disk: DiskBudget,
+        needs: fn(&[u8]) -> Option<[u8; 32]>,
+        image: RestoredLog,
+    ) -> Result<Self, ConsensusError> {
+        config.validate()?;
+        check_restore_image(&image)?;
+        if config.fast {
+            return Err(ConsensusError::Configuration(
+                "the fast track is not on the durable shell yet",
+            ));
+        }
+        convert::restore_group(&config, root, log, &image)?;
+        Self::open_on_shell(config, root, log, parent_budget, disk, needs)
+    }
     pub fn group_id(&self) -> [u8; 16] {
         dispatch!(inner = &self.backend => inner.group_id())
     }

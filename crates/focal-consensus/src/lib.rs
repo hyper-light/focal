@@ -79,6 +79,24 @@ pub struct RestoredLog {
 
 /// The bytes of committed entries one Ready gives to apply: the page a
 /// transition reads from storage at most.
+/// Refuses an image no restore may begin a log at: a point at zero, no bytes or more than an image
+/// holds, or a transition that is not the floor's successor. Both backends restore by it.
+pub(crate) fn check_restore_image(image: &RestoredLog) -> Result<(), ConsensusError> {
+    if image.index == 0
+        || image.term == 0
+        || image.data.is_empty()
+        || image.data.len() > IMAGE_BYTES
+        || image
+            .transition
+            .is_some_and(|(predecessor, successor)| predecessor == successor)
+        || image
+            .transition
+            .is_some_and(|(predecessor, _)| predecessor != image.floor)
+    {
+        return Err(ConsensusError::Configuration("invalid restore image"));
+    }
+    Ok(())
+}
 pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// The most bytes of the application's state a snapshot, a checkpoint or a
 /// restored image holds.
@@ -581,19 +599,7 @@ impl LogNode {
         image: RestoredLog,
     ) -> Result<Self, ConsensusError> {
         config.validate()?;
-        if image.index == 0
-            || image.term == 0
-            || image.data.is_empty()
-            || image.data.len() > IMAGE_BYTES
-            || image
-                .transition
-                .is_some_and(|(predecessor, successor)| predecessor == successor)
-            || image
-                .transition
-                .is_some_and(|(predecessor, _)| predecessor != image.floor)
-        {
-            return Err(ConsensusError::Configuration("invalid restore image"));
-        }
+        check_restore_image(&image)?;
         let identity = shared.identity()?;
         if identity.cluster != config.cluster_id || identity.node != config.node_id {
             return Err(ConsensusError::Configuration(

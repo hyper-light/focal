@@ -455,3 +455,155 @@ fn the_owners_signal_is_called_when_the_log_answers_a_write() {
     }
     assert_eq!(gave, vec![(2, b"a".to_vec())]);
 }
+
+/// A log on a file of its own under `dir`, made the first time.
+fn log_in(dir: &std::path::Path) -> Log<DeviceFile> {
+    let path = dir.join("raft.log");
+    let fresh = !path.exists();
+    let align = Alignment::new(4096).unwrap();
+    let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).unwrap();
+    if fresh {
+        Log::create(file, log_config(), LOG_ID).unwrap()
+    } else {
+        Log::open(file, log_config(), LOG_ID).unwrap().0
+    }
+}
+
+fn image(index: u64, term: u64) -> RestoredLog {
+    RestoredLog {
+        index,
+        term,
+        data: b"restored state".to_vec(),
+        floor: MANAGED,
+        transition: None,
+    }
+}
+
+fn restore(
+    dir: &std::path::Path,
+    log: &Log<DeviceFile>,
+    image: RestoredLog,
+) -> Result<DurableNode, ConsensusError> {
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    DurableNode::restore_on_shell(
+        config(1),
+        dir,
+        &log.opener(),
+        &budget,
+        DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap(),
+        no_needs,
+        image,
+    )
+}
+
+/// A group restored onto the shell (26 §6) opens at its image as a restart would, commits past it,
+/// and a restore issued again opens the same member; one cut after its files and before its log
+/// is finished; a group that holds anything else, and an image no restore may begin at, are
+/// refused, as on focal-log.
+#[test]
+fn a_restore_onto_the_shell_opens_at_its_image_resumes_where_cut_and_never_overwrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = log_in(dir.path());
+    let mut node = restore(dir.path(), &log, image(40, 3)).unwrap();
+    assert_eq!(node.snapshot_index(), 40);
+    assert_eq!(node.status().committed_index, 40);
+    // Its entries need the decoder the image's log promised, which the application confirms.
+    node.confirm_decoder(MANAGED).unwrap();
+    node.campaign().unwrap();
+    for _ in 0..DRAINS {
+        if !node.has_ready() {
+            break;
+        }
+        drop(node.drain().unwrap());
+    }
+    assert_eq!(node.status().role, StateRole::Leader);
+    node.propose(b"after".to_vec()).unwrap();
+    let mut committed = Vec::new();
+    for _ in 0..DRAINS {
+        if !node.has_ready() {
+            break;
+        }
+        committed.extend(node.drain().unwrap().committed);
+    }
+    assert!(
+        committed
+            .iter()
+            .any(|entry| entry.data == b"after" && entry.index > 40)
+    );
+    drop(node);
+    // The group now holds more than the image: a restore into it is history overwritten.
+    assert!(matches!(
+        restore(dir.path(), &log, image(40, 3)),
+        Err(ConsensusError::Configuration(
+            "restore into a populated log"
+        ))
+    ));
+    drop(log);
+
+    // Issued again on a group that holds this restore and nothing else, it opens the member.
+    let again = tempfile::tempdir().unwrap();
+    let log = log_in(again.path());
+    drop(restore(again.path(), &log, image(7, 2)).unwrap());
+    let node = restore(again.path(), &log, image(7, 2)).unwrap();
+    assert_eq!(node.snapshot_index(), 7);
+    drop(node);
+    // Another image into the same group is refused.
+    assert!(matches!(
+        restore(again.path(), &log, image(8, 2)),
+        Err(ConsensusError::Configuration(
+            "restore into a populated log"
+        ))
+    ));
+    drop(log);
+
+    // Cut after its records and image, before its log: issued again, it writes the log and opens.
+    let cut = tempfile::tempdir().unwrap();
+    let log = log_in(cut.path());
+    let mut medium = FileMedium;
+    let group_dir = group_files::create(&mut medium, cut.path(), config(1).group_id).unwrap();
+    group_files::write_records(
+        &mut medium,
+        &group_dir,
+        &group_files::GroupRecords {
+            identity: config(1),
+            fast: false,
+            decoder_floor: Some(MANAGED),
+            decoder_transition: None,
+        },
+    )
+    .unwrap();
+    group_files::write_image(
+        &mut medium,
+        &group_dir,
+        &group_files::ImagePoint {
+            index: 12,
+            term: 4,
+            configuration: ConfState {
+                voters: config(1).voters,
+                ..ConfState::default()
+            },
+        },
+        b"restored state",
+        IMAGE_BYTES,
+    )
+    .unwrap();
+    let node = restore(cut.path(), &log, image(12, 4)).unwrap();
+    assert_eq!(node.snapshot_index(), 12);
+    assert_eq!(node.status().committed_index, 12);
+    drop(node);
+
+    // An image at zero, or one of no bytes, is refused before anything is written.
+    let invalid = tempfile::tempdir().unwrap();
+    let log = log_in(invalid.path());
+    assert!(matches!(
+        restore(invalid.path(), &log, image(0, 1)),
+        Err(ConsensusError::Configuration("invalid restore image"))
+    ));
+    let mut empty = image(5, 1);
+    empty.data.clear();
+    assert!(matches!(
+        restore(invalid.path(), &log, empty),
+        Err(ConsensusError::Configuration("invalid restore image"))
+    ));
+    assert!(!group_files::group_dir(invalid.path(), config(1).group_id).exists());
+}

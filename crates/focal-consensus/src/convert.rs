@@ -174,7 +174,7 @@ fn file_error(error: GroupFileError) -> ConsensusError {
 /// Claims group `id` in `log`, which must hold nothing of it: a conversion writes into a log made
 /// for it (step 2 removes any earlier attempt's).
 fn claim_empty(
-    log: &Log<DeviceFile>,
+    log: &impl hyper_durable::LogGroups<DeviceFile>,
     id: [u8; 16],
 ) -> Result<GroupStore<DeviceFile>, ConsensusError> {
     let store = match GroupStore::claim(log, group_of(id)) {
@@ -191,6 +191,92 @@ fn claim_empty(
         }
     };
     Ok(store)
+}
+
+/// Writes a group whose log begins at a restored image (26 §6) as the shell opens it: its records
+/// with the decoder floor and transition the image's log promised, the image at its point under
+/// the bootstrap membership, then the log's start at that point and a hard state committing it,
+/// each durable before the next (O1, O3). The three writes are cut apart by a crash, so a restore
+/// issued again goes on where it was cut: each piece already there must be this restore's, and
+/// any other is history, refused (`restore into a populated log`), as on focal-log.
+pub(crate) fn restore_group(
+    config: &NodeConfig,
+    root: &Path,
+    log: &crate::ShellLogOpener,
+    image: &RestoredLog,
+) -> Result<(), ConsensusError> {
+    let conf = ConfState {
+        voters: config.voters.clone(),
+        learners: config.learners.clone(),
+        ..ConfState::default()
+    };
+    validate_conf_state(&conf)?;
+    let records = GroupRecords {
+        identity: config.clone(),
+        fast: false,
+        decoder_floor: Some(image.floor),
+        decoder_transition: image.transition,
+    };
+    let point = ImagePoint {
+        index: image.index,
+        term: image.term,
+        configuration: conf,
+    };
+    let hard = HardState {
+        term: image.term,
+        commit: image.index,
+        ..HardState::default()
+    };
+    let populated = || ConsensusError::Configuration("restore into a populated log");
+    let mut medium = FileMedium;
+    let dir = group_files::group_dir(root, config.group_id);
+    match group_files::read_records(&medium, &dir).map_err(file_error)? {
+        Some(held) if held != records => return Err(populated()),
+        _ => {}
+    }
+    let held_image = group_files::read_image(&medium, &dir, IMAGE_BYTES).map_err(file_error)?;
+    if held_image
+        .as_ref()
+        .is_some_and(|(held, data)| *held != point || *data != image.data)
+    {
+        return Err(populated());
+    }
+    let mut store = claim_empty(log, config.group_id)?;
+    let view = store.view().map_err(|fault| store_error(&fault))?;
+    let empty = view.start.index == 0 && view.last == 0 && view.hard_state == HardState::default();
+    let restored = view.start
+        == (Point {
+            index: image.index,
+            term: image.term,
+        })
+        && view.last == image.index
+        && view.hard_state == hard;
+    // The log is written last: a log that holds anything is this restore's whole, or history.
+    let this_restore = restored && held_image.is_some();
+    if !(empty || this_restore) {
+        return Err(populated());
+    }
+    if restored {
+        return Ok(());
+    }
+    let dir = group_files::create(&mut medium, root, config.group_id).map_err(file_error)?;
+    group_files::write_records(&mut medium, &dir, &records).map_err(file_error)?;
+    if held_image.is_none() {
+        group_files::write_image(&mut medium, &dir, &point, &image.data, IMAGE_BYTES)
+            .map_err(file_error)?;
+    }
+    store
+        .write_now(&Write {
+            start: Some(Point {
+                index: image.index,
+                term: image.term,
+            }),
+            entries: None,
+            hard_state: Some(hard),
+            proposals: &[],
+            released: None,
+        })
+        .map_err(|fault| store_error(&fault))
 }
 
 /// An entry's bytes as hyper-log charges them in a frame.
