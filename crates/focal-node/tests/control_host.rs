@@ -1000,7 +1000,26 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
     );
     // The transport may hold this value while a slow peer consumes its bytes.
     drop(response);
-    assert_eq!(memory.stats(), before);
+    // What the answer held is given back the moment it is dropped.
+    assert_eq!(
+        memory.stats().by_kind[BudgetKind::Control as usize],
+        before.by_kind[BudgetKind::Control as usize]
+    );
+    // And nothing is kept: the budget comes back to where it was. Not at
+    // once: the owner goes on leading, and a write of its own in flight (a
+    // beat, a commit it settles) holds its `Pending` until written — under
+    // sixteen copies at once one held 464 bytes at the moment of the drop.
+    // Waited for in the owner's periods.
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 100, FROZEN);
+    while memory.stats() != before {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the budget never came back: {spent}; {:?} against {before:?}",
+                memory.stats()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     host.stop().await.unwrap();
     owner.join().unwrap();
 }
