@@ -1740,14 +1740,17 @@ then the shell, alternated). A commit that moves alone is no longer a write of i
 | three voters, 4,000 entries pipelined | 56,711 and 50,503 entries/s | 91,159 and 100,294 entries/s |
 | flushes for 4,201 entries, by member | 202 to 203 | 404 to 408 |
 
-The cost the shell still carries is flushes: two an entry where focal-log makes one, since hyper-log
-answers a frame only once a later durable record confirms its flush, and an entry that nothing
-follows waits for a confirmation of its own. Each flush is power and, on a flash device, wear
-(the terminating goal's tenth condition), so the switch is measured on flushes as well as on time.
+The cost the shell still carries is flushes, and only for an entry written alone. Of the 4,201
+entries, the 200 written one at a time take 200 flushes on focal-log and 400 on the shell; the
+4,000 pipelined add two to five on either. hyper-log answers a frame only once a later durable
+record confirms its flush, and an entry that nothing follows waits for a confirmation of its own:
+at no cost in time here (the medians are equal), but a second flush for every write of a node at
+rest, which is a laptop's ordinary traffic. Each flush is power and, on a flash device, wear (the
+terminating goal's tenth condition), so the switch is measured on flushes as well as on time.
 
 **Open before the switch:**
-- **The shell's second flush an entry** (above): taken to hyper-raft with these numbers, for the
-  confirmation's rule rather than a focal workaround.
+- **The shell's second flush for an entry written alone** (above): taken to hyper-raft with these
+  numbers, for the confirmation's rule rather than a focal workaround.
 - **The log's growth needs the volume's admission** (found 2026-10-07). §15.3 takes `max_segments`
   from "the node's disk budget for `DiskKind::Wal`", but focal's `DiskBudget` is a volume envelope
   with a watermark and no per-kind quota. focal-log reserves from it before every write, so a full
