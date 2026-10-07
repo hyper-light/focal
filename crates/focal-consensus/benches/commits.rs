@@ -21,7 +21,10 @@
 //!
 //! `FOCAL_BENCH_BACKEND=shell` runs every member over hyper-durable's shell, its
 //! log a hyper-log of its own on the same disk (27 §15.10: the shell replaces
-//! focal-log only where it is at least as fast); the default is focal-log.
+//! focal-log only where it is at least as fast); the default is focal-log. On
+//! the shell each member's frames, updates and flushes per entry of the
+//! one-at-a-time phase are reported from its log's statistics, and
+//! `FOCAL_BENCH_WAITS=never` makes the log's writer never wait between frames.
 use focal_consensus::{DurableNode, Message, NodeConfig, StateRole};
 use focal_memory::{DiskBudget, DiskBudgetConfig, MemoryBudget};
 use hyper_block::buf::Alignment;
@@ -63,7 +66,11 @@ fn log_config() -> LogConfig {
         group_bytes: 256 << 20,
         group_cache: 8 << 20,
         queue_submissions: 64,
-        waits: Waits::Measured,
+        waits: if std::env::var("FOCAL_BENCH_WAITS").as_deref() == Ok("never") {
+            Waits::Never
+        } else {
+            Waits::Measured
+        },
     }
 }
 
@@ -258,6 +265,19 @@ fn three(staged: bool) {
         while seen < 1 {
             seen += commits.recv().unwrap();
         }
+        let counts = |stores: &[Store]| -> Vec<(u64, u64, u64)> {
+            stores
+                .iter()
+                .map(|store| match store {
+                    Store::Shell(log) => {
+                        let s = log.stats(None).unwrap();
+                        (s.frames, s.updates, s.flushes)
+                    }
+                    Store::Wal => (0, 0, 0),
+                })
+                .collect()
+        };
+        let before_counts = counts(&stores);
         let mut latencies = Vec::with_capacity(ONE_AT_A_TIME);
         for round in 0..ONE_AT_A_TIME {
             let began = Instant::now();
@@ -271,6 +291,19 @@ fn three(staged: bool) {
             latencies.push(began.elapsed());
         }
         report("three voters, an entry at a time", latencies);
+        let after_counts = counts(&stores);
+        for (at, (b, a)) in before_counts.iter().zip(&after_counts).enumerate() {
+            if matches!(stores[at], Store::Wal) {
+                continue;
+            }
+            println!(
+                "member {}: per entry frames {:.2} updates {:.2} flushes {:.2}",
+                at + 1,
+                (a.0 - b.0) as f64 / ONE_AT_A_TIME as f64,
+                (a.1 - b.1) as f64 / ONE_AT_A_TIME as f64,
+                (a.2 - b.2) as f64 / ONE_AT_A_TIME as f64
+            );
+        }
         let began = Instant::now();
         for round in 0..PIPELINED {
             leader
