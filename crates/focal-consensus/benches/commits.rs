@@ -18,11 +18,78 @@
 //! `FOCAL_BENCH_OWNER=settle` drives each member with the drain that waits
 //! and gives everything at once; the default drives it as its owners do: a
 //! leader's messages are sent while its write is in flight.
+//!
+//! `FOCAL_BENCH_BACKEND=shell` runs every member over hyper-durable's shell, its
+//! log a hyper-log of its own on the same disk (27 §15.10: the shell replaces
+//! focal-log only where it is at least as fast); the default is focal-log.
 use focal_consensus::{DurableNode, Message, NodeConfig, StateRole};
+use focal_memory::{DiskBudget, DiskBudgetConfig, MemoryBudget};
+use hyper_block::buf::Alignment;
+use hyper_block::file::{CachingRequest, DeviceFile};
+use hyper_log::{Config as LogConfig, Log, Waits};
 use std::{
+    path::Path,
     sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
+
+/// A member's storage: focal-log's WAL in its directory, or a hyper-log of its own there.
+enum Store {
+    Wal,
+    Shell(Log<DeviceFile>),
+}
+
+impl Store {
+    /// Flushes the member's log has made so far.
+    fn flushes(&self, node: &DurableNode) -> u64 {
+        match self {
+            Store::Wal => node.shared_wal().unwrap().stats().unwrap().group_commits,
+            Store::Shell(log) => log.stats(None).unwrap().flushes,
+        }
+    }
+}
+
+fn shell() -> bool {
+    std::env::var("FOCAL_BENCH_BACKEND").as_deref() == Ok("shell")
+}
+
+/// The member's log as the node runs it: it waits between frames as measured.
+fn log_config() -> LogConfig {
+    LogConfig {
+        segment_bytes: 64 * 1024 * 1024,
+        max_segments: 16,
+        max_groups: 4,
+        group_entries: 1 << 16,
+        group_bytes: 256 << 20,
+        group_cache: 8 << 20,
+        queue_submissions: 64,
+        waits: Waits::Measured,
+    }
+}
+
+fn no_needs(_: &[u8]) -> Option<[u8; 32]> {
+    None
+}
+
+/// Opens member `config` in `dir` on the backend the bench runs.
+fn open(config: NodeConfig, dir: &Path) -> (Store, DurableNode) {
+    if !shell() {
+        return (Store::Wal, DurableNode::open(config, dir).unwrap());
+    }
+    let align = Alignment::new(4096).unwrap();
+    let file = DeviceFile::open(
+        &dir.join("raft.log"),
+        true,
+        CachingRequest::PreferDirect,
+        align,
+    )
+    .unwrap();
+    let log = Log::create(file, log_config(), 0x0062_656e_6368).unwrap();
+    let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+    let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
+    let node = DurableNode::open_on_shell(config, dir, &log, &budget, disk, no_needs).unwrap();
+    (Store::Shell(log), node)
+}
 
 const PAYLOAD: usize = 256;
 const ALONE: usize = 200;
@@ -55,20 +122,23 @@ fn report(name: &str, mut latencies: Vec<Duration>) {
 
 fn alone() {
     let dir = tempfile::tempdir().unwrap();
-    let mut node = DurableNode::open(config(1, &[1]), dir.path()).unwrap();
+    let (store, mut node) = open(config(1, &[1]), dir.path());
     node.campaign().unwrap();
-    drop(node.drain().unwrap());
-    let wal = node.shared_wal().unwrap();
-    let before = wal.stats().unwrap().group_commits;
+    while !node.has_committed_current_term() {
+        drop(node.drain().unwrap());
+    }
+    let before = store.flushes(&node);
     let mut latencies = Vec::with_capacity(ALONE);
     for round in 0..ALONE {
         let began = Instant::now();
         node.propose(vec![round as u8; PAYLOAD]).unwrap();
-        let events = node.drain().unwrap();
-        assert_eq!(events.committed.len(), 1);
+        let mut given = 0;
+        while given < 1 {
+            given += node.drain().unwrap().committed.len();
+        }
         latencies.push(began.elapsed());
     }
-    let flushes = wal.stats().unwrap().group_commits - before;
+    let flushes = store.flushes(&node) - before;
     report("one voter, an entry at a time", latencies);
     println!(
         "one voter: {:.2} flushes a commit",
@@ -81,6 +151,7 @@ fn alone() {
 /// every entry it gives back committed.
 fn member(
     mut node: DurableNode,
+    store: &Store,
     inbox: Receiver<Input>,
     peers: Vec<(u64, Sender<Input>)>,
     committed: Option<Sender<usize>>,
@@ -93,15 +164,20 @@ fn member(
             }
         }
     };
-    let wal = node.shared_wal().unwrap();
-    let before = wal.stats().unwrap().group_commits;
+    let before = store.flushes(&node);
     'serve: loop {
         // Everything that waits is taken before the next drain: what came
-        // while the last write was in flight is one batch.
-        let mut first = Some(match inbox.recv() {
-            Ok(input) => input,
-            Err(_) => break,
-        });
+        // while the last write was in flight is one batch. A member with
+        // work due drives again without waiting for input: over the shell a
+        // drain may give what is ready while later writes are still out.
+        let mut first = if node.has_ready() {
+            None
+        } else {
+            Some(match inbox.recv() {
+                Ok(input) => input,
+                Err(_) => break,
+            })
+        };
         while let Some(input) = first.take().or_else(|| inbox.try_recv().ok()) {
             match input {
                 Input::Message(message) => {
@@ -135,16 +211,16 @@ fn member(
         }
         send(events.messages);
     }
-    wal.stats().unwrap().group_commits - before
+    store.flushes(&node) - before
 }
 
 fn three(staged: bool) {
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-    let mut nodes: Vec<_> = dirs
+    let (stores, mut nodes): (Vec<_>, Vec<_>) = dirs
         .iter()
         .enumerate()
-        .map(|(at, dir)| DurableNode::open(config(at as u64 + 1, &[1, 2, 3]), dir.path()).unwrap())
-        .collect();
+        .map(|(at, dir)| open(config(at as u64 + 1, &[1, 2, 3]), dir.path()))
+        .unzip();
     // The election, before the members take their threads: messages are
     // carried by hand until the first member has committed in its term.
     nodes[0].campaign().unwrap();
@@ -165,7 +241,7 @@ fn three(staged: bool) {
     let (committed, commits) = mpsc::channel::<usize>();
     let flushes = std::thread::scope(|scope| {
         let mut threads = Vec::new();
-        for (at, (node, inbox)) in nodes.drain(..).zip(inboxes).enumerate() {
+        for (at, ((node, inbox), store)) in nodes.drain(..).zip(inboxes).zip(&stores).enumerate() {
             let peers: Vec<_> = senders
                 .iter()
                 .enumerate()
@@ -173,7 +249,7 @@ fn three(staged: bool) {
                 .map(|(peer, sender)| (peer as u64 + 1, sender.clone()))
                 .collect();
             let committed = (at == 0).then(|| committed.clone());
-            threads.push(scope.spawn(move || member(node, inbox, peers, committed, staged)));
+            threads.push(scope.spawn(move || member(node, store, inbox, peers, committed, staged)));
         }
         let leader = &senders[0];
         // The leader's first entry of its term: the group is ready after it.
@@ -224,6 +300,14 @@ fn three(staged: bool) {
 
 fn main() {
     let staged = std::env::var("FOCAL_BENCH_OWNER").as_deref() != Ok("settle");
+    println!(
+        "backend: {}",
+        if shell() {
+            "hyper-durable's shell over hyper-log"
+        } else {
+            "focal-log"
+        }
+    );
     println!(
         "owner: {}",
         if staged {
