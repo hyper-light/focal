@@ -485,8 +485,19 @@ change's tree):
 | read p99 | 17.7–33.8 µs | 12.8–55.0 µs (lower in 2 of 4 pairs measured) |
 
 Write p99 followed the order of the pair, not the binary: higher for whichever ran second. Both
-binaries show a write p99.9 near 150 ms in about half the runs, against 16–23 ms in the others: a
-periodic stall outside this change, taken up next.
+binaries show a write p99.9 near 150 ms in about half the runs, against 16–23 ms in the others.
+
+**That tail is the drive's flush, not focal's work.** Each write's latency, in start order
+(`FOCAL_LOAD_WRITES_CSV`), put the stalls in clusters of two or three consecutive writes of
+100–118 ms, two to five clusters a run, at no cadence (writes 1,583; 282 and 1,910; 450 and 2,048 in
+three runs). A sample of a whole run at 1 ms put the WAL writer in `F_FULLFSYNC` for 24.5 s of the
+run's 26 s, and no function of focal's held a stall's worth of samples: the seal's quote and the
+archive's sealed outcomes took about 18 ms each across the whole run. A bare loop of 3,000 appends
+of 3 KB, each flushed by `F_FULLFSYNC` on the same volume while other processes built, gave p50
+4.2 ms, p99.9 10.4 ms and one flush of 87 ms. A commit of focal's takes two such flushes (doc 28),
+so it meets the drive's slow flushes twice as often, and a closed loop of one writer waits through
+each. The levers are fewer flushes a commit and a pipeline in which the next frame confirms the
+last, which hyper-log gives (focal 27 §15).
 
 This change:
 

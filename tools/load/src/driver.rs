@@ -665,6 +665,34 @@ fn merged(outcomes: &[Outcome]) -> Merged {
     total
 }
 
+/// The environment variable that names a file to write every write's sample to, in start order: one
+/// line a write, its start and its latency in nanoseconds. For finding when a tail happens, as the
+/// percentiles cannot say.
+pub const WRITES_CSV_ENV: &str = "FOCAL_LOAD_WRITES_CSV";
+
+/// Writes the samples where `WRITES_CSV_ENV` names, sorted by start already (`halves`).
+fn write_samples(samples: &[(u128, u128)]) -> Result<(), LoadError> {
+    let Some(path) = std::env::var_os(WRITES_CSV_ENV) else {
+        return Ok(());
+    };
+    // Shape: a line is two decimal u128s, a comma and a newline: at most 2 * 39 + 2 bytes.
+    let bytes = samples
+        .len()
+        .checked_mul(80)
+        .ok_or(LoadError::Bound("write samples"))?;
+    let mut text = String::new();
+    text.try_reserve_exact(bytes)
+        .map_err(|_| LoadError::Bound("write samples"))?;
+    text.push_str("start_ns,latency_ns\n");
+    let origin = samples.first().map_or(0, |(start, _)| *start);
+    for (start, latency) in samples {
+        use std::fmt::Write as _;
+        writeln!(text, "{},{latency}", start.saturating_sub(origin))
+            .map_err(|_| LoadError::Bound("write samples"))?;
+    }
+    std::fs::write(path, text).map_err(LoadError::Io)
+}
+
 /// Percentiles of all samples, and of the halves by start time.
 fn halves(samples: &mut [(u128, u128)]) -> Result<(Latency, Latency, Latency), LoadError> {
     samples.sort_unstable_by_key(|(start, _)| *start);
@@ -825,6 +853,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     let warmup = u128::from(shape.warmup_ms).saturating_mul(1_000_000);
     writes.samples.retain(|(start, _)| *start >= warmup);
     let (latency_ns, first_half, second_half) = halves(&mut writes.samples)?;
+    write_samples(&writes.samples)?;
     let mut refusals = Vec::new();
     for outcome in &write_outcomes {
         for reason in &outcome.refusals {
