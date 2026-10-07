@@ -1728,7 +1728,26 @@ to 54,000 entries a second pipelined. A commit alone pays two flushes on both ba
 commit frame after its data, hyper-log's confirming record); under load hyper-log's next frame
 confirms the last.
 
+**Measured again at hyper-raft `b483a13`** (2026-10-07; `benches/commits.rs`, the owner sending a
+leader's messages while its write is out; macOS arm64, load average 5 to 9; two rounds each, focal-log
+then the shell, alternated). A commit that moves alone is no longer a write of its own on the shell
+(hyper-raft PR #2), and the shell now leads where it trailed:
+
+| | focal-log | shell |
+|---|---|---|
+| one voter, an entry at a time: median, p99 | 8.6 ms; 27 and 101 ms | 8.5 ms; 9.6 and 16.6 ms |
+| three voters, an entry at a time: median | 22.3, 22.4 ms | 21.3, 19.3 ms |
+| three voters, 4,000 entries pipelined | 56,711 and 50,503 entries/s | 91,159 and 100,294 entries/s |
+| flushes for 4,201 entries, by member | 202 to 203 | 404 to 408 |
+
+The cost the shell still carries is flushes: two an entry where focal-log makes one, since hyper-log
+answers a frame only once a later durable record confirms its flush, and an entry that nothing
+follows waits for a confirmation of its own. Each flush is power and, on a flash device, wear
+(the terminating goal's tenth condition), so the switch is measured on flushes as well as on time.
+
 **Open before the switch:**
+- **The shell's second flush an entry** (above): taken to hyper-raft with these numbers, for the
+  confirmation's rule rather than a focal workaround.
 - **The log's growth needs the volume's admission** (found 2026-10-07). §15.3 takes `max_segments`
   from "the node's disk budget for `DiskKind::Wal`", but focal's `DiskBudget` is a volume envelope
   with a watermark and no per-kind quota. focal-log reserves from it before every write, so a full
