@@ -188,6 +188,8 @@ pub struct Limits {
     pub bytes: usize,
     /// Cumulative enclosing/nested parsing or preparation work. An inspected
     /// checkpoint retains the unused allowance for membership comparisons.
+    /// Derived from the other bounds (`Limits::derived`), so a root within
+    /// them is never refused for its work.
     pub visits: usize,
     pub members: usize,
     pub rows: usize,
@@ -203,7 +205,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             bytes: 8 * 1024 * 1024,
-            visits: 256 * 1024 * 1024,
+            visits: 0,
             members: 2048,
             rows: 100_000,
             row_bytes: 8 * 1024 * 1024,
@@ -211,9 +213,35 @@ impl Default for Limits {
             assembled_bytes: 256 * 1024 * 1024,
             movement_bytes: 1024 * 1024,
         }
+        .derived()
     }
 }
 impl Limits {
+    /// These limits with their work bound derived from the rest, as a checkpoint's work grows:
+    /// preparing the root (one encoding pass), then the frame, which counts the root's work again
+    /// and writes the root's bytes or its chunk table, its head, its membership check and its
+    /// fixed fields, all within the frame's `bytes`, at most three visits a byte written
+    /// (`root::work_bound`). Reading one back takes no more than writing it. Saturating: a bound
+    /// past a machine word is no bound at all, never a wrap.
+    pub fn derived(mut self) -> Self {
+        let root = root::work_bound(self.rows, self.inline_bytes.max(self.assembled_bytes))
+            .unwrap_or(usize::MAX);
+        // The membership check (`fields::check_configuration`): five, then a page of 1024 for
+        // each member and five more.
+        let membership = self
+            .members
+            .min(2048)
+            .saturating_add(5)
+            .saturating_mul(1024)
+            .saturating_add(5);
+        self.visits = root
+            .saturating_mul(2)
+            .saturating_add(self.bytes.saturating_mul(3))
+            .saturating_add(membership)
+            // The frame head's fixed fields, format and genesis hashes.
+            .saturating_add(2048);
+        self
+    }
     /// The most chunks a seeded checkpoint may name.
     pub fn max_seed_chunks(&self) -> usize {
         self.assembled_bytes.div_ceil(SEED_CHUNK_BYTES).max(1)

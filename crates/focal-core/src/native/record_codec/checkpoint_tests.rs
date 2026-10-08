@@ -761,3 +761,21 @@ fn streaming_preserves_early_middle_and_trailer_output_errors_and_allows_exact_r
     drop(pressure);
     assert_eq!(budget.stats(), before);
 }
+
+/// The work bound a checkpoint's visit limit is derived from holds every root: what an encoding
+/// takes, measured, never passes `work_bound` of its own rows and bytes. A visit bound below it
+/// would refuse a root its row and byte bounds hold.
+#[test]
+fn the_work_bound_covers_what_an_encoding_takes() {
+    for core in [populated(), fixture::core()] {
+        let quote = EncodingPlan::prepare(&core, limits()).unwrap().quote();
+        let bound = work_bound(quote.rows, quote.bytes).unwrap();
+        assert!(
+            quote.visits <= bound,
+            "{} visits past the bound of {bound} for {} rows of {} bytes",
+            quote.visits,
+            quote.rows,
+            quote.bytes
+        );
+    }
+}

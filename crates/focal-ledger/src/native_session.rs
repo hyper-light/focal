@@ -140,7 +140,8 @@ impl NativeSessionLimits {
                 .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
                 .unwrap_or(0),
             ..crate::native_checkpoint::Limits::default()
-        };
+        }
+        .derived();
         Self {
             recovery: recovery::Limits {
                 // Bounded owner shapes: every completion-class admission funds

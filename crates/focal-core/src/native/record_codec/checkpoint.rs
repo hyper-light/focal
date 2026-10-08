@@ -1019,6 +1019,28 @@ fn frame_entries<'a>(
     Ok(digest)
 }
 
+/// The most work an encoding of a root of at most `rows` rows and `bytes` bytes takes, by the
+/// charges [`frame_entries`] makes: the frame's start (256), its range layout at the most members a
+/// layout holds (`layout_visits`), a step a row (`ROW_STEP`), a walk's iteration at each seek and
+/// once more at its end (`iteration_work`; a seek per page, no more pages than rows, and one into
+/// each layout member and the terminating probe), and each write's one visit and one a byte. A
+/// write is a length-prefixed element's prefix or its bytes, so there are no more writes than
+/// twice the bytes, and the writes take at most three visits a byte. A checkpoint's visit bound
+/// derived from this never refuses a root its row and byte bounds hold (a ledger session filled
+/// to its admission bound stopped at its checkpoint, 268,771,520 visits past a fixed 256 Mi).
+pub fn work_bound(rows: usize, bytes: usize) -> Option<usize> {
+    let members = super::super::ranges::MAX_LAYOUT_MEMBERS;
+    let seeks = rows.checked_add(members)?.checked_add(2)?;
+    let walk = iteration_work().ok()?.checked_mul(seeks)?;
+    let steps = ROW_STEP.checked_mul(rows)?;
+    let writes = bytes.checked_mul(3)?;
+    256usize
+        .checked_add(layout_visits(members).ok()?)?
+        .checked_add(walk)?
+        .checked_add(steps)?
+        .checked_add(writes)
+}
+
 /// What one row adds to a checkpoint, exactly: its tag, its key, its body's length and its body,
 /// as [`put_row`] writes them. Kept as a running total over a root's rows
 /// (`NativeState::encoded_rows`), so what admission projects a checkpoint to is what it encodes

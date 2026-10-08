@@ -2157,6 +2157,8 @@ pub(crate) fn native_limits(
     let mut limits = focal_ledger::NativeSessionLimits::standard(domain);
     limits.disk_headroom_bytes = disk_headroom_bytes()?;
     limits.checkpoint.inline_bytes = seed_inline_bytes()?;
+    // The work bound follows the inline bound it is derived from.
+    limits.checkpoint = limits.checkpoint.derived();
     if let Some(outcomes) = native_outcomes()? {
         limits.recovery.native.outcomes = outcomes;
     }
