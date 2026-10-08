@@ -675,6 +675,7 @@ dependencies = [
  "focal-log",
  "focal-memory",
  "focal-model",
+ "focal-seal",
  "hyper-block",
  "hyper-log",
  "postcard",

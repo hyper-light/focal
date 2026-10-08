@@ -566,6 +566,7 @@ fn a_restore_onto_the_shell_opens_at_its_image_resumes_where_cut_and_never_overw
             decoder_floor: Some(MANAGED),
             decoder_transition: None,
         },
+        &group_files::test_seal(cut.path()),
     )
     .unwrap();
     group_files::write_image(
@@ -581,6 +582,7 @@ fn a_restore_onto_the_shell_opens_at_its_image_resumes_where_cut_and_never_overw
         },
         b"restored state",
         IMAGE_BYTES,
+        &group_files::test_seal(cut.path()),
     )
     .unwrap();
     let node = restore(cut.path(), &log, image(12, 4)).unwrap();

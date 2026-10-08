@@ -372,13 +372,27 @@ impl Twin {
         let align = Alignment::new(4096).unwrap();
         let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).unwrap();
         let new = Log::create(file, log_config(), LOG_ID).unwrap();
-        let copied = convert::copy_groups(&wal, dir.path(), &new, &log.budget).unwrap();
+        let copied = convert::copy_groups(
+            &wal,
+            dir.path(),
+            &new,
+            &log.budget,
+            &crate::group_files::test_seal(dir.path()),
+        )
+        .unwrap();
         assert_eq!(copied.groups, 1);
         drop(new);
         // Verified as a restart opens it.
         let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).unwrap();
         let (new, _) = Log::open(file, log_config(), LOG_ID).unwrap();
-        convert::verify(&wal, dir.path(), &new, &log.budget).unwrap();
+        convert::verify(
+            &wal,
+            dir.path(),
+            &new,
+            &log.budget,
+            &crate::group_files::test_seal(dir.path()),
+        )
+        .unwrap();
         drop(new);
         drop(wal);
         let shell = &mut self.shell[at];

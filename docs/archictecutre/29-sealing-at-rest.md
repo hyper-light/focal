@@ -90,7 +90,7 @@ originator-usage period is at most two years (SP 800-57 Pt 1, Table 1).
 | Store | Files | Construction | Owner of the code |
 |---|---|---|---|
 | Node log | `raft/log` | hyper-log `With { sealing: Some(Sealing { parent, auth }) }` | hyper-log (exists) |
-| Group files | `raft/groups/*/{image,meta,checkpoint}` | `hyper_seal::sealed_file` (STREAM per file, padded to the device's alignment) under the group key, renamed into place by `hyper_block::file::rename_durable` | focal-consensus writes them. hyper-durable writes no files: `StateMachine::image` fills the owner's buffer |
+| Group files | `raft/groups/*/{image,meta}` | `hyper_seal::sealed_file` over the framed file (magic, version, payload, CRC kept inside), a data key per file wrapped by the node's group-file key, which is unwrapped from the root key file for that write or read and wiped after it (`focal_seal::store_key`): no store key is held between files, so a node's 1,058 groups never reach the locked region's bound | focal-consensus (`group_files`) |
 | Content | `content/` | STREAM per object, names keyed per node (`hyper_seal::name`) so a stored name does not reveal the content's hash | focal-evidence |
 | Journals and small files | `*.admin`, `CLIENT.contexts`, `MCP.operations`, `catalogue.bin`, `trust-adopted.bin`, `IDENTITY`'s secret half | STREAM per file, written by the existing atomic replace | focal-platform `install` |
 | Legacy WAL | `wal/` (below the storage level) | not sealed. The conversion to hyper-log seals as it copies, and the WAL is removed after the conversion is verified | focal-consensus `convert` |
@@ -150,3 +150,14 @@ file and a wrong key are each refused, typed, and never served.
 - **The node log is sealed from its creation.** `open_node_storage` takes the root key file (`node.root_key`, or the platform default named for the node), and the shell's log is created and opened with `hyper_log::Sealing`. The conversion creates its log sealed and verifies it sealed. The shell had not shipped, so no unsealed shell log exists to convert.
 - **The log's derived configuration is the sealed one** (`node_log::config`, `sealed: true`): its frames carry their MAC and a key record, and its records their tags.
 - **Open.** A sealed log opened without its keys is refused, but hyper-log reports it as a foreign log. A typed refusal is asked of hyper-raft. The renderer does not yet mount the root key as a Kubernetes Secret or a systemd credential. It is the next deployment change, with its goldens.
+- **Step 5 (group files).** Every group's records and image are sealed before their durable
+  install. The framed file of 27 §15.4 becomes the sealed file's plaintext, so its magic, version
+  and checksum still refuse another file's bytes under a valid seal (a records file renamed to an
+  image opens, then reads as "another file's magic"). Each file has its own data key, under the
+  node's group-file key, read from the root key file for that one write or read: images are written
+  at the owners' checkpoint cadence, so the unwrap costs microseconds a thousand entries. Tested:
+  - a flipped byte at every offset, and a cut tail, refused by the seal;
+  - no group file holds its image's bytes, its records' floor or either magic in the clear;
+  - another node's keys do not open a group's files;
+  - the crash cut at every operation of a rewrite still leaves the old file or the new;
+  - the conversion writes and verifies sealed group files.

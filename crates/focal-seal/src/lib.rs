@@ -68,6 +68,8 @@ pub enum SealSetupError {
     MissingKey(PathBuf),
     #[error("the root key file {0} does not open this data directory's keys")]
     WrongKey(PathBuf),
+    #[error("the data directory {0} holds no sealed keys: the node's storage start makes them")]
+    NoKeys(PathBuf),
     #[error("{SEAL_FILE} is damaged: {0}")]
     Damaged(&'static str),
     #[error("the root key file {path}: {source}")]
@@ -387,7 +389,17 @@ fn keys(children: Vec<(KeyId, Secret32)>, root: (KeyId, u32)) -> Result<NodeKeys
     })
 }
 
-fn open(bytes: &[u8], key_file: &Path) -> Result<NodeKeys, SealSetupError> {
+/// `SEAL.node` opened as far as its node key: the node key, the five store keys' entries below
+/// it, still wrapped, and the root key's ID and generation.
+struct Opened {
+    node_key: WrappingKey,
+    entries: Vec<Entry>,
+    root: (KeyId, u32),
+}
+
+/// The node key of `SEAL.node`'s `bytes`, unwrapped by the root key in `key_file`, with the
+/// entries of the five store keys below it, still wrapped.
+fn node_key(bytes: &[u8], key_file: &Path) -> Result<Opened, SealSetupError> {
     if bytes.len() != SEAL_BYTES {
         return Err(SealSetupError::Damaged("a file of the wrong length"));
     }
@@ -411,15 +423,81 @@ fn open(bytes: &[u8], key_file: &Path) -> Result<NodeKeys, SealSetupError> {
         other => SealSetupError::Seal(other),
     })?;
     let node_key = WrappingKey::new(node.id, node.generation, node_secret);
-    let mut children = Vec::with_capacity(KEYS.saturating_sub(1));
+    let mut entries = Vec::with_capacity(KEYS.saturating_sub(1));
     for _ in 1..KEYS {
-        let child = read_entry(body, &mut at)?;
+        entries.push(read_entry(body, &mut at)?);
+    }
+    Ok(Opened {
+        node_key,
+        entries,
+        root: (root_id, root_generation),
+    })
+}
+
+fn open(bytes: &[u8], key_file: &Path) -> Result<NodeKeys, SealSetupError> {
+    let Opened {
+        node_key,
+        entries,
+        root,
+    } = node_key(bytes, key_file)?;
+    let mut children = Vec::with_capacity(entries.len());
+    for child in entries {
         let secret = node_key
             .unwrap(&child.record)
             .map_err(|_| SealSetupError::Damaged("a store key that does not unwrap"))?;
         children.push((child.id, secret));
     }
-    keys(children, (root_id, root_generation))
+    keys(children, root)
+}
+
+/// A store sealed under one of the node's keys (§3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Store {
+    /// The group files: images, records and checkpoints.
+    Group,
+    /// The content store's objects.
+    Content,
+    /// Journals and small files.
+    Journal,
+}
+
+impl Store {
+    /// The store key's place among `SEAL.node`'s entries below the node key.
+    fn entry(self) -> usize {
+        match self {
+            Self::Group => 2,
+            Self::Content => 3,
+            Self::Journal => 4,
+        }
+    }
+}
+
+/// The key of one store of the data directory `data_dir`, unwrapped by the root key in `key_file`
+/// and nothing else unwrapped: what a writer or reader of that store holds for one file and drops.
+/// A data directory without keys is refused, never given new ones here: only the node's storage
+/// start makes them (`open_or_create`).
+pub fn store_key(
+    data_dir: &Path,
+    key_file: &Path,
+    store: Store,
+) -> Result<WrappingKey, SealSetupError> {
+    hyper_seal::lock_keys(key_slots())?;
+    let seal = data_dir.join(SEAL_FILE);
+    let medium = FileMedium;
+    if !medium.exists(&seal).map_err(SealSetupError::Io)? {
+        return Err(SealSetupError::NoKeys(data_dir.to_path_buf()));
+    }
+    let bytes = medium.read(&seal, SEAL_BYTES).map_err(SealSetupError::Io)?;
+    let Opened {
+        node_key, entries, ..
+    } = node_key(&bytes, key_file)?;
+    let entry = entries
+        .get(store.entry())
+        .ok_or(SealSetupError::Damaged("fewer keys than a node holds"))?;
+    let secret = node_key
+        .unwrap(&entry.record)
+        .map_err(|_| SealSetupError::Damaged("a store key that does not unwrap"))?;
+    Ok(WrappingKey::new(entry.id, entry.generation, secret))
 }
 
 #[cfg(test)]

@@ -176,6 +176,8 @@ pub(crate) struct ShellNode {
     failed: bool,
     /// The group's own directory: its records and its image.
     dir: PathBuf,
+    /// Where the key its files are sealed under comes from (29 §5).
+    seal: group_files::GroupSeal,
     disk: DiskBudget,
     /// The writer of the node's log this member was opened through (`ShellStorage::writer`).
     writer: crate::LogWriterId,
@@ -200,6 +202,10 @@ fn file_error(error: GroupFileError) -> ConsensusError {
         GroupFileError::Bound { .. } => ConsensusError::Corruption("a group file past its bound"),
         GroupFileError::Encoding(error) => ConsensusError::Encoding(error),
         GroupFileError::Io(error) => ConsensusError::Log(focal_log::LogError::Io(error)),
+        GroupFileError::Keys(_) => {
+            ConsensusError::Configuration("the node's keys do not open its group files")
+        }
+        GroupFileError::Seal(_) => ConsensusError::Corruption("a group file's seal refused it"),
     }
 }
 
@@ -274,8 +280,9 @@ impl ShellNode {
             }
         };
         let mut medium = FileMedium;
+        let seal = storage.group_seal();
         let dir = group_files::group_dir(root, config.group_id);
-        let records = match group_files::read_records(&medium, &dir).map_err(file_error)? {
+        let records = match group_files::read_records(&medium, &dir, &seal).map_err(file_error)? {
             Some(records) => {
                 // The identity as focal-log checks it: the tunables may change between starts.
                 if !records.identity.same_identity(&config) || records.fast {
@@ -304,7 +311,8 @@ impl ShellNode {
                 // Durable before anything of the group is in the log (27 §15.5, O1).
                 let dir =
                     group_files::create(&mut medium, root, config.group_id).map_err(file_error)?;
-                group_files::write_records(&mut medium, &dir, &records).map_err(file_error)?;
+                group_files::write_records(&mut medium, &dir, &records, &seal)
+                    .map_err(file_error)?;
                 records
             }
         };
@@ -315,8 +323,15 @@ impl ShellNode {
                 successor,
             });
         let decoders = DecoderGate::new(records.decoder_floor, transition);
-        let machine = HandOver::open(medium, dir.clone(), false, IMAGE_BYTES, founding(&config))
-            .map_err(file_error)?;
+        let machine = HandOver::open(
+            medium,
+            dir.clone(),
+            false,
+            IMAGE_BYTES,
+            founding(&config),
+            seal.clone(),
+        )
+        .map_err(file_error)?;
         let store = FloorStore::new(
             store,
             needs,
@@ -364,6 +379,7 @@ impl ShellNode {
             wire: Wire::Frozen,
             failed: false,
             dir,
+            seal,
             disk,
             writer: storage.writer(),
             _boxed: boxed,
@@ -1159,7 +1175,7 @@ impl ShellNode {
     /// a write the store held for it goes out at the next drive.
     fn write_records(&mut self, intent: FloorWrite) -> Result<(), ConsensusError> {
         let mut medium = FileMedium;
-        let mut records = group_files::read_records(&medium, &self.dir)
+        let mut records = group_files::read_records(&medium, &self.dir, &self.seal)
             .map_err(file_error)?
             .ok_or(ConsensusError::Corruption(
                 "the group's records are missing",
@@ -1174,7 +1190,8 @@ impl ShellNode {
                 pair.successor
             }
         };
-        group_files::write_records(&mut medium, &self.dir, &records).map_err(file_error)?;
+        group_files::write_records(&mut medium, &self.dir, &records, &self.seal)
+            .map_err(file_error)?;
         self.decoders.written(intent);
         self.replica.release(&met);
         // The write the store held goes out at the next drive.

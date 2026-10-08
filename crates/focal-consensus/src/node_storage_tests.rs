@@ -66,18 +66,40 @@ fn a_member_names_the_writer_of_the_handle_it_was_opened_through() {
     drop(member);
 
     let log = log_in(dir.path());
-    let shell = ShellStorage::new(dir.path(), &log, disk(), identity(), budget()).unwrap();
-    let on_shell = NodeStorage::Shell(shell.clone());
+    let shell = ShellStorage::new(
+        dir.path(),
+        &log,
+        disk(),
+        identity(),
+        budget(),
+        &crate::node_storage::test_key_file(dir.path()),
+    )
+    .unwrap();
+    let on_shell = NodeStorage::Shell(Box::new(shell.clone()));
     let member = on_shell.open_member(group(2), &budget(), no_needs).unwrap();
     assert_eq!(member.storage_writer().unwrap(), on_shell.writer());
     assert_eq!(on_shell.identity().unwrap(), identity());
     assert_ne!(on_shell.writer(), on_wal.writer());
     // A second handle on the same log is another writer: an owner given one admits no member of
     // the other, as one given a WAL admits none of a WAL opened again.
-    let again = ShellStorage::new(dir.path(), &log, disk(), identity(), budget()).unwrap();
-    assert_ne!(NodeStorage::Shell(again).writer(), on_shell.writer());
+    let again = ShellStorage::new(
+        dir.path(),
+        &log,
+        disk(),
+        identity(),
+        budget(),
+        &crate::node_storage::test_key_file(dir.path()),
+    )
+    .unwrap();
+    assert_ne!(
+        NodeStorage::Shell(Box::new(again)).writer(),
+        on_shell.writer()
+    );
     // A clone is the same handle, and the same writer.
-    assert_eq!(NodeStorage::Shell(shell).writer(), on_shell.writer());
+    assert_eq!(
+        NodeStorage::Shell(Box::new(shell)).writer(),
+        on_shell.writer()
+    );
     drop(member);
     drop(log.close().unwrap());
 }
@@ -88,8 +110,17 @@ fn the_handle_measures_its_volume_and_charges_within_its_budget() {
     let log = log_in(dir.path());
     let parent = budget();
     let child = parent.child(1 << 20, 1 << 20).unwrap();
-    let storage =
-        NodeStorage::Shell(ShellStorage::new(dir.path(), &log, disk(), identity(), child).unwrap());
+    let storage = NodeStorage::Shell(Box::new(
+        ShellStorage::new(
+            dir.path(),
+            &log,
+            disk(),
+            identity(),
+            child,
+            &crate::node_storage::test_key_file(dir.path()),
+        )
+        .unwrap(),
+    ));
     assert!(storage.is_budgeted_within(&parent));
     assert!(!storage.is_budgeted_within(&budget()));
     // The volume is sampled, and with nothing promised the handle gives what the volume has
@@ -120,9 +151,17 @@ fn the_handle_restores_a_group_on_either_backend() {
     assert_eq!(restored.snapshot_index(), 9);
     drop(restored);
     let log = log_in(dir.path());
-    let shell = NodeStorage::Shell(
-        ShellStorage::new(dir.path(), &log, disk(), identity(), budget()).unwrap(),
-    );
+    let shell = NodeStorage::Shell(Box::new(
+        ShellStorage::new(
+            dir.path(),
+            &log,
+            disk(),
+            identity(),
+            budget(),
+            &crate::node_storage::test_key_file(dir.path()),
+        )
+        .unwrap(),
+    ));
     let restored = shell
         .restore_member(group(2), &budget(), no_needs, image())
         .unwrap();

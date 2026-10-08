@@ -20,8 +20,15 @@ fn dir() -> PathBuf {
     Path::new("/data/raft/groups/g").to_path_buf()
 }
 
+/// The seal the tests' images are written under: keys made once, in a data directory the test
+/// process keeps (the files themselves live on the simulated disk).
+fn seal() -> group_files::GroupSeal {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    group_files::test_seal(HOME.get_or_init(|| tempfile::tempdir().unwrap()).path())
+}
+
 fn handover(disk: Disk, control: bool) -> HandOver<Disk> {
-    HandOver::open(disk, dir(), control, BOUND, voters(&[1])).unwrap()
+    HandOver::open(disk, dir(), control, BOUND, voters(&[1]), seal()).unwrap()
 }
 
 /// What the tests' entries need: a managed entry needs `MANAGED`.
@@ -235,7 +242,7 @@ fn an_install_is_durable_when_it_returns_and_replaces_what_waited() {
     let at = Point { index: 10, term: 2 };
     machine.install(b"image", at, &configuration).unwrap();
     machine.medium.crash();
-    let (point, bytes) = group_files::read_image(&machine.medium, &dir(), BOUND)
+    let (point, bytes) = group_files::read_image(&machine.medium, &dir(), BOUND, &seal())
         .unwrap()
         .unwrap();
     assert_eq!((point.index, point.term), (10, 2));

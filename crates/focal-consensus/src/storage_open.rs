@@ -194,9 +194,9 @@ fn open_shell(
             .map_err(|error| OpenError::Wal(focal_log::LogError::Io(error)))?;
         log
     };
-    let shell = ShellStorage::new(root, &log, disk, identity, budget)?;
+    let shell = ShellStorage::new(root, &log, disk, identity, budget, &plan.key_file)?;
     Ok(OpenedStorage {
-        storage: NodeStorage::Shell(shell),
+        storage: NodeStorage::Shell(Box::new(shell)),
         log: Some(log),
         cache: Some(cache),
         keys: Some(keys),

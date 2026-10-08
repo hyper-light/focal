@@ -42,7 +42,13 @@ impl DurableNode {
                 "the fast track is not on the durable shell yet",
             ));
         }
-        convert::restore_group(&config, storage.root(), storage.opener(), &image)?;
+        convert::restore_group(
+            &config,
+            storage.root(),
+            storage.opener(),
+            &image,
+            &storage.group_seal(),
+        )?;
         Self::open_on_shell(config, storage, parent_budget, needs)
     }
     pub fn group_id(&self) -> [u8; 16] {

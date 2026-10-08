@@ -17,6 +17,7 @@ blake3.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
 tempfile.workspace = true
 focal-log = { version = "0.1.0", path = "../focal-log" }
 hyper-block.workspace = true

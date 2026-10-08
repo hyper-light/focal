@@ -99,8 +99,16 @@ fn open(config: NodeConfig, dir: &Path) -> (Store, DurableNode) {
         node: config.node_id,
         stream: 0,
     };
+    // The root key off the data directory, as a node keeps it (29 §2): one directory for the run.
+    static KEYS: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let key_file = KEYS
+        .get_or_init(|| tempfile::tempdir().unwrap())
+        .path()
+        .join(format!("{:x}.key", config.node_id));
+    focal_seal::open_or_create(dir, &key_file).unwrap();
     let storage =
-        focal_consensus::ShellStorage::new(dir, &log, disk, identity, budget.clone()).unwrap();
+        focal_consensus::ShellStorage::new(dir, &log, disk, identity, budget.clone(), &key_file)
+            .unwrap();
     let node = DurableNode::open_on_shell(config, &storage, &budget, no_needs).unwrap();
     (Store::Shell(log), node)
 }

@@ -862,8 +862,24 @@ fn shell_storage(
             stream: 0,
         },
         budget(),
+        &key_file(dir),
     )
     .unwrap()
+}
+
+/// The root key file of the data directory `dir`: off it, in one directory the test process keeps,
+/// its keys made in `dir` (29 §2).
+fn key_file(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+    static KEYS: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    let key = KEYS
+        .get_or_init(|| tempfile::tempdir().unwrap())
+        .path()
+        .join(format!("{:016x}.key", hasher.finish()));
+    focal_seal::open_or_create(dir, &key).unwrap();
+    key
 }
 
 /// 27 §15.6–15.7: control groups over the shell. Do: two partition groups share one hyper-log, each

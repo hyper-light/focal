@@ -36,6 +36,8 @@ pub struct ShellStorage {
     identity: WalIdentity,
     budget: MemoryBudget,
     writer: LogWriterId,
+    /// The root key file the group files' key opens under (29 §2).
+    key_file: PathBuf,
 }
 
 impl ShellStorage {
@@ -52,6 +54,7 @@ impl ShellStorage {
         disk: DiskBudget,
         identity: WalIdentity,
         budget: MemoryBudget,
+        key_file: &Path,
     ) -> Result<Self, ConsensusError> {
         Ok(Self {
             root: root.to_path_buf(),
@@ -60,7 +63,15 @@ impl ShellStorage {
             identity,
             budget,
             writer: LogWriterId(OwnerId::new().map_err(|_| ConsensusError::Capacity)?),
+            key_file: key_file.to_path_buf(),
         })
+    }
+    /// Where the group files' key comes from: this data directory and its root key file.
+    pub fn group_seal(&self) -> crate::group_files::GroupSeal {
+        crate::group_files::GroupSeal {
+            data_dir: self.root.clone(),
+            key_file: self.key_file.clone(),
+        }
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -81,8 +92,9 @@ impl ShellStorage {
 pub enum NodeStorage {
     /// focal-log's WAL: below the upgrade fence's storage level.
     Wal(SharedWal),
-    /// The node's hyper-log log under the shell.
-    Shell(ShellStorage),
+    /// The node's hyper-log log under the shell, boxed: the handle carries the data directory, the
+    /// root key file and the log's opener, several times the WAL's.
+    Shell(Box<ShellStorage>),
 }
 
 impl std::fmt::Debug for NodeStorage {
@@ -168,6 +180,21 @@ impl NodeStorage {
     }
 }
 
+/// The root key file of the data directory `root` in this crate's tests: off the data directory,
+/// in one directory the test process keeps, its keys made in `root` (29 §2).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn test_key_file(root: &Path) -> PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+    static KEYS: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(|| tempfile::tempdir().unwrap());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    let key = keys.path().join(format!("{:016x}.key", hasher.finish()));
+    focal_seal::open_or_create(root, &key).unwrap();
+    key
+}
+
 /// A handle on `log` for this crate's tests: groups' files under `root`, disk drawn from `disk`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -182,6 +209,7 @@ pub(crate) fn test_shell(root: &Path, log: &ShellLog, disk: DiskBudget) -> Shell
             stream: 0,
         },
         MemoryBudget::new(1 << 20, 1 << 20).unwrap(),
+        &test_key_file(root),
     )
     .unwrap()
 }

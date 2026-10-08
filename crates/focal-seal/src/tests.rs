@@ -156,3 +156,27 @@ fn the_default_key_file_is_never_the_data_directory() {
     let key = default_key_file("node-1").unwrap();
     assert!(key.ends_with("node-1.key"));
 }
+
+#[test]
+fn one_store_key_opens_as_the_node_made_it() {
+    let d = dirs();
+    let made = open_or_create(&d.data, &d.key).unwrap();
+    for (store, key) in [
+        (Store::Group, &made.group),
+        (Store::Content, &made.content),
+        (Store::Journal, &made.journal),
+    ] {
+        assert!(
+            same(key, &store_key(&d.data, &d.key, store).unwrap()),
+            "{store:?}"
+        );
+    }
+    // A data directory the node never started on has no keys to give.
+    let empty = d.data.parent().unwrap().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(matches!(
+        store_key(&empty, &d.key, Store::Group),
+        Err(SealSetupError::NoKeys(_))
+    ));
+    assert!(!empty.join(SEAL_FILE).exists());
+}

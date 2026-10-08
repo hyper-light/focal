@@ -31,7 +31,7 @@ use hyper_log::Log;
 use hyper_raft::proto::{Entry, HardState, Snapshot};
 
 use super::*;
-use crate::group_files::{self, GroupFileError, GroupRecords, ImagePoint};
+use crate::group_files::{self, GroupFileError, GroupRecords, GroupSeal, ImagePoint};
 use crate::storage::RamLog;
 
 /// What a conversion copied: groups, entries and bytes, for the node's record of it.
@@ -168,6 +168,10 @@ fn file_error(error: GroupFileError) -> ConsensusError {
         GroupFileError::Bound { .. } => ConsensusError::Capacity,
         GroupFileError::Encoding(error) => ConsensusError::Encoding(error),
         GroupFileError::Io(error) => ConsensusError::Log(focal_log::LogError::Io(error)),
+        GroupFileError::Keys(_) => {
+            ConsensusError::Configuration("the node's keys do not open its group files")
+        }
+        GroupFileError::Seal(_) => ConsensusError::Corruption("a group file's seal refused it"),
     }
 }
 
@@ -204,6 +208,7 @@ pub(crate) fn restore_group(
     root: &Path,
     log: &crate::ShellLogOpener,
     image: &RestoredLog,
+    seal: &GroupSeal,
 ) -> Result<(), ConsensusError> {
     let conf = ConfState {
         voters: config.voters.clone(),
@@ -230,11 +235,12 @@ pub(crate) fn restore_group(
     let populated = || ConsensusError::Configuration("restore into a populated log");
     let mut medium = FileMedium;
     let dir = group_files::group_dir(root, config.group_id);
-    match group_files::read_records(&medium, &dir).map_err(file_error)? {
+    match group_files::read_records(&medium, &dir, seal).map_err(file_error)? {
         Some(held) if held != records => return Err(populated()),
         _ => {}
     }
-    let held_image = group_files::read_image(&medium, &dir, IMAGE_BYTES).map_err(file_error)?;
+    let held_image =
+        group_files::read_image(&medium, &dir, IMAGE_BYTES, seal).map_err(file_error)?;
     if held_image
         .as_ref()
         .is_some_and(|(held, data)| *held != point || *data != image.data)
@@ -260,9 +266,9 @@ pub(crate) fn restore_group(
         return Ok(());
     }
     let dir = group_files::create(&mut medium, root, config.group_id).map_err(file_error)?;
-    group_files::write_records(&mut medium, &dir, &records).map_err(file_error)?;
+    group_files::write_records(&mut medium, &dir, &records, seal).map_err(file_error)?;
     if held_image.is_none() {
-        group_files::write_image(&mut medium, &dir, &point, &image.data, IMAGE_BYTES)
+        group_files::write_image(&mut medium, &dir, &point, &image.data, IMAGE_BYTES, seal)
             .map_err(file_error)?;
     }
     store
@@ -296,6 +302,7 @@ fn write_new(
     root: &Path,
     log: &Log<DeviceFile>,
     converted: &mut Converted,
+    seal: &GroupSeal,
 ) -> Result<(), ConsensusError> {
     if old.records.fast {
         return Err(ConsensusError::Configuration(
@@ -305,7 +312,7 @@ fn write_new(
     let id = old.records.identity.group_id;
     let mut medium = FileMedium;
     let dir = group_files::create(&mut medium, root, id).map_err(file_error)?;
-    group_files::write_records(&mut medium, &dir, &old.records).map_err(file_error)?;
+    group_files::write_records(&mut medium, &dir, &old.records, seal).map_err(file_error)?;
     let storage = &old.storage;
     let start = match image_point(&storage.snapshot) {
         Some(point) => {
@@ -315,6 +322,7 @@ fn write_new(
                 &point,
                 &storage.snapshot.data,
                 IMAGE_BYTES,
+                seal,
             )
             .map_err(file_error)?;
             converted.image_bytes = converted.image_bytes.saturating_add(
@@ -416,29 +424,35 @@ pub fn copy_groups(
     root: &Path,
     log: &Log<DeviceFile>,
     budget: &MemoryBudget,
+    seal: &GroupSeal,
 ) -> Result<Converted, ConsensusError> {
     let mut converted = Converted::default();
     for id in wal.logs()? {
         let Some(old) = read_old(wal, id, budget)? else {
             continue;
         };
-        write_new(&old, root, log, &mut converted)?;
+        write_new(&old, root, log, &mut converted, seal)?;
     }
     Ok(converted)
 }
 
 /// Compares one group's new home with what focal-log holds of it, value for value.
-fn verify_group(old: &OldGroup, root: &Path, log: &Log<DeviceFile>) -> Result<(), ConsensusError> {
+fn verify_group(
+    old: &OldGroup,
+    root: &Path,
+    log: &Log<DeviceFile>,
+    seal: &GroupSeal,
+) -> Result<(), ConsensusError> {
     let mismatch = |what: &'static str| Err(ConsensusError::Corruption(what));
     let id = old.records.identity.group_id;
     let medium = FileMedium;
     let dir = group_files::group_dir(root, id);
-    let records = group_files::read_records(&medium, &dir).map_err(file_error)?;
+    let records = group_files::read_records(&medium, &dir, seal).map_err(file_error)?;
     if records.as_ref() != Some(&old.records) {
         return mismatch("converted records differ");
     }
     let storage = &old.storage;
-    let image = group_files::read_image(&medium, &dir, IMAGE_BYTES).map_err(file_error)?;
+    let image = group_files::read_image(&medium, &dir, IMAGE_BYTES, seal).map_err(file_error)?;
     match (image_point(&storage.snapshot), image) {
         (None, None) => {}
         (Some(point), Some((read, data))) => {
@@ -508,13 +522,14 @@ pub fn verify(
     root: &Path,
     log: &Log<DeviceFile>,
     budget: &MemoryBudget,
+    seal: &GroupSeal,
 ) -> Result<(), ConsensusError> {
     let mut groups = 0usize;
     for id in wal.logs()? {
         let Some(old) = read_old(wal, id, budget)? else {
             continue;
         };
-        verify_group(&old, root, log)?;
+        verify_group(&old, root, log, seal)?;
         groups = groups.saturating_add(1);
     }
     let held = log
@@ -701,7 +716,11 @@ pub fn convert_data_dir(
     )
     .map_err(ConvertError::Log)?;
     focal_platform::sync_dir(&raft)?;
-    let copied = copy_groups(&wal, root, &log, budget)?;
+    let seal = GroupSeal {
+        data_dir: root.to_path_buf(),
+        key_file: plan.key_file.clone(),
+    };
+    let copied = copy_groups(&wal, root, &log, budget, &seal)?;
     log.close().map_err(ConvertError::Log)?;
     if raft.join("groups").exists() {
         focal_platform::sync_dir(&raft.join("groups"))?;
@@ -714,7 +733,7 @@ pub fn convert_data_dir(
         log_sealing(root, &plan.key_file)?,
     )
     .map_err(ConvertError::Log)?;
-    verify(&wal, root, &log, budget)?;
+    verify(&wal, root, &log, budget, &seal)?;
     log.close().map_err(ConvertError::Log)?;
     drop(wal);
     // Step 6: the commit point. Step 7: the old segments aside.

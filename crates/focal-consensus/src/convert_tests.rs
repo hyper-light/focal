@@ -100,17 +100,34 @@ fn two_groups_with_a_floor_a_checkpoint_and_a_tail_move_whole() {
     let budget = budget();
     let shared = wal(old.path(), &budget);
     let log = Log::create(log_file(new.path()), log_config(), LOG_ID).unwrap();
-    let copied = copy_groups(&shared, new.path(), &log, &budget).unwrap();
+    let copied = copy_groups(
+        &shared,
+        new.path(),
+        &log,
+        &budget,
+        &group_files::test_seal(new.path()),
+    )
+    .unwrap();
     assert_eq!(copied.groups, 2);
     assert_eq!(copied.image_bytes, 5);
     drop(log);
     let (log, _) = Log::open(log_file(new.path()), log_config(), LOG_ID).unwrap();
-    verify(&shared, new.path(), &log, &budget).unwrap();
+    verify(
+        &shared,
+        new.path(),
+        &log,
+        &budget,
+        &group_files::test_seal(new.path()),
+    )
+    .unwrap();
     drop(shared);
-    let records =
-        group_files::read_records(&FileMedium, &group_files::group_dir(new.path(), [2; 16]))
-            .unwrap()
-            .unwrap();
+    let records = group_files::read_records(
+        &FileMedium,
+        &group_files::group_dir(new.path(), [2; 16]),
+        &group_files::test_seal(new.path()),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(records.decoder_floor, Some(HASH));
     let disk = || DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
     let mut floored = DurableNode::open_on_shell(
@@ -165,22 +182,49 @@ fn verification_refuses_a_copy_that_differs() {
     // Records that differ.
     let new = tempfile::tempdir().unwrap();
     let log = Log::create(log_file(new.path()), log_config(), LOG_ID).unwrap();
-    copy_groups(&shared, new.path(), &log, &budget).unwrap();
+    copy_groups(
+        &shared,
+        new.path(),
+        &log,
+        &budget,
+        &group_files::test_seal(new.path()),
+    )
+    .unwrap();
     let dir = group_files::group_dir(new.path(), [3; 16]);
-    let mut records = group_files::read_records(&FileMedium, &dir)
-        .unwrap()
-        .unwrap();
+    let mut records =
+        group_files::read_records(&FileMedium, &dir, &group_files::test_seal(new.path()))
+            .unwrap()
+            .unwrap();
     records.decoder_floor = Some(HASH);
-    group_files::write_records(&mut FileMedium, &dir, &records).unwrap();
+    group_files::write_records(
+        &mut FileMedium,
+        &dir,
+        &records,
+        &group_files::test_seal(new.path()),
+    )
+    .unwrap();
     assert!(matches!(
-        verify(&shared, new.path(), &log, &budget),
+        verify(
+            &shared,
+            new.path(),
+            &log,
+            &budget,
+            &group_files::test_seal(new.path())
+        ),
         Err(ConsensusError::Corruption(_))
     ));
     drop(log);
     // A group the WAL does not hold.
     let new = tempfile::tempdir().unwrap();
     let log = Log::create(log_file(new.path()), log_config(), LOG_ID).unwrap();
-    copy_groups(&shared, new.path(), &log, &budget).unwrap();
+    copy_groups(
+        &shared,
+        new.path(),
+        &log,
+        &budget,
+        &group_files::test_seal(new.path()),
+    )
+    .unwrap();
     let mut stray = claim_empty(&log, [9; 16]).unwrap();
     stray
         .write_now(&Write {
@@ -193,7 +237,13 @@ fn verification_refuses_a_copy_that_differs() {
         })
         .unwrap();
     assert!(matches!(
-        verify(&shared, new.path(), &log, &budget),
+        verify(
+            &shared,
+            new.path(),
+            &log,
+            &budget,
+            &group_files::test_seal(new.path())
+        ),
         Err(ConsensusError::Corruption(_))
     ));
 }
@@ -211,7 +261,13 @@ fn a_group_on_the_fast_track_is_refused() {
     let new = tempfile::tempdir().unwrap();
     let log = Log::create(log_file(new.path()), log_config(), LOG_ID).unwrap();
     assert!(matches!(
-        copy_groups(&shared, new.path(), &log, &budget),
+        copy_groups(
+            &shared,
+            new.path(),
+            &log,
+            &budget,
+            &group_files::test_seal(new.path())
+        ),
         Err(ConsensusError::Configuration(_))
     ));
 }
@@ -325,7 +381,15 @@ fn a_data_directory_converts_whole_and_once() {
     let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
     let mut floored = DurableNode::open_on_shell(
         config(2),
-        &crate::node_storage::test_shell(root.path(), &log, disk),
+        &crate::ShellStorage::new(
+            root.path(),
+            &log,
+            disk,
+            identity(),
+            budget.clone(),
+            &plan(root.path()).key_file,
+        )
+        .unwrap(),
         &budget,
         no_needs,
     )
