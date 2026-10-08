@@ -192,3 +192,39 @@ fence must not open until every rendered deployment gives the node a persistent 
 
 The renderer's goldens change with this, and each deployment test (DC01–DC20) restarts a node
 across a container's recreation and reads its sealed data back.
+
+## 11. The content store, designed (step 4)
+
+The content store keeps every artifact's bytes in `objects/<domain>/`, one file per chunk named by
+its content hash, plus a manifest per object, staging for uploads, and custody records. It is the
+largest store a node keeps, and its file names alone reveal the content hashes of what it holds.
+
+- **A key per content domain.** Each content domain (a tenant's) gets a random key, wrapped by
+  the node's content key and kept beside its objects as a 61-byte record. Destroying that record
+  erases every byte of the domain wherever it lies: on this node, in its backups and archives
+  (NIST SP 800-88r1 cryptographic erase; the erase doc 26's retention asks for).
+- **Chunks sealed by content** (`FileSealer::content_keyed`, docs/seal.md §4). A chunk's data key
+  and file ID derive from its domain key and its 256-bit hash, so the same chunk seals to the same
+  bytes. Deduplication within a domain, idempotent re-seals and the store's verify-by-rehash all
+  keep working. Two different chunks share a key only if their hashes collide (Bellare,
+  Keelveedhi and Ristenpart, EUROCRYPT 2013, message-locked encryption within one parent).
+- **Names keyed per domain** (`hyper_seal::name`, §7): a chunk's file name is a keyed hash of its
+  content hash, so a directory listing reveals nothing about what the domain holds.
+- **Manifests and custody records** are sealed whole under the domain key, as group files are.
+- **Keys held.** The store has one owner, the node's exclusive content writer, which holds the
+  node's content key for its life (one slot). It keeps a bounded cache of unwrapped domain keys,
+  evicted least recently used, sized within the locked region. A miss unwraps the domain's record
+  again: microseconds, never a disk read of the root key.
+- **Range reads** open only the 64 KiB segments a range covers (`SealedReader`). Every chunk
+  delivered is still hashed whole, as now.
+- **Transfers stay plaintext inside TLS** (F58): a node seals what it receives under its own keys.
+  Replicas therefore hold different ciphertext for the same chunk, and none needs another's keys.
+- **Existing stores.** A store written before the storage fence is rewritten once, chunk by chunk,
+  when the node crosses the fence, resumable from any crash cut as the log's conversion is. Reads
+  during the rewrite find each chunk in exactly one form.
+
+Tests owed with it:
+- a flipped byte, a truncation, a chunk swapped between domains, and a renamed file are refused;
+- no stored file or name contains a chunk's bytes or hash;
+- erasing a domain's key record leaves its chunks unreadable while other domains read;
+- a crash cut at every step of the rewrite.
