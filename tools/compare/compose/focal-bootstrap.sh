@@ -19,8 +19,13 @@ retry() {
   done
 }
 serving() { $DC exec -T "$1" focal --data-dir /data diagnose node --probe serving >/dev/null 2>&1; }
+# Serving is the owners running, by design asking no leadership of them (F25);
+# an invitation is the root leader's to issue, so the founder is waited on until
+# it leads (authoritative), as an operator inviting from it must.
+authoritative() { $DC exec -T "$1" focal --data-dir /data diagnose node --probe authoritative >/dev/null 2>&1; }
 
 retry 300 serving focal1
+retry 300 authoritative focal1
 for host in focal2 focal3; do
   f1 cluster invite --node "$host" --output "/invite/$host.invite"
 done
