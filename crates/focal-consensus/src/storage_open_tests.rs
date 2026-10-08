@@ -31,15 +31,43 @@ fn disk() -> DiskBudget {
     DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap()
 }
 
-/// A data directory as a node leaves it before its storage opens: its identity file in place.
-fn data_dir() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(IDENTITY_FILE), b"identity").unwrap();
-    dir
+/// A data directory as a node leaves it before its storage opens: its identity file in place,
+/// its root key file beside it, off the data directory (29 §2), both removed with the test.
+struct Dir {
+    _outer: tempfile::TempDir,
+    data: std::path::PathBuf,
+}
+impl Dir {
+    fn path(&self) -> &Path {
+        &self.data
+    }
+}
+fn data_dir() -> Dir {
+    let outer = tempfile::tempdir().unwrap();
+    let data = outer.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join(IDENTITY_FILE), b"identity").unwrap();
+    Dir {
+        _outer: outer,
+        data,
+    }
+}
+/// The root key file of the data directory `root` made by `data_dir`.
+fn key_of(root: &Path) -> std::path::PathBuf {
+    root.parent().unwrap().join("keys").join("node.key")
 }
 
 fn opened(root: &Path, fence_open: bool) -> OpenedStorage {
-    open_node_storage(root, identity(), facts(), envelope(), disk(), fence_open).unwrap()
+    open_node_storage(
+        root,
+        identity(),
+        facts(),
+        envelope(),
+        disk(),
+        fence_open,
+        &key_of(root),
+    )
+    .unwrap()
 }
 
 /// Below the storage level a node runs on focal-log's WAL, as before, and keeps no log.
@@ -70,6 +98,7 @@ fn at_the_storage_level_a_founded_directory_opens_and_reopens_its_log() {
         envelope.clone(),
         disk(),
         true,
+        &key_of(dir.path()),
     )
     .unwrap();
     assert!(matches!(opened.storage, NodeStorage::Shell(_)));
@@ -113,8 +142,8 @@ fn at_the_storage_level_a_wal_is_converted_first() {
 #[test]
 fn the_log_plan_is_the_same_at_every_start() {
     let dir = data_dir();
-    let a = log_plan(dir.path(), facts(), &envelope()).unwrap();
-    let b = log_plan(dir.path(), facts(), &envelope()).unwrap();
+    let a = log_plan(dir.path(), facts(), &envelope(), &key_of(dir.path())).unwrap();
+    let b = log_plan(dir.path(), facts(), &envelope(), &key_of(dir.path())).unwrap();
     assert_eq!(a.config, b.config);
     assert_eq!(a.align.get(), b.align.get());
 }

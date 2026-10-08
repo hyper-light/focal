@@ -648,6 +648,7 @@ dependencies = [
  "focal-log",
  "focal-memory",
  "focal-platform",
+ "focal-seal",
  "focal-sim",
  "focal-timing",
  "getrandom 0.3.4",
@@ -655,6 +656,7 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
+ "hyper-seal",
  "postcard",
  "raft-proto",
  "serde",
@@ -903,12 +905,14 @@ dependencies = [
  "focal-platform",
  "focal-ranges",
  "focal-runtime",
+ "focal-seal",
  "focal-sim",
  "focal-stream",
  "focal-timing",
  "focal-wire",
  "futures-util",
  "getrandom 0.3.4",
+ "hyper-seal",
  "postcard",
  "quinn",
  "rcgen 0.14.10",
@@ -957,6 +961,18 @@ dependencies = [
  "focal-model",
  "postcard",
  "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "focal-seal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "focal-platform",
+ "getrandom 0.3.4",
+ "hyper-seal",
  "tempfile",
  "thiserror",
 ]

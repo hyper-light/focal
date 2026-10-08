@@ -1,0 +1,21 @@
+[package]
+name = "focal-seal"
+description = "A node's keys at rest: the root key's file, the node key and the keys of each store below it (docs/archictecutre/29-sealing-at-rest.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+getrandom.workspace = true
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
+hyper-seal.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -42,6 +42,8 @@ pub struct OpenedStorage {
     pub log: Option<ShellLog>,
     /// The log's cache, charged to the storage's envelope while the log lives.
     pub cache: Option<Allocation>,
+    /// The keys of the stores sealed beside the log, where the node runs on the shell (29 §3).
+    pub keys: Option<focal_seal::StoreKeys>,
 }
 
 impl std::fmt::Debug for OpenedStorage {
@@ -69,6 +71,8 @@ pub enum OpenError {
     Device(#[from] hyper_block::DiskError),
     #[error("the node's storage memory: {0}")]
     Memory(#[from] MemoryError),
+    #[error("the node's keys: {0}")]
+    Keys(#[from] focal_seal::SealSetupError),
 }
 
 /// The configuration of the log a node with `facts` keeps in the data directory `root`, whose
@@ -77,6 +81,7 @@ pub fn log_plan(
     root: &Path,
     facts: StorageFacts,
     budget: &MemoryBudget,
+    key_file: &Path,
 ) -> Result<LogPlan, OpenError> {
     let block = node_log::device_block(&root.join(IDENTITY_FILE))?;
     let disk_bytes = focal_platform::total_space(root).ok_or(ConsensusError::Configuration(
@@ -99,12 +104,17 @@ pub fn log_plan(
     )?;
     let align = hyper_block::buf::Alignment::new(block)
         .map_err(|_| ConsensusError::Configuration("the device's block is not a power of two"))?;
-    Ok(LogPlan { config, align })
+    Ok(LogPlan {
+        config,
+        align,
+        key_file: key_file.to_path_buf(),
+    })
 }
 
 /// Opens the storage of node `identity` in the data directory `root`: on focal-log's WAL below
 /// the storage level (`fence_open` false), and on the shell at it, converting first where the WAL
-/// is still the node's log. `budget` is the storage's envelope, `disk` the node's disk.
+/// is still the node's log. `budget` is the storage's envelope, `disk` the node's disk, and
+/// `key_file` the root key file the shell's keys open under (29 §2).
 pub fn open_node_storage(
     root: &Path,
     identity: focal_log::WalIdentity,
@@ -112,6 +122,7 @@ pub fn open_node_storage(
     budget: MemoryBudget,
     disk: DiskBudget,
     fence_open: bool,
+    key_file: &Path,
 ) -> Result<OpenedStorage, OpenError> {
     match convert::start(root, identity, fence_open)? {
         Start::Wal => {
@@ -126,10 +137,11 @@ pub fn open_node_storage(
                 storage: NodeStorage::Wal(wal),
                 log: None,
                 cache: None,
+                keys: None,
             })
         }
         start => {
-            let plan = log_plan(root, facts, &budget)?;
+            let plan = log_plan(root, facts, &budget, key_file)?;
             if start == Start::Convert {
                 convert::convert_data_dir(root, identity, &plan, &budget)?;
             }
@@ -165,8 +177,9 @@ fn open_shell(
         hyper_block::file::CachingRequest::PreferDirect,
         plan.align,
     )?;
+    let ((parent, auth), keys) = focal_seal::open_or_create(root, &plan.key_file)?.split();
     let with = hyper_log::With {
-        sealing: None,
+        sealing: Some(hyper_log::Sealing { parent, auth }),
         growth: Some(Box::new(DiskGrowth::new(disk.clone(), root.to_path_buf())?)),
     };
     let id = convert::log_id(identity);
@@ -186,6 +199,7 @@ fn open_shell(
         storage: NodeStorage::Shell(shell),
         log: Some(log),
         cache: Some(cache),
+        keys: Some(keys),
     })
 }
 

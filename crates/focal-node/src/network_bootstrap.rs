@@ -304,6 +304,9 @@ impl FoundingNetwork {
                 stream: 0,
             },
             &budget,
+            &settings
+                .root_key_file(identity.node)
+                .map_err(NodeError::Config)?,
         )?;
         let mut control = ControlReplica::open_on_storage(
             options,

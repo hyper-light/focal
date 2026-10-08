@@ -224,17 +224,37 @@ fn identity() -> WalIdentity {
     }
 }
 
-fn plan() -> LogPlan {
+/// The plan of the data directory `root` made by `node_dir`: its root key file beside it, off the
+/// data directory (29 §2), removed with the test.
+fn plan(root: &Path) -> LogPlan {
     LogPlan {
         config: log_config(),
         align: Alignment::new(4096).unwrap(),
+        key_file: root.parent().unwrap().join("keys").join("node.key"),
+    }
+}
+
+/// A node's data directory, one level inside the temporary directory that holds its key too.
+struct NodeDir {
+    _outer: tempfile::TempDir,
+    data: std::path::PathBuf,
+}
+impl NodeDir {
+    fn path(&self) -> &Path {
+        &self.data
     }
 }
 
 /// A node's data directory whose `wal/` holds `recorded()`'s two groups, closed.
-fn node_dir() -> (tempfile::TempDir, Vec<CommittedEntry>) {
+fn node_dir() -> (NodeDir, Vec<CommittedEntry>) {
     let (old, tail) = recorded();
-    let root = tempfile::tempdir().unwrap();
+    let outer = tempfile::tempdir().unwrap();
+    let data = outer.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let root = NodeDir {
+        _outer: outer,
+        data,
+    };
     std::fs::create_dir(root.path().join(WAL_DIR)).unwrap();
     for entry in std::fs::read_dir(old.path()).unwrap() {
         let entry = entry.unwrap();
@@ -274,7 +294,7 @@ fn a_data_directory_converts_whole_and_once() {
     let held = segments(&root.path().join(WAL_DIR));
     let budget = budget();
     let Outcome::Converted { copied, moved } =
-        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap()
+        convert_data_dir(root.path(), identity(), &plan(root.path()), &budget).unwrap()
     else {
         panic!("converted now");
     };
@@ -299,7 +319,9 @@ fn a_data_directory_converts_whole_and_once() {
         align,
     )
     .unwrap();
-    let (log, _) = Log::open(file, log_config(), log_id(identity())).unwrap();
+    // The converted log is sealed (29 §5): it opens only under the node's keys.
+    let sealing = crate::convert::log_sealing(root.path(), &plan(root.path()).key_file).unwrap();
+    let (log, _) = Log::open_sealed(file, log_config(), log_id(identity()), sealing).unwrap();
     let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
     let mut floored = DurableNode::open_on_shell(
         config(2),
@@ -320,7 +342,7 @@ fn a_data_directory_converts_whole_and_once() {
     drop(floored);
     drop(log);
     assert_eq!(
-        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap(),
+        convert_data_dir(root.path(), identity(), &plan(root.path()), &budget).unwrap(),
         Outcome::Finished { moved: 0 }
     );
 }
@@ -335,7 +357,7 @@ fn a_conversion_resumes_where_a_crash_left_it() {
     std::fs::create_dir_all(root.path().join(RAFT_DIR).join("groups")).unwrap();
     std::fs::write(root.path().join(LOG_FILE), b"a torn earlier attempt").unwrap();
     assert!(matches!(
-        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap(),
+        convert_data_dir(root.path(), identity(), &plan(root.path()), &budget).unwrap(),
         Outcome::Converted { .. }
     ));
     let (root, _) = node_dir();
@@ -343,7 +365,7 @@ fn a_conversion_resumes_where_a_crash_left_it() {
     focal_log::conversion::commit(&root.path().join(WAL_DIR), identity(), log_id(identity()))
         .unwrap();
     assert_eq!(
-        convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap(),
+        convert_data_dir(root.path(), identity(), &plan(root.path()), &budget).unwrap(),
         Outcome::Finished { moved: held }
     );
 }
@@ -369,7 +391,7 @@ fn a_start_opens_what_the_fence_and_the_directory_state() {
     std::fs::remove_dir_all(root.path().join(RAFT_DIR)).unwrap();
     // Converted: the shell, at the level or (never lowered) below it.
     let budget = budget();
-    convert_data_dir(root.path(), identity(), &plan(), &budget).unwrap();
+    convert_data_dir(root.path(), identity(), &plan(root.path()), &budget).unwrap();
     assert_eq!(start(root.path(), identity(), true).unwrap(), Start::Shell);
     assert_eq!(start(root.path(), identity(), false).unwrap(), Start::Shell);
     // Another node's commit point, and a commit point whose log is gone.

@@ -29,11 +29,12 @@ pub(crate) fn facts() -> StorageFacts {
 }
 
 /// Opens the storage of the node `identity` names in the data directory `root`, its memory
-/// within `budget`.
+/// within `budget`, its shell's keys under the root key file `key_file` (29 §2).
 pub(crate) fn open(
     root: &Path,
     identity: WalIdentity,
     budget: &MemoryBudget,
+    key_file: &Path,
 ) -> Result<OpenedStorage, NodeError> {
     let disk = crate::network_service::disk_budget().map_err(NodeError::Content)?;
     let fence_open = crate::storage_level::storage_opened(root)?;
@@ -46,6 +47,7 @@ pub(crate) fn open(
             .map_err(focal_consensus::storage_open::OpenError::Memory)?,
         disk,
         fence_open,
+        key_file,
     )?)
 }
 

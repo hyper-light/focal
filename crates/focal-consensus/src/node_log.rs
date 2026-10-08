@@ -62,7 +62,9 @@ pub fn config(groups: &NodeConfig, log: &NodeLog) -> Result<hyper_log::Config, C
         .ok_or_else(unfit)?;
     hyper_log::Config::derive(&Facts {
         align,
-        sealed: false,
+        // The node log is always sealed (29 §5): its frames carry a MAC and a key record, its
+        // records their tags.
+        sealed: true,
         largest_entry: largest,
         disk_bytes: log.disk_bytes,
         max_groups: log.max_groups,

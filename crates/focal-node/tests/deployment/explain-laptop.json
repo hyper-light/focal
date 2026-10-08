@@ -75,6 +75,7 @@
     "node.listen": "creation_default",
     "node.max_tenants": "creation_default",
     "node.metrics_listen": "creation_default",
+    "node.root_key": "creation_default",
     "node.seeds": "creation_default",
     "placement.home_regions": {
       "committed": 1

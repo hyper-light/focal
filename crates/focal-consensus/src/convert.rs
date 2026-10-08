@@ -539,15 +539,20 @@ pub const CONVERTED_DIR: &str = "wal-converted";
 
 /// The log a conversion writes: its configuration (from the device and the node, [27] §15.3) and
 /// the file's alignment.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LogPlan {
     pub config: hyper_log::Config,
     pub align: hyper_block::buf::Alignment,
+    /// The root key file the node's keys open under (29 §2): the log is sealed from its creation.
+    pub key_file: std::path::PathBuf,
 }
 
 /// Why a data directory was not converted. Every refusal leaves the WAL the node's log.
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
+    /// The node's keys did not open or could not be made (29 §2): nothing was written.
+    #[error(transparent)]
+    Keys(#[from] focal_seal::SealSetupError),
     /// The volume cannot hold the new log beside the WAL (step 1): nothing was written.
     #[error("the conversion needs {needed} bytes free beside the WAL, and the volume has {free}")]
     Disk { needed: u64, free: u64 },
@@ -620,6 +625,16 @@ fn open_log_file(path: &Path, plan: &LogPlan) -> Result<DeviceFile, ConvertError
     .map_err(|error| ConvertError::Io(std::io::Error::other(error.to_string())))
 }
 
+/// The node log's sealing (29 §5): its writer sessions' parent key and its MAC key, from the
+/// node's keys under the root key file the plan names.
+pub fn log_sealing(root: &Path, key_file: &Path) -> Result<hyper_log::Sealing, ConvertError> {
+    let keys = focal_seal::open_or_create(root, key_file)?;
+    Ok(hyper_log::Sealing {
+        parent: keys.log_parent,
+        auth: keys.log_auth,
+    })
+}
+
 /// Converts the data directory `root` from focal-log's WAL (`root/wal`) to hyper-log and the group
 /// files (`root/raft`): [27] §15.8, steps 1 to 7, in order, the WAL untouched until the commit point.
 /// The WAL must be closed; this holds its lock while it reads it. A directory already past the
@@ -678,8 +693,13 @@ pub fn convert_data_dir(
     focal_log::create_durable_directory(&raft)?;
     // Steps 3 and 4: every group copied, durable as written.
     let log_path = root.join(LOG_FILE);
-    let log = hyper_log::Log::create(open_log_file(&log_path, plan)?, plan.config, id)
-        .map_err(ConvertError::Log)?;
+    let log = hyper_log::Log::create_sealed(
+        open_log_file(&log_path, plan)?,
+        plan.config,
+        id,
+        log_sealing(root, &plan.key_file)?,
+    )
+    .map_err(ConvertError::Log)?;
     focal_platform::sync_dir(&raft)?;
     let copied = copy_groups(&wal, root, &log, budget)?;
     log.close().map_err(ConvertError::Log)?;
@@ -687,8 +707,13 @@ pub fn convert_data_dir(
         focal_platform::sync_dir(&raft.join("groups"))?;
     }
     // Step 5: opened as a restart opens it, and compared.
-    let (log, _) = hyper_log::Log::open(open_log_file(&log_path, plan)?, plan.config, id)
-        .map_err(ConvertError::Log)?;
+    let (log, _) = hyper_log::Log::open_sealed(
+        open_log_file(&log_path, plan)?,
+        plan.config,
+        id,
+        log_sealing(root, &plan.key_file)?,
+    )
+    .map_err(ConvertError::Log)?;
     verify(&wal, root, &log, budget)?;
     log.close().map_err(ConvertError::Log)?;
     drop(wal);

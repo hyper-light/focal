@@ -64,6 +64,11 @@ pub struct NodeSettings {
     /// An optional loopback endpoint for the read-only metrics text (doc
     /// 08 §9); node-local, never a cluster fact.
     pub metrics_listen: Option<SocketAddr>,
+    /// The file the node's root key lives in (29 §2): 32 bytes, owner-only,
+    /// never inside the data directory. Unset, the platform's per-user
+    /// configuration directory (`focal_seal::default_key_file`); in a
+    /// container, a mounted secret file. Node-local, never a cluster fact.
+    pub root_key: Option<PathBuf>,
     /// How long a credential the cluster issues lasts, in seconds — the
     /// founder's own, every joined node's and every participant's; a node
     /// renews its own in the last third of it (24 §11). The founder commits
@@ -195,6 +200,17 @@ impl Settings {
                 reason: "must not be empty",
             });
         }
+        if self
+            .node
+            .root_key
+            .as_ref()
+            .is_some_and(|s| s.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid {
+                field: "node.root_key",
+                reason: "must not be empty",
+            });
+        }
         if self.node.seeds.iter().any(|s| s.trim().is_empty())
             || self
                 .node
@@ -321,6 +337,17 @@ impl Settings {
             durability: self.durability.clone(),
             placement: self.placement.clone(),
         }
+    }
+    /// The root key file of node `node` (29 §2): the configured file, or the
+    /// platform's default, named for the node.
+    pub fn root_key_file(&self, node: u64) -> Result<PathBuf, ConfigError> {
+        if let Some(path) = &self.node.root_key {
+            return Ok(path.clone());
+        }
+        focal_seal::default_key_file(&format!("{node:016x}")).ok_or(ConfigError::Invalid {
+            field: "node.root_key",
+            reason: "unset, and the platform names no per-user configuration directory",
+        })
     }
     pub fn data_dir(&self) -> Result<PathBuf, ConfigError> {
         if let Some(path) = &self.node.data_dir {

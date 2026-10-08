@@ -395,6 +395,9 @@ impl OwnerGate {
                         storage,
                         log,
                         cache,
+                        // The store keys beside the log are taken by the stores sealed next
+                        // (29 §8); until then they are wiped here.
+                        keys: _,
                     } = opened;
                     drop(storage);
                     if let Some(log) = log
@@ -543,6 +546,9 @@ impl Prepared {
                     stream: 0,
                 },
                 &budget,
+                &settings
+                    .root_key_file(state.node)
+                    .map_err(NodeError::Config)?,
             )?;
             let options = ControlOptions::new(NodeConfig::joining(
                 state.node,
