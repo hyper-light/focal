@@ -20,6 +20,10 @@ thiserror = "2.0"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux's native AIO system calls (`aio`): io_setup, io_submit, io_getevents, io_destroy.
+libc = "0.2.189"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",

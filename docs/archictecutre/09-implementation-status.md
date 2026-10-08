@@ -14017,3 +14017,17 @@ default budget admits an anchor and alias that the stated one refuses, and the s
 without the budget. `scripts/check-contracts.py` now refuses `serde_saphyr::from_str`,
 `from_slice` and `from_reader` in production sources (an inline test module may compare against
 them), so a new site cannot take the default.
+
+### 2026-10-08 — The shared crates at hyper-raft 5d68252
+
+The seven `hyper-*` snapshots move from `f311ab6` to `5d68252`, hyper-raft main once its CI
+passed all 14 jobs (run 37823366100). `5d68252` changed only `hyper-block`: it gains `aio`, whose
+`AioFile` issues a direct file's reads, writes and their flush to Linux's native AIO from the
+caller's thread and reaps them there (io_submit(2), io_getevents(2); the flush an
+`IOCB_CMD_FDSYNC` once every write of its batch succeeded, `fdatasync` in place on a kernel
+before 4.18), refused, typed, over a buffered file and on every other OS. Its manifest gains
+`libc` on Linux for those calls. The other six crates are byte for byte `f311ab6`'s. focal
+does not call `aio` yet: whether its log writes through it is a separate change, decided by a
+measured before and after, so this snapshot claims no gain of its own. hyper-raft
+`docs/research/issuer-completions.md` §8 states the design and `docs/benchmarks.md` its
+measurements.

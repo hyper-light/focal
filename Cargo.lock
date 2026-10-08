@@ -1225,6 +1225,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "getrandom 0.4.3",
+ "libc",
  "rustix 1.1.4",
  "thiserror",
  "windows-sys 0.61.2",
