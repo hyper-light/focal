@@ -12,8 +12,10 @@ repository = "https://github.com/hyper-light/hyper-raft"
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom = "0.4"
 thiserror = "2.0"
-# The device a sealed file is written and read through (`sealed_file`).
-hyper-block = { version = "0.1.0", path = "../hyper-block" }
+# The device a sealed file is written and read through (`sealed_file`), behind the `files`
+# feature: hyper-block opens and writes files, and a consumer that confines file writes to one
+# crate enables it there alone.
+hyper-block = { version = "0.1.0", path = "../hyper-block", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # mlock(2) and madvise(2) for the key region, and the page size.
@@ -22,6 +24,10 @@ rustix = { version = "1.1", features = ["mm", "param"] }
 [target.'cfg(windows)'.dependencies]
 # VirtualLock for the key region; GetSecurityInfo and the ACL walk for a key file's owner-only check.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
+
+[features]
+# A whole file sealed through a `hyper_block::block::BlockFile` (`sealed_file`).
+files = ["dep:hyper-block"]
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
 # suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.

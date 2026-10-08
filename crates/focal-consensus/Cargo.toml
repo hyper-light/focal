@@ -11,7 +11,8 @@ focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
 focal-seal = { version = "0.1.0", path = "../focal-seal" }
-hyper-seal.workspace = true
+# The group files are sealed whole here (`group_files`), the one crate that writes them.
+hyper-seal = { workspace = true, features = ["files"] }
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 getrandom.workspace = true
 hyper-block.workspace = true

@@ -5,8 +5,8 @@
 //!   [`keys::KeySource`] a root key comes from (§3).
 //! - [`stream`]: a file written once, sealed in segments by STREAM, each an AES-256-GCM seal at a
 //!   nonce counting its segment and marking the last (§4).
-//! - [`sealed_file`]: a whole file sealed by STREAM, written and read through a
-//!   `hyper_block::BlockFile`, padded to its alignment, one buffer reused (§4).
+//! - `sealed_file`, with the `files` feature: a whole file sealed by STREAM, written and read
+//!   through a `hyper_block::BlockFile`, padded to its alignment, one buffer reused (§4).
 //! - [`log`]: an appended log's records sealed one by one under a key per writer session, each at
 //!   its offset, so no key ever seals two records at one offset, crash or not (§5).
 //! - [`recipient`]: a key wrapped to another machine's ML-KEM-1024 key (§6).
@@ -40,6 +40,7 @@ pub mod log;
 mod memory;
 pub mod name;
 pub mod recipient;
+#[cfg(feature = "files")]
 pub mod sealed_file;
 pub mod stream;
 
