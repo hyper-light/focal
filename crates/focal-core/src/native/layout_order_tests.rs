@@ -345,3 +345,54 @@ fn evaluation_rows_are_stored_in_key_order_and_the_wire_key_orders_the_same() {
         "a declaration's evaluations are interleaved with another's"
     );
 }
+
+/// The keys `same_family` compares field by field, several of each family differing in each field
+/// in turn, each pair ordered as their slots order them: the fast comparison is the order.
+#[test]
+fn the_field_comparison_of_one_family_is_the_slot_order() {
+    let ids = |n: u8| [n; 16];
+    let request = |p: u8, e: u64, i: u8| RequestKey {
+        principal: ParticipantId(ids(p)),
+        epoch: RequestEpoch(e),
+        id: RequestId(ids(i)),
+    };
+    let mut keys = Vec::new();
+    for a in [1u8, 2, 200] {
+        for b in [1u8, 3, 255] {
+            let (x, y) = (claim(a), claim(b));
+            keys.extend([
+                Key::Claim(x),
+                Key::IncomingHead(x),
+                Key::ClaimContent(x),
+                Key::IncomingLink(x, y),
+                Key::MonitorLink(x, focal_model::MonitorId(ids(b))),
+                Key::ByIssuer(ParticipantId(ids(a)), y),
+                Key::BySubject(ParticipantId(ids(a)), y),
+                Key::ByStatus(u16::from(a), y),
+                Key::ByAction(u16::from(a), y),
+                Key::ByCreated(
+                    u16::from(a),
+                    SessionSeq(u64::from(b)),
+                    focal_model::ObjectId(ids(b)),
+                ),
+                Key::ByCreated(
+                    u16::from(a),
+                    SessionSeq(u64::from(b)),
+                    focal_model::ObjectId(ids(a)),
+                ),
+                Key::ByObject(u16::from(a), focal_model::ObjectId(ids(b))),
+                Key::Event(SessionSeq(u64::from(a)), u32::from(b)),
+                Key::Outcome(NativeInvocation::Request(request(a, u64::from(b), b))),
+                Key::Outcome(NativeInvocation::Request(request(a, u64::from(b), a))),
+                Key::Outcome(NativeInvocation::Request(request(b, u64::from(a), a))),
+                Key::CreationResult(NativeInvocation::Request(request(a, u64::from(b), b))),
+                Key::CreationResult(NativeInvocation::Request(request(b, 7, a))),
+            ]);
+        }
+    }
+    for a in &keys {
+        for b in &keys {
+            assert_eq!(a.cmp(b), order_key(a).cmp(&order_key(b)), "{a:?} vs {b:?}");
+        }
+    }
+}

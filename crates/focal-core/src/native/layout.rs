@@ -387,8 +387,51 @@ impl Ord for Key {
         affinity(self)
             .cmp(&affinity(other))
             .then_with(|| family(self).cmp(&family(other)))
-            .then_with(|| slots(self).cmp(&slots(other)))
+            .then_with(|| {
+                same_family(self, other).unwrap_or_else(|| slots(self).cmp(&slots(other)))
+            })
     }
+}
+
+/// Two keys of one affinity and family compared field by field, the values [`slots`] lays out in
+/// the same order, without building either key's ten slots. A family is one variant, so its keys
+/// have one shape and comparing their values in order is comparing their slots. A 2026-10-08 profile
+/// of committed authored claims spent the write path's most CPU in `slots`: one principal's
+/// outcomes and creation results, and the index rows, share an affinity and family by the thousand,
+/// so most comparisons of a page search reached it. Kinds not listed here take [`slots`].
+fn same_family(a: &Key, b: &Key) -> Option<std::cmp::Ordering> {
+    use Key as K;
+    Some(match (a, b) {
+        (K::IncomingHead(x), K::IncomingHead(y))
+        | (K::MonitorHead(x), K::MonitorHead(y))
+        | (K::Claim(x), K::Claim(y))
+        | (K::RetiredCycleHead(x), K::RetiredCycleHead(y))
+        | (K::Retired(x), K::Retired(y))
+        | (K::ClaimResultTestament(x), K::ClaimResultTestament(y))
+        | (K::ClaimContent(x), K::ClaimContent(y)) => x.0.cmp(&y.0),
+        (K::IncomingLink(c, f), K::IncomingLink(d, g)) => (c.0, f.0).cmp(&(d.0, g.0)),
+        (K::MonitorLink(c, m), K::MonitorLink(d, n)) => (c.0, m.0).cmp(&(d.0, n.0)),
+        (K::ByIssuer(p, c), K::ByIssuer(q, d)) | (K::BySubject(p, c), K::BySubject(q, d)) => {
+            (p.0, c.0).cmp(&(q.0, d.0))
+        }
+        (K::ByStatus(k, c), K::ByStatus(l, d)) | (K::ByAction(k, c), K::ByAction(l, d)) => {
+            (u64::from(*k), c.0).cmp(&(u64::from(*l), d.0))
+        }
+        (K::ByCreated(k, s, o), K::ByCreated(l, t, p)) => {
+            (u64::from(*k), s.0, o.0).cmp(&(u64::from(*l), t.0, p.0))
+        }
+        (K::ByObject(k, o), K::ByObject(l, p)) => (u64::from(*k), o.0).cmp(&(u64::from(*l), p.0)),
+        (K::Event(s, o), K::Event(t, p)) => (s.0, u64::from(*o)).cmp(&(t.0, u64::from(*p))),
+        (K::Outcome(i), K::Outcome(j)) | (K::CreationResult(i), K::CreationResult(j)) => {
+            match (i, j) {
+                (NativeInvocation::Request(r), NativeInvocation::Request(q)) => {
+                    (r.principal.0, r.epoch.0, r.id.0).cmp(&(q.principal.0, q.epoch.0, q.id.0))
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
