@@ -65,7 +65,7 @@ mod gc;
 pub use gc::{CollectorConfig, CollectorReport, ProtectionSet, SeedReport};
 #[path = "seeds.rs"]
 mod seeds;
-pub use seeds::{SEED_CHUNK_BYTES, SeedReader, SeedStore};
+pub use seeds::{SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader, SeedStore};
 #[path = "native_artifact.rs"]
 mod native_artifact;
 pub use native_artifact::*;

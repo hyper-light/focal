@@ -7,6 +7,7 @@ use super::engine::{Domain, NativeEngine};
 use super::*;
 use crate::native_checkpoint::{self as enclosing, Activation, AncillaryProfile, Metadata};
 use focal_consensus::AppliedSnapshot;
+use focal_evidence::SeedCommit;
 
 /// The producer incarnation of a replica that installed an authoritative
 /// snapshot: derived from the attested genesis and the exact install event, so
@@ -93,15 +94,32 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &DurableNode,
         seeds: &mut SeedStore,
     ) -> Result<(Vec<u8>, Allocation), NativeSessionError> {
-        let (bytes, allocation) = self.encode_checkpoint_inner(consensus, seeds)?;
-        self.note_seeds(&bytes)?;
+        let (bytes, allocation, commit) = self.encode_checkpoint_deferred(consensus, seeds)?;
+        if let Some(commit) = commit
+            && let Err(error) = commit.run()
+        {
+            seeds.fail();
+            return Err(NativeSessionError::from(enclosing::Error::from(error)));
+        }
         Ok((bytes, allocation))
+    }
+    /// As `encode_checkpoint`, a root sealed as seeds left for the returned
+    /// commit to make durable: until it has, the bytes must not reach
+    /// consensus (they name the chunks).
+    pub(crate) fn encode_checkpoint_deferred(
+        &mut self,
+        consensus: &DurableNode,
+        seeds: &mut SeedStore,
+    ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
+        let (bytes, allocation, commit) = self.encode_checkpoint_inner(consensus, seeds)?;
+        self.note_seeds(&bytes)?;
+        Ok((bytes, allocation, commit))
     }
     fn encode_checkpoint_inner(
         &self,
         consensus: &DurableNode,
         seeds: &mut SeedStore,
-    ) -> Result<(Vec<u8>, Allocation), NativeSessionError> {
+    ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
         self.check()?;
         let status = consensus.status();
         if self.applied_raft == 0
@@ -161,7 +179,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         )?;
         // A root beyond the inline bound is sealed as seeds first (25 §5);
         // the bytes consensus carries then name them.
-        Ok(plan.encode_in_seeded(&self.budget, seeds)?.into_parts())
+        let (encoded, commit) = plan.encode_in_seeded_deferred(&self.budget, seeds)?;
+        let (bytes, allocation) = encoded.into_parts();
+        Ok((bytes, allocation, commit))
     }
 
     /// Validate and install an authoritative snapshot. Every identity, floor,

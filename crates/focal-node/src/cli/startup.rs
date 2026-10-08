@@ -1,5 +1,5 @@
-//! What `focal start node` shows on a colour terminal: focal's study, five lenses finding
-//! their focus, beside the node's status while it starts; then, once it is ready, the
+//! What `focal start node` shows on a colour terminal: focal's mark as lit glass, a glint
+//! travelling its rim and its focal point breathing, beside the node's status while it starts; then, once it is ready, the
 //! lenses settled and the status as a card, redrawn in place whenever the node reports a
 //! new one. Nothing moves once the node is ready: a node left in the foreground spends no
 //! processor time on its display. Off a terminal the node prints its JSON, as always.
@@ -13,7 +13,7 @@ use focal_tui::motion::{self, Clock};
 use focal_tui::page::Line;
 use focal_tui::terminal::{self, Stream};
 use focal_tui::tokens::{self, Paint, Rgb};
-use focal_tui::{layout, lens, text};
+use focal_tui::{layout, text};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -25,8 +25,10 @@ const FRAME: Duration = Duration::from_millis(33);
 /// on a quorum that does not come may wait for good; its display stops moving and says
 /// it is still starting, so that waiting costs no processor time either.
 const MOST_MOTION: Duration = Duration::from_secs(600);
-/// The narrowest terminal the lenses are drawn on, beside the card.
-const WITH_LENSES: usize = 76;
+/// The narrowest terminal the mark is drawn on, beside the card.
+const WITH_LENSES: usize = 64;
+/// The mark's width in cells beside the card: 24 shaded pixels square, 12 rows.
+const MARK_COLS: usize = 24;
 
 /// What the node said about itself last.
 #[derive(Debug, Clone, Default)]
@@ -230,16 +232,11 @@ fn draw(
 ) {
     let cols = terminal::width(Stream::Stdout);
     let lenses = cols >= WITH_LENSES;
-    // The study's view is 544 × 436 units; at two dots a column and four a row, its
-    // rows are two fifths of its columns.
-    let lens_cols = if lenses { (cols / 2).clamp(28, 44) } else { 0 };
-    let lens_rows = lens_cols.saturating_mul(2) / 5;
-    if canvas.cols() != lens_cols || canvas.rows() != lens_rows {
-        canvas.resize(lens_cols, lens_rows);
-    }
-    if lenses {
-        lens::draw(canvas, t);
-    }
+    // The mark as lit glass, its glint travelling the rim while the node starts.
+    let lens_cols = if lenses { MARK_COLS } else { 0 };
+    let mark = focal_tui::shade::mark(lens_cols, t);
+    let lens_rows = mark.rows();
+    let _ = canvas;
     let room = cols.saturating_sub(lens_cols.saturating_add(4)).max(20);
     let info = card_lines(paint, title, card, t, moving, room);
     let rows = info.len().max(lens_rows);
@@ -250,7 +247,7 @@ fn draw(
         l.pad(1);
         if lenses {
             if r < lens_rows {
-                canvas.row(r, paint, &mut l.s);
+                mark.row(r, paint, &mut l.s);
                 l.w = l.w.saturating_add(lens_cols);
             } else {
                 l.pad(lens_cols);

@@ -24,6 +24,24 @@ struct FundedCheckpointInput {
     allocation: Allocation,
 }
 
+/// Whether a funded checkpoint input's permit covers its buffer.
+fn funded(input: &FundedCheckpointInput) -> Result<(), ConsensusError> {
+    let overhead = if input.data.capacity() == 0 {
+        0
+    } else {
+        const { 4 * size_of::<usize>() }
+    };
+    let required = input
+        .data
+        .capacity()
+        .checked_add(overhead)
+        .ok_or(ConsensusError::Capacity)?;
+    if input.allocation.bytes() < required {
+        return Err(ConsensusError::Capacity);
+    }
+    Ok(())
+}
+
 impl LogNode {
     pub fn checkpoint_pending(&self) -> bool {
         self.checkpoint.is_some()
@@ -42,20 +60,38 @@ impl LogNode {
         allocation: Allocation,
     ) -> Result<(), ConsensusError> {
         let mut input = FundedCheckpointInput { data, allocation };
-        let overhead = if input.data.capacity() == 0 {
-            0
-        } else {
-            const { 4 * size_of::<usize>() }
-        };
-        let required = input
-            .data
-            .capacity()
-            .checked_add(overhead)
-            .ok_or(ConsensusError::Capacity)?;
-        if input.allocation.bytes() < required {
-            return Err(ConsensusError::Capacity);
-        }
+        funded(&input)?;
         self.begin_checkpoint(index, std::mem::take(&mut input.data))
+    }
+
+    /// `begin_checkpoint_from` for a funded buffer, as `begin_checkpoint_funded`
+    /// is for the delivered prefix.
+    pub fn begin_checkpoint_from_funded(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+        allocation: Allocation,
+    ) -> Result<(), ConsensusError> {
+        let mut input = FundedCheckpointInput { data, allocation };
+        funded(&input)?;
+        self.begin_checkpoint_from(point, std::mem::take(&mut input.data))
+    }
+
+    /// The point a checkpoint of the delivered prefix is taken at: its index,
+    /// the term of its entry and the configuration applied through it. The
+    /// owner captures it with the state it encodes, so that a checkpoint made
+    /// durable later (`begin_checkpoint_from`) names exactly that prefix.
+    pub fn checkpoint_point(&self) -> Result<CheckpointPoint, ConsensusError> {
+        self.check()?;
+        let index = self.delivered_index;
+        if index == 0 || index > self.raw.store().hard_state.commit {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        Ok(CheckpointPoint {
+            index,
+            term: self.raw.store().term(index)?,
+            configuration: self.raw.store().conf_state.clone(),
+        })
     }
 
     /// Prepare an exact published-prefix checkpoint without waiting for disk.
@@ -63,13 +99,42 @@ impl LogNode {
     /// unadmitted checkpoint is explicitly canceled.
     pub fn begin_checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.check()?;
+        if index != self.delivered_index {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        let point = self.checkpoint_point()?;
+        self.begin_checkpoint_from(point, data)
+    }
+
+    /// As `begin_checkpoint`, for a prefix captured earlier (`checkpoint_point`)
+    /// whose state was made durable while the replica went on: the snapshot is
+    /// of `point`, and every entry after it stays in the log behind it, so a
+    /// restart replays them over the image exactly as a member installing it
+    /// does (Ongaro's thesis §5.1). Refused, retryably, when a snapshot past
+    /// the point already supersedes it, when the point's entry is no longer the one
+    /// captured, or when the configuration changed after it: compaction would
+    /// otherwise set the live configuration back to the point's.
+    pub fn begin_checkpoint_from(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+    ) -> Result<(), ConsensusError> {
+        self.check()?;
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending);
         }
+        let CheckpointPoint {
+            index,
+            term: point_term,
+            configuration,
+        } = point;
         if index == 0
-            || index != self.delivered_index
+            || index > self.delivered_index
             || index > self.raw.store().hard_state.commit
+            || index < proto::snapshot_index(&self.raw.store().snapshot)
             || self.raw.has_ready()
+            || configuration != self.raw.store().conf_state
+            || self.raw.store().term(index)? != point_term
         {
             return Err(ConsensusError::CheckpointIndex);
         }
@@ -84,11 +149,11 @@ impl LogNode {
             bytes,
         )?;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let term = self.raw.store().term(index)?;
+            let term = point_term;
             let snapshot = Snapshot {
                 data,
                 metadata: Some(SnapshotMetadata {
-                    conf_state: Some(self.raw.store().conf_state.clone()),
+                    conf_state: Some(configuration),
                     index,
                     term,
                 }),

@@ -449,6 +449,29 @@ impl DurableNode {
     /// Prepare an exact published-prefix checkpoint without waiting for disk.
     /// No RawNode mutation is allowed until its ticket completes or this still
     /// unadmitted checkpoint is explicitly canceled.
+    /// The point a checkpoint of the delivered prefix is taken at, captured
+    /// with the state the owner encodes.
+    pub fn checkpoint_point(&self) -> Result<CheckpointPoint, ConsensusError> {
+        dispatch!(inner = &self.backend => inner.checkpoint_point())
+    }
+    /// `begin_checkpoint_from_funded`, consensus funding its own copies.
+    pub fn begin_checkpoint_from(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+    ) -> Result<(), ConsensusError> {
+        dispatch!(inner = &mut self.backend => inner.begin_checkpoint_from(point, data))
+    }
+    /// A checkpoint of a prefix captured earlier, its state made durable while
+    /// the replica went on; the entries after it stay in the log.
+    pub fn begin_checkpoint_from_funded(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+        allocation: Allocation,
+    ) -> Result<(), ConsensusError> {
+        dispatch!(inner = &mut self.backend => inner.begin_checkpoint_from_funded(point, data, allocation))
+    }
     pub fn begin_checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.begin_checkpoint(index, data))
     }

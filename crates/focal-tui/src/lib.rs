@@ -6,7 +6,8 @@
 //!   them on 24-bit or 256-colour terminals.
 //! - `motion`: one clock per display and the site's curves.
 //! - `canvas`: Braille cells as a 2×4 dot canvas, for drawing at sub-cell resolution.
-//! - `mark`: the focal mark, its prism lit along its rim, its focal point breathing.
+//! - `mark`: the focal mark in Braille, for terminals that show no colour fill.
+//! - `shade`: shaded half-block images; the focal mark as lit glass.
 //! - `lens`: focal's study, five lenses and three beams finding one focus.
 //! - `text`, `layout`: eyebrows, sizes, counts and times; text wrapped at words.
 //! - `page`: the head, sections, usage lines, entries and options of every page.
@@ -38,6 +39,7 @@ pub mod meter;
 pub mod motion;
 pub mod page;
 pub mod panel;
+pub mod shade;
 pub mod terminal;
 pub mod text;
 pub mod tokens;

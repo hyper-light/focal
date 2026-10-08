@@ -103,6 +103,7 @@ impl Owner {
                     bytes: timing.bytes,
                     native_micros: timing.native_micros,
                     envelope_micros: timing.envelope_micros,
+                    deferred_micros: timing.deferred_micros,
                     write_micros: timing.write_micros,
                 })
                 .collect(),

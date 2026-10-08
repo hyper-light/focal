@@ -2,7 +2,6 @@
 //! tracked capitals), sections under eyebrows, usage lines coloured by what their words
 //! are, and entries in columns.
 
-use crate::canvas::Canvas;
 use crate::layout;
 use crate::text;
 use crate::tokens::{self, Paint, Rgb};
@@ -82,20 +81,18 @@ impl Page {
     }
 }
 
-/// The mark's size in the head: 24 × 24 dots, three quarters of its 32-unit box, the
-/// least at which its rays, axis and focal point stay apart.
-const MARK_COLS: usize = 12;
-const MARK_ROWS: usize = 6;
+/// The mark's size in the head: 20 × 20 shaded pixels, ten rows.
+const MARK_COLS: usize = 20;
 
 /// The head: the mark (where there is room) beside the brand `F O C A L` in the prism,
 /// `name` in tracked capitals after it, then `lines` under them.
 pub fn head(page: &mut Page, p: &Paint, cols: usize, name: &str, lines: &[(Rgb, bool, &str)]) {
     let with_mark = cols >= 60;
-    let mut mark = Canvas::new(if with_mark { MARK_COLS } else { 0 }, MARK_ROWS);
-    if with_mark {
-        // A still of the mark: a page is drawn once.
-        crate::mark::draw(&mut mark, crate::motion::SETTLED);
-    }
+    // A still of the mark: a page is drawn once.
+    let mark = crate::shade::mark(
+        if with_mark { MARK_COLS } else { 0 },
+        crate::motion::SETTLED,
+    );
     let room = cols.saturating_sub(if with_mark {
         MARK_COLS.saturating_add(4)
     } else {

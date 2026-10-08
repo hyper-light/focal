@@ -760,6 +760,28 @@ impl ShellNode {
     pub fn checkpoint_pending(&self) -> bool {
         false
     }
+    pub fn begin_checkpoint_from_funded(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+        allocation: Allocation,
+    ) -> Result<(), ConsensusError> {
+        let overhead = if data.capacity() == 0 {
+            0
+        } else {
+            const { 4 * size_of::<usize>() }
+        };
+        let required = data
+            .capacity()
+            .checked_add(overhead)
+            .ok_or(ConsensusError::Capacity)?;
+        if allocation.bytes() < required {
+            return Err(ConsensusError::Capacity);
+        }
+        let result = self.begin_checkpoint_from(point, data);
+        drop(allocation);
+        result
+    }
     pub fn begin_checkpoint_funded(
         &mut self,
         index: u64,
@@ -784,18 +806,56 @@ impl ShellNode {
     /// whole and durable before it returns, then the log let go of what is before it (O3).
     pub fn begin_checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.check()?;
+        if index != self.replica.machine().applied().index {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        let point = self.checkpoint_point()?;
+        self.begin_checkpoint_from(point, data)
+    }
+    /// The point a checkpoint of the applied prefix is taken at (as focal-log's backend's).
+    pub fn checkpoint_point(&self) -> Result<CheckpointPoint, ConsensusError> {
+        self.check()?;
         let at = self.replica.machine().applied();
+        if at.index == 0 {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        Ok(CheckpointPoint {
+            index: at.index,
+            term: at.term,
+            configuration: self.replica.configuration().clone(),
+        })
+    }
+    /// The image of a prefix captured earlier, made the group's: written whole, then the log
+    /// compacted through it, every entry after it kept (as focal-log's backend's). Refused,
+    /// retryably, when an image past it already supersedes it, when its entry is no longer the one
+    /// captured, or when the configuration changed after it.
+    pub fn begin_checkpoint_from(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+    ) -> Result<(), ConsensusError> {
+        self.check()?;
+        let applied = self.replica.machine().applied();
+        let imaged = self.replica.machine().imaged().map_or(0, |at| at.index);
+        let CheckpointPoint {
+            index,
+            term,
+            configuration,
+        } = point;
         if index == 0
-            || index != at.index
+            || index > applied.index
+            || index < imaged
             || self.replica.machine().holds_events()
             || self.recovered.is_some()
+            || &configuration != self.replica.configuration()
+            || self.replica.core().store().term(index)? != term
         {
             return Err(ConsensusError::CheckpointIndex);
         }
         if data.len() > IMAGE_BYTES {
             return Err(ConsensusError::Capacity);
         }
-        let configuration = self.replica.configuration().clone();
+        let at = hyper_durable::Point { index, term };
         self.replica
             .machine_mut()
             .checkpoint(at, &configuration, &data)

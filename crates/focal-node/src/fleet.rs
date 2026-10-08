@@ -1834,6 +1834,9 @@ impl Owner {
     /// its applied prefix and the log behind it is compacted; nothing is
     /// retired before its checkpoint is durable.
     fn checkpoint_by_cadence(&mut self) -> Result<(), LedgerError> {
+        // A checkpoint whose seeds were being made durable off this thread is
+        // handed to consensus as soon as they are.
+        retryable(self.session.poll_deferred_checkpoint())?;
         if self.log_entries_since_checkpoint() < self.config.checkpoint_after_entries {
             return Ok(());
         }
@@ -1847,11 +1850,14 @@ impl Owner {
     fn try_checkpoint(&mut self) -> Result<bool, LedgerError> {
         if self.session.persistence_pending()
             || self.session.checkpoint_in_flight()
+            || self.session.deferred_checkpoint_pending()
             || self.stopping.is_some()
         {
             return Ok(false);
         }
-        match self.session.checkpoint() {
+        // The owner encodes the state; its seeds are made durable off this
+        // thread, so the replica's work never waits for their syncs.
+        match self.session.begin_deferred_checkpoint() {
             Ok(()) => Ok(true),
             Err(
                 LedgerError::Capacity
@@ -4579,3 +4585,26 @@ fn wall_ms() -> Result<u64, LedgerError> {
 #[cfg(test)]
 #[path = "fleet_list_tests.rs"]
 mod list_tests;
+
+/// A checkpoint step's outcome with what only waits for a later period taken
+/// as nothing done: a resource condition or unpersisted state.
+fn retryable(result: Result<bool, LedgerError>) -> Result<bool, LedgerError> {
+    match result {
+        Ok(done) => Ok(done),
+        Err(
+            LedgerError::Capacity
+            | LedgerError::NotReady { .. }
+            | LedgerError::Consensus(
+                focal_consensus::ConsensusError::PersistencePending
+                | focal_consensus::ConsensusError::Capacity
+                | focal_consensus::ConsensusError::CheckpointIndex,
+            ),
+        ) => Ok(false),
+        Err(LedgerError::Native(error))
+            if error.class() == focal_ledger::FailureClass::Retryable =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}

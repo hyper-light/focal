@@ -377,3 +377,38 @@ fn unprotected_seeds_are_removed_past_the_grace() {
     assert!(!seeds.contains(old));
     assert!(seeds.contains(young));
 }
+
+/// What a crash left unnamed (an install's or a batch's unsynced file) leaves
+/// past the grace too; a young one, as a live batch's would be, stays.
+#[test]
+fn unnamed_files_a_crash_left_are_removed_past_the_grace() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("seeds");
+    let mut seeds =
+        SeedStore::open(&root, DiskBudget::new(DiskBudgetConfig::default()).unwrap()).unwrap();
+    let stale_install = root.join(format!("{}.install", ContentHash([3; 32])));
+    let stale_batch = root.join(format!("{}.7.batch", ContentHash([4; 32])));
+    let young_batch = root.join(format!("{}.8.batch", ContentHash([5; 32])));
+    for path in [&stale_install, &stale_batch, &young_batch] {
+        std::fs::write(path, b"partial").unwrap();
+    }
+    for path in [&stale_install, &stale_batch] {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_millis(2 * DAY))
+            .unwrap();
+    }
+    let mut complete = false;
+    for _ in 0..16 {
+        if seeds.collect(&[], DAY, now_ms(), 4).unwrap().complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert!(!stale_install.exists());
+    assert!(!stale_batch.exists());
+    assert!(young_batch.exists());
+}

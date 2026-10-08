@@ -408,6 +408,18 @@ pub struct DurableNode {
     backend: Backend,
 }
 
+/// The point a checkpoint names: an applied entry's index and term, and the
+/// configuration applied through it. Captured by the owner with the state it
+/// encodes (`DurableNode::checkpoint_point`) and handed back once that state
+/// is durable (`DurableNode::begin_checkpoint_from`), however far the replica
+/// went on meanwhile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointPoint {
+    pub index: u64,
+    pub term: u64,
+    configuration: ConfState,
+}
+
 /// What a [`DurableNode`] runs over.
 #[expect(
     clippy::large_enum_variant,

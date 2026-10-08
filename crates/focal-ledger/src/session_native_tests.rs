@@ -991,6 +991,59 @@ fn a_lagging_replica_installs_a_seeded_ss6_checkpoint_once_its_host_pulls_the_ch
     );
 }
 
+/// A deferred checkpoint (Ongaro's thesis §5.1): the owner encodes its state
+/// and goes on committing while the root's seed chunks are made durable off its
+/// thread; the checkpoint lands at the point it was captured, the entries after
+/// it stay in the log, and a restart opens at the image and replays them.
+#[test]
+fn a_deferred_seeded_checkpoint_lands_at_its_point_while_the_replica_goes_on() {
+    let mut limits = native_limits();
+    limits.checkpoint.inline_bytes = 64;
+    let mut cluster = Cluster::with_limits(3, &[true, true, true], limits);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    for occurrence in 1..=2 {
+        let claim = creation(cluster.next(PARTIES.issuer), occurrence);
+        cluster.commit(1, PARTIES.issuer, claim, &[]);
+    }
+    let captured = cluster.node(1).applied_raft;
+    cluster.node(1).begin_deferred_checkpoint().unwrap();
+    assert!(cluster.node(1).deferred_checkpoint_pending());
+    // One at a time: a second is refused, retryably, while the first is pending.
+    assert!(matches!(
+        cluster.node(1).begin_deferred_checkpoint(),
+        Err(LedgerError::Capacity)
+    ));
+    // The replica goes on while the seeds are made durable.
+    let third = creation(cluster.next(PARTIES.issuer), 3);
+    cluster.commit(1, PARTIES.issuer, third, &[]);
+    assert!(cluster.node(1).applied_raft > captured);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !cluster.node(1).poll_deferred_checkpoint().unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the seeds never became durable"
+        );
+        std::thread::yield_now();
+    }
+    assert!(!cluster.node(1).deferred_checkpoint_pending());
+    let landed = cluster.node(1).recent_checkpoints().last().unwrap();
+    assert_eq!(landed.index, captured, "{landed:?}");
+    // Restarted, the replica opens at the image and replays what came after it.
+    cluster.stop(1);
+    cluster.reopen(1, true);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(3));
+    assert!(cluster.node(1).pending_seed().is_none());
+    cluster.elect(1, &[]);
+    let fourth = creation(cluster.next(PARTIES.issuer), 4);
+    cluster.commit(1, PARTIES.issuer, fourth, &[]);
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(4))),
+        "{sequences:?}"
+    );
+}
+
 mod legacy {
     use super::*;
     use focal_model::{
