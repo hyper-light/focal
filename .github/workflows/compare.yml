@@ -103,12 +103,18 @@ jobs:
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, glob, os
           rows = []
+          legacy_focal = False
           for path in sorted(glob.glob("reports/*.json")):
               r = json.load(open(path))
               name = os.path.basename(path)[:-5]
               if "latency_ns" in r:  # focal-load
-                  l = r["latency_ns"]; us = lambda v: v / 1000
-                  rows.append((name, r["shape"].get("rate"), r["committed"], r["refused"] + r["unknown"],
+                  m = r.get("measured_writes")
+                  if m is None:
+                      legacy_focal = True
+                  l = m["committed_latency_ns"] if m is not None else r["latency_ns"]
+                  counts = m if m is not None else r
+                  us = lambda v: v / 1000
+                  rows.append((name, r["shape"].get("rate"), counts["committed"], counts["refused"] + counts["unknown"] + counts.get("expired", 0),
                                us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])))
               else:  # focal-compare
                   rows.append((name, r["offered_per_second"], r["acknowledged"], r["failed"] + r["refused_by_generator"],
@@ -117,4 +123,6 @@ jobs:
           print("|---|---|---|---|---|---|---|---|")
           for row in rows:
               print("| " + " | ".join(f"{v:,.0f}" if isinstance(v, float) else str(v) for v in row) + " |")
+          if legacy_focal:
+              print("\nOlder focal reports contain all-attempt latency and whole-phase counts; refusals and warm-up can skew those rows.")
           PY

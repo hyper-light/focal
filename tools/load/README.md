@@ -13,7 +13,7 @@ the workspace's no-panic policy: every failure is a typed error printed once.
 cargo run -p focal-load --release -- --shape shape.yaml --out report.json
 ```
 
-`--shape` is required; `--out` defaults to stdout. A one-line summary is always
+`--shape` is required; `--out` defaults to stdout. Summary statistics are always
 printed to stderr.
 
 ## Shape
@@ -26,6 +26,8 @@ transport: embedded   # optional; `embedded` (default) or `unix`
 data_dir: /tmp/node   # `unix`: the running node's directory; `embedded`: keep the node here
 profile: authored_v1  # optional; the frame profile — the transport's own by default
 concurrency: 1        # optional; concurrent callers, 1..=64
+rate: 100             # optional; fixed offered rate over all callers
+warmup_ms: 15000      # optional; intended starts before this time are not measured
 reopen: false         # optional, embedded only; reopen the node afterwards and time it
 ```
 
@@ -105,6 +107,53 @@ one-session ceiling the capacity envelope states). `read_hits < reads` would
 indicate lost committed state — the campaign asserts they are equal; so would
 `reopen_read_hit: false`. `refusals` holds at most eight distinct reasons.
 
+`committed`, `refused`, `unknown` and `expired` count the whole write phase,
+including warm-up. The original `latency_ns` and half reports describe all
+attempts after warm-up, including fast capacity refusals. They therefore do
+not describe successful-write latency when any attempts fail or are refused.
+`measured_writes` counts that measured population by outcome and reports
+`committed_latency_ns`, `refused_latency_ns`, `unknown_latency_ns` and
+`expired_latency_ns` separately. Each count covers the same requests as its
+percentiles; a zero count means its zero-valued latency has no samples.
+
+## Tail diagnosis
+
+```sh
+FOCAL_LOAD_WRITES_CSV=writes.csv cargo run -p focal-load --release -- \
+  --shape shape.yaml --out report.json
+python3 tools/compare/analyze_tail.py --report report.json --csv writes.csv
+```
+
+The CSV retains `start_ns,latency_ns` as its first columns and adds
+`sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns`.
+There is one row per attempt after warm-up, sorted by intended start. The
+first retained intended start is zero for `start_ns`, `sent_ns` and
+`finished_ns`. `phase_start_ns` retains the intended offset from the entire
+phase, including warm-up; `run_start_epoch_ns` (also in the JSON as
+`write_phase_start_epoch_ns`) approximates that phase's Unix-time origin,
+for correlation with checkpoint and host cgroup traces.
+
+`sent_ns` marks entry to `Client::request`; its interval to `finished_ns`
+includes client routing and retries and the remote request. Per row,
+`latency_ns = finished_ns - start_ns` splits into schedule delay
+(`sent_ns - start_ns`) and client request time (`finished_ns - sent_ns`).
+The corresponding distributions are `measured_writes.schedule_delay_ns`
+and `measured_writes.client_request_latency_ns`. Their percentiles cannot
+be added to reconstruct the end-to-end percentile. The request identity,
+generation, worker, logical-write index and attempt distinguish re-issues
+and let a node-side trace correlate the same request.
+
+The trace reserves at most two samples per logical write before sending,
+funded through `focal_memory::MemoryBudget`. Reductions and CSV ordering
+scratch are funded separately. CSV output streams through a funded 4 KiB
+buffer after the write phase, so writing it does not stall the measured path.
+
+On a Linux Docker host using cgroup v2, `tools/compare/collect_cpu.py` samples
+`cpu.max`, `cpu.stat`, pressure, I/O and memory counters for up to eight
+containers for a bounded duration. It reads host cgroup files, avoiding a
+`docker exec` for every sample; unavailable counters remain explicit. Run
+it alongside the generator and correlate its Unix timestamps with the CSV.
+
 ## Nightly campaign
 
 `tools/load/tests/campaign.rs` (`#[ignore]`) runs the generator across a seed
@@ -118,7 +167,5 @@ FOCAL_SEED_START=0 FOCAL_SEED_COUNT=16 FOCAL_CAMPAIGN_CLAIMS=500 FOCAL_CAMPAIGN_
 
 ## What it does not do yet
 
-A QUIC transport (an enrolled client context's credentials are loaded by the
-CLI's private context module), evidence and artifact transfer, validation
-modes, retention and geography. The natural next knobs live in `src/shape.rs`
-and `src/driver.rs`.
+Evidence and artifact transfer, validation modes, retention and geography.
+The natural next knobs live in `src/shape.rs` and `src/driver.rs`.

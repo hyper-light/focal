@@ -22,7 +22,10 @@ fn repo() -> PathBuf {
         .unwrap()
 }
 fn render(args: &[&str], output: &Path) -> serde_json::Value {
+    // Rendering fixtures must not read the operator's default store policy.
+    let store = output.parent().unwrap().join("render-store");
     let result = Command::new(env!("CARGO_BIN_EXE_focal"))
+        .args(["--data-dir", store.to_str().unwrap()])
         .args(args)
         .args(["--output", output.to_str().unwrap()])
         .output()
@@ -118,6 +121,10 @@ fn the_checked_in_kubernetes_manifests_are_the_renderer_output() {
     }
     // A rendered file is never overwritten.
     let again = Command::new(env!("CARGO_BIN_EXE_focal"))
+        .args([
+            "--data-dir",
+            temp.path().join("render-store").to_str().unwrap(),
+        ])
         .args([
             "--config",
             config.to_str().unwrap(),

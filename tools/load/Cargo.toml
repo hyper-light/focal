@@ -17,6 +17,7 @@ path = "src/main.rs"
 focal-client = { version = "0.1.0", path = "../../crates/focal-client" }
 focal-core = { version = "0.1.0", path = "../../crates/focal-core" }
 focal-ledger = { version = "0.1.0", path = "../../crates/focal-ledger" }
+focal-memory = { version = "0.1.0", path = "../../crates/focal-memory" }
 focal-model = { version = "0.1.0", path = "../../crates/focal-model" }
 focal-native-client = { version = "0.1.0", path = "../../crates/focal-native-client" }
 focal-node = { version = "0.1.0", path = "../../crates/focal-node" }

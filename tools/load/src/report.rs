@@ -4,6 +4,7 @@
 //! session size shows), the read phase, and — when the shape asked for it —
 //! the reopen time of the node and its first read afterwards.
 use crate::error::LoadError;
+use crate::measurements::WriteMeasurements;
 use crate::shape::WorkloadShape;
 use serde::Serialize;
 
@@ -30,6 +31,12 @@ pub struct Report {
     /// The writes that started in the second half: dearer than the first when
     /// the per-op cost grows with the session.
     pub latency_ns_second_half: Latency,
+    /// Write attempts after the warm-up, separated by reply kind, with
+    /// schedule delay and Client::request time measured independently.
+    pub measured_writes: WriteMeasurements,
+    /// Approximate Unix nanoseconds at the write phase's monotonic origin,
+    /// for correlation with the host's cgroup and checkpoint-stage trace.
+    pub write_phase_start_epoch_ns: u128,
     /// Claim reads issued after the creations (0 when the shape asks for none).
     pub reads: u64,
     /// Reads that returned the claim (a miss would indicate lost committed state).

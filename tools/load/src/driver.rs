@@ -11,6 +11,7 @@
 use crate::authored;
 use crate::error::LoadError;
 use crate::generations::{Finished, Generations};
+use crate::measurements::{self, WriteMeasurements, WriteOutcome, WriteSample, WriteSamples};
 use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Profile, Transport, WorkloadShape};
@@ -179,6 +180,7 @@ enum Phase {
 #[derive(Default)]
 struct Outcome {
     samples: Vec<(u128, u128)>,
+    writes: WriteSamples,
     committed: u64,
     refused: u64,
     unknown: u64,
@@ -417,8 +419,20 @@ fn worker(
         Conn::open(&job.connector, &job.names, &job.limits)?
     };
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
+    // The shape bounds logical writes at MAX_CLAIMS; each has at most
+    // ATTEMPTS samples. The complete trace is funded before sending work.
+    let write_limit = match phase {
+        Phase::Write => count
+            .checked_mul(usize::try_from(ATTEMPTS).map_err(|_| LoadError::Bound("write attempts"))?)
+            .ok_or(LoadError::Bound("write samples"))?,
+        Phase::Read => 0,
+    };
     let mut outcome = Outcome {
-        samples: Vec::with_capacity(count),
+        samples: Vec::with_capacity(match phase {
+            Phase::Write => 0,
+            Phase::Read => count,
+        }),
+        writes: WriteSamples::reserve(write_limit)?,
         ..Outcome::default()
     };
     let mut caller = Caller {
@@ -470,11 +484,26 @@ fn worker(
                         }
                         None => Instant::now(),
                     };
-                    let reply = classify(caller.send(envelope));
-                    outcome.samples.push((
-                        started.saturating_duration_since(run_start).as_nanos(),
-                        started.elapsed().as_nanos(),
-                    ));
+                    let sent = Instant::now();
+                    let response = caller.send(envelope);
+                    let finished = Instant::now();
+                    let reply = classify(response);
+                    outcome.writes.record(WriteSample {
+                        start_ns: started.saturating_duration_since(run_start).as_nanos(),
+                        sent_ns: sent.saturating_duration_since(run_start).as_nanos(),
+                        finished_ns: finished.saturating_duration_since(run_start).as_nanos(),
+                        worker: job.index,
+                        write: i,
+                        attempt,
+                        epoch: minted.epoch,
+                        request,
+                        outcome: match &reply {
+                            Reply::Committed => WriteOutcome::Committed,
+                            Reply::Expired => WriteOutcome::Expired,
+                            Reply::Refused(_) => WriteOutcome::Refused,
+                            Reply::Unknown(_) => WriteOutcome::Unknown,
+                        },
+                    })?;
                     if let Finished::Advance { epoch, minimum } =
                         generations.finish(minted.epoch)?
                     {
@@ -542,7 +571,11 @@ fn run_phase(
     jobs: Vec<Job>,
     phase: Phase,
     generations: &Generations,
-) -> Result<(Vec<Outcome>, u128), LoadError> {
+) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
+    let run_start_epoch_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| LoadError::Clock)?
+        .as_nanos();
     let run_start = Instant::now();
     let outcomes = std::thread::scope(|scope| -> Result<Vec<Outcome>, LoadError> {
         let mut handles = Vec::with_capacity(jobs.len());
@@ -562,7 +595,7 @@ fn run_phase(
         }
         Ok(outcomes)
     })?;
-    Ok((outcomes, run_start.elapsed().as_nanos()))
+    Ok((outcomes, run_start.elapsed().as_nanos(), run_start_epoch_ns))
 }
 
 /// `total` split evenly over `parts`; the first `total % parts` parts get one more.
@@ -657,40 +690,18 @@ fn merged(outcomes: &[Outcome]) -> Merged {
     let mut total = Merged::default();
     for outcome in outcomes {
         total.samples.extend_from_slice(&outcome.samples);
+        total.samples.extend(
+            outcome
+                .writes
+                .iter()
+                .map(|sample| (sample.start_ns, sample.latency_ns())),
+        );
         total.committed = total.committed.saturating_add(outcome.committed);
         total.refused = total.refused.saturating_add(outcome.refused);
         total.unknown = total.unknown.saturating_add(outcome.unknown);
         total.hits = total.hits.saturating_add(outcome.hits);
     }
     total
-}
-
-/// The environment variable that names a file to write every write's sample to, in start order: one
-/// line a write, its start and its latency in nanoseconds. For finding when a tail happens, as the
-/// percentiles cannot say.
-pub const WRITES_CSV_ENV: &str = "FOCAL_LOAD_WRITES_CSV";
-
-/// Writes the samples where `WRITES_CSV_ENV` names, sorted by start already (`halves`).
-fn write_samples(samples: &[(u128, u128)]) -> Result<(), LoadError> {
-    let Some(path) = std::env::var_os(WRITES_CSV_ENV) else {
-        return Ok(());
-    };
-    // Shape: a line is two decimal u128s, a comma and a newline: at most 2 * 39 + 2 bytes.
-    let bytes = samples
-        .len()
-        .checked_mul(80)
-        .ok_or(LoadError::Bound("write samples"))?;
-    let mut text = String::new();
-    text.try_reserve_exact(bytes)
-        .map_err(|_| LoadError::Bound("write samples"))?;
-    text.push_str("start_ns,latency_ns\n");
-    let origin = samples.first().map_or(0, |(start, _)| *start);
-    for (start, latency) in samples {
-        use std::fmt::Write as _;
-        writeln!(text, "{},{latency}", start.saturating_sub(origin))
-            .map_err(|_| LoadError::Bound("write samples"))?;
-    }
-    std::fs::write(path, text).map_err(LoadError::Io)
 }
 
 /// Percentiles of all samples, and of the halves by start time.
@@ -845,7 +856,8 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     // One journal's generations for every caller, as N processes of one
     // participant share one (the audit's F12).
     let generations = Generations::new();
-    let (write_outcomes, write_nanos) = run_phase(jobs, Phase::Write, &generations)?;
+    let (write_outcomes, write_nanos, write_phase_start_epoch_ns) =
+        run_phase(jobs, Phase::Write, &generations)?;
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
@@ -853,7 +865,19 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     let warmup = u128::from(shape.warmup_ms).saturating_mul(1_000_000);
     writes.samples.retain(|(start, _)| *start >= warmup);
     let (latency_ns, first_half, second_half) = halves(&mut writes.samples)?;
-    write_samples(&writes.samples)?;
+    let measured_writes = WriteMeasurements::measure(
+        write_outcomes
+            .iter()
+            .flat_map(|outcome| outcome.writes.iter()),
+        warmup,
+    )?;
+    measurements::write_samples(
+        write_outcomes
+            .iter()
+            .flat_map(|outcome| outcome.writes.iter()),
+        warmup,
+        write_phase_start_epoch_ns,
+    )?;
     let mut refusals = Vec::new();
     for outcome in &write_outcomes {
         for reason in &outcome.refusals {
@@ -883,7 +907,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 pace: None,
             });
         }
-        let (read_outcomes, read_nanos) = run_phase(jobs, Phase::Read, &generations)?;
+        let (read_outcomes, read_nanos, _) = run_phase(jobs, Phase::Read, &generations)?;
         let reads = merged(&read_outcomes);
         let issued = u64::try_from(reads.samples.len()).map_err(|_| LoadError::Bound("reads"))?;
         let mut latencies: Vec<u128> = reads.samples.iter().map(|(_, latency)| *latency).collect();
@@ -945,6 +969,8 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
         latency_ns,
         latency_ns_first_half: first_half,
         latency_ns_second_half: second_half,
+        measured_writes,
+        write_phase_start_epoch_ns,
         reads,
         read_hits,
         read_wall_ms: read_nanos.checked_div(1_000_000).unwrap_or(0),

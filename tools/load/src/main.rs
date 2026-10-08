@@ -21,6 +21,7 @@ mod authored;
 mod driver;
 mod error;
 mod generations;
+mod measurements;
 mod native;
 mod report;
 mod shape;
@@ -104,7 +105,7 @@ fn run(args: &Args) -> Result<(), LoadError> {
     }
     writeln!(
         stderr,
-        "committed {} ({} refused, {} unknown) in {} ms from {} worker(s) — {:.0} ops/s, latency p50 {} ns, p99 {} ns{}",
+        "committed {} ({} refused, {} unknown) in {} ms from {} worker(s) — {:.0} ops/s, all attempts latency p50 {} ns, p99 {} ns{}",
         report.committed,
         report.refused,
         report.unknown,
@@ -117,6 +118,17 @@ fn run(args: &Args) -> Result<(), LoadError> {
             Some(millis) => format!("; reopened in {millis} ms"),
             None => String::new(),
         }
+    )?;
+    writeln!(
+        stderr,
+        "measured writes: {} committed, {} refused, {} unknown, {} expired; successful-write p99 {} ns, schedule-delay p99 {} ns, client-request p99 {} ns",
+        report.measured_writes.committed,
+        report.measured_writes.refused,
+        report.measured_writes.unknown,
+        report.measured_writes.expired,
+        report.measured_writes.committed_latency_ns.p99,
+        report.measured_writes.schedule_delay_ns.p99,
+        report.measured_writes.client_request_latency_ns.p99,
     )?;
     if !report.refusals.is_empty() {
         writeln!(stderr, "refusal reasons: {:?}", report.refusals)?;

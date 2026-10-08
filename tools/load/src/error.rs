@@ -28,6 +28,8 @@ pub enum LoadError {
     Clock,
     /// An arithmetic or capacity bound of the tool itself.
     Bound(&'static str),
+    /// The bounded write trace or reduction scratch could not be funded.
+    Memory(focal_memory::MemoryError),
     /// The report could not be serialized.
     Report(serde_json::Error),
 }
@@ -45,6 +47,7 @@ impl fmt::Display for LoadError {
             Self::Worker(reason) => write!(f, "worker: {reason}"),
             Self::Clock => f.write_str("system clock out of range"),
             Self::Bound(what) => write!(f, "bound exceeded: {what}"),
+            Self::Memory(error) => write!(f, "measurement memory: {error}"),
             Self::Report(error) => write!(f, "report: {error}"),
         }
     }
@@ -80,6 +83,11 @@ impl From<focal_wire::WireError> for LoadError {
 impl From<serde_json::Error> for LoadError {
     fn from(error: serde_json::Error) -> Self {
         Self::Report(error)
+    }
+}
+impl From<focal_memory::MemoryError> for LoadError {
+    fn from(error: focal_memory::MemoryError) -> Self {
+        Self::Memory(error)
     }
 }
 impl From<crate::native::FixtureError> for LoadError {
