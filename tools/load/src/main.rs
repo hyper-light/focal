@@ -54,11 +54,35 @@ fn read_shape(path: &PathBuf) -> Result<shape::WorkloadShape, LoadError> {
             path.display()
         )));
     }
-    let text = std::fs::read_to_string(path)?;
-    let shape: shape::WorkloadShape =
-        serde_saphyr::from_str(&text).map_err(|error| LoadError::Shape(error.to_string()))?;
+    // The length is read again through the bound: a file that grew after
+    // its metadata was read is refused, not read whole.
+    let mut text = String::new();
+    std::io::Read::read_to_string(
+        &mut std::io::Read::take(
+            std::fs::File::open(path)?,
+            MAX_SHAPE_BYTES.saturating_add(1),
+        ),
+        &mut text,
+    )?;
+    if u64::try_from(text.len()).map_or(true, |read| read > MAX_SHAPE_BYTES) {
+        return Err(LoadError::Shape(format!(
+            "{} grew past {MAX_SHAPE_BYTES} bytes while it was read",
+            path.display()
+        )));
+    }
+    let shape = parse_shape(&text)?;
     shape.validate().map_err(LoadError::Shape)?;
     Ok(shape)
+}
+
+/// A shape under the same budget as every YAML document focal reads: no
+/// aliases or anchors, so no document expands past the bytes it holds.
+fn parse_shape(text: &str) -> Result<shape::WorkloadShape, LoadError> {
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {max_depth:16,max_events:8192,max_nodes:4096,max_total_scalar_bytes:64*1024,max_aliases:0,max_anchors:0,max_documents:1},
+    };
+    serde_saphyr::from_str_with_options(text, options)
+        .map_err(|error| LoadError::Shape(error.to_string()))
 }
 
 fn run(args: &Args) -> Result<(), LoadError> {
@@ -109,5 +133,28 @@ fn main() -> ExitCode {
             let _ = writeln!(std::io::stderr().lock(), "focal-load: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shape_that_expands_by_aliases_is_refused() {
+        assert!(parse_shape("claims: 10\nseed: 3\n").is_ok());
+        // Each level names the one before nine times: 9^5 claims' worth of
+        // nodes from a few hundred bytes (the "billion laughs" shape).
+        let mut bomb = String::from("a: &a [1,1,1,1,1,1,1,1,1]\n");
+        for (level, previous) in ["b", "c", "d", "e"].iter().zip(["a", "b", "c", "d"]) {
+            let refs = vec![format!("*{previous}"); 9].join(",");
+            bomb.push_str(&format!("{level}: &{level} [{refs}]\n"));
+        }
+        bomb.push_str("claims: 1\n");
+        assert!(parse_shape(&bomb).is_err());
+        // An anchor and an alias on fields the shape takes: the default
+        // budget expands them, this one refuses them.
+        assert!(parse_shape("claims: &n 5\nseed: *n\n").is_err());
+        assert!(serde_saphyr::from_str::<shape::WorkloadShape>("claims: &n 5\nseed: *n\n").is_ok());
     }
 }

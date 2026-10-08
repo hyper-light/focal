@@ -110,3 +110,19 @@ fn each_skill_lists_its_frontmatter_and_a_complete_manifest_of_its_own_files() {
     assert!(skills.read("file:///etc/passwd").is_none());
     assert!(skills.bytes() > 0);
 }
+
+/// A skill's frontmatter is parsed under a budget with no aliases or
+/// anchors: a header that names nodes by alias is refused, not expanded.
+#[test]
+fn frontmatter_that_expands_by_aliases_is_refused() {
+    let mut header = String::from("---\nname: bomb\ndescription: d\na: &a [1,1,1,1,1,1,1,1,1]\n");
+    for (level, previous) in ["b", "c", "d", "e"].iter().zip(["a", "b", "c", "d"]) {
+        let refs = vec![format!("*{previous}"); 9].join(",");
+        header.push_str(&format!("{level}: &{level} [{refs}]\n"));
+    }
+    header.push_str("---\nbody\n");
+    assert!(super::parse_frontmatter("bomb", header.as_bytes()).is_err());
+    assert!(
+        super::parse_frontmatter("plain", b"---\nname: plain\ndescription: d\n---\nbody\n").is_ok()
+    );
+}

@@ -1278,3 +1278,64 @@ fn a_members_core_bounds_are_derived_from_its_settings() {
     assert_eq!(limits.proposals, payload / std::mem::size_of::<Entry>());
     assert_eq!(limits.pending_reads, config.max_inflight_messages + 1);
 }
+/// Three voters whose leader is node 1; `bounds` sets each one's largest
+/// entry and the bytes of uncommitted entries it may lead.
+fn led_cluster(bounds: Option<(usize, u64)>) -> Cluster {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let nodes = dirs
+        .iter()
+        .enumerate()
+        .map(|(i, dir)| {
+            let mut cfg = config(i as u64 + 1);
+            cfg.voters = vec![1, 2, 3];
+            if let Some((entry, uncommitted)) = bounds {
+                cfg.max_entry_bytes = entry;
+                cfg.max_uncommitted_bytes = uncommitted;
+            }
+            DurableNode::open(cfg, dir.path()).unwrap()
+        })
+        .collect();
+    let mut cluster = Cluster {
+        dirs,
+        nodes,
+        applied: vec![Vec::new(); 3],
+        snapshots: vec![Vec::new(); 3],
+    };
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    assert_eq!(cluster.nodes[0].status().role, StateRole::Leader);
+    cluster
+}
+/// hyper-raft answers one `ProposalDropped` for several causes; the owners
+/// are told which, so a refusal is retried and never taken for a failure.
+#[test]
+fn a_dropped_proposal_is_refused_by_its_cause() {
+    // A leader whose uncommitted entries fill its bound: capacity. Nothing
+    // commits while the leader's messages go undelivered.
+    // The smallest bound a node takes: one largest entry and 1 KiB more.
+    let mut cluster = led_cluster(Some((512, 1536)));
+    for fill in 0..3 {
+        cluster.nodes[0].propose(vec![fill; 512]).unwrap();
+    }
+    assert!(matches!(
+        cluster.nodes[0].propose(vec![3; 512]),
+        Err(ConsensusError::Capacity)
+    ));
+    // Once those commit, the leader takes the next.
+    cluster.pump(None);
+    cluster.nodes[0].propose(vec![3; 512]).unwrap();
+
+    // A leader handing over its leadership: leaving.
+    let mut cluster = led_cluster(None);
+    cluster.nodes[0].transfer_leader(2).unwrap();
+    assert!(matches!(
+        cluster.nodes[0].propose(b"during the handover".to_vec()),
+        Err(ConsensusError::LeaderLeaving)
+    ));
+
+    // A member that does not lead names its leader, as it did before.
+    assert!(matches!(
+        cluster.nodes[2].propose(b"to a follower".to_vec()),
+        Err(ConsensusError::NotLeader { leader: 1 })
+    ));
+}

@@ -25,7 +25,8 @@ fn admission_error(error: ControlError) -> DirectoryBootstrapError {
         | ControlError::Consensus(
             ConsensusError::PersistencePending
             | ConsensusError::LearnerBehind
-            | ConsensusError::MembershipPending,
+            | ConsensusError::MembershipPending
+            | ConsensusError::LeaderLeaving,
         ) => DirectoryBootstrapError::NotReady,
         ControlError::Consensus(ConsensusError::NotLeader { .. }) => {
             DirectoryBootstrapError::Unavailable

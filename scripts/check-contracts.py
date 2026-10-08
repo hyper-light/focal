@@ -87,6 +87,23 @@ for entry in entries:
     if actual != entry["sha256"]:
         errors.append(f"imported source changed: {path.relative_to(ROOT)}")
 
+# Every YAML document focal reads is parsed under a stated budget (no
+# aliases or anchors, bounded depth, events, nodes and scalar bytes), so no
+# document expands past the bytes it holds. serde-saphyr's unbudgeted entry
+# points take its liberal default budget (50,000 aliases, 250,000 nodes) and
+# are refused in production; an inline test module at the end of a file may
+# use them to compare against the default.
+YAML_UNBUDGETED = re.compile(r"\bserde_saphyr::from_(?:str|slice|reader)(?:::<[^>]*>)?\s*\(")
+INLINE_TESTS = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*mod\s+\w+\s*\{", re.MULTILINE)
+for source in sorted(list((ROOT / "crates").glob("*/src/**/*.rs")) + list((ROOT / "tools").glob("*/src/**/*.rs"))):
+    if source.name == "tests.rs" or source.stem.endswith("_tests") or "tests" in source.relative_to(ROOT).parts[3:-1]:
+        continue
+    text = source.read_text()
+    inline = INLINE_TESTS.search(text)
+    production = text[: inline.start()] if inline else text
+    if YAML_UNBUDGETED.search(production):
+        errors.append(f"{source.relative_to(ROOT)}: parses YAML without a stated budget (serde_saphyr::from_str_with_options)")
+
 # The one audited unsafe file (decision 11, doc 10). The compiler denies
 # `unsafe_code` everywhere and it is allowed only in this file; this check is
 # the belt-and-suspenders that no other source relaxes the lint or writes an

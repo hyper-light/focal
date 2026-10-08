@@ -43,7 +43,8 @@ fn response(
         verified,
         &limits,
         &focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
-    );
+    )
+    .answered();
     validate_response(&request, &response, Some(principal.principal()), &limits)
         .unwrap_or_else(|error| panic!("{error:?}: {request:?} => {response:?}"));
     response

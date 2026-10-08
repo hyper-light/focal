@@ -103,6 +103,33 @@ pub(crate) fn check_leader<S: Storage>(raw: &RawNode<S>) -> Result<(), Consensus
     }
 }
 
+/// The core's refusal of a proposal as the owners' error. hyper-raft answers
+/// one `ProposalDropped` for several causes; each is told apart here by the
+/// state the core is in, so a caller retries what is retryable and never
+/// takes an ordinary refusal for a failure (a dropped proposal ended a
+/// directory owner and its node's service, CI on 3113638): a member that does
+/// not lead is `NotLeader`; a leader handing over its leadership, or no longer
+/// a member of what it leads, is `LeaderLeaving`; a leader whose uncommitted
+/// entries fill its bound is `Capacity`. Any other error is the core's own.
+pub(crate) fn proposal_refused<S: Storage>(
+    raw: &RawNode<S>,
+    error: hyper_raft::Error,
+) -> ConsensusError {
+    if error != hyper_raft::Error::ProposalDropped {
+        return ConsensusError::Raft(error);
+    }
+    let raft = &raw.raft;
+    if raft.state() != StateRole::Leader {
+        ConsensusError::NotLeader {
+            leader: raft.leader_id(),
+        }
+    } else if raft.lead_transferee().is_some() || raft.tracker().get(raft.id()).is_none() {
+        ConsensusError::LeaderLeaving
+    } else {
+        ConsensusError::Capacity
+    }
+}
+
 /// An entry an owner proposes: something, and no more than one entry holds.
 pub(crate) fn check_entry(config: &NodeConfig, len: usize) -> Result<(), ConsensusError> {
     if len == 0 || len > config.max_entry_bytes {
