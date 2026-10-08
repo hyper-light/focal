@@ -42,7 +42,7 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     dc exec -T focal-load sh -c "cat > /reports/shape.yaml" <<EOF
 claims: $total
 transport: enrolled
-enrollment: /client
+enrollment: /client/CLIENT.contexts/enrollment-bench
 worker: "$worker"
 profile: authored_v1
 concurrency: $callers
