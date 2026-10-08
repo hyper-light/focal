@@ -69,4 +69,4 @@ The [network startup guide](../network-startup.md) documents the implemented fou
 
 The [manual CLI guide](../manual-cli.md) documents the implemented local submit/get/list commands, validation results, artifact downloads and durable operation recovery. The CLI uses shared typed Rust builders and the service's authenticated mutation/read boundary.
 
-The [MCP guide and agent skills](../mcp.md) document `focal mcp serve`, its implemented operation catalog, named local/authenticated remote contexts and exact retry contract. Native lifecycle activation, complete peer challenge/consult workflows and full deployment journeys remain required. Participants retain responsibility for executing tools and authoring any follow-up claims.
+The [MCP guide and agent skills](../mcp.md) document `focal serve mcp`, its implemented operation catalog, named local/authenticated remote contexts and exact retry contract. Native lifecycle activation, complete peer challenge/consult workflows and full deployment journeys remain required. Participants retain responsibility for executing tools and authoring any follow-up claims.

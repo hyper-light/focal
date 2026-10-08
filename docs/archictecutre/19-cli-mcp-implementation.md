@@ -27,28 +27,28 @@ separately. Unknown outcomes retain the original expanded command.
 |---|---|---|
 | `submit claim` | `claim.submit` | Generate an immutable claim and its pinned requirements as the authenticated issuer. |
 | `submit claims` | `claim.submit_batch` | Atomically generate 1–64 immutable claims, including intra-batch dependencies, under one durable request identity. |
-| `claim post ID` | `claim.post` | Post an admitted generated claim. |
-| `receipt acquire ID` | `receipt.acquire` | Acquire responsibility as the allowed subject; create no testament. |
-| `evidence begin --claim ID` | `evidence.begin` | Open an evidence set under the exact execution receipt. |
+| `post claim ID` | `claim.post` | Post an admitted generated claim. |
+| `acquire receipt ID` | `receipt.acquire` | Acquire responsibility as the allowed subject; create no testament. |
+| `begin evidence --claim ID` | `evidence.begin` | Open an evidence set under the exact execution receipt. |
 | `submit artifact` | `artifact.submit` | Register and attach verified evidence under the holder's receipt and evidence set. |
 | `submit testament` | `testament.submit` | Respondent authors an explicit outcome, summary and confidence after success or failure, freezing the exact artifact manifest. Every non-Complete outcome requires a durable error artifact. |
-| `testament receive ID --claim ID` | `testament.receive` | Issuer records receipt of the exact current testament. This is delivery acknowledgment. |
-| `validation begin --claim ID` | `validation.begin` | Issuer pins whole-work validation runs over the acknowledged response. |
-| `validation begin-increment` | `validation.begin_increment` | Issuer pins an incremental requirement to an already attached artifact and an observed evidence manifest. |
-| `artifact register` | `artifact.register` | Participant registers its own independent proof artifact without borrowing a respondent's receipt. |
+| `receive testament ID --claim ID` | `testament.receive` | Issuer records receipt of the exact current testament. This is delivery acknowledgment. |
+| `begin validation --claim ID` | `validation.begin` | Issuer pins whole-work validation runs over the acknowledged response. |
+| `begin increment` | `validation.begin_increment` | Issuer pins an incremental requirement to an already attached artifact and an observed evidence manifest. |
+| `register artifact` | `artifact.register` | Participant registers its own independent proof artifact without borrowing a respondent's receipt. |
 | `submit validation` | `validation.submit` | Actual designated evaluator submits its fenced result and committed proof references. |
-| `validation complete --claim ID` | `validation.complete` | Issuer requests deterministic aggregation of committed results and graph conditions. No desired outcome is accepted. |
-| `claim cancel ID` | `claim.cancel` | Authorized cancellation with a reason. |
-| `claim supersede ID` | `claim.supersede` | Generate a compatible successor with explicit immutable predecessor lineage. |
-| `claim release-scope ID` | `claim.release_scope` | Native: the issuer releases a terminal claim's owned scope once. |
-| `receipt adopt ID --holder P` | `receipt.adopt` | Native: the issuer replaces the current holder; the committed receipt is fenced one epoch earlier. |
-| `artifact fail --claim ID --slot N --diagnostic ID[:HASH]` | `artifact.fail` | Native: the holder records an unproducible slot with its committed production diagnostic. |
-| `artifact receive ID --claim ID` | `artifact.receive` | Native: the issuer receives one generated work artifact. |
-| `artifact reject ID --claim ID --reason structure\|metadata` | `artifact.reject` | Native: the issuer rejects one work artifact with its own diagnostic, inheriting the product's visibility. |
+| `complete validation --claim ID` | `validation.complete` | Issuer requests deterministic aggregation of committed results and graph conditions. No desired outcome is accepted. |
+| `cancel claim ID` | `claim.cancel` | Authorized cancellation with a reason. |
+| `supersede claim ID` | `claim.supersede` | Generate a compatible successor with explicit immutable predecessor lineage. |
+| `release scope ID` | `claim.release_scope` | Native: the issuer releases a terminal claim's owned scope once. |
+| `adopt receipt ID --holder P` | `receipt.adopt` | Native: the issuer replaces the current holder; the committed receipt is fenced one epoch earlier. |
+| `fail slot --claim ID --slot N --diagnostic ID[:HASH]` | `artifact.fail` | Native: the holder records an unproducible slot with its committed production diagnostic. |
+| `receive artifact ID --claim ID` | `artifact.receive` | Native: the issuer receives one generated work artifact. |
+| `reject artifact ID --claim ID --reason structure\|metadata` | `artifact.reject` | Native: the issuer rejects one work artifact with its own diagnostic, inheriting the product's visibility. |
 | `validation begin\|report … --phase admission\|increment [--target ID]` | `validation.begin`, `validation.report` | Native: the same two verbs select admission and increment evaluations by phase. |
-| `validation seal-increments --claim ID` | `validation.seal_increments` | Native: the issuer freezes increment target membership while the response is open. |
-| `validation enter-whole-work ID --claim ID` | `validation.enter_whole_work` | Native: the issuer closes the increment cohort of the received testament and enters whole-work evaluation. |
-| `audit generate --claim ID`, `audit post ID` | `audit.generate`, `audit.post` | Native: the issuer generates and posts the closed claim's result testament. |
+| `seal increments --claim ID` | `validation.seal_increments` | Native: the issuer freezes increment target membership while the response is open. |
+| `enter whole-work ID --claim ID` | `validation.enter_whole_work` | Native: the issuer closes the increment cohort of the received testament and enters whole-work evaluation. |
+| `generate audit --claim ID`, `post audit ID` | `audit.generate`, `audit.post` | Native: the issuer generates and posts the closed claim's result testament. |
 | `monitor register\|rebind\|cancel` | `monitor.register`, `monitor.rebind`, `monitor.cancel` | Native: durable waits over committed claims with a logical-time deadline; rebinding follows a committed supersession; cancellation needs a terminal owner. |
 | `get archived CLAIM [--artifact\|--work\|--diagnostic\|--validation\|--testament\|--receipt ID]` | `archive.get` | Native: one object of a claim's family wherever the family is — from the ledger while it is live, from the archive bundle its `Retired` continuation names once it retired (the audit's F11); a validation comes with its evaluations and accepted results. |
 
@@ -228,7 +228,7 @@ and a test asserts it is empty, so a future owner operation must choose its
 surface explicitly. Each verb's compile reads exactly the objects it binds
 (a work artifact and its descriptor for a rejection, the diagnostic for a
 failed slot, the result testament for its posting, both claims for a
-rebinding), and the CLI's `focal audit` root is the only addition to the
+rebinding), and the CLI's `focal generate audit` and `focal post audit` are the only addition to the
 command tree of [13](13-cli-and-agent-implementation-plan.md).
 
 ### Native CLI routing and replicated custody
@@ -266,7 +266,7 @@ target's manifest with custody, the results after a revision cursor and the
 delivery result) and reached by `get validation ID --context` and
 `validation.context`; the trusted timers fire from the node's sweep
 ([native_timers.rs](../../crates/focal-node/src/native_timers.rs)) without
-any verb. `focal schema coverage` prints the R4.0 table and `focal schema get
+any verb. `focal inspect coverage` prints the R4.0 table and `focal get schema
 NAME --native` the version 2 schema.
 
 On the replicated host the data service attests artifact-bearing frames
@@ -304,7 +304,7 @@ identical documents therefore produce byte-identical frames from flags,
 documents and tools. MCP results are consumed explicitly, as managed results
 are: a committed operation stays in `request.pending` until acknowledged, a
 recorded refusal leaves it, and `request.inspect` with `remote: true` (and
-`focal request inspect --operation-id n1:… --remote`) reads the owner's
+`focal inspect request --operation-id n1:… --remote`) reads the owner's
 committed outcome by request key so each adapter can observe the other's
 operations. An unreachable owner at startup keeps the V1 catalogue only for a
 context that never journaled a native operation; a context with a native
@@ -423,8 +423,8 @@ currently resolves the pinned implementation in its own environment.
 
 ## Recorded validator contracts
 
-`validator list` / `validator.list` inspect the external handlers actually pinned
-in immutable validation requirements. `validator get ID --version HASH` /
+`list validators` / `validator.list` inspect the external handlers actually pinned
+in immutable validation requirements. `get validator ID --version HASH` /
 `validator.get` select an exact handler version. Every list filter is optional;
 claim, evaluator, kind, phase, mode, agentic capability and expected evidence
 schema are conjunctive. One row is a whole requirement, retaining its original
@@ -451,23 +451,23 @@ Local operation requires only the data directory. Named contexts add connection
 selection without changing the domain commands:
 
 ```sh
-focal context add laptop --node-data-dir /absolute/path/to/node
-focal context use laptop
+focal add context laptop --node-data-dir /absolute/path/to/node
+focal use context laptop
 focal list claims
 focal --client-context laptop get claim CLAIM_ID
-focal context show
-focal context list
-focal context use local
+focal inspect context
+focal list contexts
+focal use context local
 ```
 
 For an independently authenticated remote participant:
 
 ```sh
-focal --data-dir /node cluster client invite --name alice --output /private/alice.invite
-focal --data-dir /client context enroll alice --invite-file /private/alice.invite
-focal --data-dir /client context use alice
+focal --data-dir /node invite client --name alice --output /private/alice.invite
+focal --data-dir /client enroll context alice --invite-file /private/alice.invite
+focal --data-dir /client use context alice
 focal --data-dir /client list claims
-focal --data-dir /client mcp serve
+focal --data-dir /client serve mcp
 ```
 
 Enrollment persists one invitation, key, CSR, request ID, and completed
@@ -484,7 +484,7 @@ files. Losing initialized catalogue or request history fails closed. Explicitly
 selecting `local` restores the ordinary local context. `--client-context` avoids
 colliding with the existing validation `--context` read option.
 
-`context add --file` accepts an explicit Unix or QUIC connection document for
+`add context --file` accepts an explicit Unix or QUIC connection document for
 already provisioned credentials. Remote documents carry credential paths, not
 secret bytes. Endpoint, trust, selected ledger, and client identity are distinct
 fields; a principal in a document is a client hint checked by authenticated
@@ -567,8 +567,8 @@ must preserve these distinctions when the new lifecycle profile is activated;
 old-profile release observations cannot supply missing successor provenance.
 
 Large payload workflows save exact staged bytes, hashes, offsets, upload identity
-and final artifact command before transmission. `artifact upload inspect` sends
-nothing; `artifact upload cancel` saves and retries the existing cancellation
+and final artifact command before transmission. `inspect upload` sends
+nothing; `cancel upload` saves and retries the existing cancellation
 request. Cancellation preserves immutable content references and committed
 artifact facts. A terminal server upload fence prevents delayed Begin from
 reviving a canceled or finished local upload identity. File-transfer cancellation
@@ -581,10 +581,10 @@ to stderr, while results and partial pages stay on stdout. MCP uses the same
 SDK classification through nested store, watch and transfer errors. Administrative
 errors preserve their separate root/application operation identities and fences.
 
-Offline `schema validate` compiles strict authored input under a real selected
+Offline `validate document` compiles strict authored input under a real selected
 context; `--shape-only` explicitly limits the check to document structure.
-`request build` freezes a complete raw envelope into a private, no-clobber file.
-`request check` verifies supported raw shape, resource bounds and exact wire hash,
+`build request` freezes a complete raw envelope into a private, no-clobber file.
+`check request` verifies supported raw shape, resource bounds and exact wire hash,
 without authenticating the author. The existing raw sender remains compatible
 with protocol families outside the offline checker's supported subset. Discovery,
 examples and completion derive from the released descriptors and command tree.
@@ -689,8 +689,8 @@ published designs chose them; a smaller language of focal's own would be bounded
 same way but read worse to every model. Boa, the pure-Rust engine, has per-loop
 iteration and recursion limits but no heap limit, so a single `"x".repeat(n)` is
 unbounded growth; Starlark (Meta's `starlark-rust`) is deterministic and hermetic but
-has no heap limit either. The CLI runs the same programs (`focal code run --run ID
---file P`, `focal code search --file P`), one binary, one registry.
+has no heap limit either. The CLI runs the same programs (`focal run code --run ID
+--file P`, `focal search tools --file P`), one binary, one registry.
 
 ## Remaining independent work
 

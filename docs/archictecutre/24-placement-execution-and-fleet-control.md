@@ -137,7 +137,7 @@ the current node registry (a missing, re-enrolled or ineligible member counts
 as lost; a member whose domain cannot be evaluated makes `achieved` `None`), and
 `blocked_by` lists, per node, what stands between the two: outstanding
 assignment phases, refusals, the awaited cutover or activation, and copies still
-draining. It allocates one bounded vector and is the source of `cluster status`
+draining. It allocates one bounded vector and is the source of `inspect cluster`
 in the operator batch.
 
 `NodeLoad` gains `disk_available`. The planner skips nodes below the caller's
@@ -552,7 +552,7 @@ included, below — renews in the last third of the credential's lifetime
 (`credential_renewal::renewal_window`: a third, as ACME clients renew; the
 lifetime is read from the receipt itself and is the cluster's committed
 `node.credential_lifetime_seconds`, thirty days by default), or now on
-`cluster credentials renew` (`AdminCommand::RenewCredential`
+`renew credential` (`AdminCommand::RenewCredential`
 over the admin socket, `cluster.credentials.renew` in the MCP catalogue,
 served by a `CredentialHandle` in the node's handles). It signs the request
 with the credential it holds, installs the renewed receipt over the one on
@@ -754,7 +754,7 @@ steps the succession at the cadence of a credential's retries
 (`QuorumEnrollmentHost::maintain_issuer`): the successor is staged in the
 last third of the issuer's lifetime, or when the operator asks (`cluster
 credentials rotate-issuer`, `cluster.credentials.rotate_issuer`, founder
-only; `cluster credentials issuers` reads the set), activated at the next
+only; `list issuers` reads the set), activated at the next
 step, and the predecessor retired once nothing live was issued under it —
 no receipt in the registry, current or retired, that is unexpired, and not
 the bootstrap server certificate, which is staged under the new issuer as
@@ -819,10 +819,10 @@ lives; a compacted token or certificate is unknown, which never redeems
 or authorizes — what was `Expired` or `Revoked` before is `Unauthorized`
 after, and neither admits. `max_invitations` therefore bounds the open
 and live population; the issuance and revocation history is the committed
-command stream until the log compacts, and `cluster invitations list` is
+command stream until the log compacts, and `list invitations` is
 its export while a record is open.
 
-**Rotation (2026-09-10, R9.3).** `cluster credentials rotate`
+**Rotation (2026-09-10, R9.3).** `rotate credential`
 (`AdminCommand::RotateCredential`, `cluster.credentials.rotate`) moves a
 node's credential to a fresh key under the same identity. The holder stages
 a key with its own request identity and CSR (`JOIN/node-key.next`, kept
@@ -855,7 +855,7 @@ the committed rotation from the staged key at once. The root re-grants a
 node whose enrolled key changed under its new identity at the next
 generation before any other root work (`next_root_command`); the partition
 learns the re-grant like a drain's (§19) and the node's seats stay its own.
-`cluster credentials get` and the renewal reply report `key_identity`.
+`get credential` and the renewal reply report `key_identity`.
 
 **A host that joins an old cluster (2026-09-30).** A joined host's first
 observation of the root is the genesis, and the genesis names the founder
@@ -1094,7 +1094,7 @@ under `PARTITION.admin`, made where the group leads: a node whose replica
 votes and follows asks for leadership first and waits, bounded, and one that
 cannot lead reports who does — requests are never forwarded, since a leader
 cannot bind another node's administrator to a client of its retry window),
-and a leaving host's seat is vacated by `cluster nodes remove`
+and a leaving host's seat is vacated by `remove node`
 before its root membership (handing the group's leadership on first where
 it led). The groups a split creates are seated like the first: a member's
 replica opens with the group's identity (the genesis the root's grant
@@ -1219,8 +1219,8 @@ partition so the reply fits the admin frame; and the controller's next
 actions, derived from the same facts by the pure `planned_actions` (begin,
 install, add or promote a learner, cut over, activate, drain and retire,
 replan) plus the partition's reshape state (a split or merge in progress or
-due). Two descriptors expose it on every surface: `cluster placement` /
-`cluster.placement` and `cluster plan` / `cluster.plan` (client
+due). Two descriptors expose it on every surface: `inspect placement` /
+`cluster.placement` and `plan placement` / `cluster.plan` (client
 `AdminResult::{Placement, Plan}`, the cluster skill at version 4).
 
 **The control plane in the view (2026-10-02, the audit's F24).** The
@@ -1262,8 +1262,8 @@ import pending and none stopped, while it leads none of them;
 committed prefix (`ReplicaHost::diagnostics().authoritative`);
 `policy_satisfied` when every session it hosts is listed by the directory
 with its desired durability achieved and nothing blocking it (a bounded
-report that leaves sessions out does not satisfy). `diagnose node --readiness`
-prints the report; `diagnose node --probe …` exits 0 when one probe
+report that leaves sessions out does not satisfy). `inspect node --readiness`
+prints the report; `inspect node --probe …` exits 0 when one probe
 holds and 1 (`probe_failed`) otherwise, for a supervisor. Nothing here is a
 quorum read, and a process that merely listens is never authoritative.
 
@@ -1325,8 +1325,8 @@ record and signed fact, the partition's `CreateSession`), so a created
 session gains its directory entry, its placement policy and every later
 plan exactly as the founder's did.
 
-**Surfaces.** `cluster tenants admit --tenant` / `cluster.tenants.admit`,
-`cluster tenants list` / `cluster.tenants.list`, and `cluster sessions
+**Surfaces.** `admit tenant --tenant` / `cluster.tenants.admit`,
+`list tenants` / `cluster.tenants.list`, and `cluster sessions
 create --tenant --name` / `cluster.sessions.create` (the reply names the
 ledger, its group and node). A client reaches a created session through a
 connection document naming its tenant and session under a credential whose
@@ -1357,7 +1357,7 @@ the policy the founding node's settings carried, and a policy stronger than
 one node can satisfy is refused at registration (`verify_placement` requires
 a quorum to survive the promised failures), so the only way a laptop session
 reaches three hosts is an operator asking for it once the hosts exist:
-`cluster sessions plan --tenant --session --survive node|zone|region
+`plan session --tenant --session --survive node|zone|region
 --max-failures N` / `cluster.sessions.plan`. The node's placement agent
 answers the request on its next pass over the partition holding the session,
 from committed facts alone: a pending plan is reported as `pending`; an
@@ -1408,12 +1408,12 @@ reported as the founder's until they follow (§15).
 
 **Qualification on real binaries** (`crates/focal-node/tests/placement_binary.rs`):
 three `focal` processes over QUIC (founder, two invited and joined hosts),
-enrollment with load through `cluster placement`, the operator's request for
+enrollment with load through `inspect placement`, the operator's request for
 one tolerated node loss (`planned`, then `pending` on retry), the founder
 (session leader and controller) killed with SIGKILL while the plan is under
 way, restarted, and the plan driven to activation from the committed
 directory (route epoch 2, membership epoch 3, three voters, the promised
-failure achieved, `satisfied` on the same request, an empty `cluster plan`);
+failure achieved, `satisfied` on the same request, an empty `plan placement`);
 then one host killed (a quorum read still answers through the founder's
 local socket, the directory suspects the host and measures no tolerated
 failure) and returned (alive again, the guarantee whole). The local socket
@@ -1527,7 +1527,7 @@ copies the node held are drained, removed from the session logs and retired
 `NoPlacement` refusal and keeps the node's copies: the operator adds capacity
 or undrains. The root group's membership is untouched by a drain.
 
-**Removal.** `cluster nodes remove --node N` (`cluster.nodes.remove`) is
+**Removal.** `remove node --node N` (`cluster.nodes.remove`) is
 refused while the node's committed grant is eligible (`not_drained`, exit 5)
 or while any session in the placement view still names it as a voter,
 materializer, content copy, retiring copy or pending assignment
@@ -1564,16 +1564,16 @@ already revoked invitation read as done. The revoked node can no longer
 present its credential on any path; its data directory is the operator's to
 release.
 
-**Replacement.** `cluster nodes replace --node N --with M`
+**Replacement.** `replace node --node N --with M`
 (`cluster.nodes.replace`) drains `N` once `M` is enrolled, alive, eligible
 and reporting load in the placement view (`node_not_ready`, exit 5
 otherwise); the healed placements are planned among every eligible node, so
 `M` is a candidate, not a promise.
 
-**The operator's view.** `cluster placement` shows each node's `generation`
+**The operator's view.** `inspect placement` shows each node's `generation`
 and `eligible` flag (§15) and each session's `retiring` copies; the drain is
 complete for a session when the node appears in none of its lists and its
-guarantee is achieved again. `cluster nodes list` still shows contact
+guarantee is achieved again. `list nodes` still shows contact
 announcements only.
 
 **Limits.** A drained node keeps its root-group vote until removed, so a
@@ -1586,7 +1586,7 @@ a new invitation and a new node identity.
 
 ## 20. Repairing a session's custody
 
-`cluster repair [--tenant T] [--session S] [--after A] [--limit N]`
+`repair session [--tenant T] [--session S] [--after A] [--limit N]`
 (`AdminCommand::Repair`, `cluster.repair`) answers instruction 3 of R9 for
 custody: forward repair of the copies a placement already requires, never a
 new promise. The replica exports its committed prefix
@@ -1692,13 +1692,13 @@ authority through `Change::ActivateFence { level }`: a fence only rises
 (`prepare_activate_fence` refuses zero and lower levels; the same level is
 a conflict an operator's retry reads as done).
 
-`cluster upgrade status` (`AdminCommand::UpgradeStatus`,
+`inspect upgrade` (`AdminCommand::UpgradeStatus`,
 `cluster.upgrade.status`, any node) reads the registry — through the root
 quorum, or the node's own applied copy when a quorum read is not its to
 make — and the directory's node records, and reports the fence, this
 binary's compiled and announced levels, every listed node's reported level
 (the highest across partitions; zero until it reports) and `activatable`,
-the least reported level. `cluster upgrade activate --fence LEVEL`
+the least reported level. `activate upgrade --fence LEVEL`
 (`AdminCommand::ActivateFence`, `cluster.upgrade.activate`, founder only)
 refuses by name while any listed node reports less than `LEVEL` or none
 (`members_behind`, listing them), refuses a lower level (`invalid_input`),
@@ -1788,7 +1788,7 @@ placement agent's intents and admission (§7, §10), the directory's route
 and placement epochs and achieved durability per session (§15), and the
 upgrade fence (§21) — and publishes through a `watch` the admin socket
 reads (`OperatorRead::Metrics` → `AdminResult::Metrics { text }`, CLI
-`diagnose node --metrics` printing the text as it is, MCP
+`inspect node --metrics` printing the text as it is, MCP
 `diagnose.node.metrics`). Rendering is Prometheus text exposition (version
 0.0.4) with `# HELP`/`# TYPE` per series and fixed labels on every sample
 (`node`, `cluster`; `focal_node_info` carries `role`, `region`, `zone` and
@@ -1806,7 +1806,7 @@ published (`metrics::MetricsPage`); the socket and the loopback serve it
 as it is.
 
 The page is bounded by what one operator read carries (`metrics::MAX_PAGE_BYTES`:
-the admin socket's `MAX_COMMAND` less the reply's envelope, so `diagnose node --metrics`
+the admin socket's `MAX_COMMAND` less the reply's envelope, so `inspect node --metrics`
 reads any page; the loopback serves the same page), and it holds two kinds of series
 (2026-10-04, the audit's F26). Aggregates are over every member of a family, every round,
 with no ask of an owner: the hosted sessions, read in place (`ReplicaHost::observe`) —
@@ -1836,7 +1836,7 @@ measured peer 139, a tenant 328 — so a node hosting 4,096 sessions lists four 
 (three beside a member, a peer and a tenant), flagged ones first, and every one within
 1,365 rounds. Per-session series of every session each round would be 131,072 series a
 node; the aggregates are what an alert reads, and a session is read in full by
-`diagnose cluster --replicas --session`. With 4,096 sessions in one grouped owner and the only
+`inspect replicas --replicas --session`. With 4,096 sessions in one grouped owner and the only
 stopped one placed past the first 512 by key, the first round's aggregates count it and
 the page lists it, in every round, under a load average of 31 to 36 on 18 cores
 (`fleet::async_tests::the_only_stopped_session_past_the_first_512_shows_in_the_first_round`);
@@ -1899,7 +1899,7 @@ gives a name (`host:port`, a DNS host and a nonzero port, at most 259
 bytes) rather than an address has it carried with the contact
 (`Operation::NodeContact { endpoint }`, `ContactRecord.endpoint`, contact
 checkpoint schema 4 — retirement counters, 2026-09-13 — and control checkpoint schema 7 with every earlier shape
-decoded) and shown by `cluster placement` (`advertise`, `endpoint` per
+decoded) and shown by `inspect placement` (`advertise`, `endpoint` per
 node). The peer pool's dial for a route is a task of its own
 (`PeerConnectionPool::dial`, one per slot at a time): it dials the
 announced address and, after a 100 ms head start, every fresh address the
@@ -1935,13 +1935,13 @@ starts and ignores the file. One command therefore serves a supervised
 host and a pod alike, with no init step that would need a shell.
 `prepare-volume --owner UID:GID` creates the data directory for the
 node's user and exits: the privileged step a packaged volume needs,
-performed by the same image and nothing else. `cluster invite --output -`
+performed by the same image and nothing else. `invite node --output -`
 writes the invitation to the caller's pipe, so a founder that has no
 readable path can still issue one through `kubectl exec`. A name denotes
-one invitation at a time — retrying `cluster invite --node NAME` returns
+one invitation at a time — retrying `invite node --node NAME` returns
 the live invitation exactly, and a redeemed one still denotes its
 enrolled node — but not forever: an invitation that is finished (revoked,
-as `cluster nodes remove` does, or expired before anyone redeemed it) is
+as `remove node` does, or expired before anyone redeemed it) is
 superseded by a fresh invitation under the same name, so a removed
 StatefulSet ordinal comes back under its stable pod name (revised
 2026-09-13: the first shape refused the name for good once its
@@ -1960,7 +1960,7 @@ new invitation is joined; an unknown outcome keeps the journal and the
 exact retry (`PendingJoin::retire`, `terminal_rejection`). An invitation
 file is read through links (a mounted secret is a link into its volume)
 and must be a regular file nobody but its owner may write and nobody
-outside its group may read (mode `0600` as `cluster invite` writes it, or
+outside its group may read (mode `0600` as `invite node` writes it, or
 `0440` as a secret mounted with `defaultMode: 288` under the pod's
 `fsGroup`); the journals and keys a node writes itself stay at exactly
 `0600`.
@@ -1981,7 +1981,7 @@ zone; `2f+1` zones are required and otherwise reported as missing), each
 pod with its own volume claim and its own enrollment, a ConfigMap with one
 configuration per set, disruption budgets (the founder never voluntarily
 disrupted, hosts at most `max_failures` at once), probes that ask the node
-(`diagnose node --probe alive` for startup, liveness and readiness;
+(`inspect node --probe alive` for startup, liveness and readiness;
 `authoritative` and `policy` are inspection, so a healthy node is not
 restarted for a missing quorum), an init step that gives the volume to
 the node's user, and an invitation script that issues one invitation per

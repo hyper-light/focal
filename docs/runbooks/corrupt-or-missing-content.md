@@ -3,17 +3,17 @@
 **Failure.** A sealed artifact's chunk is gone from a copy's content store, or its bytes no
 longer match the hash the ledger names.
 
-**Symptoms.** `diagnose cluster --replicas` shows `custody_objects_missing` on the copy; a
-read of the artifact on that node fails verification; `cluster placement` may show the
+**Symptoms.** `inspect replicas --replicas` shows `custody_objects_missing` on the copy; a
+read of the artifact on that node fails verification; `inspect placement` may show the
 session's guarantee `blocked_by` a custody blocker; `focal_session_custody_objects_missing`
-in `diagnose node --metrics`.
+in `inspect node --metrics`.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir DIR diagnose cluster --replicas --session ID
-focal --data-dir DIR cluster placement
-focal --data-dir DIR diagnose node --storage
+focal --data-dir DIR inspect replicas --replicas --session ID
+focal --data-dir DIR inspect placement
+focal --data-dir DIR inspect node --storage
 ```
 
 **Preconditions.** The session names the object in its committed prefix and at least one
@@ -23,7 +23,7 @@ Repair never invents bytes: an object no copy can supply is reported, not replac
 **Commands.**
 
 ```sh
-focal --data-dir DIR cluster repair --tenant T --session S   # re-verify, recopy, complete peers
+focal --data-dir DIR repair session --tenant T --session S   # re-verify, recopy, complete peers
 ```
 
 The reply lists what was `verified`, `repaired`, `pushed` and `unrecoverable`; a partial run
@@ -36,7 +36,7 @@ required copy; the ledger's history is untouched.
 **Stop conditions.** Stop when `unrecoverable_count` is nonzero: the object exists on no
 required copy. Do not delete the corrupt copy's other objects.
 
-**Verification.** A second `cluster repair` reports everything `verified` and nothing
+**Verification.** A second `repair session` reports everything `verified` and nothing
 `repaired`; the artifact reads back on the repaired node with its recorded hash.
 
 **Escalation.** An unrecoverable object is restored from a backup that holds it
@@ -44,11 +44,11 @@ required copy. Do not delete the corrupt copy's other objects.
 claim's record; Focal never marks it present.
 
 **Executed test.** `runbook_corrupt_or_missing_content`: a session with three copies; one
-copy loses a chunk file and another holds it with altered bytes; `cluster repair` on each
+copy loses a chunk file and another holds it with altered bytes; `repair session` on each
 re-verifies, recopies from a healthy copy, and a second run reports nothing to repair; the
 artifact's bytes read back on every copy.
 
-Every command above is under `focal --data-dir DIR cluster ...` on the node named, over its
+Every command above is run as `focal --data-dir DIR ACTION THING ...` on the node named, over its
 own admin socket ([cluster-admin.md](../cluster-admin.md)); reads never change the cluster.
 The executed test runs the real binary through this runbook's commands
 (`crates/focal-node/tests/runbooks.rs`); its evidence is recorded in

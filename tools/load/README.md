@@ -35,10 +35,10 @@ reopen: false         # optional, embedded only; reopen the node afterwards and 
 unless `data_dir` says where), activates it natively (`projection_only` unless
 `profile` says `authored_v1`) and drives it over the embedded transport.
 
-`unix` drives a running `focal start` node through `<data_dir>/focal.sock` as
+`unix` drives a running `focal start node` node through `<data_dir>/focal.sock` as
 that node's own local participant, exactly as the CLI does without a
 `--client-context`; the node must have been activated natively
-(`focal cluster replicas activate-native` activates `authored_v1`, the default
+(`focal activate native` activates `authored_v1`, the default
 frame profile for this transport).
 
 The profile decides how a creation is built. On a `projection_only` ledger a

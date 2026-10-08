@@ -71,6 +71,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -203,7 +204,7 @@ fn retired(root: &Path, claim: &str) -> Value {
             json!({"stderr": String::from_utf8_lossy(&output.stderr), "stdout": String::from_utf8_lossy(&output.stdout)})
         };
         if !deadline.open() {
-            let retention = admin(root, None, &["diagnose", "cluster", "--retention"]);
+            let retention = admin(root, None, &["inspect", "replicas", "--retention"]);
             panic!("claim {claim} never retired: {retention}\n{last}");
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -232,7 +233,7 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -241,9 +242,8 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -254,15 +254,15 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
         ],
     );
     assert!(enrolled.status.success());
-    let alice_standing = admin(client.path(), Some("alice"), &["status"]);
+    let alice_standing = admin(client.path(), Some("alice"), &["inspect", "prefix"]);
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // ---- The complete two-party cycle (the A1 gate) ----
@@ -284,17 +284,17 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
     ));
     let claim = created(&result, "Claim").remove(0);
     let validation = created(&result, "Validation").remove(1);
-    committed(&cli(root, None, &["claim", "post", &claim]));
+    committed(&cli(root, None, &["post", "claim", &claim]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &claim],
+        &["acquire", "receipt", &claim],
     ));
     let (_, result) = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -309,8 +309,8 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
         client.path(),
         Some("alice"),
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &claim,
             "--summary",
@@ -327,19 +327,19 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["testament", "post", &testament, "--claim", &claim],
+        &["post", "testament", &testament, "--claim", &claim],
     ));
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament, "--claim", &claim],
+        &["receive", "testament", &testament, "--claim", &claim],
     ));
     committed(&cli(
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &claim,
             "--validation",
@@ -350,8 +350,8 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &claim,
             "--validation",
@@ -385,7 +385,7 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
     assert_eq!(objects(&online)[0]["Artifact"], live_artifact, "{online}");
 
     // ---- Retirement: satisfied and released, the family leaves ----
-    committed(&cli(root, None, &["claim", "release-scope", &claim]));
+    committed(&cli(root, None, &["release", "scope", &claim]));
     let continuation = retired(root, &claim);
     assert_eq!(hex_hash(&continuation["claim"]), claim);
     // The plain reads say the rows left: the artifact and the testament are
@@ -483,7 +483,7 @@ fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept
     // Custody this node does not hold, or holds corrupt, is unavailable —
     // a typed refusal, never a missing object.
     let identity =
-        admin(root, None, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+        admin(root, None, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
     let bundle_hex = hex_hash(&continuation["bundle"]);
     let objects_dir = root.join("content").join("objects").join(&tenant_hex);

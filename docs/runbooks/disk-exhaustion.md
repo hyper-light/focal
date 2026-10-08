@@ -4,19 +4,19 @@
 quota or size limit refuses the write.
 
 **Symptoms.** Writes through this node fail with an operation error naming the log (exit 1,
-`[operation_failed]`), never with an acknowledgement; `diagnose node --storage` reports the
+`[operation_failed]`), never with an acknowledgement; `inspect node --storage` reports the
 volume's `free` near zero and `headroom` unmet; `focal_disk_free_bytes` in
-`diagnose node --metrics` is at the floor; the node may stop its ledger owner and exit when the
+`inspect node --metrics` is at the floor; the node may stop its ledger owner and exit when the
 write-ahead log itself cannot be extended (`ledger egress ended`). Readers keep answering
 from the durable prefix.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir DIR diagnose node --storage        # disk: free, outstanding, headroom, by kind
-focal --data-dir DIR diagnose node --metrics | grep focal_disk
-focal --data-dir DIR diagnose cluster --retention      # what holds the retention floor (cursors, archive)
-focal --data-dir DIR diagnose node --gc             # what the collector reclaimed and quarantined
+focal --data-dir DIR inspect node --storage        # disk: free, outstanding, headroom, by kind
+focal --data-dir DIR inspect node --metrics | grep focal_disk
+focal --data-dir DIR inspect replicas --retention      # what holds the retention floor (cursors, archive)
+focal --data-dir DIR inspect node --gc             # what the collector reclaimed and quarantined
 ```
 
 **Preconditions.** The volume is the node's own data directory; another node's volume is
@@ -28,23 +28,23 @@ to reconcile on the client beyond retrying the same request identity.
 
 1. Free space on the volume, outside Focal, or raise the limit. Focal's own reclaim is
    bounded by the retention floor: a consumer that stopped acknowledging holds the log
-   (`diagnose cluster --retention` shows `blocker: cursors`); an archive that has not received a
+   (`inspect replicas --retention` shows `blocker: cursors`); an archive that has not received a
    family holds it (`blocker: archive`). Nothing below the floor is deleted.
-2. Restart the node if it stopped: `focal --data-dir DIR start ...` with the same arguments.
+2. Restart the node if it stopped: `focal --data-dir DIR start node ...` with the same arguments.
    Recovery replays the durable log; a write that was refused is absent, a write that was
    acknowledged is present.
-3. Retry the refused requests with their original identities (`focal request retry
+3. Retry the refused requests with their original identities (`focal retry request
    --operation-id ...`); an unknown outcome is answered from the retained receipt.
 
 **Preserved guarantee.** No acknowledged write is lost; no refused write is silently applied.
 The other voters of a session continue without this node as long as a majority holds.
 
 **Stop conditions.** Stop and escalate if the node fails to start after space was freed
-(the log is refused as corrupt rather than short), or if `diagnose node --storage` still
+(the log is refused as corrupt rather than short), or if `inspect node --storage` still
 reports `free` at zero after the filesystem says otherwise (a stale sample: wait one
 sampling interval, then escalate).
 
-**Verification.** After restart, `diagnose node --readiness` reports `alive` and, for a founder,
+**Verification.** After restart, `inspect node --readiness` reports `alive` and, for a founder,
 `authoritative`; a claim written before the exhaustion is read back unchanged; a new claim
 commits.
 
@@ -59,7 +59,7 @@ acknowledgement; the node restarted without the limit reads the first claim back
 commits a new one. Not exercised: quota systems and the collector reclaiming space
 under pressure.
 
-Every command above is under `focal --data-dir DIR cluster ...` on the node named, over its
+Every command above is run as `focal --data-dir DIR ACTION THING ...` on the node named, over its
 own admin socket ([cluster-admin.md](../cluster-admin.md)); reads never change the cluster.
 The executed test runs the real binary through this runbook's commands
 (`crates/focal-node/tests/runbooks.rs`); its evidence is recorded in

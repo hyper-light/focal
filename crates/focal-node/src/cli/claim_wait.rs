@@ -114,6 +114,6 @@ fn map_error(error: ClaimWaitError) -> CliError {
     match error {
         ClaimWaitError::Client(error) => CliError::Client(error),
         ClaimWaitError::NotFound => CliError::NotFound,
-        ClaimWaitError::InvalidRequest => CliError::Input("invalid claim wait query".into()),
+        ClaimWaitError::InvalidRequest => CliError::Input("invalid `wait claim` query".into()),
     }
 }

@@ -64,6 +64,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -119,7 +120,7 @@ fn admin(root: &Path, context: Option<&str>, args: &[&str]) -> Value {
     })
 }
 
-/// `focal code run|search`, its parsed result and whether it exited 0.
+/// `focal run code|search`, its parsed result and whether it exited 0.
 fn code(root: &Path, args: &[&str]) -> (bool, Value) {
     let output = run(root, None, args);
     let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
@@ -156,7 +157,7 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -165,9 +166,8 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -178,8 +178,8 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -200,8 +200,8 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
         client.path(),
         Some("alice"),
         &[
-            "code",
             "run",
+            "code",
             "--run",
             "whoami",
             "--file",
@@ -229,7 +229,7 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
     .unwrap();
     let (ok, found) = code(
         root,
-        &["code", "search", "--file", search.to_str().unwrap()],
+        &["search", "tools", "--file", search.to_str().unwrap()],
     );
     assert!(ok, "{found}");
     let names = &found["result"]["outcome"]["value"];
@@ -251,8 +251,8 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
     let input = files.join("input.json");
     std::fs::write(&input, json!({"claim": claim}).to_string()).unwrap();
     let cycle = [
-        "code",
         "run",
+        "code",
         "--run",
         "cycle-1",
         "--file",
@@ -305,8 +305,8 @@ fn a_program_run_twice_across_a_killed_node_makes_one_claim() {
     let (ok, counted) = code(
         root,
         &[
-            "code",
             "run",
+            "code",
             "--run",
             "count-1",
             "--file",

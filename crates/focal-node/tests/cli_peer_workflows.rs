@@ -45,6 +45,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -167,9 +168,8 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             name,
             "--output",
@@ -180,8 +180,8 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
         client,
         None,
         &[
-            "context",
             "enroll",
+            "context",
             name,
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -192,7 +192,7 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
         "enroll {name}: {}",
         String::from_utf8_lossy(&enrolled.stderr)
     );
-    let standing = admin(client, Some(name), &["status"]);
+    let standing = admin(client, Some(name), &["inspect", "prefix"]);
     hex_hash(&objects(&standing)[0]["Standing"]["principal"])
 }
 fn receipt_check() -> String {
@@ -219,12 +219,12 @@ fn artifact_hash(root: &Path, context: Option<&str>, artifact: &str) -> String {
 /// slot 0, a complete testament, posted; the issuer then receives it.
 fn respond(root: &Path, client: &Path, holder: &str, claim: &str, payload: &str) -> String {
     let context = Some(holder);
-    committed(&cli(client, context, &["receipt", "acquire", claim]));
+    committed(&cli(client, context, &["acquire", "receipt", claim]));
     let (_, result) = committed(&cli(
         client,
         context,
         &[
-            "artifact", "submit", "--claim", claim, "--slot", "0", "--text", payload,
+            "submit", "artifact", "--claim", claim, "--slot", "0", "--text", payload,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -233,8 +233,8 @@ fn respond(root: &Path, client: &Path, holder: &str, claim: &str, payload: &str)
         client,
         context,
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             claim,
             "--summary",
@@ -251,19 +251,19 @@ fn respond(root: &Path, client: &Path, holder: &str, claim: &str, payload: &str)
     committed(&cli(
         client,
         context,
-        &["testament", "post", &testament, "--claim", claim],
+        &["post", "testament", &testament, "--claim", claim],
     ));
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament, "--claim", claim],
+        &["receive", "testament", &testament, "--claim", claim],
     ));
     artifact
 }
 /// The lineage's claims in order — the claim, its ancestors, its followers
 /// — of an observation that is complete at its one prefix.
 fn lineage_ids(root: &Path, claim: &str) -> Vec<String> {
-    let page = cli(root, None, &["claim", "lineage", claim]);
+    let page = cli(root, None, &["trace", "lineage", claim]);
     assert_eq!(page["condition"], "Lineage", "{page}");
     lineage_claims(&page)
 }
@@ -293,11 +293,11 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let issuer = hex_hash(&objects(&status)[0]["Standing"]["principal"]);
     let alice = enroll(root, client.path(), "alice");
     let eve = enroll(root, client.path(), "eve");
@@ -308,8 +308,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         root,
         None,
         &[
-            "claim",
             "consult",
+            "participant",
             "--target",
             &alice,
             "--description",
@@ -330,17 +330,17 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         consult_object["content"]["policy"]["max_follow_ups"], 1,
         "{consult_object}"
     );
-    committed(&cli(root, None, &["claim", "post", &consult]));
+    committed(&cli(root, None, &["post", "claim", &consult]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &consult],
+        &["acquire", "receipt", &consult],
     ));
     let (_, result) = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &consult, "--slot", "0", "--text", ANSWER,
+            "submit", "artifact", "--claim", &consult, "--slot", "0", "--text", ANSWER,
         ],
     ));
     let answer = created(&result, "Artifact").remove(0);
@@ -349,8 +349,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         client.path(),
         Some("alice"),
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &consult,
             "--summary",
@@ -367,15 +367,15 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["testament", "post", &answer_testament, "--claim", &consult],
+        &["post", "testament", &answer_testament, "--claim", &consult],
     ));
     // Before the issuer receives it, a short testament wait ends Pending.
     let (code, pending) = refused(
         root,
         None,
         &[
-            "claim",
             "wait",
+            "claim",
             &consult,
             "--until",
             "testament",
@@ -390,8 +390,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         root,
         None,
         &[
-            "testament",
             "receive",
+            "testament",
             &answer_testament,
             "--claim",
             &consult,
@@ -401,8 +401,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         root,
         None,
         &[
-            "claim",
             "wait",
+            "claim",
             &consult,
             "--until",
             "testament",
@@ -418,8 +418,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
     // refused by the policy, and the subject may not file one.
     fn follow_args<'a>(consult: &'a str, description: &'a str, receipt: &'a str) -> Vec<&'a str> {
         vec![
-            "claim",
-            "follow-up",
+            "refine",
+            "consultation",
             "--refines",
             consult,
             "--description",
@@ -448,8 +448,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         client.path(),
         Some("alice"),
         &[
-            "claim",
-            "follow-up",
+            "refine",
+            "consultation",
             "--refines",
             &consult,
             "--target",
@@ -472,8 +472,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         root,
         None,
         &[
-            "claim",
             "challenge",
+            "participant",
             "--target",
             &alice,
             "--artifact",
@@ -503,14 +503,14 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
                 && hex_hash(&relation["target"]["Evidence"]["hash"]) == answer_hash
         });
     assert!(disputes, "{challenge_object}");
-    committed(&cli(root, None, &["claim", "post", &challenge]));
+    committed(&cli(root, None, &["post", "claim", &challenge]));
     let proof = respond(root, client.path(), "alice", &challenge, PROOF);
     committed(&cli(
         client.path(),
         Some("eve"),
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &challenge,
             "--validation",
@@ -521,8 +521,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         client.path(),
         Some("eve"),
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &challenge,
             "--validation",
@@ -539,8 +539,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         root,
         None,
         &[
-            "claim",
             "wait",
+            "claim",
             &challenge,
             "--until",
             "satisfied",
@@ -555,8 +555,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
     let correct =
         |context: &Path, name: Option<&str>, verdict: &str, target: Option<&str>| -> Output {
             let mut args = vec![
-                "claim",
                 "correct",
+                "challenge",
                 "--challenge",
                 &challenge,
                 "--verdict",
@@ -590,7 +590,7 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
     let retried = cli(
         client.path(),
         Some("eve"),
-        &["request", "retry", "--operation-id", &operation],
+        &["retry", "request", "--operation-id", &operation],
     );
     assert_eq!(retried["condition"], "Committed", "{retried}");
     let correction_object = claim_object(root, &correction);
@@ -638,8 +638,8 @@ fn peer_workflows_run_through_the_cli_with_typed_refusals_identity_and_restart()
         root,
         None,
         &[
-            "claim",
             "wait",
+            "claim",
             &challenge,
             "--until",
             "terminal",

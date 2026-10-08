@@ -1042,7 +1042,7 @@ async fn a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader() 
     founder.stop().await;
 }
 
-/// A store bootstrapped at one durability and raised by `deployment apply`
+/// A store bootstrapped at one durability and raised by `apply deployment`
 /// restarts from the same static file it was bootstrapped with (a
 /// Kubernetes configmap does not follow the committed policy). The committed
 /// policy is what the fleet already carries, so the restart must carry it
@@ -1067,7 +1067,7 @@ async fn a_founder_restarts_from_its_stale_seed_file_after_a_stronger_policy_was
         .unwrap()
         .expect("first start committed the seed");
     assert_eq!(seeded.revision, PolicyRevision(1));
-    // `deployment apply` commits stronger durability than the seed.
+    // `apply deployment` commits stronger durability than the seed.
     let mut stronger = seeded.intent.clone();
     stronger.durability.survive = crate::config::FailureDomain::Zone;
     stronger.durability.max_failures = 1;

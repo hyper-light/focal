@@ -2,7 +2,7 @@
 //! F24), journaled like the root's: one latest request per node, retained
 //! until its receipt is known, so a lost reply is recovered by reference and
 //! never re-issued as a fresh change; a group's leadership handed on; and a
-//! leaving node's seats vacated, which `cluster nodes remove` does before
+//! leaving node's seats vacated, which `remove node` does before
 //! the node leaves the root (its seats' permits end with its root
 //! membership, and a group must not count a voter that is gone).
 use super::*;

@@ -293,7 +293,7 @@ since no external pressure reaches the reconstruction alone once the entry appli
 and nothing else: `Change::{CommitPolicy, PlanSession, NoChange}` and a guarantee
 derived from the sessions' achieved levels alone. The root group kept the founder's
 single vote (every enrolled node is admitted as a root learner by the network
-controller; promotion was `cluster membership promote`, by hand, mentioned nowhere a
+controller; promotion was `promote learner`, by hand, mentioned nowhere a
 zone-survival request leads), the directory partition is hosted by the founder alone
 (24 §13), and the issuer's key is the founder's. The KIND campaign of 2026-09-29 (D5)
 saw it: three session voters across zones, `root_leader=not_leader` while the founder
@@ -308,7 +308,7 @@ loss leaves a quorum, with the same blockers (missing, ineligible, dead, unknown
 domain); a control voter is named by the log's configuration, without a generation. The
 root's own observation (`ControlHost::observe_root`: its configuration and the authority
 checkpoint) gives every node the root's voters and learners, each partition group's
-grant and the issuer's holder, and `cluster placement` carries them as `control`
+grant and the issuer's holder, and `inspect placement` carries them as `control`
 (`AdminControlPlane`: the root, the partition groups and the issuer, each with what it
 tolerates of nodes, zones and regions and what blocks it). The deployment plan asks the
 placement agent for the root's voters as it asks for a session's (`AdminCommand::
@@ -323,7 +323,7 @@ planned voter through the root once the root holds it as a learner — one exact
 request each (`ClusterAdmin::membership`), a learner behind, a request decided meanwhile
 or an earlier request still deciding asked again as the root moves within the operator's
 allowance, the rest journaled as under way and resumed by a repeated apply; the step
-is complete when every planned voter votes, and `deployment status` sees it. Preflight
+is complete when every planned voter votes, and `inspect deployment` sees it. Preflight
 fences a planned voter the directory no longer knows (`stale: root members`), never
 the root's index, which moves as the controller admits learners. Readiness
 (`policy_satisfied`) now also requires the root to tolerate what the committed policy
@@ -339,7 +339,7 @@ preflight by members not by index, satisfied and refused). Real binaries,
 `tests/deployment_control_plane.rs`: three zones; before the plan the view says the
 root is the founder's vote alone, as are the partition and the issuer; `deployment
 plan` names `plan_root` with the three before `plan_session`, the control promise
-zone/1; `deployment apply --wait 240` completes with three root voters, `cluster
+zone/1; `apply deployment --wait 240` completes with three root voters, `cluster
 placement` measures the root at zone/1 and node/1, the partition still at 0,
 readiness holds the policy and lists two peers; the same plan applied again is
 exact; the founder's zone silenced (SIGSTOP), the root is led from another zone and
@@ -349,7 +349,7 @@ policy holds again. The KIND campaign's D5 is this test's premise.
 **Found on the way: a control read was served by the leader alone.** The first root
 with three voters showed it: a founder restarted under its committed policy never
 reported `Ready` — its startup asks its own root for the membership, a quorum read,
-and its root now followed a host — and `cluster membership show` on any non-leader
+and its root now followed a host — and `inspect membership` on any non-leader
 node was refused `not_leader`; the F24 fleet's session plan stalled the same way once
 root leadership had moved, the agent's root reads refused. The core forwards a
 follower's read index to its leader and answers with the leader's commit (27 §5),
@@ -367,7 +367,7 @@ same restart showed the second assumption: the permit the founder's own partitio
 opens with was refused unless the root replica led — at its admission
 (`Owner::prepare_directory`), at its barrier (`complete_directory`) and in its
 minting (`authorize_first_directory`) — so a founder whose root followed another
-voter never reopened the partition it hosts — no `Ready`, no directory view (`cluster placement` empty), the agent's root
+voter never reopened the partition it hosts — no `Ready`, no directory view (`inspect placement` empty), the agent's root
 intents refused for want of a route. The permit is minted on committed facts behind
 a quorum barrier — asked through the leader where the replica follows — the same on
 every member that applied them; it no longer asks who leads. The CLI deployment
@@ -419,7 +419,7 @@ exact `p1:` request each through `AdminCommand::Partition` (`PartitionAdminComma
 it; `ClusterAdmin::partition_change`, journaled under `PARTITION.admin` with one
 retry window per group), asked again on `not_ready`, `compare_failed`, `pending` or
 `unavailable` within `--wait`; preflight fences a partition whose group changed or a
-planned voter the directory no longer knows. `cluster placement` reports each
+planned voter the directory no longer knows. `inspect placement` reports each
 partition group's leader and applied configuration index from the replicas this node
 hosts (0 where it hosts none), and readiness `control_satisfied` holds the committed
 policy to every control group.
@@ -493,7 +493,7 @@ partition blocks and is named); `cli_deployment` (four changes, four steps, the
 partition's voters and node/1 after apply); real binaries, `deployment_control_plane`
 extended: `plan_partition` names the three after `plan_root`; after apply the
 partition group's three voters tolerate zone/1; with the founder's zone silenced the
-partition is led from another zone and `cluster sessions create` succeeds on host-b.
+partition is led from another zone and `create session` succeeds on host-b.
 Measurements: see doc 09's entry.
 
 **Open after batch 2.** A split destination's replica on another node: its genesis
@@ -597,7 +597,7 @@ window; leadership moves instead, for the root (`lead_here`) and the partition g
 (`partition_lead_here`) alike. **Closed (batch 3, 2026-10-02):** `cluster
 partitions show|add-learner|promote|remove|transfer` drive a partition group's
 membership and leadership by hand (descriptors, MCP tools, the focal-cluster skill);
-`cluster nodes remove` vacates a leaving node's seats in every partition group before
+`remove node` vacates a leaving node's seats in every partition group before
 its root membership — the root's grant seats a host while it is a root member, so the
 groups must stop counting it before the root does — handing a group's leadership on
 first where the node leads, and reports `partitions_vacated`; a seat not vacated within
@@ -640,7 +640,7 @@ client it was journaled under); the mirror image at the leader's ingress, which 
 a sender's local client in the decoder but not in the `Submit` and `Receipt` checks that
 follow (the founder's partition intents, journaled under its local client while it led,
 were refused through the new leader, so its own copy's progress never arrived and the
-heal stood at `Preparing`); `cluster nodes remove` read a placement with no partition
+heal stood at `Preparing`); `remove node` read a placement with no partition
 observed yet as `unknown_node` (it waits, as for an eligible entry); and the agent wiped
 the operator's last observation whenever one pass observed nothing (a read refused, a
 replica between leaders), showing a cluster without partitions — it keeps the last
@@ -855,7 +855,7 @@ produced them.
 → the only catalogue with the name → V1; online the shared standing probe, contradiction
 refused, assumption reported); native examples for all 43 descriptors generated from the
 native contracts; `--native` on `list`, `get`, `example`, `validate`; engine and version
-in `schema list`; context-backed validation compiles against the ledger's bindings with
+in `list schemas`; context-backed validation compiles against the ledger's bindings with
 throwaway identities; the MCP catalogue served by the same engine; README and manual
 carry the native quickstart and the rule.
 
@@ -1631,7 +1631,7 @@ it), `ancestors_missing` names an ancestor unreadable at the prefix (the chain s
 short of its root), and `followers_beyond` says, per relation, how many followers the
 list named that the observation did not read and carries the list's own continuation
 (`claim.list` with the same relation filter resumes there); `is_complete` is all of
-them absent. The CLI prints `claim lineage` by role (`CLAIM`, `ANCESTOR`, `FOLLOWER`)
+them absent. The CLI prints `trace lineage` by role (`CLAIM`, `ANCESTOR`, `FOLLOWER`)
 with a `COMPLETE` flag and the `*_BEYOND`/`*_MISSING` rows; MCP returns
 `native_lineage` under condition `Lineage`; the schema names every field; the peers
 skill (version 2) tells an agent to check the bounds before reading a sample as the
@@ -1746,7 +1746,7 @@ and continues in the generation the owner admits. Seal bundles are content roots
 collector, carried by a backup). The archive agent proposes a seal when the pressure floors
 are non-empty or the closed rows reach half a bundle, and counts `seals_proposed` and
 `seals_waiting`. The node's resident window is `FOCAL_NATIVE_OUTCOMES` for qualification. The embedded node
-(`focal start` without a network) runs the agent's walk on its owner thread
+(`focal start node` without a network) runs the agent's walk on its owner thread
 (`EmbeddedArchive`, the derivations shared with the fleet's owner in `archive_derive`), each
 bundle sealed into its own store: before, it neither retired nor — now — sealed, so its window
 would have filled for good; found by driving `focal-load` under a small window. The load tool
@@ -1787,7 +1787,7 @@ Node (`cli_native_epochs.rs`):
 binary under a small resident window: the founder's generation is closed under pressure and
 the refusal is by name with exit 5, the next command commits in the admitted generation, every
 committed operation of the closed generation is still answered by its journal and read from
-the seal by `request inspect --remote`, the claims stay live, and a restart changes none of
+the seal by `inspect request --remote`, the claims stay live, and a restart changes none of
 it), `an_embedded_node_seals_its_closed_generations_and_retires_released_families` (the same
 on the embedded node, and a released family retires behind its continuation across a
 restart). `focal-load` (`generations::tests`): the rotation at the journal's pace, the
@@ -1993,7 +1993,7 @@ lifetime of the activation. The issuer's lifetime is committed policy
 credential lifetimes, Let's Encrypt's intermediate-to-leaf ratio; at least six — the
 last third must hold activation and retirement, a lifetime each; at most ten years, what
 the genesis issuer had), and the succession is staged in the last third of it or when
-the operator asks (`cluster credentials rotate-issuer`; `cluster credentials issuers`
+the operator asks (`rotate issuer`; `list issuers`
 reads the set). It is the first behaviour gated on the upgrade fence
 (`ISSUER_SUCCESSION_LEVEL` 2; `CAPABILITY_LEVEL` 2): an older binary cannot verify an
 endorsed chain, so staging is refused by name (`Fenced`) until the fence is at the
@@ -2059,7 +2059,7 @@ renewal or rotation moves a record's closing with the credential, so the live ke
 records and an exact redeem retry is preserved while the credential lives; a compacted
 token or certificate is unknown, which never redeems or authorizes. The bound now holds the
 open and live population; the issuance and revocation history is the committed command
-stream until the log compacts (`cluster invitations list` is its export while a record is
+stream until the log compacts (`list invitations` is its export while a record is
 open). The audit's "partition issuance" is F21's.
 
 **Tests.** `closed_records_compact_so_onboarding_outlives_the_active_bound`: a bound of
@@ -2873,7 +2873,7 @@ load report whose revision had moved (`metadata comparison failed`, the periodic
 report's compare, not the plan's). The report could not tell whether the
 replacement's copy ever learned a leader or was ever appended to; the test now prints
 each node's `cluster replicas diagnostics` (leader, commit, apply per replica) and
-`cluster plan` (the controller's next actions) beside its health, so the next run says
+`plan placement` (the controller's next actions) beside its health, so the next run says
 which. **It did (Linux, d5d4143, 2026-10-02):** the replacement's replica knew the
 leader (term 6, so it was beaten through several terms), held nothing (`applied 0`,
 `committed 0`, no delivery retained, no seed missing, native not yet active), and the
@@ -2973,7 +2973,7 @@ before the future is polled; the journey is told in four phases. The body's fram
 KiB now, `Running::start`'s 82, `join_peer`'s 41, the start's chain about 1.2 MB; the suite
 passes with the thread's 2 MiB and overflows a 1 MiB thread still. *Open.* The frames that
 remain are the service's: `open_with_socket_inner` 483 KiB and `Prepared::open_inner` 172
-KiB, under `block_on` on the main thread of `focal start`, which Windows gives 1 MiB.
+KiB, under `block_on` on the main thread of `focal start node`, which Windows gives 1 MiB.
 `clippy::large_stack_frames` estimates six functions above a quarter of that stack:
 `NetworkService::open_with_socket_inner` (607 KB), `PlacementAgent::tick` (521 KB), the
 evidence suite's `evidence_scenario` (486 KB), `PlacementAgent::run` (397 KB),
@@ -3019,7 +3019,7 @@ on the same journey tests the runs above had passed, one on a unit test; none fa
 
 **A renewal served between a commit and the read of it** (ubuntu, cli_nodes
 `a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capacity_is_refused`:
-`cluster credentials renew` after two `rotate-issuer`, `the renewed credential could not
+`renew credential` after two `rotate-issuer`, `the renewed credential could not
 be installed or presented`). The controller served a credential request where it took
 it, at the foot of its loop, on the trust it had read at the head: the operator's second
 rotation activated the successor, the founder's sponsor answered the renewal under it a
@@ -3038,7 +3038,7 @@ and a host the moment the root shows the successor issuing, and refuses an insta
 failure where it tolerates the sponsor's endpoint between two certificates (24 §11).
 
 **A plan stale for a leader the fleet moved** (macOS, deployment_fleet
-`the_vm_stage_adds_addresses_invitations_and_a_durability_intent`: `deployment apply` of
+`the_vm_stage_adds_addresses_invitations_and_a_durability_intent`: `apply deployment` of
 the node-1 plan, `plan is stale: session … changed its operation`). The session step's
 request named the operation the plan was made under — the hash of the session's
 authority record, among other facts — and the apply refused a reply naming another. The
@@ -4083,7 +4083,7 @@ truncation flag; nothing aggregated over all of them, so a failing session past 
 was never shown. Reading for the fix found a worse defect of the same view: every
 operator reply is bounded by one admin frame (`network_admin::MAX_COMMAND`, 60 KiB), and
 the page went out in one reply. At about 7 KiB a detailed session, a node hosting more
-than a few sessions answered its own metrics read (`cluster node metrics`, now `diagnose node --metrics`) with `Capacity`; the
+than a few sessions answered its own metrics read (`cluster node metrics`, now `inspect node --metrics`) with `Capacity`; the
 reader's 8 MiB check could never be reached. The root leader's members, the liveness
 view's measured peers and the admitted tenants grew the page with the cluster as the
 sessions did.

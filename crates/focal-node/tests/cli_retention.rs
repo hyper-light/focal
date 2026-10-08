@@ -49,6 +49,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -190,7 +191,7 @@ fn retired(root: &Path, claim: &str) -> Value {
     }
 }
 fn retention(root: &Path) -> Value {
-    let shown = admin(root, &["diagnose", "cluster", "--retention"]);
+    let shown = admin(root, &["inspect", "replicas", "--retention"]);
     assert_eq!(shown["result"]["kind"], "retention", "{shown}");
     shown["result"]["retention"].clone()
 }
@@ -209,7 +210,7 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -217,9 +218,8 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     admin(
         root,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -231,8 +231,8 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -241,7 +241,10 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
         .status
         .success()
     );
-    let alice_standing = admin(client.path(), &["--client-context", "alice", "status"]);
+    let alice_standing = admin(
+        client.path(),
+        &["--client-context", "alice", "inspect", "prefix"],
+    );
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // Two claims: one runs its course and is released, one stays live.
@@ -276,12 +279,12 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     // released only just now and still under the agent's cadence.
     let before = retention(root);
     assert_eq!(before["retired"], 0, "{before}");
-    committed(&cli(root, None, &["claim", "cancel", &a]));
+    committed(&cli(root, None, &["cancel", "claim", &a]));
     // The final status is read before the release: once released, the
     // agent may retire the claim before another read lands.
     let status = first_object(root, &a)["Claim"]["status"].clone();
     assert!(!status.is_null());
-    committed(&cli(root, None, &["claim", "release-scope", &a]));
+    committed(&cli(root, None, &["release", "scope", &a]));
     // The agent seals the bundle under custody and commits the record.
     let continuation = retired(root, &a);
     assert_eq!(hex_hash(&continuation["claim"]), a);
@@ -293,13 +296,13 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     let bundle = hex_hash(&continuation["bundle"]);
     // The live claim is untouched, and the retired one refuses commands.
     assert!(first_object(root, &b).get("Claim").is_some());
-    let (code, _) = refused(root, &["claim", "cancel", &a]);
+    let (code, _) = refused(root, &["cancel", "claim", &a]);
     assert_ne!(code, 0);
     // The operator sees the count and the verified bundle with its receipt.
     let after = retention(root);
     assert_eq!(after["retired"], 1, "{after}");
     assert_eq!(after["retiring"], false, "{after}");
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["kind"], "archive", "{archive}");
     let shown = &archive["result"]["archive"];
     assert_eq!(shown["claim"], json!(a));
@@ -309,19 +312,19 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert_eq!(shown["members"], json!([a]));
     assert!(shown["rows"].as_u64().unwrap() >= 4, "{archive}");
     assert!(!shown["families"].as_array().unwrap().is_empty());
-    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let node = identity["node"].clone();
     let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
     assert_eq!(shown["receipts"], json!([node]), "{archive}");
     // A live claim has no archive.
-    let none = admin(root, &["cluster", "archive", "show", "--claim", &b]);
+    let none = admin(root, &["inspect", "archive", "--claim", &b]);
     assert_eq!(none["result"]["archive"], Value::Null, "{none}");
     // The outcome of the retired claim's creation stays: the exact retry
     // is answered from it.
     let retried = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &operation],
+        &["retry", "request", "--operation-id", &operation],
     );
     assert_eq!(retried["condition"], "Committed", "{retried}");
     assert_eq!(retried["result"]["created"], created_outcome["created"]);
@@ -336,11 +339,11 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     let mut tampered = original.clone();
     tampered[0] ^= 0xff;
     std::fs::write(&chunk, &tampered).unwrap();
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], false, "{archive}");
     assert_eq!(archive["result"]["archive"]["bundle"], json!(bundle));
     std::fs::write(&chunk, &original).unwrap();
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     // A kill and restart keep the continuation, the count and the bundle.
     drop(server);
@@ -350,7 +353,7 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert!(first_object(root, &b).get("Claim").is_some());
     let restarted = retention(root);
     assert_eq!(restarted["retired"], 1, "{restarted}");
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     assert_eq!(
         archive["result"]["archive"]["receipts"],

@@ -1,17 +1,17 @@
 # Failed movement
 
-**Failure.** A range move (`cluster replicas ranges move`) stops half way: the destination
+**Failure.** A range move (`move range`) stops half way: the destination
 died, or the source did.
 
-**Symptoms.** `cluster replicas ranges list --session ID` shows a transfer in progress whose
+**Symptoms.** `list ranges --session ID` shows a transfer in progress whose
 phase does not advance (`seed`, `barrier`, `ready` without `activate`); admission of writes
 to the moving range answers retryable `range_moving`; the session's other ranges serve.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir DIR cluster replicas ranges list --session ID
-focal --data-dir DIR cluster placement
+focal --data-dir DIR list ranges --session ID
+focal --data-dir DIR inspect placement
 ```
 
 **Preconditions.** The movement record is in the session's log
@@ -40,7 +40,7 @@ move to another host is begun and the destination is killed before it completes;
 session keeps committing; the destination restarted with its disk lets the transfer finish,
 and `ranges list` shows the member on the new holder.
 
-Every command above is under `focal --data-dir DIR cluster ...` on the node named, over its
+Every command above is run as `focal --data-dir DIR ACTION THING ...` on the node named, over its
 own admin socket ([cluster-admin.md](../cluster-admin.md)); reads never change the cluster.
 The executed test runs the real binary through this runbook's commands
 (`crates/focal-node/tests/runbooks.rs`); its evidence is recorded in

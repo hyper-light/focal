@@ -16,7 +16,7 @@ const CLUSTER_NODE_IDENTITY: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --identity"),
+    cli_path: Some("inspect node --identity"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -32,7 +32,7 @@ const CLUSTER_NODE_HEALTH: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --health"),
+    cli_path: Some("inspect node --health"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -48,7 +48,7 @@ const CLUSTER_NODE_READINESS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --readiness"),
+    cli_path: Some("inspect node --readiness"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -64,7 +64,7 @@ const CLUSTER_NODE_METRICS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --metrics"),
+    cli_path: Some("inspect node --metrics"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -80,7 +80,7 @@ const CLUSTER_NODE_CONFIG: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --listener"),
+    cli_path: Some("inspect node --listener"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -96,7 +96,7 @@ const CLUSTER_REPLICAS_DIAGNOSTICS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose cluster --replicas"),
+    cli_path: Some("inspect replicas --replicas"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"properties":{"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}}}"#,
     ),
@@ -114,7 +114,7 @@ const CLUSTER_RETENTION_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose cluster --retention"),
+    cli_path: Some("inspect replicas --retention"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"properties":{"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}}}"#,
     ),
@@ -132,7 +132,7 @@ const CLUSTER_ARCHIVE_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster archive show"),
+    cli_path: Some("inspect archive"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["claim"],"properties":{"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"claim":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}}}"#,
     ),
@@ -150,7 +150,7 @@ const CLUSTER_GC_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --gc"),
+    cli_path: Some("inspect node --gc"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -166,7 +166,7 @@ const CLUSTER_BACKUP_CREATE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster backup create"),
+    cli_path: Some("create backup"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["output"],"properties":{"tenant":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"output":{"type":"string","minLength":1}}}"#,
     ),
@@ -184,7 +184,7 @@ const CLUSTER_REPAIR: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster repair"),
+    cli_path: Some("repair session"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"properties":{"tenant":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"after":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"limit":{"type":"integer","minimum":1,"maximum":4096,"default":256}}}"#,
     ),
@@ -202,7 +202,7 @@ const CLUSTER_BACKUP_VERIFY: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster backup verify"),
+    cli_path: Some("verify backup"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string","minLength":1}}}"#,
     ),
@@ -220,7 +220,7 @@ const CLUSTER_STORAGE_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("diagnose node --storage"),
+    cli_path: Some("inspect node --storage"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -236,7 +236,7 @@ const CLUSTER_RESTORE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster restore"),
+    cli_path: Some("restore session"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string","minLength":1},"new_incarnation":{"type":"boolean"}}}"#,
     ),
@@ -254,7 +254,7 @@ const CLUSTER_GC_RESTORE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster gc restore"),
+    cli_path: Some("restore object"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["domain","root"],"properties":{"domain":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"root":{"type":"string","pattern":"^[0-9a-fA-F]{64}$"}}}"#,
     ),
@@ -272,7 +272,7 @@ const CLUSTER_INVITE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster invite"),
+    cli_path: Some("invite node"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["node","output"],"properties":{"node":{"type":"string","minLength":1,"maxLength":63,"pattern":"^[A-Za-z0-9_.-]+$"},"output":{"type":"string","minLength":1,"maxLength":4096}}}"#,
     ),
@@ -290,7 +290,7 @@ const CLUSTER_REPLICAS_TRANSFER: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas transfer"),
+    cli_path: Some("transfer replica-leader"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["node"],"properties":{"session":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}}}"#,
     ),
@@ -308,7 +308,7 @@ const CLUSTER_REPLICAS_LIST: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas list"),
+    cli_path: Some("list replicas"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":[],"properties":{"after":{"type":"string","pattern":"^[0-9a-f]{32}$"},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32}}}"#,
     ),
@@ -326,7 +326,7 @@ const CLUSTER_REPLICAS_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas show"),
+    cli_path: Some("inspect replica"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":[],"properties":{"session":{"type":"string","pattern":"^[0-9a-f]{32}$"}}}"#,
     ),
@@ -344,7 +344,7 @@ const CLUSTER_REPLICAS_ADD_LEARNER: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas membership add-learner"),
+    cli_path: Some("add replica-learner"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["node"],"properties":{"session":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}}}"#,
     ),
@@ -362,7 +362,7 @@ const CLUSTER_REPLICAS_PROMOTE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas membership promote"),
+    cli_path: Some("promote replica-learner"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["node"],"properties":{"session":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}}}"#,
     ),
@@ -380,7 +380,7 @@ const CLUSTER_REPLICAS_REMOVE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas membership remove"),
+    cli_path: Some("remove replica-member"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["node"],"properties":{"session":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}}}"#,
     ),
@@ -398,7 +398,7 @@ const CLUSTER_REPLICAS_LEAVE_JOINT: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas membership leave-joint"),
+    cli_path: Some("leave replica-joint"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":[],"properties":{"session":{"type":"string","pattern":"^[0-9a-f]{32}$"},"expected_configuration_index":{"type":"integer","minimum":0}}}"#,
     ),
@@ -416,7 +416,7 @@ const CLUSTER_REPLICAS_REQUEST_INSPECT: OperationDescriptor = OperationDescripto
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas request inspect"),
+    cli_path: Some("inspect replica-request"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":[],"properties":{}}"#,
     ),
@@ -434,7 +434,7 @@ const CLUSTER_REPLICAS_REQUEST_RETRY: OperationDescriptor = OperationDescriptor 
     wire: WireProfile::V1,
     retry: RetryIdentity::ReplicaR1,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas request retry"),
+    cli_path: Some("retry replica-request"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["operation_id"],"properties":{"operation_id":{"type":"string","pattern":"^r1:[0-9a-f]{16}:[0-9a-f]{32}$","minLength":52,"maxLength":52}}}"#,
     ),
@@ -452,7 +452,7 @@ const CLUSTER_REPLICAS_REQUEST_RECONCILE: OperationDescriptor = OperationDescrip
     wire: WireProfile::V1,
     retry: RetryIdentity::ReplicaR1,
     surface: Surface::Administration,
-    cli_path: Some("cluster replicas request reconcile"),
+    cli_path: Some("reconcile replica-request"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["operation_id"],"properties":{"operation_id":{"type":"string","pattern":"^r1:[0-9a-f]{16}:[0-9a-f]{32}$","minLength":52,"maxLength":52}}}"#,
     ),
@@ -470,7 +470,7 @@ const CLUSTER_STATUS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster status"),
+    cli_path: Some("inspect cluster"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -488,7 +488,7 @@ const CLUSTER_MEMBERSHIP_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster membership show"),
+    cli_path: Some("inspect membership"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -506,7 +506,7 @@ const CLUSTER_NODES_LIST: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster nodes list"),
+    cli_path: Some("list nodes"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -524,7 +524,7 @@ const CLUSTER_NODES_DRAIN: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster nodes drain"),
+    cli_path: Some("drain node"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -542,7 +542,7 @@ const CLUSTER_NODES_UNDRAIN: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster nodes undrain"),
+    cli_path: Some("undrain node"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -560,7 +560,7 @@ const CLUSTER_NODES_REMOVE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster nodes remove"),
+    cli_path: Some("remove node"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -578,7 +578,7 @@ const CLUSTER_NODES_REPLACE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster nodes replace"),
+    cli_path: Some("replace node"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1},"replacement":{"type":"integer","minimum":1}},"required":["node","replacement"],"additionalProperties":false}"#,
     ),
@@ -596,7 +596,7 @@ const CLUSTER_MEMBERSHIP_ADD_LEARNER: OperationDescriptor = OperationDescriptor 
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster membership add-learner"),
+    cli_path: Some("add learner"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -614,7 +614,7 @@ const CLUSTER_MEMBERSHIP_PROMOTE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster membership promote"),
+    cli_path: Some("promote learner"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -632,7 +632,7 @@ const CLUSTER_MEMBERSHIP_REMOVE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster membership remove"),
+    cli_path: Some("remove member"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -650,7 +650,7 @@ const CLUSTER_MEMBERSHIP_LEAVE_JOINT: OperationDescriptor = OperationDescriptor 
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster membership leave-joint"),
+    cli_path: Some("leave joint"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"expected_configuration_index":{"type":"integer","minimum":0}},"required":[],"additionalProperties":false}"#,
     ),
@@ -668,7 +668,7 @@ const CLUSTER_LEADER_TRANSFER: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster leader transfer"),
+    cli_path: Some("transfer leader"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["node"],"additionalProperties":false}"#,
     ),
@@ -686,7 +686,7 @@ const CLUSTER_PARTITIONS_SHOW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster partitions show"),
+    cli_path: Some("inspect partition"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["partition"],"additionalProperties":false}"#,
     ),
@@ -704,7 +704,7 @@ const CLUSTER_PARTITIONS_ADD_LEARNER: OperationDescriptor = OperationDescriptor 
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster partitions add-learner"),
+    cli_path: Some("add partition-learner"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
     ),
@@ -722,7 +722,7 @@ const CLUSTER_PARTITIONS_PROMOTE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster partitions promote"),
+    cli_path: Some("promote partition-learner"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
     ),
@@ -740,7 +740,7 @@ const CLUSTER_PARTITIONS_REMOVE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster partitions remove"),
+    cli_path: Some("remove partition-member"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
     ),
@@ -758,7 +758,7 @@ const CLUSTER_PARTITIONS_TRANSFER: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster partitions transfer"),
+    cli_path: Some("transfer partition-leader"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"partition":{"type":"string","pattern":"^[0-9a-f]{32}$"},"node":{"type":"integer","minimum":1},"expected_configuration_index":{"type":"integer","minimum":0}},"required":["partition","node"],"additionalProperties":false}"#,
     ),
@@ -776,7 +776,7 @@ const CLUSTER_REQUEST_INSPECT: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster request inspect"),
+    cli_path: Some("inspect admin-request"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -794,7 +794,7 @@ const CLUSTER_REQUEST_RECONCILE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::AdminA1,
     surface: Surface::Administration,
-    cli_path: Some("cluster request reconcile"),
+    cli_path: Some("reconcile admin-request"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"operation_id":{"type":"string","pattern":"^a1:[0-9a-f]{16}:[0-9a-f]{16}$","minLength":36,"maxLength":36}},"required":["operation_id"],"additionalProperties":false}"#,
     ),
@@ -812,7 +812,7 @@ const CLUSTER_REQUEST_RETRY: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::AdminA1,
     surface: Surface::Administration,
-    cli_path: Some("cluster request retry"),
+    cli_path: Some("retry admin-request"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"operation_id":{"type":"string","pattern":"^a1:[0-9a-f]{16}:[0-9a-f]{16}$","minLength":36,"maxLength":36}},"required":["operation_id"],"additionalProperties":false}"#,
     ),
@@ -830,7 +830,7 @@ const CLUSTER_INVITATIONS_LIST: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster invitations list"),
+    cli_path: Some("list invitations"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"after":{"type":"string","pattern":"^[0-9a-f]{32}$","minLength":32,"maxLength":32},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32},"expected_revision":{"type":"integer","minimum":0}},"required":[],"additionalProperties":false}"#,
     ),
@@ -848,7 +848,7 @@ const CLUSTER_INVITATIONS_GET: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster invitations get"),
+    cli_path: Some("get invitation"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"id":{"type":"string","pattern":"^[0-9a-f]{32}$","minLength":32,"maxLength":32}},"required":["id"],"additionalProperties":false}"#,
     ),
@@ -866,7 +866,7 @@ const CLUSTER_CREDENTIALS_GET: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster credentials get"),
+    cli_path: Some("get credential"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"id":{"type":"string","pattern":"^[0-9a-f]{32}$","minLength":32,"maxLength":32}},"required":["id"],"additionalProperties":false}"#,
     ),
@@ -884,7 +884,7 @@ const CLUSTER_INVITATIONS_REVOKE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster invitations revoke"),
+    cli_path: Some("revoke invitation"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"id":{"type":"string","pattern":"^[0-9a-f]{32}$","minLength":32,"maxLength":32},"expected_revision":{"type":"integer","minimum":0}},"required":["id"],"additionalProperties":false}"#,
     ),
@@ -902,7 +902,7 @@ const CLUSTER_CREDENTIALS_REVOKE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster credentials revoke"),
+    cli_path: Some("revoke credential"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"id":{"type":"string","pattern":"^[0-9a-f]{32}$","minLength":32,"maxLength":32},"expected_revision":{"type":"integer","minimum":0}},"required":["id"],"additionalProperties":false}"#,
     ),
@@ -920,7 +920,7 @@ const CLUSTER_CLIENT_INVITE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster client invite"),
+    cli_path: Some("invite client"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["name","output"],"properties":{"name":{"type":"string","minLength":1,"maxLength":63,"pattern":"^[a-zA-Z0-9_.-]+$"},"output":{"type":"string","minLength":1,"maxLength":4096}}}"#,
     ),
@@ -938,7 +938,7 @@ const CLUSTER_CREDENTIALS_ROTATE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster credentials rotate"),
+    cli_path: Some("rotate credential"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
     ),
@@ -956,7 +956,7 @@ const CLUSTER_CREDENTIALS_RENEW: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster credentials renew"),
+    cli_path: Some("renew credential"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
     ),
@@ -974,7 +974,7 @@ const CLUSTER_CREDENTIALS_ISSUERS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster credentials issuers"),
+    cli_path: Some("list issuers"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
     ),
@@ -992,7 +992,7 @@ const CLUSTER_CREDENTIALS_ROTATE_ISSUER: OperationDescriptor = OperationDescript
     wire: WireProfile::V1,
     retry: RetryIdentity::Fresh,
     surface: Surface::Administration,
-    cli_path: Some("cluster credentials rotate-issuer"),
+    cli_path: Some("rotate issuer"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
     ),
@@ -1010,7 +1010,7 @@ const CLUSTER_PLACEMENT: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster placement"),
+    cli_path: Some("inspect placement"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -1028,7 +1028,7 @@ const CLUSTER_PLAN: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster plan"),
+    cli_path: Some("plan placement"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -1046,7 +1046,7 @@ const CLUSTER_UPGRADE_STATUS: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster upgrade status"),
+    cli_path: Some("inspect upgrade"),
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
@@ -1062,7 +1062,7 @@ const CLUSTER_UPGRADE_ACTIVATE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster upgrade activate"),
+    cli_path: Some("activate upgrade"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["fence"],"properties":{"fence":{"type":"integer","minimum":1}}}"#,
     ),
@@ -1080,7 +1080,7 @@ const CLUSTER_TENANTS_ADMIT: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster tenants admit"),
+    cli_path: Some("admit tenant"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["tenant"],"properties":{"tenant":{"type":"string","minLength":32,"maxLength":32,"pattern":"^[0-9a-f]{32}$"}}}"#,
     ),
@@ -1098,7 +1098,7 @@ const CLUSTER_TENANTS_LIST: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster tenants list"),
+    cli_path: Some("list tenants"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     ),
@@ -1116,7 +1116,7 @@ const CLUSTER_SESSIONS_CREATE: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster sessions create"),
+    cli_path: Some("create session"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["tenant","name"],"properties":{"tenant":{"type":"string","minLength":32,"maxLength":32,"pattern":"^[0-9a-f]{32}$"},"name":{"type":"string","minLength":1,"maxLength":63,"pattern":"^[A-Za-z0-9_.-]+$"}}}"#,
     ),
@@ -1134,7 +1134,7 @@ const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Administration,
-    cli_path: Some("cluster sessions plan"),
+    cli_path: Some("plan session"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["tenant","session","max_failures"],"properties":{"tenant":{"type":"string","minLength":32,"maxLength":32,"pattern":"^[0-9a-f]{32}$"},"session":{"type":"string","minLength":32,"maxLength":32,"pattern":"^[0-9a-f]{32}$"},"survive":{"type":"string","enum":["node","zone","region"]},"max_failures":{"type":"integer","minimum":0,"maximum":255},"dry_run":{"type":"boolean"}}}"#,
     ),

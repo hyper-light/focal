@@ -47,7 +47,7 @@ fn start(root: &Path) -> Process {
         Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
             .arg(root)
-            .arg("start")
+            .args(["start", "node"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -86,7 +86,7 @@ impl Mcp {
             Command::new(env!("CARGO_BIN_EXE_focal"))
                 .arg("--data-dir")
                 .arg(root)
-                .args(["mcp", "serve"])
+                .args(["serve", "mcp"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -295,7 +295,7 @@ fn modern_and_legacy_stdio_share_durable_ids_builders_and_real_evidence_workflow
     let recovered = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root.path())
-        .args(["request", "retry"])
+        .args(["retry", "request"])
         .arg(journal)
         .args(["--format", "json"])
         .output()
@@ -418,7 +418,7 @@ fn validation_context_pages_match_human_cli_without_reserving_mutations() {
     let demo = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root.path())
-        .arg("demo")
+        .args(["run", "demo"])
         .output()
         .unwrap();
     assert!(
@@ -723,8 +723,8 @@ fn lost_managed_mutation_response_recovers_through_human_cli_without_reexecution
         .arg("--data-dir")
         .arg(root.path())
         .args([
-            "request",
             "retry",
+            "request",
             "--operation-id",
             &operation,
             "--format",

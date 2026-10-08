@@ -11,7 +11,7 @@ describes downloadable CI artifacts while the first tagged release is pending.
 The `focal` binary connects to the running local service through its authenticated Unix socket. Start it in one terminal:
 
 ```sh
-focal --data-dir /tmp/focal-manual start
+focal --data-dir /tmp/focal-manual start node
 ```
 
 Use the same `--data-dir` in another terminal. The examples below abbreviate that common option. `--config FILE` and `--data-dir DIR` work before or after subcommands. `--help` lists the flags at each level.
@@ -22,19 +22,19 @@ These commands need no running service, node identity or saved configuration. Th
 do not create client journals or reserve request identities:
 
 ```sh
-focal schema list
-focal schema list --format json
-focal schema list --native
-focal schema get claim.submit
-focal schema get claim.submit --native
-focal schema get claim.submit --direction input
-focal schema get claim.submit --direction output
-focal schema example claim.submit > claim.json
-focal schema example claim.submit --native > claim.json
-focal schema validate claim.submit --native --shape-only --file claim.json
-focal schema get test-report
-focal schema get error-report
-focal schema get domain-registry
+focal list schemas
+focal list schemas --format json
+focal list schemas --native
+focal get schema claim.submit
+focal get schema claim.submit --native
+focal get schema claim.submit --direction input
+focal get schema claim.submit --direction output
+focal get example claim.submit > claim.json
+focal get example claim.submit --native > claim.json
+focal validate document claim.submit --native --shape-only --file claim.json
+focal get schema test-report
+focal get schema error-report
+focal get schema domain-registry
 ```
 
 Two engines share these names: the V1 engine a fresh ledger runs (version 1 descriptors)
@@ -42,8 +42,8 @@ and the native engine (version 2). One rule selects the engine for every surface
 catalogue, schema, example, validation and the mutation itself — so what discovery
 prints is what the ledger accepts: offline, `--native` wins, else the only catalogue that
 has the name (a native-only verb such as `claim.challenge` needs no flag), else V1; a V1-only
-name under `--native` is refused by name, never redirected. `schema list` shows each
-operation's engine and version. Online — a mutation, `status`, or `schema validate` with a
+name under `--native` is refused by name, never redirected. `list schemas` shows each
+operation's engine and version. Online — a mutation, `status`, or `validate document` with a
 client context — the ledger's engine is probed the way every mutation probes it; `--native`
 against a ledger that answers V1 is refused, and an engine assumed because the owner was
 unreachable is reported as assumed.
@@ -75,19 +75,19 @@ version, manifest, receipt and proof references are illustrative: copy the real
 committed context and evidence instead. Required optimistic revisions belong to
 the mutation envelope (`--expected-revision`), not these authored documents.
 Discovery does not promise server admission.
-`schema list --format json` marks `example_available` for each released operation;
+`list schemas --format json` marks `example_available` for each released operation;
 an unavailable example is an error, never a fabricated request.
 
 Generate completion scripts from this binary's actual Clap command tree:
 
 ```sh
-focal completion bash > focal.bash
+focal generate completion bash > focal.bash
 source ./focal.bash
 
-focal completion zsh > _focal
-focal completion fish > focal.fish
-focal completion powershell > focal.ps1
-focal completion elvish > focal.elv
+focal generate completion zsh > _focal
+focal generate completion fish > focal.fish
+focal generate completion powershell > focal.ps1
+focal generate completion elvish > focal.elv
 ```
 
 Load the generated file using your shell's normal completion setup. Scripts include
@@ -112,7 +112,7 @@ focal submit claim \
   --validation-json '{"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive the report testament","evaluator":"self"}'
 ```
 
-The result includes the generated claim ID. Request registration, identity allocation and receipt cleanup happen automatically; no extra flags are required. This generates the claim; `focal claim post CLAIM_ID` makes it actionable. A receipt requirement checks receipt of the testament. Substantive work acceptance requires additional pinned validation definitions. Participant-authored challenge, consultation and corrective/follow-up helpers remain planned in [P20](archictecutre/13-cli-and-agent-implementation-plan.md), refined by the [peer validation contract](archictecutre/16-peer-validation-contract.md). The participant authors that work; Focal records and checks its authorized mutations.
+The result includes the generated claim ID. Request registration, identity allocation and receipt cleanup happen automatically; no extra flags are required. This generates the claim; `focal post claim CLAIM_ID` makes it actionable. A receipt requirement checks receipt of the testament. Substantive work acceptance requires additional pinned validation definitions. Participant-authored challenge, consultation and corrective/follow-up helpers remain planned in [P20](archictecutre/13-cli-and-agent-implementation-plan.md), refined by the [peer validation contract](archictecutre/16-peer-validation-contract.md). The participant authors that work; Focal records and checks its authorized mutations.
 
 JSON and YAML use the same authored document and the same Rust builder:
 
@@ -133,7 +133,7 @@ focal submit claim --file claim.yaml
 focal submit claim --file - --input-format json
 ```
 
-Each fresh invocation generates a new occurrence and request identity. If a submission is interrupted, copy its printed `focal request retry --operation-id m1:…` command. Retrying the same managed ID preserves the original command; an acknowledged ID reports `Retired` and cannot execute again. Supplying the same explicit IDs and authored fields yields the same canonical command across flags, JSON and YAML; it does not replace the durable request identity.
+Each fresh invocation generates a new occurrence and request identity. If a submission is interrupted, copy its printed `focal retry request --operation-id m1:…` command. Retrying the same managed ID preserves the original command; an acknowledged ID reports `Retired` and cannot execute again. Supplying the same explicit IDs and authored fields yields the same canonical command across flags, JSON and YAML; it does not replace the durable request identity.
 
 Choose field flags or one document. Documents cannot override issuer, trusted cause, runtime authority, lifecycle or custody. Unknown fields, duplicate keys, YAML aliases/tags/multiple documents, numeric vocabulary codes, excessive nesting and over-budget input are rejected. A document is limited to 256 KiB. Validation definitions can also be supplied with repeated `--validation-file FILE`; aggregate definition bytes are bounded. Detailed authored fields are defined by [the shared DTOs](../crates/focal-client/src/input/documents.rs).
 
@@ -145,11 +145,11 @@ creates a testament. The respondent supplies the summary, outcome and exact
 evidence references. Use the IDs printed by each preceding step:
 
 ```sh
-focal claim post CLAIM_ID
-focal receipt acquire CLAIM_ID
-focal claim progress CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1 --message 'Report checked'
-focal evidence begin --claim CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1
-focal schema get test-report
+focal post claim CLAIM_ID
+focal acquire receipt CLAIM_ID
+focal report progress CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1 --message 'Report checked'
+focal begin evidence --claim CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1
+focal get schema test-report
 ```
 
 The built-in schema command prints the exact test-report schema hash, descriptor and an example. Attach a report using that hash and the returned evidence-set ID:
@@ -169,7 +169,7 @@ focal submit testament --claim CLAIM_ID \
 For unsuccessful work, use this alternative in place of the successful report and
 testament above. The error-report schema describes tool failures, refusals and
 interruptions without assuming any test ran. Obtain its exact hash with
-`focal schema get error-report` and substitute it for `ERROR_SCHEMA_HASH`:
+`focal get schema error-report` and substitute it for `ERROR_SCHEMA_HASH`:
 
 ```sh
 focal submit artifact --claim CLAIM_ID \
@@ -236,7 +236,7 @@ confidence: committed
 outcome: complete
 ```
 
-Artifacts accept the same document modes. An inline payload document is `{type: text, text: ...}` or `{type: inline, bytes: [...]}`; a content payload contains an existing immutable content reference. Inline payloads and opaque metadata are each limited to 16 KiB. `submit artifact --payload-file FILE` stages the complete file in a private durable transfer journal, uploads it through custody, then attaches its immutable reference. Interrupted retries preserve the exact staged bytes even if the original file changes or disappears. The transfer limit is 64 MiB; this release's built-in test-report schema attestation accepts at most 1 MiB. Transfer capacity does not bypass schema or custody admission. `artifact register --payload-file FILE` uses the same durable 64-MiB staging/upload path before registering independent proof; its schema admission remains subject to the actual installed validator bound.
+Artifacts accept the same document modes. An inline payload document is `{type: text, text: ...}` or `{type: inline, bytes: [...]}`; a content payload contains an existing immutable content reference. Inline payloads and opaque metadata are each limited to 16 KiB. `submit artifact --payload-file FILE` stages the complete file in a private durable transfer journal, uploads it through custody, then attaches its immutable reference. Interrupted retries preserve the exact staged bytes even if the original file changes or disappears. The transfer limit is 64 MiB; this release's built-in test-report schema attestation accepts at most 1 MiB. Transfer capacity does not bypass schema or custody admission. `register artifact --payload-file FILE` uses the same durable 64-MiB staging/upload path before registering independent proof; its schema admission remains subject to the actual installed validator bound.
 
 Schema meaning and the chosen validating tool or skill are a participant contract.
 The schema hash pins the payload shape; `kind` names the artifact's role. Thus a
@@ -248,9 +248,9 @@ cannot install a schema validator or assert trusted custody/schema validity.
 Inspect or cancel a saved transfer using the `upload_id` reported by an interrupted upload:
 
 ```sh
-focal artifact upload inspect UPLOAD_ID --format json
-focal artifact upload cancel UPLOAD_ID --format yaml
-focal artifact upload inspect UPLOAD_ID --origin mcp
+focal inspect upload UPLOAD_ID --format json
+focal cancel upload UPLOAD_ID --format yaml
+focal inspect upload UPLOAD_ID --origin mcp
 ```
 
 `UPLOAD_ID` is the exact nonzero 32-character lowercase hexadecimal transfer ID, not the artifact ID or managed operation ID. The default `--origin cli` selects automatic file-transfer history; `--origin mcp` selects uploads initiated by that adapter in the same client context. Inspection is local and sends nothing. Neither command creates a missing upload or store. Preserve the selected context and its private history.
@@ -262,8 +262,8 @@ the testament, run validators or establish satisfaction. The issuer can explicit
 receive the closing response and begin its eligible evaluation:
 
 ```sh
-focal testament receive TESTAMENT_ID --claim CLAIM_ID
-focal validation begin --claim CLAIM_ID
+focal receive testament TESTAMENT_ID --claim CLAIM_ID
+focal begin validation --claim CLAIM_ID
 focal get validation VALIDATION_ID --context --format json
 ```
 
@@ -273,7 +273,7 @@ agent or worker. After producing actual result evidence, register that evidence
 as yourself and submit your verdict against the exact observed run:
 
 ```sh
-focal artifact register --kind test-report --schema-hash SCHEMA_HASH \
+focal register artifact --kind test-report --schema-hash SCHEMA_HASH \
   --payload-file ./validator-result.json
 
 focal submit validation --validation VALIDATION_ID \
@@ -282,7 +282,7 @@ focal submit validation --validation VALIDATION_ID \
   --manifest MANIFEST_HASH --receipt RECEIPT_ID --receipt-epoch RECEIPT_EPOCH \
   --value pass --evidence RESULT_ARTIFACT_ID:RESULT_DESCRIPTOR_HASH
 
-focal validation complete --claim CLAIM_ID
+focal complete validation --claim CLAIM_ID
 ```
 
 Use the real outcome (`pass`, `fail`, `incomplete` or `error`) and the committed
@@ -290,10 +290,10 @@ run's exact handler, target, manifest, epoch and attempt. `--agentic` must match
 pinned handler and grants no authority. Omit receipt fields only for a run whose
 context actually requires no receipt. Repeat `--evidence` for multiple committed
 proof artifacts. Registering evidence does not insert it into the respondent's
-already-closed manifest. `artifact register` supports inline `--text`, bounded
+already-closed manifest. `register artifact` supports inline `--text`, bounded
 `--payload-file`, optional `--metadata-file`, repeated typed `--input-json`
 references and `--visibility`; the service still verifies its supported schema and
-custody. `submit validation` and `artifact register` also accept one strict
+custody. `submit validation` and `register artifact` also accept one strict
 `--json`, `--yaml` or `--file` authored document instead of field flags.
 
 For a failure testament, validate its exact error artifact just as you validate
@@ -303,7 +303,7 @@ from the respondent's reported outcome and artifact kind. The designated evaluat
 (which may be the claimant) records the actual authorized verdict and its own proof;
 Focal does not manufacture either participant's account.
 
-`testament receive`, `validation begin` and `validation complete` use the observed
+`receive testament`, `begin validation` and `complete validation` use the observed
 claim revision when `--expected-revision` is omitted. That fence is persisted with
 the prepared request; an exact retry does not silently substitute a newer revision.
 Receipt does not prove quality, and complete derives the actual recorded Required
@@ -316,15 +316,15 @@ To correct or replace work, create an explicit successor without rewriting the
 predecessor's history:
 
 ```sh
-focal claim supersede CLAIM_ID --file successor-claim.json
+focal supersede claim CLAIM_ID --file successor-claim.json
 ```
 
 The successor uses the same claim field flags or claim JSON/YAML document as
 `submit claim`; the predecessor is the positional ID. An optional `--id` names the
 new successor. The registry's `claim.supersede` schema wraps these as `predecessor`
 and `successor`, while this CLI spelling supplies the predecessor separately.
-`focal claim cancel CLAIM_ID --reason TEXT` remains explicit business cancellation,
-subject to standing and lifecycle rules. The optional `focal demo` uses the Rust
+`focal cancel claim CLAIM_ID --reason TEXT` remains explicit business cancellation,
+subject to standing and lifecycle rules. The optional `focal run demo` uses the Rust
 embedding helper under exclusive ownership; it is not required for peer evaluation.
 
 ## Get and list
@@ -375,10 +375,10 @@ The current testament is not necessarily the target of an older recorded run. Co
 ## Summarize the selected ledger
 
 ```sh
-focal ledger summary
-focal ledger summary --format json
-focal ledger summary --format yaml
-focal schema get ledger.summary --direction output
+focal inspect ledger
+focal inspect ledger --format json
+focal inspect ledger --format yaml
+focal get schema ledger.summary --direction output
 ```
 
 This returns committed counts for claims, testaments, artifacts, validations, evidence sets and validation runs in the selected ledger. The service copies scalar map lengths after a fresh quorum read; it does not download or scan the graph. JSON/YAML includes `summary.token` (ledger, sequence and route) and `summary.applied_index`. Repeated reads consume no mutation IDs or managed ordinals. Counts include all retained canonical records; they do not classify lifecycle outcomes or describe other ledgers. The token identifies this observation without retaining a historical snapshot lease. No filters, cursor or saved-prefix input are accepted.
@@ -386,10 +386,10 @@ This returns committed counts for claims, testaments, artifacts, validations, ev
 ## Traverse the graph
 
 ```sh
-focal ledger traverse claim:CLAIM_ID --edge requirement --depth 1 --limit 32
-focal ledger traverse claim:CLAIM_ID artifact:ARTIFACT_ID --direction reverse --limit 16 --format json
-focal ledger traverse claim:CLAIM_ID --edge requirement --depth 1 --limit 32 --cursor CURSOR
-focal schema get ledger.traverse --direction input
+focal traverse ledger claim:CLAIM_ID --edge requirement --depth 1 --limit 32
+focal traverse ledger claim:CLAIM_ID artifact:ARTIFACT_ID --direction reverse --limit 16 --format json
+focal traverse ledger claim:CLAIM_ID --edge requirement --depth 1 --limit 32 --cursor CURSOR
+focal get schema ledger.traverse --direction input
 ```
 
 Traversal follows existing object-target edges in deterministic breadth-first
@@ -416,14 +416,14 @@ the same query and page contract.
 
 ## Native engine verbs
 
-A ledger activated on the native engine (`focal cluster replicas activate-native`,
+A ledger activated on the native engine (`focal activate native`,
 [cluster-admin.md](cluster-admin.md)) answers the same verbs through the native
 wire profile. The CLI probes the engine once per invocation with a standing
 read; on a native ledger it compiles every document into one exact `FCNINPUT`
 frame, journals it under an `n1:` reference before sending, and resends the
 identical bytes until the owner commits or refuses it. Native and V1 differ in
 what a document may say, so the native descriptors are version 2 of the same
-names (`focal schema get claim.submit --native`, `focal schema coverage`).
+names (`focal get schema claim.submit --native`, `focal inspect coverage`).
 
 The two-party cycle on a native ledger:
 
@@ -433,17 +433,17 @@ focal submit claim --description 'Run the suite.' --target <ALICE> \
   --validation-json '{"kind":"receipt","description":"Record delivery.","deadline":{"at":4102444800000}}' \
   --validation-json '{"kind":"test","description":"The suite passes.","target":{"type":"slot","index":0,"name":"report"},"evaluator":"self","handlers":[{"id":<HANDLER>,"version":<VERSION>}],"deadline":{"at":4102444800000}}' \
   --slot-json '{"slot":0,"checks":[{"declaration":1}]}' --format json
-focal claim post <CLAIM>
+focal post claim <CLAIM>
 # respondent (an enrolled client context)
-focal --client-context alice receipt acquire <CLAIM>
-focal --client-context alice artifact submit --claim <CLAIM> --slot 0 --text '{"passed":3,"failed":0,"skipped":0}'
-focal --client-context alice testament submit --claim <CLAIM> --summary 'Suite passed.' \
+focal --client-context alice acquire receipt <CLAIM>
+focal --client-context alice submit artifact --claim <CLAIM> --slot 0 --text '{"passed":3,"failed":0,"skipped":0}'
+focal --client-context alice submit testament --claim <CLAIM> --summary 'Suite passed.' \
   --confidence committed --outcome complete --slot 0=<ARTIFACT>:<HASH>
-focal --client-context alice testament post <TESTAMENT> --claim <CLAIM>
+focal --client-context alice post testament <TESTAMENT> --claim <CLAIM>
 # issuer receives, evaluates and reports; acceptance is derived by the owner
-focal testament receive <TESTAMENT> --claim <CLAIM>
-focal validation begin --claim <CLAIM> --validation <VALIDATION>
-focal validation report --claim <CLAIM> --validation <VALIDATION> --verdict pass --text '{"passed":3,"failed":0,"skipped":0}'
+focal receive testament <TESTAMENT> --claim <CLAIM>
+focal begin validation --claim <CLAIM> --validation <VALIDATION>
+focal report verdict --claim <CLAIM> --validation <VALIDATION> --verdict pass --text '{"passed":3,"failed":0,"skipped":0}'
 focal get claim <CLAIM>
 ```
 
@@ -483,29 +483,29 @@ The peer verbs package these shapes; each is an authored shape of `submit
 claim` with the same frame, `n1:` identity and receipt:
 
 ```text
-focal claim challenge --target <ALICE> --description 'Prove the report covers the edge cases.' \
+focal challenge participant --target <ALICE> --description 'Prove the report covers the edge cases.' \
   --artifact <ARTIFACT>[@<HASH>] --validation-json '...' --slot-json '...' \
   --policy-json '{"corrective_allowed":true,"max_follow_ups":1,"single_issuer":true,"escalation":"evaluator"}'
-focal claim consult --target <ALICE> --description 'Which cases does the parser leave undefined?' \
+focal consult participant --target <ALICE> --description 'Which cases does the parser leave undefined?' \
   --validation-json '...' --policy-json '{"max_follow_ups":2,"escalation":"holder"}'
-focal claim correct --challenge <CHALLENGE> --verdict <REPORT>[@<HASH>] \
+focal correct challenge --challenge <CHALLENGE> --verdict <REPORT>[@<HASH>] \
   --description 'Redo the inspection with the missing cases.' --validation-json '...'
-focal claim follow-up --refines <CONSULT> --description 'And the unicode cases?' --validation-json '...'
-focal claim lineage <CLAIM> --format json
-focal claim wait <CLAIM> --until testament --timeout-ms 10000
+focal refine consultation --refines <CONSULT> --description 'And the unicode cases?' --validation-json '...'
+focal trace lineage <CLAIM> --format json
+focal wait claim <CLAIM> --until testament --timeout-ms 10000
 ```
 
-`claim challenge` needs `--policy-json`; `--artifact` names the disputed
-artifact, whose hash is read from the ledger when omitted. `claim correct`
+`challenge participant` needs `--policy-json`; `--artifact` names the disputed
+artifact, whose hash is read from the ledger when omitted. `correct challenge`
 cites the report artifact of the challenge's failed verdict (read it from
 `get claim`: the evaluation's `last_result.evidence`); `--target` defaults
 to the challenge's subject, and the correction's occurrence identity derives
 from the challenge, the verdict and you, so the same correction sent twice
-is one claim. `claim follow-up` refines a committed consultation and
+is one claim. `refine consultation` refines a committed consultation and
 defaults its target to that consultation's subject; its identity derives
 from the refined claim, the query and you. Every verb also takes the
 document form (`--json`, `--yaml`, `--file`) with the same fields as the MCP
-tools. `claim lineage` prints one observation at one prefix: the claim with
+tools. `trace lineage` prints one observation at one prefix: the claim with
 its content, its `caused_by` ancestors nearest first (up to 16), then the
 corrections that invalidate it, the consultations that refine it and the
 children it caused (up to 64, each with its content), every object read
@@ -515,7 +515,7 @@ exact at the first read's token — and what those bounds left out, named:
 the followers listed but not read and the list's continuation, which
 `list claims --relation` resumes). Empty `followers_beyond` and null
 ancestor fields mean the lineage is complete at that prefix (`COMPLETE` in
-the table). `claim wait` observes a native claim like the V1 observer (31 probes,
+the table). `wait claim` observes a native claim like the V1 observer (31 probes,
 one second apart, at most 30 seconds) and adds `--until testament`, met once
 the issuer has received a closing testament.
 
@@ -526,11 +526,11 @@ validation, receipt, artifact or testament). A closed refusal prints
 matching class (invalid input 2, unauthorized 3, not found 4, stale or
 conflicting 5 — including `request_history_expired` and `epoch_not_admitted`,
 a generation the owner closed or does not admit yet — capacity 6); a pending ticket or a lost reply exits 7 with a
-`Recovery:` line naming `focal request retry --operation-id n1:…`, which
+`Recovery:` line naming `focal retry request --operation-id n1:…`, which
 resends the exact journaled frame and prints the receipt once it commits. A
 committed receipt is durable in the journal before it is printed, so a reply
-lost on a broken pipe is found with `focal request pending` and reprinted by
-the same retry. `focal request inspect --operation-id n1:…` shows the
+lost on a broken pipe is found with `focal list requests` and reprinted by
+the same retry. `focal inspect request --operation-id n1:…` shows the
 recorded receipt or refusal without sending anything; with `--remote` it
 reads the owner's committed outcome for that request key instead, which
 also observes an operation the MCP adapter journaled under the same context
@@ -546,14 +546,14 @@ definition, the registration and evaluation selected like `validation
 begin` (`--phase admission|increment`, `--slot N`, `--target ARTIFACT`,
 `--generation N`), the target's manifest with each artifact's custody, the
 accepted results after `--cursor REVISION` (at most `--limit`) and the
-delivery result of the same response; `focal status` prints the standing
+delivery result of the same response; `focal inspect prefix` prints the standing
 read.
 Frozen vocabularies (claim status, validation mode) print as their registered
 codes. Native-specific flags: `--slot`, `--parent`, `--max-responses` and
 `--slot-json` on `submit claim`; `--slot SLOT=ID:HASH` and `--diagnostic
-ID:HASH` on `testament submit`; `--slot` on `artifact submit`; `artifact
+ID:HASH` on `submit testament`; `--slot` on `submit artifact`; `artifact
 diagnostic --reason work|production|structure|metadata`; `--validation` and
-`--slot` on `validation begin`; `validation report --verdict
+`--slot` on `begin validation`; `report verdict --verdict
 pass|fail|incomplete|error`. V1-only fences (`--receipt`, `--evidence-set`,
 `--expected-revision`, `--operation PATH`) are refused on a native ledger
 rather than ignored. Claim, evaluation and monitor deadlines are logical
@@ -563,65 +563,65 @@ expires) without any command; `get claim` and `list monitors` show the
 outcome. Claim batches, graph traversal, validator listing and chunked
 uploads are not offered on the native engine; the CLI says so explicitly
 instead of answering from the wrong engine. Failed work is
-evidence, never an omission: `testament submit --outcome failed` (or any
+evidence, never an omission: `submit testament --outcome failed` (or any
 non-complete outcome) must cite at least one of the holder's own committed
 work diagnostics with `--diagnostic ID:HASH` and is refused before sending
 without one (exit 2); the claimant reads the diagnostic through `get
 artifact` and the testament's `diagnostics` name the exact reference. A check
 whose slot the frozen manifest lacks can be neither begun nor reported (exit
-4); `validation enter-whole-work TESTAMENT --claim ID` assesses it, ending
+4); `enter whole-work TESTAMENT --claim ID` assesses it, ending
 the required check and the claim `ValidationIncomplete` without any
 manufactured verdict. An evaluator that cannot run its handler reports
 `--verdict error`: the error report is retained with its exact target and
 attempt, and while the handler's declared `attempts` remain the evaluation
 stays open on the next attempt (`attempt_index` counts from zero) for a
-further `validation report`; only the final attempt makes it `Errored`. On the native engine `--parent CLAIM_ID` (or `"parent"` in the document) names the committed claim this claim is caused by: the command reads the parent's current binding and receipt and pins them, and the owner admits the child only from the parent's issuer or its current receipt holder while the parent is live, registering the child on the parent; a forged parent is refused before sending (exit 4), a third party is refused as unauthorized (exit 3), and a terminal or changed parent is refused with a typed outcome (exit 5). Cancelling the parent cancels its pending children.
+further `report verdict`; only the final attempt makes it `Errored`. On the native engine `--parent CLAIM_ID` (or `"parent"` in the document) names the committed claim this claim is caused by: the command reads the parent's current binding and receipt and pins them, and the owner admits the child only from the parent's issuer or its current receipt holder while the parent is live, registering the child on the parent; a forged parent is refused before sending (exit 4), a third party is refused as unauthorized (exit 3), and a terminal or changed parent is refused with a typed outcome (exit 5). Cancelling the parent cancels its pending children.
 
 Every remaining owner operation has a verb on a native ledger. Evaluations of
 the admission and increment phases are selected on the same `validation
-begin` and `validation report` commands with `--phase admission|increment`
+begin` and `report verdict` commands with `--phase admission|increment`
 (the default is `whole_work`) and, when several increments are current,
 `--target WORK_ARTIFACT`; the admission evaluation exists once the claim is
 posted, an increment evaluation once the holder submits that artifact. The
-issuer's verbs over a cycle are `artifact receive ID --claim ID` (a
-generated output), `artifact reject ID --claim ID --reason
+issuer's verbs over a cycle are `receive artifact ID --claim ID` (a
+generated output), `reject artifact ID --claim ID --reason
 structure|metadata --text ERROR_JSON` (the diagnostic inherits the rejected
-product's visibility), `validation seal-increments --claim ID` (while the
-response is open) and `validation enter-whole-work TESTAMENT --claim ID`
-(after receiving it; a plain `validation begin` enters implicitly). The
-holder records an unproducible slot with `artifact fail --claim ID --slot N
+product's visibility), `seal increments --claim ID` (while the
+response is open) and `enter whole-work TESTAMENT --claim ID`
+(after receiving it; a plain `begin validation` enters implicitly). The
+holder records an unproducible slot with `fail slot --claim ID --slot N
 --diagnostic ID[:HASH]`, citing its own committed `artifact diagnostic
 --reason production`. The issuer replaces the holder with `receipt adopt
 CLAIM --holder PARTICIPANT|self` (the old receipt is fenced one epoch
 earlier; testimony under it is refused as stale), releases a terminal
-claim's owned scope with `claim release-scope ID`, and audits a closed claim
-with `audit generate --claim ID` then `audit post TESTAMENT` (read with `get
-testament`). Durable waits are `monitor register --owner CLAIM --root
+claim's owned scope with `release scope ID`, and audits a closed claim
+with `generate audit --claim ID` then `post audit TESTAMENT` (read with `get
+testament`). Durable waits are `register monitor --owner CLAIM --root
 satisfied|terminal|released:CLAIM… --at LOGICAL_MS`, `monitor rebind
 MONITOR --owner CLAIM --predecessor CLAIM --successor CLAIM` (the successor
 must be a committed claim that `supersedes` the predecessor) and, once the
-owning claim is terminal, `monitor cancel MONITOR --owner CLAIM`; `list
+owning claim is terminal, `cancel monitor MONITOR --owner CLAIM`; `list
 monitors --claim ID` shows registrations, rebindings and dispositions. Each
 verb accepts the same `--json|--yaml|--file` document as its MCP tool
-(`focal schema get receipt.adopt --native`); minted identities are reported
+(`focal get schema receipt.adopt --native`); minted identities are reported
 under `created` (`Receipt`, `ResultTestament`, `Monitor`, `Artifact`).
 
 ```text
-focal validation begin --claim <CLAIM> --validation <ADMISSION> --phase admission
-focal validation report --claim <CLAIM> --validation <ADMISSION> --phase admission --verdict pass --text '{"passed":1,"failed":0,"skipped":0}'
-focal validation begin --claim <CLAIM> --validation <INCREMENT> --phase increment --target <ARTIFACT>
-focal artifact receive <ARTIFACT> --claim <CLAIM>
-focal validation seal-increments --claim <CLAIM>
-focal validation enter-whole-work <TESTAMENT> --claim <CLAIM>
-focal claim release-scope <CLAIM>
-focal audit generate --claim <CLAIM>
-focal audit post <RESULT_TESTAMENT>
-focal --client-context alice artifact fail --claim <CLAIM> --slot 1 --diagnostic <DIAGNOSTIC>
-focal artifact reject <ARTIFACT> --claim <CLAIM> --reason structure --text '{"code":"malformed","message":"Not a test report."}'
-focal receipt adopt <CLAIM> --holder self
-focal monitor register --owner <CLAIM> --root satisfied:<OTHER> --at 4102444800000
-focal monitor rebind <MONITOR> --owner <CLAIM> --predecessor <OTHER> --successor <SUCCESSOR>
-focal monitor cancel <MONITOR> --owner <CLAIM>
+focal begin validation --claim <CLAIM> --validation <ADMISSION> --phase admission
+focal report verdict --claim <CLAIM> --validation <ADMISSION> --phase admission --verdict pass --text '{"passed":1,"failed":0,"skipped":0}'
+focal begin validation --claim <CLAIM> --validation <INCREMENT> --phase increment --target <ARTIFACT>
+focal receive artifact <ARTIFACT> --claim <CLAIM>
+focal seal increments --claim <CLAIM>
+focal enter whole-work <TESTAMENT> --claim <CLAIM>
+focal release scope <CLAIM>
+focal generate audit --claim <CLAIM>
+focal post audit <RESULT_TESTAMENT>
+focal --client-context alice fail slot --claim <CLAIM> --slot 1 --diagnostic <DIAGNOSTIC>
+focal reject artifact <ARTIFACT> --claim <CLAIM> --reason structure --text '{"code":"malformed","message":"Not a test report."}'
+focal adopt receipt <CLAIM> --holder self
+focal register monitor --owner <CLAIM> --root satisfied:<OTHER> --at 4102444800000
+focal rebind monitor <MONITOR> --owner <CLAIM> --predecessor <OTHER> --successor <SUCCESSOR>
+focal cancel monitor <MONITOR> --owner <CLAIM>
 ```
 
 Lists on a native ledger are bounded scans over the native index families
@@ -660,14 +660,14 @@ that issued it: a tampered, reused or stale cursor is refused.
 
 ## Run a program against your tools (code mode)
 
-`focal code` runs a JavaScript program the way the MCP server's `code.run` and
+`focal run code` runs a JavaScript program the way the MCP server's `code.run` and
 `code.search` do ([docs/mcp.md](mcp.md#code-mode-one-program-instead-of-many-calls)),
-through the same backend and the same journal as `focal mcp serve`, so a run begun
+through the same backend and the same journal as `focal serve mcp`, so a run begun
 over MCP resumes here and the reverse.
 
 ```sh
-focal code search --file find.js        # find.js sees `registry`, every tool you may call
-focal code run --run standup-1 --file standup.js --input me.json [--now-ms N]
+focal search tools --file find.js        # find.js sees `registry`, every tool you may call
+focal run code --run standup-1 --file standup.js --input me.json [--now-ms N]
 ```
 
 The program is the body of an async function: `await focal.claim.list({...})` calls a
@@ -679,48 +679,48 @@ resumes each mutation it made exactly once.
 
 ## Output and recovery
 
-The default output is a compact table. `--format json` and `--format yaml` emit the same versioned structured results with readable top-level IDs, complete typed object/receipt data, read tokens and cursors. YAML is serialized directly to the output sink without making a second whole-result tree. Nested model values retain their frozen wire representation: IDs are byte arrays and vocabularies are numeric codes. `focal schema get domain-registry` provides those codes. Authored input uses readable string IDs and snake-case vocabulary names.
+The default output is a compact table. `--format json` and `--format yaml` emit the same versioned structured results with readable top-level IDs, complete typed object/receipt data, read tokens and cursors. YAML is serialized directly to the output sink without making a second whole-result tree. Nested model values retain their frozen wire representation: IDs are byte arrays and vocabularies are numeric codes. `focal get schema domain-registry` provides those codes. Authored input uses readable string IDs and snake-case vocabulary names.
 
 Lists expose `--max-visits` separately from `--limit`: the first bounds examined records, the second bounds returned matches. A page can contain no matches and still carry a continuation. Resume with the same filters and limits. `status` uses the selected client context, including a named remote connection; it does not substitute the local data directory's ledger.
 
-Ordinary mutations use a private managed request stream automatically. The CLI durably reserves an `m1:…` ID and saves normalized input, generated IDs and the exact request before sending. Successful commands print their object outcome without recovery diagnostics. An unresolved command or failed result output prints a copyable recovery command on stderr; a broken diagnostic stream never prevents submission or replaces the original failure. If preparation has not completed, recovery points to pending discovery and explicit sealing rather than retrying an unprepared request. After an abrupt process kill, `focal request pending` discovers its durable reservation or prepared operation even if no output appeared. The data directory must already be private (mode `0700`); newly created node directories satisfy this. An older, publicly searchable directory is rejected rather than silently changing permissions. Its owner can make the selected directory private with `chmod 700 /path/to/data-dir` before using managed requests. Explicit legacy `--operation` journals retain their previous directory requirements. The stream is bound to the selected cluster, ledger and authenticated principal. It does not advance the legacy principal-wide epoch floor. A stream generation issues at most 65,536 IDs; once every one of them is acknowledged, the CLI closes the generation, removes its store and registers the next one on the same slot automatically, without deleting anything by age. IDs of a closed generation report `Retired` from `request inspect` and never execute again. `FOCAL_MANAGED_ROTATION=N` lowers the bound for fault campaigns; the bound is saved with the coordinator on first use, so every later invocation must use the same value.
+Ordinary mutations use a private managed request stream automatically. The CLI durably reserves an `m1:…` ID and saves normalized input, generated IDs and the exact request before sending. Successful commands print their object outcome without recovery diagnostics. An unresolved command or failed result output prints a copyable recovery command on stderr; a broken diagnostic stream never prevents submission or replaces the original failure. If preparation has not completed, recovery points to pending discovery and explicit sealing rather than retrying an unprepared request. After an abrupt process kill, `focal list requests` discovers its durable reservation or prepared operation even if no output appeared. The data directory must already be private (mode `0700`); newly created node directories satisfy this. An older, publicly searchable directory is rejected rather than silently changing permissions. Its owner can make the selected directory private with `chmod 700 /path/to/data-dir` before using managed requests. Explicit legacy `--operation` journals retain their previous directory requirements. The stream is bound to the selected cluster, ledger and authenticated principal. It does not advance the legacy principal-wide epoch floor. A stream generation issues at most 65,536 IDs; once every one of them is acknowledged, the CLI closes the generation, removes its store and registers the next one on the same slot automatically, without deleting anything by age. IDs of a closed generation report `Retired` from `inspect request` and never execute again. `FOCAL_MANAGED_ROTATION=N` lowers the bound for fault campaigns; the bound is saved with the coordinator on first use, so every later invocation must use the same value.
 
-Several processes of one participant may run at once on the same data directory: CLI invocations beside each other and beside `focal mcp serve`. Ordinary commands read the context catalogue and an enrolled context's credentials under shared locks, so readers never exclude each other; only `context` commands hold them exclusively, and a reader that finds a writer active fails closed rather than waiting. The native request journal is created once under a short creation lock (a creation interrupted before its marker is redone, never reused), and its per-operation lock is waited for briefly instead of failing; every change to an operation's record is read, judged and written under one hold of that lock. A native operation whose committed receipt or closed refusal has been reported stays answered by `request inspect` and `request retry` until the journal needs its slot for a new operation; then the one reported longest ago retires — its frame leaves the journal, its `n1:` reference stays taken (a retry answers that it retired; the node answers an exact retry from its receipt) — so the journal never fills with finished work: its capacity bounds the operations it holds and, separately, the retired references it remembers. A capacity refusal keeps its frame for the exact retry and never retires. A claim whose expansion failed, or that was interrupted before its frame was ready, holds no slot. A node that refuses a request for capacity (its ingress is full, or the WAL volume is below its free-space watermark) admitted nothing, so the client resends the same request up to three times with backoff — each pause drawn uniformly from nothing to the capped exponential step, so callers refused together do not return together — and then reports the refusal itself, never an unknown outcome; a journaled native reference refused this way stays `Pending` and commits exactly once on a later `request retry`. A node that died or restarted is noticed by an enrolled client within ten seconds of silence (QUIC keep-alive and idle bound); reconnecting to an endpoint that is still down is bounded by the request timeout. `FOCAL_DISK_HEADROOM_BYTES=N` sets the free bytes the WAL volume must keep before fresh native work is admitted (the standard watermark is 64 MiB; `0` disables it); exact retries of committed work never need headroom. The journal issues its operations in request generations: it opens the next generation once half its capacity was issued in the current one and, once every operation of the earlier generations has been reported, advances the owner's floor for this principal by itself (`epoch.advance`, a protocol operation no tool exposes). The owner keeps the outcomes of the open generations resident and seals the closed ones into bundles under custody; under pressure on its resident window it closes the least recently used generations first, and a command issued in a generation the owner closed is refused by name (`request_history_expired`, exit 5) — never executed — after which the journal continues in the generation the owner admits. `request retry` still answers a committed operation of a closed generation from the journal, and `request inspect --remote` reads its outcome from the seal that holds it. `FOCAL_NATIVE_OUTCOMES=N` sets a node's resident outcome window (the standard is one million); every replica of a session runs under one value.
+Several processes of one participant may run at once on the same data directory: CLI invocations beside each other and beside `focal serve mcp`. Ordinary commands read the context catalogue and an enrolled context's credentials under shared locks, so readers never exclude each other; only `context` commands hold them exclusively, and a reader that finds a writer active fails closed rather than waiting. The native request journal is created once under a short creation lock (a creation interrupted before its marker is redone, never reused), and its per-operation lock is waited for briefly instead of failing; every change to an operation's record is read, judged and written under one hold of that lock. A native operation whose committed receipt or closed refusal has been reported stays answered by `inspect request` and `retry request` until the journal needs its slot for a new operation; then the one reported longest ago retires — its frame leaves the journal, its `n1:` reference stays taken (a retry answers that it retired; the node answers an exact retry from its receipt) — so the journal never fills with finished work: its capacity bounds the operations it holds and, separately, the retired references it remembers. A capacity refusal keeps its frame for the exact retry and never retires. A claim whose expansion failed, or that was interrupted before its frame was ready, holds no slot. A node that refuses a request for capacity (its ingress is full, or the WAL volume is below its free-space watermark) admitted nothing, so the client resends the same request up to three times with backoff — each pause drawn uniformly from nothing to the capped exponential step, so callers refused together do not return together — and then reports the refusal itself, never an unknown outcome; a journaled native reference refused this way stays `Pending` and commits exactly once on a later `retry request`. A node that died or restarted is noticed by an enrolled client within ten seconds of silence (QUIC keep-alive and idle bound); reconnecting to an endpoint that is still down is bounded by the request timeout. `FOCAL_DISK_HEADROOM_BYTES=N` sets the free bytes the WAL volume must keep before fresh native work is admitted (the standard watermark is 64 MiB; `0` disables it); exact retries of committed work never need headroom. The journal issues its operations in request generations: it opens the next generation once half its capacity was issued in the current one and, once every operation of the earlier generations has been reported, advances the owner's floor for this principal by itself (`epoch.advance`, a protocol operation no tool exposes). The owner keeps the outcomes of the open generations resident and seals the closed ones into bundles under custody; under pressure on its resident window it closes the least recently used generations first, and a command issued in a generation the owner closed is refused by name (`request_history_expired`, exit 5) — never executed — after which the journal continues in the generation the owner admits. `retry request` still answers a committed operation of a closed generation from the journal, and `inspect request --remote` reads its outcome from the seal that holds it. `FOCAL_NATIVE_OUTCOMES=N` sets a node's resident outcome window (the standard is one million); every replica of a session runs under one value.
 
 After a verified receipt, the CLI writes and flushes the result, records delivery durably, and acknowledges only the contiguous prefix of delivered results. Normal use therefore continues beyond the bounded request window without manual cleanup. A timeout, domain refusal, canceled wait or failed output leaves the request recoverable. If cleanup fails after successful output, business success remains success; the next command resumes the saved cleanup. A retired ID cannot execute again and its complete receipt may no longer be available. Successful flush means delivery to the selected output stream, not proof that another application consumed it.
 
 ```sh
-focal request pending
-focal request inspect --operation-id MANAGED_ID --format json
-focal request inspect --operation-id MANAGED_ID --remote --format json
-focal request retry --operation-id MANAGED_ID --format json
+focal list requests
+focal inspect request --operation-id MANAGED_ID --format json
+focal inspect request --operation-id MANAGED_ID --remote --format json
+focal retry request --operation-id MANAGED_ID --format json
 ```
 
-Pending discovery includes the bounded CLI and MCP stores, with separate streams so unconsumed MCP results do not fill the CLI window. Inspection does not acknowledge a result. Retrying a committed operation prints its saved result and then records delivery; it never creates a replacement operation. If a refused or never-sent request blocks the window and you intend to abandon that request, `focal request seal --operation-id MANAGED_ID` (also available as `request abandon`) commits an exact request fence or returns its existing committed outcome. Sealing is distinct from canceling the business claim. It does not undo a committed command. `focal request acknowledge --operation-id MANAGED_ID` explicitly confirms consumption of an already saved result, including one produced through MCP.
+Pending discovery includes the bounded CLI and MCP stores, with separate streams so unconsumed MCP results do not fill the CLI window. Inspection does not acknowledge a result. Retrying a committed operation prints its saved result and then records delivery; it never creates a replacement operation. If a refused or never-sent request blocks the window and you intend to abandon that request, `focal seal request --operation-id MANAGED_ID` (also available as `request abandon`) commits an exact request fence or returns its existing committed outcome. Sealing is distinct from canceling the business claim. It does not undo a committed command. `focal acknowledge request --operation-id MANAGED_ID` explicitly confirms consumption of an already saved result, including one produced through MCP.
 
 For automation that needs a known ID before submitting, reserve it first:
 
 ```sh
-focal request reserve --format json
+focal reserve request --format json
 focal submit claim --operation-id MANAGED_ID --file claim.json
 ```
 
-Reservation alone sends no business command. If its output is lost, use `request pending` to discover outstanding reservations. Repeating reserve creates another reservation. A caller-supplied `m1:…` ID must already belong to one of these stores; a missing ID cannot create work. Invalid authored input is rejected before default request allocation. A full window caused by unresolved work requires inspecting, retrying or explicitly sealing that work; elapsed time does not make it safe to discard.
+Reservation alone sends no business command. If its output is lost, use `list requests` to discover outstanding reservations. Repeating reserve creates another reservation. A caller-supplied `m1:…` ID must already belong to one of these stores; a missing ID cannot create work. Invalid authored input is rejected before default request allocation. A full window caused by unresolved work requires inspecting, retrying or explicitly sealing that work; elapsed time does not make it safe to discard.
 
 Explicit legacy journals retain their original behavior:
 
 ```sh
 focal submit claim --operation /private/new-operation --file claim.json
-focal request inspect /private/new-operation --format json
-focal request inspect /private/new-operation --remote --format json
-focal request retry /private/new-operation --format json
-focal request status --request-id REQUEST_ID --epoch 1 --format json
-focal request epoch --epoch 1 --format json
+focal inspect request /private/new-operation --format json
+focal inspect request /private/new-operation --remote --format json
+focal retry request /private/new-operation --format json
+focal inspect mutation --request-id REQUEST_ID --epoch 1 --format json
+focal inspect epoch --epoch 1 --format json
 ```
 
 `--operation DIR` must name a new directory under an existing parent. It is mutually exclusive with `--operation-id`. Positional inspect/retry arguments always remain paths, even if a filename resembles a managed ID. Different legacy operations use independent request IDs in fixed epoch one; their receipts and journals are not automatically retired. Two processes cannot own one legacy journal concurrently. Preserve these journals for recovery. JSON retains exact Unix `operation_path_bytes`; `operation` is null for a non-UTF-8 path on filesystems that support it. Filesystem rejection returns an IO error before transmission. Existing unqualified 32-hex MCP operation IDs retain their legacy store semantics.
 
-Legacy journal-path `request inspect` defaults to saved local state. With `--remote`, it queries the saved business request at a fresh owner quorum barrier and checks any retained receipt against the exact saved command and existing local receipt. It works even when the journal still awaits epoch admission, and does not modify the journal. `request status` needs only the wire request ID and epoch; `request epoch` observes admission, minimum epoch and latest admitted epoch. The CLI defaults `--epoch` to 1. The authenticated principal and selected ledger always supply the lookup scope; `--source` cannot select someone else's request history.
+Legacy journal-path `inspect request` defaults to saved local state. With `--remote`, it queries the saved business request at a fresh owner quorum barrier and checks any retained receipt against the exact saved command and existing local receipt. It works even when the journal still awaits epoch admission, and does not modify the journal. `inspect mutation` needs only the wire request ID and epoch; `inspect epoch` observes admission, minimum epoch and latest admitted epoch. The CLI defaults `--epoch` to 1. The authenticated principal and selected ledger always supply the lookup scope; `--source` cannot select someone else's request history.
 
 A retained domain or stream-cursor receipt proves the recorded commit, including when its epoch is below the floor. `BelowFloor` fences new admission at the observed prefix but leaves historical commitment unknown. `Unknown` means no retained outcome is visible and an earlier proposal may still commit. Both are successful observations, not permission to regenerate the command or erase recovery state. Quorum loss returns an operational error. JSON includes the observed domain sequence and applied Raft index, since cursor metadata can commit without advancing the domain sequence. A remote observation never erases a previously saved receipt; use ordinary local inspection to view that receipt and exact retry to persist recovery progress.
 
@@ -735,31 +735,31 @@ A retained domain or stream-cursor receipt proves the recorded commit, including
 | 6 | Operation journal owned by another process |
 | 7 | Outcome unknown or missing verified receipt |
 
-Ordinary domain outcomes are also emitted as structured results for mutations. A failed validation remains readable evidence and is not a failed read command. The existing `focal request REQUEST.json` still sends a complete explicit wire envelope; retry the same file after uncertainty.
+Ordinary domain outcomes are also emitted as structured results for mutations. A failed validation remains readable evidence and is not a failed read command. `focal send request REQUEST.json` sends a complete explicit wire envelope; retry the same file after uncertainty.
 
 ## Deployment scope
 
-Configuration precedence is explicit ([08 §2](archictecutre/08-stepped-complexity-and-deployment.md)): command-line overrides apply to node-local startup fields, then the `--config` file, then creation defaults; an unknown key is refused by its full path (`node.shards`); on an initialized store the `durability` and `placement` fields are the committed policy — a file that sets one of them to another value is refused by name and directed to `deployment plan`/`apply`, one that omits them keeps the committed values. `deployment explain` prints `requested`, `effective`, `committed_revision` and `sources` per field.
+Configuration precedence is explicit ([08 §2](archictecutre/08-stepped-complexity-and-deployment.md)): command-line overrides apply to node-local startup fields, then the `--config` file, then creation defaults; an unknown key is refused by its full path (`node.shards`); on an initialized store the `durability` and `placement` fields are the committed policy — a file that sets one of them to another value is refused by name and directed to `plan deployment`/`apply`, one that omits them keeps the committed values. `explain deployment` prints `requested`, `effective`, `committed_revision` and `sources` per field.
 
-The manual adapter defaults to the local node's identity and ledger. On a joined node it verifies the saved enrollment and uses that Unix listener's actual participant, without taking the running node's storage lease. Named contexts select another local node or an enrolled remote participant. Existing network commands are documented in [network startup](network-startup.md): `start --advertise`, `cluster invite`, and `join`. `deployment explain` is an offline placement plan, not an activated guarantee.
+The manual adapter defaults to the local node's identity and ledger. On a joined node it verifies the saved enrollment and uses that Unix listener's actual participant, without taking the running node's storage lease. Named contexts select another local node or an enrolled remote participant. Existing network commands are documented in [network startup](network-startup.md): `start --advertise`, `invite node`, and `join`. `explain deployment` is an offline placement plan, not an activated guarantee.
 
-Policy changes go through a plan ([08 §9](archictecutre/08-stepped-complexity-and-deployment.md)). `deployment plan --config FILE --dry-run` prints the plan the file's policy denotes against what the node observes (its committed policy revision and every session the directory shows with its epochs and achieved guarantee); `--output PLAN` writes it as an immutable `FCLPLAN1` artifact instead (a new file, never overwritten). Planning is read-only: each session's placement is asked as a dry run that the directory journals nothing for. The plan lists its changes in order — `commit_policy` when the request differs from the committed policy, then `plan_root` (the root group's voters the durability needs, when its voters do not tolerate it yet), then `plan_partition` per directory partition group whose voters do not tolerate it yet (the partition, its group and the voters), then per session `plan_session` (the exact operation, the voters chosen, the epochs expected) or `no_change` — the guarantee `before`, `during` and `after` for the sessions' data and `control_guarantee` for the control plane (the root and every partition group, the weakest of them), and any session the planner could not place as `blocked` (the guarantee after then equals the guarantee before) or a root or partition group it could not seat as `blocked_control`. `deployment apply --plan-file PLAN [--wait SECONDS]` refuses a plan for another deployment (`wrong_deployment`, exit 2), a tampered plan (`plan_corrupt`, exit 2), a plan with blocked sessions (`guarantee_unsatisfied`, exit 6) and a stale plan whose observed revision or epochs moved (`stale_plan`, exit 5) before any side effect; otherwise it journals every change under `cluster/apply/<plan>/` (`Prepared`, `Committed`, `Verified`, `Complete`), commits the policy as its next revision, promotes each planned root voter once the root holds it as a learner (one exact request each, retried as the root moves while a learner is behind), sends each placement request and, with `--wait`, watches the directory until the placement activates and every planned voter votes. Re-running apply resumes the journal and repeats nothing; `deployment status [--plan ID]` re-checks journaled plans against the directory. After apply, start the node with the file that requested the policy or with none: omitted policy fields take the committed values, and the previous file is refused by name.
+Policy changes go through a plan ([08 §9](archictecutre/08-stepped-complexity-and-deployment.md)). `plan deployment --config FILE --dry-run` prints the plan the file's policy denotes against what the node observes (its committed policy revision and every session the directory shows with its epochs and achieved guarantee); `--output PLAN` writes it as an immutable `FCLPLAN1` artifact instead (a new file, never overwritten). Planning is read-only: each session's placement is asked as a dry run that the directory journals nothing for. The plan lists its changes in order — `commit_policy` when the request differs from the committed policy, then `plan_root` (the root group's voters the durability needs, when its voters do not tolerate it yet), then `plan_partition` per directory partition group whose voters do not tolerate it yet (the partition, its group and the voters), then per session `plan_session` (the exact operation, the voters chosen, the epochs expected) or `no_change` — the guarantee `before`, `during` and `after` for the sessions' data and `control_guarantee` for the control plane (the root and every partition group, the weakest of them), and any session the planner could not place as `blocked` (the guarantee after then equals the guarantee before) or a root or partition group it could not seat as `blocked_control`. `apply deployment --plan-file PLAN [--wait SECONDS]` refuses a plan for another deployment (`wrong_deployment`, exit 2), a tampered plan (`plan_corrupt`, exit 2), a plan with blocked sessions (`guarantee_unsatisfied`, exit 6) and a stale plan whose observed revision or epochs moved (`stale_plan`, exit 5) before any side effect; otherwise it journals every change under `cluster/apply/<plan>/` (`Prepared`, `Committed`, `Verified`, `Complete`), commits the policy as its next revision, promotes each planned root voter once the root holds it as a learner (one exact request each, retried as the root moves while a learner is behind), sends each placement request and, with `--wait`, watches the directory until the placement activates and every planned voter votes. Re-running apply resumes the journal and repeats nothing; `inspect deployment [--plan ID]` re-checks journaled plans against the directory. After apply, start the node with the file that requested the policy or with none: omitted policy fields take the committed values, and the previous file is refused by name.
 
-Packaging is rendered from the same file ([08 §3, §5](archictecutre/08-stepped-complexity-and-deployment.md); [24 §24](archictecutre/24-placement-execution-and-fleet-control.md)). `deployment render systemd --config FILE --output DIR [--binary --user --state-dir --config-path --invite-file]` writes `focal.service` (the node under its own user, SIGTERM, a stop timeout above the 30 s cleanup bound, restart on failure, no capabilities) and `focal.yaml`; `deployment render kubernetes --config FILE --namespace NS --output DIR [--image REF] [--storage-class NAME] [--secret NAME] [--zone Z ...] [--nodes N] [--volume 20Gi] [--port 7443]` writes a headless Service, a founder StatefulSet and one host StatefulSet (node survival) or one per named zone (zone survival, `2f+1` zones), a ConfigMap per set, disruption budgets, a kustomization and `invitations.sh`. The result names every fact the render lacked under `missing` (image, storage class, invitation secret, zones) instead of guessing it; region survival is refused, since a cluster spans zones. Rendering touches no cluster and no node, and an existing file is never overwritten. The checked-in `deploy/` directory holds the rendered output for `deploy/config`, a Helm chart and a container image recipe.
+Packaging is rendered from the same file ([08 §3, §5](archictecutre/08-stepped-complexity-and-deployment.md); [24 §24](archictecutre/24-placement-execution-and-fleet-control.md)). `render systemd --config FILE --output DIR [--binary --user --state-dir --config-path --invite-file]` writes `focal.service` (the node under its own user, SIGTERM, a stop timeout above the 30 s cleanup bound, restart on failure, no capabilities) and `focal.yaml`; `render kubernetes --config FILE --namespace NS --output DIR [--image REF] [--storage-class NAME] [--secret NAME] [--zone Z ...] [--nodes N] [--volume 20Gi] [--port 7443]` writes a headless Service, a founder StatefulSet and one host StatefulSet (node survival) or one per named zone (zone survival, `2f+1` zones), a ConfigMap per set, disruption budgets, a kustomization and `invitations.sh`. The result names every fact the render lacked under `missing` (image, storage class, invitation secret, zones) instead of guessing it; region survival is refused, since a cluster spans zones. Rendering touches no cluster and no node, and an existing file is never overwritten. The checked-in `deploy/` directory holds the rendered output for `deploy/config`, a Helm chart and a container image recipe.
 
 A packaged host starts with `start --advertise NAME:PORT --invite-file FILE`: the invitation is redeemed once, when the data directory holds no identity, and ignored afterwards. `--advertise` takes an address or a `host:port` name; a name is announced with the node's contact so peers find the node again after it moves, and reachability restated at a later start (another address, a name, or none) is adopted and announced while the identity holds. `prepare-volume --owner UID:GID` creates the data directory for the node's user and exits, the one privileged step a packaged volume needs.
 
-A node's metrics are Prometheus text ([24 §23](archictecutre/24-placement-execution-and-fleet-control.md)): `diagnose node --metrics` prints the snapshot the service sampled last (every five seconds), one series per fact — memory and volume envelopes, WAL counters, each hosted replica's indices and lags, retention floors, peers, liveness, credential expiry, placement intents and admission, the directory's epochs and achieved durability, the upgrade fence — under fixed `node`, `cluster`, `region` and `zone` labels. With `node.metrics_listen: 127.0.0.1:PORT` in the node's configuration the same text answers `GET /metrics` over HTTP/1.0 on that loopback address, read-only and unauthenticated; any other path is `404`, any other method `405`, and up to eight connections are served at once (one beyond them is closed unanswered); the text is rendered once per sample, every hosted replica is asked at once, and a replica whose owner did not answer within the cadence is reported `focal_session_observed 0` with its owner-side series absent rather than zero. The four probes (`diagnose node --readiness|probe`) are what a supervisor asks; the metrics are what explains their answer.
+A node's metrics are Prometheus text ([24 §23](archictecutre/24-placement-execution-and-fleet-control.md)): `inspect node --metrics` prints the snapshot the service sampled last (every five seconds), one series per fact — memory and volume envelopes, WAL counters, each hosted replica's indices and lags, retention floors, peers, liveness, credential expiry, placement intents and admission, the directory's epochs and achieved durability, the upgrade fence — under fixed `node`, `cluster`, `region` and `zone` labels. With `node.metrics_listen: 127.0.0.1:PORT` in the node's configuration the same text answers `GET /metrics` over HTTP/1.0 on that loopback address, read-only and unauthenticated; any other path is `404`, any other method `405`, and up to eight connections are served at once (one beyond them is closed unanswered); the text is rendered once per sample, every hosted replica is asked at once, and a replica whose owner did not answer within the cadence is reported `focal_session_observed 0` with its owner-side series absent rather than zero. The four probes (`inspect node --readiness|probe`) are what a supervisor asks; the metrics are what explains their answer.
 
-Hosts leave through a drain ([24 §19](archictecutre/24-placement-execution-and-fleet-control.md)): `cluster nodes drain --node N` re-issues the host's grant ineligible, after which the controller heals every placement that named it and retires its copies; `cluster placement` shows the host with `eligible: false` and, once healed, no session naming it. `cluster nodes remove --node N` then vacates its seats in the directory's partition groups (handing a group's leadership on first where it leads; `partitions_vacated` counts them), removes its root-group membership, revokes its credential and retires its committed contact record (`contact_retired`; `cluster nodes list` no longer shows it), and is refused while the host was never drained (`not_drained`) or still holds copies (`node_holding`); a remove that follows its drain at once waits up to ten seconds for the placement to observe the committed drain and is refused `drain_pending` (retry) only if it still has not — a placement the remaining hosts cannot absorb keeps its copies, so removal stays refused until capacity is added or the host is undrained (`cluster nodes undrain`). `cluster nodes replace --node N --with M` drains `N` once `M` is enrolled, alive, eligible and reporting. The founder is never drained.
+Hosts leave through a drain ([24 §19](archictecutre/24-placement-execution-and-fleet-control.md)): `drain node --node N` re-issues the host's grant ineligible, after which the controller heals every placement that named it and retires its copies; `inspect placement` shows the host with `eligible: false` and, once healed, no session naming it. `remove node --node N` then vacates its seats in the directory's partition groups (handing a group's leadership on first where it leads; `partitions_vacated` counts them), removes its root-group membership, revokes its credential and retires its committed contact record (`contact_retired`; `list nodes` no longer shows it), and is refused while the host was never drained (`not_drained`) or still holds copies (`node_holding`); a remove that follows its drain at once waits up to ten seconds for the placement to observe the committed drain and is refused `drain_pending` (retry) only if it still has not — a placement the remaining hosts cannot absorb keeps its copies, so removal stays refused until capacity is added or the host is undrained (`undrain node`). `replace node --node N --with M` drains `N` once `M` is enrolled, alive, eligible and reporting. The founder is never drained.
 
-A host's own credential is renewed and rotated in place ([24 §11](archictecutre/24-placement-execution-and-fleet-control.md)): `cluster credentials renew` issues a fresh certificate and lifetime for the key the host holds; `cluster credentials rotate` moves the host to a fresh key under the same identity — the host stages the key, the sponsor issues for it on the proof of the credential held, the host adopts the receipt over the key it held and presents it on its listener, its peer pool and its placement agent before the reply, and the root re-grants the host under the new key at its next generation. The previous certificate authorizes through the renewal's grace. Both converge after an interruption: a retry finds the committed renewal, and a host that crashed between the sponsor's commit and its own adoption adopts the committed rotation from its staged key when it starts. `cluster credentials get` reports `key_identity`, `renewals` and `rotations`. The founder's identity is its bootstrap authority's certificate and is neither renewed nor rotated. The issuer every credential chains to succeeds itself too ([24 §11](archictecutre/24-placement-execution-and-fleet-control.md)): `cluster credentials issuers` shows the issuers as committed — the one issuing, one staged, one retiring, and the upgrade fence the succession is gated on — and `cluster credentials rotate-issuer` (founder only) stages the successor now: endorsed by the current issuer, so every verifier accepts the chains issued under it before it has adopted it, trusted everywhere from its staging, issuing from the controller's next step; every node renews under it ahead of expiry, and the current issuer retires once nothing live was issued under it. Left alone, the succession is staged in the last third of the issuer's committed lifetime (`node.issuer_lifetime_seconds`). It is refused by name while the upgrade fence is below level 2.
+A host's own credential is renewed and rotated in place ([24 §11](archictecutre/24-placement-execution-and-fleet-control.md)): `renew credential` issues a fresh certificate and lifetime for the key the host holds; `rotate credential` moves the host to a fresh key under the same identity — the host stages the key, the sponsor issues for it on the proof of the credential held, the host adopts the receipt over the key it held and presents it on its listener, its peer pool and its placement agent before the reply, and the root re-grants the host under the new key at its next generation. The previous certificate authorizes through the renewal's grace. Both converge after an interruption: a retry finds the committed renewal, and a host that crashed between the sponsor's commit and its own adoption adopts the committed rotation from its staged key when it starts. `get credential` reports `key_identity`, `renewals` and `rotations`. The founder's identity is its bootstrap authority's certificate and is neither renewed nor rotated. The issuer every credential chains to succeeds itself too ([24 §11](archictecutre/24-placement-execution-and-fleet-control.md)): `list issuers` shows the issuers as committed — the one issuing, one staged, one retiring, and the upgrade fence the succession is gated on — and `rotate issuer` (founder only) stages the successor now: endorsed by the current issuer, so every verifier accepts the chains issued under it before it has adopted it, trusted everywhere from its staging, issuing from the controller's next step; every node renews under it ahead of expiry, and the current issuer retires once nothing live was issued under it. Left alone, the succession is staged in the last third of the issuer's committed lifetime (`node.issuer_lifetime_seconds`). It is refused by name while the upgrade fence is below level 2.
 
-Custody is repaired in place ([24 §20](archictecutre/24-placement-execution-and-fleet-control.md)): `cluster repair [--tenant T] [--session S]` walks the session's committed artifact projection on this node, verifies every object held here, recopies from another required copy, chunk by verified chunk and under the same object identity, whatever is missing or fails its hash, and gives other required copies the objects they lack. The report counts `verified`, `repaired` and `pushed` objects; an object no required copy can supply is listed as unrecoverable and sets `restore_required`, which a verified backup answers (`cluster restore`), never a fresh object. `--limit N` bounds one call (256 by default); a report with `complete: false` names `next_after`, which `--after` resumes. Repair is idempotent and initiates nothing beyond the copies the placement already requires.
+Custody is repaired in place ([24 §20](archictecutre/24-placement-execution-and-fleet-control.md)): `repair session [--tenant T] [--session S]` walks the session's committed artifact projection on this node, verifies every object held here, recopies from another required copy, chunk by verified chunk and under the same object identity, whatever is missing or fails its hash, and gives other required copies the objects they lack. The report counts `verified`, `repaired` and `pushed` objects; an object no required copy can supply is listed as unrecoverable and sets `restore_required`, which a verified backup answers (`restore session`), never a fresh object. `--limit N` bounds one call (256 by default); a report with `complete: false` names `next_after`, which `--after` resumes. Repair is idempotent and initiates nothing beyond the copies the placement already requires.
 
-Geography is declared, announced and fenced ([24 §22](archictecutre/24-placement-execution-and-fleet-control.md)): a node's `topology.region` and `topology.zone` (its local configuration, at most 64 bytes each, a zone needing its region) are announced with its contact, registered as regions by the root and granted as its failure domains, so `durability.survive: zone|region` places voters and copies across distinct declared domains and `placement.residency` keeps every durable copy inside the named regions. `cluster placement` shows each node's labels and each session's residency. A copy never moves outside the boundary: the planner keeps plans inside it, and the residency fence refuses every other transfer before a byte moves — a sealed artifact's replication, a repair, an obligation's ask — and an operator's `cluster replicas ranges move --node N` to a node outside it (`outside_residency`, exit 5). A node that declares no region lies outside every boundary.
+Geography is declared, announced and fenced ([24 §22](archictecutre/24-placement-execution-and-fleet-control.md)): a node's `topology.region` and `topology.zone` (its local configuration, at most 64 bytes each, a zone needing its region) are announced with its contact, registered as regions by the root and granted as its failure domains, so `durability.survive: zone|region` places voters and copies across distinct declared domains and `placement.residency` keeps every durable copy inside the named regions. `inspect placement` shows each node's labels and each session's residency. A copy never moves outside the boundary: the planner keeps plans inside it, and the residency fence refuses every other transfer before a byte moves — a sealed artifact's replication, a repair, an obligation's ask — and an operator's `move range --node N` to a node outside it (`outside_residency`, exit 5). A node that declares no region lies outside every boundary.
 
-Upgrades roll one binary at a time behind a committed fence ([24 §21](archictecutre/24-placement-execution-and-fleet-control.md), [08 §10](archictecutre/08-stepped-complexity-and-deployment.md)). Every node reports the capability level its binary implements with its load; `cluster upgrade status` shows the committed fence, this binary's level, every node's reported level and `activatable`, the highest fence every node supports. Once every node runs the new binary, the founder raises the fence with `cluster upgrade activate --fence LEVEL`; it is refused by name (`members_behind`) while any node reports less or none, never lowers, and reads as done when already there. After the fence rises a binary announcing a lower level refuses to start and a running one stops (`upgrade_fenced`): a rollback past the fence is a restore from a verified backup, never a downgrade. `FOCAL_CAPABILITY_LEVEL=N` lowers the level a node announces for a staged rollout or a rehearsal; it never raises it.
+Upgrades roll one binary at a time behind a committed fence ([24 §21](archictecutre/24-placement-execution-and-fleet-control.md), [08 §10](archictecutre/08-stepped-complexity-and-deployment.md)). Every node reports the capability level its binary implements with its load; `inspect upgrade` shows the committed fence, this binary's level, every node's reported level and `activatable`, the highest fence every node supports. Once every node runs the new binary, the founder raises the fence with `activate upgrade --fence LEVEL`; it is refused by name (`members_behind`) while any node reports less or none, never lowers, and reads as done when already there. After the fence rises a binary announcing a lower level refuses to start and a running one stops (`upgrade_fenced`): a rollback past the fence is a restore from a verified backup, never a downgrade. `FOCAL_CAPABILITY_LEVEL=N` lowers the level a node announces for a staged rollout or a rehearsal; it never raises it.
 
 ## Errors and exit status
 
@@ -794,26 +794,26 @@ MCP, including nested request-store, upload, watch and administrative errors.
 ## Select a client context
 
 ```sh
-focal context add work --node-data-dir /absolute/path/to/node
-focal context use work
+focal add context work --node-data-dir /absolute/path/to/node
+focal use context work
 focal list claims
 focal --client-context work get validation VALIDATION_ID --context
-focal context show
-focal context list
-focal context use local
+focal inspect context
+focal list contexts
+focal use context local
 ```
 
 To enroll an independent remote participant, create a client invitation on the running founder, then redeem it in the client's own directory:
 
 ```sh
-focal --data-dir /node cluster client invite --name alice --output /private/alice.invite
-focal --data-dir /client context enroll alice --invite-file /private/alice.invite
-focal --data-dir /client context use alice
+focal --data-dir /node invite client --name alice --output /private/alice.invite
+focal --data-dir /client enroll context alice --invite-file /private/alice.invite
+focal --data-dir /client use context alice
 focal --data-dir /client list claims
-focal --data-dir /client mcp serve
+focal --data-dir /client serve mcp
 ```
 
-Retry `context enroll` with the same name and invitation after interruption. It preserves the original key, CSR and enrollment request. Context selection applies to domain operations and MCP. `context add NAME --file FILE` also accepts a strict JSON/YAML connection document for existing DER credentials. A connection may address a session other than the founder's own — one an operator created (`cluster sessions create`) or restored (`cluster restore`): `context add NAME --node-data-dir DIR --tenant ID --session ID` uses the node operator's local socket, which serves every session of every tenant the node admits, and `context add NAME --enrolled-as CONTEXT --session ID` reuses an enrolled identity for another session of its own tenant. `context show` redacts credentials. Removing a context retains its request history; reusing that name for a different identity is rejected. Missing initialized context or history files require restoring those files.
+Retry `enroll context` with the same name and invitation after interruption. It preserves the original key, CSR and enrollment request. Context selection applies to domain operations and MCP. `add context NAME --file FILE` also accepts a strict JSON/YAML connection document for existing DER credentials. A connection may address a session other than the founder's own — one an operator created (`create session`) or restored (`restore session`): `add context NAME --node-data-dir DIR --tenant ID --session ID` uses the node operator's local socket, which serves every session of every tenant the node admits, and `add context NAME --enrolled-as CONTEXT --session ID` reuses an enrolled identity for another session of its own tenant. `inspect context` redacts credentials. Removing a context retains its request history; reusing that name for a different identity is rejected. Missing initialized context or history files require restoring those files.
 
 See [the implementation contract](archictecutre/19-cli-mcp-implementation.md) for the peer lifecycle operations, scoped protocol admission, and separation between command availability and the independent lifecycle storage migration.
 
@@ -822,13 +822,13 @@ The full command inventory, cluster progression, MCP/skills mapping and challeng
 
 ### Inspecting external validator contracts
 
-Use `focal validator list` to inspect handlers pinned by recorded validation
+Use `focal list validators` to inspect handlers pinned by recorded validation
 requirements. It needs no filter. Narrow the page with `--claim`, `--evaluator`,
 `--kind`, `--phase`, `--mode`, `--agentic true|false`, or `--schema-hash`.
 
 ```sh
-focal validator list --claim CLAIM_ID
-focal validator get HANDLER_ID --version VERSION_HASH --format json
+focal list validators --claim CLAIM_ID
+focal get validator HANDLER_ID --version VERSION_HASH --format json
 ```
 
 The result preserves each requirement's evaluator, full handler chain, quality
@@ -857,7 +857,7 @@ A batch contains 1–64 claims within the aggregate authored input bound. Assign
 explicit claim IDs when members refer to one another through dependencies.
 Each member still needs its own immutable validation requirements. Admission is
 atomic: an invalid member cannot leave earlier members committed. Generated
-claims are posted separately using `claim post`.
+claims are posted separately using `post claim`.
 
 
 ## Watch delivered ledger changes
@@ -865,14 +865,14 @@ claims are posted separately using `claim post`.
 ```sh
 focal watch claims
 focal watch artifacts --claim CLAIM_ID --name evidence
-focal watch all --name changes --format json
-focal watch inspect --format json
-focal watch resume evidence
+focal watch everything --name changes --format json
+focal inspect watch --format json
+focal resume watch evidence
 ```
 
 `claims`, `testaments`, `artifacts`, `validations` and `all` are available. Omit `--claim` for the complete ledger; repeat it for a union of claim associations. Defaults seed the current graph at one fixed prefix and then follow the retained delta tail. `--no-seed` starts from available retained history. `--limit 1..256` bounds source visits/items; `--pages N` stops after N flushed pages. JSON output is one complete delivery per line; YAML output uses one `---` document per delivery. Preserve the selected `--data-dir` and `--client-context` on recovery.
 
-Each named watch saves its exact pending request or one unconsumed page before output. CLI output is acknowledged locally only after write and flush succeed; the next source poll commits the cursor acknowledgment. A poll with nothing new to acknowledge is a plain read: it commits nothing at the source, takes no request slot, and on a replicated node waits there for a page (up to the owner's request time) instead of answering an empty one; the source renews the watch's lease itself once half of it has passed. Following pauses 250 ms only after an empty page. Ctrl-C or a broken output pipe retains unfinished delivery and prints a copyable `watch resume` command. A crash after flush but before the durable local acknowledgment may replay the same delivery ID: sinks should deduplicate that ID. Stopping after `--pages` can leave completion maintenance for the next resume. Inspecting never consumes a page.
+Each named watch saves its exact pending request or one unconsumed page before output. CLI output is acknowledged locally only after write and flush succeed; the next source poll commits the cursor acknowledgment. A poll with nothing new to acknowledge is a plain read: it commits nothing at the source, takes no request slot, and on a replicated node waits there for a page (up to the owner's request time) instead of answering an empty one; the source renews the watch's lease itself once half of it has passed. Following pauses 250 ms only after an empty page. Ctrl-C or a broken output pipe retains unfinished delivery and prints a copyable `resume watch` command. A crash after flush but before the durable local acknowledgment may replay the same delivery ID: sinks should deduplicate that ID. Stopping after `--pages` can leave completion maintenance for the next resume. Inspecting never consumes a page.
 
 Seed pages contain real graph objects. Claim-filtered seeds use the committed association index, not artifact provenance; empty filtered pages still advance. Each seed continuation enforces a 64-KiB page bound at the source. An individual row that cannot fit returns capacity rather than skipping it. The original seed lease must survive until every page is consumed. Expiry or server restart during a partial seed fails explicitly; choose a new watch name and reseed after deciding how the sink handles overlap. A retained page remains recoverable even when its source lease has expired.
 
@@ -887,8 +887,8 @@ There are at most 16 saved watch names per selected context, each with an indepe
 Use the same bounded JSON/YAML documents as ordinary commands:
 
 ```sh
-focal schema validate claim.submit --file claim.yaml --shape-only
-focal --data-dir ./node schema validate claim.submit --file claim.yaml
+focal validate document claim.submit --file claim.yaml --shape-only
+focal --data-dir ./node validate document claim.submit --file claim.yaml
 ```
 
 `--shape-only` checks strict DTO decoding, duplicate/unknown fields and input
@@ -899,7 +899,7 @@ preflight. A missing, corrupt or explicitly selected unknown context is an error
 it never silently falls back to shape-only validation. No request, operation
 reservation, generated identity or mutation journal is published by validation.
 Actual authority, lifecycle state, evidence custody and server acceptance still
-require the running owner. Use `schema example claim.submit` for a complete
+require the running owner. Use `get example claim.submit` for a complete
 starting document.
 
 Normal submissions remain one command with automatic managed recovery. The
@@ -907,12 +907,12 @@ following expert workflow instead creates a **legacy raw request** whose request
 epoch and identity you manage:
 
 ```sh
-focal --data-dir ./node request build claim.submit --file claim.yaml \
+focal --data-dir ./node build request claim.submit --file claim.yaml \
   --request-epoch 1 --output claim.request.json
-focal request check claim.request.json
-focal --data-dir ./node request send claim.request.json
+focal check request claim.request.json
+focal --data-dir ./node send request claim.request.json
 # After an unknown reply or process restart, send precisely the same file:
-focal --data-dir ./node request claim.request.json
+focal --data-dir ./node send request claim.request.json
 ```
 
 `build` performs no network call. It expands authored IDs once and publishes the
@@ -936,7 +936,7 @@ legacy epoch admission, lifecycle or custody state, or server acceptance. Manage
 ownership/control and node/control peer families require their dedicated
 workflows and are explicitly unsupported by this offline checker. The generated
 JSON file is also bounded to 256 KiB; wire encoding is independently checked
-against the default 1-MiB frame limit. `request send FILE` is an alias for the
+against the default 1-MiB frame limit. `send request FILE` is an alias for the
 existing positional raw sender, retaining its 1-MiB input limit and wire surface.
 It never rebuilds IDs or silently converts the request into managed work.
 
@@ -973,20 +973,20 @@ authored DTO as their MCP operation:
 
 | CLI verb | Authored fields |
 |---|---|
-| `claim post` | `claim` |
-| `claim progress` | `claim`, `receipt: {id, epoch}`, `message` |
-| `claim cancel` | `claim`, `reason` |
-| `receipt acquire` | `claim`, `epoch`, optional new receipt `id` |
-| `evidence begin` | `claim`, `receipt: {id, epoch}`, optional evidence-set `id` |
-| `testament receive` | `claim`, `testament` |
-| `validation begin` / `validation complete` | `claim` |
+| `post claim` | `claim` |
+| `report progress` | `claim`, `receipt: {id, epoch}`, `message` |
+| `cancel claim` | `claim`, `reason` |
+| `acquire receipt` | `claim`, `epoch`, optional new receipt `id` |
+| `begin evidence` | `claim`, `receipt: {id, epoch}`, optional evidence-set `id` |
+| `receive testament` | `claim`, `testament` |
+| `begin validation` / `complete validation` | `claim` |
 
-For example, `focal claim post --file post.yaml` accepts `claim: 'CLAIM_ID'` after
-replacing the placeholder with the actual ID. Use `schema get claim.post` or the
+For example, `focal post claim --file post.yaml` accepts `claim: 'CLAIM_ID'` after
+replacing the placeholder with the actual ID. Use `get schema claim.post` or the
 corresponding operation name for the complete strict schema. Document fields
 cannot be combined with positional domain IDs or domain field flags; output,
 operation recovery and expected-revision options remain envelope options. The
-flag form `receipt acquire CLAIM_ID` retains its default epoch 1; documents name
+flag form `acquire receipt CLAIM_ID` retains its default epoch 1; documents name
 that epoch explicitly. All forms pass through the same builder and durable
 preparation path, preserving current authority, receipt and revision checks.
 
@@ -1027,9 +1027,9 @@ cursors fail explicitly; start a new query to observe a new prefix.
 ## Observe a claim until a condition holds
 
 ```sh
-focal claim wait CLAIM_ID --until satisfied --timeout-ms 5000
-focal claim wait CLAIM_ID --until terminal --format json
-focal claim wait --file wait.yaml --format yaml
+focal wait claim CLAIM_ID --until satisfied --timeout-ms 5000
+focal wait claim CLAIM_ID --until terminal --format json
+focal wait claim --file wait.yaml --format yaml
 ```
 
 Replace `CLAIM_ID` with the actual ID. The document form is

@@ -98,7 +98,7 @@ fn start(node: &Node, address: Option<&str>) -> (Server, Value) {
     deadline::observe(node.root());
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--config", node.config.to_str().unwrap()]);
-    command.args(["--data-dir", node.root().to_str().unwrap(), "start"]);
+    command.args(["--data-dir", node.root().to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
         command.args(["--advertise", address]);
     }
@@ -136,8 +136,8 @@ fn join(founder: &Node, host: &Node, name: &str, advertise: &str) -> u64 {
     admin(
         founder,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -148,6 +148,7 @@ fn join(founder: &Node, host: &Node, name: &str, advertise: &str) -> u64 {
         host,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -157,7 +158,7 @@ fn join(founder: &Node, host: &Node, name: &str, advertise: &str) -> u64 {
     joined["node"].as_u64().unwrap()
 }
 fn placement(node: &Node) -> Option<Value> {
-    let output = run(node, &["cluster", "placement"]);
+    let output = run(node, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -222,12 +223,12 @@ fn declared_zones_place_voters_across_domains_and_the_residency_fence_refuses_a_
     let host_c = Node::new("host-c", "ra", "a3", &[]);
     let host_d = Node::new("host-d", "rb", "b1", &[]);
     let addresses: Vec<String> = (0..4).map(|_| address()).collect();
-    let activation = admin(&founder, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(&founder, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let (_founder_server, status) = start(&founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
     let identity =
-        admin(&founder, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+        admin(&founder, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let founder_node = identity["node"].as_u64().unwrap();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let ledger = identity["session"].as_str().unwrap().to_owned();
@@ -263,9 +264,8 @@ fn declared_zones_place_voters_across_domains_and_the_residency_fence_refuses_a_
     let planned = admin(
         &founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -303,17 +303,7 @@ fn declared_zones_place_voters_across_domains_and_the_residency_fence_refuses_a_
     assert_eq!(active["survive"], "Zone");
     // A move of a range member to the node outside the residency is refused
     // by name before anything moves; the same move inside it is admitted.
-    let ranges = admin(
-        &founder,
-        &[
-            "cluster",
-            "replicas",
-            "ranges",
-            "--session",
-            &ledger,
-            "list",
-        ],
-    );
+    let ranges = admin(&founder, &["list", "ranges", "--session", &ledger]);
     let member = ranges["result"]["ranges"]["members"][0]["id"]
         .as_str()
         .unwrap()
@@ -321,12 +311,10 @@ fn declared_zones_place_voters_across_domains_and_the_residency_fence_refuses_a_
     let (code, report) = failure(
         &founder,
         &[
-            "cluster",
-            "replicas",
-            "ranges",
+            "move",
+            "range",
             "--session",
             &ledger,
-            "move",
             "--member",
             &member,
             "--node",
@@ -343,9 +331,8 @@ fn declared_zones_place_voters_across_domains_and_the_residency_fence_refuses_a_
     let output = run(
         &founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",

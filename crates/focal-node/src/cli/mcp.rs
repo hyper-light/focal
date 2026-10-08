@@ -24,7 +24,7 @@ pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> 
 }
 
 /// Code mode from the CLI (19 §Code mode): one program, run against the same
-/// backend and journal `mcp serve` offers, so a run begun over MCP resumes
+/// backend and journal `serve mcp` offers, so a run begun over MCP resumes
 /// here with the same `--run`, and the reverse.
 #[derive(clap::Subcommand)]
 pub(crate) enum CodeCommand {

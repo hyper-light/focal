@@ -2462,7 +2462,7 @@ impl PlacementAgent {
         let verification = crate::backup::verify(&request.input)?;
         if !verification.complete {
             return Err(AgentError::Restore(if verification.decoder_supported {
-                "the backup does not verify; run `cluster backup verify` for the problems"
+                "the backup does not verify; run `verify backup` for the problems"
             } else {
                 "this binary does not carry the decoder the backup's log promised"
             }));

@@ -44,7 +44,7 @@ fn start(root: &Path, config: &Path, advertise: &str) -> Server {
     deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--config", config.to_str().unwrap()])
-        .args(["--data-dir", root.to_str().unwrap(), "start"])
+        .args(["--data-dir", root.to_str().unwrap(), "start", "node"])
         .args(["--advertise", advertise])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -104,7 +104,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // The operator surface is the network node's admin socket; a laptop
     // node without an address has none.
     let _server = start(root, &config, &advertise);
-    let identity = run(root, &config, &["diagnose", "node", "--identity"]);
+    let identity = run(root, &config, &["inspect", "node", "--identity"]);
     assert!(identity.status.success());
     let identity: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
     let node = identity["result"]["identity"]["node"].as_u64().unwrap();
@@ -116,7 +116,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // labels and the founder's session, once the sampler has run.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     let text = loop {
-        let output = run(root, &config, &["diagnose", "node", "--metrics"]);
+        let output = run(root, &config, &["inspect", "node", "--metrics"]);
         assert!(
             output.status.success(),
             "{}",

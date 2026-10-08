@@ -107,12 +107,12 @@ hash (the original bare pair reads as revision 1, unchanged on disk); config res
 three modes on an initialized store. The pod's own `start` treats the committed policy as
 authoritative: omitted policy fields take the committed values, and a file value that differs
 also yields to it (both reported as `committed` at that revision) — the file only seeds the
-first start, and `deployment apply` may have committed stronger durability than that seed, so a
+first start, and `apply deployment` may have committed stronger durability than that seed, so a
 restart is never refused for carrying what the fleet already carries (revised 2026-09-13: the
 earlier blanket `CommittedPolicyChange` refusal crash-looped every founder restart after an
 apply from a static configmap). An operator command still refuses a file that sets a policy
 field to another value, naming the field and directing to plan/apply; a policy request
-(plan/explain) keeps the file's values as the request. `deployment explain` prints `requested`
+(plan/explain) keeps the file's values as the request. `explain deployment` prints `requested`
 (the file), `effective` (the committed policy) and `sources` per field
 (`command_line`, `file`, `creation_default`, `committed`). Identity keys, membership epochs, seeds learned from peers, placements,
 and measured scheduling decisions live in managed state, not generated user YAML.
@@ -120,9 +120,9 @@ and measured scheduling decisions live in managed state, not generated user YAML
 ## 3. Stage 1: laptop, with durable storage from the first run
 
 ```sh
-focal start
-focal deployment explain
-focal demo claims --session deployment-check
+focal start node
+focal explain deployment
+focal run demo claims --session deployment-check
 ```
 
 `start` runs in the foreground and logs its local endpoint/readiness. Run the other
@@ -154,7 +154,7 @@ receipt and evidence hash. The demo itself does not shut down the running server
 same demo command remains the application-level acceptance probe at every later stage.
 
 Implemented 2026-09-10 (R9.6, [24 §24](24-placement-execution-and-fleet-control.md)):
-`focal deployment render systemd --config FILE --output DIR` writes the hardened unit
+`focal render systemd --config FILE --output DIR` writes the hardened unit
 and its configuration (`deploy/systemd` is that output for `deploy/config/systemd.yaml`);
 `start --invite-file` lets a supervised host enroll and start in one command; a host
 restarted at another address, or advertising a name, is adopted and announced.
@@ -167,17 +167,17 @@ database. An existing local node retains its deployment ID and serves as the spo
 interface; otherwise startup explains the need for a separate `--listen` mapping.
 
 ```sh
-focal start --advertise node-a.example.internal:7443
-focal cluster invite --node node-b --output node-b.invite
-focal cluster invite --node node-c --output node-c.invite
+focal start node --advertise node-a.example.internal:7443
+focal invite node --node node-b --output node-b.invite
+focal invite node --node node-c --output node-c.invite
 ```
 
 Transfer each invitation through the operator's chosen secure administrative channel.
 On its named destination, with the same supported binary:
 
 ```sh
-focal join --invite-file node-b.invite --advertise node-b.example.internal:7443
-focal start
+focal join cluster --invite-file node-b.invite --advertise node-b.example.internal:7443
+focal start node
 ```
 
 `join` enrolls identity and persists configuration; `start` runs the service. A join
@@ -207,9 +207,9 @@ durability:
 ```
 
 ```sh
-focal deployment plan --config deployment.yaml --output fleet.plan
-focal deployment apply --plan-file fleet.plan
-focal deployment explain
+focal plan deployment --config deployment.yaml --output fleet.plan
+focal apply deployment --plan-file fleet.plan
+focal explain deployment
 ```
 
 The planner derives a valid quorum and artifact-copy layout and names the independent
@@ -226,8 +226,8 @@ packages around the same binary. A future operator may automate existing APIs; i
 not become a second placement authority or a prerequisite for ordinary deployment.
 
 ```sh
-focal deployment render kubernetes --config deployment.yaml --namespace focal --output deploy/
-focal deployment explain --manifest-dir deploy/
+focal render kubernetes --config deployment.yaml --namespace focal --output deploy/
+focal explain deployment --manifest-dir deploy/
 ```
 
 Rendered assets cover stable pod identities, persistent volumes, peer discovery,
@@ -250,7 +250,7 @@ durability (`survive: node, max_failures: 0`), the only first start a lone node
 can satisfy (a founder alone cannot promise zone survival). The *requested*
 policy is rendered beside it in the same ConfigMap as `target.yaml` and mounted
 read-only at `/etc/focal-target/target.yaml`. Once every host pod is Ready, the
-operator commits it once from the founder — `deployment plan --config
+operator commits it once from the founder — `plan deployment --config
 /etc/focal-target/target.yaml --output <plan>` then `deployment apply
 --plan-file <plan>` — and from then on the committed policy carries every
 restart (§2), so the static ConfigMap never has to follow it. This is why a
@@ -273,7 +273,7 @@ policy satisfaction. A disruption budget complements Focal's membership checks; 
 does not prove that arbitrary eviction preserves quorum or artifact custody.
 
 Implemented 2026-09-10 (R9.6, [24 §24](24-placement-execution-and-fleet-control.md)):
-`focal deployment render kubernetes --config FILE --namespace NS --output DIR [--image
+`focal render kubernetes --config FILE --namespace NS --output DIR [--image
 --storage-class --secret --zone ... --nodes --volume --port]` writes the objects above as
 plain manifests and a kustomization, names the facts it lacks (`missing`: image, storage
 class, invitation secret, zones) and never touches a cluster; `deploy/kubernetes` is that
@@ -307,7 +307,7 @@ The planner names any missing zone or dependent storage placement. It does not c
 zone survival because three pods happened to be scheduled on three machines. The root
 group and the directory's partition groups are seated across the zones by the same
 plan (`plan_root`, then `plan_partition`, before the sessions' changes) and their
-promise is stated apart from the data's (`control_guarantee`; `cluster placement` →
+promise is stated apart from the data's (`control_guarantee`; `inspect placement` →
 `control`): what the root, the directory partitions and the issuer each survive,
 measured by one rule ([24 §15](24-placement-execution-and-fleet-control.md); the
 audit's F24). What the founder alone still hosts — the issuer's key, a split
@@ -377,9 +377,9 @@ allocation for the population; Focal applies the same session placement rules wi
 Proposed administrative usage keeps policy content in the same versioned schema:
 
 ```sh
-focal deployment plan --config eu-workloads.yaml --scope tenant:example-eu --output eu.plan
-focal deployment apply --plan-file eu.plan
-focal deployment explain --scope tenant:example-eu
+focal plan deployment --config eu-workloads.yaml --scope tenant:example-eu --output eu.plan
+focal apply deployment --plan-file eu.plan
+focal explain deployment --scope tenant:example-eu
 ```
 
 For example, `eu-workloads.yaml` contains only the geographic policy delta:
@@ -414,8 +414,8 @@ Measured CPU/RAM/disk/RTT inputs tune scheduling; they do not authorize those ch
 
 ```sh
 focal deployment capabilities
-focal deployment explain --session deployment-check --format json
-focal deployment plan --config deployment.yaml --dry-run
+focal explain deployment --session deployment-check --format json
+focal plan deployment --config deployment.yaml --dry-run
 ```
 
 `capabilities` reports supported binary/wire/storage versions, available local resources,
@@ -442,7 +442,7 @@ revision and hash and, on a node that runs a directory, every session the placem
 view names with its route, membership and placement epochs, voters and achieved
 guarantee, plus the nodes' liveness and disk — and what the file requests (omitted
 policy fields take the committed values). Each session is asked as a dry run
-(`cluster sessions plan --dry-run`): the placement agent proposes from the committed
+(`plan session --dry-run`): the placement agent proposes from the committed
 directory and journals nothing, so planning creates no file, ticket or directory record.
 The plan's changes are ordered: the policy commit (revision *n* → *n*+1) when the request
 differs, then the root group's voters the durability needs (`plan_root`, the voters and
@@ -464,7 +464,7 @@ the guarantee during the plan is the guarantee before it, because the old contra
 until the new placement is verified. The artifact is `FCLPLAN1` (magic, postcard body,
 BLAKE3 trailer) whose identity is derived from the facts alone, so the same observation
 and request make the same plan whenever it is computed; `--output` writes a new file and
-never overwrites one, `--dry-run` prints without writing. `deployment apply --plan-file`
+never overwrites one, `--dry-run` prints without writing. `apply deployment --plan-file`
 refuses a plan made for another cluster, a plan with blocked sessions (missing capacity
 leaves the contract intact), a tampered plan, and — before any side effect and without
 journaling — a stale plan whose observed policy revision or session epochs moved. It
@@ -485,7 +485,7 @@ when every planned voter votes; a `plan_partition` step admits each planned vote
 group does not hold as a learner, which then hosts a replica of the group once the
 root's grant seats it, and promotes it once it has caught up — one exact `p1:` request
 each through the node that leads the group — and is complete the same way. A repeated apply resumes the journal and repeats
-nothing; `deployment status` re-checks journaled plans against the directory. A
+nothing; `inspect deployment` re-checks journaled plans against the directory. A
 committed policy stronger than one host provides no longer refuses the founder's
 restart: the local solve pins only the first policy, the directory satisfies committed
 ones. Residency and home-region changes commit as policy intent; their enforcement over

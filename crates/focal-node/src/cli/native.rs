@@ -77,7 +77,7 @@ pub(super) fn run(
             }
             SubmitCommand::Validation(_) => {
                 return Err(CliError::Input(
-                    "use validation report on the native engine".into(),
+                    "use `report verdict` on the native engine".into(),
                 ));
             }
         },
@@ -179,7 +179,7 @@ pub(super) fn run(
             }
             ValidationCommand::BeginIncrement(_) => {
                 return Err(CliError::Input(
-                    "use validation begin --phase increment on the native engine".into(),
+                    "use `begin validation --phase increment` on the native engine".into(),
                 ));
             }
             ValidationCommand::SealIncrements(args) => {
@@ -535,7 +535,7 @@ fn recovery_hint(context: &Context, id: NativeOperationId) {
     if let Some(invocation) = &context.invocation {
         let _ = writeln!(
             std::io::stderr().lock(),
-            "Recovery: {invocation} request retry --operation-id {id}"
+            "Recovery: {invocation} retry request --operation-id {id}"
         );
     }
 }
@@ -759,7 +759,7 @@ pub(super) fn inspect(
         ),
     }
 }
-/// `(reference, condition)` rows for `request pending`.
+/// `(reference, condition)` rows for `list requests`.
 pub(super) fn outstanding(context: &Context) -> Result<Vec<(String, &'static str)>> {
     let Some(store) = store(context, false)? else {
         return Ok(Vec::new());
@@ -817,7 +817,7 @@ fn read(
         | focal_native_client::NativeReadOutcome::Wait(_) => Err(CliError::InvalidResponse),
     }
 }
-/// `claim wait` on the native engine: the same predicates as the V1
+/// `wait claim` on the native engine: the same predicates as the V1
 /// observer plus `testament`, the same bounds, printed the same way.
 fn wait(
     runtime: &tokio::runtime::Runtime,
@@ -875,7 +875,7 @@ pub(super) fn render_page(page: NativeReadPage, format: OutputFormat) -> Result<
 }
 /// An observation of the owner (a remote outcome read) is labelled apart from
 /// an object read so callers never mistake one for the other.
-/// `claim lineage`: one observation at one prefix, what it holds by role
+/// `trace lineage`: one observation at one prefix, what it holds by role
 /// and what its bounds left beyond it, so a bounded sample is never read as
 /// the whole lineage.
 fn render_lineage(
@@ -977,7 +977,7 @@ fn render_page_as(condition: &str, page: NativeReadPage, format: OutputFormat) -
         }
     }
 }
-/// The ledger's standing under this principal; the native `focal status`.
+/// The ledger's standing under this principal; the native `focal inspect prefix`.
 pub(super) fn status(
     runtime: &tokio::runtime::Runtime,
     context: &Context,

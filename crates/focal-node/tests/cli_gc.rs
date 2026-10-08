@@ -51,6 +51,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -155,7 +156,7 @@ fn created(result: &Value, kind: &str) -> Vec<String> {
         .collect()
 }
 fn gc_status(root: &Path) -> Value {
-    let shown = admin(root, &["diagnose", "node", "--gc"]);
+    let shown = admin(root, &["inspect", "node", "--gc"]);
     assert_eq!(shown["result"]["kind"], "gc", "{shown}");
     shown["result"]["gc"].clone()
 }
@@ -205,19 +206,18 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let invitation = client.path().join("alice.invite");
     admin(
         root,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -229,8 +229,8 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -239,7 +239,10 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         .status
         .success()
     );
-    let alice_standing = admin(client.path(), &["--client-context", "alice", "status"]);
+    let alice_standing = admin(
+        client.path(),
+        &["--client-context", "alice", "inspect", "prefix"],
+    );
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // A claim whose work artifact's inline payload is sealed as an object.
@@ -260,17 +263,17 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let claim = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &claim]));
+    committed(&cli(root, None, &["post", "claim", &claim]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &claim],
+        &["acquire", "receipt", &claim],
     ));
     let (_, result) = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -286,8 +289,8 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         client.path(),
         Some("alice"),
         &[
-            "artifact",
             "submit",
+            "artifact",
             "--claim",
             &claim,
             "--slot",
@@ -338,9 +341,7 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     let restore = || {
         admin(
             root,
-            &[
-                "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-            ],
+            &["restore", "object", "--domain", &tenant, "--root", &orphan],
         )
     };
     let mut window = Deadline::after(Duration::from_secs(60));
@@ -379,8 +380,8 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     // The claim retires: its family's bundle is a new object, the payload's
     // object stays because the bundle's header names it, and the bundle
     // still verifies after the collector ran over it.
-    committed(&cli(root, None, &["claim", "cancel", &claim]));
-    committed(&cli(root, None, &["claim", "release-scope", &claim]));
+    committed(&cli(root, None, &["cancel", "claim", &claim]));
+    committed(&cli(root, None, &["release", "scope", &claim]));
     let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["get", "claim", &claim, "--format", "json"]);
@@ -405,7 +406,7 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     let retired = manifests(root, &tenant);
     assert_eq!(retired.len(), 2, "payload and bundle: {retired:?}");
     assert!(retired.contains(&bound[0]));
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &claim]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &claim]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     let bundle = archive["result"]["archive"]["bundle"].as_str().unwrap();
     assert!(retired.contains(&bundle.to_owned()));
@@ -415,9 +416,7 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     let _server = start(root, &advertise);
     let restored = admin(
         root,
-        &[
-            "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-        ],
+        &["restore", "object", "--domain", &tenant, "--root", &orphan],
     );
     assert_eq!(restored["result"]["restored"], true, "{restored}");
     assert!(manifests(root, &tenant).contains(&orphan));

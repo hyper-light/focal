@@ -59,7 +59,7 @@ fn the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss() {
         &founder,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _founder_server = journey.start(
         &founder,
@@ -74,7 +74,7 @@ fn the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss() {
     let (server_c, node_c) = journey.join(&founder, &host_c, "host-c", &addresses[2]);
     let all = [founder_node, node_b, node_c];
     // Every node is granted with the zone it announced.
-    journey.admin(&founder, "placement view", &[], &["cluster", "placement"]);
+    journey.admin(&founder, "placement view", &[], &["inspect", "placement"]);
     wait_for(
         &founder,
         "declared zones",
@@ -94,9 +94,8 @@ fn the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss() {
         "zone survival",
         &["tenant", "session", "survive zone"],
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -166,9 +165,8 @@ fn the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss() {
         "region survival",
         &["survive region"],
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",

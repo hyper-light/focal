@@ -121,7 +121,7 @@ pub use deadline::progress;
 /// The periods a node's root owner has run since it started, from its
 /// metrics; none while the node does not answer.
 pub fn periods(node: &Node) -> Option<u64> {
-    let output = run(node, None, &["diagnose", "node", "--metrics"]);
+    let output = run(node, None, &["inspect", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -192,7 +192,7 @@ pub fn failure(node: &Node, context: Option<&str>, args: &[&str]) -> (i32, Strin
 pub fn spawn(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc::Receiver<Value>) {
     deadline::observe(node.root());
     let mut command = base(node, None);
-    command.arg("start").args(args);
+    command.args(["start", "node"]).args(args);
     command.envs(envs.iter().copied());
     let mut child = command
         .stdout(Stdio::piped())
@@ -237,7 +237,7 @@ pub fn invitation(founder: &Node, host: &Node, name: &str) -> PathBuf {
     let output = run(
         founder,
         None,
-        &["cluster", "invite", "--node", name, "--output", "-"],
+        &["invite", "node", "--node", name, "--output", "-"],
     );
     assert!(
         output.status.success(),
@@ -266,7 +266,7 @@ pub fn join_start(founder: &Node, host: &Node, name: &str, advertise: &str) -> (
 }
 /// (node, tenant, session) of a running node.
 pub fn identity(node: &Node) -> (u64, String, String) {
-    let identity = admin(node, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+    let identity = admin(node, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     (
         identity["node"].as_u64().unwrap(),
         identity["tenant"].as_str().unwrap().to_owned(),
@@ -274,7 +274,7 @@ pub fn identity(node: &Node) -> (u64, String, String) {
     )
 }
 pub fn placement(node: &Node) -> Option<Value> {
-    let output = run(node, None, &["cluster", "placement"]);
+    let output = run(node, None, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -336,7 +336,7 @@ pub fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let health = run(node, None, &["diagnose", "node", "--health"]);
+    let health = run(node, None, &["inspect", "node", "--health"]);
     panic!(
         "{what} did not happen ({spent}; allowance {timeout:?}); health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -353,9 +353,8 @@ pub fn plan_and_settle(
 ) -> Value {
     let failures = max_failures.to_string();
     let mut args = vec![
-        "cluster",
-        "sessions",
         "plan",
+        "session",
         "--tenant",
         tenant,
         "--session",
@@ -381,9 +380,8 @@ pub fn enroll_client(founder: &Node, client: &Node, name: &str) -> String {
     admin(
         founder,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             name,
             "--output",
@@ -398,8 +396,8 @@ pub fn enroll_client(founder: &Node, client: &Node, name: &str) -> String {
             client,
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 name,
                 "--invite-file",
                 invitation.to_str().unwrap(),
@@ -414,7 +412,7 @@ pub fn enroll_client(founder: &Node, client: &Node, name: &str) -> String {
             "{refusal}"
         );
     }
-    let standing = admin(client, &["--client-context", name, "status"]);
+    let standing = admin(client, &["--client-context", name, "inspect", "prefix"]);
     hex_hash(&objects(&standing)[0]["Standing"]["principal"])
 }
 /// An identity as the CLI prints it: hex, or the byte array of a raw result.
@@ -441,7 +439,7 @@ pub fn committed(value: &Value) -> Value {
 /// A founder whose session is native before its first start (23 §5): the
 /// participant workflow the runbooks write needs the native engine.
 pub fn activate_native(node: &Node) {
-    let activation = admin(node, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(node, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
 }
 pub fn created(result: &Value, kind: &str) -> Vec<String> {
@@ -479,18 +477,18 @@ pub fn write_claim(node: &Node, principal: &str, description: &str) -> String {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let claim = created(&result, "Claim").remove(0);
-    committed(&cli(node, None, &["claim", "post", &claim]));
+    committed(&cli(node, None, &["post", "claim", &claim]));
     claim
 }
 /// A claim written by `write_claim` with its artifact delivered by the
 /// participant; the artifact id.
 pub fn deliver_artifact(client: &Node, context: &str, claim: &str) -> String {
-    committed(&cli(client, Some(context), &["receipt", "acquire", claim]));
+    committed(&cli(client, Some(context), &["acquire", "receipt", claim]));
     let result = committed(&cli(
         client,
         Some(context),
         &[
-            "artifact", "submit", "--claim", claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     created(&result, "Artifact").remove(0)
@@ -518,13 +516,13 @@ pub fn chunk_files(node: &Node, tenant: &str) -> Vec<PathBuf> {
 pub fn repair(node: &Node, tenant: &str, ledger: &str) -> Value {
     let report = admin(
         node,
-        &["cluster", "repair", "--tenant", tenant, "--session", ledger],
+        &["repair", "session", "--tenant", tenant, "--session", ledger],
     );
     assert_eq!(report["result"]["kind"], "repaired", "{report}");
     report["result"]["repair"].clone()
 }
 pub fn readiness(node: &Node) -> Value {
-    admin(node, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone()
+    admin(node, &["inspect", "node", "--readiness"])["result"]["readiness"].clone()
 }
 /// Start under a file-size limit (`ulimit -f`, in 512-byte blocks) with
 /// `SIGXFSZ` ignored, so an oversized write returns `EFBIG` instead of
@@ -542,7 +540,7 @@ pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
     if let Some(config) = &node.config {
         command.args(["--config", config.to_str().unwrap()]);
     }
-    command.args(["--data-dir", node.root().to_str().unwrap(), "start"]);
+    command.args(["--data-dir", node.root().to_str().unwrap(), "start", "node"]);
     command.args(args);
     let mut child = command
         .stdout(Stdio::piped())
@@ -591,11 +589,7 @@ pub fn largest_file(root: &Path) -> u64 {
     largest
 }
 pub fn ranges(node: &Node, ledger: &str) -> Option<Value> {
-    let output = run(
-        node,
-        None,
-        &["cluster", "replicas", "ranges", "--session", ledger, "list"],
-    );
+    let output = run(node, None, &["list", "ranges", "--session", ledger]);
     if !output.status.success() {
         return None;
     }

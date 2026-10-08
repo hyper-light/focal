@@ -3,13 +3,12 @@
 **Failure.** A node's credential is past its lifetime, or was revoked, so its peers refuse
 its connections.
 
-**Symptoms.** `cluster placement` on any node shows the node's `credential: retired`
+**Symptoms.** `inspect placement` on any node shows the node's `credential: retired`
 (the registry no longer authorizes it; `active` for every other node); the founder's
-`cluster credentials get --invitation ID` shows `expires_at` in the past or the invitation
-revoked; the node's own `diagnose node --health` shows the placement agent's `last_error`
+`get credential --invitation ID` shows `expires_at` in the past or the invitation
+revoked; the node's own `inspect node --health` shows the placement agent's `last_error`
 naming `unauthorized`; `focal_credential_expires_at_seconds` in its metrics is past. Its
-peers close its connections and admit no new ones, so it learns nothing more: `cluster
-node readiness` on it shows `catching_up: false` and `authoritative: false`, and a node
+peers close its connections and admit no new ones, so it learns nothing more: `inspect node --probe` on it shows `catching_up: false` and `authoritative: false`, and a node
 whose own copy of the registry applied the revocation before it was cut off refuses to
 serve or start (`[credential_retired]`, exit 5). A node that has just renewed or rotated
 its credential is not retired by a copy of the registry that has not yet applied that
@@ -19,9 +18,9 @@ probes for a while, so `alive` can lag: the credential field, not liveness, is t
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir FOUNDER cluster invitations list
-focal --data-dir FOUNDER cluster credentials get --invitation ID
-focal --data-dir NODE diagnose node --health
+focal --data-dir FOUNDER list invitations
+focal --data-dir FOUNDER get credential --invitation ID
+focal --data-dir NODE inspect node --health
 ```
 
 **Preconditions.** A node renews its own credential in the last third of its lifetime
@@ -30,15 +29,13 @@ focal --data-dir NODE diagnose node --health
 past its lifetime only when the node could not reach the founder for that long, or its
 invitation was revoked. The founder renews its own the same way, through the enrollment
 host it runs. The issuer the credentials chain to succeeds itself as well, in the last
-third of its committed lifetime (`node.issuer_lifetime_seconds`) or on `cluster
-credentials rotate-issuer`; `cluster credentials issuers` shows the one issuing, one
+third of its committed lifetime (`node.issuer_lifetime_seconds`) or on `rotate issuer`; `list issuers` shows the one issuing, one
 staged and one retiring, and the upgrade fence the succession waits on.
 
-**Commands.** Within the grace the sponsor allows: `focal --data-dir NODE cluster
-credentials renew` on the node (the same key under a fresh certificate). Beyond it, or
+**Commands.** Within the grace the sponsor allows: `focal --data-dir NODE renew credential` on the node (the same key under a fresh certificate). Beyond it, or
 after revocation: the node's identity is retired. Drain and remove it
-(`cluster nodes drain --node N`, `cluster nodes remove --node N`) and enroll the host again
-with a fresh invitation into a fresh data directory (`cluster invite`, `start
+(`drain node --node N`, `remove node --node N`) and enroll the host again
+with a fresh invitation into a fresh data directory (`invite node`, `start node
 --invite-file`), then let the controller place it.
 
 **Preserved guarantee.** A revoked or expired credential authorizes nothing, immediately and
@@ -48,7 +45,7 @@ its removal completes.
 **Stop conditions.** Stop if removal is refused with `node_holding` and no host can take the
 copies: add capacity first.
 
-**Verification.** The old node is gone from `cluster nodes list`; the re-enrolled host is
+**Verification.** The old node is gone from `list nodes`; the re-enrolled host is
 alive and eligible; every session's `achieved` equals `desired`.
 
 **Escalation.** A founder renews its own credential like any node; one whose credential
@@ -61,7 +58,7 @@ placement view shows its credential retired; restarted, the host either refuses
 (`credential_retired`) or starts and never catches up; it is drained and removed; the same machine enrolls again from a fresh invitation into a fresh
 directory and the placement heals onto it.
 
-Every command above is under `focal --data-dir DIR cluster ...` on the node named, over its
+Every command above is run as `focal --data-dir DIR ACTION THING ...` on the node named, over its
 own admin socket ([cluster-admin.md](../cluster-admin.md)); reads never change the cluster.
 The executed test runs the real binary through this runbook's commands
 (`crates/focal-node/tests/runbooks.rs`); its evidence is recorded in

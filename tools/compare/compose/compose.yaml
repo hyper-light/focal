@@ -93,15 +93,15 @@ services:
   # bootstrap issues on the founder, a bounded wait, then joins with it.
   focal1:
     <<: *focal
-    command: ["focal", "--config", "/etc/focal/focal1.yaml", "--data-dir", "/data", "start", "--listen", "0.0.0.0:7443", "--advertise", "focal1:7443"]
+    command: ["focal", "--config", "/etc/focal/focal1.yaml", "--data-dir", "/data", "start", "node", "--listen", "0.0.0.0:7443", "--advertise", "focal1:7443"]
     volumes: ["./focal1.yaml:/etc/focal/focal1.yaml:ro", "focal1:/data", "invites:/invite"]
   focal2:
     <<: *focal
-    command: ["sh", "-c", "n=0; until [ -s /invite/focal2.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal2.yaml --data-dir /data start --listen 0.0.0.0:7443 --advertise focal2:7443 --invite-file /invite/focal2.invite"]
+    command: ["sh", "-c", "n=0; until [ -s /invite/focal2.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal2.yaml --data-dir /data start node --listen 0.0.0.0:7443 --advertise focal2:7443 --invite-file /invite/focal2.invite"]
     volumes: ["./focal2.yaml:/etc/focal/focal2.yaml:ro", "focal2:/data", "invites:/invite"]
   focal3:
     <<: *focal
-    command: ["sh", "-c", "n=0; until [ -s /invite/focal3.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal3.yaml --data-dir /data start --listen 0.0.0.0:7443 --advertise focal3:7443 --invite-file /invite/focal3.invite"]
+    command: ["sh", "-c", "n=0; until [ -s /invite/focal3.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal3.yaml --data-dir /data start node --listen 0.0.0.0:7443 --advertise focal3:7443 --invite-file /invite/focal3.invite"]
     volumes: ["./focal3.yaml:/etc/focal/focal3.yaml:ro", "focal3:/data", "invites:/invite"]
   # The generator, on the bench network as every system's generator runs.
   focal-load:

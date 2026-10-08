@@ -25,7 +25,7 @@ impl Drop for Server {
 fn start(root: &Path) -> Server {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut child = command(root, &["start"])
+    let mut child = command(root, &["start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -97,10 +97,10 @@ fn scalar_document_modes_execute_actual_receipt_lifecycle_without_changing_autho
     let _server = start(root.path());
     let id = "00000000000000000000000000000001";
     claim(root.path(), id);
-    document(root.path(), &["claim", "post"], json!({"claim":id}), false);
+    document(root.path(), &["post", "claim"], json!({"claim":id}), false);
     let acquired = document(
         root.path(),
-        &["receipt", "acquire"],
+        &["acquire", "receipt"],
         json!({"claim":id,"epoch":1}),
         true,
     );
@@ -108,13 +108,13 @@ fn scalar_document_modes_execute_actual_receipt_lifecycle_without_changing_autho
     let fence = json!({"id":receipt,"epoch":1});
     document(
         root.path(),
-        &["claim", "progress"],
+        &["report", "progress"],
         json!({"claim":id,"receipt":fence,"message":"Prepared response"}),
         false,
     );
     let evidence = document(
         root.path(),
-        &["evidence", "begin"],
+        &["begin", "evidence"],
         json!({"claim":id,"receipt":fence}),
         true,
     );
@@ -128,19 +128,19 @@ fn scalar_document_modes_execute_actual_receipt_lifecycle_without_changing_autho
     let testament = closed["result"]["testament"].as_str().unwrap();
     document(
         root.path(),
-        &["testament", "receive"],
+        &["receive", "testament"],
         json!({"claim":id,"testament":testament}),
         true,
     );
     document(
         root.path(),
-        &["validation", "begin"],
+        &["begin", "validation"],
         json!({"claim":id}),
         false,
     );
     document(
         root.path(),
-        &["validation", "complete"],
+        &["complete", "validation"],
         json!({"claim":id}),
         true,
     );
@@ -157,8 +157,8 @@ fn scalar_document_modes_execute_actual_receipt_lifecycle_without_changing_autho
             cli(
                 root.path(),
                 &[
-                    "claim",
                     "wait",
+                    "claim",
                     id,
                     "--until",
                     until,
@@ -179,31 +179,31 @@ fn scalar_document_modes_execute_actual_receipt_lifecycle_without_changing_autho
     .unwrap();
     cli(
         root.path(),
-        &["claim", "cancel", "--file", cancel.to_str().unwrap()],
+        &["cancel", "claim", "--file", cancel.to_str().unwrap()],
     );
-    let prefix = json(root.path(), &["status"])["result"].clone();
+    let prefix = json(root.path(), &["inspect", "prefix"])["result"].clone();
     for args in [
         vec![
-            "claim",
             "post",
+            "claim",
             id,
             "--json",
             "{\"claim\":\"00000000000000000000000000000001\"}",
         ],
         vec![
-            "validation",
             "begin",
+            "validation",
             "--json",
             "{\"claim\":\"00000000000000000000000000000001\",\"runtime\":true}",
         ],
         vec![
-            "receipt",
             "acquire",
+            "receipt",
             "--json",
             "{\"claim\":\"a\",\"claim\":\"b\",\"epoch\":1}",
         ],
     ] {
         assert!(!run(root.path(), &args).status.success());
-        assert_eq!(json(root.path(), &["status"])["result"], prefix);
+        assert_eq!(json(root.path(), &["inspect", "prefix"])["result"], prefix);
     }
 }

@@ -8,7 +8,7 @@
     clippy::disallowed_macros
 )]
 //! The first product gate on the native engine through the MCP adapter: a
-//! real binary, two real participants each behind their own `mcp serve`,
+//! real binary, two real participants each behind their own `serve mcp`,
 //! offline activation, the complete claim cycle through native tools, a
 //! killed and restarted node, identical reads afterwards, explicit
 //! acknowledgment and exact retries of journaled frames (REMAINING §9 A1).
@@ -65,6 +65,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -120,7 +121,7 @@ fn admin(root: &Path, context: Option<&str>, args: &[&str]) -> Value {
     })
 }
 
-/// One `mcp serve` process on the modern profile for one participant.
+/// One `serve mcp` process on the modern profile for one participant.
 struct Mcp {
     _process: Server,
     input: ChildStdin,
@@ -135,7 +136,7 @@ impl Mcp {
             command.args(["--client-context", context]);
         }
         let mut child = command
-            .args(["mcp", "serve"])
+            .args(["serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -255,7 +256,7 @@ fn two_participants_complete_a_native_claim_cycle_through_mcp_and_survive_a_kill
     private(client.path());
     let root = founder.path();
 
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -264,9 +265,8 @@ fn two_participants_complete_a_native_claim_cycle_through_mcp_and_survive_a_kill
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -277,8 +277,8 @@ fn two_participants_complete_a_native_claim_cycle_through_mcp_and_survive_a_kill
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -541,8 +541,8 @@ fn two_participants_complete_a_native_claim_cycle_through_mcp_and_survive_a_kill
         root,
         None,
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             &report_id,
             "--remote",

@@ -1,7 +1,7 @@
 # Native binary releases
 
 One `focal` executable provides the server (`start`), human CLI and MCP stdio
-server (`mcp serve`). Release assets are raw binaries, not source-install helpers.
+server (`serve mcp`). Release assets are raw binaries, not source-install helpers.
 This workflow does not imply that a release/tag already exists.
 
 `platforms.json` is the exact required asset matrix. Each target is built and

@@ -9,8 +9,10 @@ pub(crate) mod discovery;
 mod documents;
 mod download;
 pub(super) mod errors;
+pub(crate) mod grammar;
 mod graph;
 mod lifecycle;
+pub(crate) mod look;
 mod managed;
 mod mcp;
 mod monitor;
@@ -20,6 +22,7 @@ mod output;
 mod reads;
 mod reconcile;
 mod request_files;
+pub(crate) mod startup;
 #[cfg(test)]
 mod tests;
 pub(crate) mod trace;
@@ -27,6 +30,7 @@ mod upload;
 mod upload_control;
 mod validators;
 mod watch;
+pub(crate) use args::OutputFormat;
 use args::*;
 pub(super) use args::{Commands, RequestArgs, RequestCommand};
 pub(super) fn check_request_file(path: &std::path::Path) -> Result<()> {
@@ -417,7 +421,7 @@ pub(super) fn status(
     super::output_response(reply).map_err(CliError::Other)
 }
 
-/// `schema validate` under the selected context: the engine is probed the
+/// `validate document` under the selected context: the engine is probed the
 /// way every mutation probes it, then the document is checked the way that
 /// engine's mutation path checks it. Nothing is journaled or sent.
 pub(super) fn schema_validate(

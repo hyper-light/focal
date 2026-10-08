@@ -89,10 +89,10 @@ pub(crate) struct OutputOptions {
 }
 #[derive(Args)]
 pub(crate) struct MutationOptions {
-    /// Private journal directory. Existing operations use `request retry`.
+    /// Private journal directory. Existing operations use `retry request`.
     #[arg(long)]
     pub operation: Option<PathBuf>,
-    /// Resume an ID previously returned by `request reserve` or pending recovery.
+    /// Resume an ID previously returned by `reserve request` or pending recovery.
     #[arg(long, conflicts_with = "operation")]
     pub operation_id: Option<String>,
     /// Reject a mutation if the object's revision has changed.
@@ -123,7 +123,7 @@ pub(crate) struct DocumentInput {
 }
 #[derive(Subcommand)]
 pub(crate) enum SubmitCommand {
-    /// Generate an immutable claim. Use `claim post` to make it actionable.
+    /// Generate an immutable claim. Use `post claim` to make it actionable.
     Claim(ClaimArgs),
     /// Generate an atomic batch; each claim retains its own pinned requirements.
     Claims(ClaimBatchArgs),

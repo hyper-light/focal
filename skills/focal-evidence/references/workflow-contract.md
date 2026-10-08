@@ -38,8 +38,8 @@ committed response.
 
 Schema hash: `add7b85a5a6fac7b753f85551b38c7ef913e55cd8c896c63bb00c6db19b00ab4`.
 This reviewed payload contract is pinned here for MCP-only participants. When the
-CLI is available, `focal schema get error-report` returns the descriptor, exact
-hash, limit and example. `focal schema get test-report` describes actual test
+CLI is available, `focal get schema error-report` returns the descriptor, exact
+hash, limit and example. `focal get schema test-report` describes actual test
 counts. MCP currently exposes neither payload-schema resource discovery nor a
 schema registration tool; `tools/list` describes the authored operation inputs.
 
@@ -129,7 +129,7 @@ For ongoing observation, discover `watch.open`, `watch.next`, `watch.acknowledge
 
 Consume the entire page in the destination before calling `watch.acknowledge` with the name and hexadecimal delivery ID. Completion: `Consumed` records the durable local frontier; the next `watch.next` commits the source acknowledgment before advancing. Repeat the exact acknowledgment after response loss. An unconsumed `watch.next` returns the same delivery; `watch.inspect` never consumes. Keep seed objects, original delta facts and resolved/resync markers distinct from invented lifecycle events. Filtered empty seed pages still require consumption because their continuation advances.
 
-A partial seed must retain its exact token and finish before its source lease expires. Report expiry explicitly; deliberately open a new named seed only after deciding how the destination handles overlap. Preserve the watch catalogue, initialized markers and adjacent managed allocator together. There are 16 names, one retained page per watch, 64-KiB pages and four outstanding managed cursor slots per watch. Neither implicit epoch changes nor filesystem deletion is recovery. CLI fallback: `focal watch claims`, `focal watch inspect --format json`, and the printed `focal ... watch resume NAME` command.
+A partial seed must retain its exact token and finish before its source lease expires. Report expiry explicitly; deliberately open a new named seed only after deciding how the destination handles overlap. Preserve the watch catalogue, initialized markers and adjacent managed allocator together. There are 16 names, one retained page per watch, 64-KiB pages and four outstanding managed cursor slots per watch. Neither implicit epoch changes nor filesystem deletion is recovery. CLI fallback: `focal watch claims`, `focal inspect watch --format json`, and the printed `focal ... watch resume NAME` command.
 
 ## Native engine
 

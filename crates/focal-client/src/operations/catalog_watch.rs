@@ -16,7 +16,7 @@ const WATCH_OPEN: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Watch,
-    cli_path: Some("watch all"),
+    cli_path: Some("watch everything"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["name"],"properties":{"name":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_.-]+$"},"claims":{"type":"array","maxItems":256,"items":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"}},"family":{"enum":["claim","testament","artifact","validation",null]},"seed":{"type":"boolean","default":true},"max_items":{"type":"integer","minimum":1,"maximum":256,"default":64},"max_bytes":{"type":"integer","minimum":4096,"maximum":65536,"default":65536}}}"#,
     ),
@@ -34,7 +34,7 @@ const WATCH_NEXT: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Watch,
-    cli_path: Some("watch resume"),
+    cli_path: Some("resume watch"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["name"],"properties":{"name":{"type":"string","minLength":1,"maxLength":64}}}"#,
     ),
@@ -70,7 +70,7 @@ const WATCH_INSPECT: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Watch,
-    cli_path: Some("watch inspect"),
+    cli_path: Some("inspect watch"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"properties":{"name":{"type":"string","minLength":1,"maxLength":64}}}"#,
     ),

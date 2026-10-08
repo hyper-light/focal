@@ -63,7 +63,7 @@ fn success(root: &Path, args: &[&str]) -> Value {
 fn start(root: &Path, address: Option<&str>, envs: &[(&str, &str)]) -> Server {
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     command.envs(envs.iter().copied());
     if let Some(address) = address {
         command.args(["--advertise", address]);
@@ -111,7 +111,7 @@ fn start(root: &Path, address: Option<&str>, envs: &[(&str, &str)]) -> Server {
     server
 }
 fn placement(root: &Path) -> Option<Value> {
-    let output = command(root, &["cluster", "placement"]);
+    let output = command(root, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -178,7 +178,7 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    let health = command(root, &["diagnose", "node", "--health"]);
+    let health = command(root, &["inspect", "node", "--health"]);
     panic!(
         "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -189,8 +189,8 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     let written = success(
         founder,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -202,6 +202,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         host,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -238,7 +239,7 @@ fn eventually(root: &Path, args: &[&str]) -> Value {
 /// One series of the node's metrics by session: what the replica of each
 /// session this node hosts says.
 fn series(root: &Path, name: &str) -> Option<BTreeMap<String, u64>> {
-    let output = command(root, &["diagnose", "node", "--metrics"]);
+    let output = command(root, &["inspect", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -271,7 +272,9 @@ fn a_fleet_led_from_its_founder_spreads_its_leaders_and_leadership_follows() {
     let founder = roots[0];
     let addresses: Vec<String> = (0..3).map(|_| ports::address()).collect();
     let mut servers = vec![Some(start(founder, Some(&addresses[0]), OFF))];
-    let founder_node = success(founder, &["identity"])["node"].as_u64().unwrap();
+    let founder_node = success(founder, &["inspect", "identity"])["node"]
+        .as_u64()
+        .unwrap();
     let node_a = join(founder, roots[1], "host-a", &addresses[1]);
     let node_b = join(founder, roots[2], "host-b", &addresses[2]);
     servers.push(Some(start(roots[1], None, OFF)));
@@ -292,9 +295,7 @@ fn a_fleet_led_from_its_founder_spreads_its_leaders_and_leadership_follows() {
     for name in ["orders", "returns"] {
         let created = eventually(
             founder,
-            &[
-                "cluster", "sessions", "create", "--tenant", &tenant, "--name", name,
-            ],
+            &["create", "session", "--tenant", &tenant, "--name", name],
         );
         assert_eq!(created["node"], founder_node, "{created}");
     }
@@ -312,9 +313,8 @@ fn a_fleet_led_from_its_founder_spreads_its_leaders_and_leadership_follows() {
         let planned = eventually(
             founder,
             &[
-                "cluster",
-                "sessions",
                 "plan",
+                "session",
                 "--tenant",
                 &tenant,
                 "--session",
@@ -439,7 +439,7 @@ fn a_fleet_led_from_its_founder_spreads_its_leaders_and_leadership_follows() {
     println!("{asked} hand-overs asked for, {failed} that did not hold");
 
     // At rest: nothing is planned, and nothing moves while it is watched.
-    let plan = success(founder, &["cluster", "plan"])["result"]["actions"].clone();
+    let plan = success(founder, &["plan", "placement"])["result"]["actions"].clone();
     assert_eq!(plan, serde_json::json!([]));
     // Four holds of the controller's own time, by the periods it ran.
     let began = deadline::periods(founder).unwrap();

@@ -28,7 +28,7 @@ fn start(root: &Path) -> Server {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.to_str().unwrap(), "start"])
+        .args(["--data-dir", root.to_str().unwrap(), "start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -99,10 +99,10 @@ fn claim() -> Value {
     json!({"target":"self","action":"handoff","description":"Checked human command","validations":[{"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive evidence","evaluator":"self"}]})
 }
 fn pending(root: &Path) -> Value {
-    cli(root, &["request", "pending", "--format", "json"])["operations"].clone()
+    cli(root, &["list", "requests", "--format", "json"])["operations"].clone()
 }
 fn sequence(root: &Path) -> Value {
-    cli(root, &["status"])["result"]["Read"]["token"]["sequence"].clone()
+    cli(root, &["inspect", "prefix"])["result"]["Read"]["token"]["sequence"].clone()
 }
 
 #[test]
@@ -130,8 +130,8 @@ fn default_human_commands_retire_beyond_window_without_manual_cleanup_and_keep_l
     let retired = cli(
         root.path(),
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             &first,
             "--format",
@@ -140,7 +140,7 @@ fn default_human_commands_retire_beyond_window_without_manual_cleanup_and_keep_l
     );
     assert_eq!(retired["condition"], "Retired");
     assert_eq!(
-        run(root.path(), &["request", "retry", "--operation-id", &first])
+        run(root.path(), &["retry", "request", "--operation-id", &first])
             .status
             .code(),
         Some(5)
@@ -165,8 +165,8 @@ fn default_human_commands_retire_beyond_window_without_manual_cleanup_and_keep_l
     let retried = cli(
         root.path(),
         &[
-            "request",
             "retry",
+            "request",
             legacy.to_str().unwrap(),
             "--format",
             "json",
@@ -209,14 +209,14 @@ fn broken_stdout_keeps_exact_committed_request_for_retry_after_restart() {
     assert_eq!(rows[0]["condition"], "Committed");
     let diagnostic = String::from_utf8(failed.stderr).unwrap();
     assert!(diagnostic.contains(&format!(
-        "Recovery: focal --data-dir '{}' --client-context 'local' request retry --operation-id {id}",
+        "Recovery: focal --data-dir '{}' --client-context 'local' retry request --operation-id {id}",
         root.path().display()
     )));
     let inspected = cli(
         root.path(),
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             &id,
             "--format",
@@ -238,8 +238,8 @@ fn broken_stdout_keeps_exact_committed_request_for_retry_after_restart() {
     let remote = cli(
         root.path(),
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             &id,
             "--remote",
@@ -252,8 +252,8 @@ fn broken_stdout_keeps_exact_committed_request_for_retry_after_restart() {
     let retried = quiet_cli(
         root.path(),
         &[
-            "request",
             "retry",
+            "request",
             "--operation-id",
             &id,
             "--format",
@@ -277,7 +277,7 @@ fn reserved_ids_are_not_business_commands_and_refusal_stays_pending_until_explic
     assert_eq!(bad.status.code(), Some(2));
     assert_eq!(pending(root.path()), json!([]));
     assert!(!root.path().join("CLI.requests").exists());
-    let reserved = cli(root.path(), &["request", "reserve", "--format", "json"]);
+    let reserved = cli(root.path(), &["reserve", "request", "--format", "json"]);
     let id = reserved["operation_id"].as_str().unwrap();
     assert_eq!(reserved["condition"], "Reserved");
     assert_eq!(sequence(root.path()), initial);
@@ -285,8 +285,8 @@ fn reserved_ids_are_not_business_commands_and_refusal_stays_pending_until_explic
         cli(
             root.path(),
             &[
-                "request",
                 "inspect",
+                "request",
                 "--operation-id",
                 id,
                 "--format",
@@ -295,19 +295,19 @@ fn reserved_ids_are_not_business_commands_and_refusal_stays_pending_until_explic
         )["condition"],
         "Reserved"
     );
-    let unprepared = run(root.path(), &["request", "retry", "--operation-id", id]);
+    let unprepared = run(root.path(), &["retry", "request", "--operation-id", id]);
     assert!(!unprepared.status.success());
     let diagnostic = String::from_utf8(unprepared.stderr).unwrap();
     assert!(diagnostic.contains(&format!("Saved reservation: {id}")));
-    assert!(diagnostic.contains("request pending"));
-    assert!(diagnostic.contains(&format!("request seal --operation-id {id}")));
-    assert!(!diagnostic.contains("request retry --operation-id"));
+    assert!(diagnostic.contains("list requests"));
+    assert!(diagnostic.contains(&format!("seal request --operation-id {id}")));
+    assert!(!diagnostic.contains("retry request --operation-id"));
     assert_eq!(sequence(root.path()), initial);
     let refused = run(
         root.path(),
         &[
-            "claim",
             "post",
+            "claim",
             "00000000000000000000000000000999",
             "--operation-id",
             id,
@@ -325,12 +325,12 @@ fn reserved_ids_are_not_business_commands_and_refusal_stays_pending_until_explic
     assert_eq!(outcome["condition"], "DomainOutcome");
     assert!(
         String::from_utf8_lossy(&refused.stderr)
-            .contains(&format!("request retry --operation-id {id}"))
+            .contains(&format!("retry request --operation-id {id}"))
     );
     assert_eq!(pending(root.path())[0]["operation_id"], id);
     let refused_without_stderr = closed_stderr(
         root.path(),
-        &["request", "retry", "--operation-id", id, "--format", "json"],
+        &["retry", "request", "--operation-id", id, "--format", "json"],
     );
     assert_eq!(refused_without_stderr.status.code(), Some(5));
     assert_eq!(
@@ -338,7 +338,7 @@ fn reserved_ids_are_not_business_commands_and_refusal_stays_pending_until_explic
         "DomainOutcome"
     );
     assert_eq!(
-        run(root.path(), &["request", "retry", "--operation-id", id])
+        run(root.path(), &["retry", "request", "--operation-id", id])
             .status
             .code(),
         Some(5)
@@ -346,13 +346,13 @@ fn reserved_ids_are_not_business_commands_and_refusal_stays_pending_until_explic
     assert_eq!(sequence(root.path()), initial);
     let sealed = quiet_cli(
         root.path(),
-        &["request", "seal", "--operation-id", id, "--format", "json"],
+        &["seal", "request", "--operation-id", id, "--format", "json"],
     );
     assert_eq!(sealed["condition"], "Sealed");
     assert_eq!(sequence(root.path()), initial);
     assert_eq!(pending(root.path()), json!([]));
     assert_eq!(
-        run(root.path(), &["request", "retry", "--operation-id", id])
+        run(root.path(), &["retry", "request", "--operation-id", id])
             .status
             .code(),
         Some(5)
@@ -416,8 +416,8 @@ fn managed_flags_json_yaml_keep_shared_authored_identity_and_explicit_path_synta
         run(
             root.path(),
             &[
-                "request",
                 "retry",
+                "request",
                 "some-path",
                 "--operation-id",
                 a["operation_id"].as_str().unwrap()
@@ -505,8 +505,8 @@ fn a_bounded_generation_rotates_automatically_and_retires_its_references_across_
             root.path(),
             "3",
             &[
-                "request",
                 "inspect",
+                "request",
                 "--operation-id",
                 id,
                 "--format",
@@ -516,18 +516,14 @@ fn a_bounded_generation_rotates_automatically_and_retires_its_references_across_
         assert_eq!(inspected["condition"], "Retired", "{inspected}");
     }
     assert_eq!(
-        rotating(
-            root.path(),
-            "3",
-            &["request", "pending", "--format", "json"]
-        )["operations"],
+        rotating(root.path(), "3", &["list", "requests", "--format", "json"])["operations"],
         json!([])
     );
     drop(server);
     let _server = start(root.path());
     let retry = command(
         root.path(),
-        &["request", "retry", "--operation-id", &ids[0]],
+        &["retry", "request", "--operation-id", &ids[0]],
     )
     .env("FOCAL_MANAGED_ROTATION", "3")
     .output()

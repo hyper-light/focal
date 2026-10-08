@@ -210,7 +210,7 @@ Pending admission uses a bounded staging allowance independent of the total core
 
 The shared-port listener selects separate data and bootstrap certificates by ALPN. Real QUIC tests cover pin-before-token enrollment, Node-only metadata reads, withheld data grants, role/CSR privilege rejection and live revocation. Network helper boundaries return errors for missing Tokio context and contain dependency failures from runtimes missing IO/timer drivers. Bind checks run once; exchanges contain dependency unwinds even when a handle moves to another runtime, without probing a timer per request. Failed Unix setup removes only the socket inode it created. Connection admission accounts for bookkeeping; it is not a complete measurement of transport buffer RSS. Authority activation, grants and proof-consuming commands now commit in the control log, preserving previous bootstrap hashes and command tags. Once activated, injected legacy verifiers cannot bypass installed authority. Partitions install authenticated root snapshots through their own log; revocations take effect there after installation. Live session/custody/delegation evidence producers remain open. These additions do not complete the join-to-voter service or any distributed deployment journey.
 
-The join component keeps one private key, CSR and request identity across unknown enrollment outcomes and restart. Verified enrollment is persisted before physical identity installation, and loss of initialized private state is rejected. Invitation files use private, non-clobbering atomic installation; private invitation/join wrappers redact and clear their secret buffers on drop. Generic transport buffers do not provide that zeroization guarantee. `cluster invite` calls a founder-only OS-authenticated administrative socket; its named request survives retries and signer restart. `join` installs identity and exits; plain `start` selects the persisted network service. A joining Node certificate creates no voter, session replica or Runtime grant.
+The join component keeps one private key, CSR and request identity across unknown enrollment outcomes and restart. Verified enrollment is persisted before physical identity installation, and loss of initialized private state is rejected. Invitation files use private, non-clobbering atomic installation; private invitation/join wrappers redact and clear their secret buffers on drop. Generic transport buffers do not provide that zeroization guarantee. `invite node` calls a founder-only OS-authenticated administrative socket; its named request survives retries and signer restart. `join` installs identity and exits; plain `start` selects the persisted network service. A joining Node certificate creates no voter, session replica or Runtime grant.
 
 Membership cleanup binds each change to the complete applied configuration and its Raft index, so returning to the same voter set cannot satisfy a stale request. Receipts come from applying the configuration entry itself. The session replica host waits for a subsequent current-term quorum read before returning a membership result. Control writes return the committed receipt; obtaining the current control configuration requires a separate quorum-fenced read. An unassigned or removed node cannot campaign through an upstream path that assumes local voter progress exists. Session checkpoint V3 retains the latest membership receipt and reads the earlier formats; older superseded membership requests require reconciliation from a fresh view. Control checkpoint V3 retains configuration indices and contacts while preserving its existing retry table. Leadership transfer reports initiation, not a committed membership result. These APIs remain trusted composition boundaries; a Node certificate grants no placement or Runtime authority.
 
@@ -274,7 +274,7 @@ The local binary now accepts `submit claim`, `submit testament`, and `submit art
 
 Each manual mutation persists the fully expanded request and a distinct epoch-admission request before transmission. Owner-private, checksummed journals retain exclusive filesystem locks across waits and survive lost epoch/business replies. Fixed epoch one permits independent processes without racing an epoch-floor advance; no automatic floor/receipt GC is claimed. Only a verified committed or duplicate receipt completes an operation. `request inspect/retry` reopens exact state; missing initialized state, mismatched context and ambiguous journal writes fail closed. Journal fsync and CLI file IO run on the main OS thread between network waits. Manual commands use a current-thread async runtime rather than starting a worker pool for each process. No new async actor, worker thread or `Arc` wrapper is introduced by this adapter.
 
-`claim post/progress/cancel`, `receipt acquire`, and `evidence begin` expose existing domain operations. Artifact downloads use at most 64 KiB network pages, server manifest/chunk verification and exact client offset/length/EOF checks; complete bytes are synced and atomically linked into a new private output file without overwriting an existing path. The content root addresses a manifest rather than raw byte concatenation. Independent client manifest-proof export and convenient resumable uploads remain open. JSON output uses fallible typed envelopes for paths and object results, retaining exact Unix path bytes. Joined-node local contexts explicitly reject before transmission until the adapter can resolve that node's actual authenticated principal and ledger.
+`claim post/progress/cancel`, `acquire receipt`, and `begin evidence` expose existing domain operations. Artifact downloads use at most 64 KiB network pages, server manifest/chunk verification and exact client offset/length/EOF checks; complete bytes are synced and atomically linked into a new private output file without overwriting an existing path. The content root addresses a manifest rather than raw byte concatenation. Independent client manifest-proof export and convenient resumable uploads remain open. JSON output uses fallible typed envelopes for paths and object results, retaining exact Unix path bytes. Joined-node local contexts explicitly reject before transmission until the adapter can resolve that node's actual authenticated principal and ledger.
 
 The [manual guide](../manual-cli.md) documents executable examples and limits. This increment does not automatically acknowledge a testament or run work validators in the foreground service. `TestamentGenerated` remains distinct from satisfaction. MCP/skills, complete challenge/consult workflow policy and corrective/follow-up issuance, remote contexts, remaining cluster operations and deployment/scale gates are still required.
 
@@ -288,7 +288,7 @@ Final manual CLI qualification on macOS arm64, 2026-09-05: **561 tests across 51
 Final architecture checks resolve **309 links**, preserve all **37 imported Hecate source hashes**, and validate **15 frozen vocabularies**. [MCP protocol research](14-mcp-protocol-research.md) records the verified primary revision, compatibility choice, Rust ownership/transport tradeoffs and future conformance gates; it does not claim an implemented MCP server.
 
 
-The local MCP increment adds `focal mcp serve` over the existing authenticated Unix client. The shared Rust registry contains 16 authored operations and exhaustive coverage metadata for the 29 model commands plus wire/query/stream/upload/custody families. CLI lifecycle/read/list construction now uses those same builders. MCP adds `request.inspect` and `request.retry`, with caller-selected durable operation IDs independent of JSON-RPC IDs. Flags, JSON, YAML and MCP continue to compile into the existing frozen wire types; this increment adds no model or command ordinal.
+The local MCP increment adds `focal serve mcp` over the existing authenticated Unix client. The shared Rust registry contains 16 authored operations and exhaustive coverage metadata for the 29 model commands plus wire/query/stream/upload/custody families. CLI lifecycle/read/list construction now uses those same builders. MCP adds `request.inspect` and `request.retry`, with caller-selected durable operation IDs independent of JSON-RPC IDs. Flags, JSON, YAML and MCP continue to compile into the existing frozen wire types; this increment adds no model or command ordinal.
 
 A private operation-ID store binds cluster/principal/ledger, operation version, authored intent and expected revision before generating IDs. It persists complete expanded epoch/business requests before transmission, retains exact replies in ordinary CLI journals, and conservatively reserves aggregate disk quota before admitting another ID. Initialization faults after complete prepared requests recover those same bytes; an incomplete durable ID claim without them fails closed. A separate context-bound bootstrap marker prevents a missing initialized store from silently resetting retry identity. Root catalog locks end before network waits; each operation owns its own journal lock. No automatic history eviction or epoch-floor advancement is introduced.
 
@@ -318,7 +318,7 @@ The lookup spans both retained domain and cursor mutation receipts. Cursor metad
 
 Retained results win even below the epoch floor. `BelowFloor` means that new admission is fenced at the committed prefix, with historical outcome unknown. All other missing results remain `Unknown`, including pending uncommitted proposals. Quorum loss, a stale owner/route or capacity exhaustion returns an operational error. The client validates query, principal, ledger, request key, route, sequence and cursor application bounds before exposing a result.
 
-The CLI exposes `request status`, `request epoch` and `request inspect --remote`. MCP exposes shared `request.status`/`request.epoch` operations and optional `remote: true` on `request.inspect`. Remote journal inspection always queries the business request, even if local recovery still awaits epoch admission. It checks a returned domain receipt's command hash and any saved receipt, rejects cursor-family collisions, and never advances or clears the journal. Exact retry remains the action that persists recovered receipts. Existing local inspection remains available without a remote request. The packaged skill contract now covers all 20 advertised tools and preserves these uncertainty rules.
+The CLI exposes `inspect mutation`, `inspect epoch` and `inspect request --remote`. MCP exposes shared `request.status`/`request.epoch` operations and optional `remote: true` on `request.inspect`. Remote journal inspection always queries the business request, even if local recovery still awaits epoch admission. It checks a returned domain receipt's command hash and any saved receipt, rejects cursor-family collisions, and never advances or clears the journal. Exact retry remains the action that persists recovered receipts. Existing local inspection remains available without a remote request. The packaged skill contract now covers all 20 advertised tools and preserves these uncertainty rules.
 
 Safe concurrent ownership and retirement of each principal's epoch stream remain P17.11. Read-only observation cannot by itself authorize epoch-floor advancement, acknowledge another process's request or garbage-collect its recovery journal. Remote credential selection, broader lifecycle/workflow integration and the complete P00–P20 deployment gates remain required.
 
@@ -427,7 +427,7 @@ epoch or stream configuration. A successfully flushed result is marked delivered
 on disk before maintenance ACKs the contiguous delivered prefix. A broken output
 stream, timeout or noncommitted domain result leaves its exact operation pending;
 later successes cannot retire that gap. Cleanup failure after successful output
-is deferred. `request pending/inspect/retry` recover IDs; `request seal` (alias
+is deferred. `request pending/inspect/retry` recover IDs; `seal request` (alias
 `abandon`) explicitly fences a request without canceling a business claim.
 
 MCP uses a separate managed store with explicit `request.reserve`, discovery and
@@ -1186,7 +1186,7 @@ fixed blank-codepoint semantics, and a 64-KiB encoded limit. Shape checking reta
 no field strings and decides no verdict. Local and replicated custody use the
 same checker and schema-specific content read bounds. Local inline attestation
 now borrows bytes instead of cloning them. Existing test-report identity and
-parsing behavior remain unchanged. `focal schema get error-report` exposes its
+parsing behavior remain unchanged. `focal get schema error-report` exposes its
 exact descriptor/hash/example; list and shell completion discovery include it.
 MCP submits the same typed artifact, though payload-schema lookup currently
 remains CLI discovery. Runtime/tool failure needs no invented test counts.
@@ -5179,7 +5179,7 @@ Membership additions and promotions require the native promise after
 activation. Nodes host the engine at construction over `<data>/content`
 ([network_service.rs](../../crates/focal-node/src/network_service.rs),
 [embedded.rs](../../crates/focal-node/src/embedded.rs)); the support driver
-makes hosted replicas promise; `cluster replicas activate-native --session`
+makes hosted replicas promise; `activate native --session`
 proposes activation through the replica admin protocol; replica diagnostics
 report native hosting, readiness and activation.
 
@@ -5341,7 +5341,7 @@ them. Bounded lists, the validation context read, claim history expansion and
 node-scheduled native timers are refused as unsupported until the index
 families of the next batch exist; nothing is partially served.
 
-Activation gained the pieces a laptop needs: `cluster replicas activate-native`
+Activation gained the pieces a laptop needs: `activate native`
 on a node without a network listener runs offline against the exclusive data
 directory ([native_activation.rs](../../crates/focal-node/src/native_activation.rs)),
 commits the record under the node's own authority, checkpoints and returns;
@@ -5476,12 +5476,12 @@ claims its `n1:` identity in the client journal and drives the frame to a
 committed receipt, a closed refusal or a recovery command
 ([native.rs](../../crates/focal-node/src/cli/native.rs),
 [native_documents.rs](../../crates/focal-node/src/cli/native_documents.rs)).
-New verbs and flags: `artifact submit --slot`, `artifact diagnostic --reason`,
-`testament submit --slot SLOT=ID:HASH --diagnostic ID:HASH`, `testament post`,
-`validation begin --validation --slot`, `validation report --verdict`, and
+New verbs and flags: `submit artifact --slot`, `submit diagnostic --reason`,
+`submit testament --slot SLOT=ID:HASH --diagnostic ID:HASH`, `post testament`,
+`begin validation --validation --slot`, `report verdict --verdict`, and
 `--parent`, `--max-responses`, `--slot-json` on `submit claim`; `request
-retry|inspect --operation-id n1:…`, `request pending` rows for native
-operations, `schema coverage`, `schema get NAME --native`, and an
+retry|inspect --operation-id n1:…`, `list requests` rows for native
+operations, `inspect coverage`, `get schema NAME --native`, and an
 engine-aware `status`. The client journal records reported refusals and a
 delivery marker so a reply lost after the commit stays listed until the
 recovery command reprints it. Results share the application result shape
@@ -5517,7 +5517,7 @@ issuer's receipt of the testament, begin and report of the evaluation,
 showing the validated evaluation, an exact retry printing the same receipt,
 SIGKILL and restart with identical reads and the same retried receipt, a
 post of the satisfied claim refused with the conflict exit class, and a
-reply lost on a closed stdout recovered through `request pending` and the
+reply lost on a closed stdout recovered through `list requests` and the
 printed recovery command. [fleet_native_tests.rs](../../crates/focal-node/src/fleet_native_tests.rs)
 drives the replicated host in process (activation, standing, creation,
 linearizable object reads, post and a second principal's receipt), and the
@@ -5583,7 +5583,7 @@ refusal from a shared host serving a V1 ledger alike) and the
 V1 domain refusals do.
 
 Evidence: [mcp_native_a1.rs](../../crates/focal-node/tests/mcp_native_a1.rs)
-runs the real binary with two `mcp serve` processes, the issuer on the local
+runs the real binary with two `serve mcp` processes, the issuer on the local
 socket and the respondent on an enrolled QUIC client context: the native
 catalogue is discovered by both, the complete cycle (claim, post, receipt,
 work artifact, testament, post, receive, begin, report) runs through native
@@ -5735,11 +5735,11 @@ claim's current fence and parse their wait predicates and deadline;
 rebinding names both claims; audits mint the result testament identity and
 post it by its committed binding. Nothing is derived from wall-clock time and
 every minted identity is journaled with the frame as before. The CLI gains
-`claim release-scope`, `receipt adopt`, `artifact fail|receive|reject`,
+`release scope`, `adopt receipt`, `artifact fail|receive|reject`,
 `validation seal-increments|enter-whole-work`, the `audit generate|post`
 root (the one addition to the root list of
 [13](13-cli-and-agent-implementation-plan.md)), `monitor rebind|cancel`,
-native `monitor register` on the existing flags, and `--phase`/`--target` on
+native `register monitor` on the existing flags, and `--phase`/`--target` on
 `validation begin|report`; each adapts flags and documents identically
 ([native_documents.rs](../../crates/focal-node/src/cli/native_documents.rs),
 [monitor.rs](../../crates/focal-node/src/cli/monitor.rs)) and is refused by
@@ -6219,7 +6219,7 @@ and the MCP adapter for its failure branches. Two participants run two claims
 on a native ledger. On the first, the respondent's work fails: a failed
 testament without its diagnostic is refused before anything is sent (typed
 input failure); the respondent records the actual diagnostic with `artifact
-diagnostic --reason work` and authors `testament submit --outcome failed
+diagnostic --reason work` and authors `submit testament --outcome failed
 --diagnostic ID:HASH`; the reply is lost on a closed stdout (CLI) or the
 adapter dies before the result is consumed (MCP), the journaled frame is
 found committed and replayed, and exactly one testament exists. The claimant
@@ -6227,11 +6227,11 @@ receives it, reads the testament's `diagnostics` (producer, reason `Work`,
 exact artifact reference) and the diagnostic bytes through `get artifact`;
 the evaluator's context read names the missing slot as the exact target with
 the delivery check passed and the registration ineligible; `validation
-begin` and `validation report` on the missing slot are refused; `validation
+begin` and `report verdict` on the missing slot are refused; `validation
 enter-whole-work` assesses it, ending the required check and the claim
 `ValidationIncomplete` from a missing-target result with no attempt and no
 evidence, never Satisfied. On the second claim the work succeeds and the
-evaluator cannot run its handler: `validation report --verdict error` retains
+evaluator cannot run its handler: `report verdict --verdict error` retains
 an error report whose provenance names the claim, validation, exact artifact
 target and attempt zero, the evaluation stays open on attempt one of a
 declared bound of two, the claim stays Validating and the work is untouched;
@@ -6584,7 +6584,7 @@ and holder's later corrections `ConflictingCause`;
 `consult_follow_ups_refine_their_parent_within_its_authored_policy`: the
 subject refused under `escalation: none`, one follow-up admitted, the second
 refused `InvalidPolicy`, and a consultation without a policy taking
-follow-ups from anyone). The peer verbs, documents, `claim wait` on the
+follow-ups from anyone). The peer verbs, documents, `wait claim` on the
 native engine, the peer skill and the CLI/MCP fault journeys are R5.3–R5.5.
 
 Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09
@@ -6630,7 +6630,7 @@ bounds and monotonic checks over exact native claim reads, plus the
 `testament` predicate met once the issuer has received a closing
 testament; result kind `native_wait`). The wire claim content now carries
 the authored `policy`, so `get claim` returns it. The CLI adds `claim
-challenge|consult|correct|follow-up|lineage` and serves `claim wait` on
+challenge|consult|correct|follow-up|lineage` and serves `wait claim` on
 native ledgers (with `--until testament`); the MCP adapter derives the six
 tools from the descriptors, dispatches the composed reads through one
 `focal_native_client::read` entry point with a cancellable pause, and its
@@ -7161,7 +7161,7 @@ decision F33).
   `RegisteredEnrollment::renew` waits for its own grant); contacts and
   grants keep retired certificates through their grace;
   `AdminCommand::RenewCredential`, `ClusterAdmin::renew_credential`,
-  `AdminResult::CredentialRenewed`, CLI `cluster credentials renew`, MCP
+  `AdminResult::CredentialRenewed`, CLI `renew credential`, MCP
   `cluster.credentials.renew` (33 administration tools; the cluster skill is
   version 3).
 - **Contact retries.** A contact announcement retried after a lost reply is
@@ -7429,7 +7429,7 @@ discovery after placement change" of R6 ([24](24-placement-execution-and-fleet-c
 ## The operator's placement view (R6.10) — 2026-09-09
 
 Instruction 5 of R6 ([24](24-placement-execution-and-fleet-control.md) §15):
-`cluster placement` and `cluster plan` on the CLI and MCP.
+`inspect placement` and `plan placement` on the CLI and MCP.
 
 - **Client** (`focal-client`): `AdminResult::{Placement, Plan}`,
   `AdminPlacement`, `AdminPartition`, `AdminSeal`, `AdminPlacementNode`,
@@ -7511,7 +7511,7 @@ application sessions by name.
   tenants, create_session}` (the client recomputes the expected session
   identity and refuses any other answer), `AdminResult::{Tenants,
   SessionCreated}`, `AdminSessionPlacement.founder`; CLI `cluster tenants
-  admit|list`, `cluster sessions create`; MCP `AdminAction::{AdmitTenant,
+  admit|list`, `create session`; MCP `AdminAction::{AdmitTenant,
   Tenants, CreateSession}` and descriptors `cluster.tenants.admit|list`,
   `cluster.sessions.create` (`ADMIN_TOOL_COUNT` 38); cluster skill version 5
   (digest re-pinned), manifest, `docs/cluster-admin.md`.
@@ -7564,7 +7564,7 @@ qualification the plan names for R6.
   `propose_placement` with the active policy's residency and the requested
   durability, identity `focal.placement.request.v1` over ledger, authority
   record and durability). `SessionPlannedReply`, `ClusterAdmin::plan_session`,
-  `AdminResult::SessionPlanned`, CLI `cluster sessions plan`, MCP
+  `AdminResult::SessionPlanned`, CLI `plan session`, MCP
   `cluster.sessions.plan` (`ADMIN_TOOL_COUNT` 39), skill version 6.
 - **Local socket redirects**: the Unix client transport resends at a hinted
   epoch to the same node instead of refusing the hint; the node answers the
@@ -7586,8 +7586,8 @@ qualification the plan names for R6.
   epoch 2 from the founder.
 - **Test** `crates/focal-node/tests/placement_binary.rs::a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is_killed_mid_plan`:
   three real `focal` processes (founder with `--advertise`, two hosts
-  invited with `cluster invite`, joined with `join`, started), enrollment
-  and load observed through `cluster placement`, `cluster sessions plan`
+  invited with `invite node`, joined with `join`, started), enrollment
+  and load observed through `inspect placement`, `plan session`
   for one tolerated node loss (`planned` with the three voters; the retry
   names the same operation as `planned` or `pending`), the founder killed
   with SIGKILL as soon as the pending plan leaves `Planned` (or activated),
@@ -7595,7 +7595,7 @@ qualification the plan names for R6.
   pending plan, route epoch 2, membership epoch 3, placement epoch 2,
   three voters, `achieved_max_failures` 1, nothing blocking, nothing
   retiring, founder recorded, `satisfied` on the same request, an empty
-  `cluster plan`); host-b killed (a `status` quorum read still answers
+  `plan placement`); host-b killed (a `status` quorum read still answers
   through the founder's local socket; the directory suspects the host and
   measures no tolerated failure), then restarted (alive, the guarantee
   whole, no pending plan).
@@ -7881,7 +7881,7 @@ bypassed.
   which is how a native authority admits a prospective learner; the grouped
   worker reports a stopped session's reason on standard error; replica
   diagnostics gain `seed_chunks_missing` and `delivery_retained`; the
-  replica admin protocol and `focal cluster replicas checkpoint` take an
+  replica admin protocol and `focal checkpoint replica` take an
   explicit synchronous checkpoint; `FOCAL_SEED_INLINE_BYTES` moves the
   inline bound for qualification.
 - **Tests**: evidence `seeds_are_sealed_read_back_verified_and_removed_only_on_purpose`;
@@ -8101,7 +8101,7 @@ identity.
   `placement_controller::drive_balance` after `drive_movement` (skipped while
   a transfer is pending or in flight; a split names the new member from the
   ledger, member, affinity and epoch; refusals are observed again); client
-  `AdminRangeMember.entries`; `cluster replicas ranges list` shows it.
+  `AdminRangeMember.entries`; `list ranges` shows it.
 - **Tests**: `range_balancer::tests` (a dip resets, a split precedes a
   merge, a full layout never splits, non-adjacent or unequal pairs never
   merge, a departed member drops its observations); in-process
@@ -8158,7 +8158,7 @@ drive; the directory publishes each session's holders.
   with every holding replica a member of the active placement at its
   enrolled generation (`Missing`/`StaleNode`).
 - **Admin**: `AdminSessionPlacement.{range_epoch, holders}` with
-  `AdminRangeHolder`; `cluster placement` shows them.
+  `AdminRangeHolder`; `inspect placement` shows them.
 - **Tests**: `placement_progress::holders_publish_in_epoch_order_for_placement_members_only`
   (every refusal, idempotence, conflict, staleness, the schema 7 round trip
   and a schema 6 restore); real-binary
@@ -8339,7 +8339,7 @@ counts and verifies a bundle.
   on reads of a retired claim; `OperatorRead::Archive {session, claim}`
   → `AdminArchiveBundle` (continuation, verified structure, families,
   receipts); `AdminRetention {retired, retiring}`; CLI `cluster retention
-  show`, `cluster archive show --claim`; MCP `cluster.retention.show`,
+  show`, `inspect archive --claim`; MCP `cluster.retention.show`,
   `cluster.archive.show` (41 admin descriptors; cluster skill version 7,
   manifest re-pinned).
 - **Tests**: `native::retirement_tests` (3), `record_codec::archive` through
@@ -8480,7 +8480,7 @@ its verification, which runs without a node.
   `SeedManifest::assemble_with` reads chunks from any source.
 - `focal-node`: `backup.rs` (`create` through the replica's evidence export
   and a blocking write; `verify` offline), `AdminCommand::BackupCreate`,
-  `cluster backup create --output DIR [--session ID]`, `cluster backup
+  `create backup --output DIR [--session ID]`, `cluster backup
   verify --input DIR` (runs before any node or data directory is opened),
   MCP `cluster.backup.create` and `cluster.backup.verify` (45 admin
   descriptors, cluster skill v9), `AdminResult::{BackupCreated,
@@ -8517,7 +8517,7 @@ its verification, which runs without a node.
 **Remaining in R8.6.** Restore: verification before serving, the
 recovery incarnation (a new log group and genesis, the placement and
 membership sections reset, the session registered as this node's own),
-the fenced same-incarnation decision, `cluster restore`, and the
+the fenced same-incarnation decision, `restore session`, and the
 real-binary journey through a killed node and a fresh cluster.
 
 ## Restore and the recovery incarnation (R8.6, second step, 2026-09-10)
@@ -8548,12 +8548,12 @@ history.
   admit the tenant, import through `ContentHost::restore_content`, install
   seeds and rewrite on a blocking thread, begin the log, record the copy as
   created here, attach it through the refactored `attach_copy`; the next
-  pass registers it), `AdminCommand::Restore`, `cluster restore --input DIR
+  pass registers it), `AdminCommand::Restore`, `restore session --input DIR
   [--new-incarnation]`, MCP `cluster.restore` (46 admin descriptors,
   cluster skill v10), `AdminResult::Restored` with `AdminRestore`;
-  `cluster backup create` takes `--tenant` for a served tenant's session;
-  saved connections address another served session (`context add NAME
-  --node-data-dir DIR --tenant ID --session ID`, `context add NAME
+  `create backup` takes `--tenant` for a served tenant's session;
+  saved connections address another served session (`add context NAME
+  --node-data-dir DIR --tenant ID --session ID`, `add context NAME
   --enrolled-as CONTEXT --session ID`).
 
 **Evidence (macOS arm64, `--offline`).** Gate 87, 2026-09-10
@@ -8652,7 +8652,7 @@ omitted fields keep committed values; every value names its source.
   key or a committed change is operator input (exit 2, `committed_policy`).
 - `node.metrics_listen` (loopback only) joins the schema and the settings;
   the schema now declares `node.max_tenants`.
-- `deployment explain` prints `requested`, `effective`, `committed_revision`
+- `explain deployment` prints `requested`, `effective`, `committed_revision`
   and `sources`.
 - Tests: `config/tests.rs` (unknown-key paths, schema/serde agreement,
   precedence and sources, committed policy over omitted fields and refusal
@@ -8681,7 +8681,7 @@ journaled per change so a repeated apply resumes and repeats nothing.
   waiters as `(reply, dry_run)` pairs and journals `SessionChange::Plan`
   only when a waiter is not a dry run — a request that is only dry runs
   proposes from the committed directory and commits nothing; `pending` and
-  `satisfied` answers never journaled. `cluster sessions plan --dry-run`,
+  `satisfied` answers never journaled. `plan session --dry-run`,
   MCP `cluster.sessions.plan` v2 (`dry_run`), `AdminResult::SessionPlanned
   { dry_run }`; cluster skill v12.
 - `crates/focal-node/src/deployment/`: `plan.rs` (`FCLPLAN1`: magic,
@@ -8713,7 +8713,7 @@ journaled per change so a repeated apply resumes and repeats nothing.
   `status` re-checks journaled plans), `mod.rs` (`DeploymentError` with
   exits `stale_plan` 5, `wrong_deployment` 2, `plan_corrupt` 2,
   `guarantee_unsatisfied` 6).
-- `cli/deployment.rs` (moved out of `main.rs`): `deployment plan --config
+- `cli/deployment.rs` (moved out of `main.rs`): `plan deployment --config
   FILE (--output NEW_FILE | --dry-run)`, `apply --plan-file FILE [--wait
   SECONDS]`, `status [--plan ID]`, and the existing `explain` (now printing
   `requested`, `effective`, `committed_revision` and `sources` also when the
@@ -8722,7 +8722,7 @@ journaled per change so a repeated apply resumes and repeats nothing.
   committed policy for every command, so omitted policy fields take the
   committed values at startup (the R9.1 rule, previously only stated) and a
   differing file is refused by name at load; `resolve_request` serves
-  `deployment plan`/`explain`, where the file is the request. The founding
+  `plan deployment`/`explain`, where the file is the request. The founding
   network node solves the single-node placement only when pinning its first
   policy, and the service falls back to the single-node scope before its
   session registers, so a committed policy stronger than one host provides
@@ -8886,7 +8886,7 @@ it.
   (`next_root_command`); the partition learns the re-grant like a drain's.
 - **Surface.** `AdminCommand::RotateCredential` → `CredentialRotated`;
   `CredentialSummary` and the renewal reply gain `key_identity` and
-  `rotations`; CLI `cluster credentials rotate`; MCP
+  `rotations`; CLI `rotate credential`; MCP
   `cluster.credentials.rotate` (53 descriptors, cluster skill v15); the
   founder answers `unsupported`.
 - **Tests.** `focal-enrollment` `a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only_through_the_grace`
@@ -8917,7 +8917,7 @@ destination data triggers verified recopy, not fresh object identity"):
 forward repair of the copies a placement already requires, and the pull a
 fresh copy makes for the objects its committed history names.
 
-- **The walk.** `cluster repair [--tenant T] [--session S] [--after A]
+- **The walk.** `repair session [--tenant T] [--session S] [--after A]
   [--limit N]` (`AdminCommand::Repair` → `RepairedReply` → `AdminResult::Repaired
   { repair: AdminRepair }`; MCP `cluster.repair`; 54 descriptors, cluster
   skill v16). The replica exports its committed prefix (the same
@@ -8996,7 +8996,7 @@ a binary behind the fence refuses to serve.
   (`prepare_activate_fence`: zero or lower is invalid, the same level a
   conflict read as done; `EnrollmentCommand::activated_fence`), committed
   through the quorum enrollment host (`QuorumEnrollmentHost::activate_fence`).
-- **Surface.** `cluster upgrade status` / `cluster.upgrade.status`
+- **Surface.** `inspect upgrade` / `cluster.upgrade.status`
   (`AdminCommand::UpgradeStatus` → `UpgradeReply` → `AdminResult::Upgrade
   { upgrade: AdminUpgrade }`: the fence, this binary's compiled and
   announced levels, every directory-listed node with the level it last
@@ -9180,7 +9180,7 @@ found and could not start.
 - **One command for a packaged host.** `start --invite-file FILE` enrolls
   when the directory holds no identity, then starts; `prepare-volume
   --owner UID:GID` creates the data directory for the node's user;
-  `cluster invite --output -` writes the invitation to a pipe.
+  `invite node --output -` writes the invitation to a pipe.
 - **Rendering.** `deployment/render/{systemd,kubernetes}.rs` and
   `deployment render systemd|kubernetes`: deterministic files, never
   overwritten, every lacking fact named as `missing` (image, storage
@@ -9390,7 +9390,7 @@ workload and upgrade stages follow.
   written under it, and a full volume (`ulimit -f`) refusing an oversized
   write with no acknowledgement; a backup restored on a fresh laptop as a
   recovery incarnation, and only with `--new-incarnation`, read back
-  through a saved connection; `deployment explain` naming requested,
+  through a saved connection; `explain deployment` naming requested,
   effective and observed values against a golden; a dry run that writes
   nothing under the directory; and a plan of another deployment
   (`wrong_deployment`) and a tampered plan (`plan_corrupt`) refused before
@@ -9416,7 +9416,7 @@ workload and upgrade stages follow.
   is not removed, a drained one leaves the guarantee visibly short until a
   replacement joins and the placement heals, and is removed only once
   nothing names it.
-- **Explain observes the running directory.** `deployment explain` without
+- **Explain observes the running directory.** `explain deployment` without
   an inventory now, on a node that runs a directory, plans against every
   node the directory knows (with its announced domains and standing) and
   reports each session's achieved level and what blocks it in an `observed`
@@ -9688,7 +9688,7 @@ install-check lanes.
 
 **R10 Windows CLI + MCP product gates both green (Windows Server 2022 CI, run
 34672668845, commit 727278c):** the MCP A1 gate now runs beside the CLI gate —
-two participants each behind their own `focal mcp serve`, the full native claim
+two participants each behind their own `focal serve mcp`, the full native claim
 cycle through MCP tools over stdio, a killed and restarted node, identical reads
 and exact retries — and both pass on the shipped release binary. This closes the
 plan's R10 criterion "the Windows CI lane runs platform, transport, CLI, MCP and
@@ -9961,8 +9961,8 @@ beyond the already-fixed items.
 ## 2026-09-13 — Completion reservation decoupled from `preparation_bytes` (per-node concurrent-respondent envelope)
 
 **Defect (live multi-agent exercise, macOS arm64).** On a long-lived QUIC node,
-completion-class native writes from enrolled participants (`receipt acquire`,
-`artifact submit`, `testament submit`) began failing `Owner(Native(Memory(
+completion-class native writes from enrolled participants (`acquire receipt`,
+`submit artifact`, `submit testament`) began failing `Owner(Native(Memory(
 Capacity { requested, available })))` — surfaced to the client as
 `RequestUnconfirmed` / capacity — while the founder's Unix-socket creations kept
 succeeding. Root cause: the native owner pre-reserves a respondent's entire
@@ -10029,12 +10029,12 @@ Raft term 1→2 and applied index 18→20.
 
 **Bootstrap finding.** A founder's first start must be satisfiable by its own
 facts (`bootstrap_blocking`: `placement::plan` over the founder alone); the
-stronger guarantee is committed later by `deployment apply` and realised by the
+stronger guarantee is committed later by `apply deployment` and realised by the
 placement controller promoting learners. The shipped `deploy/kubernetes`
 configmap hands the founder `survive: zone, max_failures: 1` as its first-start
 config, which cannot cold-start (three zones required, one present). The KIND
-run bootstraps with `max_failures: 0` and upgrades through `deployment apply`;
-manual `cluster membership promote` is not the path.
+run bootstraps with `max_failures: 0` and upgrades through `apply deployment`;
+manual `promote learner` is not the path.
 
 **SWIM/Raft tests measured against `../slates/crates/cluster/tests` (the
 benchmark: ~3,800 lines / 11 dedicated files).** Mechanisms were present
@@ -10058,7 +10058,7 @@ covered by `tests/fleet_quic.rs`. Still open against the benchmark: slates'
 commit-level late-work extension (`extend.rs`: extended past deadline, stalled
 commit expires uncertain, straggler session reuse) is a mechanism focal's
 Raft-proposal commits do not have (AD-26 design decision), and there is no
-focal-native supervisor for self-restart (`focal start` exits on fail-stop and
+focal-native supervisor for self-restart (`focal start node` exits on fail-stop and
 relies on the orchestrator).
 
 **Evidence.** `cargo fmt --all --check` clean; `clippy -p focal-consensus -p
@@ -10083,7 +10083,7 @@ announce after the retry floor moved. Regressions:
 `network_join_tests::a_join_carries_the_advertised_name_...`.
 
 **Zone-survival guarantee — ACHIEVED and survives a zone kill.** After the learners caught up,
-`deployment plan --config target.yaml` was unblocked and `deployment apply` converged the application
+`plan deployment --config target.yaml` was unblocked and `apply deployment` converged the application
 session to `voters=[founder, b, c]` across zones a/b/c with `achieved_survive: Zone, max_failures: 1,
 blocked_by: []`. Killing zone c kept session quorum (the founder stayed available and applied) and c
 rejoined on a new IP and caught up. The root control group stays 1 voter + 2 learners by design (the
@@ -10152,7 +10152,7 @@ This is also the first periodic control-log compaction (previously the root log 
 
 **Live validation (KIND, fresh deploy, focal:0.1.7, no restart).** Both learners reach
 `matched = leader.applied` within ~5s (was stuck at 0 for 18+ min); `snapshot_index` tracks `applied`
-and stays stable for 180s (no storm, log bounded); `deployment apply` then converges the application
+and stays stable for 180s (no storm, log bounded); `apply deployment` then converges the application
 session to `voters` across zones a/b/c with `achieved_survive: Zone, blocked_by: []` in ~20s — the full
 laptop→zone-survival journey from a clean deploy with no manual intervention.
 
@@ -10160,15 +10160,15 @@ Gates green: `cargo fmt --all --check`; `clippy --workspace --all-targets -D war
 `check-production.sh`; `check-contracts.py` (1454 links); `focal-consensus` 49 + `raft_safety_tests` 6;
 `focal-control` 8+5+9+1; `focal-node --lib` 222.
 
-## 2026-09-13 — Leader-loss recovery on KIND found two availability bugs: a founder that could not restart after `deployment apply`, and a liveness probe that killed healthy hosts when the root leader was down
+## 2026-09-13 — Leader-loss recovery on KIND found two availability bugs: a founder that could not restart after `apply deployment`, and a liveness probe that killed healthy hosts when the root leader was down
 
 Killing the founder pod (the only root voter, so the root leader, and a session voter) on the
 healthy 3-node KIND deployment exposed two bugs in how a node behaves when its control plane is
 gone or its committed policy has moved past its file.
 
-**Bug 1 — a founder crash-looped on restart after a sanctioned `deployment apply`.** The pod's
+**Bug 1 — a founder crash-looped on restart after a sanctioned `apply deployment`.** The pod's
 static configmap seeds single-node durability (`survive: node, max_failures: 0`, the only first
-start a lone founder can satisfy); `deployment apply` then committed `survive: zone,
+start a lone founder can satisfy); `apply deployment` then committed `survive: zone,
 max_failures: 1`. On restart `config::resolve` (and `embedded::check_policy`) refused the
 differing file value as `CommittedPolicyChange` and the founder exited with
 `[committed_policy] configuration field durability.survive differs from the committed policy` —
@@ -10184,8 +10184,8 @@ never refused for carrying what the fleet already carries; the file only seeds t
 An **operator command** (identity, cluster, deployment apply, …; `resolve`, the default) still
 refuses a file that sets a policy field to a value other than the committed one, by name,
 directing to plan/apply — so an operator who edits the file learns their edit does not take
-effect that way (the divergence is also visible through `deployment explain`). A policy
-**request** (`deployment plan`/`explain`, `resolve_request`) keeps the file's values as the
+effect that way (the divergence is also visible through `explain deployment`). A policy
+**request** (`plan deployment`/`explain`, `resolve_request`) keeps the file's values as the
 request. `policy::install_or_check` still refuses to overwrite a committed policy on a
 first-start install. Doc 08 §2 revised. This start/operator split matches REMAINING.md's narrow
 "restart" wording and keeps `cli_deployment`'s operator-refusal assertion.
@@ -10250,7 +10250,7 @@ network_service/join/controller/liveness tests (26).
 ### 2026-09-13 — dozens of nodes on KIND (focal:0.1.10)
 
 Scale-out from 3 to 25 pods (founder + 12 hosts in each of zones b and c; 22
-invitations issued from the founder with `cluster invite` and merged into the
+invitations issued from the founder with `invite node` and merged into the
 invitation secret, then `kubectl scale`): all 25 Ready in 108 s under `OrderedReady`
 (two sets in parallel, one pod at a time each), 0 restarts. Founder view after the
 join storm: root applied 144, snapshot 144 (one refresh per membership change, no
@@ -10258,7 +10258,7 @@ storm — counters identical 40 s later), 24 learners all `matched = applied` in
 Replicate, 26 dials / 26 connections opened (no failed dial), liveness 24 alive / 0
 suspect / 0 dead / 0 probe timeouts. Sampled hosts (b-5, b-11, c-11): leader known,
 applied 144, no placement error, 24 connections each, 24 alive. Pods respected zone
-affinity (4 per zone-b/zone-c worker, founder alone in zone a). `deployment explain`
+affinity (4 per zone-b/zone-c worker, founder alone in zone a). `explain deployment`
 against the mounted target: `PlanValid`, effective `zone / 1`, activated, committed
 revision 2. Bounds relevant at this scale (unchanged): peer pool and listener 128
 connections, enrollment listener 32 concurrent joins, partition `max_nodes` 1024,
@@ -10295,8 +10295,8 @@ alive / 0 dead / 0 probe timeouts, guarantee `Zone` with voters 099/100/101.
 
 Scale-down and node removal at scale: both host sets scaled 15 → 12 (six pods
 departed); the founder's liveness went 3 suspect → 6 dead within about 35 s while
-root membership still listed 30 learners. `cluster nodes remove` before any drain was
-refused `[not_drained]`; `cluster nodes drain` committed each node ineligible
+root membership still listed 30 learners. `remove node` before any drain was
+refused `[not_drained]`; `drain node` committed each node ineligible
 (`node_eligibility`, generation 2, indexes 190–195), and a `remove` issued in the same
 second was still refused `[not_drained]` — the drained grant reaches the placement
 partition's node view asynchronously — while the same `remove` about 40 s later
@@ -10306,7 +10306,7 @@ applied 207 = snapshot 207 (a refresh per membership change), liveness 24 alive 
 dead, guarantee unchanged.
 
 Writes during zone loss at scale: a client principal invited from the founder
-(`cluster client invite`, `context enroll` in the founder pod) submitted a baseline
+(`invite client`, `enroll context` in the founder pod) submitted a baseline
 claim, then all 12 zone-c pods (voter 100 among them) were deleted and a second claim
 was submitted 6 s into the outage: `Committed` at t = 7 s, readable during the outage
 (`get claim`), and both claims readable after zone c returned at t = 73 s; fleet
@@ -10356,7 +10356,7 @@ delete a removed node's volume with the node (the renderer's StatefulSets keep
 `volumeClaimTemplates` claims by design); a fenced node is visible as
 `root_leader 0` with no progress. Not changed: completing TLS for unknown
 certificates to deliver a reason would widen the unauthenticated surface. Open item:
-`cluster nodes list` still showed the contact records of removed nodes (31 records
+`list nodes` still showed the contact records of removed nodes (31 records
 for 25 live nodes); they route nowhere (no grant, no route) but the table is bounded
 by `max_nodes` (1024) and refuses new announcements when full, so a fleet that scales up
 and down would eventually wedge new nodes — fixed below (contact retirement).
@@ -10365,7 +10365,7 @@ A fresh data directory with an already-redeemed (and revoked) invitation file
 crash-loops at join, as it must: invitations are one-use.
 
 Re-inviting a removed name was impossible (`crates/focal-node/src/quorum_enrollment.rs`,
-`crates/focal-enrollment/src/journal.rs`): `cluster invite --node focal-b-12` after that
+`crates/focal-enrollment/src/journal.rs`): `invite node --node focal-b-12` after that
 ordinal had been drained, removed and its invitation revoked was refused
 `[invalid_input]` — the name's private slot still held the first invitation, whose
 committed record is now revoked, so `PendingInvitation::release` refused it for good,
@@ -10397,7 +10397,7 @@ scale-down/scale-up of a StatefulSet ordinal (below).
 
 Contact retirement (`crates/focal-control/src/{contacts.rs,state.rs,lib.rs}`,
 `crates/focal-node/src/{cluster_admin.rs,network_admin.rs,control_host.rs}`):
-`cluster nodes remove` now ends by retiring the node's committed contact record —
+`remove node` now ends by retiring the node's committed contact record —
 `ControlCommand::RetireContact { node, expected_generation }` (appended, append-only
 log discriminants), prepared by `NodeContacts::prepare_retire`, which compares the
 generation the operator read and refuses (`Unauthorized`) while any committed
@@ -10410,7 +10410,7 @@ receipt so an absent receipt with the record gone or moved is absence for good.
 `NodeRemoved.contact_retired` reports it (`false` on the exact repeat). Tests:
 `contacts::a_contact_is_retired_only_once_nothing_enrolls_its_node` (a live node's
 record refused; a removed node's retired once at its generation; checkpoint restores)
-and `cli_nodes` (removal reports `contact_retired: true`, `cluster nodes list` no
+and `cli_nodes` (removal reports `contact_retired: true`, `list nodes` no
 longer names the node, the repeat reports `false`). Doc 24 §19 and the manual revised.
 Regressions: `config::tests` (committed value + `Committed(3)` source for a differing file
 field) and `network_service_tests::a_founder_restarts_from_its_stale_seed_file_after_a_stronger_policy_was_applied`
@@ -10433,14 +10433,14 @@ other probes are incomplete rather than late. Regression
 (founder stopped: `alive` holds at once; `catching-up` returns `ProbeFailed` within the budget).
 
 **Bug 3 (deployment) — the renderer pinned the guarantee in every pod's static configmap.**
-`deployment render kubernetes` wrote the requested `survive: zone, max_failures: 1` into each
+`render kubernetes` wrote the requested `survive: zone, max_failures: 1` into each
 pod's mounted config. That config cannot bootstrap a lone founder (first-start placement needs
 three zones) and, after the operator's apply, is exactly the file/committed mismatch Bug 1
 crash-looped on. Fix (`deployment/render/kubernetes.rs`, Helm chart, doc 08 §5): every pod's
 configmap ships the first-start *seed* (`survive: node, max_failures: 0`, its zone), and the
 requested policy is rendered once as `target.yaml` in the same configmap, mounted read-only at
 `/etc/focal-target/target.yaml`; the notes and NOTES.txt tell the operator to
-`deployment plan --config /etc/focal-target/target.yaml` then `apply` once the hosts are Ready.
+`plan deployment --config /etc/focal-target/target.yaml` then `apply` once the hosts are Ready.
 The committed policy then carries every restart. Goldens regenerated; render golden and unit
 tests updated. systemd already seeds `node/0` and needs no split.
 
@@ -10585,7 +10585,7 @@ through a placement change. Three defects, each older than this work:
    A copy now also admits the members the committed directory names for its session
    (active voters, a pending plan's voters, retiring copies), which its agent announces
    (`ReplicaHost::admit_members`, at most 2048).
-2. **`cluster nodes drain` lost to a concurrent grant and left the journal pending.**
+2. **`drain node` lost to a concurrent grant and left the journal pending.**
    The grant is compared at the authority revision it was prepared from; a grant the
    controller committed in between refused it, and `reconcile` had no rule for a grant,
    so every later admin command answered `outcome_unknown`. `reconcile` proves a grant
@@ -11325,7 +11325,7 @@ stall by a longer period instead passed 14 of 16 here and failed CI on all three
 every request's time and every cadence stretched with it, past what wall-bounded clients
 and slower runners allow.
 
-**A death, held and told.** `cluster plan` says for how many seconds a death still stands
+**A death, held and told.** `plan placement` says for how many seconds a death still stands
 before a seat moves (`focal_directory::deaths_stand_for`, one rule with `deaths_held`). On
 five real processes a voter that goes silent and returns within the hold keeps its seat
 while a spare waits, nothing moves once the hold would have passed, and one that stays
@@ -11449,7 +11449,7 @@ load of 4–14 throughout, seen by both):
 | Path | before | after |
 |---|---|---|
 | A networked founder's `start --advertise` to its readiness line — twelve rounds each, the binaries alternating every round | median 3,181 ms (2,664–3,463) | median 3,100 ms (2,691–3,578) |
-| `cluster invite` (an admin request the founder signs) — two passes of ten | 111 / 106 ms | 100 / 107 ms |
+| `invite node` (an admin request the founder signs) — two passes of ten | 111 / 106 ms | 100 / 107 ms |
 | A peer's `join --invite-file` (a CLI process enrolling over TLS: its first randomness) — two passes of ten | 315 / 332 ms | 321 / 327 ms |
 | The joined peer's `start` to its readiness line — two passes of ten | 124 / 111 ms | 99 / 122 ms |
 
@@ -11664,7 +11664,7 @@ Namespace object, so `kubectl apply -k .` on a fresh cluster failed with
 "namespaces \"focal\" not found". It renders `namespace.yaml` first in the
 kustomization now; the checked-in manifests and the render golden test follow.
 
-**D2, the campaign's headline.** Every voter added by `deployment apply` after
+**D2, the campaign's headline.** Every voter added by `apply deployment` after
 `activate-native` stopped with `Corrupt` ("persisted ledger identity, format or
 prefix mismatch") and the session stayed in Catchup for good, the pods Ready.
 Reproduced in process
@@ -11774,7 +11774,7 @@ wait was lengthened.
 
 ### 2026-09-29 — the first online activation: the KIND campaign's D3 at its cause
 
-On every run of the campaign the first `cluster replicas activate-native` on a
+On every run of the campaign the first `activate native` on a
 freshly Ready founder answered `[unavailable] metadata owner is unavailable`
 (exit 6) and the retry succeeded. Not a race with readiness: an activation needs
 the local promise of the native decoder durable and every voter's recorded, the
@@ -11926,11 +11926,11 @@ the client's driver), `focal-wire`
 `validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound`.
 ### 2026-09-29 — F09: discovery selects the engine the mutation path uses
 
-`focal schema example claim.submit` printed the V1 engine's document whatever engine
+`focal get example claim.submit` printed the V1 engine's document whatever engine
 the ledger ran, normalised through the V1 decoder, and on a native ledger it failed at
 four layers in turn (an unknown `evidence_schemas`, a missing per-declaration
 `deadline`, a receipt declaration naming an evaluator, a claim on oneself the owner
-never posts); `schema list`, shape-only validation and name completion used the V1
+never posts); `list schemas`, shape-only validation and name completion used the V1
 registry too, and discovery's tests validated examples against the registry that
 produced them. One engine selection serves every surface now
 (`focal_client::operations::engine`): offline, `--native` wins, else the only catalogue
@@ -11939,7 +11939,7 @@ that has the name, else V1; online, the standing probe every host performs once
 an assumed engine reported as assumed. Every native descriptor has an authored example
 (`operations::native_examples`, the single source the tests draw on: deadlines at
 2100-01-01, claims that name another participant), normalised through the native
-decoder; `schema list` shows each operation's engine and version; `schema validate`
+decoder; `list schemas` shows each operation's engine and version; `validate document`
 with a context compiles the document against the ledger's committed bindings without
 claiming a journal identity. Tests: both engines' examples decode through their own
 decoder and shape (`discovery_tests`, `engine_tests`, `native_tests`), each authored
@@ -12450,7 +12450,7 @@ record, F13).
 
 ### 2026-09-30 — a request follows a leader that moves within a route epoch
 
-`drain_leader` failed now and then with `invalid_response` on a `receipt acquire` issued
+`drain_leader` failed now and then with `invalid_response` on a `acquire receipt` issued
 while the drained leader handed leadership on. Cause: the client's route cache refused a
 hint at the epoch it held that named another endpoint (`Routes::insert`), taking a route
 epoch's hint for immutable; but a route epoch names a placement, and within one the leader
@@ -12702,7 +12702,7 @@ and left the root group with the founder's single vote, the directory partition 
 issuer with the founder (the KIND campaign's D5): metadata operations stopped while the
 founder was down, and the operator was told the guarantee was achieved. The plan now
 seats the root's voters before the sessions' (`plan_root`), apply promotes them through
-the root one exact request each, `cluster placement` states what the root, the partition
+the root one exact request each, `inspect placement` states what the root, the partition
 groups and the issuer each survive by the rule the sessions are measured by, and
 readiness holds the committed policy to the root ([24 §15, §17](24-placement-execution-and-fleet-control.md);
 the remediation record, F24). On real binaries across three zones the root is led from
@@ -12750,7 +12750,7 @@ the remediation record, F24). The control plane's promise is the weakest of the
 root's and every partition group's, and readiness holds the policy to all of them.
 Measured on three real processes across three zones (`deployment_control_plane`,
 macOS, 2026-10-02): the plan names the partition group's three voters after the
-root's; `deployment apply` completes in 18 s with the root and the partition group
+root's; `apply deployment` completes in 18 s with the root and the partition group
 each at three voters tolerating zone/1 and node/1, every host running a replica of
 the partition at the leader's applied index; with the founder's zone silenced, the
 partition is led from another zone and a session is created on a host there. On
@@ -12786,7 +12786,7 @@ of its admission, and the admission waits on nothing.
 
 Two of batch 2's open items closed the same day: `cluster partitions
 show|add-learner|promote|remove|transfer` drive a directory partition group's membership
-and leadership by hand, and `cluster nodes remove` vacates a leaving node's seats in
+and leadership by hand, and `remove node` vacates a leaving node's seats in
 every partition group before its root membership (handing a group's leadership on first
 where it leads; `partitions_vacated` reports them). Found on the way: a control replica
 refused a leadership transfer whenever it did not lead, so a removal run anywhere but on
@@ -12852,7 +12852,7 @@ two lifetimes, a chain of three certificates (about 1.6 KiB).
 ### 2026-10-02 — a session plan is answered by its commit
 
 The macOS run of the drain journey waited three minutes on an activation that
-was never pending: `cluster sessions plan` had answered `planned` before the
+was never pending: `plan session` had answered `planned` before the
 plan's intent was journaled, the request was already off the agent's queue,
 and the partition then refused the intent (its observation had gone stale),
 so the plan was lost while the operator was told it was under way — and the
@@ -13317,7 +13317,7 @@ beside them, now wait on the fact they need, charged to what makes it
 - **The listener**: its admission changes. Each release it owes pairs with a place it
   took, so the changes it has made bound them.
 - **What the system bounds itself**: a QUIC close by the connection's idle timeout, a
-  child `claim wait` by its `--timeout-ms`, the MCP adapter by its shutdown bound, a
+  child `wait claim` by its `--timeout-ms`, the MCP adapter by its shutdown bound, a
   pool's send by its deadline. Beyond that bound stands only the frozen window (60 s),
   a wedge.
 - **Servers and workers that report no period**: the frozen window alone.
@@ -13357,7 +13357,7 @@ the time it takes without the burners:
 `runtime_host`'s check that a runtime refusing for capacity makes no call now waits for
 the owners to run the periods a quarter of a second holds, not for the quarter second.
 Recorded open: sleeps that only choose which path a test exercises, since no fact yet
-says that the path began (a child `claim wait` started 100 ms before its claim is
+says that the path began (a child `wait claim` started 100 ms before its claim is
 cancelled and 80 ms before SIGINT, where nothing reports a wait begun; a monitor timer
 read 1.5 s past its instant, where nothing reports a timer fired: F26's metrics are where
 both belong); and production waits with no stated derivation that the sweep found: the
@@ -13572,7 +13572,7 @@ the binary itself, with its flags, so a transcript cannot name a command the CLI
 
 The sampler listed the first 512 sessions by key and nothing over all of them; and a page
 of more than a few sessions passed the 60 KiB an operator reply carries, so a node's own
-metrics read (`cluster node metrics`, now `diagnose node --metrics`) answered `Capacity`. The page is now bounded by that reply
+metrics read (`cluster node metrics`, now `inspect node --metrics`) answered `Capacity`. The page is now bounded by that reply
 (`metrics::MAX_PAGE_BYTES`), every family — hosted sessions, root members, measured peers,
 admitted tenants — is aggregated whole each round without an ask, the counts sessions
 made are kept with a retired total so no node counter falls, and entities are listed
@@ -13694,7 +13694,7 @@ replication then goes at once. Without the change the probe returns `Err(Lost)`.
 ### 2026-10-04 — F59: code mode, one program instead of many calls
 
 The MCP adapter offers `code.search` and `code.run` beside its tools, and the CLI runs
-the same programs (`focal code search|run`) through the same backend and journal
+the same programs (`focal search tools|run`) through the same backend and journal
 (19 §Code mode). A program runs in QuickJS-NG 0.16.2 through `rquickjs` 0.14, whose
 pre-generated bindings cover all eight release targets. Its calls queue inside the
 sandbox's own heap and the driver dispatches each one as a direct tool call through
@@ -13722,7 +13722,7 @@ refused `Unlisted` in the program.
 - **Exactly once.** A V1 claim submitted by a program and replayed under the same run
   commits once (core at sequence 2), and the same run with other input is refused.
 - **Real binary** (`cli_code_mode`, 9 s). On a native ledger, a program submits, posts
-  and reads a claim; the node is SIGKILLed and restarted; the same `focal code run`
+  and reads a claim; the node is SIGKILLed and restarted; the same `focal run code`
   replays to the same claim with the same `n1:` reference; the same run with other
   input exits 10 (`program_failed`, a new row in the exit table); and a counting
   program finds one claim.
@@ -13754,7 +13754,7 @@ reshaped client contract test, and focal-evidence's 57.
 
 ### 2026-10-04 — Two CI failures of b9b78cb, closed at their causes
 
-- **Windows: `mcp serve` exited at start** (`mcp_native_a1`, the reader saw `Disconnected`).
+- **Windows: `serve mcp` exited at start** (`mcp_native_a1`, the reader saw `Disconnected`).
   The Windows runners check text out with CRLF, so the binary embedded each `SKILL.md`
   as `---\r\n…`, the frontmatter parse refused it, and the adapter, which refuses to
   serve skills it cannot describe, did not start. The skills are content-addressed (the
@@ -13873,7 +13873,7 @@ given more than one. Each flush is the segment's `fsync` plus the fence's instal
 (write, `fsync`, rename, directory `fsync`), about 13 ms here.
 
 The replicated owner (`fleet.rs`) already parks a request with a deadline and answers it
-when its commit arrives. The single-node owner (`LocalHost`, which `focal start` and the
+when its commit arrives. The single-node owner (`LocalHost`, which `focal start node` and the
 embedded transport use) now does the same for native mutations. A fresh proposal is
 parked with its reply header, answer channel and charge. The owner takes every queued
 request before it waits on the log, so the frames that arrive during one flush are

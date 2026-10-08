@@ -38,8 +38,8 @@ fn json(root: &Path, args: &[&str]) -> Value {
 #[test]
 fn offline_catalog_schemas_examples_and_legacy_contracts_need_no_state() {
     let root = tempfile::tempdir().unwrap();
-    let catalog = json(root.path(), &["schema", "list", "--format", "json"]);
-    let yaml = run(root.path(), &["schema", "list", "--format", "yaml"]);
+    let catalog = json(root.path(), &["list", "schemas", "--format", "json"]);
+    let yaml = run(root.path(), &["list", "schemas", "--format", "yaml"]);
     assert!(
         yaml.status.success(),
         "{}",
@@ -60,29 +60,29 @@ fn offline_catalog_schemas_examples_and_legacy_contracts_need_no_state() {
         let name = entry["name"].as_str().unwrap();
         let descriptor = focal_client::operations::find(name).unwrap();
         assert_eq!(
-            json(root.path(), &["schema", "get", name]),
+            json(root.path(), &["get", "schema", name]),
             descriptor.input_schema().unwrap()
         );
         assert_eq!(
             json(
                 root.path(),
-                &["schema", "get", name, "--direction", "output"]
+                &["get", "schema", name, "--direction", "output"]
             ),
             descriptor.output_schema().unwrap()
         );
         if entry["example_available"] == true {
-            let value = json(root.path(), &["schema", "example", name]);
+            let value = json(root.path(), &["get", "example", name]);
             focal_client::operations::parse_json(name, &serde_json::to_vec(&value).unwrap())
                 .unwrap();
         }
     }
-    let test_report = json(root.path(), &["schema", "get", "test-report"]);
+    let test_report = json(root.path(), &["get", "schema", "test-report"]);
     assert_eq!(test_report["name"], "focal.test_report.v1");
     assert_eq!(
         test_report["hash"],
         focal_evidence::test_report_schema().to_string()
     );
-    let registry = json(root.path(), &["schema", "get", "domain-registry"]);
+    let registry = json(root.path(), &["get", "schema", "domain-registry"]);
     assert!(registry["vocabularies"].is_object());
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
@@ -91,7 +91,7 @@ fn offline_catalog_schemas_examples_and_legacy_contracts_need_no_state() {
 fn actual_shell_completions_and_unknown_discovery_fail_without_side_effects() {
     let root = tempfile::tempdir().unwrap();
     for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
-        let output = run(root.path(), &["completion", shell]);
+        let output = run(root.path(), &["generate", "completion", shell]);
         assert!(
             output.status.success(),
             "{}",
@@ -106,10 +106,10 @@ fn actual_shell_completions_and_unknown_discovery_fail_without_side_effects() {
         assert!(script.contains("schema"));
     }
     for args in [
-        vec!["schema", "get", "future.lifecycle"],
-        vec!["schema", "example", "future.lifecycle"],
-        vec!["schema", "get", "test-report", "--direction", "output"],
-        vec!["completion", "unknown-shell"],
+        vec!["get", "schema", "future.lifecycle"],
+        vec!["get", "example", "future.lifecycle"],
+        vec!["get", "schema", "test-report", "--direction", "output"],
+        vec!["generate", "completion", "unknown-shell"],
     ] {
         let output = run(root.path(), &args);
         assert_eq!(output.status.code(), Some(2));
@@ -121,7 +121,7 @@ fn actual_shell_completions_and_unknown_discovery_fail_without_side_effects() {
 #[test]
 fn closed_discovery_output_is_an_io_error_not_a_panic() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["completion", "bash"])
+        .args(["generate", "completion", "bash"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -142,7 +142,8 @@ fn actual_help_describes_local_configuration_and_only_supported_family_filters()
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("YAML configuration file"));
     assert!(help.contains("durable ledger and local client state"));
-    assert!(help.contains("selected physical node"));
+    assert!(help.contains("start node"));
+    assert!(help.contains("GLOBAL OPTIONS"));
     assert!(!help.contains("running founder"));
     for (family, present, absent) in [
         ("claims", "--source", "--producer"),
@@ -179,7 +180,7 @@ fn the_native_catalogue_examples_and_validation_need_no_state_either() {
     let root = tempfile::tempdir().unwrap();
     let catalog = json(
         root.path(),
-        &["schema", "list", "--native", "--format", "json"],
+        &["list", "schemas", "--native", "--format", "json"],
     );
     assert_eq!(catalog["engine"], "native");
     let entries = catalog["operations"].as_array().unwrap();
@@ -193,7 +194,7 @@ fn the_native_catalogue_examples_and_validation_need_no_state_either() {
     for descriptor in native_descriptors() {
         assert_eq!(descriptor.wire, WireProfile::Native);
         let name = descriptor.name;
-        let example = json(root.path(), &["schema", "example", name, "--native"]);
+        let example = json(root.path(), &["get", "example", name, "--native"]);
         assert_eq!(
             example,
             focal_client::operations::example(WireProfile::Native, name).unwrap(),
@@ -212,8 +213,8 @@ fn the_native_catalogue_examples_and_validation_need_no_state_either() {
         let validated = run(
             root.path(),
             &[
-                "schema",
                 "validate",
+                "document",
                 name,
                 "--native",
                 "--shape-only",
@@ -230,23 +231,20 @@ fn the_native_catalogue_examples_and_validation_need_no_state_either() {
     }
     // A claim's native example names a subject other than the issuer: the
     // owner never posts a claim on oneself.
-    let claim = json(
-        root.path(),
-        &["schema", "example", "claim.submit", "--native"],
-    );
+    let claim = json(root.path(), &["get", "example", "claim.submit", "--native"]);
     assert_ne!(claim["target"], "self");
     // The V1 example of the shared name is refused by the native engine, by
     // the field the native contract lacks, and a V1-only name under --native
     // is refused by name: exit 2, no redirect, no file.
-    let v1 = json(root.path(), &["schema", "example", "claim.submit"]);
+    let v1 = json(root.path(), &["get", "example", "claim.submit"]);
     assert_eq!(v1["target"], "self");
     let file = root.path().join("v1.json");
     std::fs::write(&file, v1.to_string()).unwrap();
     let refused = run(
         root.path(),
         &[
-            "schema",
             "validate",
+            "document",
             "claim.submit",
             "--native",
             "--shape-only",
@@ -263,7 +261,7 @@ fn the_native_catalogue_examples_and_validation_need_no_state_either() {
     std::fs::remove_file(&file).unwrap();
     let batch = run(
         root.path(),
-        &["schema", "example", "claim.submit_batch", "--native"],
+        &["get", "example", "claim.submit_batch", "--native"],
     );
     assert_eq!(batch.status.code(), Some(2), "{batch:?}");
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);

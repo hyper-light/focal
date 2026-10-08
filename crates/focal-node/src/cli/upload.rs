@@ -487,18 +487,18 @@ fn report<T>(
             if let Some(command) = &context.invocation {
                 writeln!(
                     stderr,
-                    "Artifact transfer remains saved. Recovery: {command} request retry --operation-id {id}"
+                    "Artifact transfer remains saved. Recovery: {command} retry request --operation-id {id}"
                 )?;
             } else {
                 writeln!(
                     stderr,
-                    "Artifact transfer remains saved. Recovery: focal request retry --operation-id {id} (with the same data directory and client context)."
+                    "Artifact transfer remains saved. Recovery: focal retry request --operation-id {id} (with the same data directory and client context)."
                 )?;
             }
         } else {
             writeln!(
                 std::io::stderr().lock(),
-                "Artifact transfer remains saved; retry the same --operation path with request retry."
+                "Artifact transfer remains saved; retry the same --operation path with `retry request`."
             )?;
         }
     }

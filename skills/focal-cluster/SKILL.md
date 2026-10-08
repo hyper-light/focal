@@ -68,7 +68,7 @@ context supplies ordinary ledger operations; it does not grant node ownership.
 For a physical node use `cluster.invite`; for an ordinary peer use
 `cluster.client.invite`. Deliver invitations through the user's authorized
 channel and retain private join/enrollment state. The CLI completes node `join`
-or `context enroll`; retry the original invitation and key after interruption.
+or `enroll context`; retry the original invitation and key after interruption.
 Completion: inspect `cluster.invitations.get` and `cluster.credentials.get` for
 the issued identity. A new credential does not promote a voter or add custody.
 
@@ -227,7 +227,7 @@ is a restore, not a downgrade.
 ## Report the achieved step
 
 Use the committed facts above to say what changed and what remains pending.
-For a laptop, ordinary `focal start` and local domain commands need no cluster
+For a laptop, ordinary `focal start node` and local domain commands need no cluster
 administration. Each larger deployment adds only its needed identity, endpoint
 and placement choices. Describe unimplemented credential rotation, repair,
 upgrade fences or global guarantees as unavailable; avoid substituting
@@ -238,6 +238,6 @@ a successful command from another scope.
 `diagnose.node.health` and `cluster.status` report each hosted ledger's engine
 (the active storage format, its effective guarantee and decoder floor).
 Activating the native engine is an offline operator command of the CLI
-(`focal cluster replicas activate-native`, run before the node listens) and
+(`focal activate native`, run before the node listens) and
 has no MCP tool; a running native ledger needs no cluster administration
 beyond the changes above, and no tool here changes an engine in place.

@@ -69,6 +69,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -189,7 +190,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     let root = founder.path();
 
     // Offline activation on the laptop before the node ever listens.
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(
         activation["result"]["kind"], "replica_native_activation_proposed",
         "{activation}"
@@ -199,7 +200,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     let server = start(root, &advertise);
 
     // The engine is reported by standing; the legacy read is not used.
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let standing = &objects(&status)[0]["Standing"];
     assert_eq!(standing["profile"], "AuthoredV1", "{status}");
     let issuer = hex_hash(&standing["principal"]);
@@ -210,9 +211,8 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -223,8 +223,8 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -237,7 +237,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         String::from_utf8_lossy(&enrolled.stderr),
         String::from_utf8_lossy(&enrolled.stdout)
     );
-    let alice_standing = admin(client.path(), Some("alice"), &["status"]);
+    let alice_standing = admin(client.path(), Some("alice"), &["inspect", "prefix"]);
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
     assert_ne!(alice, issuer);
 
@@ -261,7 +261,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     ));
     let claim = created(&result, "Claim").remove(0);
     let validation = created(&result, "Validation").remove(1);
-    let (post_id, _) = committed(&cli(root, None, &["claim", "post", &claim]));
+    let (post_id, _) = committed(&cli(root, None, &["post", "claim", &claim]));
     let page = cli(root, None, &["get", "claim", &claim]);
     // Frozen vocabularies serialize as their registered codes: Posted is 2.
     assert_eq!(objects(&page)[0]["Claim"]["status"], 2, "{page}");
@@ -270,13 +270,13 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &claim],
+        &["acquire", "receipt", &claim],
     ));
     let (_, result) = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -290,8 +290,8 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         client.path(),
         Some("alice"),
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &claim,
             "--summary",
@@ -308,21 +308,21 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["testament", "post", &testament, "--claim", &claim],
+        &["post", "testament", &testament, "--claim", &claim],
     ));
 
     // Issuer receives, evaluates and reports; acceptance is derived.
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament, "--claim", &claim],
+        &["receive", "testament", &testament, "--claim", &claim],
     ));
     committed(&cli(
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &claim,
             "--validation",
@@ -333,8 +333,8 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &claim,
             "--validation",
@@ -360,7 +360,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     let retried = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &report_id],
+        &["retry", "request", "--operation-id", &report_id],
     );
     assert_eq!(retried["condition"], "Committed");
     assert_eq!(retried["operation_id"], report_id);
@@ -373,7 +373,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     let retried_after = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &report_id],
+        &["retry", "request", "--operation-id", &report_id],
     );
     assert_eq!(
         retried_after["result"]["receipt"],
@@ -382,11 +382,11 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     let posted = cli(
         root,
         None,
-        &["request", "inspect", "--operation-id", &post_id],
+        &["inspect", "request", "--operation-id", &post_id],
     );
     assert_eq!(posted["condition"], "Committed");
     // A stale binding after restart is a closed refusal, not an unknown outcome.
-    let stale = run(root, None, &["claim", "post", &claim, "--format", "json"]);
+    let stale = run(root, None, &["post", "claim", &claim, "--format", "json"]);
     assert_eq!(
         stale.status.code(),
         Some(5),
@@ -423,7 +423,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
             .stderr(Stdio::piped());
         let failed = command.output().unwrap();
         assert!(!failed.status.success());
-        let pending = cli(root, None, &["request", "pending"]);
+        let pending = cli(root, None, &["list", "requests"]);
         let rows: Vec<&Value> = pending["operations"]
             .as_array()
             .unwrap()
@@ -440,10 +440,10 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         let id = rows[0]["operation_id"].as_str().unwrap().to_string();
         let diagnostic = String::from_utf8(failed.stderr).unwrap();
         assert!(
-            diagnostic.contains(&format!("request retry --operation-id {id}")),
+            diagnostic.contains(&format!("retry request --operation-id {id}")),
             "{diagnostic}"
         );
-        let replayed = cli(root, None, &["request", "retry", "--operation-id", &id]);
+        let replayed = cli(root, None, &["retry", "request", "--operation-id", &id]);
         let (_, result) = committed(&replayed);
         assert_eq!(created(&result, "Claim").len(), 1);
     }
@@ -451,7 +451,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     // several members, every one with rows, at a later range epoch.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
-        let output = run(root, None, &["cluster", "replicas", "ranges", "list"]);
+        let output = run(root, None, &["list", "ranges"]);
         let view: Option<Value> = output
             .status
             .success()

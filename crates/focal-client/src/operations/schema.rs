@@ -177,7 +177,7 @@ pub(super) fn input(descriptor: &OperationDescriptor) -> Result<Value, InputErro
             {"required":["claim"],"properties":{"claim":{"$ref":"#/$defs/id"}}},
             {"required":["source"],"properties":{"source":{"$ref":"#/$defs/participant"}}},
             {"required":["target"],"properties":{"target":{"$ref":"#/$defs/participant"}}},
-            {"required":["status"],"properties":{"status":{"type":"string"}}},
+            {"required":["inspect", "prefix"],"properties":{"status":{"type":"string"}}},
             {"required":["action"],"properties":{"action":{"type":"string"}}}
         ]}
     ]));

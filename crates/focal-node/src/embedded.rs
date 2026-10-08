@@ -70,7 +70,7 @@ pub enum NodeError {
     /// at start, before anything is kept there. One others may read is the
     /// node's: what it keeps private it opens private.
     #[error(
-        "data directory {} must be this user's and writable by no other user (`focal prepare-volume --owner UID:GID`)",
+        "data directory {} must be this user's and writable by no other user (`focal prepare volume --owner UID:GID`)",
         .0.display()
     )]
     NotPrivate(std::path::PathBuf),
@@ -262,7 +262,7 @@ pub(crate) fn install_policy(
 }
 /// The committed policy of an initialized store; `None` for a fresh
 /// directory that has no policy yet. A committed policy is authoritative:
-/// it is what the fleet already carries, and `deployment apply` may have
+/// it is what the fleet already carries, and `apply deployment` may have
 /// committed stronger durability than the file's first-start seed, so a
 /// differing `settings` value is not a refusal (that would keep the node
 /// from ever restarting after a sanctioned apply). Config resolution

@@ -58,6 +58,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -278,7 +279,7 @@ fn cli_native_creates_are_linearizable_against_the_offline_log() {
     private(founder.path());
     let root = founder.path();
 
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = ports::address();
     let server = start(root, &advertise);

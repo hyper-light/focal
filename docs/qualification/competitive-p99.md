@@ -104,7 +104,7 @@ report carries its drain time. Remaining before the measured runs:
   `focal-bootstrap.sh` (`tools/compare/compose`) found three `focal:bench` containers (both
   binaries, musl, on Alpine for `tc`; 107 MB), one zone each under the competitors' limits;
   the hosts join by invitation, the root, its partition and the session are placed on all
-  three surviving a zone (`deployment plan`/`apply`, asked again until the joined hosts
+  three surviving a zone (`plan deployment`/`apply`, asked again until the joined hosts
   have reported their load, since a plan made before records the capacity missing and only
   its apply refuses), the ledger is activated natively, and a client is enrolled in the
   generator's container over QUIC. Founding it found a defect, fixed at its cause: a data

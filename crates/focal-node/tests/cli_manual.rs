@@ -27,7 +27,7 @@ impl Drop for Server {
 }
 fn start(root: &Path) -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.to_str().unwrap(), "start"])
+        .args(["--data-dir", root.to_str().unwrap(), "start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -96,7 +96,7 @@ fn claim(value: u128) -> Value {
         "validations":[validation(value+2)]})
 }
 fn sequence(root: &Path) -> Value {
-    cli(root, &["status"])["result"]["Read"]["token"]["sequence"].clone()
+    cli(root, &["inspect", "prefix"])["result"]["Read"]["token"]["sequence"].clone()
 }
 fn list(root: &Path, family: &str) -> Value {
     cli(root, &["list", family, "--format", "json"])
@@ -113,31 +113,34 @@ fn named_status_uses_the_selected_connection_without_local_ledger_files() {
     cli(
         &client,
         &[
-            "context",
             "add",
+            "context",
             "near",
             "--node-data-dir",
             root.path().to_str().unwrap(),
         ],
     );
-    cli(&client, &["context", "use", "near"]);
-    let local = cli(root.path(), &["status"]);
-    let selected = cli(&client, &["status"]);
+    cli(&client, &["use", "context", "near"]);
+    let local = cli(root.path(), &["inspect", "prefix"]);
+    let selected = cli(&client, &["inspect", "prefix"]);
     assert_eq!(selected["result"], local["result"]);
     assert!(!client.join("IDENTITY").exists());
     assert!(
-        !run(&client, &["--client-context", "local", "status"])
+        !run(&client, &["--client-context", "local", "inspect", "prefix"])
             .status
             .success()
     );
     assert_eq!(
-        cli(&client, &["--client-context", "near", "status"])["result"],
+        cli(&client, &["--client-context", "near", "inspect", "prefix"])["result"],
         local["result"]
     );
     assert!(
-        !run(&client, &["--client-context", "missing", "status"])
-            .status
-            .success()
+        !run(
+            &client,
+            &["--client-context", "missing", "inspect", "prefix"]
+        )
+        .status
+        .success()
     );
 }
 
@@ -149,7 +152,7 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let server = start(root.path());
     let before = sequence(root.path());
-    let empty = cli(root.path(), &["request", "epoch", "--format", "json"]);
+    let empty = cli(root.path(), &["inspect", "epoch", "--format", "json"]);
     assert_eq!(
         empty["reply"]["page"]["result"]["Epoch"]["minimum"],
         Value::Null
@@ -157,8 +160,8 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
     let absent = cli(
         root.path(),
         &[
-            "request",
-            "status",
+            "inspect",
+            "mutation",
             "--request-id",
             &id(555),
             "--format",
@@ -171,8 +174,8 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
     );
     assert_eq!(sequence(root.path()), before);
     for args in [
-        vec!["request", "epoch", "--epoch", "0"],
-        vec!["request", "status", "--request-id", "bad"],
+        vec!["inspect", "epoch", "--epoch", "0"],
+        vec!["inspect", "mutation", "--request-id", "bad"],
     ] {
         assert_eq!(run(root.path(), &args).status.code(), Some(2));
     }
@@ -208,8 +211,8 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
         let inspected = cli(
             root.path(),
             &[
-                "request",
                 "inspect",
+                "request",
                 operation.to_str().unwrap(),
                 "--remote",
                 "--format",
@@ -228,8 +231,8 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
     let inspected = cli(
         root.path(),
         &[
-            "request",
-            "status",
+            "inspect",
+            "mutation",
             "--request-id",
             &business.request_id.to_string(),
             "--format",
@@ -243,8 +246,8 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
     let local = cli(
         root.path(),
         &[
-            "request",
             "inspect",
+            "request",
             lost_path.to_str().unwrap(),
             "--format",
             "json",
@@ -260,7 +263,7 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
         .tempdir_in("/tmp")
         .unwrap();
     let server = start(root.path());
-    let identity = cli(root.path(), &["identity"]);
+    let identity = cli(root.path(), &["inspect", "identity"]);
     let claim_id = id(100);
     let occurrence = id(101);
     let validation_id = id(102);
@@ -360,13 +363,13 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
 
     mutation(
         root.path(),
-        &["claim", "post", &claim_id],
+        &["post", "claim", &claim_id],
         &root.path().join("post-operation"),
     );
     let receipt_id = id(104);
     let acquired = mutation(
         root.path(),
-        &["receipt", "acquire", &claim_id, "--id", &receipt_id],
+        &["acquire", "receipt", &claim_id, "--id", &receipt_id],
         &root.path().join("receipt-operation"),
     );
     assert_eq!(acquired["result"]["receipt"], receipt_id);
@@ -375,8 +378,8 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
     let begun = mutation(
         root.path(),
         &[
-            "evidence",
             "begin",
+            "evidence",
             "--claim",
             &claim_id,
             "--receipt",
@@ -577,19 +580,19 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
     let second_set = id(205);
     mutation(
         root.path(),
-        &["claim", "post", &second_claim],
+        &["post", "claim", &second_claim],
         &root.path().join("second-post"),
     );
     mutation(
         root.path(),
-        &["receipt", "acquire", &second_claim, "--id", &second_receipt],
+        &["acquire", "receipt", &second_claim, "--id", &second_receipt],
         &root.path().join("second-receipt"),
     );
     mutation(
         root.path(),
         &[
-            "evidence",
             "begin",
+            "evidence",
             "--claim",
             &second_claim,
             "--receipt",
@@ -680,8 +683,8 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
     let inspected = cli(
         root.path(),
         &[
-            "request",
             "inspect",
+            "request",
             flags_operation.to_str().unwrap(),
             "--format",
             "json",
@@ -690,12 +693,12 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
     assert_eq!(inspected, flags);
     drop(server); // no graceful owner checkpoint; all acknowledged facts are WAL-durable
     let _server = start(root.path());
-    assert_eq!(cli(root.path(), &["identity"]), identity);
+    assert_eq!(cli(root.path(), &["inspect", "identity"]), identity);
     let retried = cli(
         root.path(),
         &[
-            "request",
             "retry",
+            "request",
             flags_operation.to_str().unwrap(),
             "--format",
             "json",
@@ -742,7 +745,7 @@ fn parse_failures_and_conflicting_inputs_create_no_operation_journal() {
                 r#"{"description":"invalid","target":"self","validations":[],"runtime":true}"#,
             ],
         ),
-        ("invalid-id", vec!["claim", "post", "not-a-typed-id"]),
+        ("invalid-id", vec!["post", "claim", "not-a-typed-id"]),
     ] {
         let operation = root.path().join(name);
         let mut args = args;
@@ -772,7 +775,7 @@ fn validation_get_pages_actual_committed_run_and_verdict_after_restart() {
         .prefix("focal-verdict-")
         .tempdir_in("/tmp")
         .unwrap();
-    cli(root.path(), &["demo"]);
+    cli(root.path(), &["run", "demo"]);
     let server = start(root.path());
     let definitions = cli(
         root.path(),

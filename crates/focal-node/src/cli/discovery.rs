@@ -76,7 +76,7 @@ pub(crate) enum Direction {
 pub(crate) fn operation_names() -> PossibleValuesParser {
     PossibleValuesParser::new(all_operation_names())
 }
-/// The V1 catalogue alone: `request build` writes a legacy raw envelope.
+/// The V1 catalogue alone: `build request` writes a legacy raw envelope.
 pub(crate) fn legacy_operation_names() -> PossibleValuesParser {
     PossibleValuesParser::new(operations::descriptors().iter().map(|value| value.name))
 }
@@ -159,7 +159,7 @@ fn completion_to(shell: Shell, output: &mut dyn Write) -> Result<()> {
         error: None,
     };
     let generated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut command = super::command_tree::completion_command();
+        let mut command = super::grammar::completion_command();
         command.set_bin_name("focal");
         command.build();
         shell.try_generate(&command, &mut deferred)
@@ -204,7 +204,7 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
         exposure: &'static str,
         result: &'static str,
         reads: &'static str,
-        /// Whether `schema example DESCRIPTOR --native` prints a document.
+        /// Whether `get example DESCRIPTOR --native` prints a document.
         example: bool,
     }
     let rows: Vec<Row> = native_coverage_table()
@@ -540,7 +540,7 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[path = "discovery_tests.rs"]
 mod tests;
 
-/// `schema validate --shape-only`: the document decodes through the engine
+/// `validate document --shape-only`: the document decodes through the engine
 /// offline selection picks; nothing is loaded, journaled or sent.
 pub(super) fn validate_offline(
     operation: &str,
@@ -560,7 +560,7 @@ pub(super) fn validate_offline(
     Ok(())
 }
 
-/// `schema validate` under a selected context: the ledger's engine is probed
+/// `validate document` under a selected context: the ledger's engine is probed
 /// the way every mutation probes it, an explicit `--native` must agree, and
 /// the document is checked the way that engine's mutation path checks it
 /// before it journals anything. V1 runs the shared builder's preflight; the

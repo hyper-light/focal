@@ -27,12 +27,12 @@ use fleet::*;
 use journey::*;
 
 fn upgrade(node: &Node) -> Value {
-    admin(node, &["cluster", "upgrade", "status"])["result"]["upgrade"].clone()
+    admin(node, &["inspect", "upgrade"])["result"]["upgrade"].clone()
 }
 fn wait_upgrade(node: &Node, what: &str, cond: impl Fn(&Value) -> bool) -> Value {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
     loop {
-        let output = fleet::run(node, None, &["cluster", "upgrade", "status"]);
+        let output = fleet::run(node, None, &["inspect", "upgrade"]);
         if output.status.success()
             && let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)
         {
@@ -65,7 +65,7 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
         &founder,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _founder_server = journey.start(
         &founder,
@@ -87,7 +87,7 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
         &founder,
         "upgrade status",
         &[],
-        &["cluster", "upgrade", "status"],
+        &["inspect", "upgrade"],
     )["result"]["upgrade"]
         .clone();
     let level = view["binary_level"].as_u64().unwrap();
@@ -105,13 +105,7 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
         None,
         "upgrade activate",
         &["fence level"],
-        &[
-            "cluster",
-            "upgrade",
-            "activate",
-            "--fence",
-            &(level + 1).to_string(),
-        ],
+        &["activate", "upgrade", "--fence", &(level + 1).to_string()],
     );
     assert_eq!(code, 5, "{report}");
     assert!(report.contains("[members_behind]"), "{report}");
@@ -120,13 +114,7 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
         None,
         "upgrade activate",
         &["fence level"],
-        &[
-            "cluster",
-            "upgrade",
-            "activate",
-            "--fence",
-            &(level + 1).to_string(),
-        ],
+        &["activate", "upgrade", "--fence", &(level + 1).to_string()],
     );
     assert_eq!(code, 5, "{report}");
     assert!(report.contains("[members_behind]"), "{report}");
@@ -136,13 +124,7 @@ fn the_upgrade_stage_raises_the_fence_and_refuses_a_below_fence_binary() {
         &founder,
         "upgrade activate",
         &["fence level"],
-        &[
-            "cluster",
-            "upgrade",
-            "activate",
-            "--fence",
-            &level.to_string(),
-        ],
+        &["activate", "upgrade", "--fence", &level.to_string()],
     );
     assert_eq!(
         activated["result"]["kind"], "fence_activated",

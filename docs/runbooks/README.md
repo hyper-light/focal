@@ -25,6 +25,6 @@ Common facts: a node's identity is its enrolled key, never its address or disk
 ([24 §24](../archictecutre/24-placement-execution-and-fleet-control.md)); acknowledged
 writes are on the disks of a majority of a session's voters
 ([24 §7](../archictecutre/24-placement-execution-and-fleet-control.md)); the guarantee a
-session actually has is `cluster placement` (`desired`, `achieved`, `blocked_by`) and
-`diagnose node --readiness` (`policy_satisfied`), never what a plan requested
+session actually has is `inspect placement` (`desired`, `achieved`, `blocked_by`) and
+`inspect node --readiness` (`policy_satisfied`), never what a plan requested
 ([08 §9](../archictecutre/08-stepped-complexity-and-deployment.md)).

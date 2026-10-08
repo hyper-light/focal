@@ -25,7 +25,7 @@ impl Drop for Server {
 fn start(root: &Path) -> Server {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut child = command(root, &["start"])
+    let mut child = command(root, &["start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -79,14 +79,14 @@ fn populate(root: &Path) {
         let claim = format!("{:032x}", n * 100);
         let document = json!({"id":claim,"occurrence":format!("{:032x}",n*100+1),"description":"All-page workflow","target":"self","action":"handoff","validations":[{"id":format!("{:032x}",n*100+2),"kind":"receipt","phase":"whole_work","mode":"required","description":"Delivery","evaluator":"self"}]});
         cli(root, &["submit", "claim", "--json", &document.to_string()]);
-        cli(root, &["claim", "post", &claim]);
-        let received = cli(root, &["receipt", "acquire", &claim]);
+        cli(root, &["post", "claim", &claim]);
+        let received = cli(root, &["acquire", "receipt", &claim]);
         let receipt = received["result"]["receipt"].as_str().unwrap();
         let opened = cli(
             root,
             &[
-                "evidence",
                 "begin",
+                "evidence",
                 "--claim",
                 &claim,
                 "--receipt",

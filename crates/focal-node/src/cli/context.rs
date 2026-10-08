@@ -652,7 +652,7 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 .map_err(other)?;
             if pending.enrollment().map_err(other)?.is_none() {
                 return Err(InputError::Invalid(
-                    "client enrollment is pending; retry context enroll with its original invitation",
+                    "client enrollment is pending; retry `enroll context` with its original invitation",
                 )
                 .into());
             }

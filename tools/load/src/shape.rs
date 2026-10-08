@@ -21,11 +21,11 @@ pub enum Transport {
     /// An `EmbeddedNode` opened in this process, over the embedded transport.
     #[default]
     Embedded,
-    /// A running `focal start` node, over its Unix socket `<data_dir>/focal.sock`,
+    /// A running `focal start node` node, over its Unix socket `<data_dir>/focal.sock`,
     /// as that node's own local participant (what the CLI does without a
     /// `--client-context`).
     Unix,
-    /// A remote cluster over QUIC, as the client a `focal context enroll`
+    /// A remote cluster over QUIC, as the client a `focal enroll context`
     /// left in `enrollment` (`PendingClientJoin::remote_client`): what an
     /// agent on another machine is, and what the comparison drives
     /// (`docs/qualification/competitive-p99.md`).
@@ -35,7 +35,7 @@ pub enum Transport {
 /// The native content profile the request frames are encoded for. It must be
 /// the profile the ledger was activated with: the embedded node is activated
 /// by this tool (`projection_only` unless the shape says otherwise); a node
-/// activated by `focal cluster replicas activate-native` is `authored_v1`.
+/// activated by `focal activate native` is `authored_v1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Profile {

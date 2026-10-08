@@ -28,29 +28,29 @@ history.
 It is one binary: the service, the command line and the MCP server.
 
 ```console
-$ focal start
+$ focal start node
 { "condition": "Ready", ... }
 
-$ focal schema example claim.submit > claim.json
+$ focal get example claim.submit > claim.json
 $ focal submit claim --file claim.json
 Committed
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 
-$ focal claim post d4cc83c48c5ad2bafaa1802bb87c3e07
+$ focal post claim d4cc83c48c5ad2bafaa1802bb87c3e07
 Committed
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07 (Posted)
 
-$ focal receipt acquire d4cc83c48c5ad2bafaa1802bb87c3e07
+$ focal acquire receipt d4cc83c48c5ad2bafaa1802bb87c3e07
 Committed
 Receipt: e2c5670ea738bf9bfd18035388f80e8f (epoch 1)
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 ```
 
 The flow above is the V1 engine's, which a fresh ledger runs; a ledger that runs the
-native engine (`cluster replicas activate-native`) takes the same commands with the
-native engine's example — `focal schema example claim.submit --native` — as the
+native engine (`activate native`) takes the same commands with the
+native engine's example — `focal get example claim.submit --native` — as the
 [quickstart](#on-a-native-ledger) shows. Discovery serves each engine's own contract:
-what `schema example` prints is what `submit` accepts.
+what `get example` prints is what `submit` accepts.
 
 > [!NOTE]
 > Console output in this README was captured from a debug build at `125effd` on macOS with
@@ -108,7 +108,7 @@ focal --help
 Start the service in one terminal and leave it running:
 
 ```sh
-focal start
+focal start node
 ```
 
 It creates a private data directory (`~/Library/Application Support/Focal` on macOS,
@@ -122,7 +122,7 @@ configuration file and no network port. To keep a ledger somewhere else, pass
 In another terminal, make a claim from the built-in example and post it:
 
 ```console
-$ focal schema example claim.submit > claim.json
+$ focal get example claim.submit > claim.json
 $ focal submit claim --file claim.json
 Committed
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
@@ -132,11 +132,11 @@ KIND	ID	STATE/HASH	DESCRIPTION
 claim	d4cc83c48c5ad2bafaa1802bb87c3e07	Generated	"Deliver the checked report"
 SEQUENCE	1	VISITED	1
 
-$ focal claim post d4cc83c48c5ad2bafaa1802bb87c3e07
+$ focal post claim d4cc83c48c5ad2bafaa1802bb87c3e07
 Committed
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07 (Posted)
 
-$ focal ledger summary
+$ focal inspect ledger
 LEDGER	fdb5795f2c6d5a00871e7e521eedf9b8/4040bf729c435aa42d8e669849605d5a
 SEQUENCE	1
 ROUTE EPOCH	1
@@ -154,17 +154,17 @@ claim on yourself with one check, that the report is received, so you can try th
 without setting up an evaluator. IDs are 32 hex characters and hashes are 64. Every read
 prints the `SEQUENCE` it was served at, so you know how current it is.
 
-Stop the service with Ctrl-C and run `focal start` again: the same ledger comes back.
+Stop the service with Ctrl-C and run `focal start node` again: the same ledger comes back.
 
 ### On a native ledger
 
-A ledger activated for the native engine (`focal cluster replicas activate-native`,
+A ledger activated for the native engine (`focal activate native`,
 before `start` on a laptop) accepts the native engine's documents. Ask discovery for
 that engine's example — it names another participant as the claim's subject, since a
 native claim is never on oneself — and the same verbs carry it:
 
 ```console
-$ focal schema example claim.submit --native > claim.json
+$ focal get example claim.submit --native > claim.json
 $ focal submit claim --file claim.json
 CONDITION	Committed
 OPERATION_ID	n1:d391b67e030f273cf53bca42fbe16c8f
@@ -173,7 +173,7 @@ OPERATION	create
 CREATED	claim	95d3a0b16c827c6bbe926527efc3a290
 CREATED	validation	28b0a2f156a6d98355d56d8195a863c0
 
-$ focal claim post 95d3a0b16c827c6bbe926527efc3a290
+$ focal post claim 95d3a0b16c827c6bbe926527efc3a290
 CONDITION	Committed
 OPERATION_ID	n1:8304fd65c72167246b7467a9a868c94e
 SEQUENCE	2
@@ -183,12 +183,12 @@ $ focal get claim 95d3a0b16c827c6bbe926527efc3a290
 PREFIX	2	LOGICAL_TIME	1790718813146
 OBJECT	Claim	{"acceptance":[],"binding":{…},…,"status":2,…}
 
-$ focal schema validate claim.submit --file claim.json
+$ focal validate document claim.submit --file claim.json
 valid claim.submit (native engine; authored input compiled against the ledger's committed bindings into its exact frame; nothing journaled or sent; server acceptance unchecked)
 ```
 
-`schema list --native`, `schema get NAME --native`, `schema example NAME --native` and
-`schema validate NAME --native --shape-only` are the native engine's offline discovery;
+`list schemas --native`, `get schema NAME --native`, `get example NAME --native` and
+`validate document NAME --native --shape-only` are the native engine's offline discovery;
 without `--native` a name both engines share is served by V1 and a native-only name by
 the native engine. A command that reaches a ledger probes its engine and serves that
 one; `--native` against a ledger that answers V1 is refused, never redirected.
@@ -204,23 +204,23 @@ testament, its receipt by the claimant, a recorded validation, and the derived r
 > The demo owns its directory. Give it one that no running service is using.
 
 ```console
-$ focal --data-dir /tmp/focal-demo demo
+$ focal --data-dir /tmp/focal-demo run demo
 { "claim": [...], "status": 8, "sequence": 13, "validation": 1,
   "artifact": { "root": [...], "length": 35, "class": 2 },
   "history": [ { "status": 1, "sequence": 4 }, ..., { "status": 8, "sequence": 13 } ] }
 
-$ focal --data-dir /tmp/focal-demo demo      # the same claim and proof, nothing re-run
+$ focal --data-dir /tmp/focal-demo run demo      # the same claim and proof, nothing re-run
 ```
 
-`status: 8` is `Satisfied` and `validation: 1` is `Pass`; `focal schema get domain-registry`
+`status: 8` is `Satisfied` and `validation: 1` is `Pass`; `focal get schema domain-registry`
 prints the vocabulary. The second run recovers rather than repeats.
 
 <details>
 <summary>The same steps by hand, as the respondent</summary>
 
 ```sh
-focal receipt acquire CLAIM_ID
-focal evidence begin --claim CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1
+focal acquire receipt CLAIM_ID
+focal begin evidence --claim CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1
 focal submit artifact --claim CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1 \
   --evidence-set EVIDENCE_SET_ID --kind test-report --schema-hash SCHEMA_HASH \
   --text '{"passed":1,"failed":0,"skipped":0}'
@@ -266,7 +266,7 @@ satisfied when its checks pass and the claims it depends on are done. Not before
 | **Validation** | A declared check, its evaluator, and the recorded runs and verdicts |
 
 A fresh ledger runs the V1 engine. Turn on the **native engine** with
-`focal cluster replicas activate-native` and each of the four gets its own lifecycle, failed
+`focal activate native` and each of the four gets its own lifecycle, failed
 work becomes evidence, and agents get peer workflows: a **challenge** asks the respondent to
 prove something, a **consult** asks for work that answers a question, and a correction or
 follow-up points at the exact record it is answering. An existing V1 ledger is imported, not
@@ -274,7 +274,7 @@ rewritten.
 
 ## Use it with an AI agent (MCP)
 
-`focal mcp serve` is a [Model Context Protocol] server over stdio. Start the service, then
+`focal serve mcp` is a [Model Context Protocol] server over stdio. Start the service, then
 point your client at it:
 
 > [!TIP]
@@ -284,10 +284,10 @@ point your client at it:
 
 **Claude Code**
 ```sh
-claude mcp add focal -- /usr/local/bin/focal --data-dir /absolute/path/to/ledger mcp serve
+claude mcp add focal -- /usr/local/bin/focal --data-dir /absolute/path/to/ledger serve mcp
 # or without installing, from a registry:
-claude mcp add focal -- npx -y @hyper-light/focal --data-dir /absolute/path/to/ledger mcp serve
-claude mcp add focal -- uvx --from focal-node focal --data-dir /absolute/path/to/ledger mcp serve
+claude mcp add focal -- npx -y @hyper-light/focal --data-dir /absolute/path/to/ledger serve mcp
+claude mcp add focal -- uvx --from focal-node focal --data-dir /absolute/path/to/ledger serve mcp
 ```
 
 **Claude Desktop, Cursor and other `mcpServers` clients**
@@ -313,7 +313,7 @@ A remote participant uses `--client-context NAME` (an enrolled QUIC connection) 
 of the data directory. The handshake against the ledger above:
 
 ```console
-$ focal mcp serve
+$ focal serve mcp
 ← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"focal","version":"0.1.0"}}}
 ← tools/list: 16 tools on the first page, nextCursor present
 ```
@@ -343,19 +343,19 @@ Tool contracts, the request stream and recovery: **[docs/mcp.md](docs/mcp.md)**.
 
 | Command | What it does |
 |---|---|
-| `focal start` | Run the service (`--advertise HOST:PORT` to accept peers) |
+| `focal start node` | Run the service (`--advertise HOST:PORT` to accept peers) |
 | `focal submit claim \| testament \| artifact \| validation` | Author from flags, `--json`, `--yaml` or `--file` |
-| `focal claim post \| progress \| cancel \| wait ID` | Progress a claim you issued |
-| `focal receipt acquire ID` · `evidence begin` | Take responsibility; open an evidence set |
+| `focal post claim \| progress \| cancel \| wait ID` | Progress a claim you issued |
+| `focal acquire receipt ID` · `begin evidence` | Take responsibility; open an evidence set |
 | `focal get claim \| testament \| artifact \| validation ID` | One object, as a table or `--format json` |
 | `focal list claims \| testaments \| artifacts \| validations [filters]` | Bounded pages; every filter optional; `--all` follows pages |
-| `focal ledger summary` · `ledger traverse claim:ID` | Counts; the graph around one object |
-| `focal watch claims` · `monitor register` | Follow changes; durable wait predicates |
-| `focal schema list \| get \| example NAME` | Contracts and examples, no service needed |
-| `focal request retry --operation-id ID` · `request pending` | Resolve a lost reply |
-| `focal context` | Save and select connections, local or remote |
-| `focal cluster …` · `focal join` · `focal deployment explain` | Membership, enrollment, offline placement checks |
-| `focal mcp serve` · `focal demo` · `focal completion SHELL` | The MCP server; the demo; shell completions |
+| `focal inspect ledger` · `traverse ledger claim:ID` | Counts; the graph around one object |
+| `focal watch claims` · `register monitor` | Follow changes; durable wait predicates |
+| `focal list schemas \| get \| example NAME` | Contracts and examples, no service needed |
+| `focal retry request --operation-id ID` · `list requests` | Resolve a lost reply |
+| `focal add context` · `focal use context` · `focal list contexts` | Save and select connections, local or remote |
+| `focal invite node` · `focal inspect cluster` · `focal join cluster` · `focal explain deployment` | Membership, enrollment, offline placement checks |
+| `focal serve mcp` · `focal run demo` · `focal generate completion SHELL` | The MCP server; the demo; shell completions |
 
 Flags, JSON and YAML all build the same request. Unknown fields and duplicate keys are
 rejected. Exit codes and every flag: **[docs/manual-cli.md](docs/manual-cli.md)**.
@@ -420,16 +420,16 @@ The founder advertises an endpoint and writes a one-use invitation; the second m
 enrolls from it and starts:
 
 ```sh
-focal --data-dir ~/focal-founder start --advertise founder.example:7443
-focal --data-dir ~/focal-founder cluster invite --node worker-2 --output worker-2.invite
+focal --data-dir ~/focal-founder start node --advertise founder.example:7443
+focal --data-dir ~/focal-founder invite node --node worker-2 --output worker-2.invite
 
 # on the second host, after copying the invitation: enroll and start in one command
-focal --data-dir ~/focal-node start --invite-file worker-2.invite --advertise worker-2.example:7443
+focal --data-dir ~/focal-node start node --invite-file worker-2.invite --advertise worker-2.example:7443
 ```
 
 An address works as well as a name; a name is announced with the node so peers find it
 again when the address behind it changes. For a supervised host or a Kubernetes
-namespace, `focal deployment render systemd|kubernetes` writes the packaging
+namespace, `focal render systemd|kubernetes` writes the packaging
 ([deploy/](deploy/)).
 
 > [!IMPORTANT]
@@ -446,8 +446,8 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 | Step | What you decide | Today (2026-09-09) |
 |---|---|---|
 | Laptop | Where to keep the data | Works: durable service, restart, the full workflow through CLI and MCP |
-| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join (also `start --invite-file`), authenticated transport, names that outlive addresses, membership, leader transfer, credential renewal and rotation, drain/remove/replace, repair, backup/restore, the upgrade fence; `deployment plan`/`apply` commit a durability policy and the placement controller expands and heals the ledgers; `deployment render systemd` writes the unit |
-| Kubernetes | Storage and packaging | `deployment render kubernetes` writes the manifests (`deploy/kubernetes`), a Helm chart and a container recipe are checked in; not yet executed on a real cluster |
+| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join (also `start --invite-file`), authenticated transport, names that outlive addresses, membership, leader transfer, credential renewal and rotation, drain/remove/replace, repair, backup/restore, the upgrade fence; `plan deployment`/`apply` commit a durability policy and the placement controller expands and heals the ledgers; `render systemd` writes the unit |
+| Kubernetes | Storage and packaging | `render kubernetes` writes the manifests (`deploy/kubernetes`), a Helm chart and a container recipe are checked in; not yet executed on a real cluster |
 | Several zones | Verified failure domains, what zone loss you accept | Declared zones are announced and granted, voters spread across them, residency fenced; zone-loss journeys remain to be recorded |
 | Several regions | Residency, home regions, the latency you will pay for remote durability | Architecture and schema; the geographic executor remains |
 | Global fleet | Per-tenant geography and resource policy | Target; the partitioned directory exists, scale qualification remains |

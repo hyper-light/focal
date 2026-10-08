@@ -1,7 +1,7 @@
 //! Metrics (doc 08 §9; 24 §23): one bounded snapshot of what this node
 //! knows about itself, sampled by the service on a fixed cadence and
 //! rendered as Prometheus text over the kernel-authenticated admin socket
-//! (`diagnose node --metrics`) and, when the operator configures
+//! (`inspect node --metrics`) and, when the operator configures
 //! `node.metrics_listen`, over a read-only loopback HTTP/1.0 endpoint. Every
 //! series carries the node's fixed labels; nothing here is a quorum read
 //! and nothing here authorizes a change.
@@ -23,7 +23,7 @@ pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 const METRICS_REPLY_ENVELOPE: usize = 4;
 /// The longest page: what one operator read carries
 /// (`network_admin::MAX_COMMAND`, an admin frame less its envelope), so a
-/// node's own `diagnose node --metrics` can always read its page (the audit's
+/// node's own `inspect node --metrics` can always read its page (the audit's
 /// F26). The loopback endpoint serves the same page. What does not fit is
 /// counted in the page's aggregates and listed in a later round
 /// (`rounds`).

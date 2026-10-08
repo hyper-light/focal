@@ -50,7 +50,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         &founder,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _founder_server = journey.start(
         &founder,
@@ -75,6 +75,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         &["invitation file", "address"],
         &[
             "start",
+            "node",
             "--advertise",
             &addresses[3],
             "--invite-file",
@@ -98,6 +99,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         &["invitation file", "address"],
         &[
             "start",
+            "node",
             "--advertise",
             &addresses[4],
             "--invite-file",
@@ -120,12 +122,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
     let node_b = identity(&host_b).0;
     let revoked_host = Node::new("revoked");
     let invite_r = journey.invite(&founder, &revoked_host, "host-r");
-    let listed = journey.admin(
-        &founder,
-        "invitation",
-        &[],
-        &["cluster", "invitations", "list"],
-    );
+    let listed = journey.admin(&founder, "invitation", &[], &["list", "invitations"]);
     let pending: Vec<String> = listed["result"]["entries"]
         .as_array()
         .unwrap()
@@ -138,7 +135,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         &founder,
         "invitation",
         &["invitation id"],
-        &["cluster", "invitations", "revoke", &pending[0]],
+        &["revoke", "invitation", &pending[0]],
     );
     assert!(revoked["result"]["operation_id"].is_string(), "{revoked}");
     let (code, report) = journey.failure(
@@ -148,6 +145,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         &["invitation file", "address"],
         &[
             "start",
+            "node",
             "--advertise",
             &addresses[5],
             "--invite-file",
@@ -160,7 +158,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
     wait_for(&founder, "three hosts", Duration::from_secs(120), |view| {
         settled(view, &ledger, &all, 0)
     });
-    let view = journey.admin(&founder, "placement view", &[], &["cluster", "placement"]);
+    let view = journey.admin(&founder, "placement view", &[], &["inspect", "placement"]);
     assert_eq!(
         guarantee(&view["result"]["placement"], &ledger),
         (Some(0), 0),
@@ -189,8 +187,8 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
             "--wait",
@@ -206,7 +204,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         // its allowance (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 300 s).
         let view = placement(&founder);
-        let health = admin(&founder, &["diagnose", "node", "--health"]);
+        let health = admin(&founder, &["inspect", "node", "--health"]);
         panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
     }
     let view = wait_for(
@@ -238,8 +236,8 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             blocked_file.to_str().unwrap(),
         ],
@@ -262,8 +260,8 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             again_file.to_str().unwrap(),
         ],
@@ -290,8 +288,8 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             res_file.to_str().unwrap(),
             "--wait",
@@ -303,10 +301,10 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         // its allowance (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 300 s).
         let view = placement(&founder);
-        let health = admin(&founder, &["diagnose", "node", "--health"]);
+        let health = admin(&founder, &["inspect", "node", "--health"]);
         panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
     }
-    let explained = journey.admin(&founder, "explain", &[], &["deployment", "explain"]);
+    let explained = journey.admin(&founder, "explain", &[], &["explain", "deployment"]);
     assert_eq!(explained["committed_revision"], 3, "{explained}");
     // The early plan was made at revision 2; the policy is at 3 now, so it
     // is refused as stale before any side effect.
@@ -316,8 +314,8 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             early_home.to_str().unwrap(),
         ],
@@ -339,7 +337,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         None,
         "remove",
         &["node id"],
-        &["cluster", "nodes", "remove", "--node", &node_b.to_string()],
+        &["remove", "node", "--node", &node_b.to_string()],
     );
     assert_ne!(code, 0, "{report}");
     assert!(node_row(&placement(&founder).unwrap(), node_b).is_some());
@@ -347,7 +345,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         &founder,
         "drain",
         &["node id"],
-        &["cluster", "nodes", "drain", "--node", &node_b.to_string()],
+        &["drain", "node", "--node", &node_b.to_string()],
     );
     assert_eq!(drained["result"]["eligible"], false, "{drained}");
     let view = wait_for(
@@ -371,7 +369,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         let output = fleet::run(
             &founder,
             None,
-            &["cluster", "nodes", "remove", "--node", &node_b.to_string()],
+            &["remove", "node", "--node", &node_b.to_string()],
         );
         if output.status.success() {
             break serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();

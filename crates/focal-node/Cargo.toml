@@ -37,6 +37,7 @@ focal-runtime = { version = "0.1.0", path = "../focal-runtime" }
 focal-wire = { version = "0.1.0", path = "../focal-wire" }
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
+focal-tui = { version = "0.1.0", path = "../focal-tui" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 blake3.workspace = true
 clap.workspace = true

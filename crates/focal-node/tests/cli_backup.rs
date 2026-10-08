@@ -48,6 +48,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -158,13 +159,7 @@ const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;
 fn backup(root: &Path, output: &Path) -> Value {
     let created = admin(
         root,
-        &[
-            "cluster",
-            "backup",
-            "create",
-            "--output",
-            output.to_str().unwrap(),
-        ],
+        &["create", "backup", "--output", output.to_str().unwrap()],
     );
     assert_eq!(created["result"]["kind"], "backup_created", "{created}");
     created["result"]["backup"].clone()
@@ -172,13 +167,7 @@ fn backup(root: &Path, output: &Path) -> Value {
 fn verify(root: &Path, input: &Path) -> Value {
     let verified = admin(
         root,
-        &[
-            "cluster",
-            "backup",
-            "verify",
-            "--input",
-            input.to_str().unwrap(),
-        ],
+        &["verify", "backup", "--input", input.to_str().unwrap()],
     );
     assert_eq!(verified["result"]["kind"], "backup_verified", "{verified}");
     verified["result"]["verification"].clone()
@@ -197,19 +186,18 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let session = identity["session"].as_str().unwrap().to_owned();
     let invitation = client.path().join("alice.invite");
     admin(
         root,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -221,8 +209,8 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -231,7 +219,10 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         .status
         .success()
     );
-    let alice_standing = admin(client.path(), &["--client-context", "alice", "status"]);
+    let alice_standing = admin(
+        client.path(),
+        &["--client-context", "alice", "inspect", "prefix"],
+    );
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
     let document = json!({
         "description": "Run the suite and deliver the report.",
@@ -250,24 +241,24 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let claim = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &claim]));
+    committed(&cli(root, None, &["post", "claim", &claim]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &claim],
+        &["acquire", "receipt", &claim],
     ));
     committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     // The export waits for the session's registration with the directory:
     // a backup is taken under a committed placement.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
-        let placement = admin(root, &["cluster", "placement"]);
+        let placement = admin(root, &["inspect", "placement"]);
         let registered = placement["result"]["placement"]["partitions"]
             .as_array()
             .unwrap()
@@ -297,7 +288,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     assert_eq!(verified["inventory_matches"], true);
     // The storage view names the volume's pressure, the agents and the
     // session's floor.
-    let storage = admin(root, &["diagnose", "node", "--storage"]);
+    let storage = admin(root, &["inspect", "node", "--storage"]);
     assert_eq!(storage["result"]["kind"], "storage", "{storage}");
     let storage = &storage["result"]["storage"];
     assert_eq!(storage["node"], identity["node"]);
@@ -324,9 +315,8 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         root,
         None,
         &[
-            "cluster",
-            "backup",
             "create",
+            "backup",
             "--output",
             first.to_str().unwrap(),
             "--format",
@@ -357,8 +347,8 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     );
     // The claim retires: the next backup carries the bundle and the proof
     // its header names.
-    committed(&cli(root, None, &["claim", "cancel", &claim]));
-    committed(&cli(root, None, &["claim", "release-scope", &claim]));
+    committed(&cli(root, None, &["cancel", "claim", &claim]));
+    committed(&cli(root, None, &["release", "scope", &claim]));
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["get", "claim", &claim, "--format", "json"]);
@@ -393,9 +383,8 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         root,
         None,
         &[
-            "cluster",
-            "backup",
             "verify",
+            "backup",
             "--input",
             empty.to_str().unwrap(),
             "--format",

@@ -34,7 +34,7 @@ evidence() {
   if [ "$system" = focal ]; then
     for n in focal1 focal2 focal3; do
       echo "--- $n replicas"
-      timeout 30 docker compose -f compose.yaml --profile focal exec -T "$n" focal --data-dir /data diagnose cluster --replicas || true
+      timeout 30 docker compose -f compose.yaml --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas || true
       echo "--- $n log"
       dc logs --no-color --tail 120 "$n" || true
     done
@@ -50,7 +50,7 @@ report="$system-$rate-$payload.json"
 case "$system" in
   focal)
     bash focal-bootstrap.sh
-    worker=$(dc exec -T focal1 focal --data-dir /data identity | python3 -c '
+    worker=$(dc exec -T focal1 focal --data-dir /data inspect identity | python3 -c '
 import json, sys
 w = json.load(sys.stdin)["worker"]
 print(w if isinstance(w, str) else bytes(w).hex())')
@@ -82,7 +82,7 @@ EOF
     # Each node's replicas as they report themselves, the cost of every
     # checkpoint they wrote by stage among them, for where the tail's time went.
     for n in focal1 focal2 focal3; do
-      dc exec -T "$n" focal --data-dir /data diagnose cluster --replicas \
+      dc exec -T "$n" focal --data-dir /data inspect replicas --replicas \
         > "$out/$report.$n.replicas.json" 2>/dev/null || true
     done
     ;;

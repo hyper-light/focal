@@ -59,7 +59,7 @@ fn address() -> String {
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
         command.args(["--advertise", address]);
     }
@@ -106,7 +106,7 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     (server, status)
 }
 fn placement(root: &Path) -> Option<Value> {
-    let output = command(root, &["cluster", "placement"]);
+    let output = command(root, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -165,7 +165,7 @@ fn wait_for(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    let health = command(root, &["diagnose", "node", "--health"]);
+    let health = command(root, &["inspect", "node", "--health"]);
     panic!(
         "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
@@ -176,8 +176,8 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     let written = success(
         founder,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -189,6 +189,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         host,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -229,7 +230,9 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     let addresses: Vec<String> = (0..4).map(|_| address()).collect();
     let (_founder_server, status) = start(founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let founder_node = success(founder, &["identity"])["node"].as_u64().unwrap();
+    let founder_node = success(founder, &["inspect", "identity"])["node"]
+        .as_u64()
+        .unwrap();
     let node_a = join(founder, host_a, "host-a", &addresses[1]);
     let node_b = join(founder, dirs[2].path(), "host-b", &addresses[2]);
     let node_c = join(founder, dirs[3].path(), "host-c", &addresses[3]);
@@ -248,11 +251,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     // A tenant the cluster serves, and a session for it created on host A:
     // the founder holds no copy of it.
     let tenant = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
-    let admitted = success(
-        founder,
-        &["cluster", "tenants", "admit", "--tenant", tenant],
-    )["result"]
-        .clone();
+    let admitted = success(founder, &["admit", "tenant", "--tenant", tenant])["result"].clone();
     assert_eq!(admitted["kind"], "tenants", "{admitted}");
     let created = wait_created(host_a, tenant);
     let session_id = created["session"].as_str().unwrap().to_owned();
@@ -271,7 +270,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
             assert!(
                 deadline.open(),
                 "registration did not happen; host agent: {}",
-                String::from_utf8_lossy(&command(host_a, &["diagnose", "node", "--health"]).stdout)
+                String::from_utf8_lossy(&command(host_a, &["inspect", "node", "--health"]).stdout)
             );
             std::thread::sleep(Duration::from_millis(150));
         }
@@ -283,9 +282,8 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     let planned = success(
         founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             tenant,
             "--session",
@@ -311,26 +309,26 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     // it is authoritative and not catching up; the policy holds once the
     // expansion activated; host A leads the new session.
     let readiness =
-        success(founder, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone();
+        success(founder, &["inspect", "node", "--readiness"])["result"]["readiness"].clone();
     assert_eq!(readiness["alive"], true, "{readiness}");
     assert_eq!(readiness["authoritative"], true);
     assert_eq!(readiness["catching_up"], false);
     assert_eq!(readiness["policy_satisfied"], true, "{readiness}");
     assert!(
-        command(founder, &["diagnose", "node", "--probe", "alive"])
+        command(founder, &["inspect", "node", "--probe", "alive"])
             .status
             .success()
     );
     assert!(
-        command(founder, &["diagnose", "node", "--probe", "authoritative"])
+        command(founder, &["inspect", "node", "--probe", "authoritative"])
             .status
             .success()
     );
-    let output = command(founder, &["diagnose", "node", "--probe", "catching-up"]);
+    let output = command(founder, &["inspect", "node", "--probe", "catching-up"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("[probe_failed]"));
     let host_readiness =
-        success(host_a, &["diagnose", "node", "--readiness"])["result"]["readiness"].clone();
+        success(host_a, &["inspect", "node", "--readiness"])["result"]["readiness"].clone();
     assert_eq!(host_readiness["authoritative"], true, "{host_readiness}");
     assert!(
         host_readiness["sessions"]
@@ -343,7 +341,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
         "{host_readiness}"
     );
     // The founder still holds no copy: its replica list does not name the session.
-    let health = success(founder, &["diagnose", "node", "--health"])["result"]["health"].clone();
+    let health = success(founder, &["inspect", "node", "--health"])["result"]["health"].clone();
     assert!(
         !health["placement"]["installed"]
             .as_array()
@@ -354,11 +352,8 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     );
     // Drain the session's own leader: the heal runs through it until its
     // removal commits and the log elects another leader.
-    let drained = success(
-        founder,
-        &["cluster", "nodes", "drain", "--node", &node_a.to_string()],
-    )["result"]
-        .clone();
+    let drained =
+        success(founder, &["drain", "node", "--node", &node_a.to_string()])["result"].clone();
     assert_eq!(drained["changed"], true, "{drained}");
     let remaining: Vec<u64> = all.iter().copied().filter(|id| *id != node_a).collect();
     let view = wait_for(
@@ -377,10 +372,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     // The drained host leaves the cluster.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
     let removed = loop {
-        let output = command(
-            founder,
-            &["cluster", "nodes", "remove", "--node", &node_a.to_string()],
-        );
+        let output = command(founder, &["remove", "node", "--node", &node_a.to_string()]);
         if output.status.success() {
             break serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
         }
@@ -405,9 +397,7 @@ fn wait_created(host: &Path, tenant: &str) -> Value {
     loop {
         let output = command(
             host,
-            &[
-                "cluster", "sessions", "create", "--tenant", tenant, "--name", "orders",
-            ],
+            &["create", "session", "--tenant", tenant, "--name", "orders"],
         );
         if output.status.success() {
             return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();

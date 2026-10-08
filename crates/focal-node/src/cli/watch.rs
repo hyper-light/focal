@@ -286,13 +286,13 @@ fn recovery(context: &Context, name: &str) {
     if let Some(invocation) = context.invocation.as_deref() {
         let _ = writeln!(
             err,
-            "Resume retained watch: {invocation} watch resume {}",
+            "Resume retained watch: {invocation} resume watch {}",
             quote(name)
         );
     } else {
         let _ = writeln!(
             err,
-            "Resume retained watch: focal watch resume {} (keep the original --data-dir/--client-context)",
+            "Resume retained watch: focal resume watch {} (keep the original --data-dir/--client-context)",
             quote(name)
         );
     }

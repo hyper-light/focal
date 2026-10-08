@@ -43,6 +43,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -245,20 +246,19 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     let alice_root = client.path();
     let alice_ctx = Some("alice");
 
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let issuer = hex_hash(&objects(&status)[0]["Standing"]["principal"]);
     let invitation = client.path().join("alice.invite");
     admin(
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -269,8 +269,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         alice_root,
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -283,8 +283,9 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         String::from_utf8_lossy(&enrolled.stderr),
         String::from_utf8_lossy(&enrolled.stdout)
     );
-    let alice =
-        hex_hash(&objects(&admin(alice_root, alice_ctx, &["status"]))[0]["Standing"]["principal"]);
+    let alice = hex_hash(
+        &objects(&admin(alice_root, alice_ctx, &["inspect", "prefix"]))[0]["Standing"]["principal"],
+    );
 
     // ---- Claim A: the respondent's work fails ----
     let (_, result) = committed(&cli(
@@ -299,16 +300,16 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     ));
     let a = created(&result, "Claim").remove(0);
     let a_check = created(&result, "Validation").remove(1);
-    committed(&cli(root, None, &["claim", "post", &a]));
-    committed(&cli(alice_root, alice_ctx, &["receipt", "acquire", &a]));
+    committed(&cli(root, None, &["post", "claim", &a]));
+    committed(&cli(alice_root, alice_ctx, &["acquire", "receipt", &a]));
     // Failed testimony without its diagnostic is refused before anything is
     // sent: a failure is evidence, never an omission.
     let (code, error) = refused(
         alice_root,
         alice_ctx,
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &a,
             "--summary",
@@ -326,7 +327,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         alice_root,
         alice_ctx,
         &[
-            "artifact",
+            "submit",
             "diagnostic",
             "--claim",
             &a,
@@ -355,8 +356,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
                 alice_root.to_str().unwrap(),
                 "--client-context",
                 "alice",
-                "testament",
                 "submit",
+                "testament",
                 "--claim",
                 &a,
                 "--summary",
@@ -375,7 +376,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
             .output()
             .unwrap();
         assert!(!failed.status.success());
-        let pending = cli(alice_root, alice_ctx, &["request", "pending"]);
+        let pending = cli(alice_root, alice_ctx, &["list", "requests"]);
         let rows: Vec<&Value> = pending["operations"]
             .as_array()
             .unwrap()
@@ -387,7 +388,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         let id = rows[0]["operation_id"].as_str().unwrap().to_string();
         let diagnostic_text = String::from_utf8(failed.stderr).unwrap();
         assert!(
-            diagnostic_text.contains(&format!("request retry --operation-id {id}")),
+            diagnostic_text.contains(&format!("retry request --operation-id {id}")),
             "{diagnostic_text}"
         );
         id
@@ -395,19 +396,19 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     let replayed = cli(
         alice_root,
         alice_ctx,
-        &["request", "retry", "--operation-id", &lost_id],
+        &["retry", "request", "--operation-id", &lost_id],
     );
     let (_, result) = committed(&replayed);
     let testament_a = created(&result, "Response").remove(0);
     committed(&cli(
         alice_root,
         alice_ctx,
-        &["testament", "post", &testament_a, "--claim", &a],
+        &["post", "testament", &testament_a, "--claim", &a],
     ));
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament_a, "--claim", &a],
+        &["receive", "testament", &testament_a, "--claim", &a],
     ));
     let responses = objects(&cli(root, None, &["get", "claim", &a]))
         .iter()
@@ -480,8 +481,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &a,
             "--validation",
@@ -493,8 +494,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &a,
             "--validation",
@@ -509,13 +510,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     let (_, entered) = committed(&cli(
         root,
         None,
-        &[
-            "validation",
-            "enter-whole-work",
-            &testament_a,
-            "--claim",
-            &a,
-        ],
+        &["enter", "whole-work", &testament_a, "--claim", &a],
     ));
     assert!(created(&entered, "Artifact").is_empty(), "{entered}");
     let a_evaluations = evaluations(root, &a_check);
@@ -565,14 +560,14 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     ));
     let b = created(&result, "Claim").remove(0);
     let b_check = created(&result, "Validation").remove(1);
-    committed(&cli(root, None, &["claim", "post", &b]));
+    committed(&cli(root, None, &["post", "claim", &b]));
     assert_eq!(claim_object(root, &b)["status"], POSTED);
-    committed(&cli(alice_root, alice_ctx, &["receipt", "acquire", &b]));
+    committed(&cli(alice_root, alice_ctx, &["acquire", "receipt", &b]));
     let (_, result) = committed(&cli(
         alice_root,
         alice_ctx,
         &[
-            "artifact", "submit", "--claim", &b, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &b, "--slot", "0", "--text", PROOF,
         ],
     ));
     let output = created(&result, "Artifact").remove(0);
@@ -581,8 +576,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         alice_root,
         alice_ctx,
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &b,
             "--summary",
@@ -599,19 +594,19 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     committed(&cli(
         alice_root,
         alice_ctx,
-        &["testament", "post", &testament_b, "--claim", &b],
+        &["post", "testament", &testament_b, "--claim", &b],
     ));
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament_b, "--claim", &b],
+        &["receive", "testament", &testament_b, "--claim", &b],
     ));
     committed(&cli(
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &b,
             "--validation",
@@ -625,8 +620,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &b,
             "--validation",
@@ -684,8 +679,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &b,
             "--validation",
@@ -754,7 +749,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     let lost_after = cli(
         alice_root,
         alice_ctx,
-        &["request", "inspect", "--operation-id", &lost_id],
+        &["inspect", "request", "--operation-id", &lost_id],
     );
     assert_eq!(lost_after["condition"], "Committed", "{lost_after}");
     assert_eq!(
@@ -764,7 +759,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_t
     let error_after = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &error_id],
+        &["retry", "request", "--operation-id", &error_id],
     );
     assert_eq!(error_after["condition"], "Committed", "{error_after}");
     assert_eq!(

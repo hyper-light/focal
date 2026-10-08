@@ -70,7 +70,7 @@ const UPLOAD_CANCEL: OperationDescriptor = OperationDescriptor {
     wire: WireProfile::V1,
     retry: RetryIdentity::Exact,
     surface: Surface::Transfer,
-    cli_path: Some("artifact upload cancel"),
+    cli_path: Some("cancel upload"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"urn:focal:transfer:upload.cancel:input:1","type":"object","properties":{"upload_id":{"type":"string","pattern":"^[0-9a-f]{32}$","not":{"const":"00000000000000000000000000000000"}}},"required":["upload_id"],"additionalProperties":false}"#,
     ),

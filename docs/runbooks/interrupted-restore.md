@@ -1,18 +1,18 @@
 # Interrupted restore
 
-**Failure.** `cluster restore` did not finish: the node was killed during the restore, or the
+**Failure.** `restore session` did not finish: the node was killed during the restore, or the
 command was retried after it completed.
 
-**Symptoms.** The restored session is absent from `cluster placement` on the node, or
+**Symptoms.** The restored session is absent from `inspect placement` on the node, or
 present without its copies verified; a retried restore is refused because the directory
 already holds the ledger.
 
 **Read-only diagnostics.**
 
 ```sh
-focal --data-dir DIR cluster backup verify --input BACKUP     # runs anywhere the binary does
-focal --data-dir DIR cluster placement
-focal --data-dir DIR diagnose cluster --replicas --session ID
+focal --data-dir DIR verify backup --input BACKUP     # runs anywhere the binary does
+focal --data-dir DIR inspect placement
+focal --data-dir DIR inspect replicas --replicas --session ID
 ```
 
 **Preconditions.** The backup verifies ([26 §6](../archictecutre/26-custody-archive-retention-and-restore.md));
@@ -20,7 +20,7 @@ the restore target is a node of the cluster the backup is meant for, or a recove
 incarnation is acknowledged (`--new-incarnation`) when the source cannot be fenced.
 
 **Commands.** Restart the node if it stopped, then issue the restore again with the same
-arguments: `cluster restore --input BACKUP [--new-incarnation]`. A restore that completed
+arguments: `restore session --input BACKUP [--new-incarnation]`. A restore that completed
 is answered as restored and nothing is changed; one that was interrupted goes on where it
 was cut: content and seeds are brought again, a log that holds the backup's image and
 nothing else is opened as it is, and a copy that was recorded is the restore, complete. A
@@ -33,7 +33,7 @@ a claim of continuation.
 **Stop conditions.** Stop if `backup verify` reports problems: a restore never proceeds from
 a backup that does not verify.
 
-**Verification.** `cluster placement` lists the restored session; a claim from the backup
+**Verification.** `inspect placement` lists the restored session; a claim from the backup
 reads back with its artifact bytes; the restore's `recovery_point` is the backup's prefix.
 
 **Escalation.** None beyond another backup.
@@ -44,7 +44,7 @@ be cut at: with the backup's content brought, with its log begun, with its copy 
 The node is restarted and the restore is issued again, which completes, and again, which
 changes nothing; the claim and its artifact read back from the restored session.
 
-Every command above is under `focal --data-dir DIR cluster ...` on the node named, over its
+Every command above is run as `focal --data-dir DIR ACTION THING ...` on the node named, over its
 own admin socket ([cluster-admin.md](../cluster-admin.md)); reads never change the cluster.
 The executed test runs the real binary through this runbook's commands
 (`crates/focal-node/tests/runbooks.rs`); its evidence is recorded in

@@ -1,10 +1,23 @@
 use super::*;
 use clap::{CommandFactory, Parser};
 
+/// The manual command `args` say: in the derived tree's words, or as typed (`ACTION
+/// THING`), which the grammar says in the derived tree's.
 fn command(args: &[&str]) -> Commands {
-    let args =
-        super::super::Args::try_parse_from(std::iter::once("focal").chain(args.iter().copied()))
-            .unwrap();
+    let typed: Vec<std::ffi::OsString> = std::iter::once("focal")
+        .chain(args.iter().copied())
+        .map(Into::into)
+        .collect();
+    let derived = match args {
+        [action, thing, ..] => match super::grammar::lookup(action, thing) {
+            Some(used) => {
+                super::grammar::internal(&super::command_tree::command(), &typed, used.path)
+            }
+            None => typed,
+        },
+        _ => typed,
+    };
+    let args = super::super::Args::try_parse_from(derived).unwrap();
     let super::super::Commands::Manual(command) = args.command else {
         panic!("manual command expected");
     };
@@ -983,7 +996,7 @@ mod native_adapters {
 
     #[test]
     fn every_exposed_coverage_row_names_a_command_in_the_clap_tree() {
-        let tree = super::super::command_tree::command();
+        let tree = super::super::grammar::command();
         for row in native_coverage_table() {
             if row.exposure != NativeExposure::AuthoredTool {
                 assert!(row.cli.is_empty());

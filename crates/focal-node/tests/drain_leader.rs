@@ -23,7 +23,7 @@ use fleet::*;
 /// Where `node` says the session leads, from its metrics; none while it
 /// does not answer or does not host the session.
 fn session_leader(node: &Node, ledger: &str) -> Option<u64> {
-    let output = run(node, None, &["diagnose", "node", "--metrics"]);
+    let output = run(node, None, &["inspect", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -71,9 +71,8 @@ fn transfer(leading: &Node, nodes: &[&Node], ledger: &str, target: u64) {
             leading,
             None,
             &[
-                "cluster",
-                "replicas",
                 "transfer",
+                "replica-leader",
                 "--session",
                 ledger,
                 "--node",
@@ -133,10 +132,7 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
 
     // A replacement joins, and the host that leads is drained.
     let (_server_c, node_c) = join_start(&founder, &hosts[2], "host-c", &addresses[3]);
-    let drained = admin(
-        &founder,
-        &["cluster", "nodes", "drain", "--node", &node_a.to_string()],
-    );
+    let drained = admin(&founder, &["drain", "node", "--node", &node_a.to_string()]);
     assert_eq!(drained["result"]["eligible"], false, "{drained}");
     let healed = [founder_node, node_b, node_c];
     let everyone = [&founder, &hosts[0], &hosts[1], &hosts[2]];
@@ -164,18 +160,18 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
                         "leader {:?}; health {}; replicas {}; plan {}; periods {}",
                         session_leader(node, &ledger),
                         String::from_utf8_lossy(
-                            &run(node, None, &["diagnose", "node", "--health"]).stdout
+                            &run(node, None, &["inspect", "node", "--health"]).stdout
                         ),
                         // Which replica of the session each node runs, with
                         // its leader, commit and apply: a replacement stuck
                         // at `Installed` is one that never caught up, or never
                         // learned a leader (three CI runs of 2026-10-01/02).
                         String::from_utf8_lossy(
-                            &run(node, None, &["diagnose", "cluster", "--replicas"]).stdout
+                            &run(node, None, &["inspect", "replicas", "--replicas"]).stdout
                         ),
-                        String::from_utf8_lossy(&run(node, None, &["cluster", "plan"]).stdout),
+                        String::from_utf8_lossy(&run(node, None, &["plan", "placement"]).stdout),
                         String::from_utf8_lossy(
-                            &run(node, None, &["diagnose", "node", "--metrics"]).stdout
+                            &run(node, None, &["inspect", "node", "--metrics"]).stdout
                         )
                         .lines()
                         .filter(|line| line.contains("period") || line.contains("pace"))
@@ -213,7 +209,7 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
     let mut wait = Progress::begin(&[&hosts[0]], Duration::from_secs(120));
     while session_leader(&hosts[0], &ledger) == Some(node_a) {
         if let Some(spent) = wait.spent() {
-            let metrics = run(&hosts[0], None, &["diagnose", "node", "--metrics"]);
+            let metrics = run(&hosts[0], None, &["inspect", "node", "--metrics"]);
             panic!(
                 "the drained host still claims the session: {spent}: {:?}",
                 String::from_utf8_lossy(&metrics.stdout)
@@ -249,7 +245,7 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
         let output = run(
             &founder,
             None,
-            &["cluster", "nodes", "remove", "--node", &node_a.to_string()],
+            &["remove", "node", "--node", &node_a.to_string()],
         );
         if output.status.success() {
             break serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"]

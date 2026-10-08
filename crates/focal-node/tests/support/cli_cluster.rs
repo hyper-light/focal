@@ -41,14 +41,14 @@ fn actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restar
     let founder_address = address();
     let peer_address = address();
     let (server, _) = start(founder.path(), Some(&founder_address));
-    let (identity, _) = success(founder.path(), &["identity"]);
+    let (identity, _) = success(founder.path(), &["inspect", "identity"]);
     let founder_node = identity["node"].as_u64().unwrap();
     let invitation = founder.path().join("peer.invite");
     success(
         founder.path(),
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             "peer",
             "--output",
@@ -59,24 +59,21 @@ fn actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restar
         peer.path(),
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
             &peer_address,
         ],
     );
-    let (peer_identity, _) = success(peer.path(), &["identity"]);
+    let (peer_identity, _) = success(peer.path(), &["inspect", "identity"]);
     let peer_node = peer_identity["node"].as_u64().unwrap();
     let (peer_server, _) = start(peer.path(), None);
-    let configuration = eventually(
-        founder.path(),
-        &["cluster", "membership", "show"],
-        |value| {
-            value["result"]["configuration"]["learners"]
-                .as_array()
-                .is_some_and(|nodes| nodes.contains(&json!(peer_node)))
-        },
-    );
+    let configuration = eventually(founder.path(), &["inspect", "membership"], |value| {
+        value["result"]["configuration"]["learners"]
+            .as_array()
+            .is_some_and(|nodes| nodes.contains(&json!(peer_node)))
+    });
     let expected = configuration["result"]["configuration"]["configuration_index"]
         .as_u64()
         .unwrap()
@@ -84,23 +81,22 @@ fn actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restar
     let promoted = command(
         founder.path(),
         &[
-            "cluster",
-            "membership",
             "promote",
+            "learner",
             "--node",
             &peer_node.to_string(),
             "--expected-configuration-index",
             &expected,
         ],
     );
-    let inspected = success(founder.path(), &["cluster", "request", "inspect"]).0;
+    let inspected = success(founder.path(), &["inspect", "admin-request"]).0;
     let reference = inspected["result"]["operation_id"]
         .as_str()
         .unwrap()
         .to_owned();
     let receipt = eventually(
         founder.path(),
-        &["cluster", "request", "retry", &reference],
+        &["retry", "admin-request", &reference],
         |value| value["result"]["kind"] == "committed",
     );
     if promoted.status.success() {
@@ -110,15 +106,11 @@ fn actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restar
         );
     }
     assert!(receipt["result"]["committed_index"].as_u64().unwrap() > 0);
-    let committed = eventually(
-        founder.path(),
-        &["cluster", "membership", "show"],
-        |value| {
-            value["result"]["configuration"]["voters"]
-                .as_array()
-                .is_some_and(|nodes| nodes.len() == 2)
-        },
-    );
+    let committed = eventually(founder.path(), &["inspect", "membership"], |value| {
+        value["result"]["configuration"]["voters"]
+            .as_array()
+            .is_some_and(|nodes| nodes.len() == 2)
+    });
     assert!(
         committed["result"]["configuration"]["learners"]
             .as_array()
@@ -127,47 +119,29 @@ fn actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restar
     );
     let transfer = success(
         founder.path(),
-        &[
-            "cluster",
-            "leader",
-            "transfer",
-            "--node",
-            &peer_node.to_string(),
-        ],
+        &["transfer", "leader", "--node", &peer_node.to_string()],
     )
     .0;
     assert_eq!(transfer["result"]["kind"], "transfer_initiated");
-    let leader = eventually(peer.path(), &["cluster", "status"], |value| {
+    let leader = eventually(peer.path(), &["inspect", "cluster"], |value| {
         value["result"]["leader"] == peer_node
     });
     assert_eq!(leader["result"]["node"], peer_node);
     success(
         peer.path(),
-        &[
-            "cluster",
-            "leader",
-            "transfer",
-            "--node",
-            &founder_node.to_string(),
-        ],
+        &["transfer", "leader", "--node", &founder_node.to_string()],
     );
-    eventually(founder.path(), &["cluster", "status"], |value| {
+    eventually(founder.path(), &["inspect", "cluster"], |value| {
         value["result"]["leader"] == founder_node
     });
     let removal = success(
         founder.path(),
-        &[
-            "cluster",
-            "membership",
-            "remove",
-            "--node",
-            &peer_node.to_string(),
-        ],
+        &["remove", "member", "--node", &peer_node.to_string()],
     )
     .0;
     assert_eq!(removal["result"]["kind"], "committed");
     assert!(
-        !command(founder.path(), &["cluster", "request", "retry", &reference])
+        !command(founder.path(), &["retry", "admin-request", &reference])
             .status
             .success()
     );
@@ -179,11 +153,11 @@ fn actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restar
     drop(server);
     let (_restart, _) = start(founder.path(), None);
     assert_eq!(
-        success(founder.path(), &["cluster", "request", "retry", &latest]).0,
+        success(founder.path(), &["retry", "admin-request", &latest]).0,
         removal
     );
     assert_eq!(
-        success(founder.path(), &["cluster", "request", "inspect"]).0,
+        success(founder.path(), &["inspect", "admin-request"]).0,
         removal
     );
 }
@@ -206,8 +180,8 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
     success(
         founder.path(),
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             "unused",
             "--output",
@@ -222,7 +196,7 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let token = bundle.invitation().expose_token().unwrap();
-    let (observed, output) = success(founder.path(), &["cluster", "invitations", "get", &id]);
+    let (observed, output) = success(founder.path(), &["get", "invitation", &id]);
     assert_redacted(&output, &token);
     assert_eq!(observed["result"]["entries"][0]["id"], id);
     assert_eq!(observed["result"]["entries"][0]["revoked"], false);
@@ -230,9 +204,8 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
     let (revoked, output) = success(
         founder.path(),
         &[
-            "cluster",
-            "invitations",
             "revoke",
+            "invitation",
             &id,
             "--expected-revision",
             &revision,
@@ -241,31 +214,23 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
     assert_redacted(&output, &token);
     let operation = revoked["result"]["operation_id"].as_str().unwrap();
     assert_eq!(
-        success(founder.path(), &["cluster", "request", "retry", operation]).0,
+        success(founder.path(), &["retry", "admin-request", operation]).0,
         revoked
     );
-    let (observed, output) = success(
-        founder.path(),
-        &["cluster", "credentials", "get", "--invitation", &id],
-    );
+    let (observed, output) = success(founder.path(), &["get", "credential", "--invitation", &id]);
     assert_redacted(&output, &token);
     assert_eq!(observed["result"]["entries"][0]["revoked"], true);
     assert!(observed["result"]["entries"][0]["credential"].is_null());
     let stale = command(
         founder.path(),
-        &[
-            "cluster",
-            "invitations",
-            "list",
-            "--expected-revision",
-            &revision,
-        ],
+        &["list", "invitations", "--expected-revision", &revision],
     );
     assert!(!stale.status.success());
     let rejected = command(
         peer.path(),
         &[
             "join",
+            "cluster",
             "--invite-file",
             path.to_str().unwrap(),
             "--advertise",
@@ -283,8 +248,8 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
     success(
         founder.path(),
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             "unused",
             "--output",
@@ -298,8 +263,8 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
     success(
         founder.path(),
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             "unused",
             "--output",
@@ -315,6 +280,7 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
         peer.path(),
         &[
             "join",
+            "cluster",
             "--invite-file",
             fresh.to_str().unwrap(),
             "--advertise",

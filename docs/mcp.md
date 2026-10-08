@@ -2,7 +2,7 @@
 
 The [cluster administration guide](cluster-admin.md) lists the conditional local operator tools, their CLI equivalents, and the distinct root/application recovery guarantees.
 
-`focal mcp serve` runs a real foreground stdio MCP adapter over the selected authenticated Focal connection. It exposes shared application operations, managed recovery, five payload-transfer tools and four durable-watch tools. Local network administration adds a separate operator catalogue when that backend is available; discover all pages instead of assuming a fixed tool count. Five [repository skills](../skills/manifest.json) cover claims, evidence, external validation, peer workflows and cluster operations. They are instruction files; Focal does not execute an agent interpreter or background workflow engine.
+`focal serve mcp` runs a real foreground stdio MCP adapter over the selected authenticated Focal connection. It exposes shared application operations, managed recovery, five payload-transfer tools and four durable-watch tools. Local network administration adds a separate operator catalogue when that backend is available; discover all pages instead of assuming a fixed tool count. Five [repository skills](../skills/manifest.json) cover claims, evidence, external validation, peer workflows and cluster operations. They are instruction files; Focal does not execute an agent interpreter or background workflow engine.
 
 ## Start the service and adapter
 
@@ -15,18 +15,18 @@ bash scripts/cargo.sh build -p focal-node --bin focal --locked --offline
 Start a service in one terminal, using a new private data directory:
 
 ```sh
-target/debug/focal --data-dir /tmp/focal-mcp-example start
+target/debug/focal --data-dir /tmp/focal-mcp-example start node
 ```
 
 Configure a stdio MCP client to execute the following command, with the same absolute data directory. Keep its stdin open while awaiting tool results:
 
 ```sh
-target/debug/focal --data-dir /tmp/focal-mcp-example mcp serve
+target/debug/focal --data-dir /tmp/focal-mcp-example serve mcp
 ```
 
 Use an absolute binary path in a client whose working directory differs from this checkout. The adapter's stdout contains newline-delimited JSON-RPC only; diagnostics use stderr. One process serves one foreground connection. EOF cancels outstanding waits and begins bounded shutdown. The service remains a separate process and owns the ledger.
 
-Without a selected profile, the adapter uses the established local service identity and ledger. Named client contexts select a Unix connection or authenticated QUIC client; `--client-context NAME` selects one invocation and `context use NAME` selects a saved default. Each connection retains its own request and upload history, and authenticated standing still comes from the server. See [connection setup](archictecutre/19-cli-mcp-implementation.md) for enrollment, context files and limitations. A physical joined node’s local metadata is not a substitute for an authenticated client context. The data directory must be owner-private (`0700`); the node creates new directories with that mode.
+Without a selected profile, the adapter uses the established local service identity and ledger. Named client contexts select a Unix connection or authenticated QUIC client; `--client-context NAME` selects one invocation and `use context NAME` selects a saved default. Each connection retains its own request and upload history, and authenticated standing still comes from the server. See [connection setup](archictecutre/19-cli-mcp-implementation.md) for enrollment, context files and limitations. A physical joined node’s local metadata is not a substitute for an authenticated client context. The data directory must be owner-private (`0700`); the node creates new directories with that mode.
 
 ## Discover the actual schemas
 
@@ -37,7 +37,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"focal-example","version":"1"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | target/debug/focal --data-dir /tmp/focal-mcp-example mcp serve
+  | target/debug/focal --data-dir /tmp/focal-mcp-example serve mcp
 ```
 
 `tools/list` is paginated: send its `nextCursor` in a subsequent `tools/list` call until absent. These catalogue cursors belong to this connection; domain list cursors are different. The modern profile uses `params._meta` on each request, for example:
@@ -46,14 +46,14 @@ printf '%s\n' \
 {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"focal-example","version":"1"}}}}
 ```
 
-The catalogue a connection serves is the engine the adapter's standing probe found — the same probe and rule the CLI's mutations and discovery use (`focal schema list --native` prints the native catalogue offline, `schema example NAME --native` a document a native tool accepts unchanged). Use the discovered input/output schemas rather than generating fields from a tool's name. Application descriptors use version 1 on a V1 ledger and version 2 on a native ledger (see [native engine tools](#native-engine-tools)), encoded in their input schema `$id`. The [manifest](../skills/manifest.json) pins required names and versions and the instruction content digests. Saved transfer state is also available through `focal artifact upload inspect UPLOAD_ID --origin mcp`; `artifact upload cancel` with the same origin retries the same durable cancellation used by `upload.cancel`. The six recovery tools use recovery contract version 2. Packaged skills pin their own instruction version, application operations use version 1, and the five transfer tools use transfer contract version 1.
+The catalogue a connection serves is the engine the adapter's standing probe found — the same probe and rule the CLI's mutations and discovery use (`focal list schemas --native` prints the native catalogue offline, `get example NAME --native` a document a native tool accepts unchanged). Use the discovered input/output schemas rather than generating fields from a tool's name. Application descriptors use version 1 on a V1 ledger and version 2 on a native ledger (see [native engine tools](#native-engine-tools)), encoded in their input schema `$id`. The [manifest](../skills/manifest.json) pins required names and versions and the instruction content digests. Saved transfer state is also available through `focal inspect upload UPLOAD_ID --origin mcp`; `cancel upload` with the same origin retries the same durable cancellation used by `upload.cancel`. The six recovery tools use recovery contract version 2. Packaged skills pin their own instruction version, application operations use version 1, and the five transfer tools use transfer contract version 1.
 
-Nested results retain the frozen model encoding (byte-array IDs/hashes and numeric vocabularies). Convert identifiers to hexadecimal for authored fields. The implemented `focal schema get domain-registry` command prints the vocabulary mapping; its schema lookup is a local CLI operation, not an advertised MCP tool.
+Nested results retain the frozen model encoding (byte-array IDs/hashes and numeric vocabularies). Convert identifiers to hexadecimal for authored fields. The implemented `focal get schema domain-registry` command prints the vocabulary mapping; its schema lookup is a local CLI operation, not an advertised MCP tool.
 
 The respondent must call `testament.submit` after work completes or fails;
 `receipt.acquire` creates no testament. Non-Complete reports require a durable
 `kind: "error"` artifact in the exact manifest. Obtain the pinned diagnostic
-descriptor, hash and example with `focal schema get error-report`, then submit
+descriptor, hash and example with `focal get schema error-report`, then submit
 that payload through the ordinary `artifact.submit` tool. A tool failure can use:
 
 ```json
@@ -95,7 +95,7 @@ Every list accepts optional family-appropriate filters, including an unfiltered 
 
 `validation.context` accepts the same `id`, optional `prefix`/`after`, and `limit` as `validation.get`. It returns `result.kind = "validation_context"` and `result.context` with the pinned requirement, owning claim, optional current closing testament, run/verdict page and exact token. Component reads share that token; a missing required parent or mismatched specification fails the whole result. An expired prefix is returned as `snapshot_expired`, never silently replaced with a newer snapshot. It is read-only, takes no `operation_id` and reserves no managed ordinal. Context describes recorded facts; it is not an assignment or permission to run a validator. Historical runs retain their original targets even when the current testament differs. Artifact payloads are retrieved separately. See the [shared continuation instructions](../skills/focal-claims/references/workflow-contract.md#preserve-read-scope).
 
-`ledger.summary` accepts `{}` and returns `condition = "Observed"`, `result.kind = "summary"`, and six scalar committed counts plus the observed `token` and `applied_index`. A fresh quorum read precedes the counts; it does not download the graph. Counts cover retained claims, testaments, artifacts, validations, evidence sets and validation runs in this ledger only. They do not aggregate lifecycle statuses or cluster totals. There is no filter, cursor or saved-prefix input, and this read retains no historical snapshot lease. It takes no `operation_id` and reserves no managed ordinal. The CLI equivalent is `focal ledger summary --format json` (also table and YAML).
+`ledger.summary` accepts `{}` and returns `condition = "Observed"`, `result.kind = "summary"`, and six scalar committed counts plus the observed `token` and `applied_index`. A fresh quorum read precedes the counts; it does not download the graph. Counts cover retained claims, testaments, artifacts, validations, evidence sets and validation runs in this ledger only. They do not aggregate lifecycle statuses or cluster totals. There is no filter, cursor or saved-prefix input, and this read retains no historical snapshot lease. It takes no `operation_id` and reserves no managed ordinal. The CLI equivalent is `focal inspect ledger --format json` (also table and YAML).
 
 ## Reserve, submit and consume a managed operation
 
@@ -158,8 +158,8 @@ The service verifies the pinned test-report and error-report schemas. Obtain the
 descriptors and exact hashes through the CLI:
 
 ```sh
-focal schema get test-report
-focal schema get error-report
+focal get schema test-report
+focal get schema error-report
 ```
 
 Use the test-report hash in the discovered `artifact.submit` schema with `kind: "test-report"` and a text payload such as `{"passed":1,"failed":0,"skipped":0}`. Inline text/bytes and metadata are each limited to 16 KiB. The installed test-report validator accepts a content-backed JSON payload up to 1 MiB. Content transfers are independently bounded at 64 MiB; successful storage does not grant schema admission beyond the actual validator’s limit. Schema registration is not an MCP operation. `artifact.get` returns the descriptor/reference; `artifact.download` returns bounded payload pages. The [manual CLI](manual-cli.md#deliver-artifacts-and-a-testament) automatically stages larger `--payload-file` inputs and uses the same upload journal before attachment.
@@ -208,8 +208,7 @@ Both protocol profiles are covered by a real 300 KiB progressive upload, MCP res
 
 ## Native engine tools
 
-On a ledger activated on the native engine (`focal cluster replicas
-activate-native`, [cluster-admin.md](cluster-admin.md)) the adapter serves a
+On a ledger activated on the native engine (`focal activate native`, [cluster-admin.md](cluster-admin.md)) the adapter serves a
 different catalogue. At startup it probes the engine once with a standing read
 under the native wire profile, on the same runtime every later call uses; a V1
 answer keeps the catalogue above, a native answer replaces the application,
@@ -312,7 +311,7 @@ returns the journaled receipt, the recorded refusal, or `Pending`;
 `request.retry` resends the exact frame until the owner commits it and returns
 the bound receipt without a send once it has. `request.inspect` with
 `remote: true` reads the owner's committed outcome for the request key
-instead of the journal; the human CLI's `focal request inspect --operation-id
+instead of the journal; the human CLI's `focal inspect request --operation-id
 n1:… --remote` performs the same read, so either adapter can observe an
 operation the other journaled under the same context. Refusals are recorded
 as reported and leave the pending list; the frame stays inspectable. There
@@ -383,8 +382,8 @@ engine's polls, never a clock), `stack`, `calls`, `result` (the returned JSON, a
 of the response bound and the protocol's tree bound), `unsettled` (awaiting what never
 settles), `cancelled`, `program` (does not parse) or `exception`. Calls made before the
 end are durable and listed. The CLI runs the same programs against the same journal:
-`focal code run --run ID --file program.js [--input input.json] [--now-ms N]` and
-`focal code search --file program.js`.
+`focal run code --run ID --file program.js [--input input.json] [--now-ms N]` and
+`focal search tools --file program.js`.
 
 ## Operator-only administration
 
@@ -406,14 +405,14 @@ Legacy 32-character IDs continue under `DATA_DIR/MCP.operations`. External `MCP.
 
 Upload history lives beside each selected context’s operation stores in `CLI.uploads` or `MCP.uploads`, with external `.lock` and `.initialized` files. Preserve the directory and both files. Checksummed metadata binds scope, declared digest/class/length, exact pending request, staged prefix and any returned reference. Defaults permit 64 retained transfer IDs within 256 MiB of conservative reservations, including complete declared payloads and metadata. Completed/cancelled transfers remain counted; automatic reclamation is not implemented. Catalogue locks cover registration, while a returned upload journal exclusively owns that transfer across network waits. Unrelated uploads use independent locks; there is no new upload worker or queue.
 
-For CLI recovery, `focal request inspect --operation-id M1_ID` and `focal request retry --operation-id M1_ID` find the existing local managed store without creating another namespace. A legacy MCP journal remains `DATA_DIR/MCP.operations/OPERATION_ID/journal`:
+For CLI recovery, `focal inspect request --operation-id M1_ID` and `focal retry request --operation-id M1_ID` find the existing local managed store without creating another namespace. A legacy MCP journal remains `DATA_DIR/MCP.operations/OPERATION_ID/journal`:
 
 ```sh
-target/debug/focal --data-dir /tmp/focal-mcp-example request inspect \
+target/debug/focal --data-dir /tmp/focal-mcp-example inspect request \
   /tmp/focal-mcp-example/MCP.operations/b731bdba83db4de7bf4b690ac18e4001/journal --format json
 ```
 
-The analogous `request retry PATH` resumes it. Path-based journals keep their existing format; MCP recovery tools accept IDs rather than arbitrary paths. The foreground adapter admits one active tool call and bounds transport input, output, queues and shutdown, reporting pressure rather than an unbounded backlog.
+The analogous `retry request PATH` resumes it. Path-based journals keep their existing format; MCP recovery tools accept IDs rather than arbitrary paths. The foreground adapter admits one active tool call and bounds transport input, output, queues and shutdown, reporting pressure rather than an unbounded backlog.
 
 Each of the five skill directories is self-contained (the [Agent Skills](https://agentskills.io/specification) layout): its `SKILL.md` and a `references/` folder holding every file it links, so one directory copied alone into an agent's skills folder still resolves. Copies of a shared reference are byte-identical (a contract test refuses drift). The server also serves them over MCP with the skills extension ([SEP-2640](https://modelcontextprotocol.io/extensions/skills/overview), `io.modelcontextprotocol/skills`, final 2026-09-13). On the 2026-07-28 profile, `server/discover` declares `resources` and the extension, `skills/list` returns every skill with its frontmatter and a manifest of each file's `skill://` URI, SHA-256 digest and size computed from the bytes served, `skills/get` looks one up by URI, and `resources/read` returns a file. Directory reads are not offered, since every file is in its skill's manifest. A 2025-11-25 client reads the same files through `resources/list` and `resources/read`. The files are the ones this binary was built with, and `code.search` sees them as `skills`. Use [focal-validation](../skills/focal-validation/SKILL.md) for pinned external execution and verdict submission. Each skill carries an "On a native ledger" branch and the shared contract a [native engine](../skills/focal-claims/references/workflow-contract.md#native-engine) section; `skills/manifest.json` (schema 3) pins the version-1 operations, the version-2 native operations (`required_native_operations`, together covering every native descriptor), the recovery, transfer, watch and administration contracts, and every file digest (`cargo test -p focal-client --test skill_contract -- --ignored --nocapture print_skill_digests` prints the digests to re-pin after an edit). Contract tests pin live descriptors, recovery and administration contracts, and file digests. Protocol fixtures and the repository's Rust stdio harness provide qualification; an external SDK/client interoperability run is not claimed here.
 

@@ -43,7 +43,7 @@ fn regional(view: &Value, id: u64, region: &str) -> bool {
 fn wait_for_peer_rtt(founder: &Node) -> String {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
-        let output = fleet::run(founder, None, &["diagnose", "node", "--metrics"]);
+        let output = fleet::run(founder, None, &["inspect", "node", "--metrics"]);
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             if text.contains("focal_peer_rtt_ms{") {
@@ -76,7 +76,7 @@ fn the_region_stage_spans_regions_shows_latency_and_fences_residency() {
         &founder,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _founder_server = journey.start(
         &founder,
@@ -110,9 +110,8 @@ fn the_region_stage_spans_regions_shows_latency_and_fences_residency() {
         "region survival",
         &["tenant", "session", "survive region"],
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -154,7 +153,7 @@ fn the_region_stage_spans_regions_shows_latency_and_fences_residency() {
             "focal",
             "--data-dir",
             "<founder>",
-            "diagnose",
+            "inspect",
             "node",
             "--metrics",
         ],
@@ -192,14 +191,7 @@ fn the_region_stage_spans_regions_shows_latency_and_fences_residency() {
         &founder,
         "ranges",
         &["session"],
-        &[
-            "cluster",
-            "replicas",
-            "ranges",
-            "--session",
-            &ledger,
-            "list",
-        ],
+        &["list", "ranges", "--session", &ledger],
     );
     let member = ranges["result"]["ranges"]["members"][0]["id"]
         .as_str()
@@ -211,12 +203,10 @@ fn the_region_stage_spans_regions_shows_latency_and_fences_residency() {
         "residency fence",
         &["session", "member", "node outside residency"],
         &[
-            "cluster",
-            "replicas",
-            "ranges",
+            "move",
+            "range",
             "--session",
             &ledger,
-            "move",
             "--member",
             &member,
             "--node",

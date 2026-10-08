@@ -18,7 +18,7 @@ These examples use `/tmp` for an experiment. Use persistent storage for a node w
 In the first terminal, start the founder and leave it running:
 
 ```sh
-focal --data-dir /tmp/focal-founder start --advertise 127.0.0.1:7443
+focal --data-dir /tmp/focal-founder start node --advertise 127.0.0.1:7443
 ```
 
 Wait for the JSON startup record with `"condition": "Ready"`. The process runs in the foreground. The advertised endpoint is also the listen address unless `--listen` is supplied. The service uses one UDP/QUIC port for authenticated peer traffic and invitation redemption, plus private local Unix sockets.
@@ -26,7 +26,7 @@ Wait for the JSON startup record with `"condition": "Ready"`. The process runs i
 In a second terminal, ask the running founder to write an invitation:
 
 ```sh
-focal --data-dir /tmp/focal-founder cluster invite \
+focal --data-dir /tmp/focal-founder invite node \
   --node worker-2 --output /tmp/worker-2.invite
 ```
 
@@ -35,14 +35,14 @@ The command prints `InvitationWritten` and the output path, never the invitation
 Enroll the second node using a different, initially empty data directory:
 
 ```sh
-focal --data-dir /tmp/focal-worker-2 join \
+focal --data-dir /tmp/focal-worker-2 join cluster \
   --invite-file /tmp/worker-2.invite --advertise 127.0.0.1:7444
 ```
 
 `join` saves the enrollment and prints only the verified node identity, then exits. The cluster and application ledger IDs match the founder; the physical node ID differs. Start the enrolled node in the same terminal:
 
 ```sh
-focal --data-dir /tmp/focal-worker-2 start
+focal --data-dir /tmp/focal-worker-2 start node
 ```
 
 The founder’s `Ready` record also waits for committed initial directory activation. This requires no new configuration or geographic labels.
@@ -62,15 +62,15 @@ The joined node’s startup record is `CatchingUp`, with `assigned_ledger: false
 From another terminal, inspect the saved identities or the founder's published application prefix:
 
 ```sh
-focal --data-dir /tmp/focal-founder identity
-focal --data-dir /tmp/focal-worker-2 identity
-focal --data-dir /tmp/focal-founder status
-focal --data-dir /tmp/focal-worker-2 diagnose node --health
-focal --data-dir /tmp/focal-worker-2 cluster status
-focal --data-dir /tmp/focal-worker-2 cluster replicas list
+focal --data-dir /tmp/focal-founder inspect identity
+focal --data-dir /tmp/focal-worker-2 inspect identity
+focal --data-dir /tmp/focal-founder inspect prefix
+focal --data-dir /tmp/focal-worker-2 inspect node --health
+focal --data-dir /tmp/focal-worker-2 inspect cluster
+focal --data-dir /tmp/focal-worker-2 list replicas
 ```
 
-Top-level `status` queries the application ledger, so a joined node without that assignment cannot serve it. `diagnose node --health` observes the live local owner; `cluster status` performs a root quorum read. An empty `cluster replicas list` is the expected initial joined-node application inventory. None of these observations assigns placement or changes durability.
+Top-level `status` queries the application ledger, so a joined node without that assignment cannot serve it. `inspect node --health` observes the live local owner; `inspect cluster` performs a root quorum read. An empty `list replicas` is the expected initial joined-node application inventory. None of these observations assigns placement or changes durability.
 
 ## Nodes on different hosts
 
@@ -79,14 +79,14 @@ Install a compatible `focal` binary on each host. Choose an IP address that the 
 On the founder host:
 
 ```sh
-focal --data-dir "$HOME/focal-node" start \
+focal --data-dir "$HOME/focal-node" start node \
   --advertise 192.0.2.10:7443 --listen 0.0.0.0:7443
 ```
 
 In another terminal on that same host:
 
 ```sh
-focal --data-dir "$HOME/focal-node" cluster invite \
+focal --data-dir "$HOME/focal-node" invite node \
   --node worker-2 --output "$HOME/worker-2.invite"
 scp -p "$HOME/worker-2.invite" worker-user@192.0.2.20:worker-2.invite
 ```
@@ -97,10 +97,10 @@ On the second host, as that account:
 
 ```sh
 chmod 600 "$HOME/worker-2.invite"
-focal --data-dir "$HOME/focal-node" join \
+focal --data-dir "$HOME/focal-node" join cluster \
   --invite-file "$HOME/worker-2.invite" \
   --advertise 192.0.2.20:7443 --listen 0.0.0.0:7443
-focal --data-dir "$HOME/focal-node" start
+focal --data-dir "$HOME/focal-node" start node
 ```
 
 Different hosts may use the same port and directory spelling because those resources are local to each host. `--advertise` identifies the reachable endpoint; `--listen` selects the local bind address. An unspecified address such as `0.0.0.0` is valid only for listening. Neither address may use port zero. No seed list or manually copied certificate configuration is required: the invitation pins the cluster, founder endpoint, and trust material.
@@ -110,26 +110,26 @@ Different hosts may use the same port and directory spelling because those resou
 Stop a foreground service with Ctrl-C, then restart it with the same directory:
 
 ```sh
-focal --data-dir /tmp/focal-founder start
-focal --data-dir /tmp/focal-worker-2 start
+focal --data-dir /tmp/focal-founder start node
+focal --data-dir /tmp/focal-worker-2 start node
 ```
 
 Run these in separate terminals. On different hosts, each instead uses its saved `$HOME/focal-node` directory. Plain `start` loads the persisted network identity and endpoints; it needs neither the invitation file nor repeated address flags. Supplying changed addresses is rejected. There is no endpoint-change command yet.
 
 A stopped local-only node can introduce networking by starting its existing directory with `--advertise`. Keep the directory intact; the service preserves the existing application identity and data. After that first network start, use plain `start` for recovery. Never run two owners against one data directory.
 
-An invitation name contains 1–63 ASCII letters, digits, dots, underscores, or hyphens. Within one cluster, the same name identifies the same durable invitation request while that invitation is live or redeemed. Repeating `cluster invite` with that name returns the original invitation, including after founder restart or successful redemption; once the invitation is finished — revoked (as `cluster nodes remove` does) or expired before anyone redeemed it — the same name issues a fresh invitation, so a removed node's name can be enrolled again. Repeating the same output path succeeds only when its private file already contains exactly those bytes; a different existing file is never overwritten. The output directory must already exist.
+An invitation name contains 1–63 ASCII letters, digits, dots, underscores, or hyphens. Within one cluster, the same name identifies the same durable invitation request while that invitation is live or redeemed. Repeating `invite node` with that name returns the original invitation, including after founder restart or successful redemption; once the invitation is finished — revoked (as `remove node` does) or expired before anyone redeemed it — the same name issues a fresh invitation, so a removed node's name can be enrolled again. Repeating the same output path succeeds only when its private file already contains exactly those bytes; a different existing file is never overwritten. The output directory must already exist.
 
-An unused invitation expires **one hour after its first preparation**. Repeating the command does not renew that deadline. A fresh invitation needs a fresh name and output path. Inspect invitations with `cluster invitations list` or `cluster invitations get ID`; `cluster invitations revoke ID` durably revokes that invitation and its issued credential. Revocation does not remove a node from consensus membership. One invitation enrolls one saved join identity, not an arbitrary sequence of new nodes. A node name is an invitation label, not a topology label or permission grant.
+An unused invitation expires **one hour after its first preparation**. Repeating the command does not renew that deadline. A fresh invitation needs a fresh name and output path. Inspect invitations with `list invitations` or `get invitation ID`; `revoke invitation ID` durably revokes that invitation and its issued credential. Revocation does not remove a node from consensus membership. One invitation enrolls one saved join identity, not an arbitrary sequence of new nodes. A node name is an invitation label, not a topology label or permission grant.
 
 If `join` fails or its reply is lost, retry the exact command with the same directory, invitation, and endpoints. The saved private key, CSR, and request identity are reused. A previously committed enrollment can be recovered using that identity even after the invitation's initial redemption window closes, while the issued credential remains valid. Preserve the pending directory; substituting another invitation or endpoint is rejected. Do not delete unknown-outcome join state to manufacture a new attempt.
 
-After successful enrollment, keep the node directory intact. Startup uses its saved credentials and fails closed if initialized identity, policy, or join state is missing. Root and installed application membership removal are available through [cluster administration](cluster-admin.md). Membership removal does not drain application placement or complete evidence migration. Every node, the founder included, renews its own credential in the last third of its lifetime (thirty days by default, `node.credential_lifetime_seconds` committed at genesis), or on `cluster credentials renew` (the same key under a fresh certificate; see [cluster administration](cluster-admin.md)); the complete operational recovery journeys remain work in progress.
+After successful enrollment, keep the node directory intact. Startup uses its saved credentials and fails closed if initialized identity, policy, or join state is missing. Root and installed application membership removal are available through [cluster administration](cluster-admin.md). Membership removal does not drain application placement or complete evidence migration. Every node, the founder included, renews its own credential in the last third of its lifetime (thirty days by default, `node.credential_lifetime_seconds` committed at genesis), or on `renew credential` (the same key under a fresh certificate; see [cluster administration](cluster-admin.md)); the complete operational recovery journeys remain work in progress.
 
 ## Current deployment boundary
 
-This workflow establishes authenticated reachability and root metadata replication. It does not perform application ledger placement, root voter promotion, evidence-copy placement, or activation of a stronger durability policy. Root promotion is separately available with `cluster membership promote --node N` after actual catch-up. Installed application replicas have their own `cluster replicas membership` commands and configuration fences; changing root membership does not install an application replica. A joined Node certificate grants none of the founder's local Runtime permissions.
+This workflow establishes authenticated reachability and root metadata replication. It does not perform application ledger placement, root voter promotion, evidence-copy placement, or activation of a stronger durability policy. Root promotion is separately available with `promote learner --node N` after actual catch-up. Installed application replicas have their own `cluster replicas membership` commands and configuration fences; changing root membership does not install an application replica. A joined Node certificate grants none of the founder's local Runtime permissions.
 
-The initial directory is owned by the founder and currently requires that founder to lead the root group while preparing its directory authority permit. After root voting membership is expanded and leadership moves elsewhere, founder restart cannot reach `Ready` until root leadership returns. The local permit path also governs directory authority refresh. Remote directory-bootstrap authorization remains unimplemented. The CLI can initiate a root leadership transfer with `cluster leader transfer --node N`; inspect the resulting leader rather than treating transfer initiation as completion. This startup constraint remains even though root membership and transfer commands are available.
+The initial directory is owned by the founder and currently requires that founder to lead the root group while preparing its directory authority permit. After root voting membership is expanded and leadership moves elsewhere, founder restart cannot reach `Ready` until root leadership returns. The local permit path also governs directory authority refresh. Remote directory-bootstrap authorization remains unimplemented. The CLI can initiate a root leadership transfer with `transfer leader --node N`; inspect the resulting leader rather than treating transfer initiation as completion. This startup constraint remains even though root membership and transfer commands are available.
 
-`deployment plan`, `apply` and `status` change the committed policy and the placement through journaled plans ([manual](manual-cli.md#deployment-scope)); `deployment render` writes packaging for a supervised host or a Kubernetes namespace. A node may advertise a name (`--advertise host.example:7443`): the name travels with its contact and peers re-resolve it when the address behind it changes, and a node restarted at another address is adopted and announced under the same identity ([24 §24](archictecutre/24-placement-execution-and-fleet-control.md)). A host can enroll and start in one command, `start --advertise ... --invite-file FILE`. Multi-AZ, multi-region, and global operation are qualified by the deployment journeys recorded in [implementation status](archictecutre/09-implementation-status.md), not by this two-node workflow.
+`plan deployment`, `apply` and `status` change the committed policy and the placement through journaled plans ([manual](manual-cli.md#deployment-scope)); `deployment render` writes packaging for a supervised host or a Kubernetes namespace. A node may advertise a name (`--advertise host.example:7443`): the name travels with its contact and peers re-resolve it when the address behind it changes, and a node restarted at another address is adopted and announced under the same identity ([24 §24](archictecutre/24-placement-execution-and-fleet-control.md)). A host can enroll and start in one command, `start --advertise ... --invite-file FILE`. Multi-AZ, multi-region, and global operation are qualified by the deployment journeys recorded in [implementation status](archictecutre/09-implementation-status.md), not by this two-node workflow.

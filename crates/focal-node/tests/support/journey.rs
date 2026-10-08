@@ -262,7 +262,7 @@ impl Journey {
     }
     /// Start a node (recorded as `start ...`) and wait for its readiness.
     pub fn start(&mut self, node: &Node, concept: &str, inputs: &[&str], args: &[&str]) -> Server {
-        let mut recorded = vec!["start"];
+        let mut recorded = vec!["start", "node"];
         recorded.extend_from_slice(args);
         self.record(node, None, concept, inputs, &recorded);
         fleet::start(node, args)
@@ -276,7 +276,7 @@ impl Journey {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> Server {
-        let mut recorded = vec!["start"];
+        let mut recorded = vec!["start", "node"];
         recorded.extend_from_slice(args);
         let env_inputs: Vec<String> = envs.iter().map(|(name, _)| format!("env {name}")).collect();
         let mut all: Vec<&str> = inputs.to_vec();
@@ -295,7 +295,7 @@ impl Journey {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> (i32, String) {
-        let mut recorded = vec!["start"];
+        let mut recorded = vec!["start", "node"];
         recorded.extend_from_slice(args);
         let env_inputs: Vec<String> = envs.iter().map(|(name, _)| format!("env {name}")).collect();
         let mut all: Vec<&str> = inputs.to_vec();
@@ -490,7 +490,7 @@ pub struct Demo {
 impl Journey {
     /// The node's own local principal as the respondent.
     pub fn local_demo(&mut self, node: &Node) -> Demo {
-        let standing = self.admin(node, "standing", &[], &["status"]);
+        let standing = self.admin(node, "standing", &[], &["inspect", "prefix"]);
         assert!(
             fleet::objects(&standing)[0]["Standing"]["principal"].is_array()
                 || fleet::objects(&standing)[0]["Standing"]["principal"].is_string(),
@@ -513,9 +513,8 @@ impl Journey {
             "participant",
             &["participant name"],
             &[
-                "cluster",
-                "client",
                 "invite",
+                "client",
                 "--name",
                 name,
                 "--output",
@@ -528,8 +527,8 @@ impl Journey {
             "participant",
             &["invitation file"],
             &[
-                "context",
                 "enroll",
+                "context",
                 name,
                 "--invite-file",
                 invitation.to_str().unwrap(),
@@ -544,7 +543,7 @@ impl Journey {
             &client,
             "standing",
             &[],
-            &["--client-context", name, "status"],
+            &["--client-context", name, "inspect", "prefix"],
         );
         let principal = fleet::hex_hash(&fleet::objects(&standing)[0]["Standing"]["principal"]);
         Demo {
@@ -587,7 +586,7 @@ impl Journey {
             &["submit", "claim", "--json", &document.to_string()],
         ));
         let claim = fleet::created(&result, "Claim").remove(0);
-        fleet::committed(&self.cli(node, None, "claim", &[], &["claim", "post", &claim]));
+        fleet::committed(&self.cli(node, None, "claim", &[], &["post", "claim", &claim]));
         claim
     }
     /// The respondent acquires the receipt and, as a participant, delivers
@@ -597,7 +596,7 @@ impl Journey {
             Some(context) => (&demo.client, Some(context.as_str())),
             None => (node, None),
         };
-        fleet::committed(&self.cli(at, context, "receipt", &[], &["receipt", "acquire", claim]));
+        fleet::committed(&self.cli(at, context, "receipt", &[], &["acquire", "receipt", claim]));
         context?;
         let result = fleet::committed(&self.cli(
             at,
@@ -605,8 +604,8 @@ impl Journey {
             "artifact",
             &["artifact content"],
             &[
-                "artifact",
                 "submit",
+                "artifact",
                 "--claim",
                 claim,
                 "--slot",
@@ -709,7 +708,7 @@ impl Journey {
             None,
             "invitation",
             &["host name"],
-            &["cluster", "invite", "--node", name, "--output", "-"],
+            &["invite", "node", "--node", name, "--output", "-"],
         );
         assert!(
             output.status.success(),
@@ -733,9 +732,8 @@ impl Journey {
                 "focal".to_owned(),
                 "--data-dir".to_owned(),
                 normalize(node.root().to_str().unwrap()),
-                "cluster".to_owned(),
-                "nodes".to_owned(),
                 "remove".to_owned(),
+                "node".to_owned(),
                 "--node".to_owned(),
                 "<n>".to_owned(),
             ],
@@ -756,7 +754,7 @@ impl Journey {
     pub fn plan(&mut self, node: &Node, name: &str, yaml: &str, output: Option<&Path>) -> Value {
         let policy = node.root().join(format!("{name}.yaml"));
         std::fs::write(&policy, yaml).unwrap();
-        let mut args = vec!["--config", policy.to_str().unwrap(), "deployment", "plan"];
+        let mut args = vec!["--config", policy.to_str().unwrap(), "plan", "deployment"];
         let inputs: Vec<&str> = match output {
             Some(path) => {
                 args.extend(["--output", path.to_str().unwrap()]);

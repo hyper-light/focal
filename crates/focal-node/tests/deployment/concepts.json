@@ -53,9 +53,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -69,6 +68,7 @@
           "--data-dir",
           "<laptop>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -82,9 +82,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -100,8 +99,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -115,7 +114,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -141,8 +141,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -156,8 +156,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -174,8 +174,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -229,7 +229,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "start"
+          "start",
+          "node"
         ]
       },
       {
@@ -264,7 +265,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "start"
+          "start",
+          "node"
         ]
       },
       {
@@ -281,7 +283,8 @@
           "focal",
           "--data-dir",
           "<unwritable>",
-          "start"
+          "start",
+          "node"
         ]
       },
       {
@@ -296,7 +299,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "start"
+          "start",
+          "node"
         ]
       },
       {
@@ -325,7 +329,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "start"
+          "start",
+          "node"
         ]
       },
       {
@@ -377,8 +382,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -390,7 +395,7 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "diagnose",
+          "inspect",
           "node",
           "--identity"
         ]
@@ -401,7 +406,7 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "cluster",
+          "inspect",
           "placement"
         ]
       },
@@ -411,8 +416,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "deployment",
-          "explain"
+          "explain",
+          "deployment"
         ]
       },
       {
@@ -426,8 +431,8 @@
           "<laptop>",
           "--config",
           "<laptop>/policy.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--dry-run"
         ]
       },
@@ -443,8 +448,8 @@
           "<laptop>",
           "--config",
           "<laptop>/policy.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--output",
           "<laptop>/laptop.plan"
         ]
@@ -458,8 +463,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<laptop>/laptop.plan"
         ]
@@ -473,8 +478,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<laptop>/tampered.plan"
         ]
@@ -488,9 +493,8 @@
           "focal",
           "--data-dir",
           "<laptop>",
-          "cluster",
-          "backup",
           "create",
+          "backup",
           "--output",
           "<laptop>/backup"
         ]
@@ -512,9 +516,8 @@
           "focal",
           "--data-dir",
           "<laptop-b>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -528,6 +531,7 @@
           "--data-dir",
           "<laptop-b>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -541,8 +545,8 @@
           "focal",
           "--data-dir",
           "<laptop-b>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<laptop>/laptop.plan"
         ]
@@ -556,9 +560,8 @@
           "focal",
           "--data-dir",
           "<laptop-b>",
-          "cluster",
-          "tenants",
           "admit",
+          "tenant",
           "--tenant",
           "<id>"
         ]
@@ -572,8 +575,8 @@
           "focal",
           "--data-dir",
           "<laptop-b>",
-          "cluster",
           "restore",
+          "session",
           "--input",
           "<laptop>/backup"
         ]
@@ -587,8 +590,8 @@
           "focal",
           "--data-dir",
           "<laptop-b>",
-          "cluster",
           "restore",
+          "session",
           "--input",
           "<laptop>/backup",
           "--new-incarnation"
@@ -604,8 +607,8 @@
           "focal",
           "--data-dir",
           "<reader>",
-          "context",
           "add",
+          "context",
           "restored",
           "--node-data-dir",
           "<laptop-b>",
@@ -640,6 +643,7 @@
           "--data-dir",
           "<fresh>",
           "start",
+          "node",
           "--invite-file",
           "<laptop-b>/garbage.invite"
         ]
@@ -700,9 +704,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -718,6 +721,7 @@
           "--data-dir",
           "<founder>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -733,9 +737,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -751,8 +754,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -766,7 +769,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -796,8 +800,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -811,8 +815,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -829,8 +833,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -882,8 +886,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-a",
           "--output",
@@ -903,6 +907,7 @@
           "--data-dir",
           "<host-a>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -920,6 +925,7 @@
           "--data-dir",
           "<replay>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -937,8 +943,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-b",
           "--output",
@@ -956,6 +962,7 @@
           "--data-dir",
           "<tampered>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -975,6 +982,7 @@
           "--data-dir",
           "<host-b>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -992,8 +1000,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-r",
           "--output",
@@ -1008,9 +1016,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "invitations",
-          "list"
+          "list",
+          "invitations"
         ]
       },
       {
@@ -1024,9 +1031,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "invitations",
           "revoke",
+          "invitation",
           "<id>"
         ]
       },
@@ -1041,6 +1047,7 @@
           "--data-dir",
           "<revoked>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -1055,7 +1062,7 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
+          "inspect",
           "placement"
         ]
       },
@@ -1071,8 +1078,8 @@
           "<founder>",
           "--config",
           "<founder>/node-1.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--output",
           "<founder>/node-1.plan"
         ]
@@ -1088,8 +1095,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<founder>/node-1.plan",
           "--wait",
@@ -1153,8 +1160,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -1168,8 +1175,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -1186,8 +1193,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -1270,8 +1277,8 @@
           "<founder>",
           "--config",
           "<founder>/node-2.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--output",
           "<founder>/node-2.plan"
         ]
@@ -1287,8 +1294,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<founder>/node-2.plan"
         ]
@@ -1305,8 +1312,8 @@
           "<founder>",
           "--config",
           "<founder>/node-1-again.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--output",
           "<founder>/node-1-again.plan"
         ]
@@ -1322,8 +1329,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<founder>/node-1-again.plan"
         ]
@@ -1340,8 +1347,8 @@
           "<founder>",
           "--config",
           "<founder>/node-1-home-early.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--output",
           "<founder>/node-1-home-early.plan"
         ]
@@ -1358,8 +1365,8 @@
           "<founder>",
           "--config",
           "<founder>/node-1-res.yaml",
-          "deployment",
           "plan",
+          "deployment",
           "--output",
           "<founder>/node-1-res.plan"
         ]
@@ -1375,8 +1382,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<founder>/node-1-res.plan",
           "--wait",
@@ -1391,8 +1398,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "deployment",
-          "explain"
+          "explain",
+          "deployment"
         ]
       },
       {
@@ -1406,8 +1413,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "deployment",
           "apply",
+          "deployment",
           "--plan-file",
           "<founder>/node-1-home-early.plan"
         ]
@@ -1423,9 +1430,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "nodes",
           "remove",
+          "node",
           "--node",
           "<id>"
         ]
@@ -1441,9 +1447,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "nodes",
           "drain",
+          "node",
           "--node",
           "<id>"
         ]
@@ -1489,8 +1494,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-c",
           "--output",
@@ -1510,6 +1515,7 @@
           "--data-dir",
           "<host-c>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -1525,9 +1531,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "nodes",
           "remove",
+          "node",
           "--node",
           "<n>"
         ]
@@ -1589,8 +1594,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -1654,9 +1659,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -1673,6 +1677,7 @@
           "--data-dir",
           "<founder>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -1688,9 +1693,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -1706,8 +1710,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -1721,7 +1725,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -1735,8 +1740,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-b",
           "--output",
@@ -1756,6 +1761,7 @@
           "--data-dir",
           "<host-b>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -1773,8 +1779,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-c",
           "--output",
@@ -1794,6 +1800,7 @@
           "--data-dir",
           "<host-c>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -1808,7 +1815,7 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
+          "inspect",
           "placement"
         ]
       },
@@ -1839,8 +1846,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -1854,8 +1861,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -1872,8 +1879,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -1927,9 +1934,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "sessions",
           "plan",
+          "session",
           "--tenant",
           "<id>",
           "--session",
@@ -1975,8 +1981,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -2031,9 +2037,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "sessions",
           "plan",
+          "session",
           "--tenant",
           "<id>",
           "--session",
@@ -2121,9 +2126,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -2140,6 +2144,7 @@
           "--data-dir",
           "<founder>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -2155,9 +2160,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -2173,8 +2177,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -2188,7 +2192,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -2202,8 +2207,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-b",
           "--output",
@@ -2223,6 +2228,7 @@
           "--data-dir",
           "<host-b>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -2240,8 +2246,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-c",
           "--output",
@@ -2261,6 +2267,7 @@
           "--data-dir",
           "<host-c>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -2278,8 +2285,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-d",
           "--output",
@@ -2299,6 +2306,7 @@
           "--data-dir",
           "<host-d>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -2332,8 +2340,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -2347,8 +2355,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -2365,8 +2373,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -2420,9 +2428,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "sessions",
           "plan",
+          "session",
           "--tenant",
           "<id>",
           "--session",
@@ -2439,7 +2446,7 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "diagnose",
+          "inspect",
           "node",
           "--metrics"
         ]
@@ -2479,8 +2486,8 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -2505,12 +2512,10 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
+          "list",
           "ranges",
           "--session",
-          "<id>",
-          "list"
+          "<id>"
         ]
       },
       {
@@ -2526,12 +2531,10 @@
           "<founder>/focal.yaml",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "ranges",
+          "move",
+          "range",
           "--session",
           "<id>",
-          "move",
           "--member",
           "<id>",
           "--node",
@@ -2576,9 +2579,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -2592,6 +2594,7 @@
           "--data-dir",
           "<founder>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -2605,9 +2608,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -2623,8 +2625,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -2638,7 +2640,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -2650,8 +2653,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host",
           "--output",
@@ -2669,6 +2672,7 @@
           "--data-dir",
           "<host>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -2698,8 +2702,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -2713,8 +2717,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -2731,8 +2735,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -2775,9 +2779,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "upgrade",
-          "status"
+          "inspect",
+          "upgrade"
         ]
       },
       {
@@ -2789,9 +2792,8 @@
           "focal",
           "--data-dir",
           "<host>",
-          "cluster",
-          "upgrade",
           "activate",
+          "upgrade",
           "--fence",
           "3"
         ]
@@ -2805,9 +2807,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "upgrade",
           "activate",
+          "upgrade",
           "--fence",
           "3"
         ]
@@ -2821,9 +2822,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "upgrade",
           "activate",
+          "upgrade",
           "--fence",
           "2"
         ]
@@ -2866,6 +2866,7 @@
           "--data-dir",
           "<host>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -2880,6 +2881,7 @@
           "--data-dir",
           "<host>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -2907,8 +2909,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -2947,9 +2949,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -2963,6 +2964,7 @@
           "--data-dir",
           "<founder>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -2976,9 +2978,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -2994,8 +2995,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -3009,7 +3010,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -3021,8 +3023,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-a",
           "--output",
@@ -3040,6 +3042,7 @@
           "--data-dir",
           "<host-a>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -3055,8 +3058,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host-b",
           "--output",
@@ -3074,6 +3077,7 @@
           "--data-dir",
           "<host-b>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -3103,8 +3107,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3133,8 +3137,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3163,8 +3167,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3193,8 +3197,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3223,8 +3227,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3253,8 +3257,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3283,8 +3287,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3313,8 +3317,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3343,8 +3347,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3373,8 +3377,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3403,8 +3407,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3433,8 +3437,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3463,8 +3467,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3493,8 +3497,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3523,8 +3527,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3553,8 +3557,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3583,8 +3587,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3598,8 +3602,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -3616,8 +3620,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -3634,7 +3638,7 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "diagnose",
+          "inspect",
           "node",
           "--metrics"
         ]
@@ -3683,7 +3687,6 @@
           "<render>",
           "--config",
           "<render>/kubernetes.yaml",
-          "deployment",
           "render",
           "kubernetes",
           "--namespace",
@@ -3715,7 +3718,6 @@
           "focal",
           "--config",
           "<config>",
-          "deployment",
           "render",
           "kubernetes",
           "--namespace",
@@ -3739,9 +3741,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "replicas",
-          "activate-native"
+          "activate",
+          "native"
         ]
       },
       {
@@ -3755,6 +3756,7 @@
           "--data-dir",
           "<founder>",
           "start",
+          "node",
           "--advertise",
           "<address>"
         ]
@@ -3768,9 +3770,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
-          "client",
           "invite",
+          "client",
           "--name",
           "alice",
           "--output",
@@ -3786,8 +3787,8 @@
           "focal",
           "--data-dir",
           "<client>",
-          "context",
           "enroll",
+          "context",
           "alice",
           "--invite-file",
           "<client>/alice.invite"
@@ -3801,7 +3802,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "status"
+          "inspect",
+          "prefix"
         ]
       },
       {
@@ -3827,8 +3829,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -3842,8 +3844,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -3860,8 +3862,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",
@@ -3907,8 +3909,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "cluster",
           "invite",
+          "node",
           "--node",
           "host",
           "--output",
@@ -3934,6 +3936,7 @@
           "--data-dir",
           "<host>",
           "start",
+          "node",
           "--advertise",
           "<address>",
           "--invite-file",
@@ -3989,8 +3992,8 @@
           "focal",
           "--data-dir",
           "<founder>",
-          "claim",
           "post",
+          "claim",
           "<id>",
           "--format",
           "json"
@@ -4004,8 +4007,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "receipt",
           "acquire",
+          "receipt",
           "<id>",
           "--format",
           "json"
@@ -4022,8 +4025,8 @@
           "<client>",
           "--client-context",
           "alice",
-          "artifact",
           "submit",
+          "artifact",
           "--claim",
           "<id>",
           "--slot",

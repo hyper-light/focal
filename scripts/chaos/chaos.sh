@@ -27,20 +27,20 @@ pause() { perl -e "select(undef,undef,undef,$1)"; }
 bash "$HERE/down.sh" >/dev/null
 bash "$HERE/cluster.sh" "$IMAGE" || exit 1
 
-identity=$(focal fc-founder diagnose node --identity)
+identity=$(focal fc-founder inspect node --identity)
 tenant=$(echo "$identity" | ${PYTHON:-python3} -c 'import json,sys;print(json.load(sys.stdin)["result"]["identity"]["tenant"])')
 session=$(echo "$identity" | ${PYTHON:-python3} -c 'import json,sys;print(json.load(sys.stdin)["result"]["identity"]["session"])')
 
 # One tolerated failure: three voters. A plan refused on a stale view is
 # planned again (24 §16), at most 30 times.
 for attempt in $(seq 1 30); do
-  planned=$(focal fc-founder cluster sessions plan --tenant "$tenant" --session "$session" --max-failures 1 2>&1)
+  planned=$(focal fc-founder plan session --tenant "$tenant" --session "$session" --max-failures 1 2>&1)
   echo "$planned" | grep -q '"state": *"planned"' && break
   pause 2
 done
 echo "$planned" | grep -q '"state": *"planned"' || { echo "never planned: $planned"; exit 1; }
 for attempt in $(seq 1 180); do
-  voters=$(focal fc-founder cluster placement 2>/dev/null | ${PYTHON:-python3} -c '
+  voters=$(focal fc-founder inspect placement 2>/dev/null | ${PYTHON:-python3} -c '
 import json,sys
 view=json.load(sys.stdin)["result"]["placement"]
 for p in view.get("partitions",[]):
@@ -51,7 +51,7 @@ for p in view.get("partitions",[]):
   pause 2
 done
 [ "$voters" = "3" ] || { echo "session never reached three voters"; exit 1; }
-focal fc-founder cluster replicas activate-native >/dev/null 2>&1 || true
+focal fc-founder activate native >/dev/null 2>&1 || true
 echo "session placed on three voters"
 
 # The writer: the founder's own local principal through its socket, or
@@ -63,13 +63,13 @@ client() {
     --data-dir /c/data "$@"
 }
 if [ "$WRITER" = client ]; then
-  focal fc-founder cluster client invite --name alice --output /var/lib/focal/alice.invite >/dev/null
+  focal fc-founder invite client --name alice --output /var/lib/focal/alice.invite >/dev/null
   docker cp fc-founder:/var/lib/focal/alice.invite "$OUT/alice.invite"
   docker volume rm fc-client >/dev/null 2>&1 || true
   docker run --rm -i -v fc-client:/c alpine:3.20 sh -c \
     'mkdir -p /c/data /c/invite && cat > /c/invite/alice.invite && chown -R 65532:65532 /c && chmod 700 /c/data /c/invite && chmod 600 /c/invite/alice.invite' \
     < "$OUT/alice.invite"
-  client context enroll alice --invite-file /c/invite/alice.invite >/dev/null || { echo "client never enrolled"; exit 1; }
+  client enroll context alice --invite-file /c/invite/alice.invite >/dev/null || { echo "client never enrolled"; exit 1; }
   echo "writer: participant alice, enrolled over QUIC"
 fi
 write() {

@@ -105,8 +105,8 @@ same registration again is idempotent after retirement, a different one
 under the same identity conflicts.
 
 **Audit artifacts.** External validation reports attach audit artifacts
-through the same artifact path as respondent evidence (`audit generate` and
-`audit post`, [16](16-peer-validation-contract.md)): the same upload
+through the same artifact path as respondent evidence (`generate audit` and
+`post audit`, [16](16-peer-validation-contract.md)): the same upload
 bounds, the same custody (§1) and the same authorization (the evaluator
 named by the validation). No second path exists to bound.
 
@@ -120,7 +120,7 @@ refusal named.
 **Limits.** Registrations and retirements are process-local facts of the
 node that hosts the registry; committing them to a session's log so every
 replica agrees on the lifetime of a schema is deployment work for the
-schema tooling of R9 (`focal schema`), which today lists built-ins only.
+schema tooling of R9 (`focal list schemas`), which today lists built-ins only.
 
 ## 3. The log's retirement boundary and the retention floor (R8.4a, 2026-09-10)
 
@@ -139,7 +139,7 @@ domain candidate, a managed or cursor command or a cursor maintenance
 changes nothing a checkpoint holds until it applies — a session that
 waited for its proposals to drain checkpointed under a steady load only
 at a period that found none. The bound is the log's retirement boundary
-(instruction 4); `diagnose cluster --replicas` shows
+(instruction 4); `inspect replicas --replicas` shows
 `log_entries_since_checkpoint`.
 
 **The retention floor.** `RetentionReport` names, per native session, the
@@ -390,11 +390,11 @@ a family whose copies have not all answered waits for a later tick with
 its bundle already sealed. The agent holds nothing the records do not: a
 restart resumes the walk from the index.
 
-**The operator's view.** `diagnose cluster --retention [--session]`
+**The operator's view.** `inspect replicas --retention [--session]`
 (`diagnose.cluster.retention`) reads the floor of §3 with the families retired
 through the applied prefix and whether a retirement is in flight
 (`retention.retired`, `retention.retiring`, also in replica diagnostics);
-`cluster archive show --claim ID [--session]` (`cluster.archive.show`)
+`inspect archive --claim ID [--session]` (`cluster.archive.show`)
 reads a retired claim's continuation from the replica and the bundle from
 this node's content store, verifies it structurally and reports the root
 and length, the digest, the root and members, the rows by family, and the
@@ -514,7 +514,7 @@ it learns so by name on its next request, resolves the outcome it may already
 have from the seal, and continues in the generation the owner admits.
 
 **Reading a sealed outcome.** An exact retry of a sealed request is refused
-`RequestHistoryExpired`; its outcome is read by `request inspect --remote` (and
+`RequestHistoryExpired`; its outcome is read by `inspect request --remote` (and
 the adapter's `request.inspect`): the owner answers an outcome read whose
 request's generation is sealed with where it went (`NativeObject::Sealed`: the
 seal's ordinal, bundle and length), and the client follows it
@@ -533,7 +533,7 @@ count; the fold is applied to a window before the seal that carries it is
 recorded, so a window at the bound admits the seal that makes room. Seal
 bundles are content roots: the collector keeps them and a backup carries them.
 
-**The embedded node.** A node started without a network (`focal start` on
+**The embedded node.** A node started without a network (`focal start node` on
 its data directory alone) hosts its session on one owner thread and has no
 network service to run the agent; until this batch it never retired a family
 nor, now, sealed a generation, so its window would have filled for good. The
@@ -625,13 +625,13 @@ the pass. Settings: `FOCAL_GC_GRACE_MS` (one day), `FOCAL_GC_QUARANTINE_MS`
 (seven days), `FOCAL_GC_TERMINAL_MS` (seven days); the newest four records
 of each kind stay; 1,048,576 chunk marks per domain.
 
-**The operator.** `diagnose node --gc` (`diagnose.node.gc`) reports the
+**The operator.** `inspect node --gc` (`diagnose.node.gc`) reports the
 settings, whether a pass is in progress, how many completed and the last
 pass: replicas walked, objects protected, opaque domains, bundles this node
 could not read, and the content store's counts (visited, uploads expired,
 terminals released, objects and chunks and records and receipts
 quarantined, chunk sweeps deferred, files and bytes deleted) with the seed
-sweeps' counts. `cluster gc restore --domain --root` (`cluster.gc.restore`)
+sweeps' counts. `restore object --domain --root` (`cluster.gc.restore`)
 brings a quarantined object back, exactly once. The real-binary test
 `cli_gc.rs` seals a work artifact's payload and a refused frame's orphan,
 watches the orphan leave through quarantine while the payload stays,
@@ -675,7 +675,7 @@ everything the archive bundles it names name in turn, and a manifest that
 lists all of it with hashes and is written last. `focal_ledger::backup`
 owns the format; the node (`backup.rs`) drives it.
 
-**Taking one.** `cluster backup create --output DIR [--session ID]`
+**Taking one.** `create backup --output DIR [--session ID]`
 (`cluster.backup.create`) asks the hosting replica for its evidence export
 (`ReplicaHost::checkpoint_evidence`, §1): the replica checkpoints at its
 applied index, the consensus owner fsyncs the rewrite, and the exact
@@ -714,7 +714,7 @@ order, every object with its length, class and chunk list sorted by root,
 and the retention section's floor and retired-family count. It is decoded
 only whole: a short, mismatched or trailing manifest is corrupt.
 
-**Verifying one.** `cluster backup verify --input DIR`
+**Verifying one.** `verify backup --input DIR`
 (`cluster.backup.verify`) reads only the backup and runs anywhere the
 binary does — a killed node, another machine — because the manifest names
 its own domain and the limits derive from it. It checks the manifest's
@@ -748,7 +748,7 @@ the backup verifies (the same verification as above, including the
 decoder); a session this node already hosts, or this cluster's directory
 already holds, is refused — a live descriptor changes through a placement
 plan, never through a restore; and the session's tenant must be one this
-cluster serves (`cluster tenants admit`). Then, in order: every object the
+cluster serves (`admit tenant`). Then, in order: every object the
 manifest lists is imported into this node's content store exactly as a
 custody transfer installs it (each chunk verified, the manifest published
 last; objects already held are verified in place); the seed chunks go into
@@ -816,7 +816,7 @@ decided by revocation alone; a member that is merely dead is not fenced.
 
 ## 7. The operator's storage view and R8's close (2026-09-10)
 
-**The view.** `diagnose node --storage` (`diagnose.node.storage`) is one read
+**The view.** `inspect node --storage` (`diagnose.node.storage`) is one read
 that answers instruction 9 of R8 for a node: the volume envelope every
 durable owner of the data directory promises its bytes to
 ([24](24-placement-execution-and-fleet-control.md) §10) — free bytes at
@@ -834,7 +834,7 @@ promises nothing: a floor held by `cursors` moves when consumers
 acknowledge, one held by `archive` when the archive reports, and the
 envelope's free bytes are the sample the last admission saw. Sessions
 beyond a bound are reported as truncated, never silently left out.
-Recoverability is what `cluster backup verify` proves of a backup (§6);
+Recoverability is what `verify backup` proves of a backup (§6);
 the view does not guess it.
 
 **What R8 now holds against its close gate.** A sustained workload under
@@ -846,9 +846,9 @@ session's memory within its allowance and plateaued after warm-up, no
 proof quarantined, every creation's outcome answered exactly at the end,
 every continuation's bundle held and verified by the store, and a backup
 written and verified whole. Corrupt or missing proof is detected before
-anything unsafe: a corrupted bundle chunk turns `cluster archive show`
+anything unsafe: a corrupted bundle chunk turns `inspect archive`
 unverified and back once repaired (`cli_retention.rs`); a corrupted
-backup chunk is named by `cluster backup verify` and refused by `cluster
+backup chunk is named by `verify backup` and refused by `cluster
 restore` before any file moves (`cli_backup.rs`, `cli_restore.rs`); a
 missing seed chunk or artifact object fails the envelope's rebuild
 (§6); a chunk that fails its hash is refused on the way in by every
