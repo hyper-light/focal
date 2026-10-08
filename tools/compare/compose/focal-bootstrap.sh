@@ -18,18 +18,18 @@ retry() {
     sleep 1
   done
 }
-serving() { $DC exec -T "$1" focal --data-dir /data diagnose node --probe serving >/dev/null 2>&1; }
+serving() { $DC exec -T "$1" focal --data-dir /data inspect node --probe serving >/dev/null 2>&1; }
 # Serving is the owners running, by design asking no leadership of them (F25);
 # an invitation is the root leader's to issue, so the founder is waited on until
 # it leads (authoritative), as an operator inviting from it must.
-authoritative() { $DC exec -T "$1" focal --data-dir /data diagnose node --probe authoritative >/dev/null 2>&1; }
+authoritative() { $DC exec -T "$1" focal --data-dir /data inspect node --probe authoritative >/dev/null 2>&1; }
 
 retry 300 serving focal1
 retry 300 authoritative focal1
 # The founder may lead its root before its ledger service answers (a refusal
 # typed `unavailable`, exit 6, retryable): each invitation is asked again,
 # bounded, until it is written.
-invite() { f1 cluster invite --node "$1" --output "/invite/$1.invite" >/dev/null; }
+invite() { f1 invite node --node "$1" --output "/invite/$1.invite" >/dev/null; }
 for host in focal2 focal3; do
   retry 120 invite "$host"
 done
@@ -47,13 +47,13 @@ $DC cp focal-target.yaml focal1:/data/target.yaml
 attempt=0
 applied() {
   attempt=$((attempt + 1))
-  f1 deployment plan --config /data/target.yaml --output "/data/target-$attempt.plan" >/dev/null \
-    && f1 deployment apply --plan-file "/data/target-$attempt.plan" --wait 300 >/dev/null
+  f1 plan deployment --config /data/target.yaml --output "/data/target-$attempt.plan" >/dev/null \
+    && f1 apply deployment --plan-file "/data/target-$attempt.plan" --wait 300 >/dev/null
 }
 retry 60 applied
-retry 30 f1 cluster replicas activate-native
+retry 30 f1 activate native
 
 # The generator's client, enrolled over QUIC like every competitor's client.
-f1 cluster client invite --name bench --output /invite/client.invite
-$DC exec -T focal-load focal --data-dir /client context enroll --invite-file /invite/client.invite bench
+f1 invite client --name bench --output /invite/client.invite
+$DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/client.invite bench
 f1 identity

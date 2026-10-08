@@ -12,15 +12,15 @@
   "resources": [
     {
       "path": "focal-claims/references/workflow-contract.md",
-      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+      "blake3": "baa5dad6e07236f99187c30d3410e19d1948c3faf13434d781446bc8b302c25f"
     },
     {
       "path": "focal-evidence/references/workflow-contract.md",
-      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+      "blake3": "baa5dad6e07236f99187c30d3410e19d1948c3faf13434d781446bc8b302c25f"
     },
     {
       "path": "focal-validation/references/workflow-contract.md",
-      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+      "blake3": "baa5dad6e07236f99187c30d3410e19d1948c3faf13434d781446bc8b302c25f"
     },
     {
       "path": "focal-cluster/references/admin-workflow.md",
@@ -28,7 +28,7 @@
     },
     {
       "path": "focal-peers/references/workflow-contract.md",
-      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
+      "blake3": "baa5dad6e07236f99187c30d3410e19d1948c3faf13434d781446bc8b302c25f"
     },
     {
       "path": "focal-peers/references/peer-workflows.md",
@@ -630,7 +630,7 @@
       "name": "focal-cluster",
       "version": 22,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "328e2dd0d7c15c6acf39eed10ef2b0ebe2bb78388919bb4a17875806e1b37c0b",
+      "blake3": "c0d96931fa9fc1b0c7385aff8d94d0eb287a034a02caa8fcd96a26440fa97784",
       "references": [
         "references/admin-workflow.md"
       ],

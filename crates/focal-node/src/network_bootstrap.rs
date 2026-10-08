@@ -166,7 +166,7 @@ impl FoundingNetwork {
         let committed = crate::embedded::check_policy(directory.root(), settings)?;
         // The founder pins its policy alone, so the first start must be
         // satisfiable by this node's own facts. A committed policy is the
-        // directory's to satisfy: `deployment apply` commits stronger
+        // directory's to satisfy: `apply deployment` commits stronger
         // durability than one host provides, and a restart must not refuse
         // what the fleet already carries.
         if committed.is_none() {

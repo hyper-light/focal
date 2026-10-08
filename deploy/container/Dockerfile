@@ -11,7 +11,7 @@
 #   docker run --rm -v focal-data:/var/lib/focal -v ./focal.yaml:/etc/focal/focal.yaml:ro \
 #     -p 7443:7443/udp focal:0.1.0 start --advertise host.example:7443
 #
-# The data volume must belong to uid 65532: `docker run --user 0 ... prepare-volume
+# The data volume must belong to uid 65532: `docker run --user 0 ... prepare volume
 # --owner 65532:65532` once, or the Kubernetes init step the renderer emits.
 FROM rust:1.94.1-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS build
 # The same packages, flags and target the release workflow's musl lane uses.
@@ -40,4 +40,4 @@ VOLUME ["/var/lib/focal"]
 EXPOSE 7443/udp
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/focal", "--config", "/etc/focal/focal.yaml", "--data-dir", "/var/lib/focal"]
-CMD ["start"]
+CMD ["start", "node"]

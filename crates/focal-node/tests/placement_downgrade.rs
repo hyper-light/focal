@@ -51,9 +51,8 @@ fn lowering_max_failures_shrinks_the_voter_set_and_keeps_the_history() {
     let planned = admin(
         &founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",

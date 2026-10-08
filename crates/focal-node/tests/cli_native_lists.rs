@@ -43,6 +43,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -191,7 +192,7 @@ struct Mcp {
 impl Mcp {
     fn open(root: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-            .args(["--data-dir", root.to_str().unwrap(), "mcp", "serve"])
+            .args(["--data-dir", root.to_str().unwrap(), "serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -267,11 +268,11 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let issuer = hex(&read_objects(&status)[0]["Standing"]["principal"]);
     assert_ne!(issuer.len(), 0);
     let invitation = client.path().join("alice.invite");
@@ -279,9 +280,8 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -293,8 +293,8 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -303,7 +303,7 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
         .status
         .success()
     );
-    let alice_standing = admin(client.path(), Some("alice"), &["status"]);
+    let alice_standing = admin(client.path(), Some("alice"), &["inspect", "prefix"]);
     let alice = hex(&read_objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // Two authored claims: the first runs the complete cycle to Satisfied,
@@ -327,7 +327,7 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
     ));
     let first = created(&result, "Claim").remove(0);
     let validation = created(&result, "Validation").remove(1);
-    committed(&cli(root, None, &["claim", "post", &first]));
+    committed(&cli(root, None, &["post", "claim", &first]));
     let second_document = json!({
         "description": "Review the delivered report.",
         "target": alice,
@@ -344,17 +344,17 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
         &["submit", "claim", "--json", &second_document.to_string()],
     ));
     let second = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &second]));
+    committed(&cli(root, None, &["post", "claim", &second]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &first],
+        &["acquire", "receipt", &first],
     ));
     let result = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &first, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &first, "--slot", "0", "--text", PROOF,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -369,8 +369,8 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
         client.path(),
         Some("alice"),
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &first,
             "--summary",
@@ -387,19 +387,19 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["testament", "post", &testament, "--claim", &first],
+        &["post", "testament", &testament, "--claim", &first],
     ));
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament, "--claim", &first],
+        &["receive", "testament", &testament, "--claim", &first],
     ));
     committed(&cli(
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &first,
             "--validation",
@@ -410,8 +410,8 @@ fn native_lists_select_every_family_continue_through_empty_pages_and_refuse_fore
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &first,
             "--validation",

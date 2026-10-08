@@ -96,7 +96,7 @@ pub fn render(
         user = request.user
     );
     let mut exec = format!(
-        "{} --config {} --data-dir {} start",
+        "{} --config {} --data-dir {} start node",
         request.binary, request.config_path, request.data_dir
     );
     if let Some(invite) = &request.invite_file {
@@ -112,7 +112,7 @@ pub fn render(
     } else {
         let _ = writeln!(unit, "ReadWritePaths={}", request.data_dir);
         assets.notes.push(format!(
-            "{} is outside /var/lib: create it owned by {} with mode 0700 before the first start (`focal --data-dir {} prepare-volume --owner UID:GID`).",
+            "{} is outside /var/lib: create it owned by {} with mode 0700 before the first start (`focal --data-dir {} prepare volume --owner UID:GID`).",
             request.data_dir, request.user, request.data_dir
         ));
     }
@@ -130,7 +130,7 @@ pub fn render(
         request.config_path
     ));
     assets.notes.push(
-        "Readiness is `focal diagnose node --probe alive|catching-up|authoritative|policy` over the data directory's admin socket; a listening process is not authoritative because it listens.".into(),
+        "Readiness is `focal inspect node --probe alive|catching-up|authoritative|policy` over the data directory's admin socket; a listening process is not authoritative because it listens.".into(),
     );
     Ok(assets)
 }

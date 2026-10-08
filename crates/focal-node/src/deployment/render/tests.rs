@@ -62,15 +62,15 @@ fn node_survival_renders_a_founder_and_a_host_set_and_names_what_is_missing() {
     assert!(founder.contains("replicas: 1"));
     assert!(!founder.contains("--invite-file"));
     assert!(founder.contains("\"$(POD_NAME).focal.$(POD_NAMESPACE).svc.cluster.local:7443\""));
-    assert!(founder.contains("prepare-volume"));
+    assert!(founder.contains("\"prepare\", \"volume\""));
     assert!(founder.contains("\"--probe\", \"alive\""));
     // Readiness asks whether the owners serve; startup and liveness whether
     // the process answers.
     assert!(founder.contains(
-        "readinessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"diagnose\", \"node\", \"--probe\", \"serving\"]"
+        "readinessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"inspect\", \"node\", \"--probe\", \"serving\"]"
     ));
     assert!(founder.contains(
-        "livenessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"diagnose\", \"node\", \"--probe\", \"alive\"]"
+        "livenessProbe:\n            exec:\n              command: [\"/focal\", \"--data-dir\", \"/var/lib/focal\", \"inspect\", \"node\", \"--probe\", \"alive\"]"
     ));
     assert!(file(&assets, "pdb.yaml").contains("maxUnavailable: 1"));
     // The namespace is an object of the kustomization, listed first, so a
@@ -87,7 +87,7 @@ fn node_survival_renders_a_founder_and_a_host_set_and_names_what_is_missing() {
     assert!(file(&assets, "invitations.sh").contains("--output - > \"$host.invite\""));
     // Each set ships its first-start seed (single-node durability, the only
     // first start a lone node can satisfy), and the requested policy is
-    // rendered once as `target.yaml` for `deployment plan`.
+    // rendered once as `target.yaml` for `plan deployment`.
     let map = file(&assets, "configmap.yaml");
     assert!(map.contains("  focal-hosts.yaml: |\n    version: 1\n    topology:\n      region: \"eu-a\"\n    durability:\n      survive: node\n      max_failures: 0\n"));
     let seed = Settings::from_yaml(
@@ -235,7 +235,7 @@ fn the_systemd_unit_runs_the_node_under_its_user_and_ships_the_configuration() {
     assert!(assets.missing.is_empty());
     let unit = file(&assets, "focal.service");
     assert!(unit.contains(
-        "ExecStart=/usr/local/bin/focal --config /etc/focal/focal.yaml --data-dir /var/lib/focal start --invite-file /etc/focal/join.invite\n"
+        "ExecStart=/usr/local/bin/focal --config /etc/focal/focal.yaml --data-dir /var/lib/focal start node --invite-file /etc/focal/join.invite\n"
     ));
     assert!(unit.contains("User=focal\nGroup=focal\n"));
     assert!(unit.contains("TimeoutStopSec=45\n"));
@@ -267,7 +267,7 @@ fn the_systemd_unit_runs_the_node_under_its_user_and_ships_the_configuration() {
         custom
             .notes
             .iter()
-            .any(|note| note.contains("prepare-volume"))
+            .any(|note| note.contains("prepare volume"))
     );
     let bad = systemd::render(
         &settings,

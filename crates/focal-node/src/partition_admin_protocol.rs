@@ -3,7 +3,7 @@
 //! change submitted to the one this node leads, and a hand-off of a group's
 //! leadership. The deployment's apply drives the seats, one exact request
 //! each, as it drives the root's; `cluster partitions` drives them by hand;
-//! `cluster nodes remove` vacates a leaving node's seats.
+//! `remove node` vacates a leaving node's seats.
 use super::*;
 use focal_control::{ControlConfiguration, ControlMembershipRecord, ControlReceipt};
 use focal_directory::PartitionId;

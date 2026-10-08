@@ -45,6 +45,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -183,9 +184,8 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             name,
             "--output",
@@ -197,8 +197,8 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
             client,
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 name,
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -207,7 +207,7 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
         .status
         .success()
     );
-    let standing = admin(client, Some(name), &["status"]);
+    let standing = admin(client, Some(name), &["inspect", "prefix"]);
     hex_hash(&objects(&standing)[0]["Standing"]["principal"])
 }
 fn document(target: &str, description: &str, parent: Option<&str>) -> String {
@@ -262,11 +262,11 @@ fn child_causes_are_bound_to_the_parent_its_issuer_or_receipt_holder_and_its_liv
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let issuer = hex_hash(&objects(&status)[0]["Standing"]["principal"]);
     let alice = enroll(root, client.path(), "alice");
     let bob = enroll(root, client.path(), "bob");
@@ -287,11 +287,11 @@ fn child_causes_are_bound_to_the_parent_its_issuer_or_receipt_holder_and_its_liv
         ],
     ));
     let parent = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &parent]));
+    committed(&cli(root, None, &["post", "claim", &parent]));
     committed(&cli(
         client.path(),
         alice_ctx,
-        &["receipt", "acquire", &parent],
+        &["acquire", "receipt", &parent],
     ));
     let before = claim_object(root, None, &parent);
     assert_eq!(before["status"], RECEIVED, "{before}");
@@ -385,7 +385,7 @@ fn child_causes_are_bound_to_the_parent_its_issuer_or_receipt_holder_and_its_liv
 
     // Cancelling the parent cancels its pending children with it; a terminal
     // parent then accepts no new child.
-    committed(&cli(root, None, &["claim", "cancel", &parent]));
+    committed(&cli(root, None, &["cancel", "claim", &parent]));
     for id in [&first, &second] {
         assert_eq!(claim_object(root, None, id)["status"], CANCELLED, "{id}");
     }

@@ -18,7 +18,7 @@ Harness: `scripts/chaos/` (`cluster.sh`, `chaos.sh`, `down.sh`). Run with
    unsafe"), so the harness writes each into its own volume, owner-only and owned by the node's
    user.
 2. **Three voters.** The founder's session is placed to survive one failure
-   (`cluster sessions plan --max-failures 1`), and the harness waits until the placement reports
+   (`plan session --max-failures 1`), and the harness waits until the placement reports
    three voters with nothing pending.
 3. **Faults on every node.** A sidecar in each node's network namespace applies
    `tc netem delay 50ms 25ms loss 5%`.
@@ -86,13 +86,13 @@ session and is the node the CLI writes through, loses every packet from claim 40
 |---|---|
 | 1–39 | acknowledged |
 | 40–79 (founder cut off) | all 40 refused `unavailable`; none acknowledged |
-| 80–82 (at reconnection) | `RequestUnconfirmed`, `route_changed`: the session's route moved to epoch 2 while the founder was away; the CLI names `request retry --operation-id n1:…` for each |
+| 80–82 (at reconnection) | `RequestUnconfirmed`, `route_changed`: the session's route moved to epoch 2 while the founder was away; the CLI names `retry request --operation-id n1:…` for each |
 | 83–120 | acknowledged |
 
 After the run:
 
 - **Every acknowledged claim (77) reads back on all three nodes;** none missing, none duplicated.
-- **Each unconfirmed operation resolves exactly once.** `request retry` answered each `Committed`
+- **Each unconfirmed operation resolves exactly once.** `retry request` answered each `Committed`
   at sequences 78, 79 and 80, and a second retry answered the same sequence and the same claim.
   Each of the three reads back on all three nodes.
 - **No refused write committed behind the client.** The 77 acknowledged claims and the three
@@ -106,7 +106,7 @@ cluster would follow the route to the new leader; that is the next run.
 
 `WRITER=client bash scripts/chaos/chaos.sh focal:chaos-6c56b29 120 5 50 leader`: the same cut,
 but every claim is written by participant `alice`, enrolled at the cluster (`cluster client
-invite`, `context enroll`), over QUIC from a container of its own.
+invite`, `enroll context`), over QUIC from a container of its own.
 
 | claims | outcome |
 |---|---|

@@ -181,7 +181,7 @@ fn all_shells_omit_hidden_family_filters_and_preserve_claim_selection() {
 #[test]
 fn every_surface_descriptor_cli_path_resolves_in_the_command_tree() {
     use focal_client::operations::{admin_descriptors, transfer_descriptors, watch_descriptors};
-    let root = command();
+    let root = super::super::grammar::command();
     let mut named = 0;
     for descriptor in watch_descriptors()
         .iter()
@@ -258,7 +258,7 @@ fn documented_cli_commands_and_their_flags_resolve_in_the_command_tree() {
         "--format",
     ];
 
-    let root = command();
+    let root = super::super::grammar::command();
     let (mut checked, mut flags) = (0usize, 0usize);
     for relative in ["../../docs/manual-cli.md", "../../README.md"] {
         let manual = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);

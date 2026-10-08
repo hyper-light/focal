@@ -138,23 +138,23 @@ fn recovery(context: &Context, id: ManagedOperationId, action: Recovery) {
         Recovery::Retry => {
             let _ = writeln!(
                 error,
-                "Recovery: {command} request retry --operation-id {id}"
+                "Recovery: {command} retry request --operation-id {id}"
             );
         }
         Recovery::Seal => {
             let _ = writeln!(
                 error,
-                "Recovery: {command} request seal --operation-id {id}"
+                "Recovery: {command} seal request --operation-id {id}"
             );
         }
         Recovery::Reserved => {
             let _ = writeln!(
                 error,
-                "Saved reservation: {id}\nRecovery: {command} request pending"
+                "Saved reservation: {id}\nRecovery: {command} list requests"
             );
             let _ = writeln!(
                 error,
-                "To abandon this request: {command} request seal --operation-id {id}"
+                "To abandon this request: {command} seal request --operation-id {id}"
             );
         }
     }

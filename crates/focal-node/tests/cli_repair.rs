@@ -91,7 +91,7 @@ fn admin(root: &Path, args: &[&str]) -> Value {
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
         command.args(["--advertise", address]);
     }
@@ -129,8 +129,8 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     let written = admin(
         founder,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -142,6 +142,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         host,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -151,7 +152,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     joined["node"].as_u64().unwrap()
 }
 fn placement(root: &Path) -> Option<Value> {
-    let output = run(root, None, &["cluster", "placement"]);
+    let output = run(root, None, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -231,7 +232,7 @@ fn objects(page: &Value) -> &Vec<Value> {
 fn repair(root: &Path, tenant: &str, ledger: &str) -> Value {
     let report = admin(
         root,
-        &["cluster", "repair", "--tenant", tenant, "--session", ledger],
+        &["repair", "session", "--tenant", tenant, "--session", ledger],
     );
     assert_eq!(report["result"]["kind"], "repaired", "{report}");
     report["result"]["repair"].clone()
@@ -261,12 +262,11 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     let host_b = dirs[2].path();
     let client = dirs[3].path();
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
-    let activation = admin(founder, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(founder, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let (_founder_server, status) = start(founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let identity =
-        admin(founder, &["diagnose", "node", "--identity"])["result"]["identity"].clone();
+    let identity = admin(founder, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let founder_node = identity["node"].as_u64().unwrap();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let ledger = identity["session"].as_str().unwrap().to_owned();
@@ -275,9 +275,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     admin(
         founder,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -289,8 +288,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
             client,
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -299,7 +298,7 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
         .status
         .success()
     );
-    let standing = admin(client, &["--client-context", "alice", "status"]);
+    let standing = admin(client, &["--client-context", "alice", "inspect", "prefix"]);
     let alice = hex_hash(&objects(&standing)[0]["Standing"]["principal"]);
     let document = json!({
         "description": "Run the suite and deliver the report.",
@@ -318,13 +317,13 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let claim = created(&result, "Claim").remove(0);
-    committed(&cli(founder, None, &["claim", "post", &claim]));
-    committed(&cli(client, Some("alice"), &["receipt", "acquire", &claim]));
+    committed(&cli(founder, None, &["post", "claim", &claim]));
+    committed(&cli(client, Some("alice"), &["acquire", "receipt", &claim]));
     committed(&cli(
         client,
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     let founder_chunks = chunk_files(founder, &tenant);
@@ -354,9 +353,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     let planned = admin(
         founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -465,8 +463,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     let bounded = admin(
         founder,
         &[
-            "cluster",
             "repair",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -482,8 +480,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     let resumed = admin(
         founder,
         &[
-            "cluster",
             "repair",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -500,8 +498,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
         founder,
         None,
         &[
-            "cluster",
             "repair",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -525,7 +523,7 @@ fn wait_for_report(
         let output = run(
             root,
             None,
-            &["cluster", "repair", "--tenant", tenant, "--session", ledger],
+            &["repair", "session", "--tenant", tenant, "--session", ledger],
         );
         if output.status.success()
             && let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)

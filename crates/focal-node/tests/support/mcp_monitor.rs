@@ -42,8 +42,8 @@ fn actual_monitor_cli_mcp_registration_retry_and_release_survive_restart() {
     let cli_registered = cli(
         root.path(),
         &[
-            "monitor",
             "register",
+            "monitor",
             "--id",
             &id(301),
             "--owner",
@@ -60,7 +60,7 @@ fn actual_monitor_cli_mcp_registration_retry_and_release_survive_restart() {
     );
     assert_eq!(cli_registered["result"]["monitor"], id(301));
     let cli_page: MonitorPage =
-        serde_json::from_value(cli(root.path(), &["monitor", "get", &id(300)])).unwrap();
+        serde_json::from_value(cli(root.path(), &["get", "monitor", &id(300)])).unwrap();
     assert_eq!(cli_page.monitor, pending.monitor);
     mcp.finish();
     drop(server);
@@ -76,8 +76,8 @@ fn actual_monitor_cli_mcp_registration_retry_and_release_survive_restart() {
     cli(
         root.path(),
         &[
-            "claim",
             "cancel",
+            "claim",
             &id(200),
             "--reason",
             "Waiting target is canceled",
@@ -99,7 +99,7 @@ fn actual_monitor_cli_mcp_registration_retry_and_release_survive_restart() {
     let missing = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root.path())
-        .args(["monitor", "get", &id(999), "--format", "json"])
+        .args(["get", "monitor", &id(999), "--format", "json"])
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(4));

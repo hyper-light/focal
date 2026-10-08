@@ -225,7 +225,7 @@ pub struct PartitionProposal {
     pub group: [u8; 16],
     pub proposal: ControlProposal,
 }
-/// The answer a dry-run root plan produced (`cluster placement`'s solver).
+/// The answer a dry-run root plan produced (`inspect placement`'s solver).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlProposal {
     Planned {

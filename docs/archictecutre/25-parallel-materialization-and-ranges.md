@@ -347,7 +347,7 @@ plan's target, which is exactly what the announcement names
 (`seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only`).
 
 **Checkpointing on request.** Hosted replicas checkpoint on an operator's
-explicit request, `focal cluster replicas checkpoint [--session ID]`
+explicit request, `focal checkpoint replica [--session ID]`
 ([cluster-admin.md](../cluster-admin.md)): the replica's worker drains what
 Raft owns, encodes and installs the envelope synchronously and compacts the
 log behind it; a pending proposal refuses the request with `Capacity` until
@@ -514,8 +514,7 @@ locations are derived from the objects it names, `native_reads::locations`)
 and a listing only when it holds every member; anything else is unavailable
 there and the client is routed to the leader as before. Steering clients to
 a member's holder through the directory and the route cache is the next
-step; the operator reads every holder now with `focal cluster replicas
-ranges list` and moves a member with `focal cluster replicas ranges move
+step; the operator reads every holder now with `focal list ranges` and moves a member with `focal move range
 --member ID --node N` ([cluster-admin.md](../cluster-admin.md)).
 
 **What the tests hold.** In process (`fleet_native_tests`): a move of the one
@@ -546,8 +545,7 @@ controller observes every native session's committed map once per pass
 observations per `(ledger, member)`.
 
 **Measure.** The member's row count on the replica that answers
-(`NativeRanges::member_stats`, shown as `entries` by `focal cluster replicas
-ranges list`). Rows are the one quantity every replica agrees on at a
+(`NativeRanges::member_stats`, shown as `entries` by `focal list ranges`). Rows are the one quantity every replica agrees on at a
 prefix; bytes differ by page layout and load differs by node, so neither
 is a fact a decision can be replayed against. Load, locality and resource
 policy as further inputs remain open (below).
@@ -656,7 +654,7 @@ idempotent, a different one at the same epoch conflicts, an older one is
 stale), when its members are in key order with unique identities, and when
 every holding replica is a member of the active placement at its enrolled
 generation — so a holder the directory names is a replica the placement
-authorized. `cluster placement` shows `range_epoch` and `holders` per
+authorized. `inspect placement` shows `range_epoch` and `holders` per
 session. Clients are not yet steered to holders by it (below).
 
 **What the test holds.** Across three real processes

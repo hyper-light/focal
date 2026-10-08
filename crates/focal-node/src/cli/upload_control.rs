@@ -156,7 +156,7 @@ pub(super) fn run(
         let invocation = context.invocation.as_deref().unwrap_or("focal");
         let _ = writeln!(
             std::io::stderr().lock(),
-            "Transfer cancellation remains saved. Recovery: {invocation} artifact upload cancel {} --origin {}",
+            "Transfer cancellation remains saved. Recovery: {invocation} cancel upload {} --origin {}",
             args.upload_id,
             args.origin.name()
         );

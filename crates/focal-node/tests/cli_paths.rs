@@ -141,8 +141,8 @@ fn case(name: OsString) {
         &execute(
             &root,
             &[
-                OsStr::new("request"),
                 OsStr::new("inspect"),
+                OsStr::new("request"),
                 operation.as_os_str(),
                 OsStr::new("--format"),
                 OsStr::new("json"),
@@ -163,8 +163,8 @@ fn case(name: OsString) {
         &execute(
             &root,
             &[
-                OsStr::new("request"),
                 OsStr::new("retry"),
+                OsStr::new("request"),
                 operation.as_os_str(),
                 OsStr::new("--format"),
                 OsStr::new("json"),

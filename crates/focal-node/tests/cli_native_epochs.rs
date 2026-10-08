@@ -51,7 +51,7 @@ const OUTCOMES: &str = "48";
 fn start(root: &Path, advertise: Option<&str>) -> Server {
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(advertise) = advertise {
         command.args(["--advertise", advertise]);
     }
@@ -172,12 +172,12 @@ fn claim_document(target: &str, description: &str) -> Value {
     })
 }
 fn sequence(root: &Path) -> u64 {
-    admin(root, None, &["status"])["result"]["page"]["native_sequence"]
+    admin(root, None, &["inspect", "prefix"])["result"]["page"]["native_sequence"]
         .as_u64()
         .unwrap()
 }
 fn seals_proposed(root: &Path) -> u64 {
-    let shown = admin(root, None, &["diagnose", "node", "--storage"]);
+    let shown = admin(root, None, &["inspect", "node", "--storage"]);
     assert_eq!(shown["result"]["kind"], "storage", "{shown}");
     shown["result"]["storage"]["retire"]["seals_proposed"]
         .as_u64()
@@ -190,8 +190,8 @@ fn observed(root: &Path, operation: &str) -> Value {
         root,
         None,
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             operation,
             "--remote",
@@ -216,7 +216,7 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, Some(&advertise));
@@ -225,9 +225,8 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -238,15 +237,15 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
         ],
     );
     assert!(enrolled.status.success());
-    let alice_standing = admin(client.path(), Some("alice"), &["status"]);
+    let alice_standing = admin(client.path(), Some("alice"), &["inspect", "prefix"]);
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // The founder issues claims until the owner closes its generation: the
@@ -293,14 +292,14 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     let inspected = cli(
         root,
         None,
-        &["request", "inspect", "--operation-id", &expired],
+        &["inspect", "request", "--operation-id", &expired],
     );
     assert_eq!(inspected["condition"], "Error", "{inspected}");
     assert_eq!(inspected["result"]["code"], "request_history_expired");
     let missing = cli(
         root,
         None,
-        &["request", "inspect", "--operation-id", &expired, "--remote"],
+        &["inspect", "request", "--operation-id", &expired, "--remote"],
     );
     assert!(objects(&missing)[0].get("Missing").is_some(), "{missing}");
     // The journal learned the owner's window: the next command is issued in
@@ -324,7 +323,7 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     let retried = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", first_id],
+        &["retry", "request", "--operation-id", first_id],
     );
     assert_eq!(retried["condition"], "Committed", "{retried}");
     assert_eq!(retried["result"]["receipt"], first_result["receipt"]);
@@ -351,7 +350,7 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     let (code, again) = attempt(
         root,
         None,
-        &["request", "retry", "--operation-id", &expired],
+        &["retry", "request", "--operation-id", &expired],
     );
     assert_eq!(code, 5, "{again}");
     assert_eq!(again["condition"], "Error", "{again}");
@@ -383,7 +382,7 @@ fn retired(root: &Path, claim: &str) -> Value {
     }
 }
 
-/// The embedded node — `focal start` without a network — runs the archive
+/// The embedded node — `focal start node` without a network — runs the archive
 /// agent's walk on its owner thread against its own store (26 §4a): under
 /// the same pressure its founder's generation closes and is learned by
 /// name, its sealed outcomes are read from the seal, a released family
@@ -396,7 +395,7 @@ fn an_embedded_node_seals_its_closed_generations_and_retires_released_families()
         .unwrap();
     private(founder.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let server = start(root, None);
     // The founder issues to the worker identity its data directory names.
@@ -420,8 +419,8 @@ fn an_embedded_node_seals_its_closed_generations_and_retires_released_families()
         ],
     ));
     let released = hex_hash(&result["created"][0]["id"]);
-    committed(&cli(root, None, &["claim", "cancel", &released]));
-    committed(&cli(root, None, &["claim", "release-scope", &released]));
+    committed(&cli(root, None, &["cancel", "claim", &released]));
+    committed(&cli(root, None, &["release", "scope", &released]));
     let continuation = retired(root, &released);
     assert!(continuation["bundle"].is_array(), "{continuation}");
 
@@ -472,7 +471,7 @@ fn an_embedded_node_seals_its_closed_generations_and_retires_released_families()
     let missing = cli(
         root,
         None,
-        &["request", "inspect", "--operation-id", &expired, "--remote"],
+        &["inspect", "request", "--operation-id", &expired, "--remote"],
     );
     assert!(objects(&missing)[0].get("Missing").is_some(), "{missing}");
     let claim = hex_hash(&resumed["created"][0]["id"]);

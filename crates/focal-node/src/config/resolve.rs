@@ -90,7 +90,7 @@ const LOCAL_FIELDS: [&str; 8] = [
 enum PolicyMode {
     /// The pod's own long-running start: the committed policy is
     /// authoritative and a differing file value yields to it. The file only
-    /// seeds the first start, and `deployment apply` may have committed
+    /// seeds the first start, and `apply deployment` may have committed
     /// stronger durability than that seed, so a restart must never be
     /// refused for carrying what the fleet already carries.
     Start,
@@ -98,7 +98,7 @@ enum PolicyMode {
     /// than the committed one is refused by name, directing to plan/apply,
     /// so an operator learns their edit does not take effect that way.
     Enforce,
-    /// A policy request (`deployment plan`, `explain`): the file's value is
+    /// A policy request (`plan deployment`, `explain`): the file's value is
     /// the request and is kept.
     Request,
 }
@@ -116,8 +116,8 @@ pub fn resolve(
 /// Resolve the settings the pod's own `start` runs with. The committed
 /// policy is authoritative: a differing file value yields to it rather than
 /// refusing (a refusal would crash-loop a node whose static file seeded the
-/// first start while `deployment apply` committed a stronger policy). The
-/// divergence is visible through `deployment explain`.
+/// first start while `apply deployment` committed a stronger policy). The
+/// divergence is visible through `explain deployment`.
 pub fn resolve_start(
     cli: &CliOverrides,
     file: Option<(&Settings, &FilePresence)>,
@@ -125,7 +125,7 @@ pub fn resolve_start(
 ) -> Result<ResolvedSettings, ConfigError> {
     resolve_with(cli, file, committed, PolicyMode::Start)
 }
-/// Resolve a policy request (`deployment plan`, `explain`): the file's
+/// Resolve a policy request (`plan deployment`, `explain`): the file's
 /// policy fields are what the operator asks for, so a value other than the
 /// committed one is the request; omitted fields still take the committed
 /// values.

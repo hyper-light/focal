@@ -127,14 +127,14 @@ fn seats_move_home_one_at_a_time_and_then_rest() {
     for left in [node_a, node_b] {
         assert!(!ids(&second["content_copies"]).contains(&left), "{second}");
     }
-    let status = run(&founder, None, &["status"]);
+    let status = run(&founder, None, &["inspect", "prefix"]);
     assert!(
         status.status.success(),
         "{}",
         String::from_utf8_lossy(&status.stderr)
     );
     // At rest.
-    let plan = admin(&founder, &["cluster", "plan"])["result"]["actions"].clone();
+    let plan = admin(&founder, &["plan", "placement"])["result"]["actions"].clone();
     assert_eq!(plan, serde_json::json!([]));
     let began = periods(&founder).unwrap();
     let mut wait = Progress::begin(&[&founder], Duration::from_secs(120));

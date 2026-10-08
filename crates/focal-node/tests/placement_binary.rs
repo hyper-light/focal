@@ -60,7 +60,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 fn periods(root: &Path) -> Option<u64> {
-    let output = command(root, &["diagnose", "node", "--metrics"]);
+    let output = command(root, &["inspect", "node", "--metrics"]);
     if !output.status.success() {
         return None;
     }
@@ -99,7 +99,7 @@ fn start_with(root: &Path, address: Option<&str>, envs: &[(&str, &str)]) -> (Ser
         }
     });
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     command.envs(envs.iter().copied());
     if let Some(address) = address {
         command.args(["--advertise", address]);
@@ -169,7 +169,7 @@ fn seed_files(root: &Path) -> Vec<String> {
 /// The operator's placement view, or `None` while the node's admin socket
 /// is not answering (during a restart).
 fn placement(root: &Path) -> Option<Value> {
-    let output = command(root, &["cluster", "placement"]);
+    let output = command(root, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -216,8 +216,8 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     let written = success(
         founder,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -229,6 +229,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         host,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -253,7 +254,7 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
     let (mut founder_server, status) = start(founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let identity = success(founder, &["identity"]);
+    let identity = success(founder, &["inspect", "identity"]);
     let founder_node = identity["node"].as_u64().unwrap();
     let node_a = join(founder, dirs[1].path(), "host-a", &addresses[1]);
     let node_b = join(founder, dirs[2].path(), "host-b", &addresses[2]);
@@ -284,9 +285,8 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
     // The operator asks for one tolerated node loss: the planner picks the
     // three hosts and the request is exact on retry.
     let plan_args = [
-        "cluster",
-        "sessions",
         "plan",
+        "session",
         "--tenant",
         tenant.as_str(),
         "--session",
@@ -374,22 +374,22 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
         satisfied["state"], "satisfied",
         "{satisfied} (killed at {phase})"
     );
-    let plan = success(founder, &["cluster", "plan"])["result"]["actions"].clone();
+    let plan = success(founder, &["plan", "placement"])["result"]["actions"].clone();
     assert_eq!(plan, serde_json::json!([]));
     // The founder's local socket follows the route epoch the expansion moved.
-    let output = command(founder, &["status"]);
+    let output = command(founder, &["inspect", "prefix"]);
     assert!(
         output.status.success(),
         "status after activation: {}; founder replicas {}",
         String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&command(founder, &["diagnose", "cluster", "--replicas"]).stdout),
+        String::from_utf8_lossy(&command(founder, &["inspect", "replicas", "--replicas"]).stdout),
     );
     // Losing one host keeps a quorum: the founder still answers a quorum read
     // of its session, and the directory measures the weaker guarantee.
     drop(server_b);
     let mut deadline = Deadline::after(Duration::from_secs(30));
     loop {
-        let output = command(founder, &["status"]);
+        let output = command(founder, &["inspect", "prefix"]);
         if output.status.success() {
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert!(
@@ -403,10 +403,10 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
             "the session lost its quorum after one host loss: {}; founder replicas {}; host-a replicas {}; founder view {:#?}",
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(
-                &command(founder, &["diagnose", "cluster", "--replicas"]).stdout
+                &command(founder, &["inspect", "replicas", "--replicas"]).stdout
             ),
             String::from_utf8_lossy(
-                &command(dirs[1].path(), &["diagnose", "cluster", "--replicas"]).stdout
+                &command(dirs[1].path(), &["inspect", "replicas", "--replicas"]).stdout
             ),
             placement(founder).and_then(|view| session(&view).cloned())
         );
@@ -458,11 +458,11 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     let founder = dirs[0].path();
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
     // Offline native activation on the laptop before the node ever listens.
-    let activation = success(founder, &["cluster", "replicas", "activate-native"]);
+    let activation = success(founder, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let (founder_server, status) = start_with(founder, Some(&addresses[0]), SEEDED);
     assert_eq!(status["condition"], "Ready");
-    let identity = success(founder, &["identity"]);
+    let identity = success(founder, &["inspect", "identity"]);
     let founder_node = identity["node"].as_u64().unwrap();
     // An explicit checkpoint (retried while the node's first proposals are
     // still in flight) seals the Core root as seeds beside the founder's
@@ -470,7 +470,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     // it, so a later copy can only catch up through the seeded snapshot.
     let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
-        let output = command(founder, &["cluster", "replicas", "checkpoint"]);
+        let output = command(founder, &["checkpoint", "replica"]);
         if output.status.success() {
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(value["result"]["kind"], "replica_checkpointed", "{value}");
@@ -518,9 +518,8 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     let tenant = registered["tenant"].as_str().unwrap().to_owned();
     let ledger = registered["session"].as_str().unwrap().to_owned();
     let plan_args = [
-        "cluster",
-        "sessions",
         "plan",
+        "session",
         "--tenant",
         tenant.as_str(),
         "--session",
@@ -550,9 +549,9 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
             let diagnostics: Vec<String> = dirs
                 .iter()
                 .map(|dir| {
-                    let output = command(dir.path(), &["diagnose", "cluster", "--replicas"]);
-                    let membership = command(dir.path(), &["cluster", "replicas", "show"]);
-                    let health = command(dir.path(), &["diagnose", "node", "--health"]);
+                    let output = command(dir.path(), &["inspect", "replicas", "--replicas"]);
+                    let membership = command(dir.path(), &["inspect", "replica"]);
+                    let health = command(dir.path(), &["inspect", "node", "--health"]);
                     format!(
                         "{}: seeds {:?}; {}{}{}{}{}{}",
                         dir.path().display(),
@@ -600,7 +599,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
             host.display()
         );
     }
-    let output = command(founder, &["status"]);
+    let output = command(founder, &["inspect", "prefix"]);
     assert!(
         output.status.success(),
         "status after activation: {}",
@@ -611,7 +610,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     // seed, the barrier, host-a's readiness stated over its own connection,
     // activation and cleanup, and every process reports the same map.
     let ranges = |root: &Path| -> Option<Value> {
-        let output = command(root, &["cluster", "replicas", "ranges", "list"]);
+        let output = command(root, &["list", "ranges"]);
         if !output.status.success() {
             return None;
         }
@@ -627,10 +626,8 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     let moved = success(
         founder,
         &[
-            "cluster",
-            "replicas",
-            "ranges",
             "move",
+            "range",
             "--member",
             member.as_str(),
             "--node",
@@ -678,7 +675,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
 }
 
 fn ranges(root: &Path) -> Option<Value> {
-    let output = command(root, &["cluster", "replicas", "ranges", "list"]);
+    let output = command(root, &["list", "ranges"]);
     if !output.status.success() {
         return None;
     }
@@ -748,7 +745,7 @@ fn wait_cut(
                     let text = |args: &[&str]| {
                         String::from_utf8_lossy(&command(root, args).stdout).into_owned()
                     };
-                    let metrics = text(&["diagnose", "node", "--metrics"]);
+                    let metrics = text(&["inspect", "node", "--metrics"]);
                     let session: Vec<&str> = metrics
                         .lines()
                         .filter(|line| {
@@ -769,7 +766,7 @@ fn wait_cut(
                     format!(
                         "{}: {session:?}; health {}; ranges {:?}",
                         root.display(),
-                        text(&["diagnose", "node", "--health"]),
+                        text(&["inspect", "node", "--health"]),
                         ranges(root)
                     )
                 })
@@ -836,11 +833,13 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
     let roots: Vec<&Path> = dirs.iter().map(|dir| dir.path()).collect();
     let founder = roots[0];
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
-    let activation = success(founder, &["cluster", "replicas", "activate-native"]);
+    let activation = success(founder, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let (mut founder_server, status) = start(founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let founder_node = success(founder, &["identity"])["node"].as_u64().unwrap();
+    let founder_node = success(founder, &["inspect", "identity"])["node"]
+        .as_u64()
+        .unwrap();
     let node_a = join(founder, roots[1], "host-a", &addresses[1]);
     let node_b = join(founder, roots[2], "host-b", &addresses[2]);
     let (mut server_a, _) = start(roots[1], None);
@@ -865,9 +864,8 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
     let planned = success(
         founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             tenant.as_str(),
             "--session",
@@ -903,9 +901,8 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
     success(
         founder,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -914,7 +911,7 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
     );
     let enrolled = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--data-dir", client.path().to_str().unwrap()])
-        .args(["context", "enroll", "alice", "--invite-file"])
+        .args(["enroll", "context", "alice", "--invite-file"])
         .arg(&invitation)
         .output()
         .unwrap();
@@ -982,10 +979,8 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
     };
     let move_args = |member: &str, target: u64| -> Vec<String> {
         [
-            "cluster",
-            "replicas",
-            "ranges",
             "move",
+            "range",
             "--member",
             member,
             "--node",

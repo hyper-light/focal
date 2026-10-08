@@ -47,6 +47,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -168,6 +169,7 @@ fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -200,7 +202,7 @@ fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
     server
 }
 fn sequence(root: &Path) -> u64 {
-    admin(root, None, &["status"])["result"]["page"]["native_sequence"]
+    admin(root, None, &["inspect", "prefix"])["result"]["page"]["native_sequence"]
         .as_u64()
         .unwrap()
 }
@@ -261,19 +263,19 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let root = founder.path();
     let alice_root = client.path();
     let alice_ctx = Some("alice");
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let issuer = hex_hash(&objects(&admin(root, None, &["status"]))[0]["Standing"]["principal"]);
+    let issuer =
+        hex_hash(&objects(&admin(root, None, &["inspect", "prefix"]))[0]["Standing"]["principal"]);
     let invitation = client.path().join("alice.invite");
     admin(
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -284,8 +286,8 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
         alice_root,
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -298,8 +300,9 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
         String::from_utf8_lossy(&enrolled.stderr),
         String::from_utf8_lossy(&enrolled.stdout)
     );
-    let alice =
-        hex_hash(&objects(&admin(alice_root, alice_ctx, &["status"]))[0]["Standing"]["principal"]);
+    let alice = hex_hash(
+        &objects(&admin(alice_root, alice_ctx, &["inspect", "prefix"]))[0]["Standing"]["principal"],
+    );
 
     // ---- Concurrency: six processes on two durable journals at once ----
     let before = sequence(root);
@@ -335,8 +338,8 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     ids.dedup();
     assert_eq!(ids.len(), 6, "{ids:?}");
     assert_eq!(sequence(root), before + 6);
-    assert!(native_rows(&cli(root, None, &["request", "pending"])).is_empty());
-    assert!(native_rows(&cli(alice_root, alice_ctx, &["request", "pending"])).is_empty());
+    assert!(native_rows(&cli(root, None, &["list", "requests"])).is_empty());
+    assert!(native_rows(&cli(alice_root, alice_ctx, &["list", "requests"])).is_empty());
     assert_eq!(claims_of(root, &issuer).len(), 3);
     assert_eq!(claims_of(root, &alice).len(), 3);
 
@@ -354,7 +357,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let server = start(root, &advertise);
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(sequence(root), before, "the cut node committed nothing");
-    let rows = native_rows(&cli(root, None, &["request", "pending"]));
+    let rows = native_rows(&cli(root, None, &["list", "requests"]));
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["condition"], "Pending", "{rows:?}");
     assert_eq!(rows[0]["operation_id"], lost_before, "{rows:?}");
@@ -362,7 +365,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let replayed = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &lost_before],
+        &["retry", "request", "--operation-id", &lost_before],
     );
     let (replayed_id, replayed_result) = committed(&replayed);
     assert_eq!(replayed_id, lost_before);
@@ -370,11 +373,11 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let again = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &lost_before],
+        &["retry", "request", "--operation-id", &lost_before],
     );
     assert_eq!(again["result"]["receipt"], replayed_result["receipt"]);
     assert_eq!(sequence(root), before + 1);
-    assert!(native_rows(&cli(root, None, &["request", "pending"])).is_empty());
+    assert!(native_rows(&cli(root, None, &["list", "requests"])).is_empty());
 
     // ---- Reply lost after commitment: the node aborts after the owner
     // committed the frame and before any reply was written ----
@@ -399,7 +402,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(sequence(root), before + 1, "the commit survived the cut");
-    let rows = native_rows(&cli(root, None, &["request", "pending"]));
+    let rows = native_rows(&cli(root, None, &["list", "requests"]));
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["operation_id"], lost_after, "{rows:?}");
     // The exact retry is answered by the owner's committed outcome for the
@@ -407,7 +410,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let reconciled = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &lost_after],
+        &["retry", "request", "--operation-id", &lost_after],
     );
     let (reconciled_id, reconciled_result) = committed(&reconciled);
     assert_eq!(reconciled_id, lost_after);
@@ -416,8 +419,8 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
         root,
         None,
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             &lost_after,
             "--remote",
@@ -428,7 +431,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
         objects(&remote)[0]["Outcome"]["intent"],
         reconciled_result["receipt"]["intent"]
     );
-    assert!(native_rows(&cli(root, None, &["request", "pending"])).is_empty());
+    assert!(native_rows(&cli(root, None, &["list", "requests"])).is_empty());
     let issuer_claims = claims_of(root, &issuer);
     assert_eq!(issuer_claims.len(), 5, "{issuer_claims:?}");
 
@@ -444,7 +447,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
             &["submit", "claim", "--json", &posted_document],
         ));
         let id = created(&result, "Claim").remove(0);
-        let (post_id, post_result) = committed(&cli(root, None, &["claim", "post", &id]));
+        let (post_id, post_result) = committed(&cli(root, None, &["post", "claim", &id]));
         assert_eq!(
             objects(&cli(root, None, &["get", "claim", &id]))[0]["Claim"]["status"],
             POSTED
@@ -475,14 +478,14 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let retried = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &post_id],
+        &["retry", "request", "--operation-id", &post_id],
     );
     assert_eq!(retried["condition"], "Committed", "{retried}");
     assert_eq!(retried["result"]["receipt"], post_result["receipt"]);
     let observed = cli(
         root,
         None,
-        &["request", "inspect", "--operation-id", &post_id, "--remote"],
+        &["inspect", "request", "--operation-id", &post_id, "--remote"],
     );
     assert_eq!(observed["condition"], "Observed", "{observed}");
     assert_eq!(
@@ -496,7 +499,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let inspected = cli(
         root,
         None,
-        &["request", "inspect", "--operation-id", &refused_id],
+        &["inspect", "request", "--operation-id", &refused_id],
     );
     assert_eq!(inspected["condition"], "Pending", "{inspected}");
     assert_eq!(inspected["result"]["code"], "capacity", "{inspected}");
@@ -509,7 +512,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let (code, refused_again) = failed(
         root,
         None,
-        &["request", "retry", "--operation-id", &refused_id],
+        &["retry", "request", "--operation-id", &refused_id],
     );
     assert_eq!(code, 6, "{refused_again}");
     assert_eq!(sequence(root), before);
@@ -520,7 +523,7 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     let (admitted_id, admitted) = committed(&cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &refused_id],
+        &["retry", "request", "--operation-id", &refused_id],
     ));
     assert_eq!(admitted_id, refused_id);
     assert_eq!(created(&admitted, "Claim").len(), 1);
@@ -538,6 +541,6 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     assert_eq!(created(&result, "Claim").len(), 1);
     assert_eq!(sequence(root), before + 2);
     assert_eq!(claims_of(root, &issuer).len(), 8);
-    assert!(native_rows(&cli(root, None, &["request", "pending"])).is_empty());
+    assert!(native_rows(&cli(root, None, &["list", "requests"])).is_empty());
     drop(server);
 }

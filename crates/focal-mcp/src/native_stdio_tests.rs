@@ -481,7 +481,7 @@ fn the_probe_selects_the_native_catalogue_and_frames_are_journaled_and_acknowled
     mcp.running.stop();
 }
 
-/// The generated native example (`focal schema example claim.submit
+/// The generated native example (`focal get example claim.submit
 /// --native`, `focal_client::operations::example`) is what the adapter's
 /// `claim.submit` tool accepts as it stands: it compiles to one exact frame,
 /// is journaled, sent and committed, with the identities the frame minted.

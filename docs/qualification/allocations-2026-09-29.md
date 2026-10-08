@@ -27,11 +27,11 @@ Raw outputs, the audit notes per crate, the shapes and scripts are under `scratc
 | `crates/focal-raft/benches/allocs.rs` | the replicate harness (`tests/support`) for raft-rs (`Old`) and focal-raft (`New`), newest-first delivery as `benches/replicate.rs`, and `FOCAL_RAFT_FIFO=1` oldest-first; core vs harness share |
 | `tools/load/benches/allocs.rs` | the `focal-load` driver path (same `focal_client::Client` over `EmbeddedTransport` against an in-process `EmbeddedNode`/`LocalHost`) with the gate around node open, each committed native Create, each linearizable claim read, and shutdown; per-crate shares |
 
-**Process level**: `/usr/bin/time -l` on the unmodified `target/release/focal-load` (shapes 1k, 2k, 10k claims with as many reads) and on `target/release/focal start` serving CLI `submit claim` / `get claim` over its Unix socket (200 and 400 claims). "page reclaims" are minor faults, "page faults" major.
+**Process level**: `/usr/bin/time -l` on the unmodified `target/release/focal-load` (shapes 1k, 2k, 10k claims with as many reads) and on `target/release/focal start node` serving CLI `submit claim` / `get claim` over its Unix socket (200 and 400 claims). "page reclaims" are minor faults, "page faults" major.
 
 **Static audit**: eight read-only sweeps (wire, log, raft, consensus, core, ledger, node, client) with every line number re-verified; condensed in §5 and in `audit-*.md`.
 
-Caveats: (1) sampled shares are estimates (±5% at these sample counts); realloc counts per site are exact. (2) The raft harness (`tests/support`) clones every message and committed entry it records; its share is separated out but the per-entry totals include it. (3) `tokio::io::duplex` in the wire round trip adds one `BytesMut` realloc and one lazily-created pthread mutex per op that are the pipe's, not focal's. (4) One product discrepancy found on the way: `focal schema example claim.submit` emits `evidence_schemas`, which `submit claim` rejects (`unknown field`), and with it removed `deadline` is missing; the server runs use a hand-written self-targeted handoff document instead.
+Caveats: (1) sampled shares are estimates (±5% at these sample counts); realloc counts per site are exact. (2) The raft harness (`tests/support`) clones every message and committed entry it records; its share is separated out but the per-entry totals include it. (3) `tokio::io::duplex` in the wire round trip adds one `BytesMut` realloc and one lazily-created pthread mutex per op that are the pipe's, not focal's. (4) One product discrepancy found on the way: `focal get example claim.submit` emits `evidence_schemas`, which `submit claim` rejects (`unknown field`), and with it removed `deadline` is missing; the server runs use a hand-written self-targeted handoff document instead.
 
 ## 2. Per-path counts
 
@@ -200,7 +200,7 @@ Read path (27 allocs, 1 realloc per read): `readiness_context` (`focal-ledger/sr
 
 First-touch vs steady state (difference method): 2k − 1k = **667 minor faults per 1,000 claims ≈ 0.67 faults (2.7 MB of fresh pages) per committed claim**, which is the retained state (9.4 KB tracked live growth per claim, 10.9 KB of RSS growth per claim with allocator slack). The intercept, ≈920 faults ≈ 3.7 MB, is first touch: binary/runtime pages, the 550 KB node open, tokio/thread stacks. So at 1k claims ~58% of minor faults are first-touch and ~42% steady-state; at 10k the same slope holds ((7,580 − 1,589) / 9,000 = 0.666 faults per claim; RSS +10.9 MB per 1,000 claims), so ~12% of the 10k run's minor faults are first-touch and ~88% are the retained state of committed claims. Major faults are zero throughout; nothing is paged. Peak footprint stays far below the 64 MiB host budget (`host.rs:45`).
 
-`focal start` serving CLI submits and reads over the Unix socket (`server-faults.sh`; each CLI call is a separate process, so the server sees a fresh connection, a Hello handshake and one request per call):
+`focal start node` serving CLI submits and reads over the Unix socket (`server-faults.sh`; each CLI call is a separate process, so the server sees a fresh connection, a Hello handshake and one request per call):
 
 | run | server wall | minor faults | major | max RSS |
 |---|---|---|---|---|
@@ -394,7 +394,7 @@ above are left as written, dated.
 
 ## 7. Observations and instrumentation limits
 - `benches/replicate.rs` delivers newest-first (`at: net.len() − 1`) and therefore measures a reject/re-probe path on every round; in-order delivery is 24 allocations per entry cheaper for both cores and changes the batch=16 comparison (§2.5). Worth a note in the qualification doc when its numbers are next refreshed.
-- `focal schema example claim.submit` produces a document `submit claim` rejects (`evidence_schemas` unknown; then `deadline` missing) — the manual's "self-targeted handoff example, suitable for trying the local protocol" does not currently work as written.
+- `focal get example claim.submit` produces a document `submit claim` rejects (`evidence_schemas` unknown; then `deadline` missing) — the manual's "self-targeted handoff example, suitable for trying the local protocol" does not currently work as written.
 - The sampled site tables are estimates; realloc counts per site are exact because every reallocation is sampled. Sample budgets were raised for the second core run (the first exhausted its budget in the first half).
 - Wall-clock in `report-*.json` (17 ops/s writes, 74k ops/s reads) was taken on a loaded machine and is not a qualification number.
 

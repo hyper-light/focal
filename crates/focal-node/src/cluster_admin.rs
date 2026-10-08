@@ -61,7 +61,7 @@ pub enum ClusterAdminError {
     /// it and so replace what the journals hold: the rule the node's start
     /// applies to it, and OpenSSH's `StrictModes` to a key's directory.
     #[error(
-        "data directory {} must be this user's and writable by no other user (`focal prepare-volume --owner UID:GID`)",
+        "data directory {} must be this user's and writable by no other user (`focal prepare volume --owner UID:GID`)",
         .0.display()
     )]
     NotPrivate(PathBuf),
@@ -90,7 +90,7 @@ pub enum ClusterAdminError {
     /// The upgrade fence is below the level the issuer succession needs
     /// (24 §11, §21): raise it first.
     #[error(
-        "the upgrade fence ({level}) is below the level the issuer succession needs ({needed}); raise it with `cluster upgrade activate --fence {needed}` once every node runs a binary at that level"
+        "the upgrade fence ({level}) is below the level the issuer succession needs ({needed}); raise it with `activate upgrade --fence {needed}` once every node runs a binary at that level"
     )]
     Fenced { level: u32, needed: u32 },
     #[error("invitation was not found in the committed enrollment registry")]

@@ -469,7 +469,7 @@ not transitioned. Qualification must cover that node-level downgrade boundary
 before and after checkpoint rewriting, using an actual preserved older binary.
 
 The [recorded older-binary experiment](../../crates/focal-consensus/fixtures/decoder-transition-old-binary/README.md)
-qualifies that physical boundary using a real old `focal demo` data directory.
+qualifies that physical boundary using a real old `focal run demo` data directory.
 The old executable accepts the unchanged and V1-floor controls. It refuses a
 test-only successor transition before compaction and after same-group or other-
 group compaction, twice per branch, with every file unchanged. Original application

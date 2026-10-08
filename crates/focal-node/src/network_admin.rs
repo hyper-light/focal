@@ -349,7 +349,7 @@ impl TopologyLabels {
     }
 }
 /// `now` is the controller's clock and `holds` how long a death of each
-/// session stands (`retirement_hold`), for `cluster plan` to say for how
+/// session stands (`retirement_hold`), for `plan placement` to say for how
 /// long a dead voter keeps its seat; a caller that cannot tell passes none.
 pub(crate) fn placement_reply(
     report: crate::placement_control::DirectoryReport,

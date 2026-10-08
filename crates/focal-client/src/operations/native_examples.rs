@@ -1,7 +1,7 @@
 //! The native engine's examples: one authored document per native descriptor,
 //! the single source every surface (CLI discovery, request files, MCP,
 //! tests) draws on. Each is a complete document of the descriptor's own
-//! contract, so what `schema example NAME --native` prints is what `submit`
+//! contract, so what `get example NAME --native` prints is what `submit`
 //! and the native tools accept without hand-editing.
 //!
 //! The documents are illustrative, not fabricated outcomes: the object

@@ -146,21 +146,83 @@ enum McpCommand {
     Serve,
 }
 fn main() {
-    let mut matches = match cli::command_tree::command().try_get_matches() {
-        Ok(matches) => matches,
-        Err(error) => error.exit(),
+    let words: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Help is focal's own page, read before any parsing.
+    let page = match cli::grammar::asked(&words) {
+        cli::grammar::Asked::Top => Some(cli::look::top(&mut std::io::stdout().lock())),
+        cli::grammar::Asked::Action(action) => {
+            Some(cli::look::action(action, &mut std::io::stdout().lock()))
+        }
+        cli::grammar::Asked::Command(used) => {
+            Some(cli::look::command(used, &mut std::io::stdout().lock()))
+        }
+        cli::grammar::Asked::Run => None,
     };
-    let format = cli::errors::format(&matches);
+    if let Some(written) = page {
+        std::process::exit(if written.is_ok() { 0 } else { 1 });
+    }
+    // The parser people use names what was typed, and every mistake in its words.
+    let typed = match cli::grammar::command().try_get_matches_from(&words) {
+        Ok(matches) => matches,
+        Err(error) => parse_failure(&error),
+    };
+    let format = cli::errors::format(&typed);
+    let Some(used) = cli::grammar::chosen(&typed) else {
+        let _ = cli::look::error("", "no command was given", &["focal lists every command"]);
+        std::process::exit(2);
+    };
+    drop(typed);
+    // The command, said as its derived command, whose handler runs.
+    let tree = cli::command_tree::command();
+    let derived = cli::grammar::internal(&tree, &words, used.path);
+    let mut matches = match tree.try_get_matches_from(derived) {
+        Ok(matches) => matches,
+        Err(error) => parse_failure(&error),
+    };
     let args = match Args::from_arg_matches_mut(&mut matches) {
         Ok(args) => args,
-        Err(error) => error.exit(),
+        Err(error) => parse_failure(&error),
     };
     drop(matches);
     cli::trace::configure(args.trace_file.clone());
     if let Err(error) = execute(args) {
-        let _ = cli::errors::report(error.as_ref(), format, &mut std::io::stderr().lock());
-        std::process::exit(cli::errors::classification(error.as_ref()).exit_code);
+        let failure = cli::errors::classification(error.as_ref());
+        if matches!(format, cli::OutputFormat::Table) && cli::look::styled_errors() {
+            let mut causes = Vec::new();
+            let mut source = error.source();
+            // A foreign Error implementation may expose a cyclic source chain.
+            for _ in 0..16 {
+                let Some(cause) = source else {
+                    break;
+                };
+                causes.push(format!("caused by: {cause}"));
+                source = cause.source();
+            }
+            let hints: Vec<&str> = causes.iter().map(String::as_str).collect();
+            let title = format!("{} {}", used.action, used.thing);
+            let message = format!("[{}] {error}", failure.code);
+            let _ = cli::look::error(&title, &message, &hints);
+        } else {
+            let _ = cli::errors::report(error.as_ref(), format, &mut std::io::stderr().lock());
+        }
+        std::process::exit(failure.exit_code);
     }
+}
+/// A parse failure: help and the version print as the parser has them; a mistake is
+/// named in focal's panel on a colour terminal, as the parser says it elsewhere.
+fn parse_failure(error: &clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let printed = matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    if !printed && cli::look::styled_errors() {
+        let _ = cli::look::parse_error(error);
+        std::process::exit(error.exit_code());
+    }
+    error.exit()
 }
 fn execute(args: Args) -> Result<()> {
     let args = match args.command {
@@ -215,8 +277,10 @@ fn execute(args: Args) -> Result<()> {
 /// Resolve the settings for this invocation (doc 08 §2). On an initialized
 /// store the committed policy fills every policy field the file omits; a
 /// file that sets one to another value is refused by name, except for a
-/// policy request (`deployment plan`/`explain`), where the file is what the
-/// operator asks for.
+/// policy request (`plan deployment`, `explain deployment`, `render`), where
+/// the file is what the operator asks for: a render touches no node, so the
+/// policy of whatever store sits at the default data directory is not its
+/// business.
 /// How the invoked command resolves a policy the committed store already
 /// holds: the pod's own `start` yields to the committed policy, a policy
 /// request keeps the file's values, and every other command is refused if
@@ -282,6 +346,7 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Deployment {
             command: cli::deployment::DeploymentCommand::Plan { .. }
                 | cli::deployment::DeploymentCommand::Explain { .. }
+                | cli::deployment::DeploymentCommand::Render { .. }
         }
     ) {
         Resolution::Request
@@ -413,8 +478,11 @@ fn output_response(reply: ResponseEnvelope) -> Result<()> {
     }
 }
 async fn start(settings: Settings) -> Result<()> {
+    // On a colour terminal the node's status is drawn, its lenses moving until it is
+    // ready; elsewhere it is printed as JSON.
+    let show = cli::startup::Show::begin("start node");
     if network_requested(&settings.data_dir()?, &settings) {
-        return start_network(settings).await;
+        return start_network(settings, show).await;
     }
     let node = EmbeddedNode::open(&settings)?;
     let path = node.root().join("focal.sock");
@@ -453,9 +521,11 @@ async fn start(settings: Settings) -> Result<()> {
     let (host, owner) = LocalHost::spawn(node, limits)?;
     let serving = server.serve(host.clone());
     tokio::pin!(serving);
-    print_json(
-        &serde_json::json!({"condition":"Ready","ledger":identity.ledger,"node":identity.node,"socket":path,"durability":{"survive":"node","max_failures":0},"meaning":"Acknowledged writes are synced to this disk; loss of this disk can lose the ledger."}),
-    )?;
+    let ready = serde_json::json!({"condition":"Ready","ledger":identity.ledger,"node":identity.node,"socket":path,"durability":{"survive":"node","max_failures":0},"meaning":"Acknowledged writes are synced to this disk; loss of this disk can lose the ledger."});
+    match &show {
+        Some(show) => show.status(&ready),
+        None => print_json(&ready)?,
+    }
     // An ingress task failure is a shutdown trigger as well as a signal. Do
     // not advertise readiness forever after the listening service has failed.
     let mut finished = None;
@@ -480,9 +550,17 @@ async fn start(settings: Settings) -> Result<()> {
         signal_result?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
-    tokio::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
+    let stopped = tokio::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
         .await
-        .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?
+        .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?;
+    if let Some(show) = show {
+        let mut card = ready;
+        if let Some(fields) = card.as_object_mut() {
+            fields.insert("condition".into(), "Stopped".into());
+        }
+        show.finish(&card);
+    }
+    stopped
 }
 async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
     let root = settings.data_dir()?;
@@ -527,7 +605,7 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
     #[cfg(not(unix))]
     {
         let _ = (uid, gid);
-        return Err("prepare-volume needs a Unix filesystem".into());
+        return Err("prepare volume needs a Unix filesystem".into());
     }
     #[cfg(unix)]
     {
@@ -535,21 +613,41 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
         print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
     }
 }
-async fn start_network(settings: Settings) -> Result<()> {
+async fn start_network(settings: Settings, show: Option<cli::startup::Show>) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
+    let mut last = serde_json::Value::Null;
     let stopped = service
         .run_until(shutdown_signal(), |status| {
-            let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
-            writeln!(std::io::stdout().lock(), "{json}")
+            let value = serde_json::to_value(status).map_err(std::io::Error::other)?;
+            match &show {
+                Some(show) => show.status(&value),
+                None => {
+                    let json =
+                        serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+                    writeln!(std::io::stdout().lock(), "{json}")?;
+                }
+            }
+            last = value;
+            Ok(())
         })
         .await?;
     // The last line a planned stop prints: what this node led, and what it
     // handed off before it went (27 §5).
-    print_json(&serde_json::json!({
+    let summary = serde_json::json!({
         "condition": "Stopped",
         "sessions_led": stopped.sessions_led,
         "sessions_handed_off": stopped.sessions_handed_off,
-    }))
+    });
+    match show {
+        Some(show) => {
+            if let Some(fields) = last.as_object_mut() {
+                fields.insert("condition".into(), "Stopped".into());
+            }
+            show.finish(&last);
+            Ok(())
+        }
+        None => print_json(&summary),
+    }
 }
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;

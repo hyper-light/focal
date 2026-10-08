@@ -1522,7 +1522,7 @@ pub(crate) fn retirement_hold(period: Duration, election_periods: u64) -> i64 {
         .max(1)
 }
 /// What the controller would do next for one session, from the committed
-/// directory alone: the operator's `cluster plan`. Never executes anything.
+/// directory alone: the operator's `plan placement`. Never executes anything.
 /// `stands` is for how many seconds more a death of the placement stands
 /// before a heal may move its seat (27 §5; `focal_directory::deaths_stand_for`),
 /// none where no death stands or the caller cannot tell.

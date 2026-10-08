@@ -790,7 +790,7 @@ fn a_voter_without_native_hosting_blocks_activation_and_a_downgraded_replica_can
 /// included, and must promise as it meets the record and apply it once the
 /// promise is durable — as the ingress fence does for native history — and
 /// never fail closed (the KIND campaign of 2026-09-29, D2: both hosts added
-/// by `deployment apply` after `activate-native` stopped with Corrupt, the
+/// by `apply deployment` after `activate-native` stopped with Corrupt, the
 /// session stuck in Catchup for good).
 #[test]
 fn a_voter_added_after_a_genesis_activation_promises_the_successor_and_applies_it() {

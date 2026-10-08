@@ -126,7 +126,7 @@ pub enum ConfigError {
     #[error("unknown configuration key `{path}`")]
     UnknownKey { path: String },
     #[error(
-        "configuration field {field} differs from the committed policy of this store; commit the change through `deployment plan` and `deployment apply`, or start with the committed value"
+        "configuration field {field} differs from the committed policy of this store; commit the change through `plan deployment` and `apply deployment`, or start with the committed value"
     )]
     CommittedPolicyChange { field: &'static str },
     #[error(

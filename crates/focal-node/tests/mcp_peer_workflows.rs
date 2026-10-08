@@ -45,6 +45,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -105,9 +106,8 @@ fn enroll(root: &Path, client: &Path, name: &str) {
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             name,
             "--output",
@@ -118,8 +118,8 @@ fn enroll(root: &Path, client: &Path, name: &str) {
         client,
         None,
         &[
-            "context",
             "enroll",
+            "context",
             name,
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -146,7 +146,7 @@ impl Mcp {
             command.args(["--client-context", context]);
         }
         let mut child = command
-            .args(["mcp", "serve"])
+            .args(["serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -336,7 +336,7 @@ fn peer_workflows_run_through_mcp_with_typed_refusals_identity_cancellation_and_
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);

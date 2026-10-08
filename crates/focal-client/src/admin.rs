@@ -474,7 +474,7 @@ pub struct AdminBackupPrefix {
     pub placement_epoch: u64,
     pub membership_epoch: u64,
 }
-/// A backup written by `cluster backup create` (26 §6).
+/// A backup written by `create backup` (26 §6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminBackup {
@@ -493,7 +493,7 @@ pub struct AdminBackup {
     pub files: u64,
     pub bytes: u64,
 }
-/// What `cluster backup verify` found (26 §6).
+/// What `verify backup` found (26 §6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminBackupVerification {

@@ -47,6 +47,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -91,7 +92,7 @@ fn run(root: &Path, context: Option<&str>, args: &[&str]) -> Output {
 /// node does not answer.
 fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
     move || {
-        let output = run(root, None, &["diagnose", "node", "--metrics"]);
+        let output = run(root, None, &["inspect", "node", "--metrics"]);
         if !output.status.success() {
             return None;
         }
@@ -243,11 +244,11 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let issuer = hex_hash(&objects(&status)[0]["Standing"]["principal"]);
 
     let invitation = client.path().join("alice.invite");
@@ -255,9 +256,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -269,8 +269,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -281,7 +281,7 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     );
     let alice_root = client.path();
     let alice_ctx = Some("alice");
-    let alice_standing = admin(alice_root, alice_ctx, &["status"]);
+    let alice_standing = admin(alice_root, alice_ctx, &["inspect", "prefix"]);
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
     assert_ne!(alice, issuer);
 
@@ -305,7 +305,7 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     let a = created(&result, "Claim").remove(0);
     let validations = created(&result, "Validation");
     let (admission, increment, whole_work) = (&validations[1], &validations[2], &validations[3]);
-    committed(&cli(root, None, &["claim", "post", &a]));
+    committed(&cli(root, None, &["post", "claim", &a]));
 
     // Posting registers the admission evaluation; the issuer is its
     // evaluator and selects it by phase. The default phase does not see it.
@@ -313,8 +313,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &a,
             "--validation",
@@ -326,8 +326,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &a,
             "--validation",
@@ -340,8 +340,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &a,
             "--validation",
@@ -364,12 +364,12 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
 
     // The respondent acquires the receipt and delivers slot zero; the
     // submission registers the increment evaluation of that exact artifact.
-    committed(&cli(alice_root, alice_ctx, &["receipt", "acquire", &a]));
+    committed(&cli(alice_root, alice_ctx, &["acquire", "receipt", &a]));
     let (_, result) = committed(&cli(
         alice_root,
         alice_ctx,
         &[
-            "artifact", "submit", "--claim", &a, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &a, "--slot", "0", "--text", PROOF,
         ],
     ));
     let output = created(&result, "Artifact").remove(0);
@@ -378,8 +378,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &a,
             "--validation",
@@ -394,8 +394,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &a,
             "--validation",
@@ -413,17 +413,13 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     committed(&cli(
         root,
         None,
-        &["artifact", "receive", &output, "--claim", &a],
+        &["receive", "artifact", &output, "--claim", &a],
     ));
-    let (seal_id, seal) = committed(&cli(
-        root,
-        None,
-        &["validation", "seal-increments", "--claim", &a],
-    ));
+    let (seal_id, seal) = committed(&cli(root, None, &["seal", "increments", "--claim", &a]));
     let sealed_again = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &seal_id],
+        &["retry", "request", "--operation-id", &seal_id],
     );
     assert_eq!(sealed_again["result"]["receipt"], seal["receipt"]);
 
@@ -431,8 +427,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         alice_root,
         alice_ctx,
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &a,
             "--summary",
@@ -449,26 +445,26 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     committed(&cli(
         alice_root,
         alice_ctx,
-        &["testament", "post", &testament, "--claim", &a],
+        &["post", "testament", &testament, "--claim", &a],
     ));
     committed(&cli(
         root,
         None,
-        &["testament", "receive", &testament, "--claim", &a],
+        &["receive", "testament", &testament, "--claim", &a],
     ));
     // Explicit whole-work entry closes the increment cohort; the slot check
     // is then begun and reported without naming a phase.
     committed(&cli(
         root,
         None,
-        &["validation", "enter-whole-work", &testament, "--claim", &a],
+        &["enter", "whole-work", &testament, "--claim", &a],
     ));
     committed(&cli(
         root,
         None,
         &[
-            "validation",
             "begin",
+            "validation",
             "--claim",
             &a,
             "--validation",
@@ -479,8 +475,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "validation",
             "report",
+            "verdict",
             "--claim",
             &a,
             "--validation",
@@ -556,13 +552,13 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
 
     // The terminal claim releases its owned scope once; the audit is
     // generated from the accepted results and posted by the issuer.
-    committed(&cli(root, None, &["claim", "release-scope", &a]));
+    committed(&cli(root, None, &["release", "scope", &a]));
     assert_eq!(claim_object(root, &a)["released"], true);
-    let (code, _) = refused(root, None, &["claim", "release-scope", &a]);
+    let (code, _) = refused(root, None, &["release", "scope", &a]);
     assert_eq!(code, 5);
-    let (_, result) = committed(&cli(root, None, &["audit", "generate", "--claim", &a]));
+    let (_, result) = committed(&cli(root, None, &["generate", "audit", "--claim", &a]));
     let audit = created(&result, "ResultTestament").remove(0);
-    let (audit_post_id, audit_post) = committed(&cli(root, None, &["audit", "post", &audit]));
+    let (audit_post_id, audit_post) = committed(&cli(root, None, &["post", "audit", &audit]));
     let page = cli(root, None, &["get", "testament", &audit]);
     let posted = objects(&page)
         .iter()
@@ -584,14 +580,14 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let b = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &b]));
-    committed(&cli(alice_root, alice_ctx, &["receipt", "acquire", &b]));
+    committed(&cli(root, None, &["post", "claim", &b]));
+    committed(&cli(alice_root, alice_ctx, &["acquire", "receipt", &b]));
     let (_, result) = committed(&cli(
         alice_root,
         alice_ctx,
         &[
-            "artifact",
             "submit",
+            "artifact",
             "--claim",
             &b,
             "--slot",
@@ -609,7 +605,7 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "artifact", "reject", &bad, "--claim", &b, "--reason", "work", "--text", ERROR,
+            "reject", "artifact", &bad, "--claim", &b, "--reason", "work", "--text", ERROR,
         ],
     );
     assert_eq!(code, 2);
@@ -617,8 +613,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "artifact",
             "reject",
+            "artifact",
             &bad,
             "--claim",
             &b,
@@ -646,7 +642,7 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         alice_root,
         alice_ctx,
         &[
-            "artifact",
+            "submit",
             "diagnostic",
             "--claim",
             &b,
@@ -661,8 +657,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         alice_root,
         alice_ctx,
         &[
-            "artifact",
             "fail",
+            "slot",
             "--claim",
             &b,
             "--slot",
@@ -676,7 +672,7 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         alice_root,
         alice_ctx,
         &[
-            "artifact",
+            "submit",
             "diagnostic",
             "--claim",
             &b,
@@ -692,8 +688,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         alice_root,
         alice_ctx,
         &[
-            "artifact",
             "fail",
+            "slot",
             "--claim",
             &b,
             "--slot",
@@ -718,7 +714,7 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     let (_, result) = committed(&cli(
         root,
         None,
-        &["receipt", "adopt", &b, "--holder", "self"],
+        &["adopt", "receipt", &b, "--holder", "self"],
     ));
     assert_eq!(created(&result, "Receipt").len(), 1);
     let after = claim_object(root, &b);
@@ -730,8 +726,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         alice_root,
         alice_ctx,
         &[
-            "testament",
             "submit",
+            "testament",
             "--claim",
             &b,
             "--summary",
@@ -756,13 +752,13 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let c = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &c]));
+    committed(&cli(root, None, &["post", "claim", &c]));
     let (_, result) = committed(&cli(
         root,
         None,
         &[
-            "monitor",
             "register",
+            "monitor",
             "--owner",
             &c,
             "--root",
@@ -798,8 +794,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "monitor",
             "rebind",
+            "monitor",
             &monitor,
             "--owner",
             &c,
@@ -814,8 +810,8 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         root,
         None,
         &[
-            "monitor",
             "rebind",
+            "monitor",
             &monitor,
             "--owner",
             &c,
@@ -833,20 +829,20 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     );
     // Only a terminal claim's remaining wait can be disposed of explicitly;
     // cancelling the claim keeps the monitor until the issuer cancels it.
-    let (code, _) = refused(root, None, &["monitor", "cancel", &monitor, "--owner", &c]);
+    let (code, _) = refused(root, None, &["cancel", "monitor", &monitor, "--owner", &c]);
     assert_eq!(code, 5);
-    committed(&cli(root, None, &["claim", "cancel", &c]));
+    committed(&cli(root, None, &["cancel", "claim", &c]));
     committed(&cli(
         root,
         None,
-        &["monitor", "cancel", &monitor, "--owner", &c],
+        &["cancel", "monitor", &monitor, "--owner", &c],
     ));
     let monitors_before = list(root, None, &["monitors", "--claim", &c]);
     assert!(
         !monitors_before[0]["Monitor"]["disposition"].is_null(),
         "{monitors_before:?}"
     );
-    let (code, _) = refused(root, None, &["monitor", "cancel", &monitor, "--owner", &c]);
+    let (code, _) = refused(root, None, &["cancel", "monitor", &monitor, "--owner", &c]);
     assert_ne!(code, 0);
 
     // ---- Claim E: the trusted deadline timers fire from the node's clock ----
@@ -867,14 +863,14 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let e = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &e]));
+    committed(&cli(root, None, &["post", "claim", &e]));
     // A monitor on the live claim with a deadline of its own.
     let (_, result) = committed(&cli(
         root,
         None,
         &[
-            "monitor",
             "register",
+            "monitor",
             "--owner",
             &e,
             "--root",
@@ -918,9 +914,9 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     );
     // The expiry is a terminal fact: a later post is refused as stale and a
     // cancellation, whatever it records, never rewrites the status.
-    let (code, _) = refused(root, None, &["claim", "post", &e]);
+    let (code, _) = refused(root, None, &["post", "claim", &e]);
     assert_eq!(code, 5);
-    let _ = run(root, None, &["claim", "cancel", &e, "--format", "json"]);
+    let _ = run(root, None, &["cancel", "claim", &e, "--format", "json"]);
     assert_eq!(claim_object(root, &e)["status"], 16);
 
     // ---- Kill and restart: everything above is durable and retries hold ----
@@ -939,10 +935,10 @@ fn the_remaining_native_verbs_run_through_the_binary_and_survive_a_kill() {
     let retried = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &audit_post_id],
+        &["retry", "request", "--operation-id", &audit_post_id],
     );
     assert_eq!(retried["result"]["receipt"], audit_post["receipt"]);
-    let (code, _) = refused(root, None, &["audit", "post", &audit]);
+    let (code, _) = refused(root, None, &["post", "audit", &audit]);
     assert_eq!(code, 5);
     drop(server);
 }

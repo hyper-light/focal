@@ -10,7 +10,7 @@
 )]
 //! The second product gate on the native engine through the MCP adapter:
 //! failed respondent work and an evaluator that fails to execute remain
-//! distinct, inspectable evidence through two `mcp serve` processes, across
+//! distinct, inspectable evidence through two `serve mcp` processes, across
 //! an adapter lost before its reply was consumed and a killed and restarted
 //! node (REMAINING §9 A2).
 use serde_json::{Value, json};
@@ -44,6 +44,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -99,7 +100,7 @@ fn admin(root: &Path, context: Option<&str>, args: &[&str]) -> Value {
     })
 }
 
-/// One `mcp serve` process on the modern profile for one participant.
+/// One `serve mcp` process on the modern profile for one participant.
 struct Mcp {
     _process: Server,
     input: ChildStdin,
@@ -114,7 +115,7 @@ impl Mcp {
             command.args(["--client-context", context]);
         }
         let mut child = command
-            .args(["mcp", "serve"])
+            .args(["serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -288,7 +289,7 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_m
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -297,9 +298,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_m
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -310,8 +310,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_m
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -628,8 +628,8 @@ fn failed_work_and_evaluator_errors_stay_distinct_inspectable_evidence_through_m
         root,
         None,
         &[
-            "request",
             "inspect",
+            "request",
             "--operation-id",
             &error_id,
             "--remote",

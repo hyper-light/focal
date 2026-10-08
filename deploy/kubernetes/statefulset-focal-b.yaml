@@ -46,7 +46,7 @@ spec:
         - name: prepare-volume
           image: focal:0.1.0
           command: ["/focal"]
-          args: ["--data-dir", "/var/lib/focal", "prepare-volume", "--owner", "65532:65532"]
+          args: ["--data-dir", "/var/lib/focal", "prepare", "volume", "--owner", "65532:65532"]
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
@@ -68,6 +68,7 @@ spec:
             - "--data-dir"
             - "/var/lib/focal"
             - "start"
+            - "node"
             - "--listen"
             - "0.0.0.0:7443"
             - "--advertise"
@@ -100,17 +101,17 @@ spec:
               memory: 2Gi
           startupProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "inspect", "node", "--probe", "alive"]
             periodSeconds: 5
             failureThreshold: 60
           livenessProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "inspect", "node", "--probe", "alive"]
             periodSeconds: 10
             failureThreshold: 6
           readinessProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "serving"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "inspect", "node", "--probe", "serving"]
             periodSeconds: 5
             failureThreshold: 3
           volumeMounts:

@@ -33,7 +33,7 @@ fn start(root: &Path) -> Server {
     let mut process = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root)
-        .arg("start")
+        .args(["start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -132,14 +132,14 @@ fn authored_workflow(failed: bool) {
         root.path(),
         &["submit", "claim", "--json", &claim.to_string()],
     );
-    let contracts = cli(root.path(), &["validator", "list", "--claim", &claim_id]);
+    let contracts = cli(root.path(), &["list", "validators", "--claim", &claim_id]);
     assert_eq!(contracts["execution"], "participant_owned");
     assert_eq!(contracts["page"]["objects"].as_array().unwrap().len(), 1);
     let inspected = cli(
         root.path(),
         &[
-            "validator",
             "get",
+            "validator",
             &handler_id,
             "--version",
             &version,
@@ -151,8 +151,8 @@ fn authored_workflow(failed: bool) {
     let absent = cli(
         root.path(),
         &[
-            "validator",
             "get",
+            "validator",
             &handler_id,
             "--version",
             &"44".repeat(32),
@@ -161,8 +161,8 @@ fn authored_workflow(failed: bool) {
     assert!(absent["page"]["objects"].as_array().unwrap().is_empty());
     let graph_root = format!("claim:{claim_id}");
     let graph_args = [
-        "ledger",
         "traverse",
+        "ledger",
         &graph_root,
         "--edge",
         "requirement",
@@ -174,7 +174,7 @@ fn authored_workflow(failed: bool) {
     let first = cli(root.path(), &graph_args);
     assert_eq!(first["stop"], "PageLimit");
     assert_eq!(first["results"].as_array().unwrap().len(), 1);
-    cli(root.path(), &["claim", "post", &claim_id]);
+    cli(root.path(), &["post", "claim", &claim_id]);
     let mut graph_cursor = first["cursor"].as_str().unwrap().to_owned();
     let mut graph_count = 1;
     for _ in 0..8 {
@@ -197,14 +197,14 @@ fn authored_workflow(failed: bool) {
         }
     }
     assert_eq!(graph_count, 3);
-    let received = cli(root.path(), &["receipt", "acquire", &claim_id]);
+    let received = cli(root.path(), &["acquire", "receipt", &claim_id]);
     assert!(context(root.path(), &validation_id).testament.is_none());
     let receipt = received["result"]["receipt"].as_str().unwrap();
     let opened = cli(
         root.path(),
         &[
-            "evidence",
             "begin",
+            "evidence",
             "--claim",
             &claim_id,
             "--receipt",
@@ -289,9 +289,9 @@ fn authored_workflow(failed: bool) {
     );
     cli(
         root.path(),
-        &["testament", "receive", testament, "--claim", &claim_id],
+        &["receive", "testament", testament, "--claim", &claim_id],
     );
-    cli(root.path(), &["validation", "begin", "--claim", &claim_id]);
+    cli(root.path(), &["begin", "validation", "--claim", &claim_id]);
     let before = context(root.path(), &validation_id);
     assert_eq!(before.claim.lifecycle().status, ClaimStatus::Validating);
     let run = before
@@ -313,8 +313,8 @@ fn authored_workflow(failed: bool) {
     let proof = cli(
         root.path(),
         &[
-            "artifact",
             "register",
+            "artifact",
             "--kind",
             "test-report",
             "--schema-hash",
@@ -364,7 +364,7 @@ fn authored_workflow(failed: bool) {
     );
     cli(
         root.path(),
-        &["validation", "complete", "--claim", &claim_id],
+        &["complete", "validation", "--claim", &claim_id],
     );
     let completed = context(root.path(), &validation_id);
     assert_eq!(completed.claim.lifecycle().status, expected_status);
@@ -385,8 +385,8 @@ fn authored_workflow(failed: bool) {
     cli(
         root.path(),
         &[
-            "claim",
             "supersede",
+            "claim",
             &claim_id,
             "--json",
             &successor.to_string(),

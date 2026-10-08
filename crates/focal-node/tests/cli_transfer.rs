@@ -32,7 +32,7 @@ fn start(root: &Path) -> Process {
         Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
             .arg(root)
-            .arg("start")
+            .args(["start", "node"])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -83,16 +83,16 @@ fn setup(root: &Path) -> (String, String, String) {
     let claim = id(100);
     let document = json!({"id":claim,"target":"self","action":"handoff","description":"Durable large evidence","validations":[{"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive result","evaluator":"self"}]});
     cli(root, &["submit", "claim", "--json", &document.to_string()]);
-    cli(root, &["claim", "post", &claim]);
-    let receipt = cli(root, &["receipt", "acquire", &claim])["result"]["receipt"]
+    cli(root, &["post", "claim", &claim]);
+    let receipt = cli(root, &["acquire", "receipt", &claim])["result"]["receipt"]
         .as_str()
         .unwrap()
         .to_owned();
     let set = cli(
         root,
         &[
-            "evidence",
             "begin",
+            "evidence",
             "--claim",
             &claim,
             "--receipt",
@@ -117,7 +117,7 @@ fn large_cli_file_stays_owned_after_failure_and_retry_uploads_attaches_downloads
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let server = start(root.path());
     let (claim, receipt, set) = setup(root.path());
-    let operation = cli(root.path(), &["request", "reserve"])["operation_id"]
+    let operation = cli(root.path(), &["reserve", "request"])["operation_id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -168,7 +168,7 @@ fn large_cli_file_stays_owned_after_failure_and_retry_uploads_attaches_downloads
     let _server = start(root.path());
     let committed = cli(
         root.path(),
-        &["request", "retry", "--operation-id", &operation],
+        &["retry", "request", "--operation-id", &operation],
     );
     assert_eq!(committed["condition"], "Committed");
     assert_eq!(committed["operation_id"], operation);
@@ -257,7 +257,7 @@ fn independent_large_registration_retries_owned_bytes_in_managed_and_legacy_cont
                 .unwrap()
                 .to_owned()
         } else {
-            cli(root.path(), &["request", "reserve"])["operation_id"]
+            cli(root.path(), &["reserve", "request"])["operation_id"]
                 .as_str()
                 .unwrap()
                 .to_owned()
@@ -276,8 +276,8 @@ fn independent_large_registration_retries_owned_bytes_in_managed_and_legacy_cont
         let result = run(
             root.path(),
             &[
-                "artifact",
                 "register",
+                "artifact",
                 "--kind",
                 "test-report",
                 "--schema-hash",
@@ -307,11 +307,11 @@ fn independent_large_registration_retries_owned_bytes_in_managed_and_legacy_cont
         std::fs::remove_file(&source).unwrap();
         let _server = start(root.path());
         let committed = if legacy {
-            cli(root.path(), &["request", "retry", &operation])
+            cli(root.path(), &["retry", "request", &operation])
         } else {
             cli(
                 root.path(),
-                &["request", "retry", "--operation-id", &operation],
+                &["retry", "request", "--operation-id", &operation],
             )
         };
         if legacy {
@@ -357,7 +357,7 @@ impl Mcp {
             Command::new(env!("CARGO_BIN_EXE_focal"))
                 .arg("--data-dir")
                 .arg(root)
-                .args(["mcp", "serve"])
+                .args(["serve", "mcp"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())

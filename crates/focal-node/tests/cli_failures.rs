@@ -19,7 +19,7 @@ fn closed_stdout_returns_an_io_error_without_panicking() {
     drop(reader);
     let output: OwnedFd = output.into();
     let result = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["deployment", "schema"])
+        .args(["get", "deployment-schema"])
         .stdout(output)
         .output()
         .unwrap();
@@ -103,7 +103,7 @@ fn deployment_unmet_guarantee_has_distinct_exit_and_no_activation() {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--config")
         .arg(config)
-        .args(["deployment", "explain"])
+        .args(["explain", "deployment"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(9));
@@ -115,7 +115,7 @@ fn deployment_unmet_guarantee_has_distinct_exit_and_no_activation() {
 
 /// Configuration ownership (doc 08 §2): an unknown key fails by its full
 /// path, a committed policy is not changed by a later start and the
-/// refusal names the field, and `deployment explain` names every value's
+/// refusal names the field, and `explain deployment` names every value's
 /// source with the committed revision.
 #[test]
 fn committed_policy_and_unknown_keys_are_refused_by_name() {
@@ -128,7 +128,7 @@ fn committed_policy_and_unknown_keys_are_refused_by_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--config", unknown.to_str().unwrap(), "--data-dir"])
         .arg(&data)
-        .args(["identity"])
+        .args(["inspect", "identity"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2), "{output:?}");
@@ -138,14 +138,14 @@ fn committed_policy_and_unknown_keys_are_refused_by_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(&data)
-        .args(["demo"])
+        .args(["run", "demo"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let explained = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(&data)
-        .args(["deployment", "explain"])
+        .args(["explain", "deployment"])
         .output()
         .unwrap();
     assert!(explained.status.success(), "{explained:?}");
@@ -167,13 +167,13 @@ fn committed_policy_and_unknown_keys_are_refused_by_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--config", changed.to_str().unwrap(), "--data-dir"])
         .arg(&data)
-        .args(["demo"])
+        .args(["run", "demo"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("durability.max_failures"), "{stderr}");
-    assert!(stderr.contains("deployment plan"), "{stderr}");
+    assert!(stderr.contains("plan deployment"), "{stderr}");
     assert_eq!(std::fs::read(data.join("POLICY")).unwrap(), pinned);
     // Restating the committed value is not a change.
     let same = root.path().join("same.yaml");
@@ -181,7 +181,7 @@ fn committed_policy_and_unknown_keys_are_refused_by_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--config", same.to_str().unwrap(), "--data-dir"])
         .arg(&data)
-        .args(["identity"])
+        .args(["inspect", "identity"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");

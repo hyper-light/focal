@@ -11,7 +11,7 @@
     )
 )]
 //! `focal-load` drives a [`shape::WorkloadShape`] against a node — an
-//! `EmbeddedNode` in this process, or a running `focal start` node over its
+//! `EmbeddedNode` in this process, or a running `focal start node` node over its
 //! Unix socket — from one or more concurrent callers, and writes a
 //! [`report::Report`]. It is the R11 §5 workload generator; the nightly
 //! campaign and the capacity envelope are refreshed from its output. A

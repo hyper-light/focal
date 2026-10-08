@@ -2,7 +2,7 @@
 The node configuration a set ships: its first-start seed — the set's zone and
 single-node durability, the only first start a lone node can satisfy. The
 requested policy is "focal.target" (mounted as /etc/focal-target/target.yaml
-for `deployment plan`); the committed policy carries every restart (08 §2).
+for `plan deployment`); the committed policy carries every restart (08 §2).
 */}}
 {{- define "focal.config" -}}
 version: 1
@@ -98,7 +98,7 @@ spec:
         - name: prepare-volume
           image: {{ .root.Values.image }}
           command: ["/focal"]
-          args: ["--data-dir", "/var/lib/focal", "prepare-volume", "--owner", "65532:65532"]
+          args: ["--data-dir", "/var/lib/focal", "prepare", "volume", "--owner", "65532:65532"]
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
@@ -120,6 +120,7 @@ spec:
             - "--data-dir"
             - "/var/lib/focal"
             - "start"
+            - "node"
             - "--listen"
             - "0.0.0.0:{{ .root.Values.port }}"
             - "--advertise"
@@ -150,17 +151,17 @@ spec:
 {{ toYaml .root.Values.resources | indent 12 }}
           startupProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "inspect", "node", "--probe", "alive"]
             periodSeconds: 5
             failureThreshold: 60
           livenessProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "alive"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "inspect", "node", "--probe", "alive"]
             periodSeconds: 10
             failureThreshold: 6
           readinessProbe:
             exec:
-              command: ["/focal", "--data-dir", "/var/lib/focal", "diagnose", "node", "--probe", "serving"]
+              command: ["/focal", "--data-dir", "/var/lib/focal", "inspect", "node", "--probe", "serving"]
             periodSeconds: 5
             failureThreshold: 3
           volumeMounts:

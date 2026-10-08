@@ -31,12 +31,8 @@ fn the_documented_native_quickstart_runs_verbatim() {
     let node = Node::new("quickstart");
     activate_native(&node);
     let _server = start(&node, &[]);
-    // `focal schema example claim.submit --native > claim.json`
-    let example = run(
-        &node,
-        None,
-        &["schema", "example", "claim.submit", "--native"],
-    );
+    // `focal get example claim.submit --native > claim.json`
+    let example = run(&node, None, &["get", "example", "claim.submit", "--native"]);
     assert!(
         example.status.success(),
         "{}",
@@ -79,8 +75,8 @@ fn the_documented_native_quickstart_runs_verbatim() {
         .trim()
         .to_owned();
     assert_eq!(claim.len(), 32, "{text}");
-    // `focal claim post <CLAIM>`
-    let posted = run(&node, None, &["claim", "post", &claim]);
+    // `focal post claim <CLAIM>`
+    let posted = run(&node, None, &["post", "claim", &claim]);
     let text = String::from_utf8_lossy(&posted.stdout).into_owned();
     assert!(
         posted.status.success(),
@@ -102,8 +98,8 @@ fn the_documented_native_quickstart_runs_verbatim() {
         &node,
         None,
         &[
-            "schema",
             "validate",
+            "document",
             "claim.submit",
             "--file",
             claim_file.to_str().unwrap(),
@@ -121,15 +117,15 @@ fn the_documented_native_quickstart_runs_verbatim() {
     );
     // The V1 example is refused by the native ledger, by the field its
     // contract lacks: no silent fallback to the other engine.
-    let v1 = run(&node, None, &["schema", "example", "claim.submit"]);
+    let v1 = run(&node, None, &["get", "example", "claim.submit"]);
     let v1_file = node.root().join("v1.json");
     std::fs::write(&v1_file, &v1.stdout).unwrap();
     let refused = run(
         &node,
         None,
         &[
-            "schema",
             "validate",
+            "document",
             "claim.submit",
             "--file",
             v1_file.to_str().unwrap(),

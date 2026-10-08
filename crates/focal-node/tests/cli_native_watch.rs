@@ -44,6 +44,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -162,8 +163,20 @@ fn handler(id: u128) -> Value {
 }
 /// One `focal watch` invocation printing JSON deliveries, one per line.
 fn watch(root: &Path, context: Option<&str>, args: &[&str]) -> Vec<Value> {
-    let mut full = vec!["watch"];
-    full.extend_from_slice(args);
+    // `resume watch NAME` and `inspect watch NAME` act on a saved watch; every
+    // other call watches a family (`watch claims`).
+    let mut full = match args {
+        [verb @ ("resume" | "inspect"), rest @ ..] => {
+            let mut full = vec![*verb, "watch"];
+            full.extend_from_slice(rest);
+            full
+        }
+        _ => {
+            let mut full = vec!["watch"];
+            full.extend_from_slice(args);
+            full
+        }
+    };
     full.extend(["--format", "json"]);
     let output = run(root, context, &full);
     assert!(
@@ -213,20 +226,19 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let status = admin(root, None, &["status"]);
+    let status = admin(root, None, &["inspect", "prefix"]);
     let issuer = hex_hash(&objects(&status)[0]["Standing"]["principal"]);
     let invitation = client.path().join("alice.invite");
     admin(
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -238,8 +250,8 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -250,7 +262,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
     );
     let alice_root = client.path();
     let alice_ctx = Some("alice");
-    let alice_standing = admin(alice_root, alice_ctx, &["status"]);
+    let alice_standing = admin(alice_root, alice_ctx, &["inspect", "prefix"]);
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
     assert_ne!(alice, issuer);
 
@@ -275,8 +287,8 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let a = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &a]));
-    committed(&cli(alice_root, alice_ctx, &["receipt", "acquire", &a]));
+    committed(&cli(root, None, &["post", "claim", &a]));
+    committed(&cli(alice_root, alice_ctx, &["acquire", "receipt", &a]));
     let page = cli(root, None, &["get", "claim", &a]);
     assert_eq!(objects(&page)[0]["Claim"]["status"], RECEIVED, "{page}");
 
@@ -307,14 +319,14 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
     assert_eq!(claim["status"], RECEIVED, "{claim}");
     assert!(claim["content"].is_object(), "{claim}");
     assert!(claim["scopes"].is_object(), "{claim}");
-    let inspected = cli(root, None, &["watch", "inspect", "seeded"]);
+    let inspected = cli(root, None, &["inspect", "watch", "seeded"]);
     assert_eq!(inspected["status"]["acknowledged"], 1, "{inspected}");
     assert_eq!(inspected["status"]["seeding"], true, "{inspected}");
     assert_eq!(inspected["status"]["options"]["engine"], "Native");
 
     // A record committed after the snapshot arrives on the tail as a
     // schema-2 delta carrying the exact native fact.
-    committed(&cli(root, None, &["claim", "cancel", &a]));
+    committed(&cli(root, None, &["cancel", "claim", &a]));
     let tail = watch(root, None, &["resume", "seeded", "--pages", "3"]);
     let cancelled: Vec<Value> = tail
         .iter()
@@ -337,7 +349,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
             .all(|delta| native_claim_kind(&delta) != Some("Created")),
         "{tail:?}"
     );
-    let inspected = cli(root, None, &["watch", "inspect", "seeded"]);
+    let inspected = cli(root, None, &["inspect", "watch", "seeded"]);
     assert_eq!(inspected["status"]["seeding"], false, "{inspected}");
 
     // An unseeded watch of everything replays the whole native history from
@@ -346,7 +358,14 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
     let everything = watch(
         root,
         None,
-        &["all", "--name", "everything", "--no-seed", "--pages", "1"],
+        &[
+            "everything",
+            "--name",
+            "everything",
+            "--no-seed",
+            "--pages",
+            "1",
+        ],
     );
     assert_eq!(everything.len(), 1);
     let history = deltas(&everything[0]);
@@ -432,7 +451,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
     let table = run(
         root,
         None,
-        &["watch", "resume", "everything", "--pages", "1"],
+        &["resume", "watch", "everything", "--pages", "1"],
     );
     assert!(
         table.status.success(),
@@ -453,7 +472,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
         root,
         None,
         &[
-            "all",
+            "everything",
             "--name",
             "everything-again",
             "--no-seed",
@@ -462,7 +481,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas() {
         ],
     );
     assert_eq!(deltas(&again[0]), history);
-    let inspected = cli(root, None, &["watch", "inspect"]);
+    let inspected = cli(root, None, &["inspect", "watch"]);
     let mut names: Vec<&str> = inspected["names"]
         .as_array()
         .unwrap()

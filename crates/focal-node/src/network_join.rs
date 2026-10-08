@@ -242,7 +242,7 @@ impl NodeInvitation {
         value.validate_role(role)?;
         Ok(value)
     }
-    /// Read an invitation the operator delivered: a file `cluster invite`
+    /// Read an invitation the operator delivered: a file `invite node`
     /// wrote (mode 0600), or one a packaged secret mounted (24 §24) — a
     /// symbolic link to a regular file owned by another user, readable by
     /// this process's group and by nobody else, writable by its owner alone.

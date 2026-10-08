@@ -3,7 +3,7 @@
 //! runtime, so they are N independent callers as N processes would be —
 //! submit native claim creations, then linearizable claim reads, over the
 //! real `focal_client::Client` path: against an `EmbeddedNode` opened in this
-//! process (the embedded transport), or against a running `focal start` node
+//! process (the embedded transport), or against a running `focal start node` node
 //! over its Unix socket. Every request is timed from send to reply. In
 //! embedded mode `reopen: true` then closes the node, reopens its directory
 //! and times that to the first linearizable read: single-node recovery at

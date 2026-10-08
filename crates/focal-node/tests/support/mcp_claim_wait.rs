@@ -29,8 +29,8 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
         let out = cli(
             root.path(),
             &[
-                "claim",
                 "wait",
+                "claim",
                 &id(100),
                 "--until",
                 "satisfied",
@@ -67,8 +67,8 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
     let out = cli(
         root.path(),
         &[
-            "claim",
             "wait",
+            "claim",
             "--yaml",
             &format!("claim: '{}'\nuntil: terminal\ntimeout_ms: 250\n", id(100)),
             "--format",
@@ -85,8 +85,8 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
         .arg("--data-dir")
         .arg(root.path())
         .args([
-            "claim",
             "wait",
+            "claim",
             &id(100),
             "--until",
             "terminal",
@@ -175,8 +175,8 @@ fn claim_wait_cancellation_stops_observation_and_mcp_remains_responsive() {
         .arg("--data-dir")
         .arg(root.path())
         .args([
-            "claim",
             "wait",
+            "claim",
             &id(100),
             "--until",
             "satisfied",

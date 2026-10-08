@@ -40,7 +40,7 @@ impl Drop for Server {
 /// (`progress`). None while the node does not answer.
 fn root_periods(root: &Path) -> impl Fn() -> Option<u64> + '_ {
     move || {
-        let output = command(root, &["diagnose", "node", "--metrics"]);
+        let output = command(root, &["inspect", "node", "--metrics"]);
         if !output.status.success() {
             return None;
         }
@@ -70,7 +70,7 @@ fn address() -> String {
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
         command.args(["--advertise", address]);
     }
@@ -152,11 +152,11 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     let peer_address = address();
     let (server, status) = start(founder.path(), Some(&founder_address));
     assert_eq!(status["condition"], "Ready");
-    let (identity, _) = success(founder.path(), &["identity"]);
+    let (identity, _) = success(founder.path(), &["inspect", "identity"]);
     let invitation = founder.path().join("worker-2.invite");
     let args = [
-        "cluster",
         "invite",
+        "node",
         "--node",
         "worker-2",
         "--output",
@@ -181,8 +181,8 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     let refused = command(
         founder.path(),
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             "worker-2",
             "--output",
@@ -194,6 +194,7 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     assert_eq!(std::fs::read(&occupied).unwrap(), b"existing private file");
     let join_args = [
         "join",
+        "cluster",
         "--invite-file",
         invitation.to_str().unwrap(),
         "--advertise",
@@ -219,6 +220,7 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
         peer.path(),
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -230,32 +232,35 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     drop(server); // crash instead of invoking a shutdown callback
     let (_server, status) = start(founder.path(), None);
     assert_eq!(status["condition"], "Ready");
-    assert_eq!(success(founder.path(), &["identity"]).0, identity);
+    assert_eq!(
+        success(founder.path(), &["inspect", "identity"]).0,
+        identity
+    );
     let (_, retry_output) = success(founder.path(), &args);
     assert_redacted(&retry_output, &token);
     assert_eq!(std::fs::read(&invitation).unwrap(), original);
     let (peer_server, _) = start(peer.path(), None);
-    assert_eq!(success(peer.path(), &["identity"]).0, joined);
+    assert_eq!(success(peer.path(), &["inspect", "identity"]).0, joined);
     // Every physical owner has local diagnostics. Sharing domain IDs must never
     // grant the founder's Runtime identity or invitation-signing authority.
     let forged = json!({"protocol":1,"ledger":identity["ledger"],"route_epoch":1,"request_epoch":1,"request_id":vec![41;16],"operation":{"Submit":{"expected_revision":null,"command":{"NegotiateEpoch":{"epoch":1}}}}});
     let file = peer.path().join("forged-runtime.json");
     std::fs::write(&file, serde_json::to_vec(&forged).unwrap()).unwrap();
     assert!(
-        !command(peer.path(), &["request", file.to_str().unwrap()])
+        !command(peer.path(), &["send", "request", file.to_str().unwrap()])
             .status
             .success()
     );
     assert!(peer.path().join("focal-admin.sock").exists());
     assert_eq!(
-        success(peer.path(), &["diagnose", "node", "--identity"]).0["result"]["identity"]["node"],
+        success(peer.path(), &["inspect", "node", "--identity"]).0["result"]["identity"]["node"],
         joined["node"]
     );
     let refused = command(
         peer.path(),
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             "forged",
             "--output",
@@ -267,7 +272,7 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     assert!(!peer.path().join("forged.invite").exists());
     drop(peer_server);
     let (_peer_server, _) = start(peer.path(), None);
-    assert_eq!(success(peer.path(), &["identity"]).0, joined);
+    assert_eq!(success(peer.path(), &["inspect", "identity"]).0, joined);
 }
 
 #[test]
@@ -277,9 +282,12 @@ fn network_cli_refuses_unsafe_or_incomplete_input_without_initializing_a_local_r
         .tempdir_in("/tmp")
         .unwrap();
     assert!(
-        !command(root.path(), &["start", "--listen", "127.0.0.1:7443"])
-            .status
-            .success()
+        !command(
+            root.path(),
+            &["start", "node", "--listen", "127.0.0.1:7443"]
+        )
+        .status
+        .success()
     );
     assert!(!root.path().join("wal").exists());
     assert!(
@@ -287,6 +295,7 @@ fn network_cli_refuses_unsafe_or_incomplete_input_without_initializing_a_local_r
             root.path(),
             &[
                 "join",
+                "cluster",
                 "--invite-file",
                 "missing",
                 "--advertise",
@@ -300,9 +309,7 @@ fn network_cli_refuses_unsafe_or_incomplete_input_without_initializing_a_local_r
     assert!(
         !command(
             root.path(),
-            &[
-                "cluster", "invite", "--node", "bad name", "--output", "unused"
-            ]
+            &["invite", "node", "--node", "bad name", "--output", "unused"]
         )
         .status
         .success()

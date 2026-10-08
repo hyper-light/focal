@@ -68,7 +68,6 @@ fn the_checked_in_kubernetes_manifests_are_the_renderer_output() {
         &[
             "--config",
             config.to_str().unwrap(),
-            "deployment",
             "render",
             "kubernetes",
             "--namespace",
@@ -107,7 +106,7 @@ fn the_checked_in_kubernetes_manifests_are_the_renderer_output() {
         "kind: Service",
         "kind: PodDisruptionBudget",
         "kind: ConfigMap",
-        "prepare-volume",
+        "\"prepare\", \"volume\"",
         "\"--invite-file\"",
         "publishNotReadyAddresses: true",
         "\"--probe\", \"alive\"",
@@ -121,7 +120,6 @@ fn the_checked_in_kubernetes_manifests_are_the_renderer_output() {
         .args([
             "--config",
             config.to_str().unwrap(),
-            "deployment",
             "render",
             "kubernetes",
             "--namespace",
@@ -184,7 +182,6 @@ fn the_checked_in_unit_is_the_renderer_output_and_the_image_pins_the_release_too
         &[
             "--config",
             config.to_str().unwrap(),
-            "deployment",
             "render",
             "systemd",
             "--invite-file",

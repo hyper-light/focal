@@ -190,7 +190,7 @@ impl PendingClientJoin {
     }
     /// Resume a completed enrollment for reading beside other processes of
     /// the same participant. An enrollment that still needs a write is
-    /// reported pending; it is completed by `context enroll`, which owns the
+    /// reported pending; it is completed by `enroll context`, which owns the
     /// directory exclusively.
     pub fn resume_shared(path: impl AsRef<Path>) -> Result<Self, JoinError> {
         Self::build(path.as_ref(), None, true)

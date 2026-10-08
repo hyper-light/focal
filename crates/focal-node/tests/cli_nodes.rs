@@ -71,7 +71,7 @@ fn address() -> String {
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
-    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
         command.args(["--advertise", address]);
     }
@@ -118,7 +118,7 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     (server, status)
 }
 fn placement(root: &Path) -> Option<Value> {
-    let output = command(root, &["cluster", "placement"]);
+    let output = command(root, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -182,8 +182,8 @@ fn wait_for(
     let mut report = String::new();
     for observed in deadline::observed() {
         for read in [
-            ["diagnose", "node", "--health"],
-            ["diagnose", "node", "--metrics"],
+            ["inspect", "node", "--health"],
+            ["inspect", "node", "--metrics"],
         ] {
             let output = command(&observed, &read);
             report.push_str(&format!(
@@ -202,8 +202,8 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     let written = success(
         founder,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -215,6 +215,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         host,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -236,20 +237,20 @@ fn private_dir(name: &str) -> tempfile::TempDir {
 /// ready for it — a learner still catching up before its promotion, a
 /// change still committing, an outcome lost — within a bounded wait.
 fn partition_change(founder: &Path, verb: &str, partition: &str, node: u64) -> Value {
+    // The derived `cluster partitions VERB`, said as its action and thing.
+    let (action, thing) = match verb {
+        "add-learner" => ("add", "partition-learner"),
+        "promote" => ("promote", "partition-learner"),
+        "remove" => ("remove", "partition-member"),
+        "transfer" => ("transfer", "partition-leader"),
+        other => panic!("no partition change {other}"),
+    };
     let text = node.to_string();
     let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
     loop {
         let output = command(
             founder,
-            &[
-                "cluster",
-                "partitions",
-                verb,
-                "--partition",
-                partition,
-                "--node",
-                &text,
-            ],
+            &[action, thing, "--partition", partition, "--node", &text],
         );
         if output.status.success() {
             return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
@@ -263,12 +264,9 @@ fn partition_change(founder: &Path, verb: &str, partition: &str, node: u64) -> V
             "{verb} of {node}: {stderr}"
         );
         if !deadline.open() {
-            let health = command(founder, &["diagnose", "node", "--health"]);
-            let shown = command(
-                founder,
-                &["cluster", "partitions", "show", "--partition", partition],
-            );
-            let view = command(founder, &["cluster", "placement"]);
+            let health = command(founder, &["inspect", "node", "--health"]);
+            let shown = command(founder, &["inspect", "partition", "--partition", partition]);
+            let view = command(founder, &["inspect", "placement"]);
             panic!(
                 "{verb} of {node} stayed refused: {stderr}\nhealth: {}\nshown: {}\nplacement: {}",
                 String::from_utf8_lossy(&health.stdout),
@@ -282,10 +280,7 @@ fn partition_change(founder: &Path, verb: &str, partition: &str, node: u64) -> V
 /// The directory partition group's configuration as the founder's replica
 /// applied it.
 fn partition_shown(founder: &Path, partition: &str) -> Value {
-    success(
-        founder,
-        &["cluster", "partitions", "show", "--partition", partition],
-    )["result"]["configuration"]
+    success(founder, &["inspect", "partition", "--partition", partition])["result"]["configuration"]
         .clone()
 }
 /// Every listed node alive and reporting, and the session settled at
@@ -311,7 +306,9 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let addresses: Vec<String> = (0..5).map(|_| address()).collect();
     let (_founder_server, status) = start(founder, Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let founder_node = success(founder, &["identity"])["node"].as_u64().unwrap();
+    let founder_node = success(founder, &["inspect", "identity"])["node"]
+        .as_u64()
+        .unwrap();
     let node_a = join(founder, dirs[1].path(), "host-a", &addresses[1]);
     let node_b = join(founder, dirs[2].path(), "host-b", &addresses[2]);
     let node_c = join(founder, dirs[3].path(), "host-c", &addresses[3]);
@@ -359,9 +356,8 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let planned = plan_until_planned(
         founder,
         &[
-            "cluster",
-            "sessions",
             "plan",
+            "session",
             "--tenant",
             &tenant,
             "--session",
@@ -390,9 +386,8 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let handed = success(
         founder,
         &[
-            "cluster",
-            "partitions",
             "transfer",
+            "partition-leader",
             "--partition",
             &partition,
             "--node",
@@ -411,26 +406,19 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
 
     // The founder is never drained; a host that is still eligible is not
     // removed; unknown nodes are named.
-    let (code, report) = failure(
-        founder,
-        &["cluster", "nodes", "drain", "--node", &founder_text],
-    );
+    let (code, report) = failure(founder, &["drain", "node", "--node", &founder_text]);
     assert_eq!(code, 2, "{report}");
-    let (code, report) = failure(
-        founder,
-        &["cluster", "nodes", "remove", "--node", &drained_text],
-    );
+    let (code, report) = failure(founder, &["remove", "node", "--node", &drained_text]);
     assert_eq!(code, 5, "{report}");
     assert!(report.contains("[not_drained]"), "{report}");
-    let (code, report) = failure(founder, &["cluster", "nodes", "drain", "--node", "424242"]);
+    let (code, report) = failure(founder, &["drain", "node", "--node", "424242"]);
     assert_eq!(code, 4, "{report}");
     assert!(report.contains("[unknown_node]"), "{report}");
     let (code, report) = failure(
         founder,
         &[
-            "cluster",
-            "nodes",
             "replace",
+            "node",
             "--node",
             &drained_text,
             "--with",
@@ -442,11 +430,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
 
     // Drain one voter: its grant is re-issued ineligible at generation 2,
     // exactly once.
-    let result = success(
-        founder,
-        &["cluster", "nodes", "drain", "--node", &drained_text],
-    )["result"]
-        .clone();
+    let result = success(founder, &["drain", "node", "--node", &drained_text])["result"].clone();
     assert_eq!(result["kind"], "node_eligibility", "{result}");
     assert_eq!(result["node"], drained);
     assert_eq!(result["eligible"], false);
@@ -456,17 +440,14 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     // A remove that follows the drain at once is refused for the copies the
     // host still holds — never as "not drained": the committed grant is
     // ineligible even while the partition is still observing it.
-    let (code, report) = failure(
-        founder,
-        &["cluster", "nodes", "remove", "--node", &drained_text],
-    );
+    let (code, report) = failure(founder, &["remove", "node", "--node", &drained_text]);
     if code != 5 || !report.contains("[node_holding]") {
         // What each side saw of the drain: the founder's view, and the
         // drained host's own, which hosts a replica of the partition.
         let drained_dir = dirs[all.iter().position(|id| *id == drained).unwrap()].path();
-        let founder_view = command(founder, &["cluster", "placement"]);
-        let drained_view = command(drained_dir, &["cluster", "placement"]);
-        let drained_health = command(drained_dir, &["diagnose", "node", "--health"]);
+        let founder_view = command(founder, &["inspect", "placement"]);
+        let drained_view = command(drained_dir, &["inspect", "placement"]);
+        let drained_health = command(drained_dir, &["inspect", "node", "--health"]);
         panic!(
             "{report}\nfounder placement: {}\ndrained placement: {}\ndrained health: {}",
             String::from_utf8_lossy(&founder_view.stdout),
@@ -474,11 +455,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
             String::from_utf8_lossy(&drained_health.stdout),
         );
     }
-    let again = success(
-        founder,
-        &["cluster", "nodes", "drain", "--node", &drained_text],
-    )["result"]
-        .clone();
+    let again = success(founder, &["drain", "node", "--node", &drained_text])["result"].clone();
     assert_eq!(again["changed"], false, "{again}");
     assert_eq!(again["generation"], 2);
     assert_eq!(again["operation_id"], Value::Null);
@@ -529,7 +506,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let invitation = removed["invitation"].as_str().unwrap().to_owned();
     // The removed node's committed contact is gone: the bounded contact
     // table keeps no slot for a node that no longer exists.
-    let listed = success(founder, &["cluster", "nodes", "list"]);
+    let listed = success(founder, &["list", "nodes"]);
     assert!(
         !listed["result"]["nodes"]
             .as_array()
@@ -538,22 +515,18 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
             .any(|contact| contact["node"] == drained),
         "{listed}"
     );
-    let repeated = success(
-        founder,
-        &["cluster", "nodes", "remove", "--node", &drained_text],
-    )["result"]
-        .clone();
+    let repeated = success(founder, &["remove", "node", "--node", &drained_text])["result"].clone();
     assert_eq!(repeated["membership_removed"], false, "{repeated}");
     assert_eq!(repeated["partitions_vacated"], 0, "{repeated}");
     assert_eq!(repeated["revoked"], false);
     assert_eq!(repeated["contact_retired"], false, "{repeated}");
     assert_eq!(repeated["invitation"], invitation);
-    let inspected = success(founder, &["cluster", "invitations", "get", &invitation]);
+    let inspected = success(founder, &["get", "invitation", &invitation]);
     assert_eq!(
         inspected["result"]["entries"][0]["revoked"], true,
         "{inspected}"
     );
-    let configuration = success(founder, &["cluster", "membership", "show"])["result"].clone();
+    let configuration = success(founder, &["inspect", "membership"])["result"].clone();
     assert!(
         !ids(&configuration["configuration"]["voters"]).contains(&drained)
             && !ids(&configuration["configuration"]["learners"]).contains(&drained),
@@ -571,11 +544,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         .find(|id| **id != founder_node)
         .unwrap();
     let victim_text = victim.to_string();
-    let result = success(
-        founder,
-        &["cluster", "nodes", "drain", "--node", &victim_text],
-    )["result"]
-        .clone();
+    let result = success(founder, &["drain", "node", "--node", &victim_text])["result"].clone();
     assert_eq!(result["changed"], true, "{result}");
     assert_eq!(result["generation"], 2);
     wait_for(
@@ -590,10 +559,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let mut refused = None;
     while deadline.open() {
-        let (code, report) = failure(
-            founder,
-            &["cluster", "nodes", "remove", "--node", &victim_text],
-        );
+        let (code, report) = failure(founder, &["remove", "node", "--node", &victim_text]);
         assert_eq!(code, 5, "{report}");
         assert!(report.contains("[node_holding]"), "{report}");
         if let Some(view) = placement(founder)
@@ -613,11 +579,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert!(names(session(&refused).unwrap(), victim), "{refused}");
     // Undrain: the host is considered again and the placement heals back
     // to one tolerated loss.
-    let result = success(
-        founder,
-        &["cluster", "nodes", "undrain", "--node", &victim_text],
-    )["result"]
-        .clone();
+    let result = success(founder, &["undrain", "node", "--node", &victim_text])["result"].clone();
     assert_eq!(result["eligible"], true, "{result}");
     assert_eq!(result["changed"], true);
     assert_eq!(result["generation"], 3);
@@ -652,9 +614,8 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     let result = success(
         founder,
         &[
-            "cluster",
-            "nodes",
             "replace",
+            "node",
             "--node",
             &victim_text,
             "--with",
@@ -731,9 +692,8 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     success(
         founder,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -743,14 +703,14 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     success(
         client,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
         ],
     );
-    let standing = success(client, &["--client-context", "alice", "status"]);
+    let standing = success(client, &["--client-context", "alice", "inspect", "prefix"]);
     assert!(
         standing["result"].is_object() || standing.is_object(),
         "{standing}"
@@ -763,7 +723,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         !adopted_file.exists(),
         "nothing endorsed beyond the invitation's issuers, nothing adopted"
     );
-    let issuers = success(founder, &["cluster", "credentials", "issuers"])["result"].clone();
+    let issuers = success(founder, &["list", "issuers"])["result"].clone();
     assert!(issuers["successor"].is_null(), "{issuers}");
     assert!(issuers["retiring"].is_null(), "{issuers}");
     assert_eq!(issuers["current"]["endorsed"], false, "{issuers}");
@@ -772,7 +732,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         "{issuers}"
     );
     let genesis_issuer = issuers["current"]["fingerprint"].clone();
-    let rotated = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+    let rotated = success(founder, &["rotate", "issuer"])["result"].clone();
     let staged = rotated["successor"].clone();
     assert_eq!(staged["endorsed"], true, "{rotated}");
     assert!(staged["staged_at"].is_number(), "{rotated}");
@@ -781,7 +741,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         rotated["current"]["fingerprint"], genesis_issuer,
         "{rotated}"
     );
-    let again = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+    let again = success(founder, &["rotate", "issuer"])["result"].clone();
     assert!(
         again["successor"]["fingerprint"] == staged["fingerprint"]
             || (again["current"]["fingerprint"] == staged["fingerprint"]
@@ -792,7 +752,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     // issues, the genesis issuer retires while what it issued lives.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let activated = loop {
-        let view = success(founder, &["cluster", "credentials", "rotate-issuer"])["result"].clone();
+        let view = success(founder, &["rotate", "issuer"])["result"].clone();
         if view["current"]["fingerprint"] == staged["fingerprint"] {
             break view;
         }
@@ -807,16 +767,16 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     // chain; the participant, holding the genesis issuer alone, verifies it
     // through the endorsement and adopts the successor beside its journal
     // (24 §11) — and serves on the adopted root from then on.
-    let renewed = success(founder, &["cluster", "credentials", "renew"])["result"].clone();
+    let renewed = success(founder, &["renew", "credential"])["result"].clone();
     assert!(renewed["issued_at"].is_number(), "{renewed}");
-    let endorsed = success(client, &["--client-context", "alice", "status"]);
+    let endorsed = success(client, &["--client-context", "alice", "inspect", "prefix"]);
     assert!(endorsed.is_object(), "{endorsed}");
     assert!(
         adopted_file.is_file(),
         "the successor the participant was shown endorsed was not adopted at {}",
         adopted_file.display()
     );
-    let adopted_again = success(client, &["--client-context", "alice", "status"]);
+    let adopted_again = success(client, &["--client-context", "alice", "inspect", "prefix"]);
     assert!(adopted_again.is_object(), "{adopted_again}");
     drop(servers);
 }
@@ -841,7 +801,7 @@ fn wait_for_removal(founder: &Path, node: u64) -> Value {
     let text = node.to_string();
     let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
     loop {
-        let output = command(founder, &["cluster", "nodes", "remove", "--node", &text]);
+        let output = command(founder, &["remove", "node", "--node", &text]);
         if output.status.success() {
             return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
         }

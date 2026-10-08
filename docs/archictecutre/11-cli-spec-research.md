@@ -4,7 +4,7 @@ Research date: 2026-09-05. This is a proposed CLI contract and implementation in
 
 The research inspected Hecate revision `103c0785d2623c19d0c02a450e94677bbfc70359`, Sylk revision `50154e6159c7ed590728b82423dde3e7fc977c26`, and the current Focal working tree. Focal's working tree contains implementation beyond its HEAD, so its source links describe the inspected tree, not a release. No sibling code was changed or sibling tests run. Hecate citations use the checked-in frozen reference snapshot; Sylk citations link the inspected sibling source. The primary evidence is repository source; no external product claims are needed for this comparison.
 
-**Historical inventory:** the source matrices and proposed spellings below record the 2026-09-05 baseline, including statements that commands were then absent. They are not the current command list. The domain CLI/MCP, optional-filter queries, transfers, recovery, named remote contexts and substantial cluster administration have since landed; use [the current interface contract](19-cli-mcp-implementation.md), [manual guide](../manual-cli.md) and [status record](09-implementation-status.md). In particular, durable registration is `monitor register`, while `claim wait` is a separate bounded read; Focal does not implement the historical `validator evaluate` proposal or execute participant tools. Independent lifecycle, challenge/consult and deployment completion remain open.
+**Historical inventory:** the source matrices and proposed spellings below record the 2026-09-05 baseline, including statements that commands were then absent. They are not the current command list. The domain CLI/MCP, optional-filter queries, transfers, recovery, named remote contexts and substantial cluster administration have since landed; use [the current interface contract](19-cli-mcp-implementation.md), [manual guide](../manual-cli.md) and [status record](09-implementation-status.md). In particular, durable registration is `register monitor`, while `wait claim` is a separate bounded read; Focal does not implement the historical `validator evaluate` proposal or execute participant tools. Independent lifecycle, challenge/consult and deployment completion remain open.
 
 ## 1. Findings that determine the interface
 
@@ -28,7 +28,7 @@ The research inspected Hecate revision `103c0785d2623c19d0c02a450e94677bbfc70359
 | Sylk [skills_context_queries.go](../../../sylk/core/claims/skills_context_queries.go) | Ancestry, action claims/causality, overlapping scopes, validation history, all testaments for a claim, artifact recall, phase history | These inform filtered reads and graph traversal; Focal need not preserve Sylk-only phase/action records |
 | Sylk [skills_traverse.go](../../../sylk/core/claims/skills_traverse.go#L16) | Node traversal with optional relationship filter and depth | Prefer a shared traversal query behind convenience reads |
 | Sylk [type_registry.go](../../../sylk/core/claims/type_registry.go#L55), [validator_registry.go](../../../sylk/core/claims/validator_registry.go#L22) | Typed artifact codecs and registered validator contracts with timeout/concurrency metadata | Schema inspection and validator inspection are separate surfaces |
-| Focal [main.rs::Commands](../../crates/focal-node/src/main.rs#L53) | `start`, `cluster invite`, `join`, `demo`, `status`, `request FILE`, `identity`, `deployment explain`, `deployment schema` | These are the current shell commands; all new ledger-family commands below remain work |
+| Focal [main.rs::Commands](../../crates/focal-node/src/main.rs#L53) | `start`, `invite node`, `join`, `demo`, `status`, `request FILE`, `identity`, `explain deployment`, `get deployment-schema` | These are the current shell commands; all new ledger-family commands below remain work |
 | Focal [message.rs::ReadQuery](../../crates/focal-wire/src/message.rs#L31) | Typed point reads, unfiltered typed-key scan, depth-bounded traversal | Server-side family/source/lifecycle filters and traversal edge filters are not yet public wire queries |
 | Focal [command.rs::Command](../../crates/focal-model/src/command.rs#L25) | Twenty-nine append-numbered domain mutations | The manual can cover the whole implemented mutation vocabulary without inventing generic CRUD |
 
@@ -42,14 +42,14 @@ The CLI should expose the following distinct schema layers. Every schema respons
 
 | Layer | Actual source fields | Proposed manual surface | Current gap |
 |---|---|---|---|
-| Claim document | `NewClaim`, `ClaimContent`, embedded `NewValidation`; relations, scopes, requirement specification hashes | `schema get claim`; `schema validate claim --file FILE`; `submit claim` | Rust types exist; generated machine-readable object schemas and friendly input builder do not |
-| Testament closure document | Claim/receipt fence, evidence-set ID, exact artifact ID/hash manifest, summary, confidence, outcome | `schema get testament-close`; `submit testament` | Closure command exists; no named CLI or schema export |
-| Artifact envelope | Open `kind`, `schema_hash`, metadata bytes, payload, producer, receipt, typed inputs, visibility | `schema get artifact`; `artifact attach` | Envelope exists; kind is not a closed schema registry |
-| Artifact payload | Schema hash plus actual payload bytes; `ContentRef` for bulk content | `schema list --category artifact-payload`; `schema get --hash HASH`; `schema validate --hash HASH --file FILE` | No public catalogue/retrieval RPC; arbitrary hash does not mean its schema is installed |
-| Validation specification | Kind, phase, mode, description, quality bar, evaluator, pinned handlers, allowed evidence schemas, provenance, policy revision | `schema get validation`; definition within claim input; `get validation ID` | No standalone create/update-validation command; claim generation owns the specification |
-| Validator contract | Validator ID, implementation version hash, agentic capability, evidence schema, byte limit; runtime execution policy separately | `validator list`; `validator get ID --version HASH` | Registry/dispatch exist in code; no remote enumeration or operator installation protocol |
-| Wire request/result | `RequestEnvelope`, operation, response envelope, typed receipts and errors | `schema get request`; `request build/check/send` | Existing `request FILE` parses JSON only; no complete schema projection |
-| Deployment policy | Versioned `Settings`, topology, durability, placement; distinct runtime facts | Existing `deployment schema`; planned `deployment config show/validate` | Schema exists for deployment, not for the whole ledger |
+| Claim document | `NewClaim`, `ClaimContent`, embedded `NewValidation`; relations, scopes, requirement specification hashes | `get schema claim`; `validate document claim --file FILE`; `submit claim` | Rust types exist; generated machine-readable object schemas and friendly input builder do not |
+| Testament closure document | Claim/receipt fence, evidence-set ID, exact artifact ID/hash manifest, summary, confidence, outcome | `get schema testament-close`; `submit testament` | Closure command exists; no named CLI or schema export |
+| Artifact envelope | Open `kind`, `schema_hash`, metadata bytes, payload, producer, receipt, typed inputs, visibility | `get schema artifact`; `artifact attach` | Envelope exists; kind is not a closed schema registry |
+| Artifact payload | Schema hash plus actual payload bytes; `ContentRef` for bulk content | `list schemas --category artifact-payload`; `get schema --hash HASH`; `validate document --hash HASH --file FILE` | No public catalogue/retrieval RPC; arbitrary hash does not mean its schema is installed |
+| Validation specification | Kind, phase, mode, description, quality bar, evaluator, pinned handlers, allowed evidence schemas, provenance, policy revision | `get schema validation`; definition within claim input; `get validation ID` | No standalone create/update-validation command; claim generation owns the specification |
+| Validator contract | Validator ID, implementation version hash, agentic capability, evidence schema, byte limit; runtime execution policy separately | `list validators`; `get validator ID --version HASH` | Registry/dispatch exist in code; no remote enumeration or operator installation protocol |
+| Wire request/result | `RequestEnvelope`, operation, response envelope, typed receipts and errors | `get schema request`; `request build/check/send` | Existing `request FILE` parses JSON only; no complete schema projection |
+| Deployment policy | Versioned `Settings`, topology, durability, placement; distinct runtime facts | Existing `get deployment-schema`; planned `deployment config show/validate` | Schema exists for deployment, not for the whole ledger |
 
 The field evidence is in [objects.rs](../../crates/focal-model/src/objects.rs#L100), [message.rs](../../crates/focal-wire/src/message.rs#L171), [validators.rs](../../crates/focal-evidence/src/validators.rs#L32), and [config.rs](../../crates/focal-node/src/config/mod.rs#L9). Sylk's registration validates concrete input/output types against its artifact registry; `ListArtifactTypes` and `ValidatorRegistry.List` are code APIs, not proof of an implemented JSON Schema endpoint. See [type_registry.go](../../../sylk/core/claims/type_registry.go#L96) and [validator_registry.go](../../../sylk/core/claims/validator_registry.go#L93).
 
@@ -93,7 +93,7 @@ Each embedded validation definition covers **all** of `NewValidation.id` and `Va
 | `--outcome` / `outcome` | `OutcomeKind` | Explicit complete/partial/refused/impossible/interrupted/failed; negative outcomes still close with evidence |
 | Selected context and supported schema | Resulting `TestamentContent.ledger/schema` | Fixed by the actual command/model contract; no client-supplied lifecycle fields |
 
-The proposal must distinguish input shape validation from domain admission. For example, `focal submit claim --json '{}'` and `focal submit testament --yaml '{}'` select the correct parser and return required-field diagnostics; they do not create valid empty records. The existing low-level command remains `focal request FILE`. Field sources: [ClaimContent/NewClaim](../../crates/focal-model/src/objects.rs#L30), [CloseTestament](../../crates/focal-model/src/command.rs#L76), and [TestamentContent](../../crates/focal-model/src/objects.rs#L178).
+The proposal must distinguish input shape validation from domain admission. For example, `focal submit claim --json '{}'` and `focal submit testament --yaml '{}'` select the correct parser and return required-field diagnostics; they do not create valid empty records. The existing low-level command remains `focal send request FILE`. Field sources: [ClaimContent/NewClaim](../../crates/focal-model/src/objects.rs#L30), [CloseTestament](../../crates/focal-model/src/command.rs#L76), and [TestamentContent](../../crates/focal-model/src/objects.rs#L178).
 
 ## 4. Proposed exhaustive command matrix
 
@@ -119,17 +119,17 @@ Every row is scoped by an authenticated connection and ledger where appropriate.
 | `list validations` | None | `--claim`, `--evaluator`, `--kind`, `--phase`, `--mode`, `--status`, `--validator`, pagination | P; avoid making a parent claim mandatory |
 | `get validation ID` | Validation ID | Specification plus planned execution/target/verdict expansion | W for specification point read; P for execution runs and verdict/result read surface |
 | `get claim --source PARTICIPANT [--target PARTICIPANT]` | Claim issuer filter; subject optional | Require exactly one authorized match; no match is not found; multiple matches are ambiguous | P: bounded singular filtered read from §5 |
-| `ledger traverse KIND:ID` | One or bounded multiple typed roots | `--edge KIND`, `--depth`, `--limit`, continuation | W for roots/depth; P for edge predicates and full continuation contract |
+| `traverse ledger KIND:ID` | One or bounded multiple typed roots | `--edge KIND`, `--depth`, `--limit`, continuation | W for roots/depth; P for edge predicates and full continuation contract |
 | `claim history ID`, `validation history ID` | Typed object ID | Bounded lifecycle/relationship history, sequence window | P: define retained history query; do not synthesize history from only the current row |
-| `ledger summary` | Ledger | Bounded counters with read token and documented scope | P: no full graph download to count client-side |
+| `inspect ledger` | Ledger | Bounded counters with read token and documented scope | P: no full graph download to count client-side |
 | `ledger watch` | Ledger and stable consumer identity | Object/delta filter, resume cursor, item/byte credits, seed choice | W: typed `Stream::Open/Poll/CompleteSeed` |
 | `ledger cursor show` | Saved local cursor file | Consumer, generation, scope, exact position and resolved marker | P: local presentation; cursor is opaque authority-bound data |
 | `ledger cursor resume` | Saved cursor file | Output sink, explicit completion acknowledgment policy | W/P: stream RPC exists; durable CLI sink/cursor journal required |
-| `schema list` | None | Category, object family, version; bounded remote catalogue where applicable | P |
-| `schema get NAME` or `schema get --hash HASH` | One unambiguous selector | JSON Schema or exact registered representation; origin/version | P except existing deployment-specific schema |
-| `schema validate NAME --file FILE` | Exact schema + document | JSON/YAML input; no mutation; diagnostics with field paths | P: local syntactic/structural validation only |
-| `validator list` | None | Kind, accepted schema, agentic capability, installed version | P: bounded server introspection |
-| `validator get ID --version HASH` | Pinned validator | Contract, inputs/results, execution policy and availability | P |
+| `list schemas` | None | Category, object family, version; bounded remote catalogue where applicable | P |
+| `get schema NAME` or `get schema --hash HASH` | One unambiguous selector | JSON Schema or exact registered representation; origin/version | P except existing deployment-specific schema |
+| `validate document NAME --file FILE` | Exact schema + document | JSON/YAML input; no mutation; diagnostics with field paths | P: local syntactic/structural validation only |
+| `list validators` | None | Kind, accepted schema, agentic capability, installed version | P: bounded server introspection |
+| `get validator ID --version HASH` | Pinned validator | Contract, inputs/results, execution policy and availability | P |
 | `validator evaluate ID --version HASH --file FILE` | Pinned validator and input | Explicit offline mode; no ledger verdict; bounded execution | P/I: requires a defined safe execution surface, not just schema validation |
 
 Sources for the read coverage are [Sylk QueryBoardSkill](../../../sylk/core/claims/skills.go#L48), [context query skills](../../../sylk/core/claims/skills_context_queries.go), [Hecate graph contract](reference/hecate/docs/architecture/LEDGER.md#L149), and [Focal ReadQuery/StreamRequest](../../crates/focal-wire/src/message.rs#L31). Filters that have no corresponding Focal field/index must be implemented explicitly or rejected as unsupported; the CLI must never accept and ignore them.
@@ -140,15 +140,15 @@ All named mutation commands below are unimplemented CLI surfaces. The table cove
 
 | Tag / typed command | Proposed spelling | Inputs and boundary | Status/role |
 |---|---|---|---|
-| 1 `NegotiateEpoch` | `request epoch open` | Admit the authenticated principal's epoch through `Operation::OpenEpoch`; no arbitrary client principal | W: safe own-principal operation; raw command Runtime-only |
+| 1 `NegotiateEpoch` | `inspect epoch open` | Admit the authenticated principal's epoch through `Operation::OpenEpoch`; no arbitrary client principal | W: safe own-principal operation; raw command Runtime-only |
 | 2 `AdvanceEpochFloor` | `admin requests advance-floor` | Minimum retained epoch; explain loss of old retry coverage | W/I Runtime |
 | 3 `GenerateClaim` | `submit claim` | Claim content and embedded validation definitions; creates Generated state only | W Actor |
 | 4 `GenerateClaimBatch` | `submit claim --file FILE` with a batch document | Bounded atomic batch; complete generated IDs and exact input journal | W Actor |
-| 5 `PostClaim` | `claim post ID` | Existing Generated claim; do not silently combine creation and posting | W Actor |
-| 6 `AcquireReceipt` | `receipt acquire ID` | Receipt ID and epoch; return exact receipt fence | W Actor |
+| 5 `PostClaim` | `post claim ID` | Existing Generated claim; do not silently combine creation and posting | W Actor |
+| 6 `AcquireReceipt` | `acquire receipt ID` | Receipt ID and epoch; return exact receipt fence | W Actor |
 | 7 `AdoptReceipt` | `admin claims adopt-receipt ID` | Previous fence, new receipt, holder and epoch | W/I Runtime |
-| 8 `RecordProgress` | `claim progress ID --message TEXT` | Current receipt fence; progress never completes work | W Actor |
-| 9 `BeginEvidenceSet` | `evidence begin --claim ID` | Receipt fence and evidence-set ID; return reusable identifiers | W Actor |
+| 8 `RecordProgress` | `report progress ID --message TEXT` | Current receipt fence; progress never completes work | W Actor |
+| 9 `BeginEvidenceSet` | `begin evidence --claim ID` | Receipt fence and evidence-set ID; return reusable identifiers | W Actor |
 | 10 `AttachArtifact` | `artifact attach --claim ID --evidence-set ID` | Receipt fence, immutable artifact envelope, verified payload reference | W Actor |
 | 11 `CloseTestament` | `submit testament --claim ID --evidence-set ID` | Receipt fence, testament ID, exact manifest, summary, confidence and outcome | W Actor |
 | 12 `AcknowledgeTestament` | `admin testaments acknowledge ID --claim ID` | Runtime delivery acknowledgment, not satisfaction | W/I Runtime |
@@ -159,11 +159,11 @@ All named mutation commands below are unimplemented CLI surfaces. The table cove
 | 17 `FailPost` | `admin claims fail-post ID` | Durable error artifact reference | W/I Runtime |
 | 18 `FailReceipt` | `admin claims fail-receipt ID` | Durable error artifact reference | W/I Runtime |
 | 19 `FailTestamentGeneration` | No new CLI surface | Historical runtime-synthesized testimony only; new admission refuses it. Respondents submit ordinary testaments with error evidence. | Replay only; supersedes the original Runtime proposal |
-| 20 `CancelClaim` | `claim cancel ID --reason TEXT` | Authorized cancellation, recorded lifecycle | W Actor |
+| 20 `CancelClaim` | `cancel claim ID --reason TEXT` | Authorized cancellation, recorded lifecycle | W Actor |
 | 21 `RevokeClaim` | `admin claims revoke ID --reason TEXT` | Trusted lifecycle change | W/I Runtime |
 | 22 `ExpireClaim` | Internal timer dispatch; optional operator diagnostic | Exact timer, generation and fired time; no client-selected logical clock | W/I Runtime |
-| 23 `SupersedeClaim` | `claim supersede ID --file SUCCESSOR` | Immutable successor claim and its validations, relation and standing checks | W Actor |
-| 24 `RegisterMonitor` | `claim wait ID` | Bounded typed predicates, monitor ID and deadline | W Actor; server/runtime completion follows |
+| 23 `SupersedeClaim` | `supersede claim ID --file SUCCESSOR` | Immutable successor claim and its validations, relation and standing checks | W Actor |
+| 24 `RegisterMonitor` | `wait claim ID` | Bounded typed predicates, monitor ID and deadline | W Actor; server/runtime completion follows |
 | 25 `RebindMonitor` | Internal monitor repair | Predecessor/successor identity | W/I Runtime |
 | 26 `ReleaseScope` | `admin claims release-scope ID` | Lifecycle-permitted release; no direct scope-table editing | W/I Runtime |
 | 27 `RegisterArtifact` | `admin artifacts register --file FILE` | Trusted standalone/result artifact registration; ordinary actor uses attach | W/I Runtime |
@@ -184,10 +184,10 @@ For ergonomic `submit claim` flags, provide at least `--id`, `--description`, `-
 | `content download --ref FILE --output PATH` | Exact typed content reference, offset resume, digest verification, bounded writes | W: `Download` |
 | `artifact download ID --output PATH` | Resolve artifact at a read prefix, then verified content transfer or bounded inline output | W |
 | `request FILE` | Existing full JSON `RequestEnvelope`; same file on retry | C: local Unix transport today |
-| `request build OP ... --output FILE` | Flags/document → typed complete request, fixed IDs and chosen schema/version; no send | P |
-| `request check FILE` | Strict parse and structural checks; output exact normalized request/hash; no admission claim | P |
-| `request send FILE` | Alias/evolution of existing `request FILE`; identical semantics and retry identity | W |
-| `request retry JOURNAL` | Replay exact stored typed intent; report committed, rejected, expired history, or unknown distinctly | P: builds on client retry support |
+| `build request OP ... --output FILE` | Flags/document → typed complete request, fixed IDs and chosen schema/version; no send | P |
+| `check request FILE` | Strict parse and structural checks; output exact normalized request/hash; no admission claim | P |
+| `send request FILE` | Alias/evolution of existing `request FILE`; identical semantics and retry identity | W |
+| `retry request JOURNAL` | Replay exact stored typed intent; report committed, rejected, expired history, or unknown distinctly | P: builds on client retry support |
 | `request receipt KEY` | Authoritative retained receipt lookup for the appropriate data/control request namespace | P: control has `ControlRead::Receipt`; ordinary data wire needs an explicit read contract |
 
 Do not collapse a `ContentRef` into a bare hash: domain, content class, length and root participate in identity and authorization. The upload ID alone is not a capability. Upload sealing and testament closure are different commits. Sources: [ContentRef](../../crates/focal-model/src/objects.rs#L134), [UploadRequest/UploadReply](../../crates/focal-wire/src/message.rs#L265), and [ControlRead](../../crates/focal-control/src/rpc.rs#L5).
@@ -203,23 +203,23 @@ Do not collapse a `ContentRef` into a bare hash: domain, content class, length a
 | `identity` | Read saved identity metadata without acquiring ledger ownership | C |
 | `status` | Current implementation reads the application ledger's authoritative prefix; not root-learner health | C; richer readiness/placement status P |
 | `demo` | Existing end-to-end example with exclusive local ownership; not the sole way to operate the ledger | C |
-| `cluster invite --node NAME --output FILE` | Running founder's authenticated local admin socket; exact durable invitation label and private output | C |
+| `invite node --node NAME --output FILE` | Running founder's authenticated local admin socket; exact durable invitation label and private output | C |
 | `join --invite-file FILE --advertise ENDPOINT [--listen ADDRESS]` | Persist pinned credentials and physical identity, then exit; `start` is separate | C |
-| `cluster status` | Requested/effective/observed protection, root and directory readiness, bounded node counts | P: separate from application prefix status |
+| `inspect cluster` | Requested/effective/observed protection, root and directory readiness, bounded node counts | P: separate from application prefix status |
 | `cluster nodes list/get` | Bounded committed contacts, credential state, membership role, catch-up state, known/unknown topology | P; do not present contact registration as voter admission |
 | `cluster invitations list/get/revoke` | Metadata-only inspection, exact ID and expiry; never display secret; revoke committed admission authority | P: CLI absent; enrollment primitives are not a finished admin API |
-| `cluster credentials renew` | Durable key/CSR identity; the same key under a fresh certificate, interrupted renewal reconciles on the committed one (2026-09-09); key rotation with a proof of the previous key remains planned | C |
+| `renew credential` | Durable key/CSR identity; the same key under a fresh certificate, interrupted renewal reconciles on the committed one (2026-09-09); key rotation with a proof of the previous key remains planned | C |
 | `cluster nodes drain/remove` | Plan and commit handoff/removal; maintain placement guarantees; distinguish initiation from completion | P: internal membership primitives exist, operator workflow incomplete |
-| `cluster membership show` | Explicit group-scoped configuration and applied fence | W/P: `ControlRead::Membership/Configuration`, not an existing command |
+| `inspect membership` | Explicit group-scoped configuration and applied fence | W/P: `ControlRead::Membership/Configuration`, not an existing command |
 | `cluster membership add-learner/promote/remove/leave-joint` | Restricted repair/admin surface, expected configuration and stable operation ID; report committed configuration | W/I: internal control/session APIs exist; do not require users to operate raw Raft for normal growth |
-| `cluster leader transfer` | Trusted group-scoped initiation; separately observe resulting leader; never print “committed” for accepted transfer | W/I: `ControlRpc::Transfer` |
+| `transfer leader` | Trusted group-scoped initiation; separately observe resulting leader; never print “committed” for accepted transfer | W/I: `ControlRpc::Transfer` |
 | `cluster endpoint change` | Authenticated, durable endpoint transition bound to saved physical identity | P; current startup rejects changed saved addresses |
-| `deployment schema` | Emit current machine-readable deployment settings schema | C |
-| `deployment explain [--inventory FILE]` | Existing offline placement solver; does not activate a guarantee | C |
+| `get deployment-schema` | Emit current machine-readable deployment settings schema | C |
+| `explain deployment [--inventory FILE]` | Existing offline placement solver; does not activate a guarantee | C |
 | `deployment capabilities` | Supported versions, measured resources and qualified features; missing facts stay unknown | P: target in architecture §9 |
 | `deployment config show/validate` | Explain effective configuration and source of each value; validation does not mutate policy | P |
-| `deployment plan --config FILE` | Immutable plan bound to deployment, current revisions, actual topology, and desired policy; effects/limits explicit | P |
-| `deployment apply --plan FILE` | Recheck exact preconditions, durably journal work, report achieved/blocked transitions | P |
+| `plan deployment --config FILE` | Immutable plan bound to deployment, current revisions, actual topology, and desired policy; effects/limits explicit | P |
+| `apply deployment --plan FILE` | Recheck exact preconditions, durably journal work, report achieved/blocked transitions | P |
 | `deployment render --target kubernetes` | Packaging for the same binary/membership; stable storage/identity and resource inputs | P; no Kubernetes prerequisite for VMs or local use |
 | `deployment progress/get-plan` | Bounded durable progress and outstanding unknown outcomes | P |
 

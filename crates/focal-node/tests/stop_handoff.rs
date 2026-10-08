@@ -23,12 +23,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// The session's leader and term as `node` sees them now, from its own
-/// replica (`diagnose cluster --replicas` answers locally, unsampled).
+/// replica (`inspect replicas --replicas` answers locally, unsampled).
 fn leadership(node: &Node, ledger: &str) -> Option<(u64, u64)> {
     let output = run(
         node,
         None,
-        &["diagnose", "cluster", "--replicas", "--session", ledger],
+        &["inspect", "replicas", "--replicas", "--session", ledger],
     );
     if !output.status.success() {
         return None;
@@ -151,7 +151,7 @@ fn a_leader_told_to_stop_hands_its_log_off_before_an_election_could_start() {
     loop {
         let diagnostics = admin(
             successor_node,
-            &["diagnose", "cluster", "--replicas", "--session", &ledger],
+            &["inspect", "replicas", "--replicas", "--session", &ledger],
         )["result"]["diagnostics"]
             .clone();
         if diagnostics["authoritative"] == true && diagnostics["term"] == new_term {

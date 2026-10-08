@@ -72,7 +72,7 @@ fn admin(node: &Node, args: &[&str]) -> Value {
 fn start(node: &Node, args: &[&str]) -> Server {
     deadline::observe(node.root());
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", node.root().to_str().unwrap(), "start"])
+        .args(["--data-dir", node.root().to_str().unwrap(), "start", "node"])
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -109,7 +109,7 @@ fn start(node: &Node, args: &[&str]) -> Server {
     server
 }
 fn node_row(founder: &Node, id: u64) -> Option<Value> {
-    let output = run(founder, &["cluster", "placement"]);
+    let output = run(founder, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -138,7 +138,7 @@ fn wait_for_contact(founder: &Node, id: u64, port: &str, endpoint: Option<&str>)
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    let view = run(founder, &["cluster", "placement"]);
+    let view = run(founder, &["inspect", "placement"]);
     panic!(
         "{id} never announced port {port} / {endpoint:?}; last {last:#?}; view {}",
         String::from_utf8_lossy(&view.stdout)
@@ -157,7 +157,7 @@ fn a_host_enrolls_at_its_first_start_announces_its_name_and_is_found_after_movin
         &["--advertise", &format!("localhost:{founder_port}")],
     );
     let founder_id =
-        admin(&founder, &["diagnose", "node", "--identity"])["result"]["identity"]["node"]
+        admin(&founder, &["inspect", "node", "--identity"])["result"]["identity"]["node"]
             .as_u64()
             .unwrap();
     let founder_row = wait_for_contact(
@@ -167,10 +167,10 @@ fn a_host_enrolls_at_its_first_start_announces_its_name_and_is_found_after_movin
         Some(&format!("localhost:{founder_port}")),
     );
     assert_eq!(founder_row["eligible"], true);
-    // `cluster invite --output -` hands the invitation to a pipe.
+    // `invite node --output -` hands the invitation to a pipe.
     let invitation = run(
         &founder,
-        &["cluster", "invite", "--node", "host", "--output", "-"],
+        &["invite", "node", "--node", "host", "--output", "-"],
     );
     assert!(
         invitation.status.success(),
@@ -195,7 +195,7 @@ fn a_host_enrolls_at_its_first_start_announces_its_name_and_is_found_after_movin
             invite_file.to_str().unwrap(),
         ],
     );
-    let host_id = admin(&host, &["diagnose", "node", "--identity"])["result"]["identity"]["node"]
+    let host_id = admin(&host, &["inspect", "node", "--identity"])["result"]["identity"]["node"]
         .as_u64()
         .unwrap();
     assert_ne!(host_id, founder_id);
@@ -229,11 +229,11 @@ fn a_host_enrolls_at_its_first_start_announces_its_name_and_is_found_after_movin
         ],
     );
     assert_eq!(
-        admin(&host, &["diagnose", "node", "--identity"])["result"]["identity"]["node"],
+        admin(&host, &["inspect", "node", "--identity"])["result"]["identity"]["node"],
         host_id
     );
     wait_for_contact(&founder, host_id, &moved_port, None);
-    let probe = run(&host, &["diagnose", "node", "--probe", "alive"]);
+    let probe = run(&host, &["inspect", "node", "--probe", "alive"]);
     assert!(probe.status.success());
     // And back to a name at a third address.
     drop(host_server);

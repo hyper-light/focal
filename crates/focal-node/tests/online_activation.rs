@@ -26,7 +26,7 @@ fn a_fresh_founders_first_online_activation_is_held_until_its_promise_is_durable
     let founder = Node::new("founder");
     let _server = start(&founder, &["--advertise", &address()]);
     let started = Instant::now();
-    let output = run(&founder, None, &["cluster", "replicas", "activate-native"]);
+    let output = run(&founder, None, &["activate", "native"]);
     assert!(
         output.status.success(),
         "the first call: {}\n{}",

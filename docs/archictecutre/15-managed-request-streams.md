@@ -193,7 +193,7 @@ Ordinary `focal submit` durably reserves an ID internally, binds normalized inpu
 and saves the complete expanded request before sending. Successful output contains
 compact object IDs; unresolved operations or failed output receive a copyable
 recovery diagnostic. An abrupt process kill remains recoverable through
-`request pending`, even if nothing was printed. After a committed result is written and
+`list requests`, even if nothing was printed. After a committed result is written and
 **flushed**, the CLI durably marks that operation delivered. Maintenance ACKs only
 the contiguous prefix of delivered, locally saved results. A later delivered
 result cannot reclaim an earlier unobserved one. Flush establishes delivery to
@@ -203,9 +203,9 @@ success into failure. Normal use therefore exceeds the 32-request default window
 without manual acknowledgment.
 
 A timeout, failed output, canceled wait, Refuse or Inform leaves the exact request
-recoverable. `request pending` discovers the bounded CLI and MCP stores;
-`request inspect --operation-id` does not acknowledge a result; `request retry
---operation-id` resubmits or prints the original outcome. Explicit `request seal`
+recoverable. `list requests` discovers the bounded CLI and MCP stores;
+`inspect request --operation-id` does not acknowledge a result; `request retry
+--operation-id` resubmits or prints the original outcome. Explicit `seal request`
 (alias `request abandon`) resolves a gap to an earlier committed outcome or an
 admission fence. It does not cancel a claim or undo committed work. After its
 result is flushed, the CLI follows the same delivery/ACK path. A retired operation

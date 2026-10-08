@@ -56,7 +56,7 @@ struct SetPlan {
 const USER: u32 = 65532;
 const DATA_DIR: &str = "/var/lib/focal";
 const CONFIG_MAP: &str = "focal-config";
-/// Where every pod mounts the requested policy for `deployment plan`.
+/// Where every pod mounts the requested policy for `plan deployment`.
 const TARGET_DIR: &str = "/etc/focal-target";
 const TARGET_FILE: &str = "target.yaml";
 const SERVICE: &str = "focal";
@@ -261,7 +261,7 @@ pub fn render(
     // single-node durability, the only first start a lone node can satisfy
     // (a founder alone cannot promise zone survival, and a host's first
     // start pins its own policy the same way). The requested policy ships
-    // beside it as `target.yaml` for `deployment plan --config` once the
+    // beside it as `target.yaml` for `plan deployment --config` once the
     // hosts have joined; from then on the committed policy carries every
     // restart (08 §2), so the static file never has to follow it.
     let mut seed = settings.clone();
@@ -339,10 +339,10 @@ pub fn render(
         "Apply the founder first (`kubectl apply -k .` applies everything; host pods wait for their invitation), run invitations.sh once focal-founder-0 is Ready to issue and install the invitations, then the hosts enroll and start.".into(),
     );
     assets.notes.push(
-        "Probes ask the node: startup and liveness are `diagnose node --probe alive` (the process answers); readiness is `--probe serving` (its owners run — never a quorum, which peers need this pod's endpoint to re-form: the Service publishes not-ready addresses); `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
+        "Probes ask the node: startup and liveness are `inspect node --probe alive` (the process answers); readiness is `--probe serving` (its owners run — never a quorum, which peers need this pod's endpoint to re-form: the Service publishes not-ready addresses); `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
     );
     assets.notes.push(format!(
-        "Every pod starts at single-node durability (survive: node, max_failures: 0), the only first start a lone node can satisfy; the requested policy ({} survival, max_failures {}) is mounted as {TARGET_DIR}/{TARGET_FILE}. Once every host pod is Ready, commit it from the founder: `kubectl -n {ns} exec focal-founder-0 -c focal -- /focal --data-dir {DATA_DIR} deployment plan --config {TARGET_DIR}/{TARGET_FILE} --output {DATA_DIR}/target.plan` then `... deployment apply --plan-file {DATA_DIR}/target.plan`. The committed policy then carries every restart; the configmap never has to follow it (08 §2).",
+        "Every pod starts at single-node durability (survive: node, max_failures: 0), the only first start a lone node can satisfy; the requested policy ({} survival, max_failures {}) is mounted as {TARGET_DIR}/{TARGET_FILE}. Once every host pod is Ready, commit it from the founder: `kubectl -n {ns} exec focal-founder-0 -c focal -- /focal --data-dir {DATA_DIR} plan deployment --config {TARGET_DIR}/{TARGET_FILE} --output {DATA_DIR}/target.plan` then `... deployment apply --plan-file {DATA_DIR}/target.plan`. The committed policy then carries every restart; the configmap never has to follow it (08 §2).",
         crate::deployment::survive_name(settings.durability.survive),
         settings.durability.max_failures,
         ns = request.namespace,
@@ -376,10 +376,10 @@ fn invitations_script(namespace: &str, secret: &str, hosts: &[String]) -> String
     // Ready is the founder's owners running and asks no leadership by design
     // (F25); an invitation is its root leader's to issue, so the script waits,
     // bounded, until the founder leads (the authoritative probe).
-    out.push_str("n=0\nuntil kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal diagnose node --probe authoritative >/dev/null 2>&1; do\n  n=$((n + 1))\n  if [ \"$n\" -ge 150 ]; then echo \"focal-founder-0 never led its root\" >&2; exit 1; fi\n  sleep 2\ndone\n");
+    out.push_str("n=0\nuntil kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal inspect node --probe authoritative >/dev/null 2>&1; do\n  n=$((n + 1))\n  if [ \"$n\" -ge 150 ]; then echo \"focal-founder-0 never led its root\" >&2; exit 1; fi\n  sleep 2\ndone\n");
     out.push_str("HOSTS=\"");
     out.push_str(&hosts.join(" "));
-    out.push_str("\"\nFILES=\"\"\nfor host in $HOSTS; do\n  # Its ledger service may answer after the founder leads (a refusal typed\n  # unavailable, exit 6, retryable): asked again, bounded.\n  n=0\n  until kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal cluster invite --node \"$host\" --output - > \"$host.invite\"; do\n    n=$((n + 1))\n    if [ \"$n\" -ge 60 ]; then echo \"no invitation for $host\" >&2; exit 1; fi\n    sleep 2\n  done\n  FILES=\"$FILES --from-file=$host.invite=$host.invite\"\ndone\nkubectl -n \"$NAMESPACE\" delete secret \"$SECRET\" --ignore-not-found\n# shellcheck disable=SC2086\nkubectl -n \"$NAMESPACE\" create secret generic \"$SECRET\" $FILES\nrm -f -- *.invite\n");
+    out.push_str("\"\nFILES=\"\"\nfor host in $HOSTS; do\n  # Its ledger service may answer after the founder leads (a refusal typed\n  # unavailable, exit 6, retryable): asked again, bounded.\n  n=0\n  until kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal invite node --node \"$host\" --output - > \"$host.invite\"; do\n    n=$((n + 1))\n    if [ \"$n\" -ge 60 ]; then echo \"no invitation for $host\" >&2; exit 1; fi\n    sleep 2\n  done\n  FILES=\"$FILES --from-file=$host.invite=$host.invite\"\ndone\nkubectl -n \"$NAMESPACE\" delete secret \"$SECRET\" --ignore-not-found\n# shellcheck disable=SC2086\nkubectl -n \"$NAMESPACE\" create secret generic \"$SECRET\" $FILES\nrm -f -- *.invite\n");
     out
 }
 fn stateful_set(
@@ -411,7 +411,7 @@ fn stateful_set(
     // only for that step; the node itself never runs as root.
     let _ = write!(
         out,
-        "      initContainers:\n        - name: prepare-volume\n          image: {image}\n          command: [\"/focal\"]\n          args: [\"--data-dir\", \"{DATA_DIR}\", \"prepare-volume\", \"--owner\", \"{USER}:{USER}\"]\n          securityContext:\n            runAsUser: 0\n            runAsNonRoot: false\n            allowPrivilegeEscalation: false\n            readOnlyRootFilesystem: true\n            capabilities:\n              drop: [\"ALL\"]\n              add: [\"CHOWN\", \"FOWNER\", \"DAC_OVERRIDE\"]\n          volumeMounts:\n            - name: data\n              mountPath: {DATA_DIR}\n      containers:\n        - name: focal\n          image: {image}\n          command: [\"/focal\"]\n          args:\n            - \"--config\"\n            - \"/etc/focal/focal.yaml\"\n            - \"--data-dir\"\n            - \"{DATA_DIR}\"\n            - \"start\"\n            - \"--listen\"\n            - \"0.0.0.0:{port}\"\n            - \"--advertise\"\n            - \"$(POD_NAME).{SERVICE}.$(POD_NAMESPACE).svc.cluster.local:{port}\"\n"
+        "      initContainers:\n        - name: prepare-volume\n          image: {image}\n          command: [\"/focal\"]\n          args: [\"--data-dir\", \"{DATA_DIR}\", \"prepare\", \"volume\", \"--owner\", \"{USER}:{USER}\"]\n          securityContext:\n            runAsUser: 0\n            runAsNonRoot: false\n            allowPrivilegeEscalation: false\n            readOnlyRootFilesystem: true\n            capabilities:\n              drop: [\"ALL\"]\n              add: [\"CHOWN\", \"FOWNER\", \"DAC_OVERRIDE\"]\n          volumeMounts:\n            - name: data\n              mountPath: {DATA_DIR}\n      containers:\n        - name: focal\n          image: {image}\n          command: [\"/focal\"]\n          args:\n            - \"--config\"\n            - \"/etc/focal/focal.yaml\"\n            - \"--data-dir\"\n            - \"{DATA_DIR}\"\n            - \"start\"\n            - \"node\"\n            - \"--listen\"\n            - \"0.0.0.0:{port}\"\n            - \"--advertise\"\n            - \"$(POD_NAME).{SERVICE}.$(POD_NAMESPACE).svc.cluster.local:{port}\"\n"
     );
     if !set.founder {
         out.push_str("            - \"--invite-file\"\n            - \"/etc/focal/invitations/$(POD_NAME).invite\"\n");
@@ -421,10 +421,10 @@ fn stateful_set(
     // peers need this pod's endpoint to re-form (the Service publishes
     // not-ready addresses for that).
     let probe = format!(
-        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"diagnose\", \"node\", \"--probe\", \"alive\"]\n"
+        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"inspect\", \"node\", \"--probe\", \"alive\"]\n"
     );
     let serving = format!(
-        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"diagnose\", \"node\", \"--probe\", \"serving\"]\n"
+        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"inspect\", \"node\", \"--probe\", \"serving\"]\n"
     );
     let _ = write!(
         out,

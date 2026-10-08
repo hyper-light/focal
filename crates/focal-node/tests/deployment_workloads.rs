@@ -43,7 +43,7 @@ fn gauge(text: &str, name: &str) -> Option<u64> {
 fn metrics(node: &Node) -> String {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     loop {
-        let output = fleet::run(node, None, &["diagnose", "node", "--metrics"]);
+        let output = fleet::run(node, None, &["inspect", "node", "--metrics"]);
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             if text.contains("focal_memory_used_bytes") {
@@ -67,7 +67,7 @@ fn a_sustained_workload_stays_within_budget_and_keeps_the_guarantee() {
         &founder,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _founder_server = journey.start(
         &founder,
@@ -119,7 +119,7 @@ fn a_sustained_workload_stays_within_budget_and_keeps_the_guarantee() {
         }
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let claim = created(&value["result"], "Claim").remove(0);
-        fleet::committed(&journey.cli(&founder, None, "claim", &[], &["claim", "post", &claim]));
+        fleet::committed(&journey.cli(&founder, None, "claim", &[], &["post", "claim", &claim]));
         committed += 1;
         last = claim;
     }
@@ -142,7 +142,7 @@ fn a_sustained_workload_stays_within_budget_and_keeps_the_guarantee() {
             "focal",
             "--data-dir",
             "<founder>",
-            "diagnose",
+            "inspect",
             "node",
             "--metrics",
         ],

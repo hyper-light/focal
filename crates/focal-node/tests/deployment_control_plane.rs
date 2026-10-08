@@ -10,7 +10,7 @@
 )]
 //! The control plane survives what the data does (the audit's F24). A
 //! deployment that asks for zone survival seats the root group's voters
-//! across the zones as it seats the session's; `cluster placement` states
+//! across the zones as it seats the session's; `inspect placement` states
 //! what the root, the directory partitions and the issuer survive, apart
 //! from the data; readiness holds the committed policy to the root and the
 //! partition groups as well; and with the founder's zone silent the root
@@ -30,7 +30,7 @@ fn control(view: &Value) -> &Value {
     &view["control"]
 }
 fn configuration(node: &Node) -> Value {
-    admin(node, &["cluster", "membership", "show"])["result"]["configuration"].clone()
+    admin(node, &["inspect", "membership"])["result"]["configuration"].clone()
 }
 
 #[test]
@@ -86,8 +86,8 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
         &[
             "--config",
             policy.to_str().unwrap(),
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             plan_file.to_str().unwrap(),
         ],
@@ -123,8 +123,8 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let applied = admin(
         &founder,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
             "--wait",
@@ -141,7 +141,7 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
         // its allowance (macOS CI, 2026-10-02: root and partition seated,
         // the session step committed and not complete at 360 s).
         let view = placement(&founder);
-        let health = admin(&founder, &["diagnose", "node", "--health"]);
+        let health = admin(&founder, &["inspect", "node", "--health"]);
         panic!("apply not complete: {applied}\nplacement: {view:?}\nhealth: {health}");
     }
     let mut voters = ids(&configuration(&founder)["voters"]);
@@ -184,8 +184,8 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let again = admin(
         &founder,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
         ],
@@ -244,9 +244,8 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let created = admin(
         &host_b,
         &[
-            "cluster",
-            "sessions",
             "create",
+            "session",
             "--tenant",
             &tenant,
             "--name",
