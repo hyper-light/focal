@@ -114,3 +114,45 @@ report carries its drain time. Remaining before the measured runs:
   12.2 ms, p99.9 60.9 ms, max 65.9 ms, beside the workspace gate.
 - **The generator in a container** on the bench network, and a Linux host with real
   disks.
+
+## First measurements on Linux runners (2026-10-08)
+
+GitHub `ubuntu-24.04` runners: four vCPUs, one virtual disk (`sda`, 150 GB). Its fsync reaches
+the device: 500 synchronous 4 KiB writes took 167 ms, about 334 µs each, against about 20 µs
+under Docker Desktop. Each system ran as three containers with one CPU share each, beside its
+generator, every acknowledged write on disk at a quorum. Open-loop, 128 B records, 15 s warm-up,
+60 s measured. Two runs of each system (37755449086, 37759454104), p99 per run:
+
+| System (durable) | 1,000/s p50 | 1,000/s p99 | 4,000/s p50 | 4,000/s p99 |
+|---|---|---|---|---|
+| Kafka (flush per message) | 5.2–5.3 ms | 9.0–15.3 ms | 5.7–5.9 ms | 12.4–13.8 ms |
+| NATS JetStream (sync always) | 2.4–3.0 ms | 3.5–7.4 ms | saturated: 33–39% refused, p99 1.6–1.8 s | — |
+| Redis (appendfsync always, WAITAOF 1 2) | 2.4–3.0 ms | 5.8–15.3 ms | 2.4 ms | 4.0–5.7 ms |
+
+The spread between two runs of one system is as wide as the gap between systems, so a claim
+needs several seeded runs per condition. Recording a single run is not enough.
+
+**focal has no measured result on the runners yet.** Its arm found three defects, each fixed or
+tracked:
+- The bootstrap invited before the founder led its root: readiness asks no leadership by design.
+  Fixed: it waits on `authoritative`. The rendered Kubernetes invitations script had the same
+  gap and is fixed too.
+- The load tool was pointed at the client's root instead of its context journal. Fixed.
+- At one CPU a node, the ledger session stopped on every replica at a checkpoint (`native session
+  checkpoint: native Core checkpoint: native codec capacity exceeded`) after admitting work, and
+  the run then waited without end. A session must refuse at admission, never stop at a
+  checkpoint. Admission projects the checkpoint's rows and bytes but not its encoder's work
+  bound. Not yet reproduced off the runner: open.
+
+**focal's replicated write is slow.** Three local processes on an Apple-silicon Mac (macOS's full
+flush, which costs more than Linux's fdatasync), enrolled over QUIC, unloaded (20/s, 2 callers):
+p50 42 ms, p99 114 ms. At 1,000/s offered, 10 paced callers achieved 124/s. The competitors' p50
+on the runners was 2.4–5 ms. A floor of tens of milliseconds at low load is a cost in the
+request's path, not the disk's or the network's, and it is the first thing to find and remove.
+
+**A session's open claims are bounded** (about 11,800 authored claims before admission refuses,
+`native owner memory`). The competitors append to a log without state. focal's write is a
+claim's state transition, which stays open until it is closed, so a long run at a high rate
+fills one session. The comparison will state focal's unit plainly and spread load over sessions
+as a deployment would, never hide the bound.
+
