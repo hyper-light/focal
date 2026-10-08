@@ -71,11 +71,14 @@ EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
-      exec -T focal-load focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
+      exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
+      focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
       evidence
       exit 1
     fi
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
+    # Each write's intended start and latency, for where its tail falls in time.
+    dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
     ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
   nats) endpoints=nats1:4222,nats2:4222,nats3:4222 ;;
