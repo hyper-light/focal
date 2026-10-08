@@ -5878,3 +5878,87 @@ async fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
     server.close();
     task.await.unwrap().unwrap();
 }
+
+/// A peer whose process stalls for longer than a request's deadline keeps its
+/// connections: the request that waited ends at its deadline, and the next
+/// one on the same connection is served once the stall is over. The stall is
+/// the server's whole runtime blocked, endpoint and all, as a starved
+/// scheduler blocks it; the connection's liveness is its own idle bound,
+/// never the request timeout (a busy machine lost every connection it held to
+/// a half-second stall when the two were one, 2026-10-07).
+#[tokio::test]
+async fn a_stall_past_the_request_deadline_keeps_the_connection() {
+    const DEADLINE: Duration = Duration::from_millis(300);
+    let short = WireLimits {
+        request_timeout: DEADLINE,
+        ..Default::default()
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let (server_certificate, server_key) = pki.issue(true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &short,
+    )
+    .unwrap();
+    let (address_tx, address_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_limits = short.clone();
+    let serving = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let server = Arc::new(
+                QuicServer::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                    tls,
+                    registry,
+                    server_limits,
+                    budget(),
+                )
+                .unwrap(),
+            );
+            address_tx.send(server.local_addr().unwrap()).unwrap();
+            let handler: Arc<dyn RequestHandler> =
+                Arc::new(|verified: VerifiedRequest| async move {
+                    if verified.request().request_id == RequestId::from_u128(1) {
+                        // The whole runtime stalls: nothing of this process runs.
+                        std::thread::sleep(DEADLINE * 3);
+                    }
+                    response(verified.request())
+                });
+            let running = server.clone();
+            let task = tokio::spawn(async move { running.serve(handler).await });
+            let _ = stop_rx.await;
+            server.close();
+            let _ = task.await;
+        });
+    });
+    let address = address_rx.recv().unwrap();
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &short,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, short).unwrap();
+    let remote = connector.connect(address, "localhost").await.unwrap();
+    assert!(remote.request(&request(0)).await.is_ok());
+    // The stalled request ends at its deadline, not with its connection.
+    assert!(remote.request(&request(1)).await.is_err());
+    tokio::time::sleep(DEADLINE * 3).await;
+    assert!(!remote.closed(), "the connection outlived the stall");
+    assert!(
+        remote.request(&request(2)).await.is_ok(),
+        "the same connection serves once the stall is over"
+    );
+    let _ = stop_tx.send(());
+    serving.join().unwrap();
+}
