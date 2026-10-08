@@ -191,8 +191,10 @@ fn inside(key_file: &Path, data_dir: &Path) -> Result<bool, SealSetupError> {
     Ok(resolved.starts_with(&data))
 }
 
-/// Makes the root key file: a new owner-only file of 32 random bytes, durable with its directory.
-fn make_key_file(path: &Path) -> Result<(), SealSetupError> {
+/// Makes a root key file at `path`: a new owner-only file of 32 random bytes, durable with its
+/// directory, never over a file that is there. What a node makes at its first start, and what an
+/// operator makes for a deployment that keeps the key in a secret store (29 §10).
+pub fn create_root_key(path: &Path) -> Result<(), SealSetupError> {
     let fail = |source| SealSetupError::KeyFile {
         path: path.to_path_buf(),
         source,
@@ -334,7 +336,7 @@ pub fn open_or_create(data_dir: &Path, key_file: &Path) -> Result<NodeKeys, Seal
             source,
         })?
     {
-        make_key_file(key_file)?;
+        create_root_key(key_file)?;
     }
     create(data_dir, key_file)
 }

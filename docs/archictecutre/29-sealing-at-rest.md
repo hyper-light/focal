@@ -161,3 +161,34 @@ file and a wrong key are each refused, typed, and never served.
   - another node's keys do not open a group's files;
   - the crash cut at every operation of a rewrite still leaves the old file or the new;
   - the conversion writes and verifies sealed group files.
+
+## 10. The root key in deployments (a blocker for the storage fence)
+
+The default key path (§2) is right on a laptop or a VM, where the user's configuration
+directory persists across restarts. In a container it is wrong. A container's home is its writable
+layer, which is gone when the pod or container is recreated. The node then refuses to start
+(`MissingKey`, correctly), and its sealed data cannot be read. The defect is latent: the node's
+capability level (2) is below the storage level (4), so no node reaches the sealed shell yet. The
+fence must not open until every rendered deployment gives the node a persistent key.
+
+- **Kubernetes.** The renderer emits:
+  - a Secret holding one key per pod (`<pod>.key`), made by a keys script beside the invitations
+    script with `focal create root-key`;
+  - an init container that copies the pod's key from the Secret mount into a memory-backed
+    `emptyDir` (`medium: Memory`) as a file owned by the pod's user, mode 0600;
+  - `node.root_key` pointing at that file.
+
+  A Secret volume is owned by root and readable by `fsGroup`, which focal's owner-only check
+  refuses for a non-root process. The copy keeps the key off every disk inside the pod, which is
+  also how Vault's agent injector hands secrets over. Kubernetes stores Secrets in etcd, encrypted
+  at rest where the cluster's `EncryptionConfiguration` enables it.
+- **systemd.** The unit takes the key by `LoadCredentialEncrypted=focal-root-key:…`
+  (systemd-creds, sealed to the host's TPM 2.0 where it has one), and `node.root_key` names
+  `$CREDENTIALS_DIRECTORY/focal-root-key`. systemd makes that file owner-only and keeps it
+  in memory.
+- **Docker and compose.** The key is a mounted secret (`/run/secrets/…`), copied at entry into an
+  owner-only memory file as on Kubernetes.
+- **Laptops and VMs** keep §2's default.
+
+The renderer's goldens change with this, and each deployment test (DC01–DC20) restarts a node
+across a container's recreation and reads its sealed data back.

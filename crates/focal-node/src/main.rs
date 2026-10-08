@@ -57,6 +57,18 @@ struct Args {
     #[command(subcommand)]
     command: Commands,
 }
+/// What `create` makes.
+#[derive(Subcommand)]
+enum CreateCommand {
+    /// A node's root key (29 §10): 32 random bytes in a new owner-only file at `--output`,
+    /// never over a file that is there. Keep it in the deployment's secret store and name it in
+    /// `node.root_key`; never inside the data directory.
+    RootKey {
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Save and select authenticated client connections independently of node enrollment.
@@ -113,6 +125,12 @@ enum Commands {
     PrepareVolume {
         #[arg(long)]
         owner: String,
+    },
+    /// Make something a deployment keeps outside the node: `create root-key --output FILE` makes
+    /// a node's root key (29 §10), 32 random bytes in a new owner-only file, for a secret store.
+    Create {
+        #[command(subcommand)]
+        command: CreateCommand,
     },
     /// Run/resume the real claim/testament/validator example with exclusive local ownership.
     Demo,
@@ -323,6 +341,15 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             runtime.block_on(start(settings))
         }
         Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
+        Commands::Create {
+            command: CreateCommand::RootKey { output },
+        } => {
+            focal_seal::create_root_key(&output)?;
+            print_json(&serde_json::json!({
+                "condition": "Created",
+                "root_key": output,
+            }))
+        }
         Commands::Diagnose { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
             cli::cluster::diagnose(runtime, &selected, command)
