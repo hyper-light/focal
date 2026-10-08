@@ -15,7 +15,14 @@ done
 HOSTS="focal-b-0 focal-c-0"
 FILES=""
 for host in $HOSTS; do
-  kubectl -n "$NAMESPACE" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal cluster invite --node "$host" --output - > "$host.invite"
+  # Its ledger service may answer after the founder leads (a refusal typed
+  # unavailable, exit 6, retryable): asked again, bounded.
+  n=0
+  until kubectl -n "$NAMESPACE" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal cluster invite --node "$host" --output - > "$host.invite"; do
+    n=$((n + 1))
+    if [ "$n" -ge 60 ]; then echo "no invitation for $host" >&2; exit 1; fi
+    sleep 2
+  done
   FILES="$FILES --from-file=$host.invite=$host.invite"
 done
 kubectl -n "$NAMESPACE" delete secret "$SECRET" --ignore-not-found

@@ -379,7 +379,7 @@ fn invitations_script(namespace: &str, secret: &str, hosts: &[String]) -> String
     out.push_str("n=0\nuntil kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal diagnose node --probe authoritative >/dev/null 2>&1; do\n  n=$((n + 1))\n  if [ \"$n\" -ge 150 ]; then echo \"focal-founder-0 never led its root\" >&2; exit 1; fi\n  sleep 2\ndone\n");
     out.push_str("HOSTS=\"");
     out.push_str(&hosts.join(" "));
-    out.push_str("\"\nFILES=\"\"\nfor host in $HOSTS; do\n  kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal cluster invite --node \"$host\" --output - > \"$host.invite\"\n  FILES=\"$FILES --from-file=$host.invite=$host.invite\"\ndone\nkubectl -n \"$NAMESPACE\" delete secret \"$SECRET\" --ignore-not-found\n# shellcheck disable=SC2086\nkubectl -n \"$NAMESPACE\" create secret generic \"$SECRET\" $FILES\nrm -f -- *.invite\n");
+    out.push_str("\"\nFILES=\"\"\nfor host in $HOSTS; do\n  # Its ledger service may answer after the founder leads (a refusal typed\n  # unavailable, exit 6, retryable): asked again, bounded.\n  n=0\n  until kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal cluster invite --node \"$host\" --output - > \"$host.invite\"; do\n    n=$((n + 1))\n    if [ \"$n\" -ge 60 ]; then echo \"no invitation for $host\" >&2; exit 1; fi\n    sleep 2\n  done\n  FILES=\"$FILES --from-file=$host.invite=$host.invite\"\ndone\nkubectl -n \"$NAMESPACE\" delete secret \"$SECRET\" --ignore-not-found\n# shellcheck disable=SC2086\nkubectl -n \"$NAMESPACE\" create secret generic \"$SECRET\" $FILES\nrm -f -- *.invite\n");
     out
 }
 fn stateful_set(

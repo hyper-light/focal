@@ -13,7 +13,7 @@ on:
     inputs:
       rates:
         description: "Offered records a second, space-separated"
-        default: "200 1000 4000"
+        default: "100 200 1000 4000"
       seconds:
         description: "Seconds measured per run"
         default: "60"
@@ -76,7 +76,7 @@ jobs:
         env:
           NODE_CPUS: "1"
         run: |
-          for rate in ${{ github.event.inputs.rates || '200 1000 4000' }}; do
+          for rate in ${{ github.event.inputs.rates || '100 200 1000 4000' }}; do
             bash tools/compare/compose/run.sh "${{ matrix.system }}" "$rate" \
               "${{ github.event.inputs.seconds || '60' }}" \
               "${{ github.event.inputs.warmup || '15' }}" \

@@ -26,8 +26,12 @@ authoritative() { $DC exec -T "$1" focal --data-dir /data diagnose node --probe 
 
 retry 300 serving focal1
 retry 300 authoritative focal1
+# The founder may lead its root before its ledger service answers (a refusal
+# typed `unavailable`, exit 6, retryable): each invitation is asked again,
+# bounded, until it is written.
+invite() { f1 cluster invite --node "$1" --output "/invite/$1.invite" >/dev/null; }
 for host in focal2 focal3; do
-  f1 cluster invite --node "$host" --output "/invite/$host.invite"
+  retry 120 invite "$host"
 done
 retry 300 serving focal2
 retry 300 serving focal3
