@@ -75,9 +75,10 @@ impl SealRecord {
         bytes.extend_from_slice(&self.bundle.0);
         bytes.extend_from_slice(&self.bytes.to_le_bytes());
         bytes.extend_from_slice(&self.count.to_le_bytes());
-        let principals =
-            u64::try_from(self.bound.principals).map_err(|_| NativeSessionError::Capacity)?;
-        let rows = u64::try_from(self.bound.rows).map_err(|_| NativeSessionError::Capacity)?;
+        let principals = u64::try_from(self.bound.principals)
+            .map_err(|_| NativeSessionError::Capacity("seal principals"))?;
+        let rows = u64::try_from(self.bound.rows)
+            .map_err(|_| NativeSessionError::Capacity("seal rows"))?;
         bytes.extend_from_slice(&principals.to_le_bytes());
         bytes.extend_from_slice(&rows.to_le_bytes());
         bytes.extend_from_slice(&self.outcome_limit.to_le_bytes());
@@ -101,7 +102,8 @@ impl SealRecord {
                 bytes.extend_from_slice(&[0u8; 8 + 8 + 32 + 8]);
             }
         }
-        let floors = u32::try_from(self.floors.len()).map_err(|_| NativeSessionError::Capacity)?;
+        let floors = u32::try_from(self.floors.len())
+            .map_err(|_| NativeSessionError::Capacity("seal floors"))?;
         bytes.extend_from_slice(&floors.to_le_bytes());
         for (principal, minimum) in &self.floors {
             if principal.is_zero() || minimum.0 == 0 {

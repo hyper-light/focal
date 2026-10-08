@@ -43,10 +43,11 @@ impl MovementRecord {
     pub fn encode(&self) -> Result<Vec<u8>, NativeSessionError> {
         let body =
             postcard::to_allocvec(&self.operation).map_err(|_| NativeSessionError::Corrupt)?;
-        let length = u32::try_from(body.len()).map_err(|_| NativeSessionError::Capacity)?;
+        let length = u32::try_from(body.len())
+            .map_err(|_| NativeSessionError::Capacity("movement record"))?;
         let total = add(add(HEAD, body.len())?, 32)?;
         if total > MAX_RECORD_BYTES {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("movement record"));
         }
         let mut bytes = reserved::<u8>(total)?;
         bytes.extend_from_slice(&MAGIC);
@@ -316,7 +317,7 @@ impl Movement {
         budget: MemoryBudget,
     ) -> Result<Self, NativeSessionError> {
         if bytes.len() > limits.max_checkpoint_bytes {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("movement checkpoint"));
         }
         let (state, rest): (RangeCheckpoint, _) =
             postcard::take_from_bytes(bytes).map_err(|_| NativeSessionError::Corrupt)?;
@@ -340,7 +341,7 @@ impl Movement {
         let state = self.coordinator.checkpoint();
         let bytes = postcard::to_allocvec(state).map_err(|_| NativeSessionError::Corrupt)?;
         if bytes.len() > self.limits.max_checkpoint_bytes {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("movement checkpoint"));
         }
         Ok(bytes)
     }
@@ -375,7 +376,7 @@ impl Movement {
             generation: parent
                 .generation
                 .checked_add(1)
-                .ok_or(NativeSessionError::Capacity)?,
+                .ok_or(NativeSessionError::Capacity("range generation"))?,
             span: KeySpan {
                 start: parent.span.start,
                 end: Some(key),
@@ -416,7 +417,7 @@ impl Movement {
             generation: left_range
                 .generation
                 .checked_add(1)
-                .ok_or(NativeSessionError::Capacity)?,
+                .ok_or(NativeSessionError::Capacity("range generation"))?,
             span: KeySpan {
                 start: left_range.span.start,
                 end: right_range.span.end,

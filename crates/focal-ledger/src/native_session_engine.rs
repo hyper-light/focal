@@ -131,7 +131,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             || limits.recovery.native.pending == 0
             || limits.frame_bytes == 0
         {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("session limits"));
         }
         // Validate the derived decode limits once; every frame reuses them.
         input_codec::NativeDecodeLimits::for_native(
@@ -150,9 +150,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let mut pending = VecDeque::new();
         pending
             .try_reserve_exact(count)
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("pending candidates"))?;
         if pending.capacity() > count {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("pending candidates"));
         }
         let core = match profile {
             NativeContentProfile::ProjectionOnly => {
@@ -295,7 +295,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::RangeMoving);
         }
         if !self.pending.is_empty() || self.delivery.is_some() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity(
+                "pending work before a movement",
+            ));
         }
         let core = self.committed_core()?;
         let layout = core.native_layout();
@@ -373,7 +375,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             // per chunk (which was O(n^2) in reallocations).
             chunks
                 .try_reserve_exact(manifest.len())
-                .map_err(|_| NativeSessionError::Capacity)?;
+                .map_err(|_| NativeSessionError::Capacity("checkpoint chunks"))?;
             for chunk in manifest.chunks() {
                 let chunk = chunk?;
                 chunks.push(chunk.hash);
@@ -409,7 +411,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::RangeMoving);
         }
         if !self.pending.is_empty() || self.delivery.is_some() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity(
+                "pending work before a movement",
+            ));
         }
         Ok(())
     }
@@ -427,7 +431,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .check_retirement_outcome()
             .map_err(NativeSessionError::Retirement)?;
         owner.check_retirement().map_err(|error| match error {
-            NativeOwnerError::PendingCandidates => NativeSessionError::Capacity,
+            NativeOwnerError::PendingCandidates => {
+                NativeSessionError::Capacity("pending candidates before retirement")
+            }
             NativeOwnerError::Native(NativeError::Capacity(_)) => NativeSessionError::Retirement(
                 focal_core::native::retirement::RetirementRefusal::OutcomesReserved,
             ),
@@ -482,7 +488,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .into());
         }
         let outcome_limit = u64::try_from(self.limits.recovery.native.outcomes)
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("outcome limit"))?;
         let record = super::retirement::RetirementRecord {
             ledger: self.ledger,
             expected_prefix: prefix,
@@ -554,13 +560,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             through: plan.through,
             bundle,
             bytes,
-            count: u64::try_from(plan.rows()).map_err(|_| NativeSessionError::Capacity)?,
+            count: u64::try_from(plan.rows())
+                .map_err(|_| NativeSessionError::Capacity("seal rows"))?,
             bound: focal_core::native::seal::SealBound {
                 principals: plan.principals.len().max(1),
                 rows: plan.rows(),
             },
             outcome_limit: u64::try_from(self.limits.recovery.native.outcomes)
-                .map_err(|_| NativeSessionError::Capacity)?,
+                .map_err(|_| NativeSessionError::Capacity("outcome limit"))?,
             floors,
             fold,
         };
@@ -595,7 +602,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Sealing);
         }
         if !self.pending.is_empty() || self.delivery.is_some() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("pending work before a seal"));
         }
         let sequence = self.sequence()?;
         let pinned = self.committed_core()?.native_stats().pinned_snapshots;
@@ -612,7 +619,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .checkpoint()
             .control_ordinal
             .checked_add(1)
-            .ok_or(NativeSessionError::Capacity)?;
+            .ok_or(NativeSessionError::Capacity("control ordinal"))?;
         let prepared = movement.coordinator.prepare(
             ordinal,
             sequence,
@@ -799,7 +806,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         bound: usize,
     ) -> Result<(), NativeSessionError> {
         if self.parked_reads.len() >= bound {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("parked reads"));
         }
         if self.parked_charge.is_none() {
             let permit = self.budget.reserve(
@@ -809,7 +816,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             )?;
             self.parked_reads
                 .try_reserve_exact(bound)
-                .map_err(|_| NativeSessionError::Capacity)?;
+                .map_err(|_| NativeSessionError::Capacity("parked reads"))?;
             self.parked_charge = Some(permit.commit());
         }
         let mut context = reserved(barrier.context.len())?;
@@ -918,9 +925,18 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     return Err(error);
                 }
             };
-            if full || !headroom || !self.checkpointable()? {
+            let refused = if full {
+                Some("pending candidates")
+            } else if !headroom {
+                Some("disk headroom")
+            } else if !self.checkpointable()? {
+                Some("checkpoint: the root with its candidates past what a checkpoint holds")
+            } else {
+                None
+            };
+            if let Some(bound) = refused {
                 self.discard_candidate(candidate)?;
-                return Err(NativeSessionError::Capacity);
+                return Err(NativeSessionError::Capacity(bound));
             }
         }
         self.submit_staged(consensus, staged, status.term)
@@ -968,7 +984,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.disk_sample = Some(
                 consensus
                     .disk_available_bytes()
-                    .map_err(|_| NativeSessionError::Capacity)?,
+                    .map_err(|_| NativeSessionError::Capacity("disk sample"))?,
             );
             self.admissions_since_sample = 0;
         }

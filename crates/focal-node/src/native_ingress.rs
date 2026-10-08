@@ -159,6 +159,16 @@ pub(crate) fn failure(error: LedgerError) -> Result<NativeMutationReply, AccessE
     match error {
         LedgerError::Native(error) => match refusal(&error) {
             Some(refusal) => Ok(NativeMutationReply::Refused(refusal)),
+            // A bound refused: nothing was admitted, and the client keeps the exact frame
+            // for its retry, as for a bare capacity refusal; the refusal says which bound
+            // it was (the session's, the owner's memory, the proposal queue), so an operator
+            // reads it where it was an unnamed `capacity`.
+            None if error.class() == FailureClass::Retryable => {
+                Ok(NativeMutationReply::Refused(NativeRefusal {
+                    kind: NativeRefusalKind::Capacity,
+                    detail: error.to_string(),
+                }))
+            }
             None => Err(match error.class() {
                 FailureClass::Retryable => AccessError::Capacity,
                 FailureClass::Authority | FailureClass::FailClosed => AccessError::Unavailable,

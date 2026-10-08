@@ -499,6 +499,13 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
         &["request", "inspect", "--operation-id", &refused_id],
     );
     assert_eq!(inspected["condition"], "Pending", "{inspected}");
+    assert_eq!(inspected["result"]["code"], "capacity", "{inspected}");
+    assert!(
+        inspected["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("native session capacity: ")),
+        "the refusal names its bound: {inspected}"
+    );
     let (code, refused_again) = failed(
         root,
         None,

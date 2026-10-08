@@ -742,7 +742,7 @@ fn disk_headroom_watermark_refuses_fresh_admission_but_answers_exact_retries() {
     let before = session.budget_for_test().stats();
     assert!(matches!(
         session.propose(context(), create(2, 2)),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     assert_eq!(session.pending_count(), 0);
     assert_eq!(session.budget_for_test().stats(), before);
@@ -1272,7 +1272,7 @@ fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
         }
     };
     assert!(
-        matches!(refused, NativeSessionError::Capacity),
+        matches!(refused, NativeSessionError::Capacity(_)),
         "{refused:?}"
     );
     assert_eq!(refused.class(), FailureClass::Retryable);

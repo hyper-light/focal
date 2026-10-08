@@ -741,14 +741,14 @@ pub(super) fn inspect(
     match (operation.receipt, &operation.refusal) {
         (Some(receipt), _) => render_committed(&operation, &receipt, format),
         (None, Some(refusal)) => {
+            // A capacity refusal admitted nothing and the exact frame stays journaled for a
+            // retry: the request is still pending, refused for the reason it names.
             let classified = failure::native(refusal);
-            render_failure(
-                &operation,
-                classified.condition,
-                classified,
-                &refusal.detail,
-                format,
-            )
+            let condition = match refusal.kind {
+                NativeRefusalKind::Capacity => "Pending",
+                _ => classified.condition,
+            };
+            render_failure(&operation, condition, classified, &refusal.detail, format)
         }
         (None, None) => render_failure(
             &operation,

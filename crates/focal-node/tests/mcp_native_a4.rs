@@ -555,7 +555,17 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
         claim_document(&alice_id, "Refused under pressure."),
     );
     assert_eq!(condition, "Error", "{refused}");
-    assert_eq!(refused["result"]["code"], "capacity", "{refused}");
+    assert_eq!(refused["result"]["kind"], "native_refused", "{refused}");
+    assert_eq!(
+        refused["result"]["refusal"]["kind"], "Capacity",
+        "{refused}"
+    );
+    assert!(
+        refused["result"]["refusal"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("native session capacity: ")),
+        "the refusal names its bound: {refused}"
+    );
     let refused_id = refused["operation_id"].as_str().unwrap().to_string();
     assert_eq!(sequence(root), before);
     let retried = issuer.call("request.retry", json!({"operation_id": post_id}));
@@ -572,6 +582,10 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
     );
     let inspected = issuer.call("request.inspect", json!({"operation_id": refused_id}));
     assert_eq!(inspected["condition"], "Pending", "{inspected}");
+    assert_eq!(
+        inspected["result"]["refusal"], refused["result"]["refusal"],
+        "the pending request keeps the reason it was refused: {inspected}"
+    );
     assert_eq!(sequence(root), before);
     drop(server);
     let server = start(root, &advertise);

@@ -1187,7 +1187,7 @@ fn committed_layout_changes_apply_on_every_replica_and_fence_proposals() {
     };
     assert!(matches!(
         cluster.node(1).propose_layout(split_one),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     for _ in 0..8 {
         cluster.pump(&[]);
@@ -1909,7 +1909,7 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
         cluster
             .node(1)
             .propose_retirement(root, bundle, length, through),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     for _ in 0..8 {
         cluster.pump(&[]);
@@ -2163,7 +2163,7 @@ fn committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generati
     };
     assert!(matches!(
         cluster.node(1).propose_seal(&plan, bundle, length, None),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     for _ in 0..8 {
         cluster.pump(&[]);
