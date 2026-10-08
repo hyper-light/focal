@@ -1,0 +1,116 @@
+name: Competitive tail latency
+
+# docs/qualification/competitive-p99.md: focal, Kafka, NATS JetStream and Redis
+# on equal terms, every acknowledged write on disk at a quorum, on a Linux
+# runner whose fsync reaches its disk (Docker Desktop's VM does not). Run by
+# hand: each system is three containers at one CPU each beside the generator.
+on:
+  workflow_dispatch:
+    inputs:
+      rates:
+        description: "Offered records a second, space-separated"
+        default: "1000 4000"
+      seconds:
+        description: "Seconds measured per run"
+        default: "60"
+      warmup:
+        description: "Seconds sent and not measured, first"
+        default: "15"
+      payload:
+        description: "Bytes of each competitor record"
+        default: "128"
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-buildx-action@v3
+      # The node, focal-load and focal-compare, built as the release's musl lane
+      # builds them (tools/compare/compose/focal.Dockerfile).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/compare/compose/focal.Dockerfile
+          tags: focal:bench
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker save focal:bench | zstd -T0 -3 > focal-bench.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: focal-bench-image
+          path: focal-bench.tar.zst
+          retention-days: 3
+
+  measure:
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        system: [focal, kafka, nats, redis]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: focal-bench-image
+      - run: zstd -dc focal-bench.tar.zst | docker load
+      - name: The disk the runs write to
+        run: |
+          df -h /var/lib/docker || df -h /
+          lsblk -o NAME,ROTA,SIZE,MODEL || true
+          # 500 synchronous 4 KiB writes: whether fsync reaches the device here.
+          dd if=/dev/zero of=/tmp/dsync bs=4k count=500 oflag=dsync 2>&1 | tail -1
+          rm -f /tmp/dsync
+      - name: Runs
+        env:
+          NODE_CPUS: "1"
+        run: |
+          for rate in ${{ github.event.inputs.rates || '1000 4000' }}; do
+            bash tools/compare/compose/run.sh "${{ matrix.system }}" "$rate" \
+              "${{ github.event.inputs.seconds || '60' }}" \
+              "${{ github.event.inputs.warmup || '15' }}" \
+              "${{ github.event.inputs.payload || '128' }}" reports
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-${{ matrix.system }}
+          path: tools/compare/compose/reports
+
+  table:
+    needs: measure
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*
+          path: reports
+          merge-multiple: true
+      - name: One table, every system
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, glob, os
+          rows = []
+          for path in sorted(glob.glob("reports/*.json")):
+              r = json.load(open(path))
+              name = os.path.basename(path)[:-5]
+              if "latency_ns" in r:  # focal-load
+                  l = r["latency_ns"]; us = lambda v: v / 1000
+                  rows.append((name, r["shape"].get("rate"), r["committed"], r["refused"] + r["unknown"],
+                               us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])))
+              else:  # focal-compare
+                  rows.append((name, r["offered_per_second"], r["acknowledged"], r["failed"] + r["refused_by_generator"],
+                               r["p50_us"], r["p99_us"], r["p999_us"], r["max_us"]))
+          print("| run | offered/s | acknowledged | failed or refused | p50 µs | p99 µs | p99.9 µs | max µs |")
+          print("|---|---|---|---|---|---|---|---|")
+          for row in rows:
+              print("| " + " | ".join(f"{v:,.0f}" if isinstance(v, float) else str(v) for v in row) + " |")
+          PY

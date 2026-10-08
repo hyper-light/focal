@@ -821,6 +821,9 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
+    // Requests whose intended start falls in the warm-up are sent, never measured.
+    let warmup = u128::from(shape.warmup_ms).saturating_mul(1_000_000);
+    writes.samples.retain(|(start, _)| *start >= warmup);
     let (latency_ns, first_half, second_half) = halves(&mut writes.samples)?;
     let mut refusals = Vec::new();
     for outcome in &write_outcomes {

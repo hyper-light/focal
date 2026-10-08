@@ -86,6 +86,12 @@ pub struct WorkloadShape {
     /// as it is answered (closed loop).
     #[serde(default)]
     pub rate: Option<u64>,
+    /// Milliseconds from the phase's start whose requests are sent and not
+    /// measured: connections, handshakes and caches warm, as the comparison's
+    /// generator excludes its warm-up from every competitor's percentiles
+    /// (docs/qualification/competitive-p99.md). Zero (the default) measures all.
+    #[serde(default)]
+    pub warmup_ms: u64,
     /// `embedded` only: after the run, close the node and reopen the same
     /// directory, timing exec-to-serving and the first linearizable read —
     /// single-node recovery at exactly this run's retained size.

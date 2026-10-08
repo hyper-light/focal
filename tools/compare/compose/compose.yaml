@@ -6,8 +6,10 @@
 # One system at a time: `docker compose --profile nats up -d`.
 # focal: `docker build -f focal.Dockerfile -t focal:bench ../../..`, then
 # `docker compose --profile focal up -d` and `sh focal-bootstrap.sh`.
+# NODE_CPUS (default 2) is every container's CPU share alike: a 4-vCPU CI
+# runner gives three nodes and the generator one each.
 x-limits: &limits
-  cpus: "2"
+  cpus: "${NODE_CPUS:-2}"
   mem_limit: 2g
   cap_add: [NET_ADMIN]
   networks: [bench]
@@ -107,7 +109,16 @@ services:
     image: focal:bench
     profiles: [focal]
     command: ["sleep", "86400"]
-    volumes: ["./focal-target.yaml:/etc/focal/target.yaml:ro", "invites:/invite", "focal-client:/client"]
+    volumes: ["./focal-target.yaml:/etc/focal/target.yaml:ro", "invites:/invite", "focal-client:/client", "reports:/reports"]
+
+  # The competitors' generator (focal-compare), on the bench network as
+  # focal's own is, in the image focal.Dockerfile builds.
+  generator:
+    <<: *limits
+    image: focal:bench
+    profiles: [nats, kafka, redis]
+    command: ["sleep", "86400"]
+    volumes: ["reports:/reports"]
 
 networks:
   bench: {}
@@ -118,3 +129,4 @@ volumes:
   focal3: {}
   invites: {}
   focal-client: {}
+  reports: {}
