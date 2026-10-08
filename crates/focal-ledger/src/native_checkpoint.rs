@@ -40,6 +40,14 @@ pub enum Error {
     Invalid(&'static str),
     #[error("native Core checkpoint: {0}")]
     Core(#[from] record_codec::CodecError),
+    /// The root is past one of the checkpoint's bounds, named with its value and its limit: what
+    /// a session's admission must have projected, so a checkpoint never refuses what it admitted.
+    #[error("native Core checkpoint: {value} {bound} past the bound of {limit}")]
+    Exceeded {
+        bound: &'static str,
+        value: usize,
+        limit: usize,
+    },
     #[error("native Session checkpoint memory: {0}")]
     Memory(#[from] MemoryError),
     #[error("checkpoint output refused")]
@@ -48,6 +56,34 @@ pub enum Error {
     Seeded,
     #[error("checkpoint seed store: {0}")]
     Seeds(#[from] ContentError),
+}
+
+/// Which of the encoder's bounds the root `core` is past, measured again with none: on the failure
+/// path only, a walk of the root its memory budget already bounds.
+fn exceeded(core: &Core<NativeState>, limits: record_codec::EncodingLimits) -> Error {
+    let unbounded = record_codec::EncodingLimits {
+        bytes: usize::MAX,
+        visits: usize::MAX,
+        rows: usize::MAX,
+    };
+    let quote = match root::EncodingPlan::prepare(core, unbounded) {
+        Ok(plan) => plan.quote(),
+        Err(error) => return Error::Core(error),
+    };
+    let (bound, value, limit) = if quote.rows > limits.rows {
+        ("rows", quote.rows, limits.rows)
+    } else if quote.bytes > limits.bytes {
+        ("bytes", quote.bytes, limits.bytes)
+    } else if quote.visits > limits.visits {
+        ("visits", quote.visits, limits.visits)
+    } else {
+        return Error::Core(record_codec::CodecError::Capacity);
+    };
+    Error::Exceeded {
+        bound,
+        value,
+        limit,
+    }
 }
 
 /// One sealed chunk of a seeded checkpoint's Core root.
@@ -279,14 +315,17 @@ impl<'a> EncodingPlan<'a> {
         if movement.is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes) {
             return Err(Error::Invalid("movement section"));
         }
-        let core = root::EncodingPlan::prepare(
-            core,
-            record_codec::EncodingLimits {
-                bytes: limits.inline_bytes.max(limits.assembled_bytes),
-                visits: limits.visits,
-                rows: limits.rows,
-            },
-        )?;
+        let encoding = record_codec::EncodingLimits {
+            bytes: limits.inline_bytes.max(limits.assembled_bytes),
+            visits: limits.visits,
+            rows: limits.rows,
+        };
+        let root = core;
+        let core = match root::EncodingPlan::prepare(root, encoding) {
+            Ok(plan) => plan,
+            Err(record_codec::CodecError::Capacity) => return Err(exceeded(root, encoding)),
+            Err(error) => return Err(error.into()),
+        };
         let available = limits
             .visits
             .checked_sub(core.quote().visits)

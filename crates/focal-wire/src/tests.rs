@@ -5962,3 +5962,56 @@ async fn a_stall_past_the_request_deadline_keeps_the_connection() {
     let _ = stop_tx.send(());
     serving.join().unwrap();
 }
+
+/// What one small request costs end to end over QUIC on loopback, against a
+/// handler that answers at once: the transport's own floor, which every
+/// replication hop pays. Run by hand:
+/// `cargo test -p focal-wire --release --lib loopback_round_trip -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn loopback_round_trip_floor() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> =
+        Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+    let (server, task) = server(&pki, registry, handler).await;
+    let connector = connector(&pki, certificate, key);
+    let remote = connector
+        .connect(server.local_addr().unwrap(), "localhost")
+        .await
+        .unwrap();
+    for id in 0..200u128 {
+        remote.request(&request(id)).await.unwrap();
+    }
+    let mut samples = Vec::with_capacity(2000);
+    let mut slow = Vec::new();
+    for id in 1000..3000u128 {
+        let started = std::time::Instant::now();
+        remote.request(&request(id)).await.unwrap();
+        let took = started.elapsed().as_micros();
+        if took > 1000 {
+            slow.push((id - 1000, took));
+        }
+        samples.push(took);
+    }
+    eprintln!("slow (>1 ms) requests, index and µs: {slow:?}");
+    eprintln!(
+        "streams per connection: {}",
+        limits().streams_per_connection
+    );
+    samples.sort_unstable();
+    let at = |p: f64| samples[((samples.len() - 1) as f64 * p) as usize];
+    eprintln!(
+        "loopback request/response over QUIC: p50 {} µs, p99 {} µs, p99.9 {} µs, max {} µs",
+        at(0.5),
+        at(0.99),
+        at(0.999),
+        samples[samples.len() - 1]
+    );
+    server.close();
+    task.await.unwrap().unwrap();
+}
