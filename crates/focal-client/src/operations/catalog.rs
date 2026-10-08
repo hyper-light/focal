@@ -703,6 +703,13 @@ pub struct CodeCall {
 }
 impl ApplicationResult {
     pub fn is_error(&self) -> bool {
+        // An inspected capacity refusal is a pending request with its reason:
+        // nothing was admitted and the exact frame is kept for a retry.
+        if self.condition == "Pending"
+            && matches!(&self.result, OperationOutput::NativeRefused { .. })
+        {
+            return false;
+        }
         matches!(
             &self.result,
             OperationOutput::Error { .. }

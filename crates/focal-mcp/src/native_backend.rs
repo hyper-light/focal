@@ -223,6 +223,11 @@ impl<T: ClientTransport> Backend<T> {
                 }
                 match (operation.receipt, operation.refusal) {
                     (Some(receipt), _) => Ok(committed(receipt, operation.created)),
+                    // A capacity refusal admitted nothing and the exact frame stays
+                    // journaled for a retry: still pending, refused for the reason it names.
+                    (None, Some(refusal)) if refusal.kind == NativeRefusalKind::Capacity => {
+                        Ok(("Pending", OperationOutput::NativeRefused { refusal }))
+                    }
                     (None, Some(refusal)) => Err(BackendError::NativeRefused(Box::new(refusal))),
                     (None, None) => Ok(state("Pending")),
                 }

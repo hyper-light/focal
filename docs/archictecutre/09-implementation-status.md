@@ -13936,3 +13936,84 @@ focal opens its log `PreferDirect`, which its CI and development volumes accept.
 Gates on the final tree (macOS arm64): fmt, contracts, clippy `-D warnings`, production, `cargo
 deny`, and `cargo test --workspace --locked -- --test-threads=4`: 158 test binaries, 3,138 passed,
 0 failed, 12 ignored.
+
+### 2026-10-05 — Group commit on the single-node owner: 8 callers no longer wait in line for 8 flushes
+
+Measured with `focal-load` (release, embedded, `authored_v1`, 2,000 creations, seeds
+1–3, macOS arm64 with the host otherwise busy), 8 concurrent callers committed no more
+than 1 did: about 73 commits a second either way, with the 8 callers' p50 at 105 ms
+(p99 119–476 ms) against 12.8 ms for 1. Sampling the run showed the cause. The
+session-owner thread spent 97% of its time in `admit_local` → `Session::poll` →
+`WalAppend::wait_blocking`: each native admission proposed its frame and then waited
+for that frame's own flush before the owner took the next request. The WAL writer
+already groups every batch queued with it into one fence (up to 64), but it was never
+given more than one. Each flush is the segment's `fsync` plus the fence's install
+(write, `fsync`, rename, directory `fsync`), about 13 ms here.
+
+The replicated owner (`fleet.rs`) already parks a request with a deadline and answers it
+when its commit arrives. The single-node owner (`LocalHost`, which `focal start` and the
+embedded transport use) now does the same for native mutations. A fresh proposal is
+parked with its reply header, answer channel and charge. The owner takes every queued
+request before it waits on the log, so the frames that arrive during one flush are
+proposed before the next and share it: group commit (DeWitt et al., *Implementation
+Techniques for Main Memory Database Systems*, SIGMOD 1984; Raft thesis §10.2.1 on
+batching). Each parked proposal is answered on its commit, or with its ticket after
+`COMMIT_POLLS` (8) owner polls, the budget a lone proposal had before. Parked proposals
+are bounded by the ingress queue's own bound (`INGRESS`, 32). With that many parked, the
+owner waits on the log before it takes another request, so a slow disk slows callers and
+grows no queue. Stop and a closed ingress answer every parked proposal first.
+
+After, same runs: 1 caller 75 commits/s (p50 12.8 ms, unchanged), 8 callers 503–512
+commits/s (6.9×), p50 15.7 ms, p99 16.9–17.7 ms.
+`proposals_taken_before_one_poll_share_its_flush` dispatches 8 fresh frames on one
+owner, settles them, and asserts all 8 commit in exactly one group commit; before, each
+dispatch polled its own.
+
+### 2026-10-05 — A dropped proposal ended a node's service; the core's refusal now says why
+
+CI on 3113638 (Linux, push run) failed `a_crowded_partition_splits_survives_a_restart_and_merges_back`
+waiting for the merge back to one delegation. One node's service had ended with
+`Directory(Control(Consensus(Raft(ProposalDropped))))`. hyper-raft answers one
+`ProposalDropped` for several causes: a member that does not lead, a leader handing over its
+leadership or no longer a member of what it leads, a leader whose uncommitted entries fill its
+bound. focal passed it through as an untyped `Raft` error. The control RPC answers those as
+`Failed`, and the directory's startup, which runs fail-stop in its owner's thread, ended the
+owner and then the service. The pull-request run of the same commit passed, and 30 runs,
+three at a time, did not reproduce it, so which cause fired here is not known. The fix does not
+depend on it:
+
+- `core_state::proposal_refused` names the cause from the core's own state: `NotLeader { leader }`,
+  `LeaderLeaving` or `Capacity`. `DurableNode`'s proposals (plain, fast track, configuration
+  change) and the shell's answers use it, so every owner gets a refusal it already retries, and
+  the next occurrence names its cause. `a_dropped_proposal_is_refused_by_its_cause` fills a
+  leader's smallest legal bound (three 512-byte entries in 1,536 bytes) and asserts `Capacity`, then
+  `LeaderLeaving` during a handover and `NotLeader` at a follower. Without the classification it
+  fails at the first.
+- The founder's re-activation in `DirectoryBootstrapPermit::open` asks again after a drain when its
+  submission is refused for something that passes as the log drains (`Capacity`,
+  `PersistencePending`, `Busy`, `NotReady`), within startup's 16 rounds. Any other refusal still
+  ends startup, now by its name. The directory bootstrap's admission map answers `LeaderLeaving`
+  as not ready, as the control RPC already did.
+
+### 2026-10-05 — Every YAML document under a stated budget, held by a contract rule
+
+Condition 6's sweep for expansion bombs. focal compresses nothing (no compression crate is in
+the [inventory](../dependencies/inventory.tsv)), so the decompression-bomb surface is what its
+decoders expand. The wire, record and input codecs already refuse declared lengths before
+allocating (R11 §3), and client inputs, deployment configuration and its schema parse YAML with
+no aliases or anchors and bounded depth, events, nodes and scalar bytes. Two sites took
+serde-saphyr's default budget, which admits 50,000 aliases and 250,000 nodes:
+
+- `focal-load`'s shape file. It also read its file with an unbounded `read_to_string` after
+  checking its length, so a file that grew in between was read whole. It now reads through the
+  bound and refuses a file that grew.
+- The MCP server's skill frontmatter. The skills are compiled in, but they are parsed as any
+  YAML focal reads.
+
+Both now parse under the shared budget. `a_shape_that_expands_by_aliases_is_refused` and
+`frontmatter_that_expands_by_aliases_is_refused` refuse a five-level alias expansion (9^5
+nodes from a few hundred bytes, the "billion laughs" shape). The shape test also shows that the
+default budget admits an anchor and alias that the stated one refuses, and the skills test fails
+without the budget. `scripts/check-contracts.py` now refuses `serde_saphyr::from_str`,
+`from_slice` and `from_reader` in production sources (an inline test module may compare against
+them), so a new site cannot take the default.

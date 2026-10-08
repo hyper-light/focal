@@ -778,7 +778,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             outcome
         };
         if output.committed.len() == output.committed.capacity() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("committed output"));
         }
         output.committed.push(NativeCommit {
             raft_index: entry.index,
@@ -852,7 +852,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let mut records = Vec::new();
         records
             .try_reserve_exact(entries.len())
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("replayed records"))?;
         let mut sequence = self.sequence()?;
         let mut recording_range = self.recording_range;
         let mut recording_term = self.recording_term;
@@ -945,7 +945,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
             let header = record.header();
             if output.committed.len() == output.committed.capacity() {
-                return Err(NativeSessionError::Capacity);
+                return Err(NativeSessionError::Capacity("committed output"));
             }
             output.committed.push(NativeCommit {
                 raft_index: entry.index,
@@ -995,7 +995,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             native_sequence: self.sequence()?,
         };
         if output.reads.len() == output.reads.capacity() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("read output"));
         }
         output.reads.push(boundary);
         Ok(())
@@ -1134,7 +1134,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     // counted, never held back with the delivery — the
                     // delivery carries the entries the parked reads wait
                     // for; new reads are refused at the request.
-                    Err(NativeSessionError::Capacity) => {
+                    Err(NativeSessionError::Capacity(_)) => {
                         self.reads_dropped = self.reads_dropped.saturating_add(1);
                     }
                     Err(error) => return Err(error),
@@ -1190,7 +1190,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         context: &[u8],
     ) -> Result<(), NativeSessionError> {
         if context.is_empty() || context.len() > 1024 {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("read context"));
         }
         let _permit = self.budget.reserve(
             BudgetKind::Pending,
@@ -1214,7 +1214,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // A copy whose parked reads are at their bound is too far behind to
         // take another: refused here, typed, not dropped when answered.
         if self.parked_reads.len() >= consensus.pending_reads() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("parked reads"));
         }
         let mut context = [0u8; 24];
         if let Some(prefix) = context.get_mut(..8) {

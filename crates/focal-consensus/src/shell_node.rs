@@ -1011,7 +1011,9 @@ impl ShellNode {
     fn heard<T>(&mut self, outcome: Result<T, ReplicaError>) -> Result<T, ConsensusError> {
         let held = self.replica.held().is_some();
         outcome.map_err(|error| match error {
-            ReplicaError::Refused(error) => ConsensusError::Raft(error),
+            ReplicaError::Refused(error) => {
+                core_state::proposal_refused(self.replica.core(), error)
+            }
             ReplicaError::Stalled if held => ConsensusError::PersistencePending,
             ReplicaError::Stalled | ReplicaError::Budget(_) => ConsensusError::Capacity,
             ReplicaError::Marked => ConsensusError::Raft(hyper_raft::Error::Lost),

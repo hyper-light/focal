@@ -25,7 +25,8 @@ fn read(node: &mut EmbeddedNode, id: u128, operation: Operation) -> ResponseEnve
         verified,
         &limits,
         &focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
-    );
+    )
+    .answered();
     validate_response(&request, &reply, None, &limits).unwrap();
     reply
 }

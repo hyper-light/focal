@@ -235,6 +235,7 @@ fn with_seals(
             }
         }
     }
+    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
     let range = match tail {
         Some(tail) => core.state.rows.plan_after(
             &core.state.budget,
@@ -280,6 +281,7 @@ fn with_seals(
             fragments: range,
             outcome,
             writes: crate::native::mutation::WriteSet::unrecorded(),
+            encoded_added,
         },
         ReportAdvance { key, before, usage },
         seals,

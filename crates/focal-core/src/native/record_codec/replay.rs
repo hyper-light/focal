@@ -610,6 +610,7 @@ pub(super) fn install(
     meters.lookup.charge(work).map_err(read_evidence::codec)?;
     // Dividing the input among a group's members takes a vector per touched
     // member beyond the one the record funded (25 §4).
+    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger)?;
     let extra = core.state.rows.input_extra_bytes(changes.len())?;
     if extra != 0 {
         let mut extra_allocation = core
@@ -662,5 +663,6 @@ pub(super) fn install(
         fragments,
         outcome: header.outcome,
         writes,
+        encoded_added,
     })
 }

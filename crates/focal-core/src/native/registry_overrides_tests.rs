@@ -502,6 +502,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         &mut allowance,
     )
     .unwrap();
+    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
     let range = core
         .state
         .rows
@@ -517,6 +518,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
+        encoded_added,
     };
     assert_eq!(core.native_sequence(), original_sequence);
     for (id, members) in &original {

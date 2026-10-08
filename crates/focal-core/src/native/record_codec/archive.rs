@@ -253,6 +253,7 @@ impl<'a> StructuralArchive<'a> {
                 state: NativeState {
                     ledger: self.header.ledger,
                     profile: self.header.profile,
+                    encoded_rows: crate::native::encoded_rows_of(&rows, self.header.ledger)?,
                     rows,
                     budget,
                 },

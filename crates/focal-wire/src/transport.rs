@@ -29,7 +29,10 @@ impl TlsIdentity {
 }
 // Quinn/rustls retain shared configurations across their internal connection
 // tasks; these Arc types are required by those libraries' public APIs.
-/// Longest silence before a QUIC connection is considered dead.
+/// Longest silence before a QUIC connection is considered dead: what the
+/// transport reclaims a vanished peer's connection by, with a keep-alive every
+/// quarter of it, so a live peer is heard from several times in every window
+/// however late its scheduler runs it. It is never a request's deadline.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most a stream is given to send ahead of what its reader has taken.
 ///
@@ -317,11 +320,18 @@ pub fn quic_transport(limits: &WireLimits) -> Result<quinn::TransportConfig, Wir
     transport.stream_receive_window(frame.into());
     transport.receive_window(quinn::VarInt::from_u64(window).map_err(|_| WireError::Limit)?);
     transport.send_window(window);
-    // A peer that died or restarted is noticed within the idle bound rather
-    // than the full request timeout: keep-alive pings hold a healthy
-    // connection open across long requests, and a silent one is closed so
-    // the next attempt reconnects instead of waiting on a dead connection.
-    let idle = limits.request_timeout.min(IDLE_TIMEOUT);
+    // The connection's liveness is its own, never a request's deadline. A
+    // request ends at its deadline (`request_timeout`) and the connection
+    // carrying it stays; keep-alive pings hold a healthy connection open, and
+    // only a peer silent for the whole idle bound is gone. A restarted peer is
+    // told sooner by its stateless reset (RFC 9000 §10.3), and node death is
+    // the membership's to decide (SWIM with Lifeguard), not the transport's.
+    // Bounding the idle period by the request timeout made a short deadline a
+    // short liveness window: a process stalled for half a second under load
+    // lost every connection it held, healthy or not (a busy machine's
+    // focal-wire run, 2026-10-07). Quinn floors the bound at three PTOs
+    // (RFC 9000 §10.1).
+    let idle = IDLE_TIMEOUT;
     transport.max_idle_timeout(Some(idle.try_into().map_err(|_| WireError::Limit)?));
     transport.keep_alive_interval(Some(idle.checked_div(4).ok_or(WireError::Limit)?));
     // Chosen by measurement against the laws quinn brings

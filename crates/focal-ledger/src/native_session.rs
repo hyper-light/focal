@@ -265,8 +265,10 @@ pub enum NativeSessionError {
     Checkpoint(#[from] crate::native_checkpoint::Error),
     #[error("native session is not authoritative; known leader {leader}")]
     NotReady { leader: u64 },
-    #[error("native session capacity exceeded")]
-    Capacity,
+    /// A bound the session holds to refused, named: the caller retries, and an operator reads
+    /// which bound it was.
+    #[error("native session capacity: {0}")]
+    Capacity(&'static str),
     #[error("native session identity, profile or committed prefix mismatch")]
     Corrupt,
     #[error("native-only session refuses legacy history or migration")]
@@ -338,7 +340,7 @@ impl NativeSessionError {
             }
         }
         match self {
-            Self::Capacity
+            Self::Capacity(_)
             | Self::Memory(_)
             | Self::CustodyPending
             | Self::LayoutChanging
@@ -467,7 +469,7 @@ impl PendingSeed {
         let mut chunks = Vec::new();
         chunks
             .try_reserve_exact(self.missing.len())
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("missing chunks"))?;
         chunks.extend_from_slice(&self.missing);
         Ok(chunks)
     }
@@ -506,7 +508,7 @@ impl PendingCustody {
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(self.missing.len())
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("missing objects"))?;
         objects.extend(self.missing.iter().cloned());
         Ok(objects)
     }
@@ -561,12 +563,13 @@ fn decoder() -> [u8; 32] {
     crate::native_checkpoint::format_hash().0
 }
 fn add(a: usize, b: usize) -> Result<usize, NativeSessionError> {
-    a.checked_add(b).ok_or(NativeSessionError::Capacity)
+    a.checked_add(b)
+        .ok_or(NativeSessionError::Capacity("session arithmetic"))
 }
 fn array<T>(count: usize) -> Result<usize, NativeSessionError> {
     let bytes = count
         .checked_mul(size_of::<T>())
-        .ok_or(NativeSessionError::Capacity)?;
+        .ok_or(NativeSessionError::Capacity("session arithmetic"))?;
     add(
         bytes,
         if count == 0 {
@@ -580,9 +583,9 @@ fn reserved<T>(count: usize) -> Result<Vec<T>, NativeSessionError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)
-        .map_err(|_| NativeSessionError::Capacity)?;
+        .map_err(|_| NativeSessionError::Capacity("session allocation"))?;
     if values.capacity() > count {
-        return Err(NativeSessionError::Capacity);
+        return Err(NativeSessionError::Capacity("session allocation"));
     }
     Ok(values)
 }
@@ -630,7 +633,9 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         schemas: S,
     ) -> Result<Opened<S>, NativeSessionError> {
         if !consensus.is_budgeted_within(parent) {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity(
+                "storage outside the session budget",
+            ));
         }
         let is_new = consensus.required_decoder().is_none();
         if !is_new && consensus.required_decoder() != Some(decoder()) {

@@ -411,12 +411,14 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         funding,
     )
     .unwrap();
+    let encoded_added = crate::native::encoded_added(plan.changes(), core.state.ledger).unwrap();
     let prepared = NativePrepared {
         fragments: plan
             .build_in_with(&core.state.budget, prepare::copy)
             .unwrap(),
         outcome,
         writes,
+        encoded_added,
     };
     let bytes = encode(&prepared);
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();

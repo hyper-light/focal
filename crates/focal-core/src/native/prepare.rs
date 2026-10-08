@@ -1614,6 +1614,7 @@ impl<'a> Fresh<'a> {
                 .reserve(BudgetKind::Pending, lane, mutation_bytes)?
                 .commit(),
         )?;
+        let encoded_added = super::encoded_added(range_plan.changes(), view.state.ledger)?;
         let fragments = range_plan.build_in_with(source, copy)?;
         writes.check(&fragments)?;
         BuiltNative::new(
@@ -1621,6 +1622,7 @@ impl<'a> Fresh<'a> {
                 fragments,
                 outcome,
                 writes,
+                encoded_added,
             },
             seals,
             allocation,

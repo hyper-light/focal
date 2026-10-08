@@ -554,6 +554,9 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
         core.state.rows.publish(prepared).unwrap();
     }
     assert_eq!(core.state.rows.prefix(), source.sequence().0);
+    // Built straight from rows, as a restore is: its total summed once, as a restore sums it.
+    core.state.encoded_rows =
+        crate::native::encoded_rows_of(&core.state.rows, core.state.ledger).unwrap();
     core
 }
 
