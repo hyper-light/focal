@@ -6,6 +6,12 @@
 set -eu
 NAMESPACE="focal"
 SECRET="focal-invitations"
+n=0
+until kubectl -n "$NAMESPACE" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal diagnose node --probe authoritative >/dev/null 2>&1; do
+  n=$((n + 1))
+  if [ "$n" -ge 150 ]; then echo "focal-founder-0 never led its root" >&2; exit 1; fi
+  sleep 2
+done
 HOSTS="focal-b-0 focal-c-0"
 FILES=""
 for host in $HOSTS; do

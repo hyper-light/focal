@@ -373,6 +373,10 @@ fn invitations_script(namespace: &str, secret: &str, hosts: &[String]) -> String
         out.push_str("echo \"no host pods to invite\"\nexit 0\n");
         return out;
     }
+    // Ready is the founder's owners running and asks no leadership by design
+    // (F25); an invitation is its root leader's to issue, so the script waits,
+    // bounded, until the founder leads (the authoritative probe).
+    out.push_str("n=0\nuntil kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal diagnose node --probe authoritative >/dev/null 2>&1; do\n  n=$((n + 1))\n  if [ \"$n\" -ge 150 ]; then echo \"focal-founder-0 never led its root\" >&2; exit 1; fi\n  sleep 2\ndone\n");
     out.push_str("HOSTS=\"");
     out.push_str(&hosts.join(" "));
     out.push_str("\"\nFILES=\"\"\nfor host in $HOSTS; do\n  kubectl -n \"$NAMESPACE\" exec focal-founder-0 -c focal -- /focal --data-dir /var/lib/focal cluster invite --node \"$host\" --output - > \"$host.invite\"\n  FILES=\"$FILES --from-file=$host.invite=$host.invite\"\ndone\nkubectl -n \"$NAMESPACE\" delete secret \"$SECRET\" --ignore-not-found\n# shellcheck disable=SC2086\nkubectl -n \"$NAMESPACE\" create secret generic \"$SECRET\" $FILES\nrm -f -- *.invite\n");
