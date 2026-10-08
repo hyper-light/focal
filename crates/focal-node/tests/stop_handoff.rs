@@ -41,8 +41,31 @@ fn leadership(node: &Node, ledger: &str) -> Option<(u64, u64)> {
     ))
 }
 
+/// Founded clusters a run may take before one's observed leader still leads its session when the
+/// stop reaches it. Between the observation and the signal an election under load can move
+/// leadership (a busy machine's run, 2026-10-08), and the stopped node then truthfully leads
+/// nothing: that attempt cannot show a hand-off and is never counted as one. Such an election in
+/// that window is rare, so three fresh clusters bound the run, and a run in which none stopped a
+/// leader fails.
+const ATTEMPTS: usize = 3;
+
 #[test]
 fn a_leader_told_to_stop_hands_its_log_off_before_an_election_could_start() {
+    for attempt in 1..=ATTEMPTS {
+        if stop_the_leader() {
+            return;
+        }
+        eprintln!(
+            "attempt {attempt}: leadership moved before the stop reached it; the stopped node led \
+             nothing, so this cluster shows no hand-off"
+        );
+    }
+    panic!("no attempt of {ATTEMPTS} stopped a node that still led its session");
+}
+
+/// One founded cluster, its session's leader sent SIGTERM. True once the stopped node led its
+/// session at the signal and every claim of the hand-off held; false where it led nothing.
+fn stop_the_leader() -> bool {
     let founder = Node::new("founder");
     let hosts = [Node::new("host-a"), Node::new("host-b")];
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
@@ -111,15 +134,8 @@ fn a_leader_told_to_stop_hands_its_log_off_before_an_election_could_start() {
     };
     let took = started.elapsed();
     eprintln!("succession from {leader} to {successor} in {took:?}, term {term} -> {new_term}");
-    // Handed off, not elected after a timeout: the stopped node says so in
-    // its last status line, the successor is a survivor, and the log
-    // advanced one term for it.
-    assert!(all.contains(&successor) && successor != leader);
-    assert_eq!(
-        new_term,
-        term + 1,
-        "one term for a hand-off from term {term}"
-    );
+    // The stopped node's own word on what it led when the signal reached it: the premise of every
+    // claim below. Leading nothing, leadership had moved before the stop.
     let stopped = servers[leading]
         .as_ref()
         .unwrap()
@@ -129,6 +145,20 @@ fn a_leader_told_to_stop_hands_its_log_off_before_an_election_could_start() {
         .recv_timeout(Duration::from_secs(60))
         .expect("the stopped leader printed no Stopped line");
     assert_eq!(stopped["condition"], "Stopped", "{stopped}");
+    if stopped["sessions_led"].as_u64() == Some(0) {
+        let status = servers[leading].take().unwrap().0.wait().unwrap();
+        assert!(status.success(), "the stopped node exited {status}");
+        return false;
+    }
+    // Handed off, not elected after a timeout: the stopped node says so in
+    // its last status line, the successor is a survivor, and the log
+    // advanced one term for it.
+    assert!(all.contains(&successor) && successor != leader);
+    assert_eq!(
+        new_term,
+        term + 1,
+        "one term for a hand-off from term {term}"
+    );
     assert_eq!(
         (
             stopped["sessions_led"].as_u64(),
@@ -163,4 +193,5 @@ fn a_leader_told_to_stop_hands_its_log_off_before_an_election_could_start() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    true
 }
