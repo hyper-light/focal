@@ -215,8 +215,10 @@ fn execute(args: Args) -> Result<()> {
 /// Resolve the settings for this invocation (doc 08 §2). On an initialized
 /// store the committed policy fills every policy field the file omits; a
 /// file that sets one to another value is refused by name, except for a
-/// policy request (`deployment plan`/`explain`), where the file is what the
-/// operator asks for.
+/// policy request (`deployment plan`/`explain`/`render`), where the file is
+/// what the operator asks for: a render touches no node, so the policy of
+/// whatever store happens to sit at the default data directory is not its
+/// business.
 /// How the invoked command resolves a policy the committed store already
 /// holds: the pod's own `start` yields to the committed policy, a policy
 /// request keeps the file's values, and every other command is refused if
@@ -282,6 +284,7 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Deployment {
             command: cli::deployment::DeploymentCommand::Plan { .. }
                 | cli::deployment::DeploymentCommand::Explain { .. }
+                | cli::deployment::DeploymentCommand::Render { .. }
         }
     ) {
         Resolution::Request
