@@ -234,6 +234,22 @@ pub struct AdminReplicaDiagnostics {
     /// floor there (`cursors` or `archive`). Absent for a session that is
     /// not native.
     pub retention: Option<AdminRetention>,
+    /// The checkpoints this replica wrote most recently, oldest first, and
+    /// what each cost its owner by stage (at most eight).
+    #[serde(default)]
+    pub checkpoints: Vec<AdminCheckpointTiming>,
+}
+/// One checkpoint's cost by stage, in microseconds: the native engine's
+/// section (its root and seed installs), the rest of the envelope, and the
+/// write (the log rewrite behind its durable fence, then compaction).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCheckpointTiming {
+    pub index: u64,
+    pub bytes: u64,
+    pub native_micros: u64,
+    pub envelope_micros: u64,
+    pub write_micros: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

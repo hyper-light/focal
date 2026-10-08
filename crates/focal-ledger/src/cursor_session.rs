@@ -628,17 +628,31 @@ impl DeltaSource for Session {
 struct EncodedCheckpoint {
     bytes: Vec<u8>,
     retained: Option<(Vec<u8>, Allocation)>,
+    /// How long the native engine's section took to encode, its seeds installed.
+    native: std::time::Duration,
     _scratch: Allocation,
 }
 impl Session {
     /// Snapshot domain, cursor outcomes and the complete retained history tail
     /// together. Failure leaves the previous durable checkpoint/log authoritative.
     pub fn checkpoint(&mut self) -> Result<(), LedgerError> {
+        let started = std::time::Instant::now();
         let Some(encoded) = self.encode_checkpoint(false)? else {
             return Ok(());
         };
-        self.consensus
-            .checkpoint(self.applied_raft, encoded.bytes)?;
+        let encoded_at = std::time::Instant::now();
+        let index = self.applied_raft;
+        let bytes = u64::try_from(encoded.bytes.len()).unwrap_or(u64::MAX);
+        let native = encoded.native;
+        self.consensus.checkpoint(index, encoded.bytes)?;
+        let encoding = encoded_at.saturating_duration_since(started);
+        self.checkpoint_timings.push(CheckpointTiming {
+            index,
+            bytes,
+            native_micros: micros(native),
+            envelope_micros: micros(encoding.saturating_sub(native)),
+            write_micros: micros(encoded_at.elapsed()),
+        });
         Ok(())
     }
     fn encode_checkpoint(
@@ -684,6 +698,7 @@ impl Session {
         let request_stream_charge = self.request_streams.checkpoint_charge()?;
         // The native section is encoded under its own permit; the envelope
         // copies it once more into the final bytes.
+        let native_started = std::time::Instant::now();
         let native = match (self.native.as_deref_mut(), self.hosting.as_mut()) {
             (Some(engine), Some(hosting)) => {
                 Some(engine.encode_checkpoint(&self.consensus, &mut hosting.seeds)?)
@@ -691,6 +706,7 @@ impl Session {
             (Some(_), None) => return Err(LedgerError::NativeUnsupported),
             (None, _) => None,
         };
+        let native_elapsed = native_started.elapsed();
         let native_bytes = native.as_ref().map_or(0, |(bytes, _)| bytes.len());
         let amount = reference_charge(self.core.snapshot())?
             .checked_add(native_bytes)
@@ -738,6 +754,7 @@ impl Session {
         Ok(Some(EncodedCheckpoint {
             bytes,
             retained,
+            native: native_elapsed,
             _scratch,
         }))
     }

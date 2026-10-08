@@ -188,7 +188,16 @@ fn retention_pressure_pauses_before_proposal_and_resolved_ack_unblocks() {
         s.cursor(ConsumerId::from_u128(1)).unwrap().mode,
         CursorMode::Protected
     );
+    assert_eq!(s.recent_checkpoints().count(), 0);
     s.checkpoint().unwrap();
+    // The checkpoint's cost is remembered: its index, its size, its stages.
+    let timings: Vec<_> = s.recent_checkpoints().collect();
+    assert_eq!(timings.len(), 1, "{timings:?}");
+    let [timing] = timings.as_slice() else {
+        unreachable!()
+    };
+    assert_eq!(timing.index, s.applied_raft);
+    assert!(timing.bytes > 0, "{timing:?}");
     drop(s);
     let s = Session::open(
         dir.path(),

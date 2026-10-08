@@ -95,6 +95,17 @@ impl Owner {
                     retiring: report.retiring,
                 }
             }),
+            checkpoints: self
+                .session
+                .recent_checkpoints()
+                .map(|timing| focal_client::admin::AdminCheckpointTiming {
+                    index: timing.index,
+                    bytes: timing.bytes,
+                    native_micros: timing.native_micros,
+                    envelope_micros: timing.envelope_micros,
+                    write_micros: timing.write_micros,
+                })
+                .collect(),
         };
         ReplicaDiagnosticsReply {
             value,

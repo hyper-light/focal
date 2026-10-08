@@ -79,6 +79,12 @@ EOF
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
+    # Each node's replicas as they report themselves, the cost of every
+    # checkpoint they wrote by stage among them, for where the tail's time went.
+    for n in focal1 focal2 focal3; do
+      dc exec -T "$n" focal --data-dir /data diagnose cluster --replicas \
+        > "$out/$report.$n.replicas.json" 2>/dev/null || true
+    done
     ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
   nats) endpoints=nats1:4222,nats2:4222,nats3:4222 ;;

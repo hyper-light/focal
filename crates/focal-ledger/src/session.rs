@@ -204,6 +204,59 @@ struct Candidate {
     _charge: Allocation,
 }
 
+/// What one checkpoint of this replica cost, by stage, as the owner that wrote it
+/// measured: its applied index and encoded size, the native engine's section (the
+/// committed Core's root and its seed installs), the rest of the envelope (core,
+/// cursors, request streams, placement, deltas), and the write (consensus's log
+/// rewrite behind its durable fence, and the compaction after it). The owner does
+/// all of it on its own thread, so the sum is how long the session's work waited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CheckpointTiming {
+    pub index: u64,
+    pub bytes: u64,
+    pub native_micros: u64,
+    pub envelope_micros: u64,
+    pub write_micros: u64,
+}
+
+/// The checkpoints a session remembers the cost of: the most recent, in a ring that
+/// never grows.
+pub const CHECKPOINT_TIMINGS: usize = 8;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CheckpointTimings {
+    slots: [Option<CheckpointTiming>; CHECKPOINT_TIMINGS],
+    next: usize,
+}
+
+impl CheckpointTimings {
+    pub(crate) fn push(&mut self, timing: CheckpointTiming) {
+        if let Some(slot) = self.slots.get_mut(self.next) {
+            *slot = Some(timing);
+        }
+        self.next = self
+            .next
+            .saturating_add(1)
+            .checked_rem(CHECKPOINT_TIMINGS)
+            .unwrap_or(0);
+    }
+    /// Oldest first.
+    pub(crate) fn recent(&self) -> impl Iterator<Item = CheckpointTiming> + '_ {
+        (0..CHECKPOINT_TIMINGS).filter_map(move |i| {
+            let at = self
+                .next
+                .saturating_add(i)
+                .checked_rem(CHECKPOINT_TIMINGS)?;
+            self.slots.get(at).copied().flatten()
+        })
+    }
+}
+
+/// Microseconds of `elapsed`, saturating.
+pub(crate) fn micros(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
 /// One owner per session. Proposals may be pipelined, but speculative outcomes are
 /// never returned as committed. Both retries and effective admission include pending work.
 pub struct Session {
@@ -276,9 +329,16 @@ pub struct Session {
     /// this session opened.
     reads_parked: u64,
     reads_dropped: u64,
+    /// The cost of the checkpoints this replica wrote last, for diagnostics.
+    checkpoint_timings: CheckpointTimings,
 }
 
 impl Session {
+    /// The checkpoints this replica wrote most recently and what each cost, oldest
+    /// first; at most [`CHECKPOINT_TIMINGS`].
+    pub fn recent_checkpoints(&self) -> impl Iterator<Item = CheckpointTiming> + '_ {
+        self.checkpoint_timings.recent()
+    }
     pub fn group_id(&self) -> [u8; 16] {
         self.consensus.group_id()
     }
@@ -492,6 +552,7 @@ impl Session {
             parked_charge: None,
             reads_parked: 0,
             reads_dropped: 0,
+            checkpoint_timings: CheckpointTimings::default(),
         };
         // Recovery consumes prior committed outcomes without executing their effects.
         // A delivery retained at startup (an import waiting for its host to seal
@@ -2320,5 +2381,26 @@ mod tests {
     mod session_storage {
         use super::*;
         include!("session_storage_tests.rs");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_timing_tests {
+    use super::*;
+
+    #[test]
+    fn the_ring_keeps_the_most_recent_checkpoints_oldest_first() {
+        let mut ring = CheckpointTimings::default();
+        assert_eq!(ring.recent().count(), 0);
+        for index in 1..=11u64 {
+            ring.push(CheckpointTiming {
+                index,
+                ..CheckpointTiming::default()
+            });
+        }
+        let kept: Vec<u64> = ring.recent().map(|t| t.index).collect();
+        assert_eq!(kept, (4..=11).collect::<Vec<_>>());
+        assert_eq!(micros(std::time::Duration::from_millis(3)), 3000);
+        assert_eq!(micros(std::time::Duration::MAX), u64::MAX);
     }
 }

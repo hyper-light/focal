@@ -191,6 +191,7 @@ impl Session {
         let EncodedCheckpoint {
             bytes,
             retained,
+            native: _,
             _scratch,
         } = encoded;
         let (checkpoint, allocation) = retained.ok_or(LedgerError::Corrupt)?;
