@@ -12,6 +12,8 @@ repository = "https://github.com/hyper-light/hyper-raft"
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 getrandom = "0.4"
 thiserror = "2.0"
+# The device a sealed file is written and read through (`sealed_file`).
+hyper-block = { version = "0.1.0", path = "../hyper-block" }
 
 [target.'cfg(unix)'.dependencies]
 # mlock(2) and madvise(2) for the key region, and the page size.

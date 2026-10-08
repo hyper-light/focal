@@ -620,6 +620,9 @@ fn headers<F: BlockFile>(
     block
         .set_len(align.get())
         .map_err(|e| LogError::Disk(e.into()))?;
+    // This log's headers of the other kind than the open's: sealed ones read without keys, or
+    // unsealed ones read with them. Counted, never taken, so the open's refusal can name why.
+    let mut other_kind = 0u64;
     for slot in 0..shape.slots {
         let at = shape.start_of(slot)?;
         if at
@@ -647,12 +650,10 @@ fn headers<F: BlockFile>(
                 sealer.verify(covered, mac)?;
                 sealer.found(h.incarnation, shape.first_frame(slot)?, &key)?;
             }
-            (Some(_), None) => {
-                return Err(LogError::Tampered(
-                    "an unsealed segment header in a sealed log",
-                ));
+            (Some(_), None) | (None, Some(_)) => {
+                other_kind = other_kind.saturating_add(1);
+                continue;
             }
-            (None, Some(_)) => continue,
             (None, None) => {}
         }
         if heads.by_incarnation.insert(h.incarnation, slot).is_some() {
@@ -663,6 +664,16 @@ fn headers<F: BlockFile>(
             *e = h.incarnation;
             *n = h.nonce;
         }
+    }
+    // A log is sealed or not from its creation: headers of both kinds are bytes someone changed;
+    // headers of the other kind alone are a log opened with the wrong expectation of keys.
+    if other_kind > 0 {
+        return Err(match (heads.by_incarnation.is_empty(), sealer.is_some()) {
+            (false, true) => LogError::Tampered("an unsealed segment header in a sealed log"),
+            (false, false) => LogError::Tampered("a sealed segment header in an unsealed log"),
+            (true, true) => LogError::UnsealedWithKeys,
+            (true, false) => LogError::SealedWithoutKeys,
+        });
     }
     heads.highest = heads
         .by_incarnation

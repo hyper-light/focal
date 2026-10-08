@@ -67,6 +67,16 @@ pub enum LogError {
     /// The file holds no log, another log, or another geometry.
     #[error("the file is not this log: {0}")]
     Foreign(&'static str),
+    /// The file is this log, sealed, and was opened without its keys: every segment header of it
+    /// is a sealed one (format 4, docs/seal.md §5.3). Told from a foreign file by the header's
+    /// format alone, before anything keyed, so a missing or unconfigured key is never reported as
+    /// another node's log.
+    #[error("the log is sealed and was opened without its keys")]
+    SealedWithoutKeys,
+    /// The file is this log, unsealed, and was opened with keys: every segment header of it is an
+    /// unsealed one (format 3). A log is sealed or not from its creation.
+    #[error("the log is not sealed and was opened with keys")]
+    UnsealedWithKeys,
     /// The group's handle sent this write before it heard that an earlier one was refused: it
     /// is refused too, changing nothing, so a group's writes never apply out of the order they
     /// were sent (a later write taken after an earlier one refused would leave the group with

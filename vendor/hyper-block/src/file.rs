@@ -464,6 +464,31 @@ pub fn sync_dir(dir: &Path) -> Result<(), DiskError> {
     })
 }
 
+/// Renames `from` to `to` and flushes the directory `to` is in, and `from`'s where it differs, so
+/// the new entry survives a crash (Pillai et al., OSDI 2014). The file itself must be flushed
+/// first: a rename makes durable only the name.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the device layer renames the files it keeps into place"
+)]
+pub fn rename_durable(from: &Path, to: &Path) -> Result<(), DiskError> {
+    std::fs::rename(from, to).map_err(|source| DiskError::Io {
+        op: "rename",
+        path: to.to_path_buf(),
+        source,
+    })?;
+    let parent = |path: &Path| match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let (to_dir, from_dir) = (parent(to), parent(from));
+    sync_dir(&to_dir)?;
+    if from_dir != to_dir {
+        sync_dir(&from_dir)?;
+    }
+    Ok(())
+}
+
 fn options(create: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(create);
