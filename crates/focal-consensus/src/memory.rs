@@ -382,15 +382,22 @@ pub(super) fn staging_bytes(
     let arriving = log.unstable().snapshot_bytes();
     let held = raw.raft.held_bytes();
     let page = usize::try_from(crate::COMMITTED_PAGE_BYTES).unwrap_or(usize::MAX);
-    // What the Ready may give this transition: every durable entry above
-    // the applied — the transition itself may commit them, a campaign the
-    // whole of them — a page at most.
+    // What a transition may give to apply: every durable entry above the
+    // applied — the transition itself may commit them, a campaign the whole
+    // of them — two pages at most: the Ready's, and the page its advance
+    // gives (`LightReady`), which the drain applies before it hands over.
+    // Each page is the longest prefix that fits a page, and no entry is
+    // larger than one, so the two fit twice a page. Reserving one, a node
+    // whose log held two pages above its applied could not reopen: both
+    // were delivered by its first drain (5,976 entries and 5,960, 33.8 MB
+    // against 33.5 reserved). The drain hands over before a third
+    // (`drain_progress`).
     let durable = Storage::last_index(raw.store())?;
     let committed_page = raw.store().bytes_between(
         log.applied().saturating_add(1),
         durable.max(log.committed()).saturating_add(1),
         usize::MAX,
-        page,
+        mul(page, 2)?,
     )?;
     let sends = sends_bytes(raw)?;
     let message = usize::try_from(raw.raft.config().max_size_per_msg).unwrap_or(usize::MAX);

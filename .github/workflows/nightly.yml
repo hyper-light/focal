@@ -60,6 +60,10 @@ jobs:
           FOCAL_CAMPAIGN_CLAIMS: ${{ github.event.inputs.campaign_claims || '500' }}
           FOCAL_CAMPAIGN_READS: ${{ github.event.inputs.campaign_reads || '2000' }}
         run: bash scripts/cargo.sh test -p focal-load --test campaign --locked -- --ignored --nocapture
+      # A session filled to admission's bound closes, checkpoints and
+      # reopens (tools/load/tests/full_session.rs).
+      - name: Full session
+        run: bash scripts/cargo.sh test -p focal-load --release --test full_session --locked -- --ignored
       # What the fast track takes against the classic one, every case.
       - name: Fast track latency
         env:

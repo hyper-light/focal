@@ -391,7 +391,15 @@ impl LogNode {
         loop {
             match pending.phase {
                 Phase::Start => {
-                    if !self.raw.has_ready() {
+                    // A drain hands over what it gathered once it holds
+                    // committed entries, though Raft has more ready: its
+                    // staging reserved one page of them (`staging_bytes`,
+                    // `COMMITTED_PAGE_BYTES`), and a second page would
+                    // outgrow it. Gathering page after page, a node whose
+                    // log held a long committed tail could not reopen (its
+                    // whole tail at once, refused as capacity). The next
+                    // drain takes the next page, in order.
+                    if !self.raw.has_ready() || !pending.events.committed.is_empty() {
                         let events = self.hand_over(&mut pending.events, pending.delivered)?;
                         let retained = memory::raw_bytes(&self.raw)?;
                         let mut allocation = self
