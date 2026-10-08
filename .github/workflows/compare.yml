@@ -5,6 +5,10 @@ name: Competitive tail latency
 # runner whose fsync reaches its disk (Docker Desktop's VM does not). Run by
 # hand: each system is three containers at one CPU each beside the generator.
 on:
+  # A branch named compare/<anything> runs it with the defaults below, which
+  # starts a run without the workflow on the default branch.
+  push:
+    branches: ["compare/**"]
   workflow_dispatch:
     inputs:
       rates:
