@@ -22,6 +22,25 @@ retry() {
     sleep 2
   done
 }
+# What a stalled or failed run leaves for diagnosis, printed before the teardown:
+# each container's state, memory and CPU, each focal node's replicas and its log.
+evidence() {
+  echo "::group::evidence ($system at $rate/s)"
+  dc ps -a || true
+  docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}' || true
+  for c in $(dc ps -a --format '{{.Name}}'); do
+    docker inspect "$c" --format "$c oom={{.State.OOMKilled}} exit={{.State.ExitCode}} status={{.State.Status}}" || true
+  done
+  if [ "$system" = focal ]; then
+    for n in focal1 focal2 focal3; do
+      echo "--- $n replicas"
+      timeout 30 docker compose -f compose.yaml --profile focal exec -T "$n" focal --data-dir /data diagnose cluster --replicas || true
+      echo "--- $n log"
+      dc logs --no-color --tail 120 "$n" || true
+    done
+  fi
+  echo "::endgroup::"
+}
 cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
@@ -49,7 +68,13 @@ concurrency: $callers
 rate: $rate
 warmup_ms: $(( warmup * 1000 ))
 EOF
-    dc exec -T focal-load focal-load --shape /reports/shape.yaml --out "/reports/$report"
+    # Bounded at four times the run's intended length and two minutes more: a
+    # run that cannot keep the offered rate still ends, its evidence printed.
+    if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
+      exec -T focal-load focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
+      evidence
+      exit 1
+    fi
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
@@ -66,7 +91,7 @@ if [ "$system" != focal ]; then
       --endpoints "$endpoints" --rate "$rate" --payload "$payload" \
       --seconds "$seconds" --warmup "$warmup" --out "/reports/$report"
   }
-  retry 60 generate
+  retry 60 generate || { evidence; exit 1; }
   dc exec -T generator cat "/reports/$report" > "$out/$report"
 fi
 echo "wrote $out/$report"
