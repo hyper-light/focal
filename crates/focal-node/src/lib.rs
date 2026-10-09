@@ -53,6 +53,7 @@ pub mod network_listener;
 pub mod network_service;
 pub mod network_state;
 pub mod node_directory;
+pub(crate) mod owner_steps;
 mod pace;
 pub mod placement;
 pub mod placement_agent;
