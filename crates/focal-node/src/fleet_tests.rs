@@ -287,6 +287,54 @@ impl Drop for Fleet {
     }
 }
 
+/// The size rule (Ongaro's thesis §5.1.2): past the entry floor, a log is due
+/// once it outweighs its last image times the expansion, or takes its share of
+/// the session's memory, or holds the most entries a restart replays; a first
+/// checkpoint, with no image yet, is due at the floor.
+#[test]
+fn a_log_is_checkpointed_once_it_outweighs_its_last_image() {
+    use crate::fleet::{
+        CHECKPOINT_MAX_ENTRIES, CHECKPOINT_MEMORY_SHARE, CheckpointLog, checkpoint_due,
+    };
+    let log = |entries, held| CheckpointLog { entries, held };
+    let memory = 1 << 30;
+    // No image yet: due at the floor.
+    assert!(checkpoint_due(log(4096, 1), 0, memory, 1));
+    // A log lighter than its image waits; one heavier is due.
+    assert!(!checkpoint_due(log(4096, 10 << 20), 10 << 20, memory, 1));
+    assert!(checkpoint_due(
+        log(4096, (10 << 20) + 1),
+        10 << 20,
+        memory,
+        1
+    ));
+    // The expansion multiplies the image; zero is the floor alone.
+    assert!(!checkpoint_due(log(4096, 15 << 20), 10 << 20, memory, 2));
+    assert!(checkpoint_due(log(4096, 1), 10 << 20, memory, 0));
+    // Its share of the session's memory cuts it whatever its image.
+    let share = memory / CHECKPOINT_MEMORY_SHARE;
+    assert!(!checkpoint_due(
+        log(4096, share - 1),
+        u64::MAX / 2,
+        memory,
+        1
+    ));
+    assert!(checkpoint_due(log(4096, share), u64::MAX / 2, memory, 1));
+    // As does the most a restart replays.
+    assert!(checkpoint_due(
+        log(CHECKPOINT_MAX_ENTRIES, 1),
+        u64::MAX / 2,
+        memory,
+        1
+    ));
+    assert!(!checkpoint_due(
+        log(CHECKPOINT_MAX_ENTRIES - 1, 1),
+        u64::MAX / 2,
+        memory,
+        1
+    ));
+}
+
 /// A replica's log is kept to the cadence's bound while a steady load
 /// keeps proposals pending (26 §3): it checkpoints its applied prefix
 /// every `checkpoint_after_entries` entries, and a proposal in flight is
@@ -303,6 +351,8 @@ async fn a_replica_under_a_steady_load_checkpoints_by_cadence() {
     let root = tempfile::tempdir().unwrap();
     let fleet = Fleet::open_configured(root.path(), |config| {
         config.checkpoint_after_entries = CADENCE;
+        // The entry floor alone: the size rule is the next test's.
+        config.checkpoint_expansion = 0;
     });
     let leader = fleet.leader(None).await;
     let done = std::sync::atomic::AtomicBool::new(false);

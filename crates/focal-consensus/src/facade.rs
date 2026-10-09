@@ -432,6 +432,10 @@ impl DurableNode {
     pub fn snapshot_index(&self) -> u64 {
         dispatch!(inner = &self.backend => inner.snapshot_index())
     }
+    /// The bytes of the applied entries the log holds past its last image.
+    pub fn applied_log_bytes(&self) -> Result<u64, ConsensusError> {
+        dispatch!(inner = &self.backend => inner.applied_log_bytes())
+    }
     /// The index of the last entry this node's log holds, durable or not:
     /// an append that names an entry past it is refused.
     pub fn last_index(&self) -> Result<u64, ConsensusError> {

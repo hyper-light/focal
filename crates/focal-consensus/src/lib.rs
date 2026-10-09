@@ -1418,6 +1418,19 @@ impl LogNode {
     pub fn snapshot_index(&self) -> u64 {
         self.raw.store().snapshot_index()
     }
+    /// The bytes of the applied entries the log holds past its snapshot, as
+    /// their charge counts them: what the checkpoint rule weighs against the
+    /// last image (Ongaro's thesis §5.1.2).
+    pub fn applied_log_bytes(&self) -> Result<u64, ConsensusError> {
+        let store = self.raw.store();
+        let bytes = store.bytes_between(
+            store.snapshot_index().saturating_add(1),
+            self.delivered_index.saturating_add(1),
+            usize::MAX,
+            usize::MAX,
+        )?;
+        Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
+    }
     /// The index of the last entry this node's log holds, durable or not:
     /// an append that names an entry past it is refused.
     pub fn last_index(&self) -> Result<u64, ConsensusError> {

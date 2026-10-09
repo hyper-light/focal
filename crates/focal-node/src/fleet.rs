@@ -89,9 +89,48 @@ mod evidence_tests;
 #[path = "fleet_admission_tests.rs"]
 mod admission_tests;
 
-/// Entries a session applies past its last checkpoint before it checkpoints again
-/// ([`ReplicaConfig::checkpoint_after_entries`]'s default).
+/// Entries a session applies past its last checkpoint before it may checkpoint
+/// again ([`ReplicaConfig::checkpoint_after_entries`]'s default): the floor
+/// under the size rule, so a small state is not imaged at every few entries.
 pub const CHECKPOINT_AFTER_ENTRIES: u64 = 4096;
+/// The times its last image's bytes the applied log a session holds may come
+/// to before it checkpoints (Ongaro's thesis §5.1.2, "When to snapshot": a
+/// snapshot once the log exceeds the previous snapshot times an expansion
+/// factor), as hyper-durable's own rule and slates state it. A checkpoint
+/// re-encodes the whole state, so at a fixed entry count the cost of
+/// checkpointing grows with the state and its total with its square; under
+/// this rule an image is written for every image's worth of log, a share of
+/// half of what the session writes, whatever its size.
+pub const CHECKPOINT_EXPANSION: u64 = 1;
+/// The share of its session's memory the applied log may hold before it
+/// checkpoints whatever its image: the log's entries are charged to the same
+/// budget as the state, so a large state's log is cut before it takes the
+/// room the state grows into.
+pub const CHECKPOINT_MEMORY_SHARE: u64 = 8;
+/// The most entries a session applies past its last checkpoint whatever their
+/// bytes: what a restart replays (etcd's default snapshot count).
+pub const CHECKPOINT_MAX_ENTRIES: u64 = 100_000;
+
+/// The applied log a session holds past its last image: its entries and their
+/// bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckpointLog {
+    pub(crate) entries: u64,
+    pub(crate) held: u64,
+}
+
+/// Whether a log past the entry floor is due to be checkpointed: once it
+/// outweighs its last image (`image` bytes) times `expansion`, holds its
+/// share of the session's `memory`, or holds the most entries a restart
+/// replays.
+pub(crate) fn checkpoint_due(log: CheckpointLog, image: u64, memory: u64, expansion: u64) -> bool {
+    log.entries >= CHECKPOINT_MAX_ENTRIES
+        || log.held > image.saturating_mul(expansion)
+        || log.held
+            >= memory
+                .checked_div(CHECKPOINT_MEMORY_SHARE)
+                .unwrap_or(u64::MAX)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaConfig {
     pub root: RootCommandId,
@@ -108,8 +147,13 @@ pub struct ReplicaConfig {
     pub tick_ceiling: Duration,
     pub request_timeout: Duration,
     /// Checkpoint and compact the log once this many entries have applied
-    /// past the last snapshot (26 §3, the log's retirement boundary).
+    /// past the last snapshot (26 §3, the log's retirement boundary), and the
+    /// size rule holds ([`CHECKPOINT_EXPANSION`]).
     pub checkpoint_after_entries: u64,
+    /// The times its last image's bytes the applied log may come to before a
+    /// checkpoint ([`CHECKPOINT_EXPANSION`]); zero checkpoints at the entry
+    /// floor alone.
+    pub checkpoint_expansion: u64,
     #[cfg(test)]
     checkpoint_observer: Option<CheckpointObserver>,
 }
@@ -138,6 +182,7 @@ impl ReplicaConfig {
             tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
             checkpoint_after_entries: CHECKPOINT_AFTER_ENTRIES,
+            checkpoint_expansion: CHECKPOINT_EXPANSION,
             #[cfg(test)]
             checkpoint_observer: None,
         }
@@ -1892,10 +1937,29 @@ impl Owner {
         // A checkpoint whose seeds were being made durable off this thread is
         // handed to consensus as soon as they are.
         retryable(self.session.poll_deferred_checkpoint())?;
-        if self.log_entries_since_checkpoint() < self.config.checkpoint_after_entries {
+        if !self.checkpoint_due()? {
             return Ok(());
         }
         self.try_checkpoint().map(|_| ())
+    }
+    /// Whether the log is due to be checkpointed: past the entry floor, once
+    /// the applied log outweighs the last image times the expansion, takes
+    /// its share of the session's memory, or holds the most entries a restart
+    /// replays.
+    fn checkpoint_due(&self) -> Result<bool, LedgerError> {
+        let entries = self.log_entries_since_checkpoint();
+        if entries < self.config.checkpoint_after_entries {
+            return Ok(false);
+        }
+        Ok(checkpoint_due(
+            CheckpointLog {
+                entries,
+                held: self.session.applied_log_bytes()?,
+            },
+            self.session.checkpoint_image_bytes(),
+            u64::try_from(self.session.memory_stats().limit).unwrap_or(u64::MAX),
+            self.config.checkpoint_expansion,
+        ))
     }
     /// Checkpoint now unless the replica cannot yet: a resource condition or
     /// unpersisted state waits for a later tick, and nothing is a failure.

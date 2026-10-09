@@ -158,8 +158,10 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
         session.poll().unwrap();
     }
     let mut config = ReplicaConfig::new(RootCommandId::from_u128(152));
-    // Four applied entries past a snapshot checkpoint the replica (26 §3).
+    // Four applied entries past a snapshot checkpoint the replica (26 §3),
+    // whatever the image's size.
     config.checkpoint_after_entries = 4;
+    config.checkpoint_expansion = 0;
     config.tick = Duration::from_millis(20);
     config.request_timeout = Duration::from_millis(2000);
     let (host, owner, _outgoing) =

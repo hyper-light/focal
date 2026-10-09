@@ -825,6 +825,7 @@ impl Session {
         let bytes = u64::try_from(encoded.bytes.len()).unwrap_or(u64::MAX);
         let native = encoded.native;
         self.consensus.checkpoint(index, encoded.bytes)?;
+        self.image_bytes = bytes;
         let encoding = encoded_at.saturating_duration_since(started);
         self.checkpoint_timings.push(CheckpointTiming {
             index,
@@ -838,6 +839,22 @@ impl Session {
             written_chunks: 0,
         });
         Ok(())
+    }
+
+    /// The bytes of the latest checkpoint this replica made durable: its
+    /// envelope and a seeded root's chunks. Zero until one lands after the
+    /// replica opened.
+    pub fn checkpoint_image_bytes(&self) -> u64 {
+        let root = self
+            .native
+            .as_deref()
+            .map_or(0, |engine| engine.seed_root_bytes());
+        self.image_bytes.saturating_add(root)
+    }
+
+    /// The bytes of the applied entries the log holds past its last image.
+    pub fn applied_log_bytes(&self) -> Result<u64, LedgerError> {
+        Ok(self.consensus.applied_log_bytes()?)
     }
 
     /// Whether a deferred checkpoint is still being made durable.
@@ -976,6 +993,7 @@ impl Session {
                 let adoption = deferred.adoption.take().ok_or_else(lost_worker)?;
                 self.consensus
                     .settle_staged_checkpoint(&deferred.point, synced)?;
+                self.image_bytes = adoption.bytes;
                 // The image is the group's durable one: its chunks alone are
                 // kept from here on.
                 self.native
@@ -1138,6 +1156,7 @@ impl Session {
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.consensus.begin_checkpoint_from(point, bytes)?;
         self.consensus.finish_checkpoint()?;
+        self.image_bytes = size;
         self.checkpoint_timings.push(CheckpointTiming {
             index,
             bytes: size,

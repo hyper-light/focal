@@ -753,6 +753,11 @@ impl ShellNode {
     /// The point of the group's image: what a member behind the log is sent, so a member added
     /// after it can only be seeded by a later checkpoint, since Raft discards a snapshot whose
     /// configuration does not name the recipient.
+    /// The bytes of the applied entries the log holds past its image, as the core counts them:
+    /// what the checkpoint rule weighs against the last image (hyper-durable's own rule's).
+    pub fn applied_log_bytes(&self) -> Result<u64, ConsensusError> {
+        Ok(self.replica.compactable_bytes())
+    }
     pub fn snapshot_index(&self) -> u64 {
         self.replica.machine().durable().index
     }

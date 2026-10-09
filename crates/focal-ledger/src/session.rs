@@ -376,6 +376,10 @@ pub struct Session {
     // Boxed, as the deferred checkpoint is: a session moves by value through
     // its hosts' frames, which a Windows debug build keeps on a worker stack.
     checkpoint_timings: Box<CheckpointTimings>,
+    /// The bytes of the latest checkpoint this replica made durable, its
+    /// envelope's (a seeded root's are the engine's): what the checkpoint
+    /// rule weighs the log against. Zero until one lands after opening.
+    image_bytes: u64,
     /// A checkpoint whose seeds are being made durable off the owner's thread.
     deferred: Option<Box<DeferredCheckpoint>>,
 }
@@ -600,6 +604,7 @@ impl Session {
             reads_parked: 0,
             reads_dropped: 0,
             checkpoint_timings: Box::default(),
+            image_bytes: 0,
             deferred: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
