@@ -339,9 +339,11 @@ pub struct Session {
     reads_parked: u64,
     reads_dropped: u64,
     /// The cost of the checkpoints this replica wrote last, for diagnostics.
-    checkpoint_timings: CheckpointTimings,
+    // Boxed, as the deferred checkpoint is: a session moves by value through
+    // its hosts' frames, which a Windows debug build keeps on a worker stack.
+    checkpoint_timings: Box<CheckpointTimings>,
     /// A checkpoint whose seeds are being made durable off the owner's thread.
-    deferred: Option<DeferredCheckpoint>,
+    deferred: Option<Box<DeferredCheckpoint>>,
 }
 
 impl Session {
@@ -563,7 +565,7 @@ impl Session {
             parked_charge: None,
             reads_parked: 0,
             reads_dropped: 0,
-            checkpoint_timings: CheckpointTimings::default(),
+            checkpoint_timings: Box::default(),
             deferred: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
