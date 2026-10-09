@@ -304,6 +304,35 @@ it is installed and again when it is read, and removed only on purpose. The
 store is content-addressed, so a root that repeats a chunk (an unchanged
 first MiB) seals it once.
 
+**Off the owner (2026-10-08).** A root of tens of thousands of claims took
+the owner 166 to 429 ms to encode and seal on CI runners, the p99 stalls of
+the competitive comparison. Three steps took it off the owner's thread.
+*One commit per root:* `SeedStore::batch` writes each chunk unsynced to a
+file of its own, and the batch's `SeedCommit` syncs every file in parallel
+(at most eight scoped threads), renames each under its hash and syncs the
+directory once: N overlapping file syncs and one directory sync where each
+chunk had cost a sync, a rename and two directory syncs in turn. *A point,
+not a moment:* `Session::begin_deferred_checkpoint` captures the checkpoint
+point (`DurableNode::checkpoint_point`: index, term, configuration) and
+consensus takes the checkpoint at that point once its seeds are durable
+(`begin_checkpoint_from`), the entries after it kept in the log; a point a
+later image covers or a configuration change passed is refused and the next
+period takes a new one (Ongaro's thesis §5.1: the state machine goes on while
+its snapshot is written; etcd's `CreateSnapshot` at an applied index below
+the current one). *A frozen image:* the range store's roots are persistent
+(a batch copies the pages it changes and publishes one new root), so
+`Core::freeze_native` holds every member's root at the point (`FrozenRange`,
+each page keeping its own charge until the image drops), and a thread
+encodes the root from it into an owned `SeedBatch`, seals the chunks and
+commits them, as Redis writes its fork-time image and bbolt a read
+transaction's. On the owner remain the capture, the envelope's other
+sections (`snapshot_native_head`) and, once the thread reports, joining the
+native section (`snapshot_native_finish`, byte for byte the one-shot
+envelope) and handing consensus the bytes. One deferred checkpoint is in
+flight at a time; a synchronous checkpoint settles it first; dropped, it
+joins its thread. `CheckpointTiming` reports the owner's capture and the
+thread's encode and commit apart (`deferred_micros`).
+
 **Installing.** A replica that receives a Raft snapshot describes the
 envelope (`Checkpoint::describe`) before it touches state: an inline frame
 (`None`) installs as before; a seeded frame yields a `SeedManifest` whose
@@ -369,7 +398,9 @@ chunk is missing, byte-identical state once it lands).
 
 **Limits recorded.** `SEED_CHUNK_BYTES` (1 MiB) is the unit of transfer and
 the seed pull's `max_bytes`; `Limits.inline_bytes` (4 MiB) and
-`Limits.assembled_bytes` (256 MiB) bound the two forms; a seeded manifest
+`Limits.assembled_bytes` (256 MiB, or the engine's allowance where that is
+larger: a root is charged to that allowance, `NativeSessionLimits::standard_within`)
+bound the two forms; a seeded manifest
 names at most `assembled_bytes / SEED_CHUNK_BYTES` chunks. Sealing charges
 one chunk buffer plus the table; assembling charges the whole root once.
 Moving a member between nodes under a fence (§6) will seed the member's
