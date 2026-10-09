@@ -199,7 +199,7 @@ pub fn path_from_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
     }
     #[cfg(windows)]
     {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return None;
         }
         use std::os::windows::ffi::OsStringExt;
@@ -241,6 +241,8 @@ pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
 }
 
 pub mod fs;
+mod memory;
+pub use memory::memory_limit;
 #[cfg(windows)]
 mod windows;
 

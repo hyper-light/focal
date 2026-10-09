@@ -34,6 +34,7 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
+        SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
         Threading::{
             GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
         },
@@ -83,6 +84,26 @@ pub(crate) fn total_space(path: &Path) -> Option<u64> {
 }
 
 /// The current process user's SID bytes.
+/// The machine's physical memory in bytes (`ullTotalPhys`).
+pub(crate) fn physical_memory() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: u32::try_from(mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+        ..unsafe_zeroed_status()
+    };
+    // SAFETY: `status` is a live, writable MEMORYSTATUSEX whose `dwLength`
+    // names its own size, as the API requires; the call writes only within
+    // it and keeps no pointer past its return.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.ullTotalPhys)
+}
+/// An all-zero MEMORYSTATUSEX: every field is a plain integer, for which
+/// zero is a valid value.
+fn unsafe_zeroed_status() -> MEMORYSTATUSEX {
+    // SAFETY: MEMORYSTATUSEX holds only u32 and u64 fields; the all-zero bit
+    // pattern is a valid value of each.
+    unsafe { mem::zeroed() }
+}
+
 pub(crate) fn current_owner() -> io::Result<Vec<u8>> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: GetCurrentProcess returns the current-process pseudo-handle;
@@ -199,17 +220,17 @@ impl OwnerOnlyDacl {
         // ACL header + one allow ACE (its trailing SidStart overlaps the SID's
         // first DWORD, hence the `- 4`) + the SID bytes.
         let ace_header = mem::size_of::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>();
-        let acl_size = mem::size_of::<ACL>() + ace_header + sid.len() - mem::size_of::<u32>();
+        let acl_size = mem::size_of::<ACL>()
+            .checked_add(ace_header)
+            .and_then(|size| size.checked_add(sid.len()))
+            .and_then(|size| size.checked_sub(mem::size_of::<u32>()))
+            .ok_or_else(|| io::Error::other("owner-only ACL size"))?;
+        let acl_len =
+            u32::try_from(acl_size).map_err(|_| io::Error::other("owner-only ACL size"))?;
         let mut acl = vec![0u8; acl_size];
         // SAFETY: `acl` is `acl_size` bytes; InitializeAcl formats it as an
         // empty ACL of that size at ACL_REVISION.
-        let ok = unsafe {
-            InitializeAcl(
-                acl.as_mut_ptr().cast(),
-                acl_size as u32,
-                ACL_REVISION as u32,
-            )
-        };
+        let ok = unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_len, ACL_REVISION) };
         if ok == 0 {
             return Err(last_error());
         }
@@ -219,7 +240,7 @@ impl OwnerOnlyDacl {
         let ok = unsafe {
             AddAccessAllowedAce(
                 acl.as_mut_ptr().cast(),
-                ACL_REVISION as u32,
+                ACL_REVISION,
                 windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
                 sid.as_mut_ptr().cast(),
             )
@@ -283,7 +304,7 @@ pub(crate) fn create_private_new(path: &Path, read: bool, write: bool) -> io::Re
 fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Result<File> {
     let wide = wide(path);
     let mut dacl = OwnerOnlyDacl::new()?;
-    let mut attributes = dacl.attributes();
+    let attributes = dacl.attributes();
     let mut access = 0u32;
     if read {
         access |= FILE_GENERIC_READ;
@@ -303,7 +324,7 @@ fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Resu
             wide.as_ptr(),
             access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &mut attributes,
+            &attributes,
             disposition,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
@@ -321,10 +342,10 @@ fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Resu
 pub(crate) fn create_dir_private(path: &Path) -> io::Result<()> {
     let wide = wide(path);
     let mut dacl = OwnerOnlyDacl::new()?;
-    let mut attributes = dacl.attributes();
+    let attributes = dacl.attributes();
     // SAFETY: `wide` is NUL-terminated; `attributes` and its DACL live across
     // the call. CreateDirectoryW returns nonzero on success.
-    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), &mut attributes) };
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
     if ok == 0 {
         return Err(last_error());
     }

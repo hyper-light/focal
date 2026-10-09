@@ -24,6 +24,11 @@ jobs:
       - name: Build the workspace
         shell: bash
         run: cargo build --workspace --locked
+      # The production lints hold on Windows too (CLAUDE.md §4): code under
+      # cfg(windows) is linted only here.
+      - name: Clippy, every target, warnings denied
+        shell: bash
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Platform FFI tests (DACL, SID, file identity, locks, paths)
         shell: bash
         run: cargo test -p focal-platform --locked
