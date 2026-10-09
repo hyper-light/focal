@@ -27,8 +27,10 @@ const FRAME: Duration = Duration::from_millis(33);
 const MOST_MOTION: Duration = Duration::from_secs(600);
 /// The narrowest terminal the mark is drawn on, beside the card.
 const WITH_LENSES: usize = 64;
-/// The mark's width in cells beside the card: 24 shaded pixels square, 12 rows.
-const MARK_COLS: usize = 24;
+/// The mark beside the card, as shards draws its own: eight cells by four, its
+/// strokes in Braille dots (16 × 16), the site's geometry.
+const MARK_COLS: usize = 8;
+const MARK_ROWS: usize = 4;
 
 /// What the node said about itself last.
 #[derive(Debug, Clone, Default)]
@@ -165,7 +167,7 @@ impl Drop for Show {
 /// The display's thread: frames while the lenses move, then a frame for each status.
 fn run(paint: Paint, title: &'static str, inbox: Receiver<Note>, clock: Clock) {
     let mut frame = Frame::new();
-    let mut canvas = Canvas::new(0, 0);
+    let mut canvas = Canvas::new(MARK_COLS, MARK_ROWS);
     let mut card = Card {
         condition: "Starting".into(),
         ..Card::default()
@@ -232,11 +234,12 @@ fn draw(
 ) {
     let cols = terminal::width(Stream::Stdout);
     let lenses = cols >= WITH_LENSES;
-    // The mark as lit glass, its glint travelling the rim while the node starts.
+    // The mark, its light running the rim and its glint travelling while the node starts.
     let lens_cols = if lenses { MARK_COLS } else { 0 };
-    let mark = focal_tui::shade::mark(lens_cols, t);
-    let lens_rows = mark.rows();
-    let _ = canvas;
+    if lenses {
+        focal_tui::mark::draw(canvas, t);
+    }
+    let lens_rows = if lenses { canvas.rows() } else { 0 };
     let room = cols.saturating_sub(lens_cols.saturating_add(4)).max(20);
     let info = card_lines(paint, title, card, t, moving, room);
     let rows = info.len().max(lens_rows);
@@ -247,7 +250,7 @@ fn draw(
         l.pad(1);
         if lenses {
             if r < lens_rows {
-                mark.row(r, paint, &mut l.s);
+                canvas.row(r, paint, &mut l.s);
                 l.w = l.w.saturating_add(lens_cols);
             } else {
                 l.pad(lens_cols);
@@ -404,7 +407,7 @@ mod tests {
         let card = Card::from_json(&serde_json::json!({"condition": "Starting"}));
         for t in [0.0, 1.5] {
             let mut frame = Frame::new();
-            let mut canvas = Canvas::new(0, 0);
+            let mut canvas = Canvas::new(MARK_COLS, MARK_ROWS);
             let mut out = Vec::new();
             draw(
                 &mut frame,

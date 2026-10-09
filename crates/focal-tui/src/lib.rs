@@ -39,7 +39,6 @@ pub mod meter;
 pub mod motion;
 pub mod page;
 pub mod panel;
-pub mod shade;
 pub mod terminal;
 pub mod text;
 pub mod tokens;

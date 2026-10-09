@@ -81,20 +81,22 @@ impl Page {
     }
 }
 
-/// The mark's size in the head: 20 × 20 shaded pixels, ten rows.
-const MARK_COLS: usize = 20;
+/// The mark in the head, as shards draws its own: eight cells by four, its strokes
+/// in Braille dots, the site's geometry (`components/project-mark.tsx`).
+const MARK_COLS: usize = 8;
+const MARK_ROWS: usize = 4;
 
 /// The head: the mark (where there is room) beside the brand `F O C A L` in the prism,
 /// `name` in tracked capitals after it, then `lines` under them.
 pub fn head(page: &mut Page, p: &Paint, cols: usize, name: &str, lines: &[(Rgb, bool, &str)]) {
-    let with_mark = cols >= 60;
-    // A still of the mark: a page is drawn once.
-    let mark = crate::shade::mark(
-        if with_mark { MARK_COLS } else { 0 },
-        crate::motion::SETTLED,
-    );
+    let with_mark = cols >= 56;
+    let mut mark = crate::canvas::Canvas::new(MARK_COLS, MARK_ROWS);
+    if with_mark {
+        // A still of the mark: a page is drawn once.
+        crate::mark::draw(&mut mark, 0.0);
+    }
     let room = cols.saturating_sub(if with_mark {
-        MARK_COLS.saturating_add(4)
+        MARK_COLS.saturating_add(3)
     } else {
         1
     });
@@ -128,15 +130,6 @@ pub fn head(page: &mut Page, p: &Paint, cols: usize, name: &str, lines: &[(Rgb, 
             info.push(l);
         }
     }
-    // Beside the mark the brand and its words sit at its middle.
-    let lead = if with_mark {
-        mark.rows().saturating_sub(info.len()) / 2
-    } else {
-        0
-    };
-    let mut lines = vec![Line::default(); lead];
-    lines.extend(info);
-    let info = lines;
     let rows = info.len().max(if with_mark { mark.rows() } else { 0 });
     let mut info = info.into_iter();
     for r in 0..rows {
@@ -335,8 +328,11 @@ mod tests {
             assert!(text.contains("Post a claim"), "{text}");
             if cols >= 60 {
                 assert!(text.contains("P O S T"), "{text}");
-                // The mark is the shaded prism, drawn in half blocks.
-                assert!(text.chars().any(|c| c == '▀' || c == '▄'), "{text}");
+                // The mark, in Braille dots.
+                assert!(
+                    text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+                    "{text}"
+                );
             }
         }
     }
