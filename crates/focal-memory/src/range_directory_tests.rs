@@ -597,3 +597,58 @@ fn every_multi_level_directory_allocation_failure_preserves_base_pin_and_all_cha
     drop(store);
     assert_eq!(budget.stats().used, 0);
 }
+impl crate::RangeKey for CountedKey<'_> {}
+
+/// A key whose order prefix is its high bits alone: 256 keys share each
+/// prefix, so most directory comparisons tie on the prefix and fall to the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Coarse(u32);
+impl crate::RangeKey for Coarse {
+    fn order_prefix(&self) -> u128 {
+        u128::from(self.0 >> 8)
+    }
+}
+
+/// The cached prefixes decide a search only where they differ: every key a
+/// store holds across many pages, inserted out of order and in batches, is
+/// found where it is, and none it does not hold is found, against the
+/// store's whole-key order.
+#[test]
+fn a_search_by_cached_prefix_finds_exactly_what_the_whole_key_order_holds() {
+    let budget = budget();
+    let mut store = RangeStore::new(RangeId(803), 0, config(4), budget.clone()).unwrap();
+    // Even keys, scattered: a multiplicative step visits every residue.
+    let keys: Vec<u32> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) % 6000) * 2)
+        .collect();
+    let mut prefix = 0;
+    for batch in keys.chunks(250) {
+        let mut sorted: Vec<u32> = batch.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        prefix += 1;
+        store
+            .apply_batch(
+                prefix,
+                sorted
+                    .iter()
+                    .filter(|k| store.get(&Coarse(**k)).is_none())
+                    .map(|k| Change::Put(Entry::new(Coarse(*k), u64::from(*k), 0)))
+                    .collect(),
+                ORDINARY,
+            )
+            .unwrap();
+    }
+    assert!(store.root.pages.check_shape());
+    let held: std::collections::BTreeSet<u32> = keys.iter().copied().collect();
+    for k in 0..12_002u32 {
+        let found = store.get(&Coarse(k)).copied();
+        if held.contains(&k) {
+            assert_eq!(found, Some(u64::from(k)), "key {k}");
+        } else {
+            assert_eq!(found, None, "key {k}");
+        }
+    }
+    let ordered: Vec<u32> = store.entries().map(|entry| entry.key.0).collect();
+    assert_eq!(ordered, held.iter().copied().collect::<Vec<_>>());
+}

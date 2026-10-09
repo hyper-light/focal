@@ -294,3 +294,4 @@ fn install<'a>(
     rows.publish(prepared)?;
     Ok(())
 }
+impl focal_memory::RangeKey for IndexKey {}

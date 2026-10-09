@@ -107,7 +107,7 @@ impl LeafPartition {
 /// Oversized singletons retain the original byte-isolation rule. Partitioned
 /// ordinary pages can remain shared when each adjacent incoming key starts a
 /// different partition. Only counts escape; owned changes can then be consumed.
-pub(super) fn reusable_page<K: Ord, V>(
+pub(super) fn reusable_page<K: crate::RangeKey, V>(
     page: &Page<K, V>,
     changes: &[Change<K, V>],
     config: RangeConfig,

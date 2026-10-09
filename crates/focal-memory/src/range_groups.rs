@@ -10,7 +10,7 @@ pub(super) struct LeafGroup {
     pub count: usize,
 }
 
-pub(super) fn next<K: Ord, V>(
+pub(super) fn next<K: crate::RangeKey, V>(
     base: &Root<K, V>,
     remaining: &[Change<K, V>],
 ) -> Result<Option<LeafGroup>, MemoryError> {

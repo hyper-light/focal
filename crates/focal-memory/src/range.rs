@@ -188,7 +188,21 @@ impl RangeConfig {
 
 pub(crate) struct Page<K, V> {
     pub entries: Vec<Entry<K, V>>,
+    /// The order prefix of the first key ([`crate::RangeKey`]): what a
+    /// directory search compares before it compares the key.
+    pub first: u128,
     _allocation: Allocation,
+}
+
+impl<K: crate::RangeKey, V> Page<K, V> {
+    pub(crate) fn new(entries: Vec<Entry<K, V>>, allocation: Allocation) -> Self {
+        let first = entries.first().map_or(0, |entry| entry.key.order_prefix());
+        Self {
+            entries,
+            first,
+            _allocation: allocation,
+        }
+    }
 }
 
 // Field order keeps the complete owned input alive under its permit on every
@@ -229,7 +243,7 @@ pub(crate) struct Root<K, V> {
     _allocation: Allocation,
 }
 
-impl<K: Ord, V> Root<K, V> {
+impl<K: crate::RangeKey, V> Root<K, V> {
     pub fn get(&self, key: &K) -> Option<&Entry<K, V>> {
         let page = self.pages.get(self.page_index(key))?;
         page.entries
@@ -302,7 +316,7 @@ pub struct FrozenRange<K, V> {
     _allocation: Allocation,
 }
 
-impl<K: Ord, V> FrozenRange<K, V> {
+impl<K: crate::RangeKey, V> FrozenRange<K, V> {
     pub fn id(&self) -> RangeId {
         self.root.range
     }
@@ -332,7 +346,7 @@ pub struct PreparedRange<K, V> {
     root: Arc<Root<K, V>>,
 }
 
-impl<K: Ord, V> PreparedRange<K, V> {
+impl<K: crate::RangeKey, V> PreparedRange<K, V> {
     pub fn id(&self) -> RangeId {
         self.root.range
     }
@@ -394,7 +408,7 @@ impl<K: Ord, V> PreparedRange<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     pub fn new(
         id: RangeId,
         initial_prefix: u64,
@@ -1005,10 +1019,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                     }
                 });
             }
-            emit_page(Arc::new(Page {
-                entries,
-                _allocation: allocation,
-            }))?;
+            emit_page(Arc::new(Page::new(entries, allocation)))?;
             Ok(())
         };
         let mut previous = None;
@@ -1178,7 +1189,7 @@ fn bounded_push<T>(values: &mut Vec<T>, value: T, limit: usize) -> Result<(), Me
 
 // Both preflight and construction visit the same ordered retained/incoming
 // sequence. Preflight only adds counts and charges; it never copies a row.
-fn visit_merged<'a, K: Ord, V>(
+fn visit_merged<'a, K: crate::RangeKey, V>(
     old: &'a [Entry<K, V>],
     selected: &[Change<K, V>],
     mut visit: impl FnMut(&K, MergeEntry<'a, K, V>) -> Result<(), MemoryError>,

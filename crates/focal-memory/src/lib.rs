@@ -36,6 +36,8 @@ mod index;
 mod owned_range_tests;
 mod owner;
 mod range;
+mod range_key;
+pub use range_key::RangeKey;
 #[cfg(test)]
 mod range_elastic_tests;
 mod range_map;

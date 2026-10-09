@@ -47,7 +47,7 @@ pub trait RangeHydrationSource<K, V> {
         V: 'a;
 }
 
-impl<K: Ord + Clone, V> RangeHydration<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
     /// Insert an exact-count phase whose final row quotes depend on restored
     /// model state. Order, disjointness, phase limits, precharges, owned capacity
     /// reconciliation and failure disposal match [`Self::insert_phase`].

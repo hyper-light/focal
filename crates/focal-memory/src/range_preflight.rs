@@ -74,7 +74,7 @@ pub(super) struct FundedPreparation<'a, K, V> {
     pub(super) input: Allocation,
 }
 
-impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
+impl<K: crate::RangeKey + Clone, V> RangePreparationPlan<'_, K, V> {
     pub fn charges(&self) -> RangePreparationCharges {
         self.charges
     }
@@ -186,7 +186,7 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     /// Preflight one owned batch without reserving or allocating additional
     /// buffers. `max_bytes` bounds its conservative *additional* peak charge;
     /// existing roots/pins and extra caller/copier workspace are separate.
@@ -367,7 +367,7 @@ struct Counts {
 }
 
 impl Counts {
-    fn merge<K: Ord, V>(
+    fn merge<K: crate::RangeKey, V>(
         &mut self,
         old: &[Entry<K, V>],
         selected: &[Change<K, V>],

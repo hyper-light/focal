@@ -36,7 +36,7 @@ pub struct RangeHydrationLookup<'a, K, V> {
     staged: &'a [Change<K, V>],
 }
 
-impl<'a, K: Ord, V> RangeHydrationLookup<'a, K, V> {
+impl<'a, K: crate::RangeKey, V> RangeHydrationLookup<'a, K, V> {
     pub fn get(&self, key: &K) -> Option<&'a V> {
         self.get_entry(key).map(|entry| &entry.value)
     }
@@ -65,7 +65,7 @@ pub struct RangeHydrationView<'a, K, V> {
     root: &'a Root<K, V>,
 }
 
-impl<K: Ord, V> RangeHydrationView<'_, K, V> {
+impl<K: crate::RangeKey, V> RangeHydrationView<'_, K, V> {
     pub fn len(&self) -> usize {
         self.root.len
     }
@@ -98,7 +98,7 @@ impl<K: Ord, V> RangeHydrationView<'_, K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     /// Begin dependency-ordered restoration into a detached, empty owner.
     /// Partition semantics and fallible copying match
     /// [`Self::from_entry_plans_partitioned_with`]. Only a successful
@@ -143,7 +143,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> RangeHydration<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
     /// Insert one dependency phase with exactly `expected_entries` plans.
     /// Keys must be strictly increasing within the phase and absent from all
     /// earlier phases; phase order need not follow key order. There are no

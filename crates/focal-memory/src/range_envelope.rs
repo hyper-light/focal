@@ -108,7 +108,7 @@ impl RangeWriteEnvelope {
     /// guarantee based on this envelope. This rejects foreign owner incarnations
     /// even when RangeId/config match, excessive spare input capacity, and every
     /// shape/charge violation. It allocates nothing and consumes no candidate.
-    pub fn check_plan<K: Ord + Clone, V>(
+    pub fn check_plan<K: crate::RangeKey + Clone, V>(
         &self,
         plan: &RangePreparationPlan<'_, K, V>,
     ) -> Result<(), MemoryError> {
@@ -120,7 +120,7 @@ impl RangeWriteEnvelope {
     /// [`RangeStore::future_write_envelope_shared`] for at least that many
     /// members. Sums are bounded by the whole write's limits; every plan must
     /// belong to the group's owner incarnation; a group of one is `check_plan`.
-    pub fn check_plans<'a, 'b, K: Ord + Clone + 'a, V: 'a>(
+    pub fn check_plans<'a, 'b, K: crate::RangeKey + Clone + 'a, V: 'a>(
         &self,
         plans: impl IntoIterator<Item = &'b RangePreparationPlan<'a, K, V>>,
     ) -> Result<(), MemoryError>

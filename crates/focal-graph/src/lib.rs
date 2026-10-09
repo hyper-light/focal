@@ -297,3 +297,4 @@ impl GraphStore {
         Ok(())
     }
 }
+impl focal_memory::RangeKey for GraphKey {}

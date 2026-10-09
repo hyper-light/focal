@@ -28,6 +28,8 @@ pub(crate) struct PageDirectory<K, V> {
 struct Node<K, V> {
     // Owned buffers/children must drop before their accounting allocation.
     links: Links<K, V>,
+    /// The order prefix of the node's first key, as [`Page::first`].
+    first: u128,
     pages: usize,
     level: usize,
     _allocation: Allocation,
@@ -157,18 +159,24 @@ impl<K, V> PageDirectory<K, V> {
     }
 }
 
-impl<K: Ord, V> PageDirectory<K, V> {
+impl<K: crate::RangeKey, V> PageDirectory<K, V> {
+    /// The page whose span holds `key`. The prefixes cached beside pages and
+    /// nodes decide every comparison where they differ; where they tie, the
+    /// keys do. The sought key's prefix is computed once.
     pub(super) fn page_index(&self, key: &K) -> usize {
         let Some(mut node) = self.root.as_deref() else {
             return 0;
         };
+        let probe = key.order_prefix();
         let mut rank = 0usize;
         loop {
             match &node.links {
                 Links::Leaves(pages) => {
                     let local = pages
                         .partition_point(|page| {
-                            page.entries.first().is_some_and(|entry| &entry.key <= key)
+                            page.first < probe
+                                || (page.first == probe
+                                    && page.entries.first().is_some_and(|entry| &entry.key <= key))
                         })
                         .saturating_sub(1);
                     return rank.saturating_add(local);
@@ -176,7 +184,9 @@ impl<K: Ord, V> PageDirectory<K, V> {
                 Links::Branches(children) => {
                     let local = children
                         .partition_point(|child| {
-                            child.first_key().is_some_and(|first| first <= key)
+                            child.first < probe
+                                || (child.first == probe
+                                    && child.first_key().is_some_and(|first| first <= key))
                         })
                         .saturating_sub(1);
                     for child in children.iter().take(local) {
@@ -454,7 +464,7 @@ fn node_charge<K, V>(width: usize) -> Result<usize, MemoryError> {
 /// replaced span for a splice of a node whose order was checked when it was
 /// built (a page replaced in a node of 64 is checked against its two
 /// neighbours, not the 63 pairs that did not change).
-fn leaf<K: Ord, V>(
+fn leaf<K: crate::RangeKey, V>(
     count: usize,
     mut item: impl FnMut(usize) -> Option<Arc<Page<K, V>>>,
     seam: impl Fn(usize) -> bool,
@@ -481,8 +491,10 @@ fn leaf<K: Ord, V>(
         }
         bounded_push(&mut pages, page, count)?;
     }
+    let first = pages.first().map_or(0, |page| page.first);
     Ok(Arc::new(Node {
         links: Links::Leaves(pages),
+        first,
         pages: count,
         level: 0,
         _allocation: allocation,
@@ -491,7 +503,7 @@ fn leaf<K: Ord, V>(
 
 /// A node of `count` children, their heights and counts checked; their
 /// order where `seam` says the sequence is new, as for [`leaf`].
-fn branch<K: Ord, V>(
+fn branch<K: crate::RangeKey, V>(
     count: usize,
     mut item: impl FnMut(usize) -> Option<Arc<Node<K, V>>>,
     seam: impl Fn(usize) -> bool,
@@ -527,8 +539,10 @@ fn branch<K: Ord, V>(
         level = Some(child_level);
         bounded_push(&mut children, child, count)?;
     }
+    let first = children.first().map_or(0, |child| child.first);
     Ok(Arc::new(Node {
         links: Links::Branches(children),
+        first,
         pages,
         level: level.ok_or(invalid("empty directory branch"))?,
         _allocation: allocation,
@@ -591,7 +605,7 @@ impl<'a, T> Splice<'a, T> {
 
 type Split<K, V> = (Arc<Node<K, V>>, Option<Arc<Node<K, V>>>);
 
-fn split_leaves<K: Ord, V>(
+fn split_leaves<K: crate::RangeKey, V>(
     items: &Splice<'_, Arc<Page<K, V>>>,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Split<K, V>, MemoryError> {
@@ -629,7 +643,7 @@ fn split_leaves<K: Ord, V>(
     Ok((left, Some(right)))
 }
 
-fn split_branches<K: Ord, V>(
+fn split_branches<K: crate::RangeKey, V>(
     items: &Splice<'_, Arc<Node<K, V>>>,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Split<K, V>, MemoryError> {
@@ -683,7 +697,7 @@ fn child_at<K, V>(
     Err(MemoryError::MissingKey)
 }
 
-fn insert_node<K: Ord, V>(
+fn insert_node<K: crate::RangeKey, V>(
     node: &Node<K, V>,
     rank: usize,
     page: Arc<Page<K, V>>,
@@ -702,7 +716,7 @@ fn insert_node<K: Ord, V>(
     }
 }
 
-fn replace_node<K: Ord, V>(
+fn replace_node<K: crate::RangeKey, V>(
     node: &Node<K, V>,
     rank: usize,
     page: Arc<Page<K, V>>,
@@ -733,7 +747,7 @@ fn replace_node<K: Ord, V>(
     }
 }
 
-fn remove_node<K: Ord, V>(
+fn remove_node<K: crate::RangeKey, V>(
     node: &Node<K, V>,
     rank: usize,
     build: &mut DirectoryBuild<'_>,
@@ -774,7 +788,7 @@ fn remove_node<K: Ord, V>(
     }
 }
 
-fn repair<'a, K: Ord, V>(
+fn repair<'a, K: crate::RangeKey, V>(
     children: &'a [Arc<Node<K, V>>],
     index: usize,
     child: Arc<Node<K, V>>,
@@ -809,7 +823,7 @@ fn joined<'a, T>(left: &'a [T], right: &'a [T], index: usize) -> Option<&'a T> {
     }
 }
 
-fn redistribute<K: Ord, V>(
+fn redistribute<K: crate::RangeKey, V>(
     left: &Node<K, V>,
     right: &Node<K, V>,
     first_count: usize,
@@ -978,7 +992,7 @@ impl<'a, K, V> IntoIterator for &'a PageDirectory<K, V> {
 }
 
 #[cfg(test)]
-fn audit<K: Ord, V>(node: &Node<K, V>, root: bool) -> bool {
+fn audit<K: crate::RangeKey, V>(node: &Node<K, V>, root: bool) -> bool {
     let minimum = if root {
         match node.links {
             Links::Leaves(_) => 1,

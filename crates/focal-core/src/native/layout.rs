@@ -378,6 +378,13 @@ fn slots(key: &Key) -> [Slot; SLOTS] {
     };
     fields.slots
 }
+impl focal_memory::RangeKey for Key {
+    /// The affinity, read as a big-endian integer: the first field of the
+    /// order, so a key with a lesser prefix is a lesser key.
+    fn order_prefix(&self) -> u128 {
+        u128::from_be_bytes(affinity(self))
+    }
+}
 impl PartialOrd for Key {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))

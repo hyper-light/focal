@@ -210,3 +210,4 @@ impl RangeMap {
         Ok(bytes)
     }
 }
+impl focal_memory::RangeKey for StorageKey {}
