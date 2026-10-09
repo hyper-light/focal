@@ -642,3 +642,52 @@ pub(in crate::native) fn replay_fixture() -> (Core<NativeState>, [NativeInput; 3
         ],
     )
 }
+
+/// Measurement, not a check: the owner's CPU per authored claim creation,
+/// prepare (decode-free: the input is built) and publish apart, over a core
+/// that grows to `CLAIMS`. Run with `--release --ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_time_per_authored_claim() {
+    let claims: u128 = std::env::var("FOCAL_MEASURE_CLAIMS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    // Rounds over fresh cores, for a profiler to sample long enough.
+    let rounds: u32 = std::env::var("FOCAL_MEASURE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    for _ in 1..rounds {
+        let mut core = core();
+        for id in 1..=claims {
+            let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+            core.publish_native(prepared).unwrap();
+        }
+    }
+    let mut core = core();
+    let (mut prepare_ns, mut publish_ns) = (0u128, 0u128);
+    let mut window = (0u128, 0u128);
+    for id in 1..=claims {
+        let input = create(id, vec![proposal(id, 10_000 + id)]);
+        let started = std::time::Instant::now();
+        let prepared = prepare(&core, input, &[]);
+        let prepared_at = std::time::Instant::now();
+        core.publish_native(prepared).unwrap();
+        let p = prepared_at.duration_since(started).as_nanos();
+        let q = prepared_at.elapsed().as_nanos();
+        prepare_ns += p;
+        publish_ns += q;
+        if id > claims - 1000 {
+            window.0 += p;
+            window.1 += q;
+        }
+    }
+    println!(
+        "{claims} claims: prepare {:.1} µs, publish {:.1} µs per claim; last 1000: prepare {:.1} µs, publish {:.1} µs",
+        prepare_ns as f64 / claims as f64 / 1e3,
+        publish_ns as f64 / claims as f64 / 1e3,
+        window.0 as f64 / 1000.0 / 1e3,
+        window.1 as f64 / 1000.0 / 1e3,
+    );
+}

@@ -207,12 +207,14 @@ pub(super) fn affinity(key: &Key) -> [u8; 16] {
 /// declaration order with nested enums tagged. Distinct keys never share it.
 /// Fields are one slot sequence in declaration order, so a time precedes
 /// the identities after it and a tag precedes the fields it selects.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Slot {
     Empty,
     Id([u8; 16]),
     N(u64),
 }
+#[cfg(test)]
 const SLOTS: usize = 10;
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -221,10 +223,12 @@ struct OrderKey {
     family: u16,
     slots: [Slot; SLOTS],
 }
+#[cfg(test)]
 struct Fields {
     slots: [Slot; SLOTS],
     next: usize,
 }
+#[cfg(test)]
 impl Fields {
     fn new() -> Self {
         Self {
@@ -319,6 +323,7 @@ fn order_key(key: &Key) -> OrderKey {
     }
 }
 /// A key's fields in declaration order, nested enums tagged: its order within its affinity and family.
+#[cfg(test)]
 fn slots(key: &Key) -> [Slot; SLOTS] {
     let fields = Fields::new();
     let fields = match key {
@@ -380,58 +385,241 @@ impl PartialOrd for Key {
 }
 impl Ord for Key {
     /// Affinity, then family, then the fields, decided as early as it can be: most keys a search compares
-    /// already differ in affinity, so the slots are built only for keys of one affinity and family. A
-    /// 2026-10-06 profile of committed claims spent most of the write path's CPU building both keys' whole
-    /// order (affinity, family and slots) for every comparison.
+    /// already differ in affinity, so the fields are compared only for keys of one affinity and family,
+    /// in place ([`same_family`]), never building either key's slots. Affinities and identities compare
+    /// as big-endian integers: the byte order, in one comparison rather than a `memcmp` call. A
+    /// 2026-10-08 profile of authored claim creation spent half the owner's CPU ordering keys: every
+    /// exact lookup ends comparing a key with itself, and the families the field comparison did not
+    /// cover built both keys' ten slots to do it.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        affinity(self)
-            .cmp(&affinity(other))
+        u128::from_be_bytes(affinity(self))
+            .cmp(&u128::from_be_bytes(affinity(other)))
             .then_with(|| family(self).cmp(&family(other)))
-            .then_with(|| {
-                same_family(self, other).unwrap_or_else(|| slots(self).cmp(&slots(other)))
-            })
+            .then_with(|| same_family(self, other))
+    }
+}
+
+/// An ordering decided field by field: the first field that differs decides, as [`slots`] lays them out.
+#[derive(Clone, Copy)]
+struct Fold(std::cmp::Ordering);
+impl Fold {
+    fn start() -> Self {
+        Self(std::cmp::Ordering::Equal)
+    }
+    fn id(self, a: &[u8; 16], b: &[u8; 16]) -> Self {
+        if self.0.is_ne() {
+            return self;
+        }
+        Self(u128::from_be_bytes(*a).cmp(&u128::from_be_bytes(*b)))
+    }
+    fn n(self, a: u64, b: u64) -> Self {
+        if self.0.is_ne() {
+            return self;
+        }
+        Self(a.cmp(&b))
+    }
+    fn hash(self, a: &ContentHash, b: &ContentHash) -> Self {
+        self.id(&low(a), &low(b)).id(&high(a), &high(b))
+    }
+    fn evaluation(self, a: &EvaluationKey, b: &EvaluationKey) -> Self {
+        use EvaluationTarget as T;
+        let fold = self
+            .id(&a.claim.0, &b.claim.0)
+            .id(&a.validation.0, &b.validation.0);
+        let fold = match (a.target, b.target) {
+            (T::Admission, T::Admission) => fold.n(0, 0),
+            (T::Increment { artifact: x }, T::Increment { artifact: y }) => {
+                fold.n(1, 1).id(&x.0, &y.0)
+            }
+            (
+                T::Work {
+                    response: r,
+                    slot: s,
+                    artifact: x,
+                },
+                T::Work {
+                    response: q,
+                    slot: t,
+                    artifact: y,
+                },
+            ) => fold
+                .n(2, 2)
+                .id(&r.0, &q.0)
+                .n(u64::from(s), u64::from(t))
+                .id(&x.0, &y.0),
+            (
+                T::MissingSlot {
+                    response: r,
+                    slot: s,
+                },
+                T::MissingSlot {
+                    response: q,
+                    slot: t,
+                },
+            ) => fold.n(3, 3).id(&r.0, &q.0).n(u64::from(s), u64::from(t)),
+            (T::Delivery { response: r }, T::Delivery { response: q }) => {
+                fold.n(4, 4).id(&r.0, &q.0)
+            }
+            (x, y) => fold.n(target_tag(&x), target_tag(&y)),
+        };
+        fold.n(a.generation, b.generation)
+    }
+    fn result(self, a: &NativeResultKey, b: &NativeResultKey) -> Self {
+        self.evaluation(&a.evaluation, &b.evaluation)
+            .n(a.revision.0, b.revision.0)
+    }
+    fn cycle(self, a: &NativeCycleKey, b: &NativeCycleKey) -> Self {
+        self.id(&a.claim.0, &b.claim.0)
+            .id(&a.receipt.0, &b.receipt.0)
+            .n(a.epoch, b.epoch)
+            .n(u64::from(a.cycle), u64::from(b.cycle))
+    }
+    fn invocation(self, a: &NativeInvocation, b: &NativeInvocation) -> Self {
+        use NativeInvocation as I;
+        match (a, b) {
+            (I::Request(x), I::Request(y)) => self
+                .n(0, 0)
+                .id(&x.principal.0, &y.principal.0)
+                .n(x.epoch.0, y.epoch.0)
+                .id(&x.id.0, &y.id.0),
+            (I::EvaluationDeadline(x), I::EvaluationDeadline(y)) => self
+                .n(1, 1)
+                .evaluation(&x.evaluation, &y.evaluation)
+                .id(&x.timer.0, &y.timer.0)
+                .n(x.generation, y.generation),
+            (I::ClaimDeadline(x), I::ClaimDeadline(y)) => self
+                .n(2, 2)
+                .id(&x.claim.0, &y.claim.0)
+                .id(&x.timer.0, &y.timer.0)
+                .n(x.generation, y.generation),
+            (I::MonitorDeadline(x), I::MonitorDeadline(y)) => self
+                .n(3, 3)
+                .id(&x.claim.0, &y.claim.0)
+                .id(&x.monitor.0, &y.monitor.0)
+                .id(&x.timer.0, &y.timer.0)
+                .n(x.generation, y.generation),
+            (I::Import, I::Import) => self.n(4, 4),
+            (I::Retirement(x), I::Retirement(y)) => self.n(5, 5).id(&x.0, &y.0),
+            (I::Seal(x), I::Seal(y)) => self.n(6, 6).n(*x, *y),
+            (x, y) => self.n(invocation_tag(x), invocation_tag(y)),
+        }
+    }
+    fn timer(self, a: &TimerTarget, b: &TimerTarget) -> Self {
+        use TimerTarget as T;
+        match (a, b) {
+            (T::Claim(x), T::Claim(y)) => self.n(0, 0).id(&x.0, &y.0),
+            (T::Evaluation(x), T::Evaluation(y)) => self.n(1, 1).evaluation(x, y),
+            (T::Monitor(c, m), T::Monitor(d, o)) => self.n(2, 2).id(&c.0, &d.0).id(&m.0, &o.0),
+            (x, y) => self.n(timer_tag(x), timer_tag(y)),
+        }
+    }
+}
+fn target_tag(target: &EvaluationTarget) -> u64 {
+    match target {
+        EvaluationTarget::Admission => 0,
+        EvaluationTarget::Increment { .. } => 1,
+        EvaluationTarget::Work { .. } => 2,
+        EvaluationTarget::MissingSlot { .. } => 3,
+        EvaluationTarget::Delivery { .. } => 4,
+    }
+}
+fn invocation_tag(invocation: &NativeInvocation) -> u64 {
+    match invocation {
+        NativeInvocation::Request(_) => 0,
+        NativeInvocation::EvaluationDeadline(_) => 1,
+        NativeInvocation::ClaimDeadline(_) => 2,
+        NativeInvocation::MonitorDeadline(_) => 3,
+        NativeInvocation::Import => 4,
+        NativeInvocation::Retirement(_) => 5,
+        NativeInvocation::Seal(_) => 6,
+    }
+}
+fn timer_tag(target: &TimerTarget) -> u64 {
+    match target {
+        TimerTarget::Claim(_) => 0,
+        TimerTarget::Evaluation(_) => 1,
+        TimerTarget::Monitor(..) => 2,
     }
 }
 
 /// Two keys of one affinity and family compared field by field, the values [`slots`] lays out in
-/// the same order, without building either key's ten slots. A family is one variant, so its keys
-/// have one shape and comparing their values in order is comparing their slots. A 2026-10-08 profile
-/// of committed authored claims spent the write path's most CPU in `slots`: one principal's
-/// outcomes and creation results, and the index rows, share an affinity and family by the thousand,
-/// so most comparisons of a page search reached it. Kinds not listed here take [`slots`].
-fn same_family(a: &Key, b: &Key) -> Option<std::cmp::Ordering> {
+/// the same order. A family is one variant, so its keys have one shape but for their nested enums,
+/// which compare by tag first, as their slots do. Keys of different families are never compared
+/// here (the family decides them); were they, they would compare equal, which the family's
+/// comparison before this one rules out.
+fn same_family(a: &Key, b: &Key) -> std::cmp::Ordering {
     use Key as K;
-    Some(match (a, b) {
+    let f = Fold::start();
+    match (a, b) {
         (K::IncomingHead(x), K::IncomingHead(y))
         | (K::MonitorHead(x), K::MonitorHead(y))
         | (K::Claim(x), K::Claim(y))
         | (K::RetiredCycleHead(x), K::RetiredCycleHead(y))
         | (K::Retired(x), K::Retired(y))
         | (K::ClaimResultTestament(x), K::ClaimResultTestament(y))
-        | (K::ClaimContent(x), K::ClaimContent(y)) => x.0.cmp(&y.0),
-        (K::IncomingLink(c, f), K::IncomingLink(d, g)) => (c.0, f.0).cmp(&(d.0, g.0)),
-        (K::MonitorLink(c, m), K::MonitorLink(d, n)) => (c.0, m.0).cmp(&(d.0, n.0)),
+        | (K::ClaimContent(x), K::ClaimContent(y)) => f.id(&x.0, &y.0),
+        (K::IncomingLink(c, x), K::IncomingLink(d, y)) => f.id(&c.0, &d.0).id(&x.0, &y.0),
+        (K::Monitor(x), K::Monitor(y)) => f.id(&x.0, &y.0),
+        (K::MonitorLink(c, x), K::MonitorLink(d, y)) => f.id(&c.0, &d.0).id(&x.0, &y.0),
+        (K::MissingResult(x), K::MissingResult(y))
+        | (K::Accepted(x), K::Accepted(y))
+        | (K::DeliveryResult(x), K::DeliveryResult(y)) => f.result(x, y),
+        (K::Meta, K::Meta) | (K::End, K::End) => f,
+        (K::Definition(x), K::Definition(y)) | (K::LegacyDefinition(x), K::LegacyDefinition(y)) => {
+            f.id(&x.0, &y.0)
+        }
+        (K::Evaluation(x), K::Evaluation(y)) => f.evaluation(x, y),
+        (K::Artifact(x), K::Artifact(y))
+        | (K::Work(x), K::Work(y))
+        | (K::Diagnostic(x), K::Diagnostic(y)) => f.id(&x.0, &y.0),
+        (K::ArtifactIdentity(x), K::ArtifactIdentity(y)) => f.hash(x, y),
+        (K::Receipt(x), K::Receipt(y)) => f.id(&x.0, &y.0),
+        (K::Cycle(x), K::Cycle(y)) | (K::RetiredCycle(x), K::RetiredCycle(y)) => f.cycle(x, y),
+        (K::WorkSlot(x, s), K::WorkSlot(y, t)) => f.cycle(x, y).n(u64::from(*s), u64::from(*t)),
+        (K::Response(x), K::Response(y))
+        | (K::ResultTestament(x), K::ResultTestament(y))
+        | (K::LegacyTestament(x), K::LegacyTestament(y)) => f.id(&x.0, &y.0),
+        (K::Outcome(x), K::Outcome(y)) | (K::CreationResult(x), K::CreationResult(y)) => {
+            f.invocation(x, y)
+        }
+        (K::Epochs(x), K::Epochs(y)) => f.id(&x.0, &y.0),
+        (K::Seal(x), K::Seal(y)) => f.n(*x, *y),
+        (K::Event(s, o), K::Event(t, p)) => f.n(s.0, t.0).n(u64::from(*o), u64::from(*p)),
+        (K::ClaimIdentity(k, x), K::ClaimIdentity(l, y))
+        | (K::DefinitionIdentity(k, x), K::DefinitionIdentity(l, y)) => {
+            f.n(u64::from(*k), u64::from(*l)).hash(x, y)
+        }
+        (K::LegacyEvidenceSet(x), K::LegacyEvidenceSet(y)) => f.id(&x.0, &y.0),
+        (K::LegacyRun(v, o), K::LegacyRun(w, p)) => {
+            f.id(&v.0, &w.0).n(u64::from(*o), u64::from(*p))
+        }
         (K::ByIssuer(p, c), K::ByIssuer(q, d)) | (K::BySubject(p, c), K::BySubject(q, d)) => {
-            (p.0, c.0).cmp(&(q.0, d.0))
+            f.id(&p.0, &q.0).id(&c.0, &d.0)
         }
         (K::ByStatus(k, c), K::ByStatus(l, d)) | (K::ByAction(k, c), K::ByAction(l, d)) => {
-            (u64::from(*k), c.0).cmp(&(u64::from(*l), d.0))
+            f.n(u64::from(*k), u64::from(*l)).id(&c.0, &d.0)
         }
+        (K::ByScope(k, x, c), K::ByScope(l, y, d)) => {
+            f.n(u64::from(*k), u64::from(*l)).hash(x, y).id(&c.0, &d.0)
+        }
+        (K::ByRelation(k, t, s), K::ByRelation(l, u, r)) => f
+            .n(u64::from(*k), u64::from(*l))
+            .id(&t.0, &u.0)
+            .id(&s.0, &r.0),
+        (K::ByProducer(p, a), K::ByProducer(q, b)) => f.id(&p.0, &q.0).id(&a.0, &b.0),
+        (K::ByArtifactKind(x, a), K::ByArtifactKind(y, b))
+        | (K::BySchema(x, a), K::BySchema(y, b)) => f.hash(x, y).id(&a.0, &b.0),
+        (K::ArtifactInput(o, a), K::ArtifactInput(p, b)) => f.id(&o.0, &p.0).id(&a.0, &b.0),
+        (K::ByEvaluator(p, v), K::ByEvaluator(q, w)) => f.id(&p.0, &q.0).id(&v.0, &w.0),
+        (K::ByVerdict(k, x), K::ByVerdict(l, y)) => f.n(u64::from(*k), u64::from(*l)).result(x, y),
         (K::ByCreated(k, s, o), K::ByCreated(l, t, p)) => {
-            (u64::from(*k), s.0, o.0).cmp(&(u64::from(*l), t.0, p.0))
+            f.n(u64::from(*k), u64::from(*l)).n(s.0, t.0).id(&o.0, &p.0)
         }
-        (K::ByObject(k, o), K::ByObject(l, p)) => (u64::from(*k), o.0).cmp(&(u64::from(*l), p.0)),
-        (K::Event(s, o), K::Event(t, p)) => (s.0, u64::from(*o)).cmp(&(t.0, u64::from(*p))),
-        (K::Outcome(i), K::Outcome(j)) | (K::CreationResult(i), K::CreationResult(j)) => {
-            match (i, j) {
-                (NativeInvocation::Request(r), NativeInvocation::Request(q)) => {
-                    (r.principal.0, r.epoch.0, r.id.0).cmp(&(q.principal.0, q.epoch.0, q.id.0))
-                }
-                _ => return None,
-            }
-        }
-        _ => return None,
-    })
+        (K::DueTimer(x, s), K::DueTimer(y, t)) => f.n(*x, *y).timer(s, t),
+        (K::ByObject(k, o), K::ByObject(l, p)) => f.n(u64::from(*k), u64::from(*l)).id(&o.0, &p.0),
+        _ => f,
+    }
+    .0
 }
 
 #[cfg(test)]
