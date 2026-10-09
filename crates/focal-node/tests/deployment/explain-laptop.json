@@ -74,6 +74,7 @@
     "node.data_dir": "command_line",
     "node.listen": "creation_default",
     "node.max_tenants": "creation_default",
+    "node.memory_bytes": "creation_default",
     "node.metrics_listen": "creation_default",
     "node.root_key": "creation_default",
     "node.seeds": "creation_default",
