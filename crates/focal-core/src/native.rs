@@ -1452,6 +1452,29 @@ impl std::fmt::Display for NativePublishError {
 }
 impl std::error::Error for NativePublishError {}
 
+/// A native core's committed rows frozen at one prefix ([`Core::freeze_native`]):
+/// read-only and sendable, so a checkpoint encodes from it off the owner's
+/// thread. Its pages stay charged until it drops; its holder bounds its life.
+pub struct NativeFrozen {
+    ledger: LedgerId,
+    profile: NativeContentProfile,
+    rows: ranges::FrozenRanges,
+}
+impl std::fmt::Debug for NativeFrozen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeFrozen")
+            .field("ledger", &self.ledger)
+            .field("prefix", &self.rows.prefix())
+            .field("entries", &self.rows.len())
+            .finish_non_exhaustive()
+    }
+}
+impl NativeFrozen {
+    pub fn native_sequence(&self) -> SessionSeq {
+        SessionSeq(self.rows.prefix())
+    }
+}
+
 /// Expiring capability to a fixed native prefix. Borrowed rows cannot escape a
 /// projection call. No Clone implementation is needed on native claim rows.
 #[derive(Debug)]
@@ -1641,6 +1664,15 @@ impl Core<NativeState> {
     }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
+    }
+    /// The committed rows frozen at this prefix, for a checkpoint to encode
+    /// on another thread while this core goes on (`record_codec::checkpoint`).
+    pub fn freeze_native(&self) -> Result<NativeFrozen, MemoryError> {
+        Ok(NativeFrozen {
+            ledger: self.state.ledger,
+            profile: self.state.profile,
+            rows: self.state.rows.freeze(&self.state.budget)?,
+        })
     }
     /// The trusted clock of the last committed record; zero before any record.
     pub fn native_logical_time(&self) -> u64 {

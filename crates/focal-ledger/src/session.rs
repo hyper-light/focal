@@ -208,17 +208,23 @@ struct Candidate {
 /// measured: its applied index and encoded size, the native engine's section (the
 /// committed Core's root and its seed installs), the rest of the envelope (core,
 /// cursors, request streams, placement, deltas), and the write (consensus's log
-/// rewrite behind its durable fence, and the compaction after it). The owner does
-/// all of it on its own thread, so the sum is how long the session's work waited.
+/// rewrite behind its durable fence, and the compaction after it). All but the
+/// deferred part run on the owner's thread: their sum is how long the session's
+/// work waited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CheckpointTiming {
     pub index: u64,
     pub bytes: u64,
+    /// The native section's time on the owner: encoded and its seeds
+    /// installed, or, deferred, its rows frozen and its point captured.
     pub native_micros: u64,
+    /// The rest of the envelope's time on the owner.
     pub envelope_micros: u64,
-    /// How long its seed chunks took to be made durable away from the owner,
-    /// while the replica went on; zero when the owner made them durable itself.
+    /// A deferred checkpoint's time away from the owner, while the replica
+    /// went on: its native root encoded and its seed chunks made durable.
+    /// Zero when the owner did both itself.
     pub deferred_micros: u64,
+    /// Joining the envelope and handing it to consensus, on the owner.
     pub write_micros: u64,
 }
 

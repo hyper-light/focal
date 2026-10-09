@@ -294,6 +294,36 @@ pub struct RangeStore<K, V> {
     clock: Arc<AtomicU64>,
 }
 
+/// A committed prefix held by a strong root (see [`RangeStore::freeze`]):
+/// read-only, sendable to another thread, independent of the store's later
+/// batches.
+pub struct FrozenRange<K, V> {
+    root: Arc<Root<K, V>>,
+    _allocation: Allocation,
+}
+
+impl<K: Ord, V> FrozenRange<K, V> {
+    pub fn id(&self) -> RangeId {
+        self.root.range
+    }
+    pub fn prefix(&self) -> u64 {
+        self.root.prefix
+    }
+    pub fn len(&self) -> usize {
+        self.root.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.root.len == 0
+    }
+    /// The page count, as [`RangeStore::stats`] reports it.
+    pub fn pages(&self) -> usize {
+        self.root.pages.len()
+    }
+    pub fn entries(&self) -> impl Iterator<Item = &Entry<K, V>> {
+        self.root.from(0, 0)
+    }
+}
+
 /// Fully allocated, unpublished candidate. Admission can hold it across a
 /// durable-log proposal and drop it on rejection. Only its originating owner
 /// at the unchanged base root can publish it. Publication allocates nothing.
@@ -1011,8 +1041,29 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         Ok(before.saturating_sub(self.pins.len()))
     }
 
-    /// Only this bounded owner registry holds strong read roots. The returned
-    /// weak lease cannot retain old pages after expiry/release and maintenance.
+    /// The committed prefix, frozen: a strong root the caller holds, every
+    /// page of it staying charged where it was (each page carries its own
+    /// allocation) while later batches copy the pages they change. Unlike a
+    /// lease it does not expire; its holder bounds its life. A checkpoint
+    /// encodes from it off the owner's thread and drops it when written.
+    pub fn freeze(&self) -> Result<FrozenRange<K, V>, MemoryError> {
+        let charge = checked_add(
+            ALLOCATOR_OVERHEAD,
+            checked_add(size_of::<FrozenRange<K, V>>(), size_of::<Allocation>())?,
+        )?;
+        let allocation = self
+            .budget
+            .reserve(BudgetKind::ReadPins, BudgetLane::Ordinary, charge)?
+            .commit();
+        Ok(FrozenRange {
+            root: Arc::clone(&self.root),
+            _allocation: allocation,
+        })
+    }
+
+    /// Only this bounded owner registry holds strong read roots, but for a
+    /// [`Self::freeze`]'s holder. The returned weak lease cannot retain old
+    /// pages after expiry/release and maintenance.
     pub fn pin(&mut self, now: u64, ttl: u64) -> Result<SnapshotLease<K, V>, MemoryError> {
         self.advance_clock(now)?;
         if ttl == 0 || ttl > self.config.max_snapshot_ttl {
