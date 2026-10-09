@@ -94,7 +94,8 @@ mod admission_tests;
 /// under the size rule, so a small state is not imaged at every few entries.
 pub const CHECKPOINT_AFTER_ENTRIES: u64 = 4096;
 /// The times its last image's bytes the applied log a session holds may come
-/// to before it checkpoints (Ongaro's thesis §5.1.2, "When to snapshot": a
+/// to before it checkpoints, where a checkpoint writes the image alone (the
+/// shell's; focal-log's rewrites the log beside it and keeps the floor) (Ongaro's thesis §5.1.2, "When to snapshot": a
 /// snapshot once the log exceeds the previous snapshot times an expansion
 /// factor), as hyper-durable's own rule and slates state it. A checkpoint
 /// re-encodes the whole state, so at a fixed entry count the cost of
@@ -1951,6 +1952,15 @@ impl Owner {
         if entries < self.config.checkpoint_after_entries {
             return Ok(false);
         }
+        // A checkpoint that rewrites the log it keeps (focal-log's) costs the
+        // owner the log as well as the state: a longer log between images
+        // makes each rewrite, on the owner's thread, longer (265 ms at 22k
+        // entries on the Linux comparison). It keeps the floor alone.
+        let expansion = if self.session.checkpoint_rewrites_log() {
+            0
+        } else {
+            self.config.checkpoint_expansion
+        };
         Ok(checkpoint_due(
             CheckpointLog {
                 entries,
@@ -1958,7 +1968,7 @@ impl Owner {
             },
             self.session.checkpoint_image_bytes(),
             u64::try_from(self.session.memory_stats().limit).unwrap_or(u64::MAX),
-            self.config.checkpoint_expansion,
+            expansion,
         ))
     }
     /// Checkpoint now unless the replica cannot yet: a resource condition or

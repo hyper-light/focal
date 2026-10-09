@@ -852,6 +852,11 @@ impl Session {
         self.image_bytes.saturating_add(root)
     }
 
+    /// Whether a checkpoint rewrites the log consensus keeps beside its image.
+    pub fn checkpoint_rewrites_log(&self) -> bool {
+        self.consensus.checkpoint_rewrites_log()
+    }
+
     /// The bytes of the applied entries the log holds past its last image.
     pub fn applied_log_bytes(&self) -> Result<u64, LedgerError> {
         Ok(self.consensus.applied_log_bytes()?)

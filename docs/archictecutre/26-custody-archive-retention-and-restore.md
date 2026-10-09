@@ -158,7 +158,10 @@ is cut once it holds an eighth of the session's memory (its entries are
 charged to the budget the state grows into), and at 100,000 entries
 whatever their bytes (what a restart replays; etcd's snapshot count). A
 replica that opened has no image of its own yet and checkpoints at the
-floor first. `fleet_tests::a_log_is_checkpointed_once_it_outweighs_its_last_image`
+floor first. The rule is the shell's: focal-log's checkpoint rewrites every
+retained entry past the image beside it, on the owner's thread, so a longer
+log between images lengthens each rewrite (265 ms at 22,000 entries on the
+same comparison); a replica on focal-log keeps the floor alone. `fleet_tests::a_log_is_checkpointed_once_it_outweighs_its_last_image`
 holds the rule; the cadence tests state an expansion of zero, the floor
 alone.
 

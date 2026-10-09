@@ -432,6 +432,13 @@ impl DurableNode {
     pub fn snapshot_index(&self) -> u64 {
         dispatch!(inner = &self.backend => inner.snapshot_index())
     }
+    /// Whether a checkpoint rewrites the log it keeps: focal-log's rewrites
+    /// every retained entry past the image beside it, so its cost grows with
+    /// the log as well as the state; the shell's writes the image alone and
+    /// compacts behind it.
+    pub fn checkpoint_rewrites_log(&self) -> bool {
+        matches!(self.backend, Backend::Log(_))
+    }
     /// The bytes of the applied entries the log holds past its last image.
     pub fn applied_log_bytes(&self) -> Result<u64, ConsensusError> {
         dispatch!(inner = &self.backend => inner.applied_log_bytes())
