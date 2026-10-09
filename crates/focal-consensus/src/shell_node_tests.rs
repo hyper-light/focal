@@ -211,6 +211,74 @@ fn a_checkpoint_is_the_image_a_restart_opens_at() {
     );
 }
 
+/// An image staged off the owner: the replica goes on while it is written; adopted, a restart
+/// opens at it, but the group's durable image (what the log is compacted to) stays where it was
+/// until the directory is settled; one a later image superseded is refused, retryably.
+#[test]
+fn a_staged_image_is_adopted_by_its_owner_and_durable_once_settled() {
+    let mut member = sole(no_needs);
+    elected(&mut member);
+    for data in [b"a", b"b", b"c"] {
+        member.node().propose(data.to_vec()).unwrap();
+    }
+    member.settle();
+    let point = member.node().checkpoint_point().unwrap();
+    assert_eq!(point.index, 4);
+    let stager = member.node().image_stager().unwrap().unwrap();
+    let staged = stager.stage(&point, b"state").unwrap();
+    // The replica goes on while the image is written.
+    member.node().propose(b"d".to_vec()).unwrap();
+    assert_eq!(committed(&member.settle()), vec![(5, b"d".to_vec())]);
+    member
+        .node()
+        .adopt_staged_checkpoint(&point, &staged)
+        .unwrap();
+    assert_eq!(
+        member.node().snapshot_index(),
+        0,
+        "durable only once settled"
+    );
+    stager.settle().unwrap();
+    member
+        .node()
+        .settle_staged_checkpoint(&point, Ok(()))
+        .unwrap();
+    assert_eq!(member.node().snapshot_index(), 4);
+    // An image staged at 5, superseded by a checkpoint at 6 before it is adopted, is refused.
+    member.node().propose(b"e".to_vec()).unwrap();
+    member.settle();
+    let older = member.node().checkpoint_point().unwrap();
+    let stale = stager.stage(&older, b"older").unwrap();
+    member.node().propose(b"f".to_vec()).unwrap();
+    member.settle();
+    member.node().checkpoint(7, b"newest".to_vec()).unwrap();
+    assert!(matches!(
+        member.node().adopt_staged_checkpoint(&older, &stale),
+        Err(ConsensusError::CheckpointIndex)
+    ));
+    // A staged image adopted is what a restart opens at, settled or not.
+    member.node().propose(b"g".to_vec()).unwrap();
+    member.settle();
+    let point = member.node().checkpoint_point().unwrap();
+    let staged = stager.stage(&point, b"latest").unwrap();
+    member
+        .node()
+        .adopt_staged_checkpoint(&point, &staged)
+        .unwrap();
+    assert_eq!(member.node().snapshot_index(), 7);
+    member.restart();
+    let drained = member.settle();
+    let snapshot = drained
+        .first()
+        .and_then(|events| events.snapshot.clone())
+        .unwrap();
+    assert_eq!(
+        (snapshot.index, snapshot.data.as_slice()),
+        (8, &b"latest"[..])
+    );
+    assert_eq!(member.node().snapshot_index(), 8);
+}
+
 /// Three members, each on its own log and files.
 struct Cluster {
     members: Vec<Member>,

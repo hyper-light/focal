@@ -31,6 +31,7 @@ use super::*;
 use crate::decoder::{DecoderGate, DecoderPair, FloorWrite};
 use crate::group_files::{GroupFileError, GroupRecords};
 use crate::shell::{FloorStore, HandOver, Needs};
+use crate::staged_image::{ImageStager, StagedImage};
 
 type Store = FloorStore<GroupStore<DeviceFile>>;
 type ShellReplica = Replica<Store, HandOver<FileMedium>, FocalBudget>;
@@ -196,7 +197,7 @@ fn founding(config: &NodeConfig) -> ConfState {
 
 /// A group file's failure as the owners' error: a file that does not read whole is corruption,
 /// and anything else is the medium's.
-fn file_error(error: GroupFileError) -> ConsensusError {
+pub(crate) fn file_error(error: GroupFileError) -> ConsensusError {
     match error {
         GroupFileError::Corrupt { reason, .. } => ConsensusError::Corruption(reason),
         GroupFileError::Bound { .. } => ConsensusError::Corruption("a group file past its bound"),
@@ -856,35 +857,94 @@ impl ShellNode {
         point: CheckpointPoint,
         data: Vec<u8>,
     ) -> Result<(), ConsensusError> {
-        self.check()?;
-        let applied = self.replica.machine().applied();
-        let imaged = self.replica.machine().imaged().map_or(0, |at| at.index);
-        let CheckpointPoint {
-            index,
-            term,
-            configuration,
-        } = point;
-        if index == 0
-            || index > applied.index
-            || index < imaged
-            || self.replica.machine().holds_events()
-            || self.recovered.is_some()
-            || &configuration != self.replica.configuration()
-            || self.replica.core().store().term(index)? != term
-        {
-            return Err(ConsensusError::CheckpointIndex);
-        }
+        self.check_point(&point)?;
         if data.len() > IMAGE_BYTES {
             return Err(ConsensusError::Capacity);
         }
-        let at = hyper_durable::Point { index, term };
+        let at = hyper_durable::Point {
+            index: point.index,
+            term: point.term,
+        };
         self.replica
             .machine_mut()
-            .checkpoint(at, &configuration, &data)
+            .checkpoint(at, &point.configuration, &data)
             .map_err(file_error)?;
+        self.compact_to_image()
+    }
+    /// Whether the owner may make an image of `point` the group's: a prefix it applied, no older
+    /// than the group's latest image, of the configuration it holds, its entry still the one
+    /// captured, with nothing waiting for the owner's drain.
+    fn check_point(&self, point: &CheckpointPoint) -> Result<(), ConsensusError> {
+        self.check()?;
+        let applied = self.replica.machine().applied();
+        let imaged = self
+            .replica
+            .machine()
+            .latest_image()
+            .map_or(0, |at| at.index);
+        if point.index == 0
+            || point.index > applied.index
+            || point.index < imaged
+            || self.replica.machine().holds_events()
+            || self.recovered.is_some()
+            || &point.configuration != self.replica.configuration()
+            || self.replica.core().store().term(point.index)? != point.term
+        {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        Ok(())
+    }
+    /// The log compacted through the group's durable image.
+    fn compact_to_image(&mut self) -> Result<(), ConsensusError> {
         let waker = self.waker();
         let compacted = self.replica.compact(0, self.periods, &waker);
         self.heard(compacted).map(drop)
+    }
+    /// Where this group's image is staged off the owner ([`crate::staged_image`]).
+    pub fn image_stager(&self) -> Result<ImageStager, ConsensusError> {
+        self.check()?;
+        Ok(self.replica.machine().stager())
+    }
+    /// The image staged at `point` made the group's, by a rename: refused, retryably, as
+    /// [`ShellNode::begin_checkpoint_from`] refuses a point. It is the group's durable image, and
+    /// the log is compacted behind it, once [`ShellNode::settle_staged_checkpoint`] hears the
+    /// directory is durable.
+    pub fn adopt_staged_checkpoint(
+        &mut self,
+        point: &CheckpointPoint,
+        staged: &StagedImage,
+    ) -> Result<(), ConsensusError> {
+        self.check_point(point)?;
+        if staged.index != point.index || staged.term != point.term {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        if usize::try_from(staged.bytes).map_or(true, |bytes| bytes > IMAGE_BYTES) {
+            return Err(ConsensusError::Capacity);
+        }
+        let at = hyper_durable::Point {
+            index: point.index,
+            term: point.term,
+        };
+        self.replica
+            .machine_mut()
+            .adopt(at, &point.configuration, staged.bytes)
+            .map_err(file_error)
+    }
+    /// The directory was made durable after the image adopted at `point` was renamed (or it
+    /// failed to be: `synced`): the image is the group's durable one and the log is compacted
+    /// behind it. A later image that superseded it changes nothing.
+    pub fn settle_staged_checkpoint(
+        &mut self,
+        point: &CheckpointPoint,
+        synced: Result<(), ConsensusError>,
+    ) -> Result<(), ConsensusError> {
+        self.check()?;
+        synced?;
+        self.replica.machine_mut().settled(hyper_durable::Point {
+            index: point.index,
+            term: point.term,
+        });
+        self.compact_to_image()
     }
     pub fn cancel_unadmitted_checkpoint(&mut self) -> bool {
         false

@@ -47,6 +47,8 @@ pub mod group_files;
 mod persistence;
 mod shell;
 mod shell_node;
+pub mod staged_image;
+pub use staged_image::{ImageStager, StagedImage};
 mod storage;
 /// A group's timing, derived from the round trips it measures (27 §3.1 P2).
 pub use focal_timing as timing;

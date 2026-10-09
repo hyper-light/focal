@@ -647,28 +647,67 @@ struct DeferredNative {
     slot_generation: u64,
 }
 
-/// A deferred checkpoint thread's result: the native section's bytes with
-/// their permit, its seeds durable, and how long that took.
-type DeferredOutput = Result<(Vec<u8>, Allocation, std::time::Duration), NativeSessionError>;
+/// What a deferred checkpoint's thread made of the capture: the native
+/// section's bytes with their permit, its seeds durable; the checkpoint itself,
+/// staged as the group's next image where consensus stages one, else whole for
+/// the owner to write; and how long the thread took.
+struct Staged {
+    native: Vec<u8>,
+    _native_permit: Allocation,
+    image: StagedCheckpoint,
+    elapsed: std::time::Duration,
+}
+
+/// A deferred checkpoint's image as its thread left it.
+enum StagedCheckpoint {
+    /// Written and durable as the group's next image, for the owner to adopt.
+    Staged(focal_consensus::StagedImage),
+    /// The checkpoint's bytes, for the owner to write: consensus stages none.
+    Whole(Vec<u8>),
+}
+
+/// What a deferred checkpoint's thread tells its owner, in order: what it
+/// staged, then, once the owner adopted the image, whether its directory is
+/// durable.
+enum Told {
+    Staged(Result<Staged, LedgerError>),
+    Settled(Result<(), focal_consensus::ConsensusError>),
+}
 
 /// A checkpoint whose state the owner has captured at a point (the native
 /// rows frozen, the envelope's other sections encoded), its native root being
-/// encoded and its seed chunks made durable on a thread of their own while
-/// the replica goes on (Ongaro's thesis §5.1: the state machine continues
-/// while its snapshot is written; as Redis's fork-time image or a read
-/// transaction's snapshot in etcd's bbolt). Consensus is handed the bytes, at
-/// the point they were captured, only once the chunks they name are durable;
-/// the entries after the point stay in the log. Dropped, it waits for its
-/// thread: nothing writes the seed directory after its owner let it go.
+/// encoded, its seed chunks made durable and the group's next image written
+/// and made durable on a thread of its own while the replica goes on (Ongaro's
+/// thesis §5.1: the state machine continues while its snapshot is written; as
+/// Redis's fork-time image or a read transaction's snapshot in etcd's bbolt).
+/// The owner adopts the image, a rename, only once everything it names is
+/// durable, and takes it as the group's durable image, compacting the log
+/// behind it, only once the thread made the rename durable; the entries after
+/// the point stay in the log. The owner never waits on the disk. Dropped, it
+/// waits for its thread: nothing writes the group's files after its owner let
+/// it go.
 pub(crate) struct DeferredCheckpoint {
     point: focal_consensus::CheckpointPoint,
-    head: Vec<u8>,
-    slot_generation: u64,
     native: std::time::Duration,
     envelope: std::time::Duration,
-    done: std::sync::mpsc::Receiver<DeferredOutput>,
+    told: std::sync::mpsc::Receiver<Told>,
+    /// Whether the thread is to make an adopted image's name durable: sent
+    /// once, after the owner adopted the image or refused it.
+    adopted: Option<std::sync::mpsc::SyncSender<bool>>,
+    /// The native section of an image the owner adopted, kept until the image
+    /// is the group's durable one, and the owner's time spent on it so far.
+    adoption: Option<Adoption>,
     worker: Option<std::thread::JoinHandle<()>>,
     _scratch: Allocation,
+}
+
+/// An adopted image's native section and the owner's time spent on it.
+struct Adoption {
+    bytes: u64,
+    native: Vec<u8>,
+    _native_permit: Allocation,
+    owner: std::time::Duration,
+    deferred: std::time::Duration,
 }
 
 /// A deferred checkpoint's thread ended without telling its result.
@@ -680,6 +719,9 @@ fn lost_worker() -> NativeSessionError {
 
 impl Drop for DeferredCheckpoint {
     fn drop(&mut self) {
+        // A thread waiting to hear whether its image was adopted hears it was
+        // not, and ends.
+        drop(self.adopted.take());
         if let Some(worker) = self.worker.take() {
             // A worker that did not return failed its commit; the result it
             // owed is what `poll` reads as a failure.
@@ -687,6 +729,72 @@ impl Drop for DeferredCheckpoint {
         }
     }
 }
+
+/// The deferred checkpoint's thread: the native root encoded and its seeds
+/// made durable, the envelope finished, the image staged; then, if the owner
+/// adopts it, the directory made durable.
+fn run_deferred(
+    capture: DeferredNative,
+    point: &focal_consensus::CheckpointPoint,
+    stager: Option<&focal_consensus::ImageStager>,
+    told: &std::sync::mpsc::SyncSender<Told>,
+    adopted: &std::sync::mpsc::Receiver<bool>,
+) {
+    let DeferredNative {
+        captured,
+        batch,
+        head,
+        slot_generation,
+    } = capture;
+    let started = std::time::Instant::now();
+    let encoded = captured
+        .encode(batch)
+        .and_then(|(bytes, allocation, commit)| {
+            if let Some(commit) = commit {
+                commit.run().map_err(|error| {
+                    NativeSessionError::from(crate::native_checkpoint::Error::from(error))
+                })?;
+            }
+            Ok((bytes, allocation))
+        })
+        .map_err(LedgerError::from);
+    // The frozen rows go before anything is told: their pages are released by
+    // the time the owner reads it.
+    drop(captured);
+    let staged = encoded.and_then(|(native, native_permit)| {
+        let whole = durable_session_v1::snapshot_native_finish(head, &native, slot_generation)?;
+        let image = match stager {
+            Some(stager) => StagedCheckpoint::Staged(stager.stage(point, &whole)?),
+            None => StagedCheckpoint::Whole(whole),
+        };
+        Ok(Staged {
+            native,
+            _native_permit: native_permit,
+            image,
+            elapsed: started.elapsed(),
+        })
+    });
+    let waits = matches!(
+        &staged,
+        Ok(Staged {
+            image: StagedCheckpoint::Staged(_),
+            ..
+        })
+    );
+    // The receiver may be gone (the session dropped): the result then has no
+    // one to tell, and the commit is complete or not.
+    if told.send(Told::Staged(staged)).is_err() || !waits {
+        return;
+    }
+    // Refused, or the owner gone: the staged file stays until the next is
+    // staged over it, and a start never reads it.
+    if adopted.recv() != Ok(true) {
+        return;
+    }
+    let synced = stager.map_or(Ok(()), focal_consensus::ImageStager::settle);
+    let _ = told.send(Told::Settled(synced));
+}
+
 impl Session {
     /// Snapshot domain, cursor outcomes and the complete retained history tail
     /// together. Failure leaves the previous durable checkpoint/log authoritative.
@@ -714,16 +822,17 @@ impl Session {
         Ok(())
     }
 
-    /// Whether a deferred checkpoint's seeds are still being made durable.
+    /// Whether a deferred checkpoint is still being made durable.
     pub fn deferred_checkpoint_pending(&self) -> bool {
         self.deferred.is_some()
     }
 
-    /// Checkpoint the applied prefix without the owner waiting for its seed
-    /// chunks to be durable: the state is encoded here, the chunks are made
-    /// durable on a thread of their own, and `poll_deferred_checkpoint` hands
-    /// consensus the checkpoint once they are. A root small enough to travel
-    /// inline has no chunks and is written at once, as `checkpoint` does.
+    /// Checkpoint the applied prefix without the owner waiting on the disk:
+    /// the state is captured here; its seed chunks and the group's next image
+    /// are made durable on a thread of their own, and
+    /// `poll_deferred_checkpoint` adopts the image and, once its name is
+    /// durable, takes it as the group's. A root small enough to travel inline
+    /// has no chunks and is written at once, as `checkpoint` does.
     pub fn begin_deferred_checkpoint(&mut self) -> Result<(), LedgerError> {
         if self.deferred.is_some() {
             return Err(LedgerError::Capacity);
@@ -733,6 +842,7 @@ impl Session {
         if point.index != self.applied_raft {
             return Err(focal_consensus::ConsensusError::CheckpointIndex.into());
         }
+        let stager = self.consensus.image_stager()?;
         let Some(mut encoded) = self.encode_checkpoint_with(false, true)? else {
             return Ok(());
         };
@@ -746,117 +856,234 @@ impl Session {
             let bytes = std::mem::take(&mut encoded.bytes);
             return self.write_checkpoint(point, bytes, native, envelope, encoded_at, None);
         };
-        let DeferredNative {
-            captured,
-            batch,
-            head,
-            slot_generation,
-        } = deferred;
-        let (send, done) = std::sync::mpsc::sync_channel(1);
+        // The thread tells at most two things, and hears one.
+        let (tell, told) = std::sync::mpsc::sync_channel(2);
+        let (adopt, adopted) = std::sync::mpsc::sync_channel(1);
+        let at = point.clone();
         let worker = std::thread::Builder::new()
             .name("focal-checkpoint".into())
             .spawn(move || {
-                let started = std::time::Instant::now();
-                let output = captured.encode(batch).and_then(|(bytes, allocation, commit)| {
-                    if let Some(commit) = commit {
-                        commit.run().map_err(|error| {
-                            NativeSessionError::from(crate::native_checkpoint::Error::from(error))
-                        })?;
-                    }
-                    Ok((bytes, allocation, started.elapsed()))
-                });
-                // The frozen rows go before the result is told: their pages
-                // are released by the time the owner reads it.
-                drop(captured);
-                // The receiver may be gone (the session dropped): the result
-                // then has no one to tell, and the commit is complete or not.
-                let _ = send.send(output);
+                run_deferred(
+                    deferred,
+                    &at,
+                    stager.as_ref(),
+                    &tell,
+                    &adopted,
+                );
             })
             // No thread: the capture and its batch were dropped with the
             // closure, the batch's files removed; the next period tries again.
             .map_err(|_| LedgerError::Capacity)?;
         self.deferred = Some(Box::new(DeferredCheckpoint {
             point,
-            head,
-            slot_generation,
             native,
             envelope,
-            done,
+            told,
+            adopted: Some(adopt),
+            adoption: None,
             worker: Some(worker),
             _scratch: encoded._scratch,
         }));
         Ok(())
     }
 
-    /// Hand consensus a deferred checkpoint whose seeds are now durable; true
-    /// when one finished (written, or found covered by a later checkpoint and
+    /// Move a deferred checkpoint on by what its thread told since: adopt its
+    /// staged image, or take an adopted one as the group's durable image; true
+    /// when it finished (written, or found covered by a later checkpoint and
     /// dropped). Never waits.
     pub fn poll_deferred_checkpoint(&mut self) -> Result<bool, LedgerError> {
-        let Some(deferred) = self.deferred.as_ref() else {
-            return Ok(false);
-        };
-        let result = match deferred.done.try_recv() {
-            Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(lost_worker()),
-        };
-        self.finish_deferred(result).map(|()| true)
+        // A thread tells at most two things: both may be waiting.
+        for _ in 0..2 {
+            let Some(deferred) = self.deferred.as_ref() else {
+                return Ok(false);
+            };
+            let told = match deferred.told.try_recv() {
+                Ok(told) => Ok(told),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(lost_worker()),
+            };
+            if self.hear_deferred(told)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    /// Wait for a deferred checkpoint, if one is pending, and hand it to
-    /// consensus: bounded by its seeds' commit.
+    /// Wait for a deferred checkpoint, if one is pending, and finish it:
+    /// bounded by its seeds' commit and its image's two syncs.
     fn settle_deferred_checkpoint(&mut self) -> Result<(), LedgerError> {
-        let Some(deferred) = self.deferred.as_ref() else {
-            return Ok(());
-        };
-        let result = deferred.done.recv().unwrap_or_else(|_| Err(lost_worker()));
-        self.finish_deferred(result)
+        for _ in 0..2 {
+            let Some(deferred) = self.deferred.as_ref() else {
+                return Ok(());
+            };
+            let told = deferred.told.recv().map_err(|_| lost_worker());
+            if self.hear_deferred(told)? {
+                return Ok(());
+            }
+        }
+        // A thread that told two things finished, or the second was its last.
+        match self.deferred.take() {
+            Some(_) => Err(lost_worker().into()),
+            None => Ok(()),
+        }
     }
 
-    fn finish_deferred(&mut self, result: DeferredOutput) -> Result<(), LedgerError> {
-        let Some(mut deferred) = self.deferred.take() else {
-            return Ok(());
-        };
-        let (native, _native_permit, encoded) = match result {
-            Ok(output) => output,
-            Err(error) => {
+    /// What the deferred checkpoint's thread told, acted on; true when the
+    /// checkpoint finished.
+    fn hear_deferred(&mut self, told: Result<Told, NativeSessionError>) -> Result<bool, LedgerError> {
+        let writing = std::time::Instant::now();
+        match told {
+            Err(lost) => {
+                self.deferred = None;
+                Err(lost.into())
+            }
+            Ok(Told::Staged(Err(error))) => {
+                self.deferred = None;
                 // A seed write or commit that failed fails the store, as one
                 // on the owner's thread does: it refuses until reopened.
-                if let NativeSessionError::Checkpoint(crate::native_checkpoint::Error::Seeds(_)) =
-                    &error
+                if let LedgerError::Native(NativeSessionError::Checkpoint(
+                    crate::native_checkpoint::Error::Seeds(_),
+                )) = &error
                     && let Some(hosting) = self.hosting.as_mut()
                 {
                     hosting.seeds.fail();
                 }
-                return Err(error.into());
+                Err(error)
             }
-        };
-        let writing = std::time::Instant::now();
-        self.native
-            .as_deref_mut()
-            .ok_or(LedgerError::NativeUnsupported)?
-            .note_checkpoint_seeds(&native)?;
-        let head = std::mem::take(&mut deferred.head);
-        let bytes = durable_session_v1::snapshot_native_finish(head, &native, deferred.slot_generation)?;
-        drop(native);
-        let point = deferred.point.clone();
-        let written = self.write_checkpoint(
-            point,
-            bytes,
-            deferred.native,
-            deferred.envelope,
-            writing,
-            Some(encoded),
-        );
-        match written {
-            // A later checkpoint or snapshot already covers the point, or the
-            // configuration moved past it: this one is not needed, and the next
-            // period takes a new one.
-            Err(LedgerError::Consensus(focal_consensus::ConsensusError::CheckpointIndex)) => {
-                Ok(())
+            Ok(Told::Staged(Ok(staged))) => self.adopt_deferred(staged, writing),
+            Ok(Told::Settled(synced)) => {
+                let Some(mut deferred) = self.deferred.take() else {
+                    return Ok(true);
+                };
+                let adoption = deferred.adoption.take().ok_or_else(lost_worker)?;
+                self.consensus
+                    .settle_staged_checkpoint(&deferred.point, synced)?;
+                // The image is the group's durable one: its chunks alone are
+                // kept from here on.
+                self.native
+                    .as_deref_mut()
+                    .ok_or(LedgerError::NativeUnsupported)?
+                    .note_checkpoint_seeds(&adoption.native)?;
+                let owner = adoption.owner.saturating_add(writing.elapsed());
+                self.note_checkpoint_timing(&deferred, adoption.bytes, adoption.deferred, owner);
+                Ok(true)
             }
-            other => other,
         }
+    }
+
+    /// A deferred checkpoint's staged result: an image adopted, its chunks
+    /// kept with the durable image's until it is the group's durable one; or,
+    /// where consensus stages none, the checkpoint written whole.
+    fn adopt_deferred(
+        &mut self,
+        staged: Staged,
+        writing: std::time::Instant,
+    ) -> Result<bool, LedgerError> {
+        let Staged {
+            native,
+            _native_permit,
+            image,
+            elapsed,
+        } = staged;
+        let image = match image {
+            StagedCheckpoint::Whole(bytes) => {
+                let Some(deferred) = self.deferred.take() else {
+                    return Ok(true);
+                };
+                let point = deferred.point.clone();
+                let written = self.write_checkpoint(
+                    point,
+                    bytes,
+                    deferred.native,
+                    deferred.envelope,
+                    writing,
+                    Some(elapsed),
+                );
+                return match written {
+                    // A later checkpoint or snapshot already covers the point,
+                    // or the configuration moved past it: this one is not
+                    // needed, and the next period takes a new one.
+                    Err(LedgerError::Consensus(
+                        focal_consensus::ConsensusError::CheckpointIndex,
+                    )) => Ok(true),
+                    Err(error) => Err(error),
+                    // Written and durable: its chunks are the ones kept.
+                    Ok(()) => self
+                        .native
+                        .as_deref_mut()
+                        .ok_or(LedgerError::NativeUnsupported)?
+                        .note_checkpoint_seeds(&native)
+                        .map(|()| true)
+                        .map_err(LedgerError::from),
+                };
+            }
+            StagedCheckpoint::Staged(image) => image,
+        };
+        let Some(deferred) = self.deferred.as_deref_mut() else {
+            return Ok(true);
+        };
+        let go = deferred.adopted.take();
+        // The image's chunks are kept before its name can reach the disk.
+        let adopted = match self.native.as_deref_mut() {
+            Some(engine) => engine
+                .stage_checkpoint_seeds(&native)
+                .map_err(LedgerError::from),
+            None => Err(LedgerError::NativeUnsupported),
+        }
+        .and_then(|()| {
+            self.consensus
+                .adopt_staged_checkpoint(&deferred.point, &image)
+                .map_err(LedgerError::from)
+        });
+        match adopted {
+            Ok(()) => {
+                deferred.adoption = Some(Adoption {
+                    bytes: image.bytes(),
+                    native,
+                    _native_permit,
+                    owner: writing.elapsed(),
+                    deferred: elapsed,
+                });
+                // A thread gone already is heard as lost at the next poll.
+                if let Some(go) = go {
+                    let _ = go.send(true);
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                // The thread hears the image was not adopted and ends.
+                drop(go);
+                self.deferred = None;
+                if let Some(engine) = self.native.as_deref_mut() {
+                    engine.unstage_checkpoint_seeds();
+                }
+                match error {
+                    // Covered by a later image, or the configuration moved
+                    // past it: the next period takes a new one.
+                    LedgerError::Consensus(focal_consensus::ConsensusError::CheckpointIndex) => {
+                        Ok(true)
+                    }
+                    error => Err(error),
+                }
+            }
+        }
+    }
+
+    fn note_checkpoint_timing(
+        &mut self,
+        deferred: &DeferredCheckpoint,
+        bytes: u64,
+        elapsed: std::time::Duration,
+        owner: std::time::Duration,
+    ) {
+        self.checkpoint_timings.push(CheckpointTiming {
+            index: deferred.point.index,
+            bytes,
+            native_micros: micros(deferred.native),
+            envelope_micros: micros(deferred.envelope),
+            deferred_micros: micros(elapsed),
+            write_micros: micros(owner),
+        });
     }
 
     fn write_checkpoint(

@@ -77,6 +77,9 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// The chunks of this replica's latest checkpoint seed (25 §5): what
     /// its seed store must keep for peers that seed from it (26 §5).
     pub(super) seed_chunks: Vec<ContentHash>,
+    /// The chunks of a checkpoint adopted but not yet the group's durable
+    /// image: bounded as `seed_chunks` is, by the checkpoint's chunk limit.
+    pub(super) staged_chunks: Vec<ContentHash>,
     /// The movement coordinator (25 §6), built once the genesis names the
     /// origin member and restored from a checkpoint's movement section.
     pub(super) movement: Option<super::movement::Movement>,
@@ -193,6 +196,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             seals_applied: 0,
             seals_inert: 0,
             seed_chunks: Vec::new(),
+            staged_chunks: Vec::new(),
             movement: None,
             disk_sample: None,
             admissions_since_sample: 0,
@@ -364,9 +368,26 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn seed_chunks(&self) -> &[ContentHash] {
         &self.seed_chunks
     }
+    /// The chunks of a checkpoint adopted but not yet durable as the group's.
+    pub(crate) fn staged_seed_chunks(&self) -> &[ContentHash] {
+        &self.staged_chunks
+    }
     /// Record the seed chunks a freshly encoded or installed checkpoint
     /// names; an inline checkpoint names none.
     pub(super) fn note_seeds(&mut self, bytes: &[u8]) -> Result<(), NativeSessionError> {
+        self.seed_chunks = self.describe_seeds(bytes)?;
+        self.staged_chunks = Vec::new();
+        Ok(())
+    }
+    /// The chunks of a checkpoint whose image is adopted but not yet the
+    /// group's durable one: kept with the durable image's until it is, for a
+    /// restart may open at either.
+    pub(super) fn stage_seeds(&mut self, bytes: &[u8]) -> Result<(), NativeSessionError> {
+        self.staged_chunks = self.describe_seeds(bytes)?;
+        Ok(())
+    }
+    /// The seed chunks the native section `bytes` names, sorted and distinct.
+    fn describe_seeds(&self, bytes: &[u8]) -> Result<Vec<ContentHash>, NativeSessionError> {
         let mut chunks = Vec::new();
         if let Some(manifest) =
             crate::native_checkpoint::Checkpoint::describe(bytes, self.limits.checkpoint)?
@@ -383,8 +404,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         chunks.sort();
         chunks.dedup();
-        self.seed_chunks = chunks;
-        Ok(())
+        Ok(chunks)
     }
     /// The gates a retirement passes before its family is derived (26 §4):
     /// authority, no retirement, layout change or movement step in flight,

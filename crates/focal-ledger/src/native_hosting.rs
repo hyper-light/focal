@@ -1083,8 +1083,9 @@ impl Session {
             .native_content_roots(cursor, max_visits)
             .map_err(NativeSessionError::from)?)
     }
-    /// The seed chunks this replica must keep (26 §5): its latest
-    /// checkpoint's and those a pending seed still lacks, sorted.
+    /// The seed chunks this replica must keep (26 §5): its latest durable
+    /// checkpoint's, those of one adopted but not yet durable, and those a
+    /// pending seed still lacks, sorted.
     pub fn native_seed_chunks(&self) -> Result<Vec<ContentHash>, LedgerError> {
         let engine = self.native_engine()?;
         let mut chunks = Vec::new();
@@ -1093,11 +1094,15 @@ impl Session {
                 engine
                     .seed_chunks()
                     .len()
-                    .checked_add(self.pending_seed().map_or(0, |seed| seed.missing.len()))
+                    .checked_add(engine.staged_seed_chunks().len())
+                    .and_then(|n| {
+                        n.checked_add(self.pending_seed().map_or(0, |seed| seed.missing.len()))
+                    })
                     .ok_or(LedgerError::Capacity)?,
             )
             .map_err(|_| LedgerError::Capacity)?;
         chunks.extend_from_slice(engine.seed_chunks());
+        chunks.extend_from_slice(engine.staged_seed_chunks());
         if let Some(seed) = self.pending_seed() {
             chunks.extend_from_slice(&seed.missing);
         }

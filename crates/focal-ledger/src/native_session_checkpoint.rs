@@ -171,6 +171,18 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn note_checkpoint_seeds(&mut self, bytes: &[u8]) -> Result<(), NativeSessionError> {
         self.note_seeds(bytes)
     }
+    /// The seed chunks a checkpoint adopted but not yet durable names, kept
+    /// with the durable checkpoint's until `note_checkpoint_seeds`.
+    pub(crate) fn stage_checkpoint_seeds(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), NativeSessionError> {
+        self.stage_seeds(bytes)
+    }
+    /// A checkpoint whose image was not adopted keeps no chunks.
+    pub(crate) fn unstage_checkpoint_seeds(&mut self) {
+        self.staged_chunks = Vec::new();
+    }
     /// The checkpoint of the committed Core at the fully delivered prefix,
     /// captured here, on the owner: the point's metadata and sections, and
     /// the rows frozen (each page charged where it was). Its encoding, the

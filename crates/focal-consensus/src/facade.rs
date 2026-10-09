@@ -503,6 +503,38 @@ impl DurableNode {
     ) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.begin_checkpoint_from_funded(point, data, allocation))
     }
+    /// Where this group's image is staged off the owner, on a backend that stages one: the shell.
+    /// On focal-log none is: its checkpoint is begun and finished as it always was.
+    pub fn image_stager(&self) -> Result<Option<ImageStager>, ConsensusError> {
+        match &self.backend {
+            Backend::Log(_) => Ok(None),
+            Backend::Shell(node) => node.image_stager().map(Some),
+        }
+    }
+    /// The image staged at `point` made the group's ([`crate::staged_image`]); refused,
+    /// retryably, as [`DurableNode::begin_checkpoint_from`] refuses a point.
+    pub fn adopt_staged_checkpoint(
+        &mut self,
+        point: &CheckpointPoint,
+        staged: &StagedImage,
+    ) -> Result<(), ConsensusError> {
+        match &mut self.backend {
+            Backend::Log(_) => Err(ConsensusError::Configuration("focal-log stages no image")),
+            Backend::Shell(node) => node.adopt_staged_checkpoint(point, staged),
+        }
+    }
+    /// The directory holding an image adopted at `point` was made durable (or failed to be):
+    /// the image is the group's durable one and the log is compacted behind it.
+    pub fn settle_staged_checkpoint(
+        &mut self,
+        point: &CheckpointPoint,
+        synced: Result<(), ConsensusError>,
+    ) -> Result<(), ConsensusError> {
+        match &mut self.backend {
+            Backend::Log(_) => Err(ConsensusError::Configuration("focal-log stages no image")),
+            Backend::Shell(node) => node.settle_staged_checkpoint(point, synced),
+        }
+    }
     pub fn begin_checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.begin_checkpoint(index, data))
     }

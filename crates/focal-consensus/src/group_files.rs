@@ -37,6 +37,10 @@ pub const GROUPS_DIR: &str = "raft/groups";
 pub const META_FILE: &str = "meta";
 /// A group's image.
 pub const IMAGE_FILE: &str = "image";
+/// A group's next image, written and made durable off the owner before the owner adopts it by
+/// renaming it over [`IMAGE_FILE`]: one at most, each staging overwriting the last. A start never
+/// reads it.
+pub const STAGED_IMAGE_FILE: &str = "image.next";
 
 const META_MAGIC: &[u8; 8] = b"FOCALGM1";
 const IMAGE_MAGIC: &[u8; 8] = b"FOCALGI1";
@@ -332,6 +336,50 @@ pub fn write_image<M: Medium>(
     bound: usize,
     seal: &GroupSeal,
 ) -> Result<(), GroupFileError> {
+    let bytes = image_file(point, image, bound, seal)?;
+    focal_platform::fs::install(medium, &dir.join(IMAGE_FILE), &bytes)?;
+    Ok(())
+}
+
+/// Writes the group's next image whole into `dir` as [`STAGED_IMAGE_FILE`], durable as a file
+/// but not yet the group's: [`adopt_staged_image`] makes it so, and [`settle_images`] makes the
+/// adoption durable.
+pub fn stage_image<M: Medium>(
+    medium: &mut M,
+    dir: &Path,
+    point: &ImagePoint,
+    image: &[u8],
+    bound: usize,
+    seal: &GroupSeal,
+) -> Result<(), GroupFileError> {
+    let bytes = image_file(point, image, bound, seal)?;
+    let staged = dir.join(STAGED_IMAGE_FILE);
+    medium.create(&staged)?;
+    medium.write(&staged, &bytes)?;
+    medium.sync_file(&staged)?;
+    Ok(())
+}
+
+/// Makes the staged image the group's, in one rename: a restart reads it from here on, or, until
+/// [`settle_images`] returns, the image it replaced.
+pub fn adopt_staged_image<M: Medium>(medium: &mut M, dir: &Path) -> Result<(), GroupFileError> {
+    medium.rename(&dir.join(STAGED_IMAGE_FILE), &dir.join(IMAGE_FILE))?;
+    Ok(())
+}
+
+/// Makes the names in `dir` durable: an adopted image survives a crash from here on.
+pub fn settle_images<M: Medium>(medium: &mut M, dir: &Path) -> Result<(), GroupFileError> {
+    medium.sync_dir(dir)?;
+    Ok(())
+}
+
+/// The sealed file of an image of `point`.
+fn image_file(
+    point: &ImagePoint,
+    image: &[u8],
+    bound: usize,
+    seal: &GroupSeal,
+) -> Result<Vec<u8>, GroupFileError> {
     if image.len() > bound {
         return Err(GroupFileError::Bound {
             file: IMAGE_FILE,
@@ -367,9 +415,7 @@ pub fn write_image<M: Medium>(
     payload.extend_from_slice(&header_len.to_le_bytes());
     payload.extend_from_slice(&header);
     payload.extend_from_slice(image);
-    let bytes = sealed(seal, &frame(IMAGE_MAGIC, &payload)?)?;
-    focal_platform::fs::install(medium, &dir.join(IMAGE_FILE), &bytes)?;
-    Ok(())
+    sealed(seal, &frame(IMAGE_MAGIC, &payload)?)
 }
 
 /// The group's image in `dir` and the point it is of; none where no image was ever made durable

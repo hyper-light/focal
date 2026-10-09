@@ -58,6 +58,18 @@ pub(crate) struct HandOver<M> {
     image_bytes: Option<u64>,
     /// The configuration the image holds, at its point.
     image_configuration: ConfState,
+    /// An image staged off the owner and adopted, renamed over the group's, whose name is not
+    /// yet durable: until it settles a restart may open at `imaged` instead, so `durable` stays
+    /// there and the log is compacted no further. One at most; a checkpoint or an install
+    /// written whole supersedes it.
+    adopted: Option<Adopted>,
+}
+
+/// An adopted image waiting for its name to be durable.
+struct Adopted {
+    at: Point,
+    bytes: Option<u64>,
+    configuration: ConfState,
 }
 
 impl<M: Medium> HandOver<M> {
@@ -104,6 +116,7 @@ impl<M: Medium> HandOver<M> {
             configuration,
             imaged,
             image_bytes,
+            adopted: None,
         })
     }
 
@@ -156,10 +169,53 @@ impl<M: Medium> HandOver<M> {
             self.image_bound,
             &self.seal,
         )?;
+        // Its directory was made durable with it, and an adoption's name before it.
+        self.adopted = None;
         self.imaged = Some(at);
         self.image_bytes = u64::try_from(image.len()).ok();
         self.image_configuration = point.configuration;
         Ok(())
+    }
+
+    /// Where an image of this group is staged off the owner: its directory, seal and bound.
+    pub(crate) fn stager(&self) -> crate::staged_image::ImageStager {
+        crate::staged_image::ImageStager::new(self.dir.clone(), self.seal.clone(), self.image_bound)
+    }
+
+    /// The image staged at `at`, `bytes` long, made the group's by renaming it over the image:
+    /// the group's durable image only once [`HandOver::settled`] hears its name is durable.
+    pub(crate) fn adopt(
+        &mut self,
+        at: Point,
+        configuration: &ConfState,
+        bytes: u64,
+    ) -> Result<(), GroupFileError> {
+        group_files::adopt_staged_image(&mut self.medium, &self.dir)?;
+        self.adopted = Some(Adopted {
+            at,
+            bytes: Some(bytes),
+            configuration: configuration.clone(),
+        });
+        Ok(())
+    }
+
+    /// The directory was made durable after the image adopted at `at` was renamed: it is the
+    /// group's durable image. One a later image superseded changes nothing.
+    pub(crate) fn settled(&mut self, at: Point) {
+        let Some(adopted) = self.adopted.take_if(|adopted| adopted.at == at) else {
+            return;
+        };
+        self.imaged = Some(adopted.at);
+        self.image_bytes = adopted.bytes;
+        self.image_configuration = adopted.configuration;
+    }
+
+    /// The point of the latest image made the group's, durable or adopted.
+    pub(crate) fn latest_image(&self) -> Option<Point> {
+        self.adopted
+            .as_ref()
+            .map(|adopted| adopted.at)
+            .or(self.imaged)
     }
 
     /// Whether the group's image names every member of `current`, the configuration applied: a
@@ -168,11 +224,6 @@ impl<M: Medium> HandOver<M> {
     pub(crate) fn image_names_every_member(&self, current: &ConfState) -> bool {
         self.imaged.is_none()
             || crate::core_state::names_every_member(&self.image_configuration, current)
-    }
-
-    /// The point of the group's latest image, if it has one.
-    pub(crate) fn imaged(&self) -> Option<Point> {
-        self.imaged
     }
 
     /// The last entry handed over.
