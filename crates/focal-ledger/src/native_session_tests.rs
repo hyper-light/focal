@@ -1332,6 +1332,33 @@ fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
     for _ in 0..64 {
         let _ = session.poll().unwrap();
     }
+    if let Some(super::engine::Domain::Active(owner, _)) = session.engine.domain.as_ref() {
+        let stats = owner.budget_stats();
+        let kinds = [
+            "Arena", "Payload", "Index", "Pages", "Roots", "ReadPins", "Pending", "Query",
+            "Monitor", "Dedup", "Timer", "Recovery", "Control", "Reserved",
+        ];
+        let per = |bytes: usize| bytes as f64 / request as f64;
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "owner budget: limit {} used {} ({:.0} B/claim over {request} claims)\n",
+                stats.limit,
+                stats.used,
+                per(stats.used)
+            ),
+        )
+        .unwrap();
+        for (name, bytes) in kinds.iter().zip(stats.by_kind) {
+            if bytes > 0 {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("  {name:<9} {bytes:>12} ({:.0} B/claim)\n", per(bytes)),
+                )
+                .unwrap();
+            }
+        }
+    }
     let core = session.committed_core().unwrap();
     let rows = core.native_stats().entries;
     let quote = focal_core::native::record_codec::checkpoint::EncodingPlan::prepare(
