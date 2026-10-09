@@ -67,6 +67,15 @@ caller hands in the alignment, queue and measured depth it found.
    that writes one block a flush and has no device geometry of its own (hyper-liveness's process
    test, whose 4 KiB had been asserted of every device).
 
+7. **Batches out at once** (`issuer.rs`): a submitter attaches for up to a stated number of batches
+   (`Issuer::attach_deep`), hands each over and goes on (`Attached::submit`), and takes each answer,
+   numbered by its batch, when it needs it (`answer`, `try_answer`); `attach` and `write` keep one
+   batch out, as before. The issuer keeps each submitter's batches in a queue bounded by that
+   number and refuses one past it. For mantle's engine, whose puts waited on its extent writes:
+   at 10 M puts, uncached, a put's p99.9 went from 43.8–48.9 µs to 5.6–6.7 µs and p99.99 from
+   72.4–73.8 µs to 17.5–20.6 µs with two batches out (mantle `docs/design/engine-structure.md`
+   §6).
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

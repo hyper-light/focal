@@ -307,6 +307,11 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Commits a batch: a sweep of the tail first if it is due, then the frame.
     fn commit(&mut self, batch: VecDeque<Submission>, inbox: &Receiver<Message<F>>) {
         let whole = std::mem::replace(&mut self.schedule.restoring, false);
+        // The sweep is decided on the segments the file may use, its owner's admission among them
+        // (`crate::growth`).
+        if let Some(gate) = self.gate.as_mut() {
+            gate.refill(&mut self.state, self.p.config.max_segments);
+        }
         let read = writer::sweepable(&self.state, &self.p).and_then(|due| {
             due.then(|| writer::sweep_read(&self.state, &self.p))
                 .transpose()
@@ -349,6 +354,10 @@ impl<F: BlockFile + 'static> Owner<F> {
         let mut payload = std::mem::take(&mut self.buffers.payload);
         payload.clear();
         let mut records = 0u32;
+        let swept = swept.and_then(|mut frames| {
+            self.open_swept(read.slot, &mut frames)?;
+            Ok(frames)
+        });
         let sweep = swept.and_then(|frames| {
             writer::sweep(
                 &self.state,
@@ -363,6 +372,51 @@ impl<F: BlockFile + 'static> Owner<F> {
             Ok(sweep) => self.lay_out(batch, whole, Some(sweep), payload, records, inbox),
             Err(e) => self.failed(batch, Vec::new(), e, inbox),
         }
+    }
+
+    /// A sealed log's swept frames made plain: each entry's and proposal's bytes opened under the
+    /// tail segment's session that sealed them, so the sweep lays them again to be sealed under the
+    /// session that writes the copy.
+    fn open_swept(&self, slot: u32, frames: &mut [Swept]) -> Result<(), LogError> {
+        let Some(seal) = &self.seal else {
+            return Ok(());
+        };
+        let incarnation = writer::incarnation_of(&self.state, slot);
+        for frame in frames.iter_mut() {
+            let base = frame.base;
+            let at = |offset: usize, past: usize| {
+                offset
+                    .checked_add(past)
+                    .and_then(|o| u64::try_from(o).ok())
+                    .and_then(|o| base.checked_add(o))
+                    .ok_or(LogError::Damaged("an offset past u64"))
+            };
+            for record in frame.records.iter_mut() {
+                match record {
+                    format::Owned::Entries { group, entries, .. }
+                    | format::Owned::Relocated { group, entries, .. } => {
+                        for e in entries.iter_mut() {
+                            let offset = at(e.at, format::ENTRY_HEADER_LEN)?;
+                            e.bytes =
+                                seal.open(incarnation, offset, *group, e.index, e.term, &e.bytes)?;
+                        }
+                    }
+                    format::Owned::Proposal { group, proposal } => {
+                        let offset = at(proposal.at, format::PROPOSAL_FIELDS_LEN)?;
+                        proposal.bytes = seal.open(
+                            incarnation,
+                            offset,
+                            *group,
+                            proposal.index,
+                            proposal.term,
+                            &proposal.bytes,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Lays the batch into a frame after any sweep, and hands the frame to the device.
@@ -467,9 +521,14 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.schedule.held.push_back(s);
             return Ok(Some(false));
         }
-        let Some(placement) =
-            writer::encode(payload, &mut laid.records, s.group, &s.update, s.marks)
-        else {
+        let Some(placement) = writer::encode(
+            payload,
+            &mut laid.records,
+            s.group,
+            &s.update,
+            s.marks,
+            self.p.tag,
+        ) else {
             batch.push_front(s);
             return Err(LogError::TooLarge(len));
         };
@@ -482,7 +541,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// group, and the payload bytes its records take.
     fn fits(&self, s: &Submission, new_groups: usize) -> Result<(bool, usize), LogError> {
         let new = writer::validate(&self.state, &self.p.config, s, new_groups)?;
-        match writer::submission_len(s.group, &s.update, s.marks) {
+        match writer::submission_len(s.group, &s.update, s.marks, self.p.tag) {
             Some(len) if len <= self.p.frame_room => Ok((new, len)),
             Some(len) => Err(LogError::TooLarge(len)),
             None => Err(LogError::TooLarge(usize::MAX)),
@@ -522,7 +581,12 @@ impl<F: BlockFile + 'static> Owner<F> {
             !taken.is_empty() && taken.iter().all(|(s, _)| writer::frees(&s.update, s.marks))
         };
         let makes_room = advances || frees(&laid.taken);
-        let target = writer::target(&self.state, &self.p, payload.len(), makes_room);
+        // Slots past the file's end as its owner admits them, before the writer reads how many
+        // segments it may use (`crate::growth`).
+        if let Some(gate) = self.gate.as_mut() {
+            gate.refill(&mut self.state, self.p.config.max_segments);
+        }
+        let target = self.target_for(payload.len(), makes_room);
         match target {
             Ok(Some(target)) => self.write(payload, laid, target, tail, inbox),
             Ok(None) => {
@@ -534,6 +598,40 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.failed(VecDeque::new(), laid.taken, e, inbox);
             }
         }
+    }
+
+    /// Where a frame of `payload_len` bytes goes. A sealed log's frame also holds its MAC, and a
+    /// frame that continues a segment the writer has no session for begins with a key record; one
+    /// that opens a segment carries its session's key in the segment's header instead.
+    fn target_for(
+        &self,
+        payload_len: usize,
+        makes_room: bool,
+    ) -> Result<Option<writer::Target>, LogError> {
+        let Some(seal) = &self.seal else {
+            return writer::target(&self.state, &self.p, payload_len, makes_room);
+        };
+        let sealed = payload_len
+            .checked_add(format::MAC_LEN)
+            .ok_or(LogError::TooLarge(payload_len))?;
+        if seal.writes(self.state.head.incarnation) {
+            return writer::target(&self.state, &self.p, sealed, makes_room);
+        }
+        let keyed = sealed
+            .checked_add(format::KEY_RECORD_LEN)
+            .ok_or(LogError::TooLarge(payload_len))?;
+        let prefix =
+            u64::try_from(format::KEY_RECORD_LEN).map_err(|_| LogError::Config("a key record"))?;
+        Ok(
+            match writer::target(&self.state, &self.p, keyed, makes_room)? {
+                Some(t) if t.opens => Some(writer::Target {
+                    frame_len: writer::frame_len(&self.p, sealed)?,
+                    ..t
+                }),
+                Some(t) => Some(writer::Target { prefix, ..t }),
+                None => None,
+            },
+        )
     }
 
     /// Lays the frame, its persist record and its own confirmation into aligned buffers and hands
@@ -561,10 +659,15 @@ impl<F: BlockFile + 'static> Owner<F> {
             } else {
                 target.offset
             };
-            Ok((frame, at, record, self.record_at(sequence)?, confirm))
+            // A slot past the file's last is written whole with zeros before its first frame
+            // (`device::Frame::zero`); a slot reused is written already.
+            let grows = usize::try_from(target.slot)
+                .is_ok_and(|slot| slot >= self.state.segments.incarnation.len());
+            let zero = (target.opens && grows).then_some((at, self.p.config.segment_bytes));
+            Ok((frame, at, record, self.record_at(sequence)?, confirm, zero))
         });
         match job {
-            Ok((frame, at, record, record_at, confirm)) => {
+            Ok((frame, at, record, record_at, confirm, zero)) => {
                 let Laid {
                     sweep, mut taken, ..
                 } = laid;
@@ -592,6 +695,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     Job::Frame(Frame {
                         frame,
                         at,
+                        zero,
                         record,
                         record_at,
                         sequence,
@@ -636,7 +740,11 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// The frame's bytes: the segment's header first when it opens one, the frame's header, its
     /// payload. Laid into the last frame's buffer while it is large enough: every byte up to the
-    /// padded end is written, so nothing of the frame before survives into this one.
+    /// padded end is written, so nothing of the frame before survives into this one. In a sealed
+    /// log the segment's header carries the new session's key frame and its MAC, a key record
+    /// begins a frame that begins a session in a segment it continues, the payload's records are
+    /// sealed in place before the frame's header is computed over them, and the frame ends with
+    /// its MAC.
     fn frame_bytes(
         &mut self,
         target: &Target,
@@ -646,17 +754,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         sequence: u64,
     ) -> Result<AlignedBuf, LogError> {
         let p = self.p;
-        let frame = format::Frame {
-            log: p.id,
-            incarnation: target.incarnation,
-            nonce: target.nonce,
-            sequence,
-            tail,
-            records,
-        };
-        let header = frame
-            .header(payload)
-            .ok_or(LogError::TooLarge(payload.len()))?;
+        let sealed = self.seal.is_some();
         let block = p.align.get();
         let header_room = if target.opens { block } else { 0 };
         let frame_len =
@@ -666,20 +764,104 @@ impl<F: BlockFile + 'static> Owner<F> {
             .ok_or(LogError::TooLarge(payload.len()))?;
         let mut buf = aligned(self.buffers.frame.take(), total, p.align)?;
         let disk = |e: hyper_block::buf::BufError| LogError::Disk(e.into());
+        // A new session where the frame opens a segment or begins one in the segment it continues.
+        let key = match self.seal.as_mut() {
+            Some(seal) if target.opens || target.prefix > 0 => {
+                let from = if target.opens {
+                    target.offset
+                } else {
+                    target
+                        .offset
+                        .checked_add(format::FRAME_HEADER_BYTES)
+                        .ok_or(LogError::Damaged("an offset past u64"))?
+                };
+                Some(seal.begin(target.incarnation, from)?)
+            }
+            _ => None,
+        };
         if target.opens {
-            let header = SegmentHeader {
-                log: p.id,
-                incarnation: target.incarnation,
-                nonce: target.nonce,
-                segment_bytes: p.config.segment_bytes,
-            };
-            buf.extend_from_slice(&header.encode()).map_err(disk)?;
+            buf.extend_from_slice(&self.segment_header(target, key)?)
+                .map_err(disk)?;
             buf.extend_zeros(block.saturating_sub(buf.len()))
                 .map_err(disk)?;
         }
-        buf.extend_from_slice(&header).map_err(disk)?;
+        let frame_at = buf.len();
+        buf.extend_zeros(format::FRAME_HEADER_LEN).map_err(disk)?;
+        let mut records = records;
+        if target.prefix > 0 {
+            let frame = key.ok_or(LogError::Damaged("a key record with no session"))?;
+            let mut record = Payload::with_capacity(format::KEY_RECORD_LEN);
+            format::put(&mut record, &format::Record::Key { frame: &frame }, 0)
+                .ok_or(LogError::Damaged("a key record does not encode"))?;
+            buf.extend_from_slice(record.as_slice()).map_err(disk)?;
+            records = records
+                .checked_add(1)
+                .ok_or(LogError::TooLarge(payload.len()))?;
+        }
         buf.extend_from_slice(payload).map_err(disk)?;
+        let body_at = frame_at
+            .checked_add(format::FRAME_HEADER_LEN)
+            .ok_or(LogError::TooLarge(payload.len()))?;
+        let body_end = buf.len();
+        if let Some(seal) = self.seal.as_mut() {
+            let base = target
+                .offset
+                .checked_add(format::FRAME_HEADER_BYTES)
+                .ok_or(LogError::Damaged("an offset past u64"))?;
+            let body = buf
+                .as_mut_slice()
+                .get_mut(body_at..body_end)
+                .ok_or(LogError::Damaged("a frame's body"))?;
+            seal.seal_payload(body, records, base, target.incarnation)?;
+        }
+        let frame = format::Frame {
+            log: p.id,
+            incarnation: target.incarnation,
+            nonce: target.nonce,
+            sequence,
+            tail,
+            records,
+            sealed,
+        };
+        let body = buf
+            .as_slice()
+            .get(body_at..body_end)
+            .ok_or(LogError::Damaged("a frame's body"))?;
+        let header = frame
+            .header(body)
+            .ok_or(LogError::TooLarge(payload.len()))?;
+        crate::seal::put_at(buf.as_mut_slice().get_mut(frame_at..body_at), &header)?;
+        if let Some(seal) = &self.seal {
+            let covered = buf
+                .as_slice()
+                .get(frame_at..body_end)
+                .ok_or(LogError::Damaged("a frame"))?;
+            let mac = seal.mac_frame(covered, records)?;
+            buf.extend_from_slice(&mac).map_err(disk)?;
+        }
         Ok(buf)
+    }
+
+    /// The header of the segment `target` opens, and a sealed log's MAC after it: the new session's
+    /// key frame is `key`.
+    fn segment_header(
+        &self,
+        target: &Target,
+        key: Option<[u8; format::KEY_FRAME_LEN]>,
+    ) -> Result<Vec<u8>, LogError> {
+        let header = SegmentHeader {
+            log: self.p.id,
+            incarnation: target.incarnation,
+            nonce: target.nonce,
+            segment_bytes: self.p.config.segment_bytes,
+            key: if self.seal.is_some() { key } else { None },
+        };
+        let mut bytes = header.encode();
+        if let Some(seal) = &self.seal {
+            let mac = seal.mac(&bytes)?;
+            bytes.extend_from_slice(&mac);
+        }
+        Ok(bytes)
     }
 
     /// The persist record of the frame of `sequence`, which confirms the frame of `confirms`,
@@ -698,18 +880,32 @@ impl<F: BlockFile + 'static> Owner<F> {
         b.persist.groups.clear();
         b.persist.groups.extend(updates.map(writer::persisted));
         b.record_bytes.clear();
+        b.persist.sealed = self.seal.is_some();
         b.persist
             .encode_into(&mut b.record_bytes)
             .ok_or(LogError::TooLarge(b.persist.groups.len()))?;
-        let mut buf = aligned(kept, b.record_bytes.len(), self.p.align)?;
+        let mac = match &self.seal {
+            Some(seal) => Some(seal.mac(b.record_bytes.as_slice())?),
+            None => None,
+        };
+        let len = b
+            .record_bytes
+            .len()
+            .checked_add(if mac.is_some() { format::MAC_LEN } else { 0 })
+            .ok_or(LogError::TooLarge(b.persist.groups.len()))?;
+        let mut buf = aligned(kept, len, self.p.align)?;
         buf.extend_from_slice(b.record_bytes.as_slice())
             .map_err(|e| LogError::Disk(e.into()))?;
+        if let Some(mac) = mac {
+            buf.extend_from_slice(&mac)
+                .map_err(|e| LogError::Disk(e.into()))?;
+        }
         Ok(buf)
     }
 
     /// The file offset of the persist slot of the frame of `sequence`.
     fn record_at(&self, sequence: u64) -> Result<u64, LogError> {
-        let slot = crate::recover::persist_slot(&self.p.config, self.p.align)?;
+        let slot = crate::recover::persist_slot(&self.p.config, self.p.align, self.seal.is_some())?;
         Ok(crate::recover::persist_at(slot, sequence))
     }
 
@@ -743,6 +939,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             Some(u) if !before.is_empty() => u.answering = before,
             _ => self.keep_answers(before),
         }
+        let slots_before = self.state.segments.incarnation.len();
         let published = result.and_then(|()| {
             self.schedule.anticipation.served(timing.took_ns);
             writer::publish(
@@ -755,6 +952,22 @@ impl<F: BlockFile + 'static> Owner<F> {
                 &self.buffers.lens,
             )
         });
+        if published.is_ok() {
+            // A slot past the file's former end is durable with its frame: its admission is held.
+            let grown = self
+                .state
+                .segments
+                .incarnation
+                .len()
+                .saturating_sub(slots_before);
+            if let Some(gate) = self.gate.as_mut() {
+                gate.grew(u32::try_from(grown).unwrap_or(u32::MAX));
+            }
+            let state = &self.state;
+            if let Some(seal) = self.seal.as_mut() {
+                seal.retain(|inc| state.is_live(inc));
+            }
+        }
         if let Err(e) = published {
             // Fenced before anyone hears of it, so no answer outruns the fence.
             self.fence();

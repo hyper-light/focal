@@ -96,7 +96,7 @@ async fn one_handler_routes_live_installations_without_management_round_trips_an
     let (manager, owner, outgoing) = ReplicaFleet::spawn_managed(
         1,
         CLUSTER,
-        vec![wal.clone()],
+        vec![focal_consensus::NodeStorage::Wal(wal.clone())],
         tenants
             .iter()
             .enumerate()

@@ -21,6 +21,7 @@
 
 use std::path::PathBuf;
 
+pub mod aio;
 pub mod block;
 pub mod buf;
 pub mod commit;

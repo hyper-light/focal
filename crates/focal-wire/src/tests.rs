@@ -5879,6 +5879,101 @@ async fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
     task.await.unwrap().unwrap();
 }
 
+/// How late a peer answers a group's message (27 §8.4): the tail of the ones it answered, and,
+/// while one is still out, at least that one's age, so a peer whose owner stalls is seen late
+/// while the stall lasts. An exchange that ends unanswered leaves nothing behind.
+#[tokio::test]
+async fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holding = held.clone();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let gated = started.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let holding = holding.clone();
+        let gated = gated.clone();
+        async move {
+            if holding.load(Ordering::SeqCst) {
+                gated.notify_one();
+                std::future::pending::<()>().await;
+            }
+            verified.request().reply(Response::PeerAccepted)
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            connector(&pki, certificate, key),
+            PeerPoolLimits {
+                timeout: Duration::from_secs(30),
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let message = |id: u128| {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7],
+        };
+        packet
+    };
+    assert_eq!(
+        pool.replication_lateness(2),
+        None,
+        "nothing measured or out"
+    );
+    for id in 0..4 {
+        pool.send(2, &message(800 + id)).await.unwrap();
+    }
+    let answered = pool.replication_lateness(2).unwrap();
+    // Not what the exchanges a round waits on take: those are other requests.
+    assert_eq!(pool.exchange_tail(2), None);
+    held.store(true, Ordering::SeqCst);
+    let sending = pool.clone();
+    let packet = message(810);
+    let pending = tokio::spawn(async move { sending.send(2, &packet).await });
+    unfrozen("the message never reached the peer", started.notified()).await;
+    // The one still out grows the lateness past what the answered ones took, as it lasts.
+    unfrozen("the message still out never made its peer late", async {
+        while pool.replication_lateness(2).unwrap() <= answered {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    pending.abort();
+    let _ = pending.await;
+    assert_eq!(
+        pool.replication_lateness(2),
+        Some(answered),
+        "the exchange ended unanswered, and nothing of it is left"
+    );
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
 /// A peer whose process stalls for longer than a request's deadline keeps its
 /// connections: the request that waited ends at its deadline, and the next
 /// one on the same connection is served once the stall is over. The stall is

@@ -5,10 +5,19 @@
 //! restarted under loss catches up past its hole (hyper-raft S-4's two fixes).
 use crate::{
     ConsensusError, DurableNode, Entry, EntryType, Message, MessageType, NodeConfig, StateRole,
-    tests::config,
+    Wire, tests::config,
 };
 use focal_log::{LogicalLogId, RecordKind, SharedWal, WalIdentity, WalOptions};
 use hyper_raft::fast::{FAST_PROPOSE, FAST_VOTE};
+
+/// A member raised to the wire a fast group runs on: a follower releases what it approved by
+/// itself only through the classic commit its leader sends (hyper-raft `Message::classic`), which
+/// only the raised wire carries (`Wire`); below it a member holds what it approved until the
+/// core's bound refuses more.
+fn raised(mut node: DurableNode) -> DurableNode {
+    node.set_raft_wire(Wire::Kept).unwrap();
+    node
+}
 
 fn fast(id: u64) -> NodeConfig {
     let mut config = config(id);
@@ -36,7 +45,7 @@ impl Group {
         let nodes = dirs
             .iter()
             .enumerate()
-            .map(|(i, dir)| DurableNode::open(make(i as u64 + 1), dir.path()).unwrap())
+            .map(|(i, dir)| raised(DurableNode::open(make(i as u64 + 1), dir.path()).unwrap()))
             .collect();
         let mut group = Self {
             dirs,
@@ -73,9 +82,9 @@ impl Group {
             }
             for message in sent {
                 let to = message.to;
-                // As a peer sends it: encoded, and its sender the one the
-                // transport knows.
-                let encoded = crate::encode_message(&message).unwrap();
+                // As a peer sends it: encoded under the wire, and its sender
+                // the one the transport knows.
+                let encoded = crate::encode_message_in(&message, Wire::Kept).unwrap();
                 self.nodes[(to - 1) as usize]
                     .step_authenticated(message.from, &encoded)
                     .unwrap();
@@ -83,12 +92,19 @@ impl Group {
         }
         panic!("message delivery failed to quiesce");
     }
+    /// Ticks the leader through one heartbeat and delivers what follows.
+    fn heartbeat(&mut self) {
+        for _ in 0..(self.make)(1).heartbeat_tick {
+            self.nodes[0].tick().unwrap();
+        }
+        self.settle();
+    }
     fn settle(&mut self) {
         self.carry(|_| true);
     }
     /// Delivers one message, as `carry` does.
     fn deliver(&mut self, message: Message) {
-        let encoded = crate::encode_message(&message).unwrap();
+        let encoded = crate::encode_message_in(&message, Wire::Kept).unwrap();
         self.nodes[(message.to - 1) as usize]
             .step_authenticated(message.from, &encoded)
             .unwrap();
@@ -105,7 +121,7 @@ impl Group {
             DurableNode::open(other, placeholder.path()).unwrap(),
         );
         drop(old);
-        self.nodes[node] = DurableNode::open(config, dir).unwrap();
+        self.nodes[node] = raised(DurableNode::open(config, dir).unwrap());
     }
     fn held(&self, node: usize) -> Vec<(u64, Vec<u8>)> {
         self.nodes[node]
@@ -142,7 +158,16 @@ fn a_followers_proposal_is_committed_by_the_fast_quorum_and_applied_by_all() {
     group.settle();
     for node in 0..3 {
         assert_eq!(group.applied[node].last().unwrap(), b"fast");
-        assert!(group.held(node).is_empty());
+    }
+    // What a member approved by itself it holds until it knows a classic quorum committed it
+    // (hyper-raft `Ready::released`): the leader once its members answer the append, a follower
+    // once its leader says so, on the next append or heartbeat.
+    group.heartbeat();
+    for node in 0..3 {
+        assert!(
+            group.held(node).is_empty(),
+            "member {node} still holds what it approved"
+        );
     }
     assert_eq!(group.nodes[1].fast_stats().proposed, 1);
     assert!(group.displaced.iter().all(Vec::is_empty));
@@ -217,7 +242,7 @@ fn what_a_member_approved_is_on_disk_before_it_says_so_and_after_it_stopped() {
         1
     );
     assert!(kinds.contains(&(RecordKind::Proposal, index)));
-    group.nodes[2] = DurableNode::open(fast(3), &dir).unwrap();
+    group.nodes[2] = raised(DurableNode::open(fast(3), &dir).unwrap());
     // With the leader gone, whoever is elected takes what the two hold.
     for _ in 0..60 {
         for node in [1, 2] {
@@ -240,6 +265,56 @@ fn what_a_member_approved_is_on_disk_before_it_says_so_and_after_it_stopped() {
         assert!(group.applied[node].iter().any(|entry| entry == b"held"));
         assert!(group.held(node).is_empty());
     }
+}
+
+/// What a member approved by itself is held until it knows a classic quorum committed it, whatever
+/// its log reached (hyper-raft d8578be: a member that let go once its log reached the index gave up
+/// a fast vote a later leader could still count against). Here the follower's log holds the entry
+/// before the follower learns the classic commit, and it holds the proposal across a restart; the
+/// release is written, and a restart after it brings nothing back.
+#[test]
+fn a_proposal_the_log_reached_is_held_until_released_and_the_release_outlives_a_restart() {
+    let mut group = Group::new();
+    let index = group.nodes[1].propose_fast(b"kept".to_vec()).unwrap();
+    group.settle();
+    for node in 0..3 {
+        assert!(group.nodes[node].status().committed_index >= index);
+        assert_eq!(group.applied[node].last().unwrap(), b"kept");
+    }
+    // The follower's log holds the entry; no leader has said a classic quorum committed it.
+    assert_eq!(group.held(1), vec![(index, b"kept".to_vec())]);
+    group.reopen(1);
+    assert_eq!(
+        group.held(1),
+        vec![(index, b"kept".to_vec())],
+        "a proposal the log reached was let go at a restart before its release"
+    );
+    group.heartbeat();
+    assert!(group.held(1).is_empty());
+    // A release rides a write the member makes anyway (hyper-raft `Ready::released`): until one,
+    // a restart gives the proposal back and the member holds it until it learns the commit again,
+    // which costs room and never safety.
+    group.reopen(1);
+    assert_eq!(group.held(1), vec![(index, b"kept".to_vec())]);
+    group.heartbeat();
+    assert!(group.held(1).is_empty());
+    // The next entry is such a write: the release is durable with it, and a restart after it
+    // brings nothing back.
+    group.nodes[0].propose(b"next".to_vec()).unwrap();
+    group.settle();
+    assert_eq!(group.applied[1].last().unwrap(), b"next");
+    group.reopen(1);
+    assert!(
+        group.held(1).is_empty(),
+        "a released proposal came back at a restart"
+    );
+    // And it survives the checkpoint that rewrites the member's stream.
+    let applied = group.nodes[1].status().applied_index;
+    group.nodes[1]
+        .checkpoint(applied, b"state".to_vec())
+        .unwrap();
+    group.reopen(1);
+    assert!(group.held(1).is_empty());
 }
 
 #[test]

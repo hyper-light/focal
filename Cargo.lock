@@ -643,10 +643,12 @@ dependencies = [
 name = "focal-consensus"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crc32fast",
  "focal-log",
  "focal-memory",
  "focal-platform",
+ "focal-seal",
  "focal-sim",
  "focal-timing",
  "getrandom 0.3.4",
@@ -654,6 +656,7 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
+ "hyper-seal",
  "postcard",
  "raft-proto",
  "serde",
@@ -672,6 +675,9 @@ dependencies = [
  "focal-log",
  "focal-memory",
  "focal-model",
+ "focal-seal",
+ "hyper-block",
+ "hyper-log",
  "postcard",
  "serde",
  "tempfile",
@@ -882,6 +888,7 @@ dependencies = [
  "blake3",
  "clap",
  "clap_complete",
+ "crc32fast",
  "focal-client",
  "focal-consensus",
  "focal-control",
@@ -900,6 +907,7 @@ dependencies = [
  "focal-platform",
  "focal-ranges",
  "focal-runtime",
+ "focal-seal",
  "focal-sim",
  "focal-stream",
  "focal-timing",
@@ -907,6 +915,7 @@ dependencies = [
  "focal-wire",
  "futures-util",
  "getrandom 0.3.4",
+ "hyper-seal",
  "postcard",
  "quinn",
  "rcgen 0.14.10",
@@ -955,6 +964,18 @@ dependencies = [
  "focal-model",
  "postcard",
  "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "focal-seal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "focal-platform",
+ "getrandom 0.3.4",
+ "hyper-seal",
  "tempfile",
  "thiserror",
 ]
@@ -1214,6 +1235,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "getrandom 0.4.3",
+ "libc",
  "rustix 1.1.4",
  "thiserror",
  "windows-sys 0.61.2",
@@ -1245,6 +1267,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.4.3",
  "hyper-block",
+ "hyper-seal",
  "hyper-timing",
  "thiserror",
 ]
@@ -1256,6 +1279,18 @@ dependencies = [
  "crc32c",
  "hyper-timing",
  "thiserror",
+]
+
+[[package]]
+name = "hyper-seal"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "getrandom 0.4.3",
+ "hyper-block",
+ "rustix 1.1.4",
+ "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

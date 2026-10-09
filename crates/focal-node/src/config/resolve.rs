@@ -73,13 +73,14 @@ const POLICY_FIELDS: [&str; 4] = [
     "placement.home_regions",
     "placement.residency",
 ];
-const LOCAL_FIELDS: [&str; 8] = [
+const LOCAL_FIELDS: [&str; 9] = [
     "node.data_dir",
     "node.listen",
     "node.advertise",
     "node.seeds",
     "node.max_tenants",
     "node.metrics_listen",
+    "node.root_key",
     "topology.zone",
     "topology.region",
 ];

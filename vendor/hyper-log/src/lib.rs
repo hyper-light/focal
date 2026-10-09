@@ -29,13 +29,16 @@
     )
 )]
 pub mod codec;
+mod derive;
 mod device;
 mod error;
 pub mod format;
 mod group;
+mod growth;
 mod owner;
 mod recover;
 mod room;
+mod seal;
 mod state;
 mod stats;
 mod ticket;
@@ -48,9 +51,12 @@ use std::thread::JoinHandle;
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{Alignment, Pool};
 
+pub use derive::{Facts, Unfit};
 pub use error::LogError;
 pub use format::{HardState, Start};
 pub use group::GroupLog;
+pub use growth::Growth;
+pub use seal::Sealing;
 pub use stats::LogStats;
 pub use ticket::{Fetching, Pending};
 
@@ -133,8 +139,13 @@ pub struct Update {
     pub entries: Option<Entries>,
     /// The hard state; the latest written wins.
     pub hard_state: Option<HardState>,
-    /// Entries approved on the fast track, held until the log reaches them.
+    /// Entries approved on the fast track, each replacing the one held at its index, held until
+    /// an update releases them, whatever the log reaches.
     pub proposals: Vec<Proposal>,
+    /// The proposals at or below this index end, before this update's are taken: the replica
+    /// knows its log committed through it by a classic quorum (hyper-raft's `Ready::released`).
+    /// The greatest written is the group's, and a view says it.
+    pub released: Option<u64>,
     /// The replica left this device: every record of the group is dead. Nothing else may
     /// come with it.
     pub remove: bool,
@@ -164,8 +175,10 @@ pub struct View {
     pub last: u64,
     /// The group's hard state, if it wrote one.
     pub hard_state: Option<HardState>,
-    /// Its proposals the log has not reached.
+    /// Its proposals no update released.
     pub proposals: Vec<Proposal>,
+    /// The greatest index an update released proposals through, or zero.
+    pub released: u64,
     /// Entries the log may lack, through this mark's index and of terms up to its term,
     /// that a frame no longer readable held (mantle docs/design/raft-log.md §6). Until the log
     /// again reaches the index, or holds an entry of a later term, the replica takes no part
@@ -242,6 +255,31 @@ impl Fetched {
         self.entries.len().saturating_sub(1)
     }
 
+    /// Rewrites the entries `open` says to: each entry's place and bytes in, its new bytes out,
+    /// or `None` to keep it (a sealed log's entries opened as the owner finishes a read).
+    fn open_each(
+        &mut self,
+        mut open: impl FnMut(usize, &[u8]) -> Result<Option<Vec<u8>>, LogError>,
+    ) -> Result<(), LogError> {
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (at, &(term, start, len)) in self.entries.iter().enumerate() {
+            let stored = start
+                .checked_add(len)
+                .and_then(|end| self.bytes.get(start..end))
+                .ok_or(LogError::Damaged("a fetched entry"))?;
+            let from = bytes.len();
+            match open(at, stored)? {
+                Some(plain) => bytes.extend_from_slice(&plain),
+                None => bytes.extend_from_slice(stored),
+            }
+            entries.push((term, from, bytes.len().saturating_sub(from)));
+        }
+        self.bytes = bytes;
+        self.entries = entries;
+        Ok(())
+    }
+
     /// Fills the place `at` with an entry read from the file.
     fn fill(&mut self, at: usize, payload: &[u8]) {
         let start = self.bytes.len();
@@ -278,22 +316,32 @@ pub(crate) struct Params {
     pub(crate) frame_room: usize,
     /// Charged bytes the queue holds at most (`PIPELINE_FRAMES`).
     pub(crate) queue_bytes: u64,
+    /// Bytes of the tag after each entry's and proposal's bytes: [`format::TAG_LEN`] in a sealed
+    /// log, 0 in an unsealed one.
+    pub(crate) tag: usize,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
 /// (`Log::parts`, `GroupLog::parts`).
-pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-    let len_of = |u: &Update| writer::update_len(group, u).ok_or(LogError::TooLarge(usize::MAX));
+pub(crate) fn parts(
+    room: usize,
+    group: u128,
+    update: Update,
+    tag: usize,
+) -> Result<Vec<Update>, LogError> {
+    let len_of =
+        |u: &Update| writer::update_len(group, u, tag).ok_or(LogError::TooLarge(usize::MAX));
     if update.remove || len_of(&update)? <= room {
         return Ok(vec![update]);
     }
     let record =
-        |r: &format::Record<'_>| format::encoded_len(r).ok_or(LogError::TooLarge(usize::MAX));
+        |r: &format::Record<'_>| format::encoded_len(r, tag).ok_or(LogError::TooLarge(usize::MAX));
     let Update {
         start,
         entries,
         hard_state,
         proposals,
+        released,
         ..
     } = update;
     let mut parts = Vec::new();
@@ -348,12 +396,13 @@ pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Upda
     }
     if let Some(state) = hard_state {
         let cost = record(&format::Record::HardState { group, state })?;
-        if used.saturating_add(cost) > room {
-            parts.push(std::mem::take(&mut part));
-            used = 0;
-        }
+        make_room(&mut parts, &mut part, &mut used, cost, room);
         part.hard_state = Some(state);
-        used = used.saturating_add(cost);
+    }
+    if let Some(through) = released {
+        let cost = record(&format::Record::Released { group, through })?;
+        make_room(&mut parts, &mut part, &mut used, cost, room);
+        part.released = Some(through);
     }
     for p in proposals {
         let cost = record(&format::Record::Proposal {
@@ -365,25 +414,51 @@ pub(crate) fn parts(room: usize, group: u128, update: Update) -> Result<Vec<Upda
         if cost > room {
             return Err(LogError::TooLarge(cost));
         }
-        if used.saturating_add(cost) > room {
-            parts.push(std::mem::take(&mut part));
-            used = 0;
-        }
+        make_room(&mut parts, &mut part, &mut used, cost, room);
         part.proposals.push(p);
-        used = used.saturating_add(cost);
     }
     parts.push(part);
     Ok(parts)
 }
 
+/// Counts `cost` more bytes into the part being filled, closing it first where they would pass
+/// `room`.
+fn make_room(
+    parts: &mut Vec<Update>,
+    part: &mut Update,
+    used: &mut usize,
+    cost: usize,
+    room: usize,
+) {
+    if used.saturating_add(cost) > room {
+        parts.push(std::mem::take(part));
+        *used = 0;
+    }
+    *used = used.saturating_add(cost);
+}
+
 /// Payload bytes one frame holds: a segment less its header block and the frame's header.
-pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, LogError> {
+/// In a sealed log a frame also holds its MAC, and may begin with a key record, so its room for
+/// submissions is less by both.
+pub(crate) fn frame_room(
+    config: &Config,
+    align: Alignment,
+    sealed: bool,
+) -> Result<usize, LogError> {
     let block = u64::try_from(align.get()).map_err(|_| LogError::Config("block"))?;
+    let sealing = if sealed {
+        format::MAC_LEN
+            .checked_add(format::KEY_RECORD_LEN)
+            .ok_or(LogError::Config("a key record"))?
+    } else {
+        0
+    };
     config
         .segment_bytes
         .checked_sub(block)
         .and_then(|room| usize::try_from(room).ok())
         .and_then(|room| room.checked_sub(format::FRAME_HEADER_LEN))
+        .and_then(|room| room.checked_sub(sealing))
         .ok_or(LogError::Config("a segment holds no frame"))
 }
 
@@ -396,6 +471,17 @@ pub(crate) fn frame_room(config: &Config, align: Alignment) -> Result<usize, Log
 /// three frames alike, so it is also the most writes a group's handle keeps out at once
 /// ([`GroupLog::depth`]; hyper-raft docs/durable.md §6).
 pub(crate) const PIPELINE_FRAMES: usize = 3;
+
+/// What a log is made or opened with besides its file, its configuration and its id
+/// ([`Log::create_with`], [`Log::open_with`]).
+#[derive(Default)]
+pub struct With {
+    /// The log's keys, where it is sealed (hyper-raft docs/seal.md).
+    pub sealing: Option<Sealing>,
+    /// The owner's admission for the file to grow past its slots ([`Growth`]); without one the
+    /// file grows to `Config::max_segments`.
+    pub growth: Option<Box<dyn Growth>>,
+}
 
 /// What starting a log needs besides its file and its state.
 struct Prepared {
@@ -454,12 +540,100 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Formats a new log as [`Log::create`] does, giving the file back with a refusal.
     pub fn try_create(file: F, config: Config, id: u128) -> Result<Self, Refused<F>> {
-        let state = match recover::create(&file, &config, id) {
-            Ok(state) => state,
+        Self::make(file, config, id, None, None)
+    }
+
+    /// Formats a new sealed log `id` in `file`, which must be empty (hyper-raft docs/seal.md §5):
+    /// every entry's and proposal's bytes sealed, every frame, header and persist record under a
+    /// MAC. It opens only with [`Log::open_sealed`] and the same keys.
+    pub fn create_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<Self, LogError> {
+        Self::try_create_sealed(file, config, id, sealing).map_err(|r| r.error)
+    }
+
+    /// Formats a new sealed log as [`Log::create_sealed`] does, giving the file back with a refusal.
+    pub fn try_create_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<Self, Refused<F>> {
+        let sealer = match seal::Sealer::new(sealing, id) {
+            Ok(sealer) => sealer,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        let (log, _) = Self::start(file, config, id, state, Vec::new())?;
+        Self::make(file, config, id, Some(sealer), None)
+    }
+
+    fn make(
+        file: F,
+        config: Config,
+        id: u128,
+        mut sealer: Option<seal::Sealer>,
+        growth: Option<Box<dyn Growth>>,
+    ) -> Result<Self, Refused<F>> {
+        // A new log takes its persist area and its first slot: admitted before they are written,
+        // refused as the bound reached, and held once the log is made.
+        let first = recover::persist_area(&config).checked_add(config.segment_bytes);
+        let mut gate = match (growth, first) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(Refused::with(LogError::Config("a file past u64"), file));
+            }
+            (Some(growth), Some(first)) => {
+                let mut gate = growth::Gate::new(growth, config.segment_bytes, 0);
+                if !gate.take(first) {
+                    return Err(Refused::with(LogError::Full, file));
+                }
+                Some(gate)
+            }
+        };
+        let state = match recover::create(&file, &config, id, sealer.as_mut()) {
+            Ok(state) => state,
+            Err(error) => {
+                if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
+                    gate.give(first);
+                }
+                return Err(Refused::with(error, file));
+            }
+        };
+        if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
+            gate.hold(first);
+        }
+        let (log, _) = Self::start(file, config, id, state, Vec::new(), sealer, gate)?;
         Ok(log)
+    }
+
+    /// Formats a new log in `file`, which must be empty, with what `with` states: its keys, where
+    /// it is sealed, and its owner's admission for the file to grow (`Growth`), where it states
+    /// one. [`Log::create`] and [`Log::create_sealed`] are this with one or neither.
+    pub fn create_with(file: F, config: Config, id: u128, with: With) -> Result<Self, Refused<F>> {
+        let sealer = match with.sealing.map(|sealing| seal::Sealer::new(sealing, id)) {
+            None => None,
+            Some(Ok(sealer)) => Some(sealer),
+            Some(Err(error)) => return Err(Refused::with(error, file)),
+        };
+        Self::make(file, config, id, sealer, with.growth)
+    }
+
+    /// Opens log `id` in `file` with what `with` states, and recovers it as [`Log::open`] does.
+    /// An owner's `Growth` is told what the file's slots already take before it admits more.
+    pub fn open_with(
+        file: F,
+        config: Config,
+        id: u128,
+        with: With,
+    ) -> Result<(Self, Recovery), Refused<F>> {
+        let sealer = match with.sealing.map(|sealing| seal::Sealer::new(sealing, id)) {
+            None => None,
+            Some(Ok(sealer)) => Some(sealer),
+            Some(Err(error)) => return Err(Refused::with(error, file)),
+        };
+        Self::reopen(file, config, id, sealer, with.growth)
     }
 
     /// Opens log `id` in `file` and recovers it (mantle docs/design/raft-log.md §6). What a
@@ -472,11 +646,66 @@ impl<F: BlockFile + 'static> Log<F> {
     /// Opens a log as [`Log::open`] does, giving the file back with a refusal: what recovery
     /// found damaged stays for whoever repairs or replaces it.
     pub fn try_open(file: F, config: Config, id: u128) -> Result<(Self, Recovery), Refused<F>> {
-        let (state, recovery, restores) = match recover::open(&file, &config, id) {
+        Self::reopen(file, config, id, None, None)
+    }
+
+    /// Opens sealed log `id` in `file` with the keys it was created with, and recovers it as
+    /// [`Log::open`] does. Framing whose MAC fails, or a record that does not open, is
+    /// [`LogError::Tampered`]: the log serves nothing from such a file.
+    pub fn open_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<(Self, Recovery), LogError> {
+        Self::try_open_sealed(file, config, id, sealing).map_err(|r| r.error)
+    }
+
+    /// Opens a sealed log as [`Log::open_sealed`] does, giving the file back with a refusal.
+    pub fn try_open_sealed(
+        file: F,
+        config: Config,
+        id: u128,
+        sealing: Sealing,
+    ) -> Result<(Self, Recovery), Refused<F>> {
+        let sealer = match seal::Sealer::new(sealing, id) {
+            Ok(sealer) => sealer,
+            Err(error) => return Err(Refused::with(error, file)),
+        };
+        Self::reopen(file, config, id, Some(sealer), None)
+    }
+
+    fn reopen(
+        file: F,
+        config: Config,
+        id: u128,
+        mut sealer: Option<seal::Sealer>,
+        growth: Option<Box<dyn Growth>>,
+    ) -> Result<(Self, Recovery), Refused<F>> {
+        let (state, recovery, restores) = match recover::open(&file, &config, id, sealer.as_mut()) {
             Ok(opened) => opened,
             Err(error) => return Err(Refused::with(error, file)),
         };
-        let (mut log, pending) = Self::start(file, config, id, state, restores)?;
+        if let Some(sealer) = sealer.as_mut() {
+            sealer.retain(|inc| state.is_live(inc));
+        }
+        // What the file's slots take, each a whole segment, told before any admission: the bytes
+        // the file reaches as its last slot fills, so a restart neither counts them twice nor
+        // admits past the volume.
+        let gate = match growth {
+            None => None,
+            Some(growth) => {
+                let held = u64::try_from(state.segments.incarnation.len())
+                    .ok()
+                    .and_then(|slots| slots.checked_mul(config.segment_bytes))
+                    .and_then(|slots| slots.checked_add(recover::persist_area(&config)));
+                match held {
+                    Some(held) => Some(growth::Gate::new(growth, config.segment_bytes, held)),
+                    None => return Err(Refused::with(LogError::Config("a file past u64"), file)),
+                }
+            }
+        };
+        let (mut log, pending) = Self::start(file, config, id, state, restores, sealer, gate)?;
         for p in pending {
             if let Err(error) = p.wait() {
                 return Err(Refused {
@@ -496,10 +725,20 @@ impl<F: BlockFile + 'static> Log<F> {
         id: u128,
         state: state::State,
         restores: Vec<recover::Restore>,
+        sealer: Option<seal::Sealer>,
+        gate: Option<growth::Gate>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
-        match Self::prepare(file.alignment(), config, id, restores) {
+        match Self::prepare(file.layout_block(), config, id, restores, sealer.is_some()) {
             Ok(prepared) => {
-                let log = Self::spawn(file, prepared.p, state, prepared.room, prepared.first)?;
+                let log = Self::spawn(
+                    file,
+                    prepared.p,
+                    state,
+                    prepared.room,
+                    prepared.first,
+                    sealer,
+                    gate,
+                )?;
                 Ok((log, prepared.pending))
             }
             Err(error) => Err(Refused::with(error, file)),
@@ -513,8 +752,9 @@ impl<F: BlockFile + 'static> Log<F> {
         config: Config,
         id: u128,
         restores: Vec<recover::Restore>,
+        sealed: bool,
     ) -> Result<Prepared, LogError> {
-        let room_bytes = frame_room(&config, align)?;
+        let room_bytes = frame_room(&config, align, sealed)?;
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
             .ok_or(LogError::Config("a queue of three frames past u64"))?;
@@ -524,6 +764,7 @@ impl<F: BlockFile + 'static> Log<F> {
             align,
             frame_room: room_bytes,
             queue_bytes,
+            tag: if sealed { format::TAG_LEN } else { 0 },
         };
         let waiters = config
             .max_groups
@@ -545,7 +786,7 @@ impl<F: BlockFile + 'static> Log<F> {
                 uncertain: r.uncertain,
                 damaged: r.damaged,
             };
-            let bytes = writer::submission_len(r.group, &r.update, marks)
+            let bytes = writer::submission_len(r.group, &r.update, marks, p.tag)
                 .and_then(writer::charge)
                 .ok_or(LogError::TooLarge(usize::MAX))?;
             room.hold(r.group, bytes)?;
@@ -587,6 +828,8 @@ impl<F: BlockFile + 'static> Log<F> {
         state: state::State,
         room: room::Room,
         first: Vec<Submission>,
+        sealer: Option<seal::Sealer>,
+        gate: Option<growth::Gate>,
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
@@ -642,7 +885,8 @@ impl<F: BlockFile + 'static> Log<F> {
                 returns: back,
                 tokens: token,
             },
-        );
+        )
+        .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
         let wiring = owner::Wiring {
             device,
             more,
@@ -652,7 +896,7 @@ impl<F: BlockFile + 'static> Log<F> {
             tokens,
             requests,
         };
-        let owner = Box::new(Owner::new(p, state, room, first, wiring));
+        let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer, gate));
         // The owner's thread waits with room for the owner. Should the send fail, the owner, and
         // the file in it, ended with the thread.
         if to_owner.send(owner).is_err() {
@@ -741,55 +985,28 @@ impl<F: BlockFile + 'static> Log<F> {
         waker: Option<Waker>,
         hears: Hears,
     ) -> Result<Pending, LogError> {
-        // Refused before it holds any room: no frame could take it, and every admitted
-        // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
-        let len = writer::submission_len(group, &update, Marks::default())
-            .ok_or(LogError::TooLarge(usize::MAX))?;
-        if len > self.p.frame_room {
-            return Err(LogError::TooLarge(len));
-        }
-        let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        let submission = Submission {
+        send(
+            &self.inbox,
+            &self.p,
             group,
             update,
-            marks: Marks::default(),
-            bytes,
-            class,
-            tags: writer::Tags::default(),
-            ticket: Ticket::new(reply, waker),
-            admit: hears == Hears::Admission,
-            handle: false,
-            lens: (0, 0),
-            waits: hears == Hears::Waits,
-            epoch: 0,
-            submitted: stats::now(),
-        };
-        let message = Message::Submit { submission, wait };
-        let sent = if wait {
-            self.inbox.send(message).map_err(|_| LogError::Closed)
-        } else {
-            self.inbox.try_send(message).map_err(|e| match e {
-                TrySendError::Full(_) => LogError::Busy,
-                TrySendError::Disconnected(_) => LogError::Closed,
-            })
-        };
-        sent?;
-        if hears == Hears::Admission {
-            waiting.admitted()?;
-        }
-        Ok(Pending(waiting))
+            Sending {
+                class,
+                wait,
+                waker,
+                hears,
+            },
+        )
     }
 
     /// Asks the owner and waits for its answer.
     fn ask(&self, query: Query) -> Result<Answer, LogError> {
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        self.inbox
-            .send(Message::Query(query, Ticket::new(reply, None)))
-            .map_err(|_| LogError::Closed)?;
-        waiting.wait()
+        ask(&self.inbox, query)
+    }
+
+    /// The log's id: what it was created with, and what its file must name to open.
+    pub fn id(&self) -> u128 {
+        self.p.id
     }
 
     /// The parameters the log runs with.
@@ -812,15 +1029,15 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// The most bytes one entry may hold and still fit a frame alone.
     pub fn entry_room(&self) -> Result<usize, LogError> {
-        let one = format::encoded_len(&format::Record::Entries {
-            group: 0,
-            first: 0,
-            entries: &[(0, &[])],
-        })
-        .ok_or(LogError::Config("an entry's record"))?;
-        self.frame_room()?
-            .checked_sub(one)
-            .ok_or(LogError::Config("a frame holds no entry"))
+        entry_room(&self.p)
+    }
+
+    /// A handle that claims this log's groups from any thread ([`LogOpener`]).
+    pub fn opener(&self) -> LogOpener<F> {
+        LogOpener {
+            inbox: self.inbox.clone(),
+            p: self.p,
+        }
     }
 
     /// `update` for `group` in parts that each fit one frame, in the order they apply: its
@@ -831,7 +1048,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// never done, so never acknowledged. `TooLarge` when one entry or proposal alone is
     /// more than a frame holds.
     pub fn parts(&self, group: u128, update: Update) -> Result<Vec<Update>, LogError> {
-        parts(self.p.frame_room, group, update)
+        parts(self.p.frame_room, group, update, self.p.tag)
     }
 
     /// Submits `update` and waits until it is durable; refused at once when the queue is
@@ -854,25 +1071,12 @@ impl<F: BlockFile + 'static> Log<F> {
     /// is dropped. Refused `Claimed` while another handle holds it, `Damaged` for a group whose
     /// records are damaged, and `TooManyGroups` past the log's bound on groups.
     pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        self.inbox
-            .send(Message::Claim(group, Ticket::new(reply, None)))
-            .map_err(|_| LogError::Closed)?;
-        match waiting.wait()? {
-            Answer::Claimed(mirror) => {
-                Ok(GroupLog::new(self.inbox.clone(), self.p, group, *mirror))
-            }
-            _ => Err(LogError::Closed),
-        }
+        claim(&self.inbox, self.p, group)
     }
 
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
-        match self.ask(Query::Groups)? {
-            Answer::Groups(groups) => Ok(groups),
-            _ => Err(LogError::Closed),
-        }
+        groups(&self.inbox)
     }
 
     /// A group's durable state; `None` for a group the log holds nothing of.
@@ -1029,5 +1233,209 @@ impl<F: BlockFile + 'static> Drop for Log<F> {
     fn drop(&mut self) {
         // The owner answers what it took, then the log's threads end.
         let _ = self.stop();
+    }
+}
+
+/// Submits `update` for `group` to the log's owner (`Log::send`).
+/// How a submission is sent: its class, whether the sender waits for room in the queue, the waker
+/// its answer wakes, and what the sender hears.
+struct Sending {
+    class: Class,
+    wait: bool,
+    waker: Option<Waker>,
+    hears: Hears,
+}
+
+fn send<F: BlockFile + 'static>(
+    inbox: &SyncSender<Message<F>>,
+    p: &Params,
+    group: u128,
+    update: Update,
+    how: Sending,
+) -> Result<Pending, LogError> {
+    let Sending {
+        class,
+        wait,
+        waker,
+        hears,
+    } = how;
+    // Refused before it holds any room: no frame could take it, and every admitted
+    // submission fits the byte bound alone, so none waits for a queue that cannot hold it.
+    let len = writer::submission_len(group, &update, Marks::default(), p.tag)
+        .ok_or(LogError::TooLarge(usize::MAX))?;
+    if len > p.frame_room {
+        return Err(LogError::TooLarge(len));
+    }
+    let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
+    let (reply, answer) = ticket::port();
+    let waiting = Waiting::new(answer);
+    let submission = Submission {
+        group,
+        update,
+        marks: Marks::default(),
+        bytes,
+        class,
+        tags: writer::Tags::default(),
+        ticket: Ticket::new(reply, waker),
+        admit: hears == Hears::Admission,
+        handle: false,
+        lens: (0, 0),
+        waits: hears == Hears::Waits,
+        epoch: 0,
+        submitted: stats::now(),
+    };
+    let message = Message::Submit { submission, wait };
+    let sent = if wait {
+        inbox.send(message).map_err(|_| LogError::Closed)
+    } else {
+        inbox.try_send(message).map_err(|e| match e {
+            TrySendError::Full(_) => LogError::Busy,
+            TrySendError::Disconnected(_) => LogError::Closed,
+        })
+    };
+    sent?;
+    if hears == Hears::Admission {
+        waiting.admitted()?;
+    }
+    Ok(Pending(waiting))
+}
+
+/// Asks the log's owner `query` and waits for its answer.
+fn ask<F: BlockFile + 'static>(
+    inbox: &SyncSender<Message<F>>,
+    query: Query,
+) -> Result<Answer, LogError> {
+    let (reply, answer) = ticket::port();
+    let waiting = Waiting::new(answer);
+    inbox
+        .send(Message::Query(query, Ticket::new(reply, None)))
+        .map_err(|_| LogError::Closed)?;
+    waiting.wait()
+}
+
+/// Claims `group` from the log's owner: the handle its writes and reads go through.
+fn claim<F: BlockFile + 'static>(
+    inbox: &SyncSender<Message<F>>,
+    p: Params,
+    group: u128,
+) -> Result<GroupLog<F>, LogError> {
+    let (reply, answer) = ticket::port();
+    let waiting = Waiting::new(answer);
+    inbox
+        .send(Message::Claim(group, Ticket::new(reply, None)))
+        .map_err(|_| LogError::Closed)?;
+    match waiting.wait()? {
+        Answer::Claimed(mirror) => Ok(GroupLog::new(inbox.clone(), p, group, *mirror)),
+        _ => Err(LogError::Closed),
+    }
+}
+
+/// The groups the log holds.
+fn groups<F: BlockFile + 'static>(inbox: &SyncSender<Message<F>>) -> Result<Vec<u128>, LogError> {
+    match ask(inbox, Query::Groups)? {
+        Answer::Groups(groups) => Ok(groups),
+        _ => Err(LogError::Closed),
+    }
+}
+
+/// The most bytes one entry may hold and still fit a frame alone.
+fn entry_room(p: &Params) -> Result<usize, LogError> {
+    let one = format::encoded_len(
+        &format::Record::Entries {
+            group: 0,
+            first: 0,
+            entries: &[(0, &[])],
+        },
+        p.tag,
+    )
+    .ok_or(LogError::Config("an entry's record"))?;
+    p.frame_room
+        .checked_sub(one)
+        .ok_or(LogError::Config("a frame holds no entry"))
+}
+
+/// A handle that claims a log's groups from any thread (focal 27 §15.8): the log's inbox and its
+/// parameters, cloned, without the log's threads, which the [`Log`] alone owns and joins when it
+/// closes. An owner that places groups at runtime holds one, as a [`GroupLog`] holds the inbox.
+/// Once the log has closed, every call answers [`LogError::Closed`]; a claim through an opener is
+/// the log's claim, refused [`LogError::Claimed`] while another handle holds the group.
+pub struct LogOpener<F: BlockFile + 'static> {
+    inbox: SyncSender<Message<F>>,
+    p: Params,
+}
+
+impl<F: BlockFile + 'static> Clone for LogOpener<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inbox: self.inbox.clone(),
+            p: self.p,
+        }
+    }
+}
+
+impl<F: BlockFile + 'static> std::fmt::Debug for LogOpener<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogOpener")
+            .field("log", &self.p.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: BlockFile + 'static> LogOpener<F> {
+    /// The handle through which `group` is written and read from here on: as [`Log::group`].
+    pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
+        claim(&self.inbox, self.p, group)
+    }
+
+    /// The groups the log holds.
+    pub fn groups(&self) -> Result<Vec<u128>, LogError> {
+        groups(&self.inbox)
+    }
+
+    /// What the log has measured: as [`Log::stats`], for an owner that holds only an opener and
+    /// exports the log's counts.
+    pub fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {
+        match ask(&self.inbox, Query::Stats(into))? {
+            Answer::Stats(stats) => Ok(stats),
+            _ => Err(LogError::Closed),
+        }
+    }
+
+    /// The log's id: what it was created with, and what its file must name to open.
+    pub fn id(&self) -> u128 {
+        self.p.id
+    }
+
+    /// The parameters the log runs with.
+    pub fn config(&self) -> Config {
+        self.p.config
+    }
+
+    /// Submits `update` for `group` and waits until it is durable, waiting for room in the queue:
+    /// as [`Log::write_waiting`].
+    pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
+        send(
+            &self.inbox,
+            &self.p,
+            group,
+            update,
+            Sending {
+                class: Class::Normal,
+                wait: true,
+                waker: None,
+                hears: Hears::Waits,
+            },
+        )?
+        .wait()
+    }
+
+    /// Payload bytes one frame holds: as [`Log::frame_room`].
+    pub fn frame_room(&self) -> Result<usize, LogError> {
+        Ok(self.p.frame_room)
+    }
+
+    /// The most bytes one entry may hold and still fit a frame alone: as [`Log::entry_room`].
+    pub fn entry_room(&self) -> Result<usize, LogError> {
+        entry_room(&self.p)
     }
 }

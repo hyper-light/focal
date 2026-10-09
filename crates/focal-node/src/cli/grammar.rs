@@ -913,6 +913,13 @@ pub(crate) const USES: &[Use] = &[
     ),
     said(
         "deploy",
+        "create",
+        "root-key",
+        &["create", "root-key"],
+        "Make a node's root key: 32 random bytes in a new owner-only file, for the deployment's secret store",
+    ),
+    said(
+        "deploy",
         "render",
         "kubernetes",
         &["deployment", "render", "kubernetes"],

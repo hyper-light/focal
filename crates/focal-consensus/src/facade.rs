@@ -6,7 +6,8 @@ use super::*;
 
 impl DurableNode {
     /// A member over hyper-durable's shell ([27] §15.7): its log one group of the node's
-    /// hyper-log log `log`, its records and image under the data directory `root`, its memory
+    /// hyper-log log, claimed through `storage` (`ShellStorage`, which an owner holds for its life,
+    /// with the log's opener, the data directory `root` and the disk envelope `disk`), its records and image under the data directory `root`, its memory
     /// charged within `parent_budget` and its disk within `disk`. `needs` names the decoder an
     /// entry of the owner's needs, where it needs one the group's baseline does not give: a write
     /// holding such an entry waits until the group's records state that decoder durable
@@ -14,17 +15,41 @@ impl DurableNode {
     /// fence never does (27 §15.8).
     pub fn open_on_shell(
         config: NodeConfig,
-        root: &Path,
-        log: &hyper_log::Log<hyper_block::file::DeviceFile>,
+        storage: &ShellStorage,
         parent_budget: &MemoryBudget,
-        disk: DiskBudget,
         needs: fn(&[u8]) -> Option<[u8; 32]>,
     ) -> Result<Self, ConsensusError> {
-        shell_node::ShellNode::open(config, root, log, parent_budget, disk, needs).map(|node| {
-            Self {
-                backend: Backend::Shell(node),
-            }
+        shell_node::ShellNode::open(config, storage, parent_budget, needs).map(|node| Self {
+            backend: Backend::Shell(node),
         })
+    }
+    /// A member over the shell whose log begins at a restored image (26 §6), as
+    /// [`DurableNode::restore_on_wal_in`] begins one on focal-log: the same images are refused, a
+    /// group that holds anything but this restore is refused, and one this restore was cut in is
+    /// finished, then the member opens as a restart would. The shell does not carry the fast
+    /// track, so a group with it is refused.
+    pub fn restore_on_shell(
+        config: NodeConfig,
+        storage: &ShellStorage,
+        parent_budget: &MemoryBudget,
+        needs: fn(&[u8]) -> Option<[u8; 32]>,
+        image: RestoredLog,
+    ) -> Result<Self, ConsensusError> {
+        config.validate()?;
+        check_restore_image(&image)?;
+        if config.fast {
+            return Err(ConsensusError::Configuration(
+                "the fast track is not on the durable shell yet",
+            ));
+        }
+        convert::restore_group(
+            &config,
+            storage.root(),
+            storage.opener(),
+            &image,
+            &storage.group_seal(),
+        )?;
+        Self::open_on_shell(config, storage, parent_budget, needs)
     }
     pub fn group_id(&self) -> [u8; 16] {
         dispatch!(inner = &self.backend => inner.group_id())
@@ -284,6 +309,12 @@ impl DurableNode {
     /// it for the stalls it has seen in itself.
     pub fn set_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.set_patience(ticks))
+    }
+    /// The ticks this member, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`hyper_raft::Raft::set_quorum_patience`): what its owner
+    /// measured of its voters' answers (27 §8.4).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        dispatch!(inner = &mut self.backend => inner.set_quorum_patience(ticks))
     }
     /// The priority this node was given; in force once it has a term.
     pub fn priority(&self) -> i64 {
@@ -553,6 +584,14 @@ impl DurableNode {
     }
     pub fn shared_wal(&self) -> Result<SharedWal, ConsensusError> {
         dispatch!(inner = &self.backend => inner.shared_wal())
+    }
+    /// The writer this member's durable state goes through (`NodeStorage::writer`): an owner
+    /// admits only members of the storage it was given.
+    pub fn storage_writer(&self) -> Result<StorageWriter, ConsensusError> {
+        match &self.backend {
+            Backend::Log(node) => Ok(StorageWriter::Wal(node.shared_wal()?.writer_id())),
+            Backend::Shell(node) => node.storage_writer(),
+        }
     }
     /// True from Ready acquisition until its full output prefix is released.
     /// Mutations return PersistencePending in this state; no Raft input is lost.

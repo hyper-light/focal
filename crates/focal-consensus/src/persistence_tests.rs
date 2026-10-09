@@ -490,7 +490,8 @@ fn what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain() {
 }
 
 /// A change of membership is the one thing not applied on a commit the log
-/// does not hold. Two voters; the leader removes the other. Whoever is told
+/// does not hold. Two voters; the leader removes the other, which commits on
+/// the leader's own write, since it counts by the change. Whoever is told
 /// the removal committed may stop the removed member; a leader that then
 /// restarted without the commit would still count it, and could never elect
 /// itself. So the removal is applied, and given, only once the write that
@@ -558,26 +559,21 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
     member.change_type = ConfChangeType::RemoveNode;
     remove.changes.push(member);
     nodes[0].propose_conf_change(remove).unwrap();
-    let appends = nodes[0].drain().unwrap().messages;
-    let mut answers = Vec::new();
-    for message in appends {
-        nodes[1].step(message).unwrap();
-        answers.extend(nodes[1].drain().unwrap().messages);
-    }
-    // The leader's disk is held. The follower's answer commits the removal
-    // in the core; it is not applied, and nothing says it committed, until
-    // the commit is in the log.
+    // The removal leaves the leader the one voter, and the core counts commitment by the newest
+    // configuration its log states (hyper-raft 83f193a; Ongaro's thesis §4.1): the leader's own
+    // durable write of the entry commits it, with no answer from the member it removes. Its disk
+    // is held: the write of the entry and its commit waits, and nothing is applied.
     let (resume, worker) = pause(blocker(&wal));
-    for message in answers {
-        nodes[0].step(message).unwrap();
-    }
-    assert!(nodes[0].try_drain().unwrap().is_none());
+    let early = nodes[0].try_drain().unwrap();
+    assert!(early.is_none_or(|events| events.membership.is_empty()));
     assert!(nodes[0].persistence_pending());
     assert_eq!(nodes[0].status().voters, vec![1, 2]);
-    assert!(nodes[0].try_drain().unwrap().is_none());
     resume.send(()).unwrap();
     drop(worker.join().unwrap());
     assert!(nodes[0].wait_persisted().unwrap());
+    // The leader is the one voter its log states, so the write that holds the entry states its
+    // commit too (`sole_commit`): once it is durable the log holds the commit, and the removal is
+    // applied and given.
     let events = nodes[0].try_drain().unwrap().unwrap();
     assert_eq!(events.membership.len(), 1);
     assert_eq!(nodes[0].status().voters, vec![1]);
@@ -594,6 +590,97 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
     assert_eq!(alone.status().role, StateRole::Leader);
     alone.propose(b"alone".to_vec()).unwrap();
     assert_eq!(alone.drain().unwrap().committed[0].data, b"alone");
+}
+
+#[test]
+fn an_added_learner_is_applied_only_once_the_log_holds_its_commit() {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let config = |node: u64| {
+        let mut config = NodeConfig::single(node, [1; 16], [1; 16]);
+        config.voters = vec![1, 2];
+        config
+    };
+    let mut nodes: Vec<DurableNode> = dirs
+        .iter()
+        .enumerate()
+        .map(|(at, dir)| DurableNode::open(config(at as u64 + 1), dir.path()).unwrap())
+        .collect();
+    let carry = |nodes: &mut Vec<DurableNode>| {
+        for _ in 0..32 {
+            let mut messages = Vec::new();
+            for node in nodes.iter_mut() {
+                messages.extend(node.drain().unwrap().messages);
+            }
+            if messages.is_empty() {
+                return;
+            }
+            for message in messages {
+                let to = message.to as usize - 1;
+                nodes[to].step(message).unwrap();
+            }
+        }
+        panic!("the two members did not settle");
+    };
+    nodes[0].campaign().unwrap();
+    carry(&mut nodes);
+    assert_eq!(nodes[0].status().role, StateRole::Leader);
+    // An entry's commit waits for no write: the leader's disk is held and
+    // the entry is given all the same, on its follower's answer.
+    nodes[0].propose(b"entry".to_vec()).unwrap();
+    let appends = nodes[0].drain().unwrap().messages;
+    let mut answers = Vec::new();
+    for message in appends {
+        nodes[1].step(message).unwrap();
+        answers.extend(nodes[1].drain().unwrap().messages);
+    }
+    let wal = nodes[0].shared_wal().unwrap();
+    let (resume, worker) = pause(blocker(&wal));
+    for message in answers {
+        nodes[0].step(message).unwrap();
+    }
+    let events = nodes[0].try_drain().unwrap().unwrap();
+    assert_eq!(events.committed.len(), 1);
+    for message in events.messages {
+        nodes[1].step(message).unwrap();
+    }
+    drop(nodes[1].drain().unwrap());
+    resume.send(()).unwrap();
+    drop(worker.join().unwrap());
+    // The addition of a learner: proposed and persisted by both. The voters stay the two, so
+    // the follower's answer commits it.
+    let mut add = ConfChangeV2::default();
+    let mut member = ConfChangeSingle {
+        node_id: 3,
+        ..Default::default()
+    };
+    member.change_type = ConfChangeType::AddLearnerNode;
+    add.changes.push(member);
+    nodes[0].propose_conf_change(add).unwrap();
+    let appends = nodes[0].drain().unwrap().messages;
+    let mut answers = Vec::new();
+    // The learner is not running: what the leader sends it is lost.
+    for message in appends.into_iter().filter(|message| message.to == 2) {
+        nodes[1].step(message).unwrap();
+        answers.extend(nodes[1].drain().unwrap().messages);
+    }
+    // The leader's disk is held. The follower's answer commits the addition
+    // in the core; it is not applied, and nothing says it committed, until
+    // the commit is in the log.
+    let (resume, worker) = pause(blocker(&wal));
+    for message in answers {
+        nodes[0].step(message).unwrap();
+    }
+    assert!(nodes[0].try_drain().unwrap().is_none());
+    assert!(nodes[0].persistence_pending());
+    assert_eq!(nodes[0].status().voters, vec![1, 2]);
+    assert!(nodes[0].try_drain().unwrap().is_none());
+    resume.send(()).unwrap();
+    drop(worker.join().unwrap());
+    assert!(nodes[0].wait_persisted().unwrap());
+    let events = nodes[0].try_drain().unwrap().unwrap();
+    assert_eq!(events.membership.len(), 1);
+    assert_eq!(nodes[0].status().voters, vec![1, 2]);
+    assert_eq!(nodes[0].status().learners, vec![3]);
 }
 
 fn image(from: &std::path::Path, to: &std::path::Path) {

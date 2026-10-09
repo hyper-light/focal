@@ -45,7 +45,7 @@ async fn a_tenant_admitted_at_runtime_installs_its_sessions_under_its_own_quota(
     let (fleet, owner, _outgoing) = ReplicaFleet::spawn_managed(
         1,
         CLUSTER,
-        vec![wal.clone()],
+        vec![focal_consensus::NodeStorage::Wal(wal.clone())],
         vec![FleetTenant {
             tenant: founder_tenant,
             weight: 1,

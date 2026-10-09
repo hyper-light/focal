@@ -24,6 +24,21 @@ mod membership;
 mod memory;
 pub use membership::*;
 mod checkpoint;
+pub mod convert;
+mod disk_growth;
+pub mod storage_open;
+pub use disk_growth::DiskGrowth;
+mod log_metrics;
+pub mod node_log;
+pub use log_metrics::{LogLatency, LogMetrics};
+mod node_storage;
+pub use node_storage::{LogWriterId, NodeStorage, ShellStorage, StorageWriter};
+/// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.
+pub type ShellLog = hyper_log::Log<hyper_block::file::DeviceFile>;
+/// A handle on the node's [`ShellLog`] that claims its groups from any thread (`Log::opener`): what
+/// an owner spawned for the node's life holds, since the log owns its threads and no owner holds
+/// it in an `Arc`.
+pub type ShellLogOpener = hyper_log::LogOpener<hyper_block::file::DeviceFile>;
 mod core_state;
 mod decoder;
 pub mod envelope;
@@ -72,10 +87,31 @@ pub struct RestoredLog {
 
 /// The bytes of committed entries one Ready gives to apply: the page a
 /// transition reads from storage at most.
+/// Refuses an image no restore may begin a log at: a point at zero, no bytes or more than an image
+/// holds, or a transition that is not the floor's successor. Both backends restore by it.
+pub(crate) fn check_restore_image(image: &RestoredLog) -> Result<(), ConsensusError> {
+    if image.index == 0
+        || image.term == 0
+        || image.data.is_empty()
+        || image.data.len() > IMAGE_BYTES
+        || image
+            .transition
+            .is_some_and(|(predecessor, successor)| predecessor == successor)
+        || image
+            .transition
+            .is_some_and(|(predecessor, _)| predecessor != image.floor)
+    {
+        return Err(ConsensusError::Configuration("invalid restore image"));
+    }
+    Ok(())
+}
 pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// The most bytes of the application's state a snapshot, a checkpoint or a
 /// restored image holds.
 pub(crate) const IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// The largest entry any group may be configured to take (`NodeConfig::max_entry_bytes`): what a
+/// frame of the node's log holds alone, whichever group writes it.
+pub const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 /// The most members a group's configuration names, voters and learners together. It is the bound
 /// focal has held since before its core moved to hyper-raft, and it sizes the group files' records
 /// (`group_files::META_BOUND`), so it is carried unchanged and no file's bounds move. focal states
@@ -172,7 +208,7 @@ impl NodeConfig {
             || self.election_tick <= self.heartbeat_tick
             || self.election_tick > 1_000_000
             || self.max_entry_bytes == 0
-            || self.max_entry_bytes > 8 * 1024 * 1024
+            || self.max_entry_bytes > MAX_ENTRY_BYTES
             || self.max_uncommitted_bytes < (self.max_entry_bytes as u64).saturating_add(1024)
             || self.max_inflight_messages == 0
             || self.max_inflight_messages > 65536
@@ -206,6 +242,10 @@ pub enum ConsensusError {
     Encoding(#[from] postcard::Error),
     #[error("configuration: {0}")]
     Configuration(&'static str),
+    /// The node's facts give no hyper-log configuration (27 §15.3): the device, the disk budget
+    /// or the groups it admits cannot hold the log.
+    #[error("the node's log: {0}")]
+    LogFacts(hyper_log::Unfit),
     #[error("inconsistent durable Raft state: {0}")]
     Corruption(&'static str),
     #[error("replica is not leader (known leader: {leader})")]
@@ -586,19 +626,7 @@ impl LogNode {
         image: RestoredLog,
     ) -> Result<Self, ConsensusError> {
         config.validate()?;
-        if image.index == 0
-            || image.term == 0
-            || image.data.is_empty()
-            || image.data.len() > IMAGE_BYTES
-            || image
-                .transition
-                .is_some_and(|(predecessor, successor)| predecessor == successor)
-            || image
-                .transition
-                .is_some_and(|(predecessor, _)| predecessor != image.floor)
-        {
-            return Err(ConsensusError::Configuration("invalid restore image"));
-        }
+        check_restore_image(&image)?;
         let identity = shared.identity()?;
         if identity.cluster != config.cluster_id || identity.node != config.node_id {
             return Err(ConsensusError::Configuration(
@@ -1143,6 +1171,14 @@ impl LogNode {
         self.raw.raft.set_patience(ticks);
         Ok(())
     }
+    /// The ticks this member, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`hyper_raft::Raft::set_quorum_patience`): what its owner
+    /// measured of its voters' answers (27 §8.4).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        self.raw.raft.set_quorum_patience(ticks)?;
+        Ok(())
+    }
     /// The priority this node was given; in force once it has a term.
     pub fn priority(&self) -> i64 {
         self.priority
@@ -1667,6 +1703,16 @@ pub(crate) fn conf_of(metadata: &SnapshotMetadata) -> &ConfState {
     metadata.conf_state.as_ref().unwrap_or(&NO_CONF)
 }
 
+/// Says that the proposals at or below `through` are held no more (`RecordKind::Released`).
+pub(crate) fn released_record(config: &NodeConfig, through: u64) -> Record {
+    Record {
+        log: LogicalLogId(config.group_id),
+        kind: RecordKind::Released,
+        index: through,
+        term: 0,
+        payload: Vec::new(),
+    }
+}
 /// Says that the group has the fast track.
 fn fast_track_record(config: &NodeConfig) -> Record {
     Record {
@@ -1714,10 +1760,16 @@ fn replay_record(
             {
                 return Err(ConsensusError::Corruption("proposal envelope mismatch"));
             }
-            // What the log has reached since is set aside.
-            if entry.index > storage.last_index()? {
-                storage.hold_proposal(entry)?;
+            // Held whatever the log reached since: only a release ends it.
+            storage.hold_proposal(entry)?;
+        }
+        RecordKind::Released => {
+            if !*fast || record.term != 0 || !record.payload.is_empty() {
+                return Err(ConsensusError::Corruption(
+                    "a release in a group that has no fast track, or one that states more",
+                ));
             }
+            storage.release(record.index);
         }
         RecordKind::DecoderFloor => {
             if config.is_none() || required_decoder.is_some() {

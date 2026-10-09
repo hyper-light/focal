@@ -32,10 +32,11 @@ impl Fixture {
         let FoundingNetwork {
             state,
             control,
-            wal,
+            storage,
             directory,
             ..
         } = FoundingNetwork::open(&settings).await.unwrap();
+        let wal = crate::storage_start::test_wal(&storage.storage).clone();
         drop(control);
         let mut options = ControlOptions::new(focal_consensus::NodeConfig::single(
             state.node,

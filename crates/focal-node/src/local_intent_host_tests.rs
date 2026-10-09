@@ -215,7 +215,9 @@ async fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and
     let path = directory.path().join("journal");
     let mut journal = PrivateJournal::open(&path).unwrap();
     journal.replace(b"before").unwrap();
-    let pause = network.wal.pause_for_test().unwrap();
+    let pause = crate::storage_start::test_wal(&network.storage.storage)
+        .pause_for_test()
+        .unwrap();
     let runtime = AuthenticatedPeer::local(PeerGrant {
         principal: focal_model::ParticipantId::from_u128(771),
         tenants: [namespace.tenant].into_iter().collect(),

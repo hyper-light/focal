@@ -33,6 +33,8 @@ pub(crate) struct HandOver<M> {
     medium: M,
     /// The group's own directory (`group_files::group_dir`).
     dir: PathBuf,
+    /// Where the key its image is sealed under comes from (29 §5).
+    seal: group_files::GroupSeal,
     /// Every entry of the group is acted on at its members' next start (`apply_on_written_commit`,
     /// focal's control groups): the shell applies none before its durable commit covers it.
     control: bool,
@@ -68,9 +70,10 @@ impl<M: Medium> HandOver<M> {
         control: bool,
         image_bound: usize,
         founding: ConfState,
+        seal: group_files::GroupSeal,
     ) -> Result<Self, GroupFileError> {
         let (applied, configuration, imaged, image_bytes, snapshot) =
-            match group_files::read_image(&medium, &dir, image_bound)? {
+            match group_files::read_image(&medium, &dir, image_bound, &seal)? {
                 Some((point, data)) => {
                     let at = Point {
                         index: point.index,
@@ -90,6 +93,7 @@ impl<M: Medium> HandOver<M> {
         Ok(Self {
             medium,
             dir,
+            seal,
             control,
             image_bound,
             committed: Vec::new(),
@@ -144,7 +148,14 @@ impl<M: Medium> HandOver<M> {
             term: at.term,
             configuration: configuration.clone(),
         };
-        group_files::write_image(&mut self.medium, &self.dir, &point, image, self.image_bound)?;
+        group_files::write_image(
+            &mut self.medium,
+            &self.dir,
+            &point,
+            image,
+            self.image_bound,
+            &self.seal,
+        )?;
         self.imaged = Some(at);
         self.image_bytes = u64::try_from(image.len()).ok();
         self.image_configuration = point.configuration;
@@ -238,7 +249,7 @@ impl<M: Medium> StateMachine for HandOver<M> {
     /// The group's durable image, read from its file and verified there: what a leader sends is
     /// what a restart would open at, and the replica's prepared snapshot is the one copy kept.
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
-        let read = group_files::read_image(&self.medium, &self.dir, self.image_bound)
+        let read = group_files::read_image(&self.medium, &self.dir, self.image_bound, &self.seal)
             .map_err(|_| Fatal("the group's image file"))?;
         let Some((point, bytes)) = read else {
             return Err(Fatal("no image: the group has not checkpointed"));
@@ -418,6 +429,10 @@ impl<L: LogStore> LogStore for FloorStore<L> {
 
     fn proposals(&self, into: &mut Vec<Entry>) -> Result<(), StorageError> {
         self.inner.proposals(into)
+    }
+
+    fn released(&self) -> Result<u64, StorageError> {
+        self.inner.released()
     }
 
     fn room(&self) -> bool {

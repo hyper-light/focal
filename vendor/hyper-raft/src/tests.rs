@@ -250,9 +250,12 @@ fn only_a_voter_campaigns() {
         for _ in 0..100 {
             node.tick().unwrap();
         }
-        // Told by a leader to campaign, it does not either.
-        node.step(answer(MessageType::MsgTimeoutNow, 1, node.raft.id(), 1))
-            .unwrap();
+        // Told by a leader to campaign, it does not either, and says why.
+        let id = node.raft.id();
+        assert_eq!(
+            node.step(answer(MessageType::MsgTimeoutNow, 1, id, 1)),
+            Err(Error::NotPromotable)
+        );
         assert_eq!(node.raft.state(), StateRole::Follower);
         assert!(drain(node).is_empty());
     }
@@ -452,7 +455,7 @@ fn reads_that_wait_have_a_bound() {
     drain(&mut node);
     // One answer confirms every read asked before it.
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
-    heartbeat.context = vec![0];
+    heartbeat.context = round_answer(&[0], 2);
     node.step(heartbeat).unwrap();
     assert_eq!(node.raft.pending_read_count(), 1);
     assert_eq!(node.raft.ready_read_count(), 2);
@@ -491,7 +494,7 @@ fn a_new_leaders_read_waits_for_its_terms_first_commit() {
         vec![(2, b"early".to_vec()), (3, b"early".to_vec())]
     );
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
-    heartbeat.context = b"early".to_vec();
+    heartbeat.context = round_answer(b"early", 1);
     node.step(heartbeat).unwrap();
     assert_eq!(confirmed(&mut node), vec![b"early".to_vec()]);
 }
@@ -516,7 +519,7 @@ fn a_read_a_follower_forwards_waits_for_the_leaders_first_commit() {
         vec![(2, b"forwarded".to_vec()), (3, b"forwarded".to_vec())]
     );
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
-    heartbeat.context = b"forwarded".to_vec();
+    heartbeat.context = round_answer(b"forwarded", 1);
     node.step(heartbeat).unwrap();
     let answers: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
         .into_iter()
@@ -622,12 +625,22 @@ fn committed_leader(config: Config) -> RawNode<Memory> {
     drain(&mut node);
     node
 }
+/// The rounds in `messages`: to whom each heartbeat went, and the read it asks for (a round's
+/// heartbeat carries the last read's context and the round's number, `ReadOnly::round_context`).
 fn rounds(messages: &[Message]) -> Vec<(u64, Vec<u8>)> {
     messages
         .iter()
         .filter(|message| message.msg_type == MessageType::MsgHeartbeat)
-        .map(|message| (message.to, message.context.clone()))
+        .map(|message| {
+            let read = crate::read::ReadOnly::of_round(&message.context)
+                .map_or_else(Vec::new, |(context, _)| context.to_vec());
+            (message.to, read)
+        })
         .collect()
+}
+/// What an answer to round `round`, which asked for the read `context`, carries back.
+fn round_answer(context: &[u8], round: u64) -> Vec<u8> {
+    crate::read::ReadOnly::round_context(context, round).unwrap()
 }
 fn confirmed(node: &mut RawNode<Memory>) -> Vec<Vec<u8>> {
     let mut ready = node.ready().unwrap();
@@ -661,7 +674,7 @@ fn reads_asked_together_leave_in_one_round_and_one_answer_confirms_them() {
     // The round is out: there is nothing more to do for the reads.
     assert!(!node.has_ready());
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
-    heartbeat.context = vec![19];
+    heartbeat.context = round_answer(&[19], 1);
     node.step(heartbeat).unwrap();
     assert_eq!(node.raft.pending_read_count(), 0);
     assert_eq!(
@@ -689,7 +702,7 @@ fn a_read_asked_after_a_round_left_is_asked_for_by_the_next() {
     node.read_index(b"third".to_vec()).unwrap();
     // The answer to the first round arrives before the next round left.
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
-    heartbeat.context = b"first".to_vec();
+    heartbeat.context = round_answer(b"first", 1);
     node.step(heartbeat).unwrap();
     assert_eq!(node.raft.pending_read_count(), 2);
     let mut ready = node.ready().unwrap();
@@ -710,15 +723,52 @@ fn a_read_asked_after_a_round_left_is_asked_for_by_the_next() {
     assert!(!node.has_ready());
     // A late answer to the first round confirms nothing more.
     let mut late = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
-    late.context = b"first".to_vec();
+    late.context = round_answer(b"first", 1);
     node.step(late).unwrap();
     assert_eq!(node.raft.pending_read_count(), 2);
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
-    heartbeat.context = b"third".to_vec();
+    heartbeat.context = round_answer(b"third", 2);
     node.step(heartbeat).unwrap();
     assert_eq!(
         confirmed(&mut node),
         vec![b"second".to_vec(), b"third".to_vec()]
+    );
+}
+
+/// An answer to a round names the round, not only the read it asked for: an asker may ask a read
+/// again under the context an earlier round carried, and a late or repeated answer to that round
+/// then named a read asked after it was sent. It confirmed every read before it in the queue, all
+/// asked after the round left (hyper-check's swarm, group seed 4,521: a deposed leader answered a
+/// read 172 entries below the commit when it was asked).
+#[test]
+fn a_late_answer_to_a_round_confirms_no_read_asked_after_it_under_the_same_context() {
+    let mut node = reading_leader();
+    node.read_index(b"again".to_vec()).unwrap();
+    assert_eq!(rounds(&drain(&mut node)).len(), 2);
+    // Member 3's answer confirms it; member 2's is held back.
+    let mut answer3 = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
+    answer3.context = round_answer(b"again", 1);
+    node.step(answer3).unwrap();
+    assert_eq!(confirmed(&mut node), vec![b"again".to_vec()]);
+    // Another read, then the first asked again under its context: both wait for round 2.
+    node.read_index(b"after".to_vec()).unwrap();
+    node.read_index(b"again".to_vec()).unwrap();
+    assert_eq!(
+        rounds(&drain(&mut node)),
+        vec![(2, b"again".to_vec()), (3, b"again".to_vec())]
+    );
+    // Member 2's answer to round 1 arrives late: it was given before either was asked.
+    let mut late = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    late.context = round_answer(b"again", 1);
+    node.step(late).unwrap();
+    assert_eq!(node.raft.pending_read_count(), 2);
+    assert!(confirmed(&mut node).is_empty());
+    let mut answer2 = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    answer2.context = round_answer(b"again", 2);
+    node.step(answer2).unwrap();
+    assert_eq!(
+        confirmed(&mut node),
+        vec![b"after".to_vec(), b"again".to_vec()]
     );
 }
 
@@ -742,7 +792,7 @@ fn a_round_that_was_lost_is_asked_again_by_the_leaders_clock() {
         vec![(2, b"lost".to_vec()), (3, b"lost".to_vec())]
     );
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 3, 1, 1);
-    heartbeat.context = b"lost".to_vec();
+    heartbeat.context = round_answer(b"lost", 1);
     node.step(heartbeat).unwrap();
     assert_eq!(confirmed(&mut node), vec![b"lost".to_vec()]);
     // Deposed with a read asked and its round unsent.
@@ -1138,7 +1188,7 @@ fn a_leader_holds_uncommitted_what_it_may_and_one_proposal_at_least() {
     assert_eq!(node.raft.uncommitted_bytes(), 200);
     assert_eq!(
         node.propose(vec![], vec![2; 1]),
-        Err(Error::ProposalDropped)
+        Err(Error::ProposalDropped(crate::Dropped::Uncommitted))
     );
     drain(&mut node);
     let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
@@ -1150,7 +1200,7 @@ fn a_leader_holds_uncommitted_what_it_may_and_one_proposal_at_least() {
     node.propose(vec![], vec![3; 24]).unwrap();
     assert_eq!(
         node.propose(vec![], vec![4; 1]),
-        Err(Error::ProposalDropped)
+        Err(Error::ProposalDropped(crate::Dropped::Uncommitted))
     );
 }
 
@@ -1644,7 +1694,10 @@ fn a_change_that_cannot_be_read_is_not_proposed() {
         ..Message::default()
     };
     proposal.entries = vec![garbled];
-    assert_eq!(node.step(proposal), Err(Error::ProposalDropped));
+    assert_eq!(
+        node.step(proposal),
+        Err(Error::ProposalDropped(crate::Dropped::Malformed))
+    );
     assert_eq!(node.raft.log().last_index().unwrap(), 1);
 }
 
@@ -1769,8 +1822,12 @@ fn one_told_to_campaign_while_it_asks_whether_it_could_does() {
     assert!(drain(&mut node).is_empty());
 }
 
+/// A member counts by the newest configuration its log holds, applied or not (`docs/raft.md`
+/// §3.5): told to campaign while a change that removed its leader is in its log, committed and
+/// not applied, or not committed at all, it campaigns at once and asks only the voters the change
+/// left. What its owner is told stays what the owner applied.
 #[test]
-fn one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has() {
+fn one_told_to_campaign_counts_by_the_change_its_log_holds_applied_or_not() {
     use crate::proto::ConfChangeType;
     use crate::wire::Record;
     let change = ConfChangeV2 {
@@ -1787,46 +1844,33 @@ fn one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has() {
         data: change.encode_to_vec(),
         ..Entry::default()
     };
-    let told = |heard: Option<MessageType>| {
+    for commit in [3, 4] {
         let mut node = follower();
         let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
         append.index = 3;
         append.log_term = 1;
-        append.commit = 4;
+        append.commit = commit;
         append.entries = vec![removal.clone()];
         node.step(append).unwrap();
-        // Committed, and not applied: the owner has not taken it yet.
+        assert_eq!(node.raft.configuration().voters(), [2, 3]);
+        assert_eq!(node.raft.applied_configuration().voters(), [1, 2, 3]);
+        drain(&mut node);
         node.step(answer(MessageType::MsgTimeoutNow, 1, 2, 1))
             .unwrap();
-        assert_eq!(node.raft.state(), StateRole::Follower);
-        if let Some(kind) = heard {
-            node.step(answer(kind, 1, 2, 1)).unwrap();
-        }
-        let mut ready = node.ready().unwrap();
-        let entries = ready.entries().to_vec();
-        node.store_mut().append(&entries);
-        let committed = ready.take_committed_entries();
-        assert_eq!(committed.last().map(|entry| entry.index), Some(3));
-        let mut light = node.advance_append(ready).unwrap();
-        let committed = light.take_committed_entries();
-        assert_eq!(committed.len(), 1);
-        node.apply_conf_change(&change).unwrap();
-        node.advance_apply_to(4).unwrap();
-        node
-    };
-    let mut node = told(None);
-    assert_eq!(node.raft.state(), StateRole::Candidate);
-    assert_eq!(node.raft.term(), 2);
-    let asked = drain(&mut node);
-    // The one that left is not asked, and no lease refuses the others.
-    assert_eq!(asked.len(), 1);
-    assert_eq!(asked[0].to, 3);
-    assert_eq!(asked[0].context, proto::CAMPAIGN_TRANSFER);
-    // One that heard of a leader since does not.
-    for heard in [MessageType::MsgHeartbeat, MessageType::MsgAppend] {
-        let node = told(Some(heard));
-        assert_eq!(node.raft.state(), StateRole::Follower);
-        assert_eq!(node.raft.term(), 1);
+        assert_eq!(
+            (node.raft.state(), node.raft.term()),
+            (StateRole::Candidate, 2),
+            "commit {commit}"
+        );
+        let asked = drain(&mut node);
+        // The one that left is not asked.
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].to, 3);
+        assert_eq!(asked[0].context, proto::CAMPAIGN_TRANSFER);
+        // The owner is told what it applies.
+        let stated = node.apply_conf_change(&change).unwrap();
+        assert_eq!(stated.voters, vec![2, 3]);
+        assert_eq!(node.raft.applied_configuration().voters(), [2, 3]);
     }
 }
 
@@ -1914,7 +1958,7 @@ fn a_read_asked_by_two_members_under_one_context_answers_both() {
     assert_eq!(node.raft.pending_read_count(), 1);
     drain(&mut node);
     let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
-    heartbeat.context = b"same".to_vec();
+    heartbeat.context = round_answer(b"same", 1);
     node.step(heartbeat).unwrap();
     // The quorum confirms the read once, and each asker is answered.
     let answers: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
@@ -2449,12 +2493,12 @@ fn the_most_central_survivor_wins_its_first_campaign() {
     assert_eq!(campaigns, vec![(2 * election - 1, 2)]);
 }
 
-/// A member whose timeout runs out while a change it committed is not yet applied does not campaign
-/// on the configuration before it (`Raft::hup`), and it has not heard its leader for an election
-/// timeout: it holds no lease, and grants a voter that campaigns. An owner whose commit fence holds
-/// the change (`RawNode::pause_apply`, `docs/durable.md` §4.1) makes this common at a leader's loss.
+/// A member whose timeout runs out while a change it committed is not yet applied campaigns on
+/// the configuration its log holds (`docs/raft.md` §3.4): an owner whose commit fence holds the
+/// change (`RawNode::pause_apply`, `docs/durable.md` §4.1) no longer holds its member's campaign
+/// back at a leader's loss.
 #[test]
-fn a_member_whose_campaign_waits_for_a_change_holds_no_lease() {
+fn a_member_whose_owner_holds_a_change_campaigns_by_it() {
     let mut nodes = led_three([0, 0, 0]);
     let election = nodes[1].raft.config().election_tick;
     // Member 3's owner holds what it is given to apply; a change is committed everywhere.
@@ -2473,7 +2517,8 @@ fn a_member_whose_campaign_waits_for_a_change_holds_no_lease() {
     let committed = nodes[0].raft.log().committed();
     assert_eq!(nodes[2].raft.log().committed(), committed);
     assert!(nodes[2].raft.log().applied() < committed);
-    // 1 is gone. 3 runs out first and waits for the change; 2 runs out later and campaigns.
+    assert!(nodes[2].raft.configuration().learners().contains(&4));
+    // 1 is gone. 3 runs out first and campaigns; 2 runs out later.
     nodes[2]
         .raft
         .set_randomized_election_timeout(election)
@@ -2489,13 +2534,12 @@ fn a_member_whose_campaign_waits_for_a_change_holds_no_lease() {
                 .into_iter()
                 .map(|id| (tick, id)),
         );
-        if nodes[1].raft.state() == StateRole::Leader {
+        if nodes[2].raft.state() == StateRole::Leader {
             break;
         }
     }
-    assert_eq!(nodes[2].raft.state(), StateRole::Follower);
-    assert_eq!(nodes[1].raft.state(), StateRole::Leader, "{campaigns:?}");
-    assert_eq!(campaigns, vec![(election + election / 2, 2)]);
+    assert_eq!(nodes[2].raft.state(), StateRole::Leader, "{campaigns:?}");
+    assert_eq!(campaigns, vec![(election, 3)]);
 }
 
 /// The lease still holds where the thesis says it does: a member that heard its leader within the
@@ -3879,8 +3923,9 @@ fn rounds_to_commit_after_a_loss(staged: bool) -> u64 {
     nodes[0]
         .propose_conf_change(vec![], &single(ConfChangeType::AddNode, 4))
         .unwrap();
-    // Rounds among all four until the change commits, which the voters before it, 1, 2 and 3,
-    // commit without 4; then until all the leader holds is committed, as slates' test runs them.
+    let change = nodes[0].raft.log().last_index().unwrap();
+    // Rounds among all four until the change commits, which three of 1 to 4 commit without 4;
+    // then until all the leader holds is committed, as slates' test runs them.
     for until in [false, true] {
         let mut rounds = 0;
         loop {
@@ -3889,7 +3934,7 @@ fn rounds_to_commit_after_a_loss(staged: bool) -> u64 {
             let done = if until {
                 committed == held
             } else {
-                nodes[0].raft.configuration().votes(4)
+                committed >= change
             };
             if done {
                 break;
@@ -3919,8 +3964,10 @@ fn rounds_to_commit_after_a_loss(staged: bool) -> u64 {
 /// Figure 4.4(a): voters 1, 2 and 3 hold forty entries, member 4 joins with an empty log and the
 /// voters become 1 to 4, then 3 fails. A round here carries messages one way, so a round trip is
 /// two, where slates' round was one, its reply taken at once. Added directly, 4 leaves the group
-/// unable to commit for 45 rounds while it catches up, two entries an append and one out at a time
-/// (slates: 21 round trips); staged first as a learner and promoted once caught up, the group
+/// unable to commit for 44 rounds while it catches up, two entries an append and one out at a time
+/// (slates: 21 round trips). The leader sends to 4 from the moment the change is in its log, as
+/// slates' does, where it once waited until it applied the change: one round fewer (`docs/raft.md`
+/// §3.5). Staged first as a learner and promoted once caught up, the group
 /// commits in the first round trip after the loss (slates: one). Exact: the schedule is fixed.
 #[test]
 fn a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does() {
@@ -3931,7 +3978,650 @@ fn a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does() {
         "one round trip: the staged newcomer held the log already"
     );
     assert_eq!(
-        direct, 45,
+        direct, 44,
         "the direct newcomer's catch-up held commits back"
     );
+}
+
+// The configuration a member counts by is the newest its log holds (`docs/raft.md` §3.4).
+
+/// A change of the configuration as an entry at `index` of `term`.
+fn change_entry(index: u64, term: u64, change: &ConfChangeV2) -> Entry {
+    use crate::wire::Record;
+    Entry {
+        entry_type: EntryType::EntryConfChangeV2,
+        index,
+        term,
+        data: change.encode_to_vec(),
+        ..Entry::default()
+    }
+}
+
+/// A sole voter, elected alone.
+fn sole_leader() -> RawNode<Memory> {
+    let mut node = RawNode::new(&config(1), Memory::with_voters(&[1])).unwrap();
+    node.campaign().unwrap();
+    drain_applying(&mut node);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    node
+}
+
+/// A sole voter that adds a voter counts by both from the entry on: it commits neither the entry
+/// nor anything after it alone, whether the change is of one voter or enters a joint
+/// configuration. Counted by the configuration it had applied, it committed the entry alone, while
+/// the voter it added counted elections by both (raft-dev, 2015; `docs/research/reconfiguration.md`).
+#[test]
+fn a_sole_voter_does_not_commit_past_a_voter_it_adds_alone() {
+    use crate::proto::{ConfChangeTransition, ConfChangeType};
+    for transition in [ConfChangeTransition::Auto, ConfChangeTransition::Explicit] {
+        let mut node = sole_leader();
+        let committed = node.raft.log().committed();
+        let change = ConfChangeV2 {
+            transition,
+            ..single(ConfChangeType::AddNode, 2)
+        };
+        node.propose_conf_change(vec![], &change).unwrap();
+        let at = node.raft.log().last_index().unwrap();
+        node.propose(vec![], b"after".to_vec()).unwrap();
+        drain_applying(&mut node);
+        assert_eq!(node.raft.log().committed(), committed, "{transition:?}");
+        assert!(node.raft.log().committed() < at);
+        assert_eq!(node.raft.configuration().voters(), [1, 2], "{transition:?}");
+        // What the owner was told is what it applied: nothing yet.
+        assert_eq!(node.raft.applied_configuration().voters(), [1]);
+    }
+}
+
+/// An append that replaces the entry of a change takes the configuration back to the one before it
+/// (Ongaro's thesis §4.1: a server uses the latest configuration in its log, "whether or not the
+/// entry is committed", and falls back when the entry is removed).
+#[test]
+fn an_append_that_replaces_a_change_takes_the_configuration_back() {
+    use crate::proto::ConfChangeType;
+    let mut node = follower();
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+    append.index = 3;
+    append.log_term = 1;
+    append.commit = 2;
+    append.entries = vec![change_entry(4, 1, &single(ConfChangeType::RemoveNode, 3))];
+    node.step(append).unwrap();
+    assert_eq!(node.raft.configuration().voters(), [1, 2]);
+    // The leader of term 2 holds another entry at index 4.
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 2);
+    append.index = 3;
+    append.log_term = 1;
+    append.commit = 2;
+    append.entries = vec![entry(4, 2)];
+    node.step(append).unwrap();
+    assert_eq!(node.raft.log().last_index().unwrap(), 4);
+    assert_eq!(node.raft.configuration().voters(), [1, 2, 3]);
+    assert_eq!(node.raft.applied_configuration().voters(), [1, 2, 3]);
+}
+
+/// A joint configuration that leaves by itself is left once its entry is committed: the leader
+/// writes the entry that leaves then, whether or not its owner has applied the joint one.
+#[test]
+fn a_joint_configuration_that_leaves_by_itself_is_left_once_its_entry_commits() {
+    use crate::proto::{ConfChangeTransition, ConfChangeType};
+    let mut nodes = led_three([0, 0, 0]);
+    nodes[0].pause_apply();
+    let change = ConfChangeV2 {
+        transition: ConfChangeTransition::Auto,
+        changes: vec![
+            ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode,
+                node_id: 3,
+            },
+            ConfChangeSingle {
+                change_type: ConfChangeType::AddLearnerNode,
+                node_id: 3,
+            },
+        ],
+        ..ConfChangeV2::default()
+    };
+    nodes[0].propose_conf_change(vec![], &change).unwrap();
+    let joint = nodes[0].raft.log().last_index().unwrap();
+    assert!(nodes[0].raft.configuration().is_joint());
+    exchange(&mut nodes, &[1, 2, 3]);
+    assert!(nodes[0].raft.log().committed() >= joint);
+    assert!(nodes[0].raft.log().applied() < joint);
+    let leave = joint + 1;
+    let written = nodes[0]
+        .raft
+        .log()
+        .slice(leave, leave + 1, u64::MAX)
+        .unwrap()
+        .remove(0);
+    assert_eq!(written.entry_type, EntryType::EntryConfChangeV2);
+    assert!(
+        written.data.is_empty(),
+        "the entry that leaves states nothing"
+    );
+    assert!(!nodes[0].raft.configuration().is_joint());
+    assert_eq!(nodes[0].raft.configuration().voters(), [1, 2]);
+}
+
+/// A leader whose newest configuration names one voter, another member, answers no read alone: it
+/// leads until that configuration is committed, and the one voter may have been elected and
+/// committed since (seed 47 of the hostile schedules answered a read below a commit made there).
+#[test]
+fn a_leader_the_newest_configuration_leaves_out_answers_no_read_alone() {
+    use crate::proto::ConfChangeType;
+    // A leader of {1, 2} that writes {2}: the one voter is another member.
+    let mut node = RawNode::new(&config(1), Memory::with_voters(&[1, 2])).unwrap();
+    node.campaign().unwrap();
+    let mut asked = drain(&mut node);
+    for message in asked.drain(..) {
+        if message.msg_type == MessageType::MsgRequestPreVote {
+            node.step(answer(
+                MessageType::MsgRequestPreVoteResponse,
+                2,
+                1,
+                message.term,
+            ))
+            .unwrap();
+        }
+    }
+    for message in drain(&mut node) {
+        if message.msg_type == MessageType::MsgRequestVote {
+            node.step(answer(
+                MessageType::MsgRequestVoteResponse,
+                2,
+                1,
+                message.term,
+            ))
+            .unwrap();
+        }
+    }
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    // Its first entry is committed with member 2.
+    let first = node.raft.log().last_index().unwrap();
+    drain(&mut node);
+    let mut ack = answer(MessageType::MsgAppendResponse, 2, 1, node.raft.term());
+    ack.index = first;
+    node.step(ack).unwrap();
+    drain(&mut node);
+    assert!(node.raft.commit_to_current_term());
+    node.propose_conf_change(vec![], &single(ConfChangeType::RemoveNode, 1))
+        .unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.configuration().voters(), [2]);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    node.read_index(b"read".to_vec()).unwrap();
+    let ready = node.ready().unwrap();
+    assert!(ready.read_states().is_empty(), "answered alone");
+}
+
+/// A member a change adds takes a snapshot that does not name it: the change counts it from its
+/// entry on, and the snapshot that seeds it may be older than the entry (a server processes what a
+/// leader of its term sends without consulting its configuration, Ongaro's thesis §4.1).
+#[test]
+fn a_member_a_change_adds_takes_a_snapshot_older_than_the_change() {
+    let mut node = RawNode::new(&config(4), Memory::with_voters(&[1, 2, 3])).unwrap();
+    let mut seeded = answer(MessageType::MsgSnapshot, 1, 4, 1);
+    seeded.snapshot = Some(Box::new(snapshot(5, 1, &[1, 2, 3])));
+    node.step(seeded).unwrap();
+    assert_eq!(node.raft.log().last_index().unwrap(), 5);
+    assert_eq!(node.raft.log().committed(), 5);
+    assert_eq!(node.raft.configuration().voters(), [1, 2, 3]);
+}
+
+/// A voter of the configuration before an uncommitted change that leaves it out may still be
+/// needed: it campaigns, its own vote counting nowhere, and is elected by the voters the change
+/// names (Ongaro's thesis §4.2.2). Seed 11 of the group schedules: the leader of a joint
+/// configuration wrote the entry that leaves it and was lost; the members holding that entry were
+/// voters of no configuration they counted by, and the one voter they named lacked the entry and
+/// needed their votes, which its shorter log was refused: no member could be elected.
+#[test]
+fn a_voter_the_uncommitted_change_leaves_out_campaigns_and_is_elected_by_the_voters_it_names() {
+    use crate::proto::ConfChangeType;
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    store.append(&[entry(1, 1), entry(2, 1)]);
+    store.append(&[change_entry(3, 1, &single(ConfChangeType::RemoveNode, 1))]);
+    store.hard_state = HardState {
+        term: 1,
+        vote: 0,
+        commit: 2,
+    };
+    let mut node = RawNode::new(&config(1), store).unwrap();
+    assert_eq!(node.raft.configuration().voters(), [2, 3]);
+    assert!(node.raft.promotable());
+    node.campaign().unwrap();
+    let asked: Vec<u64> = drain(&mut node)
+        .into_iter()
+        .filter(|message| message.msg_type == MessageType::MsgRequestPreVote)
+        .map(|message| message.to)
+        .collect();
+    assert_eq!(asked, vec![2, 3]);
+    node.step(answer(MessageType::MsgRequestPreVoteResponse, 2, 1, 2))
+        .unwrap();
+    assert_eq!(
+        node.raft.state(),
+        StateRole::PreCandidate,
+        "its own vote counts nowhere"
+    );
+    node.step(answer(MessageType::MsgRequestPreVoteResponse, 3, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Candidate);
+    drain(&mut node);
+    node.step(answer(MessageType::MsgRequestVoteResponse, 2, 1, 2))
+        .unwrap();
+    node.step(answer(MessageType::MsgRequestVoteResponse, 3, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    // Once the change is known committed, it is needed no more.
+    let mut follower = RawNode::new(&config(1), {
+        let mut store = Memory::with_voters(&[1, 2, 3]);
+        store.append(&[entry(1, 1), entry(2, 1)]);
+        store.append(&[change_entry(3, 1, &single(ConfChangeType::RemoveNode, 1))]);
+        store.hard_state = HardState {
+            term: 1,
+            vote: 0,
+            commit: 3,
+        };
+        store
+    })
+    .unwrap();
+    assert!(!follower.raft.promotable());
+    assert_eq!(follower.campaign(), Err(Error::NotPromotable));
+}
+
+/// The Reconfig model's shortest history for elections by the newest configuration and commitment
+/// by the one applied (`docs/research/reconfiguration.md` §3, option (a)), on the core: 1 to 3 are
+/// the voters, B (member 2) leads and writes the joint configuration that replaces A (member 1) by
+/// D (member 4). Counted by what it applied, B committed the joint entry by A's acknowledgement;
+/// A, elected by C and D under the joint configuration, then committed its own first entry by C's,
+/// and B, back with the configuration that leaves A, was elected by D without it. The core counts
+/// both commits by the joint configuration: neither is made.
+#[test]
+fn a_commit_counted_by_the_configuration_applied_is_not_made() {
+    use crate::proto::{ConfChangeTransition, ConfChangeType};
+    let mut nodes: Vec<RawNode<Memory>> = (1..=4)
+        .map(|id| RawNode::new(&config(id), Memory::with_voters(&[1, 2, 3])).unwrap())
+        .collect();
+    nodes[1].campaign().unwrap();
+    exchange(&mut nodes, &[1, 2]);
+    assert_eq!(nodes[1].raft.state(), StateRole::Leader);
+    let change = ConfChangeV2 {
+        transition: ConfChangeTransition::Auto,
+        changes: vec![
+            ConfChangeSingle {
+                change_type: ConfChangeType::AddNode,
+                node_id: 4,
+            },
+            ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode,
+                node_id: 1,
+            },
+        ],
+        ..ConfChangeV2::default()
+    };
+    nodes[1].propose_conf_change(vec![], &change).unwrap();
+    let joint = nodes[1].raft.log().last_index().unwrap();
+    exchange(&mut nodes, &[1, 2]);
+    assert_eq!(nodes[0].raft.log().last_index().unwrap(), joint);
+    assert!(
+        nodes[1].raft.log().committed() < joint,
+        "the joint entry committed by A and B, a majority of the voters before it alone"
+    );
+    // A, holding the joint entry, is elected by C and D, and its first entry reaches C alone.
+    nodes[0].campaign().unwrap();
+    for _ in 0..4 {
+        one_round(&mut nodes, &[1, 3, 4]);
+    }
+    assert_eq!(nodes[0].raft.state(), StateRole::Leader);
+    let first = nodes[0].raft.log().last_index().unwrap();
+    assert!(first > joint);
+    exchange(&mut nodes, &[1, 3]);
+    assert!(
+        nodes[0].raft.log().committed() < first,
+        "A's first entry committed by A and C, a majority of the voters before the change alone"
+    );
+}
+
+/// A proposal dropped says why (`Dropped`): one with no entry, or whose change does not decode, is
+/// the caller's bug; one a member cannot take now is to retry or redirect: a follower that knows no
+/// leader, a candidate, a leader handing over, a leader the configuration it leads names no member,
+/// a leader at its bound of what it holds uncommitted (`a_leader_holds_uncommitted_what_it_may_and_one_proposal_at_least`,
+/// `a_change_that_cannot_be_read_is_not_proposed`).
+#[test]
+fn a_dropped_proposal_says_why() {
+    use crate::Dropped;
+    use crate::proto::ConfChangeType;
+    // No entry.
+    let mut node = leader();
+    let empty = Message {
+        msg_type: MessageType::MsgPropose,
+        from: 1,
+        to: 1,
+        ..Message::default()
+    };
+    assert_eq!(
+        node.step(empty),
+        Err(Error::ProposalDropped(Dropped::Empty))
+    );
+    assert!(Dropped::Empty.is_callers_bug() && Dropped::Malformed.is_callers_bug());
+    // A follower that knows no leader.
+    let mut alone = RawNode::new(&config(2), Memory::with_voters(&[1, 2, 3])).unwrap();
+    assert_eq!(
+        alone.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NoLeader))
+    );
+    // A candidate.
+    let mut candidate = RawNode::new(&config(1), Memory::with_voters(&[1, 2, 3])).unwrap();
+    candidate.campaign().unwrap();
+    assert_eq!(candidate.raft.state(), StateRole::PreCandidate);
+    assert_eq!(
+        candidate.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NoLeader))
+    );
+    // A leader handing over.
+    let mut handing = reading_leader();
+    handing
+        .step(answer(MessageType::MsgTransferLeader, 3, 1, 1))
+        .unwrap();
+    assert_eq!(
+        handing.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::Transferring))
+    );
+    // A leader that wrote its own removal leads until it is committed, and takes no proposal.
+    let mut leaving = reading_leader();
+    leaving
+        .propose_conf_change(vec![], &single(ConfChangeType::RemoveNode, 1))
+        .unwrap();
+    assert!(!leaving.raft.configuration().contains(1));
+    assert_eq!(
+        leaving.propose(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NotMember))
+    );
+    // The fast track's: no data, and a member that knows no leader to propose by.
+    let fast = Config {
+        fast: true,
+        ..config(2)
+    };
+    let mut proposer = RawNode::new(&fast, Memory::with_voters(&[1, 2, 3])).unwrap();
+    assert_eq!(
+        proposer.propose_fast(vec![], vec![]),
+        Err(Error::ProposalDropped(Dropped::Empty))
+    );
+    assert_eq!(
+        proposer.propose_fast(vec![], b"x".to_vec()),
+        Err(Error::ProposalDropped(Dropped::NoLeader))
+    );
+    for reason in [
+        Dropped::NoLeader,
+        Dropped::Transferring,
+        Dropped::NotMember,
+        Dropped::Uncommitted,
+    ] {
+        assert!(!reason.is_callers_bug(), "{reason:?}");
+    }
+}
+
+/// Member 2 of the highest priority holds three entries of term 1; member 3, of lower priority,
+/// asks with two entries of term 2. By the log's precedence the voter grants: it could not be
+/// elected instead. By raft-rs's (the tests' build alone) it refuses the shorter log, the refusal
+/// that left swarm group seed 9,657 without a leader with every member up (`docs/raft.md` §3.3).
+#[test]
+fn a_voter_of_higher_priority_grants_a_log_more_current_however_short() {
+    fn asked(raft_rs_precedence: bool) -> Message {
+        let mut node = follower_with(Config {
+            priority: 3,
+            raft_rs_precedence,
+            ..config(2)
+        });
+        let mut ask = answer(MessageType::MsgRequestVote, 3, 2, 3);
+        ask.log_term = 2;
+        ask.index = 2;
+        ask.priority = 1;
+        node.step(ask).unwrap();
+        let mut answers: Vec<Message> = drain(&mut node)
+            .into_iter()
+            .filter(|message| message.msg_type == MessageType::MsgRequestVoteResponse)
+            .collect();
+        assert_eq!(answers.len(), 1);
+        answers.remove(0)
+    }
+    assert!(!asked(false).reject);
+    assert!(asked(true).reject);
+}
+
+/// `RawNode::defer_commit` (`docs/durable.md` §4.1). Do: a follower takes an append of no
+/// entries that moves its commit, defers that `Ready`'s commit, then takes an append with an entry,
+/// and separately defers after taking a `Ready`'s messages. Expect: the deferred `Ready` gives no
+/// hard state, its answer states no commit past the durable one, and its write vouches for none;
+/// the next `Ready` with an entry must sync, is not deferred, and states the commit; a deferral
+/// after the messages were taken is refused.
+#[test]
+fn a_deferred_commit_vouches_for_nothing_and_its_answers_state_the_durable_commit() {
+    let mut node = follower();
+    drain(&mut node);
+    let durable = node.durable_commit();
+    assert_eq!(durable, 2);
+    let append = |index: u64, entries: Vec<Entry>, commit: u64| Message {
+        index,
+        log_term: 1,
+        entries,
+        commit,
+        ..answer(MessageType::MsgAppend, 1, 2, 1)
+    };
+    node.step(append(3, Vec::new(), 3)).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(!ready.must_sync());
+    assert_eq!(ready.hard_state().map(|hard| hard.commit), Some(3));
+    assert!(node.defer_commit(&mut ready).unwrap());
+    assert!(ready.hard_state().is_none());
+    let answers = ready.take_persisted_messages();
+    assert!(
+        answers
+            .iter()
+            .any(|m| m.msg_type == MessageType::MsgAppendResponse)
+    );
+    for m in &answers {
+        assert!(
+            m.commit <= durable,
+            "{m:?} states commit {} with {durable} durable",
+            m.commit
+        );
+    }
+    // The commit comes back as the notice's: the owner writes it with what it writes next.
+    let light = node.advance_append(ready).unwrap();
+    assert_eq!(light.commit_index(), Some(3));
+    assert_eq!(
+        node.durable_commit(),
+        durable,
+        "a deferred write vouched for a commit"
+    );
+    // The next `Ready` holding an entry must sync and is never deferred; the owner states the
+    // commit in its write and says so once it is durable.
+    node.step(append(3, vec![entry(4, 1)], 3)).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(ready.must_sync());
+    assert!(!node.defer_commit(&mut ready).unwrap());
+    node.store_mut().append(ready.entries());
+    node.store_mut().hard_state.commit = 3;
+    node.advance_append(ready).unwrap();
+    node.commit_durable(3).unwrap();
+    assert_eq!(node.durable_commit(), 3);
+    // Deferred once its messages were taken: refused, nothing deferred.
+    node.step(append(4, Vec::new(), 4)).unwrap();
+    let mut ready = node.ready().unwrap();
+    ready.take_persisted_messages();
+    assert!(matches!(
+        node.defer_commit(&mut ready),
+        Err(Error::Invariant(_))
+    ));
+    assert!(ready.hard_state().is_some());
+}
+
+// A leader's quorum patience (`docs/raft.md` §3.6): ticks beyond its election timeout before it
+// asks whether a quorum heard it.
+
+/// Ticks `node` `n` times, taking what each tick sends.
+fn ticked(node: &mut RawNode<Memory>, n: usize) {
+    for _ in 0..n {
+        node.tick().unwrap();
+        drain(node);
+    }
+}
+
+/// With no quorum patience a leader that hears from no one steps down at its election timeout,
+/// exactly as before the check had a counter of its own.
+#[test]
+fn a_leader_of_no_quorum_patience_checks_at_its_election_timeout() {
+    let mut node = leader();
+    assert_eq!(node.raft.quorum_patience(), 0);
+    ticked(&mut node, 9);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.term, 1, "a step-down is no new term");
+}
+
+/// Followers that answer late, past the election timeout and within the patience, keep the
+/// leader its term; a window in which none answers deposes it at the window's end.
+#[test]
+fn a_leader_whose_followers_answer_within_its_quorum_patience_keeps_its_term() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(10).unwrap();
+    ticked(&mut node, 15);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Leader,
+        "past the election timeout"
+    );
+    node.step(answer(MessageType::MsgHeartbeatResponse, 2, 1, 1))
+        .unwrap();
+    drain(&mut node);
+    ticked(&mut node, 5);
+    assert_eq!(node.raft.state(), StateRole::Leader, "its quorum heard it");
+    ticked(&mut node, 19);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Follower,
+        "a window none answered in"
+    );
+}
+
+/// The check judges every follower heard at any point in its window: one heard once, early in
+/// a long window, still counts at the window's end.
+#[test]
+fn a_follower_heard_early_in_a_long_window_counts_at_its_end() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(30).unwrap();
+    ticked(&mut node, 1);
+    node.step(answer(MessageType::MsgHeartbeatResponse, 3, 1, 1))
+        .unwrap();
+    drain(&mut node);
+    ticked(&mut node, 39);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Leader,
+        "heard at tick 1 of 40"
+    );
+    ticked(&mut node, 39);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Follower,
+        "heard in no window since"
+    );
+}
+
+/// Past its patience a leader none answered steps down.
+#[test]
+fn a_leader_unheard_past_its_quorum_patience_steps_down() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(5).unwrap();
+    ticked(&mut node, 14);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    ticked(&mut node, 1);
+    assert_eq!(node.raft.state(), StateRole::Follower);
+}
+
+/// A transfer that does not finish is given up at the election timeout, whatever the quorum
+/// patience: the two deadlines have their own counters.
+#[test]
+fn a_transfer_is_given_up_at_the_election_timeout_whatever_the_quorum_patience() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(20).unwrap();
+    node.transfer_leader(2).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.lead_transferee(), Some(2));
+    ticked(&mut node, 9);
+    assert_eq!(node.raft.lead_transferee(), Some(2));
+    ticked(&mut node, 1);
+    assert_eq!(
+        node.raft.lead_transferee(),
+        None,
+        "given up at the election timeout"
+    );
+    assert_eq!(
+        node.raft.state(),
+        StateRole::Leader,
+        "its quorum check is later"
+    );
+}
+
+/// The followers' side is untouched: while a patient old leader still believes it leads, the
+/// others may elect another. It commits nothing in that window, having no quorum, and steps down
+/// at the first newer term it hears.
+#[test]
+fn a_patient_leader_commits_nothing_alone_and_yields_to_a_newer_term() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(50).unwrap();
+    let committed = node.raft.log().committed();
+    node.propose(vec![], b"alone".to_vec()).unwrap();
+    drain(&mut node);
+    ticked(&mut node, 20);
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    assert_eq!(
+        node.raft.log().committed(),
+        committed,
+        "no quorum, no commit"
+    );
+    node.step(answer(MessageType::MsgHeartbeat, 2, 1, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Follower);
+    assert_eq!(node.raft.term, 2);
+    assert_eq!(node.raft.log().committed(), committed);
+}
+
+/// A patience the election timeout and it overflow is refused, typed, and the one in force
+/// stays.
+#[test]
+fn a_quorum_patience_past_what_a_tick_counts_is_refused() {
+    let mut node = leader();
+    node.raft.set_quorum_patience(7).unwrap();
+    assert!(matches!(
+        node.raft.set_quorum_patience(usize::MAX),
+        Err(Error::Settings(_))
+    ));
+    assert_eq!(node.raft.quorum_patience(), 7);
+    let most = usize::MAX - node.raft.config.election_tick;
+    node.raft.set_quorum_patience(most).unwrap();
+    assert_eq!(node.raft.quorum_patience(), most);
+}
+
+/// Under elections by suspicion, which take no ticks and whose detectors depose, a quorum patience
+/// is kept and changes nothing: a tick is still refused.
+#[test]
+fn under_elections_by_suspicion_a_quorum_patience_changes_nothing() {
+    let suspicion = Config {
+        elections: crate::Elections::Suspicion,
+        ..config(2)
+    };
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    store.hard_state = HardState {
+        term: 1,
+        vote: 1,
+        commit: 0,
+    };
+    let mut node = RawNode::new(&suspicion, store).unwrap();
+    node.raft.set_quorum_patience(9).unwrap();
+    assert_eq!(node.raft.quorum_patience(), 9);
+    assert!(matches!(node.tick(), Err(Error::Settings(_))));
 }

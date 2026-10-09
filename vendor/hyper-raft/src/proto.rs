@@ -161,6 +161,12 @@ pub struct Message {
     pub context: Vec<u8>,
     /// The sender's election priority.
     pub priority: i64,
+    /// On a leader's append, heartbeat or snapshot: the index through which it knows its log
+    /// committed by a classic quorum, which every later leader's log holds (`docs/raft.md`,
+    /// "Releasing what a member holds"). A member releases what it holds by itself only through
+    /// it. `None` from a sender that does not say, which a member takes as nothing known: never
+    /// the commit, which counts what fast quorums committed.
+    pub classic: Option<u64>,
 }
 
 /// What a member must keep across a restart.
@@ -257,10 +263,6 @@ use crate::{
 /// other's.
 pub const CAMPAIGN_TRANSFER: &[u8] = b"CampaignTransfer";
 
-/// Whether the entry changes the configuration, by either encoding.
-pub fn changes_configuration(entry: &Entry) -> bool {
-    entry.entry_type != EntryType::EntryNormal
-}
 /// The bytes the entry takes in a message (`docs/raft.md` §3.1): what the core's byte bounds
 /// count, so a message's bytes are the sum of its entries' and its fixed part.
 pub fn encoded_bytes(entry: &Entry) -> u64 {
@@ -567,7 +569,6 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(Plan::of_entry(&entry), Err(Error::Violation(_))));
-        assert!(changes_configuration(&entry));
     }
     #[test]
     fn both_encodings_of_a_change_read_alike() {

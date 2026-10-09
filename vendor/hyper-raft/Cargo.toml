@@ -12,6 +12,9 @@ repository = "https://github.com/hyper-light/hyper-raft"
 # The planted defects of `src/mutant.rs`, for hyper-raft's tests that show its oracles catch them.
 # focal never enables it.
 mutants = []
+# raft-rs's precedence of length in elections, for hyper-raft's differential tests against raft-rs
+# (docs/raft.md §3.3). It can leave a group that could elect without a leader; focal never enables it.
+raft-rs-precedence = []
 
 [dependencies]
 crc32c = "0.6"

@@ -99,10 +99,8 @@ impl Member {
                 let disk = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
                 let node = DurableNode::open_on_shell(
                     self.config.clone(),
-                    self.dir.path(),
-                    &log,
+                    &crate::node_storage::test_shell(self.dir.path(), &log, disk),
                     &self.budget,
-                    disk,
                     no_needs,
                 )
                 .unwrap();
@@ -178,7 +176,7 @@ impl Seen {
 
     /// The first part the two differ in, named.
     fn difference(&self, other: &Self) -> Option<String> {
-        let parts: [(&str, String, String); 6] = [
+        let parts: [(&str, String, String); 7] = [
             (
                 "committed",
                 format!("{:?}", self.committed),
@@ -191,8 +189,13 @@ impl Seen {
             ),
             (
                 "messages",
-                format!("{:?}", self.messages),
-                format!("{:?}", other.messages),
+                format!("{:?}", answered(&self.messages)),
+                format!("{:?}", answered(&other.messages)),
+            ),
+            (
+                "answers' commit",
+                String::new(),
+                stated_past(&self.messages, &other.messages),
             ),
             (
                 "snapshots",
@@ -215,6 +218,43 @@ impl Seen {
             .find(|(_, log, shell)| log != shell)
             .map(|(part, log, shell)| format!("{part}: focal-log {log}, shell {shell}"))
     }
+}
+
+/// Whether `message` is a member's answer to its leader, which states the member's durable commit
+/// (core step R-6): to an append or to a heartbeat.
+fn answers(message: &Message) -> bool {
+    matches!(
+        message.msg_type,
+        MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+    )
+}
+
+/// `messages` with the commit a member's answer states set aside. On the shell a commit that moved
+/// alone is not written until a write that holds anything (hyper-raft durable.md §4.1, PR #2), and
+/// an answer states only the commit the member holds durably; focal-log writes the commit at once.
+/// A leader commits by what its members match, never by the commit they state, so the two differ
+/// only there, and [`stated_past`] holds the shell to the safe side of it.
+fn answered(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if answers(&message) {
+                message.commit = 0;
+            }
+            message
+        })
+        .collect()
+}
+
+/// The answers whose commit, on the shell, is past focal-log's for the same answer: none may be,
+/// since the shell states no more than it holds durably and focal-log holds its commit at once.
+fn stated_past(log: &[Message], shell: &[Message]) -> String {
+    log.iter()
+        .zip(shell)
+        .filter(|(log, shell)| answers(log) && shell.commit > log.commit)
+        .map(|(log, shell)| format!("shell {} past focal-log {}; ", shell.commit, log.commit))
+        .collect()
 }
 
 /// The same members on both backends, driven by one input stream.
@@ -312,6 +352,61 @@ impl Twin {
             node.last_index().map_err(|error| format!("{error:?}"))
         })
         .unwrap();
+    }
+
+    /// Converts member `at`'s focal-log directory to hyper-log and its group files (27 §15.8): the
+    /// conversion copies and verifies into a new directory, the shell twin is replaced by a member
+    /// opened on what it wrote, and the focal-log member restarts. From here the two must open alike
+    /// and agree round after round, as two backends driven from the same state.
+    fn convert(&mut self, at: usize) {
+        let log = &mut self.log[at];
+        log.node = None;
+        let options = focal_log::WalOptions::new(focal_log::WalIdentity {
+            cluster: log.config.cluster_id,
+            node: log.config.node_id,
+            stream: 0,
+        });
+        let wal = focal_log::SharedWal::open(log.dir.path(), options).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.log");
+        let align = Alignment::new(4096).unwrap();
+        let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).unwrap();
+        let new = Log::create(file, log_config(), LOG_ID).unwrap();
+        let copied = convert::copy_groups(
+            &wal,
+            dir.path(),
+            &new,
+            &log.budget,
+            &crate::group_files::test_seal(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(copied.groups, 1);
+        drop(new);
+        // Verified as a restart opens it.
+        let file = DeviceFile::open(&path, true, CachingRequest::PreferDirect, align).unwrap();
+        let (new, _) = Log::open(file, log_config(), LOG_ID).unwrap();
+        convert::verify(
+            &wal,
+            dir.path(),
+            &new,
+            &log.budget,
+            &crate::group_files::test_seal(dir.path()),
+        )
+        .unwrap();
+        drop(new);
+        drop(wal);
+        let shell = &mut self.shell[at];
+        shell.node = None;
+        shell.log = None;
+        shell.dir = dir;
+        shell.open();
+        self.log[at].open();
+        self.on(at, |node| format!("{:?}", node.scalars()));
+        self.on(at, |node| {
+            node.last_index().map_err(|error| format!("{error:?}"))
+        })
+        .unwrap();
+        self.on(at, |node| node.snapshot_index());
     }
 
     /// One tick on every member, then the round.
@@ -511,4 +606,50 @@ fn both_backends_checkpoint_a_captured_prefix_after_going_on() {
             .collect();
         assert!(after.is_empty(), "{backend:?}: {after:?}");
     }
+}
+
+/// 27 §15.8: a group converted from focal-log to the shell opens where focal-log reopens it, and
+/// the two keep agreeing. Do: elect, replicate, checkpoint one member, convert every member while
+/// the twins run, then propose, restart and propose again. Expect: every round alike, and each
+/// converted member opens to the scalars, last index and snapshot of its focal-log twin.
+#[test]
+fn a_converted_group_opens_where_focal_log_reopens_it() {
+    let mut twin = Twin::new(3);
+    twin.on(0, |node| node.campaign().map_err(|e| format!("{e:?}")))
+        .unwrap();
+    twin.pump();
+    for data in [b"one".as_slice(), b"two", b"three"] {
+        twin.on(0, |node| {
+            node.propose(data.to_vec()).map_err(|e| format!("{e:?}"))
+        })
+        .unwrap();
+        twin.pump();
+    }
+    let applied = twin.on(1, |node| node.status().applied_index);
+    twin.on(1, |node| {
+        node.checkpoint(applied, b"image".to_vec())
+            .map_err(|e| format!("{e:?}"))
+    })
+    .unwrap();
+    twin.pump();
+    for at in 0..3 {
+        twin.convert(at);
+        twin.pump();
+    }
+    // Every member restarted as it converted, a follower: the group elects again.
+    twin.on(0, |node| node.campaign().map_err(|e| format!("{e:?}")))
+        .unwrap();
+    twin.pump();
+    twin.on(0, |node| {
+        node.propose(b"four".to_vec()).map_err(|e| format!("{e:?}"))
+    })
+    .unwrap();
+    twin.pump();
+    twin.restart(1);
+    twin.pump();
+    twin.on(0, |node| {
+        node.propose(b"five".to_vec()).map_err(|e| format!("{e:?}"))
+    })
+    .unwrap();
+    twin.pump();
 }

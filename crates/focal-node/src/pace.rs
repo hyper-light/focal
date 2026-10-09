@@ -42,6 +42,12 @@ struct TickShared {
     /// wherever it was.
     stall_ns: AtomicU64,
     stall_seen_ns: AtomicU64,
+    /// The quorum's exchange tail with this group's other voters, in
+    /// nanoseconds, zero while not enough of them are measured
+    /// ([`quorum_tail`]): how late a commit's answers may come from
+    /// followers whose owners stall, which the owner's own periods do not
+    /// show (27 §8.4).
+    quorum_tail_ns: AtomicU64,
     /// The last derivation as one value, for observers.
     derived: Mutex<Option<focal_timing::TickPace>>,
 }
@@ -135,6 +141,31 @@ impl TickPeriod {
             .max(1);
         usize::try_from(stall.saturating_add(tail).div_ceil(period)).unwrap_or(usize::MAX)
     }
+    /// Put the quorum's exchange tail in force ([`quorum_tail`]); none
+    /// while not enough voters are measured.
+    pub(crate) fn publish_quorum_tail(&self, tail: Option<Duration>) {
+        let ns = tail.map_or(0, |tail| u64::try_from(tail.as_nanos()).unwrap_or(u64::MAX));
+        self.0.quorum_tail_ns.store(ns, Ordering::Relaxed);
+    }
+    /// The ticks the quorum's exchange tail takes, in periods of the pace
+    /// in force: what a leader's followers may answer beyond its own
+    /// periods. At most an election timeout at the tick ceiling, the
+    /// longest a dead leader goes unnoticed; zero while not enough voters
+    /// are measured. What a request waits for a commit is given these
+    /// beyond its time.
+    pub(crate) fn quorum_ticks(&self, configured: Duration, ceiling: Duration) -> usize {
+        let tail = self.0.quorum_tail_ns.load(Ordering::Relaxed);
+        if tail == 0 {
+            return 0;
+        }
+        let period = u64::try_from(self.get(configured, ceiling).as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let most = u64::try_from(ceiling.max(configured).as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(self.election_tick().max(1)).unwrap_or(u64::MAX));
+        usize::try_from(tail.min(most).div_ceil(period)).unwrap_or(usize::MAX)
+    }
     /// The period passed without a tick.
     pub(crate) fn refuse(&self) {
         self.0.refused.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +185,20 @@ impl TickPeriod {
         self.0.election_tick.load(Ordering::Relaxed)
     }
 }
+/// The exchange tail a commit waits on among a group of `voters` voters, this
+/// one among them, from the `tails` measured with the others: a commit
+/// needs a majority, this voter and the `voters / 2` others that answer
+/// first, so the tail is the `voters / 2`-th smallest. None where fewer of
+/// the others are measured, or where this voter is a majority alone: then
+/// nothing is known, or nothing waited on.
+pub(crate) fn quorum_tail(mut tails: Vec<Duration>, voters: usize) -> Option<Duration> {
+    let needed = voters.checked_div(2)?;
+    if needed == 0 {
+        return None;
+    }
+    tails.sort_unstable();
+    tails.get(needed.checked_sub(1)?).copied()
+}
 impl PartialEq for TickPeriod {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -166,5 +211,67 @@ impl std::fmt::Debug for TickPeriod {
             .debug_struct("TickPeriod")
             .field("derived", &self.derived())
             .finish()
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+mod quorum_tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A commit waits on the majority that answers first: of three voters
+    /// the faster other, of five the second fastest of four, of four the
+    /// second fastest of three (a majority of four is three).
+    #[test]
+    fn a_commit_waits_on_the_majority_that_answers_first() {
+        assert_eq!(quorum_tail(vec![ms(30), ms(5)], 3), Some(ms(5)));
+        assert_eq!(
+            quorum_tail(vec![ms(40), ms(9), ms(700), ms(3)], 5),
+            Some(ms(9))
+        );
+        assert_eq!(quorum_tail(vec![ms(40), ms(9), ms(700)], 4), Some(ms(40)));
+    }
+
+    /// Too few others measured says nothing, and a voter that is a
+    /// majority alone waits on no one.
+    #[test]
+    fn too_few_measured_or_a_lone_voter_waits_on_nothing() {
+        assert_eq!(quorum_tail(vec![], 3), None);
+        assert_eq!(quorum_tail(vec![ms(5)], 5), None);
+        assert_eq!(quorum_tail(vec![], 1), None);
+        assert_eq!(quorum_tail(vec![ms(5)], 0), None);
+    }
+
+    /// The tail in ticks of the pace in force, rounded up, never past an
+    /// election timeout at the ceiling, and none while unmeasured.
+    #[test]
+    fn the_quorum_tail_in_ticks_is_bounded_by_an_election_timeout_at_the_ceiling() {
+        let pace = TickPeriod::default();
+        pace.announce(10);
+        let (tick, ceiling) = (ms(25), ms(100));
+        assert_eq!(pace.quorum_ticks(tick, ceiling), 0);
+        pace.publish_quorum_tail(Some(ms(301)));
+        assert_eq!(pace.quorum_ticks(tick, ceiling), 13);
+        pace.publish_quorum_tail(Some(Duration::from_secs(3600)));
+        assert_eq!(
+            pace.quorum_ticks(tick, ceiling),
+            40,
+            "ten ticks at 100 ms, in 25 ms ticks"
+        );
+        pace.publish_quorum_tail(None);
+        assert_eq!(pace.quorum_ticks(tick, ceiling), 0);
     }
 }

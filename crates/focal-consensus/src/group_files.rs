@@ -15,7 +15,13 @@
 //! its bound, or whose checksum does not match is refused, naming the file: it is never read as
 //! absent, nor as an earlier version.
 //!
+//! Each framed file is sealed whole before it is installed (29 §5): a STREAM file
+//! (`hyper_seal::sealed_file`) under a data key of its own, wrapped by the node's group-file key,
+//! which is unwrapped from the root key file for that write or read and wiped after it. So no group
+//! file is ever on the disk in the clear, and no key of the store is held between its files.
+//!
 //! [27]: ../../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -72,6 +78,120 @@ pub enum GroupFileError {
     /// The file is larger than its bound.
     #[error("group file {file} exceeds its bound of {bound} bytes")]
     Bound { file: &'static str, bound: usize },
+    /// The node's group-file key did not open (29 §2).
+    #[error("group file keys: {0}")]
+    Keys(#[from] focal_seal::SealSetupError),
+    /// The file's seal refused it: tampered, cut, extended or under another key.
+    #[error("group file seal: {0}")]
+    Seal(#[from] hyper_seal::sealed_file::SealedFileError),
+}
+
+/// Where a group file's key comes from: the node's data directory, whose `SEAL.node` holds the
+/// group-file key, and the root key file that opens it (29 §2–§3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSeal {
+    pub data_dir: PathBuf,
+    pub key_file: PathBuf,
+}
+
+/// The seal of the group files under the data directory `root` in this crate's tests.
+#[cfg(test)]
+pub(crate) fn test_seal(root: &Path) -> GroupSeal {
+    GroupSeal {
+        data_dir: root.to_path_buf(),
+        key_file: crate::node_storage::test_key_file(root),
+    }
+}
+
+/// Plaintext bytes of a sealed group file's segment: 64 KiB, the segment hyper-seal's sealed-file
+/// bench measures (docs/benchmarks.md "Sealed files"); a group's records fit one.
+const SEGMENT: u32 = 64 * 1024;
+/// A sealed file's footer: the stream's length (`hyper_seal::sealed_file`).
+const SEALED_FOOTER: u64 = 8;
+
+/// A file held in memory, for a sealed file made whole before it is installed and opened whole
+/// once read: byte-aligned, flushed by the install that writes it.
+#[derive(Default)]
+struct MemFile(RefCell<Vec<u8>>);
+
+impl hyper_block::block::BlockFile for MemFile {
+    fn alignment(&self) -> hyper_block::buf::Alignment {
+        hyper_block::buf::Alignment::BYTE
+    }
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        u64::try_from(self.0.borrow().len()).map_err(|_| short(0, 0))
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        let bytes = self.0.borrow();
+        let from = usize::try_from(offset).map_err(|_| short(offset, buf.len()))?;
+        let to = from
+            .checked_add(buf.len())
+            .ok_or(short(offset, buf.len()))?;
+        let src = bytes.get(from..to).ok_or(short(offset, buf.len()))?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        let mut bytes = self.0.borrow_mut();
+        let from = usize::try_from(offset).map_err(|_| short(offset, buf.len()))?;
+        let to = from
+            .checked_add(buf.len())
+            .ok_or(short(offset, buf.len()))?;
+        let grow = to.saturating_sub(bytes.len());
+        if grow > 0 {
+            bytes
+                .try_reserve(grow)
+                .map_err(|_| short(offset, buf.len()))?;
+            bytes.resize(to, 0);
+        }
+        bytes
+            .get_mut(from..to)
+            .ok_or(short(offset, buf.len()))?
+            .copy_from_slice(buf);
+        Ok(())
+    }
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        Ok(())
+    }
+}
+
+fn short(offset: u64, missing: usize) -> hyper_block::DiskError {
+    hyper_block::DiskError::ShortRead {
+        path: PathBuf::new(),
+        offset,
+        missing,
+    }
+}
+
+/// `framed` sealed whole under a new data key wrapped by the node's group-file key.
+fn sealed(seal: &GroupSeal, framed: &[u8]) -> Result<Vec<u8>, GroupFileError> {
+    let key = focal_seal::store_key(&seal.data_dir, &seal.key_file, focal_seal::Store::Group)?;
+    let mut writer = hyper_seal::sealed_file::SealedWriter::new(MemFile::default(), &key, SEGMENT)?;
+    writer.write(framed)?;
+    Ok(writer.finish()?.0.into_inner())
+}
+
+/// The framed bytes `bytes` seal, no more than `most` of them.
+fn opened(
+    seal: &GroupSeal,
+    file: &'static str,
+    bytes: Vec<u8>,
+    most: usize,
+) -> Result<Vec<u8>, GroupFileError> {
+    let key = focal_seal::store_key(&seal.data_dir, &seal.key_file, focal_seal::Store::Group)?;
+    let mut reader =
+        hyper_seal::sealed_file::SealedReader::open(MemFile(RefCell::new(bytes)), &key, SEGMENT)?;
+    let len = usize::try_from(reader.len())
+        .ok()
+        .filter(|len| *len <= most)
+        .ok_or(GroupFileError::Bound { file, bound: most })?;
+    let mut framed = Vec::new();
+    framed
+        .try_reserve_exact(len)
+        .map_err(|_| GroupFileError::Bound { file, bound: most })?;
+    framed.resize(len, 0);
+    reader.read_at(&mut framed, 0)?;
+    Ok(framed)
 }
 
 /// What the group is, and what its entries need to be read ([27] §15.2): its identity, whether it
@@ -172,6 +292,7 @@ pub fn write_records<M: Medium>(
     medium: &mut M,
     dir: &Path,
     records: &GroupRecords,
+    seal: &GroupSeal,
 ) -> Result<(), GroupFileError> {
     let payload = postcard::to_stdvec(records)?;
     if payload.len() > META_BOUND {
@@ -180,7 +301,7 @@ pub fn write_records<M: Medium>(
             bound: META_BOUND,
         });
     }
-    let bytes = frame(META_MAGIC, &payload)?;
+    let bytes = sealed(seal, &frame(META_MAGIC, &payload)?)?;
     focal_platform::fs::install(medium, &dir.join(META_FILE), &bytes)?;
     Ok(())
 }
@@ -190,12 +311,13 @@ pub fn write_records<M: Medium>(
 pub fn read_records<M: Medium>(
     medium: &M,
     dir: &Path,
+    seal: &GroupSeal,
 ) -> Result<Option<GroupRecords>, GroupFileError> {
     let path = dir.join(META_FILE);
     if !medium.exists(&path)? {
         return Ok(None);
     }
-    let bytes = read_bounded(medium, &path, META_FILE, META_BOUND)?;
+    let bytes = read_bounded(medium, &path, META_FILE, META_BOUND, seal)?;
     let payload = unframe(META_FILE, META_MAGIC, &bytes)?;
     Ok(Some(postcard::from_bytes(payload)?))
 }
@@ -208,6 +330,7 @@ pub fn write_image<M: Medium>(
     point: &ImagePoint,
     image: &[u8],
     bound: usize,
+    seal: &GroupSeal,
 ) -> Result<(), GroupFileError> {
     if image.len() > bound {
         return Err(GroupFileError::Bound {
@@ -244,7 +367,7 @@ pub fn write_image<M: Medium>(
     payload.extend_from_slice(&header_len.to_le_bytes());
     payload.extend_from_slice(&header);
     payload.extend_from_slice(image);
-    let bytes = frame(IMAGE_MAGIC, &payload)?;
+    let bytes = sealed(seal, &frame(IMAGE_MAGIC, &payload)?)?;
     focal_platform::fs::install(medium, &dir.join(IMAGE_FILE), &bytes)?;
     Ok(())
 }
@@ -255,6 +378,7 @@ pub fn read_image<M: Medium>(
     medium: &M,
     dir: &Path,
     bound: usize,
+    seal: &GroupSeal,
 ) -> Result<Option<(ImagePoint, Vec<u8>)>, GroupFileError> {
     let path = dir.join(IMAGE_FILE);
     if !medium.exists(&path)? {
@@ -267,7 +391,7 @@ pub fn read_image<M: Medium>(
             file: IMAGE_FILE,
             bound,
         })?;
-    let bytes = read_bounded(medium, &path, IMAGE_FILE, most)?;
+    let bytes = read_bounded(medium, &path, IMAGE_FILE, most, seal)?;
     let payload = unframe(IMAGE_FILE, IMAGE_MAGIC, &bytes)?;
     let (len, rest) = payload.split_at_checked(4).ok_or(GroupFileError::Corrupt {
         file: IMAGE_FILE,
@@ -301,19 +425,33 @@ pub fn read_image<M: Medium>(
     Ok(Some((point.point(), image.to_vec())))
 }
 
+/// The framed bytes of the sealed file at `path`, its payload no more than `payload_bound`: the
+/// sealed file is read no longer than its framed bound sealed, and opened.
 fn read_bounded<M: Medium>(
     medium: &M,
     path: &Path,
     file: &'static str,
     payload_bound: usize,
+    seal: &GroupSeal,
 ) -> Result<Vec<u8>, GroupFileError> {
-    let limit = payload_bound
+    let bound = GroupFileError::Bound {
+        file,
+        bound: payload_bound,
+    };
+    let framed = payload_bound
         .checked_add(HEADER_BYTES + TRAILER_BYTES)
         .ok_or(GroupFileError::Bound {
             file,
             bound: payload_bound,
         })?;
-    medium.read(path, limit).map_err(GroupFileError::Io)
+    let limit = u64::try_from(framed)
+        .ok()
+        .and_then(|n| hyper_seal::stream::sealed_len(n, SEGMENT).ok())
+        .and_then(|n| n.checked_add(SEALED_FOOTER))
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(bound)?;
+    let bytes = medium.read(path, limit).map_err(GroupFileError::Io)?;
+    opened(seal, file, bytes, framed)
 }
 
 /// Magic, version, length, payload and the checksum over them.

@@ -35,7 +35,7 @@ async fn local_expansion_keeps_identity_log_genesis_and_credentials_on_restart()
             identity.cluster,
             identity.ledger.session.0,
         ),
-        network.wal.clone(),
+        crate::storage_start::test_wal(&network.storage.storage).clone(),
     )
     .unwrap();
     assert_eq!(consensus.status().term, local_term);
@@ -266,4 +266,80 @@ fn missing_timer_driver_is_contained_during_endpoint_resolution() {
         runtime.block_on(resolve_addresses(&settings)),
         Err(NodeError::Io(_))
     ));
+}
+
+/// A founder whose recorded fence opens the storage level (27 §15.8) founds on the shell: its
+/// root's member is served from the node's hyper-log log, a restart reopens it there, and what
+/// the storage held is given back when the network is dropped.
+#[tokio::test]
+async fn a_founder_at_the_storage_level_founds_and_restarts_on_the_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = settings(directory.path());
+    crate::storage_level::record(directory.path(), crate::upgrade::STORAGE_LEVEL).unwrap();
+    let network = FoundingNetwork::open(&settings).await.unwrap();
+    assert!(matches!(
+        network.storage.storage,
+        focal_consensus::NodeStorage::Shell(_)
+    ));
+    assert!(network.storage.log.is_some());
+    assert!(
+        directory
+            .path()
+            .join(focal_consensus::convert::LOG_FILE)
+            .exists()
+    );
+    let state = network.state.clone();
+    let term = network.control.status().term;
+    assert!(term > 0, "the root elected its founder on the shell");
+    let budget = network.budget.clone();
+    drop(network);
+    assert_eq!(budget.stats().used, 0);
+    let again = FoundingNetwork::open(&settings).await.unwrap();
+    assert!(matches!(
+        again.storage.storage,
+        focal_consensus::NodeStorage::Shell(_)
+    ));
+    assert_eq!(again.state, state);
+    assert!(again.control.status().term >= term);
+    drop(again);
+}
+
+/// A node that ran on focal-log's WAL below the storage level is converted at its first start at
+/// it: its WAL's fence then names the log, and every later start reads it as the shell's.
+#[tokio::test]
+async fn a_wal_node_is_converted_at_its_first_start_at_the_storage_level() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = settings(directory.path());
+    let below = FoundingNetwork::open(&settings).await.unwrap();
+    assert!(matches!(
+        below.storage.storage,
+        focal_consensus::NodeStorage::Wal(_)
+    ));
+    let term = below.control.status().term;
+    let identity = below.directory.identity().clone();
+    drop(below);
+    crate::storage_level::record(directory.path(), crate::upgrade::STORAGE_LEVEL).unwrap();
+    let wal_identity = focal_log::WalIdentity {
+        cluster: identity.cluster,
+        node: identity.node,
+        stream: 0,
+    };
+    assert_eq!(
+        focal_consensus::convert::start(directory.path(), wal_identity, true).unwrap(),
+        focal_consensus::convert::Start::Convert
+    );
+    let converted = FoundingNetwork::open(&settings).await.unwrap();
+    assert!(matches!(
+        converted.storage.storage,
+        focal_consensus::NodeStorage::Shell(_)
+    ));
+    assert!(
+        converted.control.status().term >= term,
+        "the root kept its history"
+    );
+    drop(converted);
+    assert_eq!(
+        focal_consensus::convert::start(directory.path(), wal_identity, true).unwrap(),
+        focal_consensus::convert::Start::Shell
+    );
 }

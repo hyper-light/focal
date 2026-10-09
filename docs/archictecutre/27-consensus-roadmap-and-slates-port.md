@@ -1067,7 +1067,7 @@ of it was changed.
 | The pool's five seconds, the announcement's round of five and enrollment control's of four | Set, not derived. The pool's is no longer the time of an exchange (section 7, 2026-10-01): it is what a caller waits for its lane and for its connection, and what a peer is given to answer once it has the request. A peer under load that takes longer to answer is still given up |
 | The idle timeout of a connection, ten seconds | Set, not derived. It is what a path must return a datagram in (1,920 bit/s), and a path that carries nothing for longer loses its connections and what they carried |
 | A transfer's lease, sixty seconds | Set, not derived. It is the longest a copy holds an unfinished transfer without a part taken; a part is sized to cross in a twelfth of it at the rate the path showed (section 7), so a sender that stops is dropped after it and a live one renews it many times over |
-| The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Measured again on 2026-10-07 (macOS arm64, 18 cores, at `ebe057b`): eight copies of the control suite at once, 8 of 8 runs; sixteen, 47 of 48 over three rounds and 155 of 160 over ten more, where the record before §9's commit rules was five of eight and none of sixteen. Every failure left is the membership test's wait for a leader, and the suite's wait now prints each host's term and leader as they changed: in all five, a member wins its term and steps down in it about nine of its periods later, before its followers have heard it leads, term after term (`(2, 95, 2, 2)`, `(2, 104, 2, 0)`, node 1 hearing of it at its period 110). That is the leader's quorum check (`MsgCheckQuorum`, one election timeout, ten ticks): its followers' owners stalled twelve to twenty-eight ticks (longest periods 0.3 to 0.7 s at a 25 ms tick), so no quorum answered within it. Raft's timing requirement (broadcast time well under the election timeout, Ongaro's thesis §3.4) fails there, and nothing the leader measures shows it, since its probes are answered off the owner's thread and the rig's pace samples its own sleep. Reads are ReadIndex reads confirmed by a quorum, with no lease, so a leader that checks its quorum later serves nothing stale and commits nothing alone: the check is a liveness device (thesis §6.2). The fix proposed to hyper-raft: a quorum patience the owner gives its leader, in ticks beyond the election timeout, from the voters' exchange tails (`PeerConnectionPool::exchange_tail`, whose answer waits for the follower's owner to take the frame), which a stalled follower stretches and the leader's own stall does not; the request time follows the same tails |
+| The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Measured again on 2026-10-07 (macOS arm64, 18 cores, at `ebe057b`): eight copies of the control suite at once, 8 of 8 runs; sixteen, 47 of 48 over three rounds and 155 of 160 over ten more, where the record before §9's commit rules was five of eight and none of sixteen. Every failure left is the membership test's wait for a leader, and the suite's wait now prints each host's term and leader as they changed: in all five, a member wins its term and steps down in it about nine of its periods later, before its followers have heard it leads, term after term (`(2, 95, 2, 2)`, `(2, 104, 2, 0)`, node 1 hearing of it at its period 110). That is the leader's quorum check (`MsgCheckQuorum`, one election timeout, ten ticks): its followers' owners stalled twelve to twenty-eight ticks (longest periods 0.3 to 0.7 s at a 25 ms tick), so no quorum answered within it. Raft's timing requirement (broadcast time well under the election timeout, Ongaro's thesis §3.4) fails there, and nothing the leader measures shows it, since its probes are answered off the owner's thread and the rig's pace samples its own sleep. Reads are ReadIndex reads confirmed by a quorum, with no lease, so a leader that checks its quorum later serves nothing stale and commits nothing alone: the check is a liveness device (thesis §6.2). Done (2026-10-07): hyper-raft's `Raft::set_quorum_patience` (docs/raft.md §3.6) and hyper-durable's `Replica::set_quorum_patience`, set by the root's owner each tick to the quorum-th smallest exchange tail among its other voters (`pace::quorum_tail`, published by the pacer from `PeerConnectionPool::replication_lateness`: the tail of the group messages each voter answered, which it answers once its owner has taken and persisted them, or the age of one still out where that is more; `exchange_tail` measures no group message, so it never saw a follower's owner stall), in ticks, at most an election timeout at the tick ceiling; a request is given the same ticks beyond its time. Interleaved with the tree without it (eight copies of each at once, twelve rounds): 95 of 96 against 89 of 96, membership-wait failures 1 against 7 (Fisher's exact, one-sided, p ≈ 0.03). Each voter's lateness counts the age of a message still out to it as well as the tail of those it answered, so a stall shows while it lasts (`replication_lateness`; interleaved against the tails alone, 95 of 96 against 94 of 96, no difference the rig can show, since the rig times frames itself: in production the pacer had no replication signal before it). Sessions' owners are given the same patience and the same request time from their own voters. What is left is the cap: the patience is at most one election timeout at the tick ceiling, so a leader checks its quorum by twice its election timeout, twenty ticks at a 25 ms tick, and a follower whose owner stalls past it still deposes it (the remaining failure: a leader that stepped down fifteen periods into its term while one owner stalled 862 ms, thirty-four ticks). Kept: a higher cap lets a leader cut off from its quorum take requests longer before it steps down, and is to be derived from what that may cost (the requests a cut-off leader times out, against the request time that follows the same tails) and measured both ways, never set by eye |
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |
 | A voter that dies and returns within the hold, end to end | Done: `plan placement` says for how many seconds a death still stands (`focal_directory::deaths_stand_for`), and a voter that returns within the hold keeps its seat on real processes while a spare waits; one that stays dead loses it to the spare without an operator (`runbook_node_loss_within_the_hold_moves_no_seat`) |
@@ -1340,7 +1340,7 @@ The commits in focal, in order:
    `hyper_durable::StateMachine`.
 4. **The shell on hyper-log** (§15.7), opened by a constructor that only the simulations and tests
    use at first. focal-consensus's simulation and election suites run on it.
-5. **The conversion** (§15.8): one code path, run by `focal storage convert` and at start, with
+5. **The conversion** (§15.8): one code path, run by `focal convert storage` and at start, with
    every ordering edge cut.
 6. **The level**: `STORAGE_LEVEL`, the switch at start, and the old binary's refusal qualified.
 7. **Measurements and documents** (§15.10).
@@ -1541,7 +1541,7 @@ reproduce exactly stops the work and reopens the question for that owner alone.
 **Never remove the old WAL directory.** An old binary that opens a directory with no `CURRENT` and
 no `INITIALIZED` makes a fresh, empty WAL: a voter that forgot what it acknowledged.
 
-**One code path**, run by `focal storage convert` and at start. It holds `wal/LOCK` throughout.
+**One code path**, run by `focal convert storage` and at start. It holds `wal/LOCK` throughout.
 
 1. **Charge the disk budget.** The new store is written beside the old WAL, so its bytes are
    checked first. A store that does not fit is refused, typed, naming the bytes it needs and the
@@ -1574,7 +1574,7 @@ no `INITIALIZED` makes a fresh, empty WAL: a voter that forgot what it acknowled
    preserved binary actually answers.
 7. **Move the old segments** to `wal-converted/`, then flush both directories.
    - `wal-converted/` stays charged to the disk budget until it is removed.
-   - It is removed by `focal storage remove-converted`, never by a bare `rm`. The command
+   - It is removed by `focal remove converted-storage`, never by a bare `rm`. The command
      refuses unless `CURRENT` is version 3 and hyper-log opens and verifies.
 
 **After a crash.**
@@ -1596,7 +1596,7 @@ without `raft/`.
   assumes.
 - A node converts at its first start after the fence opens at `STORAGE_LEVEL` (24 §21; 08: stepped
   complexity), or at a later start if the read cannot answer. A rollout costs each node one restart.
-- `focal storage convert` runs offline under the lock and refuses unless the fence is open. It is
+- `focal convert storage` runs offline under the lock and refuses unless the fence is open. It is
   for rehearsals and staged rollouts, like `activate native`.
 - A start below the fence never converts: the binary runs `DurableNode` on focal-log, unchanged.
 - A cluster founded at `STORAGE_LEVEL` starts on hyper-log.
@@ -1699,3 +1699,107 @@ R17's timed measurement at focal's level.
   across groups; a checkpoint here pays a file flush and a directory flush. The measurement records
   the cost of a checkpoint and the node's flushes a second. If the files do not hold, the
   alternative is a per-device image store, measured against them.
+
+### 15.11 As built: the conversion (2026-10-07)
+
+Steps 5 and 6 of §15.1, built on the branch `storage-shell`:
+
+- **The copy** (`focal_consensus::convert::copy_groups`): each group read through focal-log's
+  replay by the rules a member opens on (its identity record first, every other replayed as
+  `open_on_wal_in` does), one group held at a time, and written as the shell opens it: `meta`
+  first (O1), the image before the log's start moves (O3), the entries a frame at a time, the hard
+  state last. A group on the fast track is refused: the shell does not carry it yet.
+- **The verification** (`verify`): the log reopened as a restart opens it, each group compared with
+  the old replay (records, image and point, bounds, hard state, every entry, no proposals), and no
+  group in the log that the WAL does not hold.
+- **The commit point** (`focal_log::conversion`): fence version 3, version 2's fields and the log's
+  id. A version 2 binary decodes it as its own fields and refuses it (`LogError::Identity`) before
+  any replica opens; this binary refuses it as `LogError::Converted`. The segments move to
+  `wal-converted/` only past it, and are removed only as a directory of segments.
+- **The pass** (`convert_data_dir`): steps 1 to 7 in order. Step 1's bound is derived from the WAL's
+  own live bytes, a frame's header and padding for every write (a segment less two blocks bounds a
+  frame's room from below), and each group's records; a volume that cannot hold it is refused,
+  naming both numbers. The log's id is derived from the node's identity, so a repeat names the same
+  log; a directory past its commit point finishes step 7 only.
+- **The start** (`convert::start`) and `upgrade::STORAGE_LEVEL` (4), staged as `RAFT_KEPT_LEVEL` is.
+
+Evidence so far: the differential converts every member of a running three-member group (one
+checkpointed) and each opens on the shell where focal-log reopens it, every round after alike; a
+WAL of two groups (a decoder floor, a checkpoint, a tail) moves whole; verification refuses a
+changed record and a stray group; a partial earlier store is replaced; a crash between the commit
+and the move resumes with the move.
+
+**Measured on the shell before the switch** (`benches/commits.rs`, `FOCAL_BENCH_BACKEND=shell`,
+macOS, a loaded machine, to be repeated quiet against focal-log at the same commit): one voter, an
+entry at a time, 2.00 flushes a commit, about 9 ms; three voters 43–47 ms at the median, and 35,000
+to 54,000 entries a second pipelined. A commit alone pays two flushes on both backends (focal-log's
+commit frame after its data, hyper-log's confirming record); under load hyper-log's next frame
+confirms the last.
+
+**Measured again at hyper-raft `b483a13`** (2026-10-07; `benches/commits.rs`, the owner sending a
+leader's messages while its write is out; macOS arm64, load average 5 to 9; two rounds each, focal-log
+then the shell, alternated). A commit that moves alone is no longer a write of its own on the shell
+(hyper-raft PR #2), and the shell now leads where it trailed:
+
+| | focal-log | shell |
+|---|---|---|
+| one voter, an entry at a time: median, p99 | 8.6 ms; 27 and 101 ms | 8.5 ms; 9.6 and 16.6 ms |
+| three voters, an entry at a time: median | 22.3, 22.4 ms | 21.3, 19.3 ms |
+| three voters, 4,000 entries pipelined | 56,711 and 50,503 entries/s | 91,159 and 100,294 entries/s |
+| flushes for 4,201 entries, by member | 202 to 203 | 404 to 408 |
+
+The cost the shell still carries is flushes, and only for an entry written alone. Of the 4,201
+entries, the 200 written one at a time take 200 flushes on focal-log and 400 on the shell; the
+4,000 pipelined add two to five on either. hyper-log answers a frame only once a later durable
+record confirms its flush, and an entry that nothing follows waits for a confirmation of its own:
+at no cost in time here (the medians are equal), but a second flush for every write of a node at
+rest, which is a laptop's ordinary traffic. Each flush is power and, on a flash device, wear (the
+terminating goal's tenth condition), so the switch is measured on flushes as well as on time.
+
+**Open before the switch:**
+- **The shell's second flush for an entry written alone** (above): taken to hyper-raft with these
+  numbers, for the confirmation's rule rather than a focal workaround.
+- **The log's growth needs the volume's admission** (found 2026-10-07). §15.3 takes `max_segments`
+  from "the node's disk budget for `DiskKind::Wal`", but focal's `DiskBudget` is a volume envelope
+  with a watermark and no per-kind quota. focal-log reserves from it before every write, so a full
+  volume refuses typed, before any acknowledgement. hyper-log grows its file a slot at a time up to
+  `max_segments` with no such reservation: a volume that fills first fails the growth write and
+  fences the log, stopping the node. A fixed quota cannot stand in for it: one sized to the free
+  space at open changes between starts (and a file past a smaller later quota must still open), and
+  one sized to the volume ignores the volume's other owners. Proposed to hyper-raft: a growth gate
+  the owner passes the log, asked for a segment before the file grows, whose refusal reads as the
+  quota reached (`Full`, the groups compact) and never as an I/O error; focal's gate is its
+  `DiskBudget`. The node's start (`storage_level`, `convert::start`, `node_log::config`,
+  `NodeStorage`) is wired once it lands.
+- hyper-log's `LogOpener` (hyper-raft PR #1, reviewed): owners spawned for the node's life claim
+  their groups through it, since the `Log` owns its threads and no owner holds it in an `Arc`.
+- The node's hyper-log `Config` from the device and the node (§15.3): a frame holds the largest
+  entry; a group retains twice its owner's checkpoint cadence (the control host's
+  `checkpoint_interval`, a session's `checkpoint_after_entries`) and what is uncommitted, and an
+  owner the log refuses for room checkpoints (durable.md §2.4).
+- The node's storage metrics name their backend (`metrics::StorageMetrics`): focal-log's writer
+  exports `focal_wal_*`, the node log under the shell `focal_log_*` (frames, updates, bytes and
+  flushes as counters; each flush, each frame's writes and each update's wait for its flush as a
+  summary in nanoseconds with its 0.5, 0.99 and 0.999 quantiles; and how long the flush in
+  progress has run, so a stalled device shows before any histogram hears of it), taken from
+  hyper-log's statistics by `focal_consensus::LogMetrics`. An owner that holds only the log's
+  opener reads them through `LogOpener::stats` (hyper-raft `log-preallocate-followups`).
+- The start (2026-10-07, at hyper-raft 756bfaa). `focal_consensus::storage_open::open_node_storage`,
+  called by the service and the founding bootstrap through focal-node's `storage_start`: below the
+  storage level the node last recorded it opens focal-log's WAL as before; at it a directory that
+  still holds the WAL is converted first (`convert_data_dir`), and the node's groups live in one
+  hyper-log log, created or reopened with `DiskGrowth` (hyper-log's growth gate over the node's
+  `DiskBudget`: each slot a `DiskKind::Wal` reservation on the completion lane, committed when
+  durable, refused at the watermark as the bound reached). The log's configuration comes from
+  facts that do not change between starts: the device's block (read from `IDENTITY`, on the log's
+  volume before the log is), the volume's whole size (`focal_platform::total_space`; a file is
+  never larger than its volume, and recovery refuses one past its quota), the group bound (the
+  fleet's sessions, the root and every partition a plan may place: 1,058) and the longest
+  checkpoint cadence. Its cache is the storage envelope's completion reserve, 64 MiB, charged for
+  the log's life: stated, not yet measured. The owner registry closes the log after every owner
+  that writes through it has joined. Not yet: the offline readers (`history`, the embedded node,
+  cluster administration's reads) open the WAL only, and refuse a converted directory, typed,
+  rather than read it; sealing at rest awaits the node's key source (hyper-raft `docs/seal.md`
+  §1: a key file off the data device, the keychain or a TPM, or a key service).
+- `ControlReplica` over the shell, the owners' wiring through one storage handle, the commands
+  (`focal convert storage`, `focal remove converted-storage`), and §15.10's crash cuts and qualification.

@@ -715,6 +715,14 @@ impl Session {
         self.consensus.set_patience(ticks)?;
         Ok(())
     }
+    /// The ticks the replica, while it leads, waits beyond its election
+    /// timeout before it asks whether a quorum heard it
+    /// (`DurableNode::set_quorum_patience`).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_quorum_patience(ticks)?;
+        Ok(())
+    }
     /// What this leader tracks of one member's replication.
     pub fn peer(&self, node: u64) -> Option<focal_consensus::PeerProgress> {
         self.consensus.peer(node)
@@ -825,6 +833,10 @@ impl Session {
     /// Node ownership retains the physical writer across logical-session removal.
     pub fn shared_wal(&self) -> Result<focal_consensus::SharedWal, LedgerError> {
         Ok(self.consensus.shared_wal()?)
+    }
+    /// The writer the session's durable state goes through, whichever backend holds it.
+    pub fn storage_writer(&self) -> Result<focal_consensus::StorageWriter, LedgerError> {
+        Ok(self.consensus.storage_writer()?)
     }
     /// Includes unstarted Ready work, such as the internal leadership ReadIndex
     /// queued by the last publication. Idle owners need not poll their sessions.

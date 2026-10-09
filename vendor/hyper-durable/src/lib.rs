@@ -47,7 +47,7 @@ mod store;
 pub use budget::{Budget, Bytes, Unbounded};
 pub use compaction::Compaction;
 pub use held::Held;
-pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, decode_entry, encode_entry};
+pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, LogGroups, decode_entry, encode_entry};
 pub use machine::{Fatal, StateMachine};
 pub use memory::RamStore;
 pub use owner::{Full, Handle, Owner};

@@ -24,14 +24,14 @@ use crate::{
     quorum_enrollment::{QuorumEnrollmentDriver, QuorumEnrollmentHost},
     replication::{drive_control_replication, drive_fleet_replication},
 };
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
 use focal_control::{
     ControlEvents, ControlOptions, ControlRead, ControlReadResult, ControlReplica,
 };
 use focal_enrollment::{CredentialMaterial, EnrollmentReceipt};
 use focal_evidence::{ContentStore, StoreLimits};
 use focal_ledger::{Session, SessionLimits};
-use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
+use focal_log::WalIdentity;
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget, MemoryError,
 };
@@ -345,7 +345,7 @@ struct OwnerGate {
     finished: oneshot::Receiver<Result<(), ServiceError>>,
 }
 struct OwnerRegistration {
-    storage: Option<(NodeDirectory, SharedWal)>,
+    storage: Option<(NodeDirectory, focal_consensus::storage_open::OpenedStorage)>,
     owner: Option<PhysicalOwner>,
 }
 impl OwnerGate {
@@ -388,8 +388,26 @@ impl OwnerGate {
                         result = Err(error);
                     }
                 }
-                if let Some((directory, wal)) = storage {
-                    drop(wal);
+                // Every owner has stopped: nothing writes through the storage any longer, and
+                // the shell's log closes before its directory's lock is let go.
+                if let Some((directory, opened)) = storage {
+                    let focal_consensus::storage_open::OpenedStorage {
+                        storage,
+                        log,
+                        cache,
+                        // The store keys beside the log are taken by the stores sealed next
+                        // (29 §8); until then they are wiped here.
+                        keys: _,
+                    } = opened;
+                    drop(storage);
+                    if let Some(log) = log
+                        && let Err(error) = log.close()
+                    {
+                        result = Err(ServiceError::Node(
+                            focal_consensus::storage_open::OpenError::Log(error).into(),
+                        ));
+                    }
+                    drop(cache);
                     drop(directory);
                 }
                 let _ = done.send(result);
@@ -409,12 +427,16 @@ impl OwnerGate {
             })
             .map_err(|_| ServiceError::Owner("owner registry stopped"))
     }
-    fn hold(&self, directory: NodeDirectory, wal: SharedWal) -> Result<(), ServiceError> {
+    fn hold(
+        &self,
+        directory: NodeDirectory,
+        storage: focal_consensus::storage_open::OpenedStorage,
+    ) -> Result<(), ServiceError> {
         self.sender
             .as_ref()
             .ok_or(ServiceError::Owner("closed owner registry"))?
             .send(OwnerRegistration {
-                storage: Some((directory, wal)),
+                storage: Some((directory, storage)),
                 owner: None,
             })
             .map_err(|_| ServiceError::Owner("owner registry stopped"))
@@ -459,8 +481,8 @@ pub struct NetworkService {
     /// The cluster this node belongs to, for restoring the enrollment
     /// registry the metrics sampler reads the fence from.
     cluster: [u8; 16],
-    /// The WAL writer, for its statistics in the metrics snapshot.
-    wal: SharedWal,
+    /// The node's storage, for its statistics in the metrics snapshot.
+    storage: focal_consensus::NodeStorage,
     /// The fixed labels of this node's metrics and the latest snapshot the
     /// sampler published (24 §23).
     metrics_labels: crate::metrics::MetricLabels,
@@ -482,7 +504,8 @@ struct Prepared {
     control: ControlReplica,
     recovered: ControlEvents,
     budget: MemoryBudget,
-    wal: SharedWal,
+    /// The node's storage as its start opened it (`storage_start`).
+    storage: focal_consensus::storage_open::OpenedStorage,
     allocation: Allocation,
     directory: NodeDirectory,
 }
@@ -515,16 +538,17 @@ impl Prepared {
             let allocation = budget
                 .reserve(BudgetKind::Recovery, BudgetLane::Completion, 256 * 1024)?
                 .commit();
-            let wal = SharedWal::open_with_budgets(
-                joined.directory.root().join("wal"),
-                WalOptions::new(WalIdentity {
+            let storage = crate::storage_start::open(
+                joined.directory.root(),
+                WalIdentity {
                     cluster: state.genesis.founder.cluster,
                     node: state.node,
                     stream: 0,
-                }),
-                WalWriterLimits::default(),
-                budget.child(256 * 1024 * 1024, 64 * 1024 * 1024)?,
-                disk_budget()?,
+                },
+                &budget,
+                &settings
+                    .root_key_file(state.node)
+                    .map_err(NodeError::Config)?,
             )?;
             let options = ControlOptions::new(NodeConfig::joining(
                 state.node,
@@ -533,11 +557,11 @@ impl Prepared {
                 vec![state.genesis.founder.node],
                 vec![],
             ));
-            let mut control = ControlReplica::open_on_wal(
+            let mut control = ControlReplica::open_on_storage(
                 options,
                 state.genesis.bootstrap.clone(),
                 budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
-                wal.clone(),
+                &storage.storage,
             )?;
             if control.identity() != state.genesis.root {
                 return Err(NodeError::Identity.into());
@@ -555,7 +579,7 @@ impl Prepared {
                 control,
                 recovered,
                 budget,
-                wal,
+                storage,
                 allocation,
                 directory: joined.directory,
             })
@@ -570,7 +594,7 @@ impl Prepared {
                 enrollment,
                 enrollment_driver,
                 budget,
-                wal,
+                storage,
                 _bootstrap_allocation,
                 directory,
             } = FoundingNetwork::prepare(settings).await?;
@@ -584,7 +608,7 @@ impl Prepared {
                 control,
                 recovered,
                 budget,
-                wal,
+                storage,
                 allocation: _bootstrap_allocation,
                 directory,
             })
@@ -662,17 +686,20 @@ impl NetworkService {
             control,
             recovered,
             budget,
-            wal,
+            storage: opened,
             allocation,
             directory,
         } = prepared;
-        owners.hold(directory, wal.clone())?;
+        // Every owner of the node's groups opens them through one handle (27 §15.11); the
+        // registry holds what was opened, and closes the shell's log after every owner.
+        let storage = opened.storage.clone();
+        owners.hold(directory, opened)?;
         let founder = identity.node == state.genesis.founder.node;
         let (directory, directory_startup) = DirectoryStartup::new(
             identity.node,
             state.genesis.founder.cluster,
             state.genesis.founder.node,
-            wal.clone(),
+            storage.clone(),
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
             root.clone(),
         )?;
@@ -815,7 +842,7 @@ impl NetworkService {
         // durable owner of the data directory.
         let (content, session) = {
             let root = root.clone();
-            let wal = wal.clone();
+            let storage = storage.clone();
             let identity = identity.clone();
             let tenant = tenant.clone();
             tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
@@ -828,24 +855,24 @@ impl NetworkService {
                         chunk_bytes: 1024 * 1024,
                         max_manifest_bytes: 1024 * 1024,
                     },
-                    wal.disk_budget(),
+                    storage.disk_budget(),
                 )?;
                 let session = if founder {
-                    let consensus = DurableNode::open_on_wal_in(
+                    let consensus = storage.open_member(
                         NodeConfig::single(
                             identity.node,
                             identity.cluster,
                             identity.ledger.session.0,
                         ),
-                        wal.clone(),
                         &tenant,
+                        focal_ledger::entry_needs,
                     )?;
                     Some(Session::from_node_in_hosted(
                         identity.ledger,
                         consensus,
                         SessionLimits::default(),
                         &tenant,
-                        native_hosting(&root, &identity, wal.disk_budget())
+                        native_hosting(&root, &identity, storage.disk_budget())
                             .map_err(NodeError::Content)?,
                     )?)
                 } else {
@@ -921,7 +948,7 @@ impl NetworkService {
                     identity.ledger.tenant,
                     tenant.clone(),
                 ),
-                wal: wal.clone(),
+                storage: storage.clone(),
                 jobs: agent_jobs,
             },
             budget.child(64 * 1024 * 1024, 16 * 1024 * 1024)?,
@@ -1046,7 +1073,7 @@ impl NetworkService {
         let (fleet, owner, ledger_output) = ReplicaFleet::spawn_managed(
             identity.node,
             identity.cluster,
-            vec![wal.clone()],
+            vec![storage.clone()],
             vec![FleetTenant {
                 tenant: identity.ledger.tenant,
                 weight: 1,
@@ -1171,7 +1198,7 @@ impl NetworkService {
             budget,
             _configuration: allocation,
             cluster: identity.cluster,
-            wal,
+            storage: storage.clone(),
             metrics_labels,
             metrics,
             metrics_listener,
@@ -1543,7 +1570,14 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
-            wal: self.wal.stats().ok(),
+            storage: match &self.storage {
+                focal_consensus::NodeStorage::Wal(wal) => {
+                    wal.stats().ok().map(crate::metrics::StorageMetrics::Wal)
+                }
+                focal_consensus::NodeStorage::Shell(shell) => shell.log_stats().map(|stats| {
+                    crate::metrics::StorageMetrics::Log(focal_consensus::LogMetrics::of(&stats))
+                }),
+            },
             fleet: self.handles.fleet.status(),
             root: RootMetrics {
                 peer_aggregates: members,
@@ -1860,6 +1894,17 @@ impl NetworkService {
                         .filter_map(|voter| self.pool.path(*voter))
                         .collect();
                     self.handles.control.pace(paths.iter());
+                    // What the root's commits wait on among its voters: how
+                    // late each answers the group's messages, which it does
+                    // once its owner has taken and persisted them, or the
+                    // age of one still out where that is more (27 §8.4).
+                    let voters = &observation.configuration().configuration.voters;
+                    let tails: Vec<Duration> = voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.replication_lateness(*voter))
+                        .collect();
+                    self.handles.control.quorum(tails, voters.len());
                 }
                 // Every hosted session paces itself by its own voters: a
                 // session whose voters are near keeps the configured period
@@ -1874,6 +1919,15 @@ impl NetworkService {
                         .filter_map(|voter| self.pool.path(*voter))
                         .collect();
                     host.pace(paths.iter());
+                    // How late the session's other voters answer its
+                    // messages (27 §8.4), as the root's.
+                    let tails: Vec<Duration> = progress
+                        .voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.replication_lateness(*voter))
+                        .collect();
+                    host.quorum(tails, progress.voters.len());
                     // And what each path holds in flight bounds the bytes
                     // a leader sends its peer ahead of its answers (27 §11):
                     // the voters, and the members the directory admitted,

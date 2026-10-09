@@ -23,8 +23,11 @@
 //! dispatch state; each worker owns one slot its tasks arrive on, woken alone (research/26 §5.3).
 //! A worker is told of a file attached or detached in its own slot, before any transfer for it,
 //! since a transfer goes only to a worker with no such news waiting. A volume's writer holds an
-//! [`Attached`], through which it submits one batch at a time and waits for its answer. A
-//! batch's writes all complete before its flush is issued, and the flush only if all succeeded:
+//! [`Attached`], through which it submits a batch and waits for its answer ([`Attached::write`]),
+//! or keeps up to the batches it attached for out at once and takes each answer when it needs it
+//! ([`Attached::submit`], [`Attached::answer`]): a writer on a latency path hands a write over
+//! and goes on. A batch's writes all complete before its flush is issued, and the flush only if
+//! all succeeded:
 //! a write that failed fails its batch, and its flush is never issued, because the caller then
 //! fences and recovers rather than trust what reached the device (Rebello et al., ATC 2020). The
 //! answer comes once, after the flush.
@@ -70,7 +73,10 @@ pub struct Issuer {
 
 /// What a batch's submitter is answered: the batch's buffers, in the order given, once every
 /// write and the flush asked for have completed.
-type Answer = Result<Vec<AlignedBuf>, DiskError>;
+pub type Answer = Result<Vec<AlignedBuf>, DiskError>;
+
+/// An answer with the number of the batch it answers ([`Attached::submit`]).
+type Numbered = (u64, Answer);
 
 /// A file as a worker holds it.
 type Handle = Box<dyn BlockFile>;
@@ -79,7 +85,9 @@ enum Event {
     Attach {
         /// One duplicate of the file for each worker.
         files: Vec<Handle>,
-        answers: SyncSender<Answer>,
+        /// The batches the submitter may have out at once.
+        batches: usize,
+        answers: SyncSender<Numbered>,
         reply: SyncSender<Result<(usize, u64), DiskError>>,
     },
     Detach {
@@ -90,8 +98,9 @@ enum Event {
     Batch {
         slot: usize,
         generation: u64,
-        writes: Vec<(AlignedBuf, u64)>,
-        flush: bool,
+        number: u64,
+        transfers: Vec<(AlignedBuf, u64)>,
+        kind: Kind,
     },
     Done {
         worker: usize,
@@ -100,9 +109,24 @@ enum Event {
     Stop,
 }
 
+/// What a batch's transfers do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Write each buffer at its offset, then flush if asked and every write succeeded.
+    Write { flush: bool },
+    /// Fill each buffer, all of its length, from its offset.
+    Read,
+}
+
 enum Op {
     /// The `index`th write of its batch.
     Write {
+        index: usize,
+        buf: AlignedBuf,
+        at: u64,
+    },
+    /// The `index`th read of its batch.
+    Read {
         index: usize,
         buf: AlignedBuf,
         at: u64,
@@ -127,6 +151,8 @@ enum Task {
 struct Transfer {
     slot: usize,
     generation: u64,
+    /// The batch it belongs to.
+    number: u64,
     op: Op,
 }
 
@@ -137,10 +163,11 @@ enum Report {
     Finished(Finished),
 }
 
-/// A transfer's end: the write's index and buffer, `None` for a flush.
+/// A transfer's end: the write's or read's index and buffer, `None` for a flush.
 struct Finished {
     slot: usize,
     generation: u64,
+    number: u64,
     write: Option<(usize, Option<AlignedBuf>)>,
     result: Result<(), DiskError>,
 }
@@ -148,12 +175,22 @@ struct Finished {
 impl Issuer {
     /// Starts the issuer of the device at `path` with `depth` workers, or fewer when the
     /// process's thread budget has fewer left; [`DiskError::Threads`] when it has none for one
-    /// worker and the issuer's own thread. Every thread starts here, before any is used.
+    /// worker and the issuer's own thread. Every thread starts here, before any is used. Its
+    /// submitters may have `depth` batches out together without waiting to hand one over
+    /// ([`Self::start_for`]).
+    pub fn start(path: &Path, depth: usize) -> Result<Self, DiskError> {
+        Self::start_for(path, depth, depth)
+    }
+
+    /// [`Self::start`] for submitters that together keep up to `batches` out
+    /// ([`Self::attach_deep`]): the issuer's inbox holds every worker's report and every such
+    /// batch at once, so within that budget a submission is handed over without waiting, even
+    /// while the issuer's thread is not running. Past it, a submission waits for room.
     #[allow(
         clippy::disallowed_methods,
         reason = "the issuer's bounded device workers: hyper-block runs its device's I/O (clippy.toml's file rule names it)"
     )]
-    pub fn start(path: &Path, depth: usize) -> Result<Self, DiskError> {
+    pub fn start_for(path: &Path, depth: usize, batches: usize) -> Result<Self, DiskError> {
         if depth == 0 {
             return Err(invalid(path, "an issuer needs a depth of one at least"));
         }
@@ -169,9 +206,9 @@ impl Issuer {
             });
         }
         let budget = threads::reserve(threads, path)?;
-        // Room for every worker's report at once, so a worker never waits to report while the
-        // issuer drains what arrives; a submitter waits for room behind them.
-        let (events, inbox) = sync_channel(workers);
+        // Room for every worker's report and every batch the submitters may have out, so a worker
+        // never waits to report and a submission within the budget is never held behind them.
+        let (events, inbox) = sync_channel(workers.saturating_add(batches));
         let (ready, started) = sync_channel(1);
         let completions = events.clone();
         let device = path.to_path_buf();
@@ -205,19 +242,35 @@ impl Issuer {
         self.workers
     }
 
-    /// Hands the issuer duplicates of `file`, one for each worker, for one submitter's batches.
+    /// Hands the issuer duplicates of `file`, one for each worker, for one submitter's batches,
+    /// one out at a time.
     pub fn attach<F: BlockFile + 'static>(&self, file: &F) -> Result<Attached, DiskError> {
+        self.attach_deep(file, 1)
+    }
+
+    /// [`Self::attach`] for a submitter that keeps up to `batches` out at once
+    /// ([`Attached::submit`]); its bound, which the issuer holds it to, is the submitter's to
+    /// state: the buffers it can spare while their writes are out.
+    pub fn attach_deep<F: BlockFile + 'static>(
+        &self,
+        file: &F,
+        batches: usize,
+    ) -> Result<Attached, DiskError> {
+        if batches == 0 {
+            return Err(invalid(&self.path, "a submitter needs one batch at least"));
+        }
         let mut files: Vec<Handle> = Vec::with_capacity(self.workers);
         for _ in 0..self.workers {
             files.push(Box::new(file.try_clone()?));
         }
-        // One batch is out at a time (`Attached::write` takes `&mut self`), so one answer.
-        let (answers, answered) = sync_channel(1);
+        // Each batch out is answered once: room for every answer the submitter may be owed.
+        let (answers, answered) = sync_channel(batches);
         let (reply, replied) = sync_channel(1);
         let gone = || stopped(&self.path, "the device's issuer has stopped");
         self.events
             .send(Event::Attach {
                 files,
+                batches,
                 answers,
                 reply,
             })
@@ -229,6 +282,9 @@ impl Issuer {
             events: self.events.clone(),
             answers: answered,
             path: self.path.clone(),
+            batches,
+            out: 0,
+            next: 0,
         })
     }
 }
@@ -246,42 +302,145 @@ impl Drop for Issuer {
 
 /// One submitter's way to its device's issuer: a volume's writer holds one. Dropping it
 /// detaches the file and returns once no worker holds a duplicate of it.
+#[derive(Debug)]
 pub struct Attached {
     slot: usize,
     generation: u64,
     events: SyncSender<Event>,
-    answers: Receiver<Answer>,
+    answers: Receiver<Numbered>,
     path: PathBuf,
+    /// The batches it may have out at once, those out, and the next batch's number.
+    batches: usize,
+    out: usize,
+    next: u64,
 }
 
 impl Attached {
     /// Issues every `(buffer, offset)` of `writes` at once, as deep as the device's workers go,
     /// and once all have completed, a flush when `flush` is set and every write succeeded.
     /// Returns the buffers, in order, after the last of them; the first failure otherwise, once
-    /// none is in flight.
+    /// none is in flight. Refused while batches submitted are out.
     pub fn write(
         &mut self,
         writes: Vec<(AlignedBuf, u64)>,
         flush: bool,
     ) -> Result<Vec<AlignedBuf>, DiskError> {
+        if self.out > 0 {
+            return Err(invalid(
+                &self.path,
+                "a write while submitted batches are out",
+            ));
+        }
         if writes.is_empty() && !flush {
             return Ok(Vec::new());
         }
-        let gone = || stopped(&self.path, "the device's issuer has stopped");
-        self.events
-            .send(Event::Batch {
-                slot: self.slot,
-                generation: self.generation,
-                writes,
-                flush,
-            })
-            .map_err(|_| gone())?;
-        self.answers.recv().map_err(|_| gone())?
+        let number = self.submit(writes, flush)?;
+        let (answered, answer) = self.answer()?;
+        if answered != number {
+            return Err(stopped(&self.path, "an answer to another batch"));
+        }
+        answer
     }
 
     /// Makes every completed write durable: the platform's full flush, on a worker.
     pub fn flush(&mut self) -> Result<(), DiskError> {
         self.write(Vec::new(), true).map(|_| ())
+    }
+
+    /// Hands a batch, as [`Self::write`] issues one, to the issuer and returns its number
+    /// without waiting: its answer is taken by [`Self::answer`] or [`Self::try_answer`]. Refused
+    /// with the batches attached for already out, before anything is sent. Batches complete in
+    /// any order, and a batch's flush covers only the writes completed when it is issued.
+    pub fn submit(
+        &mut self,
+        writes: Vec<(AlignedBuf, u64)>,
+        flush: bool,
+    ) -> Result<u64, DiskError> {
+        if self.out >= self.batches {
+            return Err(invalid(
+                &self.path,
+                "a batch past those the submitter attached for; take an answer first",
+            ));
+        }
+        self.send(writes, Kind::Write { flush })
+    }
+
+    /// Hands a batch of reads to the issuer and returns its number without waiting, as
+    /// [`Self::submit`] does a batch of writes: each `(buffer, offset)` is filled, the whole of the
+    /// buffer's length, from its offset, as deep as the device's workers go. The answer
+    /// ([`Self::answer`], [`Self::try_answer`]) gives the buffers back filled, in the order given,
+    /// once every read has completed; or the first failure once none is in flight, a read that
+    /// reaches the end of the file first among them (`BlockFile::read_exact_at`). Reads share the
+    /// device's depth with writes and count among the batches the submitter attached for: refused
+    /// with those already out, before anything is sent. A read's bytes are those of every write
+    /// answered before it was submitted; a read of a range a write still out covers sees either.
+    pub fn submit_reads(&mut self, reads: Vec<(AlignedBuf, u64)>) -> Result<u64, DiskError> {
+        if self.out >= self.batches {
+            return Err(invalid(
+                &self.path,
+                "a batch past those the submitter attached for; take an answer first",
+            ));
+        }
+        self.send(reads, Kind::Read)
+    }
+
+    /// Sends a batch the submitter has room for, and counts it out.
+    fn send(&mut self, transfers: Vec<(AlignedBuf, u64)>, kind: Kind) -> Result<u64, DiskError> {
+        let number = self.next;
+        let gone = || stopped(&self.path, "the device's issuer has stopped");
+        self.events
+            .send(Event::Batch {
+                slot: self.slot,
+                generation: self.generation,
+                number,
+                transfers,
+                kind,
+            })
+            .map_err(|_| gone())?;
+        self.next = self.next.wrapping_add(1);
+        self.out = self.out.saturating_add(1);
+        Ok(number)
+    }
+
+    /// The next answer, waiting for it: the batch's number and its answer. Refused with no batch
+    /// out.
+    pub fn answer(&mut self) -> Result<Numbered, DiskError> {
+        if self.out == 0 {
+            return Err(invalid(&self.path, "an answer with no batch out"));
+        }
+        let answered = self
+            .answers
+            .recv()
+            .map_err(|_| stopped(&self.path, "the device's issuer has stopped"))?;
+        self.out = self.out.saturating_sub(1);
+        Ok(answered)
+    }
+
+    /// The next answer if one has come; none otherwise, or with no batch out.
+    pub fn try_answer(&mut self) -> Result<Option<Numbered>, DiskError> {
+        if self.out == 0 {
+            return Ok(None);
+        }
+        match self.answers.try_recv() {
+            Ok(answered) => {
+                self.out = self.out.saturating_sub(1);
+                Ok(Some(answered))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(stopped(&self.path, "the device's issuer has stopped"))
+            }
+        }
+    }
+
+    /// Batches submitted and not yet answered.
+    pub fn out(&self) -> usize {
+        self.out
+    }
+
+    /// The batches it may have out at once.
+    pub fn batches(&self) -> usize {
+        self.batches
     }
 }
 
@@ -399,6 +558,7 @@ fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
     let Transfer {
         slot,
         generation,
+        number,
         op,
     } = transfer;
     let file = match files.get(slot) {
@@ -423,6 +583,19 @@ fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
                 Err(_) => (Some((index, None)), Err(unwound())),
             }
         }
+        Op::Read { index, mut buf, at } => {
+            let issued = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                let result = file.map_or_else(
+                    || Err(missing()),
+                    |f| f.read_exact_at(buf.as_mut_slice(), at),
+                );
+                (buf, result)
+            }));
+            match issued {
+                Ok((buf, result)) => (Some((index, Some(buf))), result),
+                Err(_) => (Some((index, None)), Err(unwound())),
+            }
+        }
         Op::Flush => {
             let issued = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 file.map_or_else(|| Err(missing()), |f| f.sync_data())
@@ -433,19 +606,23 @@ fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
     Finished {
         slot,
         generation,
+        number,
         write,
         result,
     }
 }
 
-/// A submitter as the issuer keeps it: where its answers go, and its batch while one is out.
+/// A submitter as the issuer keeps it: where its answers go, and its batches out, at most the
+/// number it attached for.
 struct Client {
     generation: u64,
-    answers: SyncSender<Answer>,
-    batch: Option<Batch>,
+    answers: SyncSender<Numbered>,
+    limit: usize,
+    batches: VecDeque<Batch>,
 }
 
 struct Batch {
+    number: u64,
     /// Transfers issued or queued and not yet reported.
     outstanding: usize,
     buffers: Vec<Option<AlignedBuf>>,
@@ -474,8 +651,8 @@ struct Dispatch<'a> {
     /// Tasks handed to workers and not yet reported.
     in_flight: usize,
     /// Transfers waiting for a worker, in the order they arrived. Each attached submitter has
-    /// at most one batch out, so these are at most the attached submitters' batches, whose
-    /// buffers their submitters already hold.
+    /// at most the batches it attached for out, so these are at most those batches' transfers,
+    /// whose buffers their submitters already gave.
     pending: VecDeque<Transfer>,
     /// Indexed by slot. A slot is reused once every worker has dropped the file it held.
     clients: Vec<Option<Client>>,
@@ -516,10 +693,11 @@ impl<'a> Dispatch<'a> {
         match event {
             Event::Attach {
                 files,
+                batches,
                 answers,
                 reply,
             } => {
-                let attached = self.attach(files, answers);
+                let attached = self.attach(files, batches, answers);
                 let _ = reply.try_send(attached);
             }
             Event::Detach {
@@ -530,9 +708,10 @@ impl<'a> Dispatch<'a> {
             Event::Batch {
                 slot,
                 generation,
-                writes,
-                flush,
-            } => self.batch(slot, generation, writes, flush),
+                number,
+                transfers,
+                kind,
+            } => self.batch(slot, generation, number, transfers, kind),
             Event::Done { worker, report } => {
                 self.idle.push(worker);
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -553,7 +732,8 @@ impl<'a> Dispatch<'a> {
     fn attach(
         &mut self,
         files: Vec<Handle>,
-        answers: SyncSender<Answer>,
+        limit: usize,
+        answers: SyncSender<Numbered>,
     ) -> Result<(usize, u64), DiskError> {
         if self.stopping {
             return Err(stopped(self.path, "the device's issuer is stopping"));
@@ -584,7 +764,8 @@ impl<'a> Dispatch<'a> {
         let client = Some(Client {
             generation,
             answers,
-            batch: None,
+            limit,
+            batches: VecDeque::with_capacity(limit),
         });
         match self.clients.get_mut(slot) {
             Some(free) => *free = client,
@@ -598,7 +779,7 @@ impl<'a> Dispatch<'a> {
             let _ = done.try_send(());
             return;
         }
-        // The submitter waits for nothing once it detaches; its batch, if any, has ended.
+        // The submitter waits for nothing once it detaches; its batches, if any, have ended.
         if let Some(client) = self.clients.get_mut(slot) {
             *client = None;
         }
@@ -635,29 +816,38 @@ impl<'a> Dispatch<'a> {
         }
     }
 
-    fn batch(&mut self, slot: usize, generation: u64, writes: Vec<(AlignedBuf, u64)>, flush: bool) {
+    fn batch(
+        &mut self,
+        slot: usize,
+        generation: u64,
+        number: u64,
+        transfers: Vec<(AlignedBuf, u64)>,
+        kind: Kind,
+    ) {
+        let flush = kind == Kind::Write { flush: true };
         let refused = self.stopping;
         let path = self.path;
         let Some(client) = self.client(slot, generation) else {
             // Not attached: the submitter's answers went with it.
             return;
         };
-        if refused || client.batch.is_some() {
+        if refused || client.batches.len() >= client.limit {
             let why = if refused {
                 "the device's issuer is stopping"
             } else {
-                "a second batch while one is out"
+                "a batch past those its submitter attached for"
             };
-            let _ = client.answers.try_send(Err(stopped(path, why)));
+            let _ = client.answers.try_send((number, Err(stopped(path, why))));
             return;
         }
-        let count = writes.len();
+        let count = transfers.len();
         if count == 0 && !flush {
-            let _ = client.answers.try_send(Ok(Vec::new()));
+            let _ = client.answers.try_send((number, Ok(Vec::new())));
             return;
         }
         let outstanding = if count == 0 { 1 } else { count };
-        client.batch = Some(Batch {
+        client.batches.push_back(Batch {
+            number,
             outstanding,
             buffers: std::iter::repeat_with(|| None).take(count).collect(),
             failed: None,
@@ -667,14 +857,20 @@ impl<'a> Dispatch<'a> {
             self.pending.push_back(Transfer {
                 slot,
                 generation,
+                number,
                 op: Op::Flush,
             });
         }
-        for (index, (buf, at)) in writes.into_iter().enumerate() {
+        for (index, (buf, at)) in transfers.into_iter().enumerate() {
+            let op = match kind {
+                Kind::Write { .. } => Op::Write { index, buf, at },
+                Kind::Read => Op::Read { index, buf, at },
+            };
             self.pending.push_back(Transfer {
                 slot,
                 generation,
-                op: Op::Write { index, buf, at },
+                number,
+                op,
             });
         }
     }
@@ -692,13 +888,17 @@ impl<'a> Dispatch<'a> {
         let Finished {
             slot,
             generation,
+            number,
             write,
             result,
         } = finished;
         let Some(client) = self.client(slot, generation) else {
             return;
         };
-        let Some(batch) = client.batch.as_mut() else {
+        let Some(at) = client.batches.iter().position(|b| b.number == number) else {
+            return;
+        };
+        let Some(batch) = client.batches.get_mut(at) else {
             return;
         };
         if let Some((index, buf)) = write
@@ -719,16 +919,17 @@ impl<'a> Dispatch<'a> {
             self.pending.push_back(Transfer {
                 slot,
                 generation,
+                number,
                 op: Op::Flush,
             });
             return;
         }
-        if let Some(batch) = client.batch.take() {
+        if let Some(batch) = client.batches.remove(at) {
             let answer = match batch.failed {
                 Some(e) => Err(e),
                 None => Ok(batch.buffers.into_iter().flatten().collect()),
             };
-            let _ = client.answers.try_send(answer);
+            let _ = client.answers.try_send((number, answer));
         }
     }
 
@@ -740,13 +941,14 @@ impl<'a> Dispatch<'a> {
     /// Fails `transfer`'s batch with `why`, giving its buffer back.
     fn failed(&mut self, transfer: Transfer, why: &str) {
         let write = match transfer.op {
-            Op::Write { index, buf, .. } => Some((index, Some(buf))),
+            Op::Write { index, buf, .. } | Op::Read { index, buf, .. } => Some((index, Some(buf))),
             Op::Flush => None,
         };
         let path = self.path;
         self.finished(Finished {
             slot: transfer.slot,
             generation: transfer.generation,
+            number: transfer.number,
             write,
             result: Err(stopped(path, why)),
         });
@@ -1034,6 +1236,148 @@ mod tests {
         let c = probe.counts;
         assert_eq!(c.most.load(Ordering::SeqCst), 2);
         assert_eq!(c.flushes.load(Ordering::SeqCst), 3);
+    }
+
+    /// A submitter attached for two batches has both out at once, their writes in flight
+    /// together; a third is refused before anything is sent; each answer names its batch and
+    /// gives back that batch's buffers; and a blocking write is refused while batches are out.
+    #[test]
+    fn submitted_batches_are_out_together_and_each_answer_names_its_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 4).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        assert!(issuer.attach_deep(&probe, 0).is_err());
+        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
+        assert_eq!(attached.batches(), 2);
+        let first = attached.submit(writes(2), false).unwrap();
+        let mut second = writes(4);
+        second.drain(..2);
+        let second = attached.submit(second, true).unwrap();
+        assert_eq!((first, second, attached.out()), (0, 1, 2));
+        // Both batches' writes are on the device's workers at once.
+        probe.entered(4);
+        assert_eq!(probe.counts.in_flight.load(Ordering::SeqCst), 4);
+        assert!(attached.submit(writes(1), false).is_err());
+        assert_eq!(attached.out(), 2);
+        assert!(attached.write(writes(1), false).is_err());
+        assert!(attached.try_answer().unwrap().is_none());
+        probe.open();
+        let mut answers = [attached.answer().unwrap(), attached.answer().unwrap()];
+        answers.sort_by_key(|(n, _)| *n);
+        let [(n0, a0), (n1, a1)] = answers;
+        assert_eq!((n0, n1), (0, 1));
+        let (a0, a1) = (a0.unwrap(), a1.unwrap());
+        assert_eq!(
+            a0.iter().map(|b| b.as_slice()[0]).collect::<Vec<_>>(),
+            [fill(0), fill(1)]
+        );
+        assert_eq!(
+            a1.iter().map(|b| b.as_slice()[0]).collect::<Vec<_>>(),
+            [fill(2), fill(3)]
+        );
+        assert_eq!(attached.out(), 0);
+        assert!(attached.answer().is_err());
+        assert!(attached.try_answer().unwrap().is_none());
+        // The second batch's flush followed its own writes.
+        assert_eq!(probe.counts.flushes.load(Ordering::SeqCst), 1);
+        // Out of batches, the submitter writes as one with a single batch does.
+        assert_eq!(attached.write(writes(1), true).unwrap().len(), 1);
+    }
+
+    /// Empty page buffers to read `n` pages into, at offsets `first..first + n` pages.
+    fn reads(first: usize, n: usize) -> Vec<(AlignedBuf, u64)> {
+        (first..first + n)
+            .map(|i| {
+                let mut buf = AlignedBuf::zeroed(4096, Alignment::new(4096).unwrap()).unwrap();
+                buf.set_len(4096).unwrap();
+                (buf, (i * 4096) as u64)
+            })
+            .collect()
+    }
+
+    /// Do: write four pages and take the answer, then read them back in one batch. Expect: the
+    /// read batch's answer gives every buffer back, in order, holding its page's bytes.
+    #[test]
+    fn a_read_returns_the_bytes_an_answered_write_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 4).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach_deep(&probe, 1).unwrap();
+        attached.write(writes(4), true).unwrap();
+        let number = attached.submit_reads(reads(0, 4)).unwrap();
+        let (answered, bufs) = attached.answer().unwrap();
+        assert_eq!(answered, number);
+        let bufs = bufs.unwrap();
+        assert_eq!(bufs.len(), 4);
+        for (i, buf) in bufs.iter().enumerate() {
+            assert!(
+                buf.as_slice().iter().all(|&b| b == fill(i)),
+                "page {i} read back other bytes"
+            );
+        }
+    }
+
+    /// Do: write pages 0 to 3 and take the answer; hold a batch of writes to pages 4 to 7 on the
+    /// device's workers; read pages 0 to 3 while they are held. Expect: the reads are answered,
+    /// with the answered writes' bytes, while the writes to the other offsets are still in
+    /// flight; then the writes are answered once let go.
+    #[test]
+    fn reads_complete_while_writes_to_other_offsets_are_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 8).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
+        attached.write(writes(4), false).unwrap();
+        probe.counts.open.store(false, Ordering::SeqCst);
+        let mut later = writes(8);
+        later.drain(..4);
+        let held = attached.submit(later, true).unwrap();
+        probe.entered(8);
+        assert_eq!(probe.counts.in_flight.load(Ordering::SeqCst), 4);
+        let read = attached.submit_reads(reads(0, 4)).unwrap();
+        let (answered, bufs) = attached.answer().unwrap();
+        assert_eq!(answered, read, "the held writes were answered first");
+        assert_eq!(probe.counts.in_flight.load(Ordering::SeqCst), 4);
+        for (i, buf) in bufs.unwrap().iter().enumerate() {
+            assert!(buf.as_slice().iter().all(|&b| b == fill(i)));
+        }
+        probe.open();
+        let (answered, written) = attached.answer().unwrap();
+        assert_eq!(answered, held);
+        assert_eq!(written.unwrap().len(), 4);
+    }
+
+    /// Do: read a page past the end of the file, beside one inside it. Expect: the batch fails as a
+    /// whole with the short read's error, and nothing is left out.
+    #[test]
+    fn a_read_past_the_end_fails_its_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach_deep(&probe, 1).unwrap();
+        attached.write(writes(1), false).unwrap();
+        let mut batch = reads(0, 1);
+        batch.extend(reads(8, 1));
+        attached.submit_reads(batch).unwrap();
+        let (_, answer) = attached.answer().unwrap();
+        assert!(answer.is_err(), "a read past the end was answered");
+        assert_eq!(attached.out(), 0);
+    }
+
+    /// Do: hold a batch of writes, which fills the one batch the submitter attached for, and submit
+    /// reads. Expect: the reads are refused before anything is sent; reads count among the
+    /// batches out, as writes do.
+    #[test]
+    fn reads_past_the_batches_attached_for_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut attached = issuer.attach_deep(&probe, 1).unwrap();
+        attached.submit(writes(1), false).unwrap();
+        assert!(attached.submit_reads(reads(0, 1)).is_err());
+        assert_eq!(attached.out(), 1);
+        probe.open();
+        attached.answer().unwrap().1.unwrap();
     }
 
     /// Detaching gives every duplicate back before it returns; once the issuer is dropped, a

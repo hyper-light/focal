@@ -620,13 +620,14 @@ fn route(cluster: &mut Cluster, carried: impl Fn(&crate::Message) -> bool) {
     panic!("message delivery failed to quiesce");
 }
 
-/// A leader does not propose its own leaving, and a change that removes a
-/// member can still come to be applied by that member as leader: proposed by
-/// the one that led before it. It then hands the group to a voter that holds
-/// the whole log and follows (27 §5). The core focal ran on before left it
-/// leading a group it was no member of.
+/// A leader does not propose its own leaving, and a member removed by another
+/// never leads a group it is not in: the leader counts by the change once its
+/// log holds it and replicates it only to those it keeps (hyper-raft 83f193a;
+/// Ongaro's thesis §4.1), and the removed member, never told, campaigns into
+/// logs longer than its own (27 §5). The core focal ran on before left a
+/// removed leader leading a group it was no member of.
 #[test]
-fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
+fn a_removed_member_never_told_never_leads_a_group_it_is_not_in() {
     use crate::{ConfChangeSingle, ConfChangeType, ConfChangeV2, ConsensusError, MembershipChange};
     let mut cluster = Cluster::new();
     elect(&mut cluster, 0);
@@ -646,10 +647,10 @@ fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
             Err(ConsensusError::LeaderLeaving)
         ));
     }
-    // Node 1 proposes that node 2 leaves. Node 2 holds the entry, and its
-    // answer is lost with node 1.
+    // Node 1 proposes that node 2 leaves. It counts by the change once its log holds it
+    // (hyper-raft 83f193a; Ongaro's thesis §4.1), so it replicates to node 3 alone and commits with
+    // it: node 2 never hears of its removal.
     let expected = cluster.nodes[0].membership_configuration();
-    let committed = cluster.nodes[0].status().committed_index;
     cluster.nodes[0]
         .propose_membership(
             &expected,
@@ -657,63 +658,33 @@ fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
             b"leave".to_vec(),
         )
         .unwrap();
-    route(&mut cluster, |message| message.from == 1 && message.to == 2);
-    assert_eq!(cluster.nodes[0].status().committed_index, committed);
-    // Node 2 is elected by node 3: its log is the longer.
-    let elected = {
-        let mut elected = false;
-        for _ in 0..ROUNDS {
-            for (node, timeout) in [(1usize, 10usize), (2, 19)] {
-                cluster.nodes[node]
-                    .log_mut()
-                    .raw
-                    .raft
-                    .set_randomized_election_timeout(timeout)
-                    .unwrap();
-                cluster.nodes[node].tick().unwrap();
-            }
-            route(&mut cluster, |message| message.from != 1 && message.to != 1);
-            let status = cluster.nodes[1].status();
-            // It led, committed its own removal with node 3, applied it and
-            // follows: no tick passed in between.
-            if status.term > 1 && !status.voters.contains(&2) {
-                elected = true;
-                break;
-            }
-            assert_ne!(
-                (status.role, status.voters.contains(&2)),
-                (StateRole::Leader, false),
-                "node 2 leads a group it is not in"
+    route(&mut cluster, |_| true);
+    for node in [0, 2] {
+        assert_eq!(cluster.nodes[node].status().voters, vec![1, 3]);
+    }
+    assert_eq!(cluster.nodes[1].status().voters, vec![1, 2, 3]);
+    // Node 2, hearing nothing, campaigns as often as its timer lets it: the two whose logs are
+    // longer refuse it, and it never leads a group it is not in, nor unseats the leader.
+    let none_in_it = |cluster: &Cluster| {
+        for node in &cluster.nodes {
+            let status = node.status();
+            assert!(
+                status.role != StateRole::Leader || status.voters.contains(&status.node_id),
+                "node {} leads a group it is not in",
+                status.node_id
             );
         }
-        elected
     };
-    assert!(elected, "node 2 never led");
-    let status = cluster.nodes[1].status();
-    assert_eq!(status.role, StateRole::Follower);
-    assert_eq!(status.voters, vec![1, 3]);
-    assert!(!cluster.nodes[1].failed());
-    // Node 3 was told to campaign and needs node 1, which is back.
-    let term = cluster.nodes[2].status().term;
-    assert!(term > status.term, "node 3 was not told to campaign");
-    let led = run_until(
-        &mut cluster,
-        0,
-        [10, 10, 10],
-        |cluster| leads(cluster, 3, 0),
-        |cluster| {
-            for node in &cluster.nodes {
-                let status = node.status();
-                assert!(
-                    status.role != StateRole::Leader || status.voters.contains(&status.node_id),
-                    "node {} leads a group it is not in",
-                    status.node_id
-                );
-            }
-        },
+    // Every round of the run, checked: it ends only at its bound, since no fact ends it early.
+    let _ = run_until(&mut cluster, 0, [19, 10, 19], |_| false, none_in_it);
+    assert!(
+        leads(&cluster, 1, 0) || leads(&cluster, 3, 0),
+        "the group has no leader: {:?}",
+        leaders(&cluster)
     );
-    assert!(led, "the group has no leader: {:?}", leaders(&cluster));
-    cluster.nodes[2].propose(b"after".to_vec()).unwrap();
+    assert_ne!(cluster.nodes[1].status().role, StateRole::Leader);
+    let leader = if leads(&cluster, 1, 0) { 0 } else { 2 };
+    cluster.nodes[leader].propose(b"after".to_vec()).unwrap();
     route(&mut cluster, |_| true);
     for applied in [&cluster.applied[0], &cluster.applied[2]] {
         assert!(applied.iter().any(|entry| entry == b"before"));

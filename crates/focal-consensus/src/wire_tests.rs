@@ -1,5 +1,5 @@
 //! The fields focal's peers carry beyond raft-rs's (`Wire`, 27 §15.9): a refusal's `kept`
-//! (field 17, R17) and `lost` (field 18), carried only once the upgrade fence opens
+//! (field 17, R17), `lost` (field 18) and a leader's `classic` (field 19), carried only once the upgrade fence opens
 //! `RAFT_KEPT_LEVEL`. Their bytes; raft-rs's own reader skipping them; the reader below the fence
 //! skipping `kept` and refusing `lost`; and groups whose members raise their wire at different
 //! moments, across a leader change and with the fence raised during traffic, converging with
@@ -86,6 +86,37 @@ fn below_the_fence_kept_is_skipped_and_lost_refused() {
         Err(EnvelopeError::Unstated("a member's mark"))
     );
     assert_eq!(decode_message_in(&lost_bytes, Wire::Kept).unwrap(), lost);
+}
+
+/// A leader's classic commit (hyper-raft `Message::classic`) is field 19 at or above the fence. Below
+/// it the field is left out, not refused, since every append of a leader holds one, and a reader
+/// below the fence skips it: either way the member reads nothing known, and releases nothing it
+/// approved by itself, which costs room and never safety. raft-rs's reader skips it too.
+#[test]
+fn a_leaders_classic_commit_is_field_19_and_nothing_below_the_fence() {
+    let mut append = proto::message(2, MessageType::MsgAppend);
+    append.from = 1;
+    append.term = 4;
+    append.commit = 30;
+    append.classic = Some(25);
+    let mut plain = append.clone();
+    plain.classic = None;
+    let frozen = encode_message_in(&append, Wire::Frozen).unwrap();
+    assert_eq!(frozen, encode_message_in(&plain, Wire::Frozen).unwrap());
+    let kept = encode_message_in(&append, Wire::Kept).unwrap();
+    // Field 19, a varint: the key (19 << 3 | 0 = 152) in two bytes, then 25.
+    assert_eq!(&kept[..frozen.len()], &frozen[..]);
+    assert_eq!(&kept[frozen.len()..], &[0x98, 0x01, 25]);
+    assert_eq!(decode_message_in(&kept, Wire::Kept).unwrap(), append);
+    assert_eq!(decode_message_in(&kept, Wire::Frozen).unwrap(), plain);
+    assert_eq!(decode_message_in(&frozen, Wire::Kept).unwrap(), plain);
+    let mut read = eraftpb::Message::default();
+    read.merge_from_bytes(&kept).unwrap();
+    assert_eq!(read.write_to_bytes().unwrap(), frozen);
+    // Nothing known and a classic commit of zero are one: neither takes a byte.
+    let mut zero = append.clone();
+    zero.classic = Some(0);
+    assert_eq!(encode_message_in(&zero, Wire::Kept).unwrap(), frozen);
 }
 
 /// Members whose entries are at most 1 KiB, so that an append of a page (the entry's bytes and

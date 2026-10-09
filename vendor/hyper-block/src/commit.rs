@@ -26,15 +26,30 @@
 
 use std::time::Duration;
 
-/// The unit of the return counts and of `p`: one.
-pub const RATE_ONE: u64 = 1 << 16;
+/// The unit of the return counts and of `p`: one. It sets how many submitters a batch may
+/// answer and still be learned from exactly ([`MAX_ANSWERED`]): `N` answered submitters steady
+/// the count of answered at `8·N·RATE_ONE` under the gain of 1/8, which must fit a `u64`, and one
+/// returner among them moves `p` by `RATE_ONE/(8·N)`, which must be at least one unit. The first
+/// bound falls and the second rises with the unit; 2^32 is where they meet, so it admits the
+/// most submitters.
+pub const RATE_ONE: u64 = 1 << 32;
+
+/// The most submitters one batch may answer for `p` to be both held in a `u64` and resolved to
+/// one returner ([`RATE_ONE`]): `min(RATE_ONE/8, ⌊(2^64 − 1)/(8·RATE_ONE)⌋)`, 2^29 − 1. A writer
+/// whose batches answer more learns `p` saturated rather than exactly, so it bounds its batches
+/// by this.
+pub const MAX_ANSWERED: u64 = {
+    let resolved = RATE_ONE / 8;
+    let held = u64::MAX / 8 / RATE_ONE;
+    if resolved < held { resolved } else { held }
+};
 
 /// What a group-commit writer has learned of its batches and submitters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Anticipation {
     /// Moving average of a batch's service time, in nanoseconds; zero until one is measured.
     service_ns: u64,
-    /// Running counts, in 1/2^16ths and decaying by 1/8 a batch, of answered submitters that
+    /// Running counts, in units of [`RATE_ONE`] and decaying by 1/8 a batch, of answered submitters that
     /// returned while the writer waited and of submitters answered.
     returns: (u64, u64),
 }
@@ -101,10 +116,11 @@ impl Anticipation {
 
     /// `p`: the share of answered submitters that return while the writer waits.
     fn return_share(&self) -> u64 {
-        self.returns
-            .0
-            .saturating_mul(RATE_ONE)
-            .checked_div(self.returns.1)
+        // The returned count times the unit passes a `u64` once counts reach 2^32: in `u128`.
+        u128::from(self.returns.0)
+            .saturating_mul(u128::from(RATE_ONE))
+            .checked_div(u128::from(self.returns.1))
+            .and_then(|p| u64::try_from(p).ok())
             .unwrap_or(RATE_ONE / 2)
             .min(RATE_ONE)
     }
@@ -143,6 +159,31 @@ mod tests {
             "{:?}",
             a.wait(1)
         );
+    }
+
+    /// The bound is where the two limits meet, and at it the counts stay within a `u64` while
+    /// one returner still moves `p`.
+    #[test]
+    fn one_returner_among_the_most_answered_still_moves_the_share() {
+        assert_eq!(MAX_ANSWERED, (1 << 29) - 1);
+        assert!(MAX_ANSWERED.checked_mul(8 * RATE_ONE).is_some());
+        let mut none = Anticipation::new();
+        let mut one = Anticipation::new();
+        // Until the counts settle: a gain of 1/8 leaves (7/8)^k of the start, under one unit of
+        // a count below 2^64 once k > 64·ln 2 / ln(8/7) ≈ 332.2.
+        let mut settled = false;
+        for _ in 0..333 {
+            let before = (none, one);
+            none.learn(MAX_ANSWERED, 0);
+            one.learn(MAX_ANSWERED, 1);
+            if (none, one) == before {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the counts did not settle");
+        assert!(one.returns.1 < u64::MAX, "the answered count saturated");
+        assert!(one.return_share() > none.return_share());
     }
 
     #[test]

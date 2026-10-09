@@ -190,6 +190,10 @@ pub(crate) struct Owner<F> {
     fenced: bool,
     /// The device, while no thread does I/O with it.
     device: Option<Device<F>>,
+    /// A sealed log's keys: its sessions, their openers and its framing MAC (`crate::seal`).
+    seal: Option<crate::seal::Sealer>,
+    /// The owner's admission for the file to grow, where it states one (`crate::growth`).
+    gate: Option<crate::growth::Gate>,
     /// I/O waiting for the device, in the order asked: at most [`crate::device::JOBS`].
     io: VecDeque<Waiting<F>>,
     /// Where jobs come back, with the device, from the thread that did them; read before every
@@ -250,7 +254,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         room: Room,
         restores: Vec<Submission>,
         wiring: Wiring<F>,
+        seal: Option<crate::seal::Sealer>,
+        gate: Option<crate::growth::Gate>,
     ) -> Self {
+        let mut state = state;
+        if gate.is_some() {
+            // The file may grow past its slots only as its owner admits.
+            state.ceiling = u32::try_from(state.segments.incarnation.len()).unwrap_or(u32::MAX);
+        }
         let Wiring {
             device,
             more,
@@ -274,6 +285,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             buffers: Buffers::new(),
             fenced: false,
             device: Some(device),
+            seal,
+            gate,
             io: VecDeque::new(),
             returns,
             tokens: Some(tokens),
@@ -634,8 +647,13 @@ impl<F: BlockFile + 'static> Owner<F> {
         ticket.answer(answer);
     }
 
-    /// Fences the log: no submission is taken from here on, and every waiter hears it.
+    /// Fences the log: no submission is taken from here on, and every waiter hears it. What
+    /// the owner admitted for the file to grow and is not durable goes back first: nothing more
+    /// is written.
     fn fence(&mut self) {
+        if let Some(gate) = self.gate.as_mut() {
+            gate.release_pending(&mut self.state);
+        }
         self.fenced = true;
         let mut fenced = Vec::new();
         self.room.fence(&mut fenced);

@@ -90,6 +90,8 @@ pub struct SimStats {
     pub writes: u64,
     /// Flushes issued.
     pub syncs: u64,
+    /// Writes made durable on their own (`BlockFile::write_durable_at`), each also counted a write.
+    pub durable_writes: u64,
     /// Crashes the test made.
     pub crashes: u64,
 }
@@ -366,6 +368,35 @@ impl BlockFile for SimFile {
         Ok(())
     }
 
+    /// The sim stands for a direct file on Linux, so that one run's bytes are every platform's.
+    fn fills_new_space(&self) -> bool {
+        true
+    }
+
+    /// The write, durable on its own as a FUA write is: its sectors reach the medium before it
+    /// returns, and every other sector not yet flushed stays as it was, durable at the next flush
+    /// or not at a crash. One operation, as a power cut counts it.
+    fn write_durable_at(
+        &self,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<crate::block::Durable, DiskError> {
+        self.write_all_at(buf, offset)?;
+        let mut state = self.lock()?;
+        state.stats.durable_writes = state.stats.durable_writes.saturating_add(1);
+        if buf.is_empty() {
+            return Ok(crate::block::Durable::Written);
+        }
+        let end = offset.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        let first = offset.checked_div(self.sector).unwrap_or(0);
+        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
+        for sector in first..=last {
+            state.dirty.remove(&sector);
+            persist_sector(&mut state, sector, self.sector);
+        }
+        Ok(crate::block::Durable::Written)
+    }
+
     fn sync_data(&self) -> Result<(), DiskError> {
         let mut state = self.lock()?;
         state.stats.syncs = state.stats.syncs.saturating_add(1);
@@ -422,6 +453,37 @@ mod tests {
 
     fn bytes(b: &AlignedBuf) -> Vec<u8> {
         b.as_slice().to_vec()
+    }
+
+    /// A write made durable on its own survives a power cut; a write before it that no flush has
+    /// made durable does not, as with a FUA write; both survive the next flush; and the durable
+    /// write is one operation, counted once.
+    #[test]
+    fn a_durable_write_persists_itself_and_nothing_else() {
+        let f = file(11);
+        let (one, two, three) = (block(1), block(2), block(3));
+        f.write_all_at(one.as_slice(), 0).unwrap();
+        f.sync_data().unwrap();
+        f.write_all_at(two.as_slice(), 4096).unwrap();
+        assert_eq!(
+            f.write_durable_at(three.as_slice(), 8192).unwrap(),
+            crate::block::Durable::Written
+        );
+        let stats = f.stats().unwrap();
+        assert_eq!((stats.writes, stats.syncs, stats.durable_writes), (3, 1, 1));
+        let image = f.durable_image().unwrap();
+        assert_eq!(&image[..4096], bytes(&block(1)).as_slice());
+        assert!(
+            image[4096..8192].iter().all(|&b| b == 0),
+            "the unflushed write was made durable"
+        );
+        assert_eq!(&image[8192..12288], bytes(&block(3)).as_slice());
+        f.crash(Crash::LoseAll).unwrap();
+        let mut back = block(0);
+        f.read_exact_at(back.as_mut_slice(), 8192).unwrap();
+        assert_eq!(bytes(&back), bytes(&block(3)));
+        f.read_exact_at(back.as_mut_slice(), 4096).unwrap();
+        assert_eq!(bytes(&back), vec![0; 4096]);
     }
 
     #[test]

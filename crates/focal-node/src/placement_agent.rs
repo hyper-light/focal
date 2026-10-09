@@ -30,6 +30,7 @@ use crate::{
         FirstSessionPlan, HostedSessionFacts, SessionRegistrationError, control_evidence,
     },
 };
+use focal_consensus::NodeStorage;
 use focal_consensus::{ConsensusError, DurableNode, NodeConfig};
 use focal_control::{
     ControlAuthoritySnapshot, ControlBootstrap, ControlCommand, ControlFailure, ControlRead,
@@ -43,7 +44,6 @@ use focal_directory::{
 };
 use focal_enrollment::{CredentialMaterial, PrivateJournal};
 use focal_ledger::{LedgerError, Session, SessionLimits};
-use focal_log::SharedWal;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{
     ContentHash, LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch, TenantId,
@@ -367,7 +367,8 @@ pub struct AgentInputs {
     /// The tenants this node hosts and the allowance installed copies of
     /// each are charged to.
     pub admission: TenantAdmission,
-    pub wal: SharedWal,
+    /// Where the node's groups live: every copy this agent installs opens through it.
+    pub storage: NodeStorage,
     /// Signing and collection jobs, served with the node credential.
     pub jobs: mpsc::Receiver<AgentJob>,
 }
@@ -390,7 +391,7 @@ pub struct PlacementAgent {
     pending_custody: BTreeMap<LedgerId, CustodyScope>,
     node_budget: MemoryBudget,
     admission: TenantAdmission,
-    wal: SharedWal,
+    storage: NodeStorage,
     budget: MemoryBudget,
     jobs: Option<mpsc::Receiver<AgentJob>>,
     journals: Option<Journals>,
@@ -505,7 +506,7 @@ impl PlacementAgent {
             active_custody,
             node_budget,
             admission,
-            wal,
+            storage,
             jobs,
         } = inputs;
         // Covers the bounded partition and authority projections, the
@@ -535,7 +536,7 @@ impl PlacementAgent {
             node_regions: BTreeMap::new(),
             node_budget,
             admission,
-            wal,
+            storage,
             budget,
             jobs: Some(jobs),
             journals: None,
@@ -1363,7 +1364,7 @@ impl PlacementAgent {
         }
         let report = self
             .admission
-            .report(&self.wal.disk_budget().stats(), &BTreeMap::new());
+            .report(&self.storage.disk_budget().stats(), &BTreeMap::new());
         let overloaded = report.memory_used.saturating_mul(20)
             >= report.memory_limit.saturating_mul(19)
             || report
@@ -1601,7 +1602,7 @@ impl PlacementAgent {
         // before the copy was recorded; after a restart the record is the
         // admission, under the same node bound and budget.
         let tenant = self.admit_tenant(handles, ledger.tenant).await?;
-        let consensus = DurableNode::open_on_wal_in(
+        let consensus = self.storage.open_member(
             NodeConfig::joining(
                 self.state.node,
                 self.state.genesis.founder.cluster,
@@ -1609,8 +1610,8 @@ impl PlacementAgent {
                 copy.bootstrap_voters.clone(),
                 Vec::new(),
             ),
-            self.wal.clone(),
             &tenant,
+            focal_ledger::entry_needs,
         )?;
         self.attach_copy(handles, ledger, copy, consensus, &tenant)
             .await
@@ -1626,8 +1627,11 @@ impl PlacementAgent {
     ) -> Result<ReplicaHost, AgentError> {
         let mut identity = self.identity.clone();
         identity.ledger = ledger;
-        let hosting =
-            crate::network_service::native_hosting(&self.root, &identity, self.wal.disk_budget())?;
+        let hosting = crate::network_service::native_hosting(
+            &self.root,
+            &identity,
+            self.storage.disk_budget(),
+        )?;
         let session = Session::from_node_in_hosted(
             ledger,
             consensus,
@@ -2539,7 +2543,7 @@ impl PlacementAgent {
         let limits = crate::network_service::native_limits(domain)?;
         let decoder = focal_ledger::backup::decoder_pair();
         let seed_root = crate::custody::seed_directory(&self.root.join("seeds"), ledger);
-        let disk = self.wal.disk_budget();
+        let disk = self.storage.disk_budget();
         let content_root = self.root.join("content");
         let input = request.input.clone();
         let manifest_for_rewrite = manifest.clone();
@@ -2583,10 +2587,10 @@ impl PlacementAgent {
         .await
         .map_err(|_| AgentError::Runtime)??;
         crate::fault::hit(crate::fault::FaultSite::RestoreImported);
-        let consensus = DurableNode::restore_on_wal_in(
+        let consensus = self.storage.restore_member(
             NodeConfig::single(node, cluster, group),
-            self.wal.clone(),
             &tenant,
+            focal_ledger::entry_needs,
             focal_consensus::RestoredLog {
                 index: rewritten.index,
                 term: rewritten.term,
@@ -2832,7 +2836,7 @@ impl PlacementAgent {
             active_weight: u64::try_from(handles.fleet.status().installed).unwrap_or(u64::MAX),
             // Free bytes of the data volume that no queued durable write has
             // been promised, as the disk envelope estimates them.
-            disk_available: self.wal.available_bytes().unwrap_or(0),
+            disk_available: self.storage.available_bytes().unwrap_or(0),
             capability,
         };
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
@@ -3172,7 +3176,12 @@ impl PlacementAgent {
             || (ledger == handles.directory.namespace()
                 && handles.directory.host_of_group(group).is_some());
         if voters.contains(&node) && hosts {
-            let permit = crate::placement_control::prepare_session_fact(
+            // Its own refusal is one voter's, as a remote voter's is: the
+            // majority decides, never one node. A member its group removed
+            // and never told (hyper-raft 83f193a: a leader stops sending to
+            // it once its log holds the change) cannot witness the change
+            // that removed it, and the others still can.
+            let local = match crate::placement_control::prepare_session_fact(
                 &handles.fleet,
                 &handles.control,
                 &handles.directory,
@@ -3180,9 +3189,15 @@ impl PlacementAgent {
                 fact.clone(),
                 window,
             )
-            .await?;
-            let local = permit.sign(&self.credentials)?;
-            if collected.merge(local.proof().clone())? {
+            .await
+            {
+                Ok(permit) => Some(permit.sign(&self.credentials)?),
+                Err(PlacementProofError::Unauthorized | PlacementProofError::Unavailable) => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(local) = local
+                && collected.merge(local.proof().clone())?
+            {
                 return collected.finish();
             }
         }
@@ -3225,7 +3240,7 @@ impl PlacementAgent {
         AgentStatus {
             admission: self
                 .admission
-                .report(&self.wal.disk_budget().stats(), &usage),
+                .report(&self.storage.disk_budget().stats(), &usage),
             node: self.state.node,
             root_intents: self.journals.as_ref().map_or(0, |j| j.root.completed()),
             partition_intents: self.journals.as_ref().map_or(0, |j| {

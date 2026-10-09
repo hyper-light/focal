@@ -51,7 +51,7 @@ async fn setup(path: &std::path::Path) -> (FoundingNetwork, Settings, Session, F
     let id = network.directory.identity().clone();
     let consensus = DurableNode::open_on_wal(
         NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
-        network.wal.clone(),
+        crate::storage_start::test_wal(&network.storage.storage).clone(),
     )
     .unwrap();
     let mut session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();
@@ -247,7 +247,7 @@ async fn founder_registration_preserves_existing_application_and_replays_exact_m
     );
     let permit = host.prepare_directory(partition_plan).await.unwrap();
     let mut partition = permit
-        .open(network.wal.clone(), &budget(), None)
+        .open(network.storage.storage.clone(), &budget(), None)
         .unwrap()
         .into_replica();
     let window = ProofWindow {
@@ -317,7 +317,7 @@ async fn founder_registration_preserves_existing_application_and_replays_exact_m
     drop(partition);
     let permit = host.prepare_directory(partition_plan).await.unwrap();
     let partition = permit
-        .open(network.wal.clone(), &budget(), None)
+        .open(network.storage.storage.clone(), &budget(), None)
         .unwrap()
         .into_replica();
     let (state, installed) = views(&partition);
@@ -333,7 +333,7 @@ async fn founder_registration_preserves_existing_application_and_replays_exact_m
     drop(session);
     let consensus = DurableNode::open_on_wal(
         NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
-        network.wal.clone(),
+        crate::storage_start::test_wal(&network.storage.storage).clone(),
     )
     .unwrap();
     let session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();

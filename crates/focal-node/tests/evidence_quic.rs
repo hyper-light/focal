@@ -418,7 +418,7 @@ impl Fleet {
                 let (manager, owner, channel) = ReplicaFleet::spawn_managed(
                     id,
                     [91; 16],
-                    vec![wal],
+                    vec![focal_consensus::NodeStorage::Wal(wal)],
                     vec![FleetTenant {
                         tenant: ledger().tenant,
                         weight: 1,

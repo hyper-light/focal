@@ -15,6 +15,9 @@ use std::{
 };
 use tokio::sync::{mpsc as async_mpsc, oneshot, watch};
 
+/// Entries a control group applies past its last checkpoint before it checkpoints again
+/// ([`ControlHostConfig::checkpoint_interval`]'s default).
+pub const CHECKPOINT_INTERVAL: u64 = 1024;
 #[derive(Debug, Clone)]
 pub struct ControlHostConfig {
     /// Dedicated server-owned metadata namespace; never inferred from a request.
@@ -48,7 +51,7 @@ impl ControlHostConfig {
             tick: Duration::from_millis(100),
             tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
-            checkpoint_interval: 1024,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
             enrollment_authority: None,
         }
     }
@@ -756,6 +759,14 @@ impl ControlHost {
         self.pace.publish(pace);
         pace
     }
+    /// The exchange tail a commit of the root waits on among its voters,
+    /// from the tails measured with the other voters
+    /// (`PeerConnectionPool::exchange_tail`) and how many voters there are,
+    /// this node among them; given beyond a request's time (27 §8.4).
+    pub fn quorum(&self, tails: Vec<Duration>, voters: usize) {
+        self.pace
+            .publish_quorum_tail(crate::pace::quorum_tail(tails, voters));
+    }
     /// The periods the owner has run; what a wait on it is charged in
     /// (27 §3.1 P8).
     pub fn periods(&self) -> u64 {
@@ -985,6 +996,13 @@ impl<V: AuthorityVerifier> Owner<V> {
                     self.replica.set_patience(
                         self.pace
                             .patience(self.config.tick, self.config.tick_ceiling),
+                    )?;
+                    // And what its voters' answers take beyond its own periods, which a
+                    // follower whose owner stalls stretches, is its patience before it asks
+                    // whether a quorum heard it (27 §8.4): the same ticks a request is given.
+                    self.replica.set_quorum_patience(
+                        self.pace
+                            .quorum_ticks(self.config.tick, self.config.tick_ceiling),
                     )?;
                     // A tick that was refused the room, or that came while
                     // the one before it is still persisted, changed
@@ -1844,6 +1862,17 @@ impl<V: AuthorityVerifier> Owner<V> {
                 u64::try_from(
                     self.pace
                         .patience(self.config.tick, self.config.tick_ceiling),
+                )
+                .unwrap_or(u64::MAX),
+            )?
+            // And the quorum's exchange tail: what the followers a commit
+            // waits on take to answer beyond this owner's periods, which a
+            // follower whose owner stalls stretches and this owner's own
+            // stall does not (27 §8.4).
+            .checked_add(
+                u64::try_from(
+                    self.pace
+                        .quorum_ticks(self.config.tick, self.config.tick_ceiling),
                 )
                 .unwrap_or(u64::MAX),
             )

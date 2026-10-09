@@ -7,6 +7,7 @@
 //! and nothing here authorizes a change.
 use crate::{admission::AdmissionReport, fleet::FleetStatus};
 use focal_client::admin::AdminRetention;
+use focal_consensus::{LogLatency, LogMetrics};
 use focal_log::WalWriterStats;
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, BudgetStats, DiskStats, MemoryBudget, MemoryError,
@@ -335,6 +336,14 @@ pub struct Listings {
     pub peer_rtts: Listing,
     pub tenants: Listing,
 }
+/// What the node's storage counted: focal-log's writer below the upgrade fence's storage level, the
+/// node log under the shell at it (doc 27 §15.10). Each exports its own names, so a dashboard reads
+/// which one a node runs from the names present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageMetrics {
+    Wal(WalWriterStats),
+    Log(LogMetrics),
+}
 /// One sample of the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
@@ -344,7 +353,7 @@ pub struct MetricsSnapshot {
     pub disk: Option<DiskStats>,
     pub staged_uploads: u64,
     pub staged_bytes: u64,
-    pub wal: Option<WalWriterStats>,
+    pub storage: Option<StorageMetrics>,
     pub fleet: FleetStatus,
     pub root: RootMetrics,
     pub peers: PeerPoolStats,
@@ -491,6 +500,21 @@ impl Text {
         self.header(name, "counter", help);
         let _ = writeln!(self.out, "{name}{{{}}} {value}", self.base);
     }
+    /// A latency as a summary: its quantiles where any was timed, then its sum and count.
+    fn summary(&mut self, name: &str, help: &str, latency: &LogLatency) {
+        self.header(name, "summary", help);
+        for (quantile, value) in [
+            ("0.5", latency.p50_ns),
+            ("0.99", latency.p99_ns),
+            ("0.999", latency.p999_ns),
+        ] {
+            if let Some(value) = value {
+                self.labeled(name, &[("quantile", quantile)], value);
+            }
+        }
+        let _ = writeln!(self.out, "{name}_sum{{{}}} {}", self.base, latency.sum_ns);
+        let _ = writeln!(self.out, "{name}_count{{{}}} {}", self.base, latency.count);
+    }
     fn labeled(&mut self, name: &str, extra: &[(&str, &str)], value: impl std::fmt::Display) {
         let _ = write!(self.out, "{name}{{{}", self.base);
         for (key, label) in extra {
@@ -500,6 +524,49 @@ impl Text {
         }
         let _ = writeln!(self.out, "}} {value}");
     }
+}
+/// The node log's counts under the shell (doc 27 §15.10).
+fn render_log(text: &mut Text, log: &LogMetrics) {
+    text.counter(
+        "focal_log_frames_total",
+        "Frames the node log wrote and flushed.",
+        log.frames,
+    );
+    text.counter(
+        "focal_log_updates_total",
+        "Updates the node log's frames carried.",
+        log.updates,
+    );
+    text.counter(
+        "focal_log_bytes_total",
+        "Bytes the node log wrote: frames, persist records and confirmations.",
+        log.bytes,
+    );
+    text.counter(
+        "focal_log_flushes_total",
+        "Flushes of the node log's file.",
+        log.flushes,
+    );
+    text.summary(
+        "focal_log_flush_nanoseconds",
+        "Each flush of the node log's file.",
+        &log.flush,
+    );
+    text.summary(
+        "focal_log_write_nanoseconds",
+        "Each frame's writes.",
+        &log.write,
+    );
+    text.summary(
+        "focal_log_commit_wait_nanoseconds",
+        "Each update, from its submission to the flush that let it be answered.",
+        &log.commit_wait,
+    );
+    text.gauge(
+        "focal_log_flushing_nanoseconds",
+        "How long the flush in progress has run; zero when none is.",
+        log.flushing_ns.unwrap_or(0),
+    );
 }
 impl MetricsSnapshot {
     /// The snapshot as Prometheus text exposition (version 0.0.4).
@@ -666,7 +733,10 @@ impl MetricsSnapshot {
             "Bytes uploads in progress have staged.",
             self.staged_bytes,
         );
-        if let Some(wal) = &self.wal {
+        if let Some(StorageMetrics::Log(log)) = &self.storage {
+            render_log(&mut text, log);
+        }
+        if let Some(StorageMetrics::Wal(wal)) = &self.storage {
             text.counter(
                 "focal_wal_group_commits_total",
                 "Group commits the WAL writer performed.",
@@ -1640,7 +1710,7 @@ mod tests {
             disk: None,
             staged_uploads: 0,
             staged_bytes: 0,
-            wal: None,
+            storage: None,
             fleet: FleetStatus {
                 latest_sequence: 1,
                 installed: 1,
@@ -1689,6 +1759,48 @@ mod tests {
             fence_level: 0,
             announced_level: 1,
         }
+    }
+    /// A node on the shell exports the node log's names and none of focal-log's
+    /// writer's (doc 27 §15.10): counters, each latency a summary with its
+    /// quantiles, sum and count, a quantile nothing timed left out.
+    #[test]
+    fn a_node_on_the_shell_exports_the_node_logs_counts() {
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let mut sample = snapshot(budget.stats());
+        let timed = LogLatency {
+            count: 4,
+            sum_ns: 4_000,
+            p50_ns: Some(900),
+            p99_ns: Some(1_200),
+            p999_ns: Some(1_200),
+        };
+        sample.storage = Some(StorageMetrics::Log(LogMetrics {
+            frames: 3,
+            updates: 4,
+            bytes: 12_288,
+            flushes: 3,
+            flush: timed,
+            write: timed,
+            commit_wait: LogLatency::default(),
+            flushing_ns: Some(250),
+        }));
+        let text = sample.render();
+        let base = "node=\"7\",cluster=\"ab\\\"cd\"";
+        for line in [
+            format!("focal_log_frames_total{{{base}}} 3\n"),
+            format!("focal_log_updates_total{{{base}}} 4\n"),
+            format!("focal_log_flushes_total{{{base}}} 3\n"),
+            "# TYPE focal_log_flush_nanoseconds summary\n".to_string(),
+            format!("focal_log_flush_nanoseconds{{{base},quantile=\"0.99\"}} 1200\n"),
+            format!("focal_log_flush_nanoseconds_sum{{{base}}} 4000\n"),
+            format!("focal_log_flush_nanoseconds_count{{{base}}} 4\n"),
+            format!("focal_log_commit_wait_nanoseconds_count{{{base}}} 0\n"),
+            format!("focal_log_flushing_nanoseconds{{{base}}} 250\n"),
+        ] {
+            assert!(text.contains(&line), "missing {line}");
+        }
+        assert!(!text.contains("focal_log_commit_wait_nanoseconds{"));
+        assert!(!text.contains("focal_wal_"));
     }
     /// The audit's F65: a session whose owner did not answer says so and
     /// carries no owner-side number — never a zero read as health.

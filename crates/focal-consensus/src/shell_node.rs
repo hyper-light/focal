@@ -13,7 +13,7 @@
 //!   whole period after the applied index ran past it, as focal-log's `settle_commit` writes it.
 //!
 //! [27]: ../../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::task::{Wake, Waker};
@@ -25,7 +25,6 @@ use hyper_durable::{
     Budget, Cause, ClaimError, GroupStore, LogStore, OpenError, Output, Replica, ReplicaError,
     Settings, StateMachine,
 };
-use hyper_log::Log;
 use hyper_raft::Elections;
 
 use super::*;
@@ -177,7 +176,11 @@ pub(crate) struct ShellNode {
     failed: bool,
     /// The group's own directory: its records and its image.
     dir: PathBuf,
+    /// Where the key its files are sealed under comes from (29 §5).
+    seal: group_files::GroupSeal,
     disk: DiskBudget,
+    /// The writer of the node's log this member was opened through (`ShellStorage::writer`).
+    writer: crate::LogWriterId,
     /// What the node's own box takes, held under its group's budget for as long as it lives.
     _boxed: Allocation,
 }
@@ -199,6 +202,10 @@ fn file_error(error: GroupFileError) -> ConsensusError {
         GroupFileError::Bound { .. } => ConsensusError::Corruption("a group file past its bound"),
         GroupFileError::Encoding(error) => ConsensusError::Encoding(error),
         GroupFileError::Io(error) => ConsensusError::Log(focal_log::LogError::Io(error)),
+        GroupFileError::Keys(_) => {
+            ConsensusError::Configuration("the node's keys do not open its group files")
+        }
+        GroupFileError::Seal(_) => ConsensusError::Corruption("a group file's seal refused it"),
     }
 }
 
@@ -223,12 +230,11 @@ impl ShellNode {
     /// shell yet ([27] §15.7).
     pub(crate) fn open(
         config: NodeConfig,
-        root: &Path,
-        log: &Log<DeviceFile>,
+        storage: &crate::ShellStorage,
         parent_budget: &MemoryBudget,
-        disk: DiskBudget,
         needs: Needs,
     ) -> Result<Box<Self>, ConsensusError> {
+        let (root, log, disk) = (storage.root(), storage.opener(), storage.disk().clone());
         config.validate()?;
         if config.fast {
             return Err(ConsensusError::Configuration(
@@ -274,8 +280,9 @@ impl ShellNode {
             }
         };
         let mut medium = FileMedium;
+        let seal = storage.group_seal();
         let dir = group_files::group_dir(root, config.group_id);
-        let records = match group_files::read_records(&medium, &dir).map_err(file_error)? {
+        let records = match group_files::read_records(&medium, &dir, &seal).map_err(file_error)? {
             Some(records) => {
                 // The identity as focal-log checks it: the tunables may change between starts.
                 if !records.identity.same_identity(&config) || records.fast {
@@ -304,7 +311,8 @@ impl ShellNode {
                 // Durable before anything of the group is in the log (27 §15.5, O1).
                 let dir =
                     group_files::create(&mut medium, root, config.group_id).map_err(file_error)?;
-                group_files::write_records(&mut medium, &dir, &records).map_err(file_error)?;
+                group_files::write_records(&mut medium, &dir, &records, &seal)
+                    .map_err(file_error)?;
                 records
             }
         };
@@ -315,8 +323,15 @@ impl ShellNode {
                 successor,
             });
         let decoders = DecoderGate::new(records.decoder_floor, transition);
-        let machine = HandOver::open(medium, dir.clone(), false, IMAGE_BYTES, founding(&config))
-            .map_err(file_error)?;
+        let machine = HandOver::open(
+            medium,
+            dir.clone(),
+            false,
+            IMAGE_BYTES,
+            founding(&config),
+            seal.clone(),
+        )
+        .map_err(file_error)?;
         let store = FloorStore::new(
             store,
             needs,
@@ -364,7 +379,9 @@ impl ShellNode {
             wire: Wire::Frozen,
             failed: false,
             dir,
+            seal,
             disk,
+            writer: storage.writer(),
             _boxed: boxed,
         });
         // Rebuild committed membership before elections or network messages can run. The
@@ -585,6 +602,11 @@ impl ShellNode {
         self.check()?;
         self.replica.set_patience(ticks);
         Ok(())
+    }
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        let set = self.replica.set_quorum_patience(ticks);
+        self.heard(set)
     }
     pub fn priority(&self) -> i64 {
         self.priority
@@ -952,6 +974,10 @@ impl ShellNode {
             "a member on the durable shell has no shared WAL",
         ))
     }
+    /// The writer of the node's log this member was opened through.
+    pub fn storage_writer(&self) -> Result<crate::StorageWriter, ConsensusError> {
+        Ok(crate::StorageWriter::Log(self.writer))
+    }
     /// Readies are taken ahead of their writes: nothing is ever refused for a write out.
     pub fn persistence_pending(&self) -> bool {
         false
@@ -1209,7 +1235,7 @@ impl ShellNode {
     /// a write the store held for it goes out at the next drive.
     fn write_records(&mut self, intent: FloorWrite) -> Result<(), ConsensusError> {
         let mut medium = FileMedium;
-        let mut records = group_files::read_records(&medium, &self.dir)
+        let mut records = group_files::read_records(&medium, &self.dir, &self.seal)
             .map_err(file_error)?
             .ok_or(ConsensusError::Corruption(
                 "the group's records are missing",
@@ -1224,7 +1250,8 @@ impl ShellNode {
                 pair.successor
             }
         };
-        group_files::write_records(&mut medium, &self.dir, &records).map_err(file_error)?;
+        group_files::write_records(&mut medium, &self.dir, &records, &self.seal)
+            .map_err(file_error)?;
         self.decoders.written(intent);
         self.replica.release(&met);
         // The write the store held goes out at the next drive.

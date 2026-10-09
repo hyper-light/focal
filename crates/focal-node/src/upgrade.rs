@@ -19,6 +19,11 @@ pub const ISSUER_SUCCESSION_LEVEL: u32 = 2;
 /// level cannot read. Every group a node hosts runs `Wire::Kept` once the
 /// fence opens it.
 pub const RAFT_KEPT_LEVEL: u32 = 3;
+/// The level at which a node's groups live on hyper-log under hyper-durable's shell (27 §15.8): a
+/// node converts its WAL at its first start once the fence opens it, and a cluster founded at it
+/// starts there. A binary below this level reads the converted WAL's fence as one it does not know
+/// and refuses to open.
+pub const STORAGE_LEVEL: u32 = 4;
 /// The environment variable that lowers the announced level for a staged
 /// rollout or a rehearsal; it can never raise it.
 pub const ANNOUNCED_LEVEL_ENV: &str = "FOCAL_CAPABILITY_LEVEL";

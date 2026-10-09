@@ -256,12 +256,60 @@ impl ControlReplica {
         budget: MemoryBudget,
         wal: SharedWal,
     ) -> Result<Self, ControlError> {
+        Self::open_with(options, bootstrap, budget, |config, budget| {
+            DurableNode::open_on_wal_in(config, wal, budget)
+        })
+    }
+
+    /// A control group's member over hyper-durable's shell (27 §15.7): its log one group of the
+    /// node's hyper-log log, its records and image under the data directory, its disk charged to
+    /// the envelope, all as `storage` names them. A control group's entries need no decoder beyond its baseline, so no
+    /// write is held for a record. It applies on a commit its log holds, as over focal-log
+    /// (`StateMachine::acts_at_start` for every entry, 27 §15.6).
+    pub fn open_on_shell(
+        options: ControlOptions,
+        bootstrap: ControlBootstrap,
+        budget: MemoryBudget,
+        storage: &focal_consensus::ShellStorage,
+    ) -> Result<Self, ControlError> {
+        Self::open_with(options, bootstrap, budget, |config, budget| {
+            DurableNode::open_on_shell(config, storage, budget, |_| None)
+        })
+    }
+
+    /// A control group's member through the node's storage handle (27 §15.11): on focal-log as
+    /// [`ControlReplica::open_on_wal`], on the shell as [`ControlReplica::open_on_shell`].
+    pub fn open_on_storage(
+        options: ControlOptions,
+        bootstrap: ControlBootstrap,
+        budget: MemoryBudget,
+        storage: &focal_consensus::NodeStorage,
+    ) -> Result<Self, ControlError> {
+        match storage {
+            focal_consensus::NodeStorage::Wal(wal) => {
+                Self::open_on_wal(options, bootstrap, budget, wal.clone())
+            }
+            focal_consensus::NodeStorage::Shell(shell) => {
+                Self::open_on_shell(options, bootstrap, budget, shell)
+            }
+        }
+    }
+
+    fn open_with(
+        options: ControlOptions,
+        bootstrap: ControlBootstrap,
+        budget: MemoryBudget,
+        open: impl FnOnce(
+            focal_consensus::NodeConfig,
+            &MemoryBudget,
+        ) -> Result<DurableNode, focal_consensus::ConsensusError>,
+    ) -> Result<Self, ControlError> {
         options.validate()?;
         let identity = bootstrap.identity(&options)?;
         let founded_from_image = bootstrap.is_image();
         let machine = Machine::restore(bootstrap, &options, &budget)?;
         let retries = RetryState::restore(BTreeMap::new(), &options.limits, &budget, 0)?;
-        let mut node = DurableNode::open_on_wal_in(options.consensus.clone(), wal, &budget)?;
+        let mut node = open(options.consensus.clone(), &budget)?;
         // As `open`: a control group applies on a commit its log holds.
         node.apply_on_written_commit();
         Ok(Self {
@@ -337,6 +385,13 @@ impl ControlReplica {
     pub fn set_patience(&mut self, ticks: usize) -> Result<(), ControlError> {
         self.check()?;
         self.node.set_patience(ticks)?;
+        Ok(())
+    }
+    /// The ticks the replica, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`DurableNode::set_quorum_patience`).
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.set_quorum_patience(ticks)?;
         Ok(())
     }
     pub fn configuration_index(&self) -> u64 {

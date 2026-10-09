@@ -14,9 +14,14 @@ pub struct InitialState {
     /// The configuration of the latest snapshot or applied change.
     pub configuration: ConfState,
     /// What this member approved by itself and storage holds
-    /// ([`crate::fast`]), in any order. What the log has reached since is
-    /// set aside.
+    /// ([`crate::fast`]), in any order: every proposal a `Ready` gave that no
+    /// later `Ready` released ([`crate::Ready::released`]), whatever the log
+    /// holds.
     pub proposals: Vec<Entry>,
+    /// The greatest index a `Ready` released that storage holds durably, or
+    /// zero: the member knew its log committed through it by a classic
+    /// quorum, and knows it again when it opens.
+    pub released: u64,
 }
 
 /// The durable log and state of one member, as the core reads them.

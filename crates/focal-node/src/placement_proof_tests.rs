@@ -45,7 +45,7 @@ async fn only_installed_group_and_real_committed_fence_can_produce_an_accounted_
             identity.cluster,
             identity.ledger.session.0,
         ),
-        network.wal.clone(),
+        crate::storage_start::test_wal(&network.storage.storage).clone(),
     )
     .unwrap();
     let mut session =

@@ -510,8 +510,8 @@ struct Layout<'a> {
 
 /// Which of the core's messages' fields focal's peers carry beyond raft-rs's: none until the
 /// cluster's upgrade fence opens `RAFT_KEPT_LEVEL` (focal-node `upgrade`, 24 §21), then a refusal's
-/// `kept` (field 17, R17) and `lost` (field 18, R-5). eraftpb at raft-rs `8e4cef1` numbers its
-/// fields 1 to 16.
+/// `kept` (field 17, R17), `lost` (field 18, R-5) and a leader's `classic` (field 19). eraftpb at
+/// raft-rs `8e4cef1` numbers its fields 1 to 16.
 ///
 /// Members apply the fence at different moments, so a member already raised sends `kept` to one
 /// that is not. That member reads field 17 as raft-rs reads a field it does not know, skipped: the
@@ -520,13 +520,16 @@ struct Layout<'a> {
 /// peers one resend and never a stall (27 §15.9). `lost` is refused below the fence: read without
 /// its flag, a refusal for lost entries would let a leader count acknowledgements the member no
 /// longer holds, and focal never writes one before the fence, nor after it without hyper-log's
-/// marks.
+/// marks. `classic`, the index through which a leader knows its log committed by a classic quorum
+/// (hyper-raft `Message::classic`), is left out below the fence and skipped by a member not yet
+/// raised: a member that reads none takes nothing known, so it releases nothing it approved by
+/// itself, which costs room and never safety.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Wire {
     /// raft-rs's fields alone: what a member writes and reads below the fence.
     #[default]
     Frozen,
-    /// raft-rs's fields, `kept` and `lost`: at or above the fence.
+    /// raft-rs's fields, `kept`, `lost` and `classic`: at or above the fence.
     Kept,
 }
 
@@ -534,6 +537,17 @@ pub enum Wire {
 const KEPT_FIELD: u64 = 17;
 /// Field 18 of a message: a refusal for entries lost at rest (`Message::lost`).
 const LOST_FIELD: u64 = 18;
+/// Field 19 of a message: the index through which a leader knows its log committed by a classic
+/// quorum (`Message::classic`); absent, nothing known.
+const CLASSIC_FIELD: u64 = 19;
+
+/// What `message` says of the classic commit under `wire`: nothing below the fence.
+fn classic_on(message: &Message, wire: Wire) -> u64 {
+    match wire {
+        Wire::Frozen => 0,
+        Wire::Kept => message.classic.unwrap_or(0),
+    }
+}
 
 fn layout(message: &Message, wire: Wire) -> Result<Layout<'_>> {
     if wire == Wire::Frozen {
@@ -585,6 +599,10 @@ fn layout(message: &Message, wire: Wire) -> Result<Layout<'_>> {
         length,
         varint_field_len(LOST_FIELD, u64::from(message.lost)),
     )?;
+    length = add(
+        length,
+        varint_field_len(CLASSIC_FIELD, classic_on(message, wire)),
+    )?;
     Ok(Layout {
         entries,
         snapshot,
@@ -633,6 +651,7 @@ pub fn encode_message_in(message: &Message, wire: Wire) -> Result<Vec<u8>> {
     put_varint_field(&mut out, 16, int64(message.priority));
     put_varint_field(&mut out, KEPT_FIELD, u64::from(message.kept));
     put_varint_field(&mut out, LOST_FIELD, u64::from(message.lost));
+    put_varint_field(&mut out, CLASSIC_FIELD, classic_on(message, wire));
     Ok(out)
 }
 
@@ -1071,6 +1090,13 @@ pub fn decode_message_in(bytes: &[u8], wire: Wire) -> Result<Message> {
                     return Err(EnvelopeError::Unstated("a member's mark"));
                 }
                 message.lost = lost;
+            }
+            CLASSIC_FIELD => {
+                let classic = varint_of("Message", field, value)?;
+                // Below the fence, skipped as raft-rs skips a field it does not know (`Wire`).
+                if wire == Wire::Kept {
+                    message.classic = Some(classic);
+                }
             }
             _ => {}
         }

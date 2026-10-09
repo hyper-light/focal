@@ -18,9 +18,12 @@ workspace = true
 test-support = []
 
 [dependencies]
+crc32fast.workspace = true
 focal-client = { version = "0.1.0", path = "../focal-client" }
 focal-mcp = { version = "0.1.0", path = "../focal-mcp" }
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
+hyper-seal.workspace = true
 focal-core = { version = "0.1.0", path = "../focal-core" }
 focal-control = { version = "0.1.0", path = "../focal-control" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }

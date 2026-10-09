@@ -22,6 +22,7 @@ pub struct RamStore {
     entries: VecDeque<Entry>,
     hard_state: HardState,
     proposals: Vec<Entry>,
+    released: u64,
     /// Answers not yet taken: one at most, the depth.
     answers: VecDeque<Result<(), Fault>>,
 }
@@ -81,10 +82,14 @@ impl RamStore {
         if let Some(hard) = write.hard_state {
             self.hard_state = hard;
         }
-        let last = self.last();
-        self.proposals.retain(|p| p.index > last);
-        self.proposals
-            .extend(write.proposals.iter().filter(|p| p.index > last).cloned());
+        if let Some(through) = write.released {
+            self.proposals.retain(|p| p.index > through);
+            self.released = self.released.max(through);
+        }
+        for given in write.proposals {
+            self.proposals.retain(|p| p.index != given.index);
+            self.proposals.push(given.clone());
+        }
         Ok(())
     }
 }
@@ -178,6 +183,10 @@ impl LogStore for RamStore {
     fn proposals(&self, into: &mut Vec<Entry>) -> Result<(), StorageError> {
         into.extend(self.proposals.iter().cloned());
         Ok(())
+    }
+
+    fn released(&self) -> Result<u64, StorageError> {
+        Ok(self.released)
     }
 
     fn room(&self) -> bool {

@@ -190,11 +190,16 @@ pub struct Ready {
     read_states: Vec<ReadState>,
     entries: Vec<Entry>,
     proposals: Vec<Entry>,
+    released: Option<u64>,
     displaced: Vec<Entry>,
     snapshot: Option<Snapshot>,
     after_persisting: bool,
     light: LightReady,
     must_sync: bool,
+    /// Its messages were taken: a commit can no longer be deferred, since
+    /// the answers among them already left stating it
+    /// ([`RawNode::defer_commit`]).
+    messages_taken: bool,
 }
 impl Ready {
     /// Which `Ready` this is, counted from one since the member opened.
@@ -230,12 +235,26 @@ impl Ready {
         std::mem::take(&mut self.entries)
     }
     /// To persist beside the log: what this member approved by itself
-    /// ([`crate::fast`]). What it holds it says only once this is durable,
-    /// and storage gives it back when the member opens
-    /// ([`crate::InitialState::proposals`]) until the log reaches its
-    /// index.
+    /// ([`crate::fast`]), a proposal given again at an index replacing the
+    /// one storage holds there. What it holds it says only once this is
+    /// durable, and storage gives it back when the member opens
+    /// ([`crate::InitialState::proposals`]) until a `Ready` releases it
+    /// ([`Ready::released`]), whatever its log holds.
     pub fn proposals(&self) -> &[Entry] {
         &self.proposals
+    }
+    /// The index through which what this member approved by itself is held
+    /// no more: it knows the log committed through it by a classic quorum
+    /// (`docs/raft.md` §3.5). Storage may drop the proposals it holds at or
+    /// below it, before it takes this `Ready`'s; one that keeps them gives
+    /// them back at the next open, and the member holds them until it learns
+    /// the index again, which costs room and never safety. None when it did
+    /// not move, or when the `Ready` persists nothing else: a release waits
+    /// for a write the member makes anyway. Storage must not drop a proposal
+    /// for any other reason: not when its log reaches the index, not at a
+    /// snapshot or a compaction.
+    pub fn released(&self) -> Option<u64> {
+        self.released
     }
     /// What was proposed here by the fast track and another entry took the
     /// index of: its proposer proposes it again.
@@ -267,7 +286,10 @@ impl Ready {
         self.light.committed_range()
     }
     /// To send at once: a leader's, while the term and vote it leads in
-    /// are durable.
+    /// are durable. Lent, not taken, so a commit may still be deferred
+    /// ([`RawNode::defer_commit`]) after reading them, and the answers among
+    /// them are then restated with the durable commit: a caller that sends
+    /// what it reads here, rather than what it takes, defers first.
     pub fn messages(&self) -> &[Message] {
         if self.after_persisting {
             &[]
@@ -277,6 +299,7 @@ impl Ready {
     }
     /// Takes the messages to send at once, leaving none.
     pub fn take_messages(&mut self) -> Vec<Message> {
+        self.messages_taken = true;
         if self.after_persisting {
             Vec::new()
         } else {
@@ -285,7 +308,9 @@ impl Ready {
     }
     /// To send once what this `Ready` persists is durable, and every write
     /// issued before it: every message of a member that does not lead, and
-    /// a leader's while its term or vote is not durable yet.
+    /// a leader's while its term or vote is not durable yet. Lent, not taken,
+    /// as [`Ready::messages`] are: a caller that sends what it reads here
+    /// defers a commit ([`RawNode::defer_commit`]) before it reads them.
     pub fn persisted_messages(&self) -> &[Message] {
         if self.after_persisting {
             self.light.messages()
@@ -296,6 +321,7 @@ impl Ready {
     /// Takes the messages to send once this `Ready` is durable, leaving
     /// none.
     pub fn take_persisted_messages(&mut self) -> Vec<Message> {
+        self.messages_taken = true;
         if self.after_persisting {
             self.light.take_messages()
         } else {
@@ -339,6 +365,9 @@ struct Taken {
     /// Given in place: its entries are read where the member holds them,
     /// and what it gives to apply where storage holds it.
     in_place: bool,
+    /// The release given before this `Ready`'s: what [`RawNode::defer_commit`]
+    /// takes it back to.
+    released_before: u64,
 }
 
 /// What an issued [`Ready`]'s write vouches for once it is durable. Nothing
@@ -373,7 +402,7 @@ struct Mark {
 }
 
 /// A `Ready` whose write is out.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Given {
     mark: Mark,
     /// What this member approved by itself and gave, moved from the `Ready`
@@ -393,6 +422,7 @@ struct Stable {
 
 /// A member as its owner drives it: operations in, [`Ready`]s out, and
 /// notices of what became durable in.
+#[derive(Clone)]
 pub struct RawNode<S> {
     /// The state machine itself.
     pub raft: Raft<S>,
@@ -415,6 +445,9 @@ pub struct RawNode<S> {
     /// The owner holds what it was given to apply and is given no more
     /// ([`RawNode::pause_apply`]).
     apply_paused: bool,
+    /// The index through which a `Ready` released what the member approved
+    /// by itself.
+    released: u64,
 }
 
 impl<S> RawNode<S> {
@@ -448,6 +481,7 @@ impl<S: Storage> RawNode<S> {
             previous_soft: raft.soft_state(),
             previous_hard: raft.hard_state(),
             durable_vote: (raft.term(), raft.vote()),
+            released: raft.classic,
             raft,
             number: 0,
             taken: None,
@@ -455,6 +489,22 @@ impl<S: Storage> RawNode<S> {
             commit_since: config.applied,
             apply_paused: false,
         })
+    }
+    /// The index through which the `Ready`s taken released what this member approved by itself
+    /// ([`Ready::released`]): an owner that writes again what a refused write held writes this
+    /// release with it.
+    pub fn released(&self) -> u64 {
+        self.released
+    }
+    /// The release a `Ready` that `persists` something carries: the classic commit this member
+    /// knows, if it moved since the last one given.
+    fn release_with(&mut self, persists: bool) -> Option<u64> {
+        let classic = self.raft.classic;
+        if classic > self.released && persists {
+            self.released = classic;
+            return Some(classic);
+        }
+        None
     }
     /// The storage the member reads.
     pub fn store(&self) -> &S {
@@ -481,7 +531,8 @@ impl<S: Storage> RawNode<S> {
     /// they leave: those a `Ready`'s write holds, beyond its own hard
     /// state's; those sent at once or with a notice, beyond this. That
     /// rests on the owner's part of the contract: it writes a `Ready`'s hard
-    /// state as given, its commit with it.
+    /// state as given, its commit with it, or tells the core it does not
+    /// ([`RawNode::defer_commit`]) before it takes the `Ready`'s messages.
     pub fn durable_commit(&self) -> u64 {
         self.raft.durable_commit()
     }
@@ -592,6 +643,11 @@ impl<S: Storage> RawNode<S> {
     /// ([`crate::Timing`]).
     pub fn set_timing(&mut self, timing: crate::Timing) -> Result<()> {
         self.raft.set_timing(timing)
+    }
+    /// The last index this member, leading, may take from the fast track
+    /// at ([`Raft::cap_takes`]).
+    pub fn cap_takes(&mut self, through: Option<u64>) -> Result<()> {
+        self.operate(|raft| raft.cap_takes(through))
     }
     /// The owner holds this member's campaigns, or lets them go
     /// ([`Raft::hold_campaigns`]).
@@ -977,6 +1033,16 @@ impl<S: Storage> RawNode<S> {
             }
             ready.hard_state = Some(hard);
         }
+        // What the member knows committed by a classic quorum rides with a
+        // write it makes anyway: a release is never worth a write of its own
+        // (it frees room, and a store that keeps a proposal longer is still
+        // right), and a `Ready` of nothing else to persist is not waited on.
+        let persists = new_entries
+            || new_snapshot.is_some()
+            || ready.hard_state.is_some()
+            || !ready.proposals.is_empty();
+        let released_before = self.released;
+        ready.released = self.release_with(persists);
         // Taken, and not emptied: what the member holds when it rests is
         // what it held before.
         ready.read_states = std::mem::take(&mut self.raft.read_states);
@@ -1002,7 +1068,11 @@ impl<S: Storage> RawNode<S> {
                 self.raft.log().committed(),
             );
         }
-        self.taken = Some(Taken { number, in_place });
+        self.taken = Some(Taken {
+            number,
+            in_place,
+            released_before,
+        });
         Ok(ready)
     }
     /// What this member approved by itself and gave in the `Ready`s issued
@@ -1026,6 +1096,50 @@ impl<S: Storage> RawNode<S> {
             stable: Stable::default(),
         });
         Ok(())
+    }
+    /// The owner writes no hard state for `ready`, the one taken: its commit
+    /// moved alone, and rides a later write (`docs/durable.md` §4.1, focal
+    /// F17; etcd's `MustSync`, which syncs only for entries, a snapshot, a
+    /// term or a vote). Only a `Ready` that need not sync ([`Ready::must_sync`])
+    /// and gives a hard state is deferred; any other is left as it is, and
+    /// `false` returned. A deferred `Ready`'s write vouches for no commit: its
+    /// hard state is given again by the next `Ready`, or as a notice's
+    /// [`LightReady::commit_index`]; the release given with it is taken back
+    /// (it rode the hard state, and a release is never worth a write of its
+    /// own); and the answers that leave once it is durable state no commit
+    /// past the durable one.
+    ///
+    /// Called before any of `ready`'s messages are taken: the answers among
+    /// them state the commit, and are held to the durable one here. Refused,
+    /// `Error::Invariant`, once they were taken: never deferred with answers
+    /// already out stating a commit no write holds.
+    pub fn defer_commit(&mut self, ready: &mut Ready) -> Result<bool> {
+        let taken = self
+            .taken
+            .filter(|taken| taken.number == ready.number)
+            .ok_or(Error::Invariant(
+                "a ready deferred that is not the one taken",
+            ))?;
+        if ready.messages_taken {
+            return Err(Error::Invariant(
+                "a commit deferred after its ready's messages were taken",
+            ));
+        }
+        if ready.must_sync || ready.hard_state.is_none() {
+            return Ok(false);
+        }
+        ready.hard_state = None;
+        if ready.released.take().is_some() {
+            self.released = taken.released_before;
+        }
+        if ready.after_persisting {
+            state_durable_commit(
+                &mut ready.light.messages,
+                self.raft.durable_commit(),
+                self.raft.log().committed(),
+            );
+        }
+        Ok(true)
     }
     /// `ready`, which must be the one taken, is issued: what its write
     /// vouches for.

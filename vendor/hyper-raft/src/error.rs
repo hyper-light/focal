@@ -54,10 +54,10 @@ pub enum Error {
     /// the group has the fast track), so it may not campaign.
     #[error("the log may lack what this member acknowledged")]
     Lost,
-    /// A refusal: the proposal is empty, this member does not lead or is
-    /// handing over leadership, or the log did not take it.
-    #[error("the proposal is dropped")]
-    ProposalDropped,
+    /// A refusal: the proposal is dropped, for the cause it names
+    /// ([`Dropped`]).
+    #[error("the proposal is dropped: {0}")]
+    ProposalDropped(Dropped),
     /// A refusal: a read is asked of a member that knows no leader to ask
     /// (a follower that heard none, or a candidate).
     #[error("the read is dropped: no leader to ask")]
@@ -88,6 +88,39 @@ pub enum Error {
     /// finish.
     #[error("no memory to finish an operation already begun")]
     Memory,
+}
+/// Why a proposal was dropped. Two are the caller's bugs, a proposal no member could take
+/// ([`Dropped::is_callers_bug`]); the others are ordinary refusals of a member that cannot take it
+/// now, to retry when a leader is known or redirect to it (`docs/raft.md` §3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Dropped {
+    /// No entry to propose, or a fast proposal of no data. The caller's bug.
+    #[error("it states nothing")]
+    Empty,
+    /// A change of the configuration that does not decode. The caller's bug.
+    #[error("its change does not decode")]
+    Malformed,
+    /// A follower that knows no leader to forward it to, or a candidate whose election is under
+    /// way: retried once a leader is known.
+    #[error("no leader is known")]
+    NoLeader,
+    /// The leader is handing its leadership over: retried at the next leader.
+    #[error("the leader is transferring its leadership")]
+    Transferring,
+    /// The leader leads a configuration that names it no member, until that configuration is
+    /// committed (`docs/raft.md` §3.4): retried at the next leader.
+    #[error("the leader is no member of the configuration it leads")]
+    NotMember,
+    /// What the leader holds uncommitted is at its bound (`Config::max_uncommitted_size`):
+    /// retried once entries commit.
+    #[error("the leader holds as much uncommitted as it may")]
+    Uncommitted,
+}
+impl Dropped {
+    /// Whether the proposal is one no member could take: the caller's bug, never to retry.
+    pub fn is_callers_bug(self) -> bool {
+        matches!(self, Self::Empty | Self::Malformed)
+    }
 }
 impl Error {
     /// Whether the replica must stop and be reopened.

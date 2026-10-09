@@ -14,9 +14,15 @@ pub(super) struct RamLog {
     pub conf_state: ConfState,
     pub entries: VecDeque<Entry>,
     pub snapshot: Snapshot,
-    /// What this member approved by itself (27 §4), above its log, each
-    /// with its charge. At most what the core holds (`Limits::proposals`).
+    /// What this member approved by itself (27 §4), each with its charge,
+    /// held until a write releases it (`released`), whatever the log reaches:
+    /// not at a snapshot, not at a compaction (hyper-raft `Ready::released`).
+    /// At most what the core holds (`Limits::proposals`).
     pub proposals: Vec<(Entry, Allocation)>,
+    /// The index through which a durable write released what the member
+    /// approved by itself, or zero: given back at opening, so the member holds
+    /// again only what it never released.
+    pub released: u64,
     charges: VecDeque<Allocation>,
     /// The bytes of the retained entries, running: through each entry,
     /// from an origin that moves with compaction, so the bytes of any
@@ -40,6 +46,8 @@ pub(super) struct PreparedUpdate {
     snapshot: Option<PreparedSnapshot>,
     entries: Vec<(Entry, Allocation)>,
     proposals: Vec<(Entry, Allocation)>,
+    /// Ends the proposals at or below it before this update's are taken.
+    released: Option<u64>,
 }
 impl RamLog {
     pub fn new(config: &NodeConfig, budget: MemoryBudget) -> Result<Self, ConsensusError> {
@@ -65,6 +73,7 @@ impl RamLog {
             entries: VecDeque::new(),
             snapshot: Snapshot::default(),
             proposals: Vec::new(),
+            released: 0,
             charges: VecDeque::new(),
             cumulative: VecDeque::new(),
             origin: 0,
@@ -250,14 +259,16 @@ impl RamLog {
         entries: &[Entry],
         snapshot: Option<&Snapshot>,
     ) -> Result<PreparedUpdate, ConsensusError> {
-        self.prepare_with(entries, snapshot, &[])
+        self.prepare_with(entries, snapshot, &[], None)
     }
-    /// As `prepare`, with what the member approved by itself.
+    /// As `prepare`, with what the member approved by itself and the index through which it
+    /// releases what it approved before (hyper-raft `Ready::released`).
     pub fn prepare_with(
         &mut self,
         entries: &[Entry],
         snapshot: Option<&Snapshot>,
         proposals: &[Entry],
+        released: Option<u64>,
     ) -> Result<PreparedUpdate, ConsensusError> {
         let mut held = Vec::new();
         held.try_reserve_exact(proposals.len())
@@ -329,6 +340,7 @@ impl RamLog {
             snapshot,
             entries: prepared,
             proposals: held,
+            released,
         })
     }
     pub fn publish(&mut self, update: PreparedUpdate) -> Result<(), ConsensusError> {
@@ -382,27 +394,32 @@ impl RamLog {
             self.entries.push_back(entry);
             self.charges.push_back(allocation);
         }
+        // The release first, then this write's proposals, which it does not end.
+        if let Some(through) = update.released {
+            self.release(through);
+        }
         for held in update.proposals {
-            // One entry an index: what storage holds there it keeps.
-            if !self
+            // One entry an index: a proposal given again replaces the one held there.
+            match self
                 .proposals
-                .iter()
-                .any(|(entry, _)| entry.index == held.0.index)
+                .iter_mut()
+                .find(|(entry, _)| entry.index == held.0.index)
             {
-                self.proposals.push(held);
+                Some(slot) => *slot = held,
+                None => self.proposals.push(held),
             }
         }
-        self.release_proposals()
-    }
-    /// What the log has reached is held beside it no more.
-    fn release_proposals(&mut self) -> Result<(), ConsensusError> {
-        let last = self.last_index()?;
-        self.proposals.retain(|(entry, _)| entry.index > last);
         Ok(())
+    }
+    /// Ends the proposals at or below `through`: the member knew its log committed through it by
+    /// a classic quorum. Nothing else ends one (hyper-raft `Ready::released`).
+    pub fn release(&mut self, through: u64) {
+        self.proposals.retain(|(entry, _)| entry.index > through);
+        self.released = self.released.max(through);
     }
     /// A proposal as the log of writes states it, at opening.
     pub fn hold_proposal(&mut self, entry: Entry) -> Result<(), ConsensusError> {
-        let update = self.prepare_with(&[], None, std::slice::from_ref(&entry))?;
+        let update = self.prepare_with(&[], None, std::slice::from_ref(&entry), None)?;
         self.publish(update)
     }
     pub fn append(&mut self, entries: &[Entry]) -> Result<(), ConsensusError> {
@@ -440,7 +457,7 @@ impl RamLog {
         self.snapshot = prepared.snapshot;
         self.snapshot_charge = Some(prepared.allocation);
         self.conf_state = prepared.conf;
-        self.release_proposals()
+        Ok(())
     }
 }
 impl Storage for RamLog {
@@ -453,6 +470,7 @@ impl Storage for RamLog {
                 .iter()
                 .map(|(entry, _)| entry.clone())
                 .collect(),
+            released: self.released,
         })
     }
     fn entries(

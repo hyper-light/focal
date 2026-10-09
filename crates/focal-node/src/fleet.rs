@@ -47,7 +47,7 @@ mod range_owner;
 use evidence_owner::{EvidenceCall, PendingEvidenceCall};
 pub use grouped::management::{
     FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
-    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, ManagedFleetConfig,
+    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, MAX_SESSIONS, ManagedFleetConfig,
 };
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
 pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};
@@ -89,6 +89,9 @@ mod evidence_tests;
 #[path = "fleet_admission_tests.rs"]
 mod admission_tests;
 
+/// Entries a session applies past its last checkpoint before it checkpoints again
+/// ([`ReplicaConfig::checkpoint_after_entries`]'s default).
+pub const CHECKPOINT_AFTER_ENTRIES: u64 = 4096;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaConfig {
     pub root: RootCommandId,
@@ -134,7 +137,7 @@ impl ReplicaConfig {
             tick: Duration::from_millis(100),
             tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
-            checkpoint_after_entries: 4096,
+            checkpoint_after_entries: CHECKPOINT_AFTER_ENTRIES,
             #[cfg(test)]
             checkpoint_observer: None,
         }
@@ -1115,6 +1118,15 @@ impl ReplicaHost {
         self.pace.publish(pace);
         pace
     }
+    /// How late the session's commits are answered among its voters, from
+    /// how late each other voter answers its messages
+    /// (`PeerConnectionPool::replication_lateness`) and how many voters there
+    /// are, this node among them: its leader's quorum patience and what a
+    /// request is given beyond its time (27 §8.4).
+    pub fn quorum(&self, tails: Vec<std::time::Duration>, voters: usize) {
+        self.pace
+            .publish_quorum_tail(crate::pace::quorum_tail(tails, voters));
+    }
     /// The pace in force: the last derivation, or the configured period
     /// with no samples before any.
     pub fn current_pace(&self) -> focal_timing::TickPace {
@@ -1921,6 +1933,12 @@ impl Owner {
         self.session.set_patience(
             self.pace
                 .patience(self.config.tick, self.config.tick_ceiling),
+        )?;
+        // And what its voters' answers take beyond its own periods is its
+        // patience before it asks whether a quorum heard it (27 §8.4).
+        self.session.set_quorum_patience(
+            self.pace
+                .quorum_ticks(self.config.tick, self.config.tick_ceiling),
         )?;
         // The committed placement names the session's preferred leader (27
         // §5): it outranks the other voters in an election among equally

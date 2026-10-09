@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Entries kept ahead of a hole, in order of index, each at most once, of one term.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Early {
     /// The term they were sent in.
     term: u64,

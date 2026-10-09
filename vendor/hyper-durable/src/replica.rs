@@ -149,6 +149,11 @@ pub struct Output<A> {
     /// Reads a quorum confirmed and the replica has applied far enough to serve: each read's
     /// context and the index it was confirmed at.
     pub reads: Vec<(Vec<u8>, u64)>,
+    /// What this member proposed by the fast track and another entry took the index of, in
+    /// order (`hyper_raft::Ready::displaced`): no member applies it, so its proposer proposes it
+    /// again or answers that it was not taken. The core gives at most its bound on proposals in
+    /// one `Ready` (`Limits::proposals`).
+    pub displaced: Vec<Entry>,
 }
 
 impl<A> Default for Output<A> {
@@ -157,6 +162,7 @@ impl<A> Default for Output<A> {
             messages: Vec::new(),
             answers: Vec::new(),
             reads: Vec::new(),
+            displaced: Vec::new(),
         }
     }
 }
@@ -167,6 +173,7 @@ impl<A> Output<A> {
         self.messages.clear();
         self.answers.clear();
         self.reads.clear();
+        self.displaced.clear();
     }
 }
 
@@ -1014,6 +1021,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.node.raft.set_patience(ticks);
     }
 
+    /// Ticks this member, while it leads, waits beyond its election timeout before it asks
+    /// whether a quorum heard it (`hyper_raft::Raft::set_quorum_patience`, `docs/raft.md` §3.6):
+    /// what its owner measured of its voters' answers. Refused, nothing changed, where the
+    /// election timeout and it pass what a tick counts.
+    pub fn set_quorum_patience(&mut self, ticks: usize) -> Result<(), ReplicaError> {
+        self.node
+            .raft
+            .set_quorum_patience(ticks)
+            .map_err(ReplicaError::Refused)
+    }
+
     /// What the member does with an append that arrives ahead of a hole
     /// (`hyper_raft::RawNode::set_ahead`): policy its owner sets once every peer can read a kept
     /// refusal, never part of what is durable.
@@ -1341,11 +1359,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         // keeps are the refused ones'. Fenced here before, a full log cost a fast group its
         // replica.
         let proposals: Vec<Entry> = self.node.issued_proposals().cloned().collect();
+        // And what the core released through: written again with them, the release ends no
+        // proposal they give.
+        let released = Some(self.node.released()).filter(|through| *through > 0);
         let write = Write {
             start,
             entries: entries_of(&held, start),
             hard_state: Some(hard),
             proposals: &proposals,
+            released,
         };
         let submitted = self.node.store_mut().log.submit(&write, waker);
         let state = self.submitted_state(submitted)?;
@@ -1420,6 +1442,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             && raft.log().last_term().is_ok_and(|term| term == raft.term())
     }
 
+    /// Whether an entry waits behind the fence that no write out states the commit of: the next
+    /// write states it (§4.1).
+    fn fence_needs_commit(&self) -> bool {
+        self.behind_fence()
+            .is_some_and(|(_, last)| !self.fence_covered(last))
+    }
+
     /// Whether a write out states a commit through `index`.
     fn fence_covered(&self, index: u64) -> bool {
         self.durable_commit() >= index
@@ -1459,6 +1488,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         }
         let readied = self.node.ready_in_place();
         let mut ready = self.must(readied)?;
+        // A commit that moved alone rides a later write (§4.1), unless the fence needs `C_d`
+        // for an entry no write out states: the core then vouches for no commit from this one,
+        // and holds the answers among its messages, not yet taken, to the durable commit.
+        if !self.fence_needs_commit() {
+            let deferred = self.node.defer_commit(&mut ready);
+            self.must(deferred)?;
+        }
         self.emit(ready.take_messages(), out);
         for read in ready.take_read_states() {
             self.reads.push_back((read.index, read.request_ctx));
@@ -1466,7 +1502,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let number = ready.number();
         let messages = ready.take_persisted_messages();
         let range = ready.committed_range();
-        let (hard, vote) = self.hard_of(ready.hard_state())?;
+        let carries = {
+            let persist = self.node.to_persist();
+            !persist.entries.is_empty()
+                || persist
+                    .snapshot
+                    .is_some_and(|s| !proto::snapshot_is_empty(s))
+        } || !ready.proposals().is_empty();
+        let (hard, vote) = self.hard_of(ready.hard_state(), carries)?;
         let installs = self
             .node
             .raft
@@ -1480,6 +1523,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         } else {
             self.writes_made.readies = self.writes_made.readies.saturating_add(1);
         }
+        out.displaced.append(&mut ready.take_displaced());
         let issued = self.node.advance_issued(ready);
         self.must(issued)?;
         if let Some(hard) = hard {
@@ -1526,22 +1570,25 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// The hard state a `Ready`'s write states: its term and vote, and the commit of
-    /// [`Replica::stated_commit`]; none when neither moved since the last write. With it,
-    /// whether the term or vote moved: the write's flush is then a vote's.
+    /// [`Replica::stated_commit`]; none when nothing it must state moved since the last write.
+    /// With it, whether the term or vote moved: the write's flush is then a vote's.
+    ///
+    /// A commit costs no write of its own (§4.1, focal F17): it is stated by a write that
+    /// `carries` something else (entries, a start or proposals), or when the commit fence needs
+    /// `C_d` for an entry no write out states. A commit that moved alone is volatile (Ongaro's
+    /// thesis, figure 3.1); etcd's `MustSync` likewise syncs only for entries, a term or a vote.
+    /// It rides the next write that carries anything, and the quiet write states it for a member
+    /// that goes quiet.
     fn hard_of(
         &self,
         given: Option<&HardState>,
+        carries: bool,
     ) -> Result<(Option<HardState>, bool), ReplicaError> {
         let (term, vote) = given.map_or((self.issued.term, self.issued.vote), |h| (h.term, h.vote));
         let commit = self.stated_commit()?.max(self.issued.commit);
         let moved = (term, vote) != (self.issued.term, self.issued.vote);
-        // A `Ready`'s hard state is written whenever it gives one, its commit with it (the
-        // core reads `C_d` from its notice); the commit stated is never less than it gives.
-        let hard = (given.is_some() || moved || commit > self.issued.commit).then_some(HardState {
-            term,
-            vote,
-            commit,
-        });
+        let states_commit = commit > self.issued.commit && (carries || self.fence_needs_commit());
+        let hard = (moved || states_commit).then_some(HardState { term, vote, commit });
         Ok((hard, moved))
     }
 
@@ -1571,6 +1618,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             entries: entries_of(persist.entries, start),
             hard_state: hard,
             proposals: ready.proposals(),
+            released: ready.released(),
         };
         if write.is_empty() {
             return Ok(State::Empty);
@@ -1818,32 +1866,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.applied = at;
         self.conf_index = at.index;
         self.node.store_mut().configuration = configuration;
-        if self.snapshot_misses_a_member() {
-            self.prepare()?;
-        }
         Ok(())
-    }
-
-    /// Whether the snapshot prepared for lagging members leaves out a member of the
-    /// configuration, which refuses a snapshot that does not name it.
-    fn snapshot_misses_a_member(&self) -> bool {
-        let held = self.node.store();
-        let Some(named) = held
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.metadata.as_ref())
-            .and_then(|m| m.conf_state.as_ref())
-        else {
-            return false;
-        };
-        let configuration = &held.configuration;
-        configuration
-            .voters
-            .iter()
-            .chain(&configuration.learners)
-            .chain(&configuration.voters_outgoing)
-            .chain(&configuration.learners_next)
-            .any(|&member| !names(named, member))
     }
 
     /// Tells the core how far the state machine applied.
@@ -2094,6 +2117,7 @@ fn repair_at_open<L: LogStore>(log: &mut L, durable: Point) -> Result<crate::Sto
                 ..hard
             }),
             proposals: &[],
+            released: None,
         }
     } else if durable.index > hard.commit {
         Write {

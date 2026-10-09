@@ -119,6 +119,25 @@ pub fn available_space(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
+/// Bytes the volume that holds `path` holds in all, used or not, or `None` when it cannot be
+/// determined: what a file on it may at most take, which a node's start reads as its log's
+/// bound and which, unlike the free space, does not change between starts.
+#[cfg(unix)]
+pub fn total_space(path: &std::path::Path) -> Option<u64> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    stat.f_blocks.checked_mul(stat.f_frsize)
+}
+
+#[cfg(windows)]
+pub fn total_space(path: &std::path::Path) -> Option<u64> {
+    windows::total_space(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn total_space(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 /// The operating system's memory page: the unit its virtual memory maps, faults in and reclaims. `None` where
 /// it is not known, and the caller keeps its own bound.
 #[cfg(unix)]

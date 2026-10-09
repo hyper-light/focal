@@ -13859,6 +13859,84 @@ checkpoint succeeds, and an exact retry is answered. Without the admission check
 rows never refuse. The ledger that had stopped opens Ready on the fixed binary,
 checkpoints, and commits new claims (sequence 4,622).
 
+### 2026-10-06 — The shared crates at hyper-raft b118def; what the new core asked of focal
+
+The six `hyper-*` snapshots move to `b118def` (hyper-raft main, with the `LogOpener` of PR #1), and
+`hyper-seal` joins them: hyper-log's sealed log takes its keys, MACs and tags from it (AES-256-KW
+key wrapping, ML-KEM-1024 to send a key to another machine). `vendor/README.md` and
+`docs/dependencies/inventory.tsv` name the revision. Two of the core's changes since `4c4a199` are
+fixes focal had to meet, and both found defects on focal's side:
+
+- **A fast-track proposal is held until a classic commit releases it** (hyper-raft d8578be, the fix
+  the 2026-10-05 entry waited for). focal's WAL backend ended a proposal when the log reached its
+  index, at a checkpoint (it kept only those above the snapshot) and at replay: the rule the fix
+  removed. `RamLog` now ends proposals only at `Ready::released`; a proposal given again replaces the
+  one held at its index; a checkpoint keeps every held proposal. The release is durable, in a
+  record of its own (`RecordKind::Released`, variant 12, written only in a group with the fast
+  track, so a classic group's stream is as it was), because the core refuses at opening more held
+  proposals than its bound: a stream that never recorded a release would bring every proposal back.
+  A follower learns the classic commit from its leader (`Message::classic`), which focal's
+  envelope carries as field 19 on the raised wire (`Wire::Kept`) and leaves out below it, where a
+  member reads nothing known and releases nothing: room, never safety. The fast track stays
+  withheld (`NodeConfig::validate`): it now needs the raised wire, which the capability fence does
+  not open yet. Tests:
+  `a_proposal_the_log_reached_is_held_until_released_and_the_release_outlives_a_restart` (fails
+  with the old publish-time drop restored), `a_leaders_classic_commit_is_field_19_and_nothing_below_the_fence`,
+  and the fast-track suite on the raised wire, its followers releasing on the next heartbeat.
+- **Elections and commitment count by the newest configuration in a member's log** (hyper-raft
+  83f193a, after its random walk elected two leaders of one term; Ongaro's thesis §4.1, §4.2.2). A
+  leader now stops sending to a member as soon as its log holds the change that removes it, so the
+  removed member is never told. In `cli_nodes`'
+  `a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capacity_is_refused`, the
+  drained host leads the partition and collects the session's membership proof; it cannot witness
+  the change that removed it, and its own refusal aborted the round although the three other voters
+  were a majority, so the heal stalled for good (twice, 240 s; the old core passes in 79 s). A
+  collector's own refusal is now one voter's, as a remote voter's is (`PlacementAgent::collect`):
+  the majority decides, never one node. The test passes in 85 s. Two consensus tests restated for
+  the rule: the removal of the other of two voters commits on the leader's own write, and the fence
+  is kept by a twin that adds a learner (`an_added_learner_is_applied_only_once_the_log_holds_its_commit`,
+  which fails with the fence disabled); a member removed by another never leads a group it is not in
+  (`a_removed_member_never_told_never_leads_a_group_it_is_not_in`).
+
+`inventory.tsv` was also stale by 75 crates since the competitor comparison (03197c1): rows added
+from `cargo metadata`, and `notices.py` renders again. The README named a `--check` flag that
+script does not have; it now names the call.
+
+Gates on the final tree (macOS arm64): `cargo fmt --all --check`, `python3 scripts/check-contracts.py`,
+`clippy --workspace --all-targets --locked -D warnings`, `scripts/check-production.sh`,
+`cargo deny check advisories bans licenses sources`, and `cargo test --workspace --locked --
+--test-threads=4`: 158 test binaries, 3,134 passed, 0 failed, 12 ignored.
+
+### 2026-10-07 — The shared crates at hyper-raft b483a13; the node's log from its facts
+
+The seven `hyper-*` snapshots move to `b483a13`, hyper-raft main once PRs #2, #3 and #4 landed:
+`Config::derive`, a commit that moved alone written with the next write that holds anything, and
+the admission test's hold. Two things on focal's side:
+
+- **The differential's oracle states what the shell may differ in.** On the shell a member's
+  answers to its leader (appends and heartbeats) state the commit it holds durably, which a commit
+  that moved alone reaches only at its next write; focal-log writes the commit at once. A leader
+  commits by what its members match, never by the commit they state, so the backends may differ
+  there and nowhere else: the oracle sets that field aside, and fails where the shell states more
+  than focal-log (`answered`, `stated_past`). The four differential tests pass on it.
+- **The node's log configuration** (`node_log::config`, 27 §15.3) is `hyper_log::Config::derive`
+  from what focal already states: a frame holds the largest entry any group may take
+  (`MAX_ENTRY_BYTES`, the bound `NodeConfig::validate` admits, with the shell's record); a group
+  retains two of the longest checkpoint cadence's entries at their largest and the core's
+  uncommitted bytes with one entry past them, at least `ENTRY_FIXED_BYTES` each, as the core's own
+  limits count them; the device's block is what the system reports (`device_block`,
+  `hyper_block::file::preferred_block`). Facts that cannot hold the log are refused typed
+  (`ConsensusError::LogFacts`).
+
+Found on the way, in the shared crates: hyper-log takes its layout block from the file's transfer
+alignment, one byte for a file opened buffered, so no log can be created on a file system that
+refuses direct I/O (tmpfs, many FUSE file systems); reported to hyper-raft with the reproduction.
+focal opens its log `PreferDirect`, which its CI and development volumes accept.
+
+Gates on the final tree (macOS arm64): fmt, contracts, clippy `-D warnings`, production, `cargo
+deny`, and `cargo test --workspace --locked -- --test-threads=4`: 158 test binaries, 3,138 passed,
+0 failed, 12 ignored.
+
 ### 2026-10-05 — Group commit on the single-node owner: 8 callers no longer wait in line for 8 flushes
 
 Measured with `focal-load` (release, embedded, `authored_v1`, 2,000 creations, seeds
@@ -13939,3 +14017,17 @@ default budget admits an anchor and alias that the stated one refuses, and the s
 without the budget. `scripts/check-contracts.py` now refuses `serde_saphyr::from_str`,
 `from_slice` and `from_reader` in production sources (an inline test module may compare against
 them), so a new site cannot take the default.
+
+### 2026-10-08 — The shared crates at hyper-raft 5d68252
+
+The seven `hyper-*` snapshots move from `f311ab6` to `5d68252`, hyper-raft main once its CI
+passed all 14 jobs (run 37823366100). `5d68252` changed only `hyper-block`: it gains `aio`, whose
+`AioFile` issues a direct file's reads, writes and their flush to Linux's native AIO from the
+caller's thread and reaps them there (io_submit(2), io_getevents(2); the flush an
+`IOCB_CMD_FDSYNC` once every write of its batch succeeded, `fdatasync` in place on a kernel
+before 4.18), refused, typed, over a buffered file and on every other OS. Its manifest gains
+`libc` on Linux for those calls. The other six crates are byte for byte `f311ab6`'s. focal
+does not call `aio` yet: whether its log writes through it is a separate change, decided by a
+measured before and after, so this snapshot claims no gain of its own. hyper-raft
+`docs/research/issuer-completions.md` §8 states the design and `docs/benchmarks.md` its
+measurements.
