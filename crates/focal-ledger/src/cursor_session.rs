@@ -775,7 +775,7 @@ impl Session {
             // No thread: the capture and its batch were dropped with the
             // closure, the batch's files removed; the next period tries again.
             .map_err(|_| LedgerError::Capacity)?;
-        self.deferred = Some(DeferredCheckpoint {
+        self.deferred = Some(Box::new(DeferredCheckpoint {
             point,
             head,
             slot_generation,
@@ -784,7 +784,7 @@ impl Session {
             done,
             worker: Some(worker),
             _scratch: encoded._scratch,
-        });
+        }));
         Ok(())
     }
 
