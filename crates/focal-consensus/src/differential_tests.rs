@@ -433,3 +433,82 @@ fn both_backends_restart_to_the_same_state() {
     twin.restart(0);
     twin.pump();
 }
+
+/// A checkpoint of a prefix captured earlier, made after the replica went on, is taken at the
+/// captured point with the entries after it kept, on both backends; once a later checkpoint
+/// supersedes it, the old point is refused. (The restart from a deferred image and its replay
+/// of the entries after it: `a_deferred_seeded_checkpoint_lands_at_its_point_while_the_replica_goes_on`.)
+#[test]
+fn both_backends_checkpoint_a_captured_prefix_after_going_on() {
+    for backend in [Backend::Log, Backend::Shell] {
+        let mut config = NodeConfig::single(1, CLUSTER, GROUP);
+        config.max_entry_bytes = ENTRY;
+        let mut member = Member::new(backend, config);
+        member.node().campaign().unwrap();
+        member.settle();
+        for data in [b"one".as_slice(), b"two"] {
+            member.node().propose(data.to_vec()).unwrap();
+            member.settle();
+        }
+        let point = member.node().checkpoint_point().unwrap();
+        let captured = point.index;
+        // The replica goes on while the captured state is made durable elsewhere.
+        for data in [b"three".as_slice(), b"four"] {
+            member.node().propose(data.to_vec()).unwrap();
+            member.settle();
+        }
+        let image = b"state through two".to_vec();
+        let allocation = member
+            .budget
+            .reserve(BudgetKind::Recovery, BudgetLane::Completion, 4096)
+            .unwrap()
+            .commit();
+        member
+            .node()
+            .begin_checkpoint_from_funded(point.clone(), image.clone(), allocation)
+            .unwrap_or_else(|error| panic!("{backend:?}: {error:?}"));
+        member.node().finish_checkpoint().unwrap();
+        member.settle();
+        // Superseded once a later checkpoint lands: the old point is refused, retryably.
+        member.node().propose(b"five".to_vec()).unwrap();
+        member.settle();
+        let later = member.node().checkpoint_point().unwrap();
+        let allocation = member
+            .budget
+            .reserve(BudgetKind::Recovery, BudgetLane::Completion, 4096)
+            .unwrap()
+            .commit();
+        member
+            .node()
+            .begin_checkpoint_from_funded(later, b"state through five".to_vec(), allocation)
+            .unwrap();
+        member.node().finish_checkpoint().unwrap();
+        member.settle();
+        let allocation = member
+            .budget
+            .reserve(BudgetKind::Recovery, BudgetLane::Completion, 4096)
+            .unwrap()
+            .commit();
+        assert!(matches!(
+            member
+                .node()
+                .begin_checkpoint_from_funded(point, image.clone(), allocation),
+            Err(ConsensusError::CheckpointIndex)
+        ));
+        member.restart();
+        let seen = Seen::of(member.settle());
+        let snapshot = seen
+            .snapshots
+            .first()
+            .unwrap_or_else(|| panic!("{backend:?}: no image on restart: {seen:?}"));
+        assert!(snapshot.index > captured, "{backend:?}");
+        assert_eq!(snapshot.data, b"state through five", "{backend:?}");
+        let after: Vec<&[u8]> = seen
+            .committed
+            .iter()
+            .filter(|entry| !entry.data.is_empty())
+            .map(|entry| entry.data.as_slice())
+            .collect();
+        assert!(after.is_empty(), "{backend:?}: {after:?}");
+    }
+}

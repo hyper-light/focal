@@ -124,6 +124,8 @@ impl Session {
     /// checkpoint rewrite. No witness escapes until its exact receipt completes.
     pub fn begin_checkpoint_evidence(&mut self, now: u64, ttl: u64) -> Result<(), LedgerError> {
         self.check()?;
+        // One checkpoint at a time: a deferred one is finished first.
+        self.settle_deferred_checkpoint()?;
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending.into());
         }
@@ -192,6 +194,7 @@ impl Session {
             bytes,
             retained,
             native: _,
+            commit: _,
             _scratch,
         } = encoded;
         let (checkpoint, allocation) = retained.ok_or(LedgerError::Corrupt)?;

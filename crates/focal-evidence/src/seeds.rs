@@ -18,6 +18,9 @@ pub struct SeedStore {
     pub(super) failed: bool,
     /// A seed sweep in progress (26 §5).
     pub(super) sweep: Option<std::fs::ReadDir>,
+    /// Batches begun by this writer: what names a batch's unsynced files, so
+    /// that two batches, or a batch and a single install, never share one.
+    batches: u64,
     _writer_lock: focal_platform::FileLock,
 }
 
@@ -50,6 +53,7 @@ impl SeedStore {
             disk,
             failed: false,
             sweep: None,
+            batches: 0,
             _writer_lock: lock,
         })
     }
@@ -93,6 +97,31 @@ impl SeedStore {
         }
         record.commit();
         Ok(hash)
+    }
+    /// Seal the chunks of one checkpoint as one batch (25 §5). Each chunk is
+    /// written as it is added, to a file of its own and unsynced; `commit`
+    /// then makes them durable together: every new file synced (in parallel,
+    /// on a bounded number of scoped threads), each renamed under its hash,
+    /// and the directory synced once. A checkpoint of N chunks costs N file
+    /// syncs that overlap and one directory sync, where installing them one
+    /// at a time cost a file sync, a rename and two directory syncs each,
+    /// one after another, on the owner's thread. No hash is promised durable
+    /// before `commit` returns; an IO failure fails the store, as `install`
+    /// does.
+    pub fn batch(&mut self) -> Result<SeedBatch<'_>, ContentError> {
+        self.check()?;
+        self.batches = self.batches.wrapping_add(1);
+        let number = self.batches;
+        Ok(SeedBatch {
+            store: self,
+            number,
+            pending: PendingFiles::default(),
+        })
+    }
+    /// A commit run away from this store failed: the store refuses until it is
+    /// reopened, as after any IO failure of its own.
+    pub fn fail(&mut self) {
+        self.failed = true;
     }
     /// Verify a chunk another owner wrote under `hash`, taking it as the
     /// author would have: refused when it does not hash to `hash`.
@@ -149,6 +178,193 @@ impl SeedReader {
     }
 }
 
+/// One checkpoint's chunks on their way to durability; see [`SeedStore::batch`].
+/// Dropped before `commit`, nothing is promised and the files it wrote are
+/// removed; what a crash leaves unnamed (`.batch`) the seed sweep removes.
+pub struct SeedBatch<'a> {
+    store: &'a mut SeedStore,
+    number: u64,
+    pending: PendingFiles,
+}
+
+/// A batch's durable commit, owning everything it needs: it may run on
+/// another thread while its store's owner goes on (its files are not named
+/// as chunks, so nothing reads or sweeps them meanwhile). A failure must be
+/// reported to the store with [`SeedStore::fail`].
+pub struct SeedCommit {
+    root: PathBuf,
+    pending: PendingFiles,
+}
+
+/// A batch's unsynced files. Dropped before they were made durable (a batch
+/// abandoned, a commit that failed or never ran), the ones still unnamed are
+/// removed; the seed sweep removes what a crash leaves.
+#[derive(Default)]
+struct PendingFiles(Vec<PendingSeedFile>);
+
+impl Drop for PendingFiles {
+    fn drop(&mut self) {
+        for file in self.0.drain(..) {
+            // Absent once renamed under its hash; a failure leaves it to the sweep.
+            let _ = fs::remove_file(&file.temp);
+        }
+    }
+}
+
+struct PendingSeedFile {
+    temp: PathBuf,
+    path: PathBuf,
+    file: File,
+    record: DiskReservation,
+}
+
+/// The most threads a batch syncs its files on: enough to keep a device's
+/// queue busy (NVMe and SSD serve concurrent flushes, and a journaling
+/// filesystem commits concurrent syncs together), few enough to stay a small
+/// share of the host.
+const SYNC_THREADS: usize = 8;
+
+impl<'a> SeedBatch<'a> {
+    /// Add one chunk: its hash, the bytes written to a file of their own (not
+    /// yet durable). An identical chunk already present costs no write; a
+    /// different file under the same name is corruption.
+    pub fn add(&mut self, bytes: &[u8]) -> Result<ContentHash, ContentError> {
+        self.store.check()?;
+        if bytes.is_empty() || bytes.len() > SEED_CHUNK_BYTES {
+            return Err(ContentError::Capacity);
+        }
+        let hash = ContentHash(*blake3::hash(bytes).as_bytes());
+        let path = seed_path(&self.store.root, hash);
+        if self.pending.0.iter().any(|p| p.path == path) {
+            return Ok(hash);
+        }
+        let result = self.write(bytes, hash, path);
+        if let Err(ContentError::Io(_)) = &result {
+            self.store.failed = true;
+        }
+        result.map(|()| hash)
+    }
+
+    fn write(
+        &mut self,
+        bytes: &[u8],
+        hash: ContentHash,
+        path: PathBuf,
+    ) -> Result<(), ContentError> {
+        if path.exists() {
+            // As `install`: identical bytes are complete, anything else is corrupt.
+            return install_verified_chunk(&path, bytes, hash);
+        }
+        let record = disk_reserve(
+            &self.store.disk,
+            &self.store.root,
+            DiskKind::Checkpoint,
+            BudgetLane::Completion,
+            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+        )?;
+        let temp = path.with_extension(format!("{}.batch", self.number));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        self.pending
+            .0
+            .try_reserve(1)
+            .map_err(|_| ContentError::Capacity)?;
+        self.pending.0.push(PendingSeedFile {
+            temp,
+            path,
+            file,
+            record,
+        });
+        Ok(())
+    }
+
+    /// Make every added chunk durable here, on this thread: the files synced
+    /// together, renamed, and the directory synced once. Only then are their
+    /// hashes promised.
+    pub fn commit(self) -> Result<(), ContentError> {
+        let (store, commit) = self.split();
+        let result = commit.run();
+        if result.is_err() {
+            store.failed = true;
+        }
+        result
+    }
+
+    /// The batch's commit, to run away from the store's owner: the chunks are
+    /// promised only once it returns `Ok`.
+    pub fn detach(self) -> SeedCommit {
+        self.split().1
+    }
+
+    fn split(self) -> (&'a mut SeedStore, SeedCommit) {
+        let SeedBatch { store, pending, .. } = self;
+        let root = store.root.clone();
+        (store, SeedCommit { root, pending })
+    }
+}
+
+impl SeedCommit {
+    /// Make every chunk of the batch durable; see [`SeedBatch::commit`].
+    pub fn run(self) -> Result<(), ContentError> {
+        let SeedCommit { root, mut pending } = self;
+        Self::durable(&root, &pending.0)?;
+        for file in pending.0.drain(..) {
+            file.record.commit();
+        }
+        Ok(())
+    }
+
+    /// How many chunks the commit makes durable.
+    pub fn chunks(&self) -> usize {
+        self.pending.0.len()
+    }
+
+    fn durable(root: &Path, pending: &[PendingSeedFile]) -> Result<(), ContentError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, SYNC_THREADS)
+            .min(pending.len());
+        let per = pending.len().div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|scope| -> Result<(), ContentError> {
+            let mut workers = Vec::new();
+            workers
+                .try_reserve_exact(threads)
+                .map_err(|_| ContentError::Capacity)?;
+            for share in pending.chunks(per) {
+                let worker = std::thread::Builder::new()
+                    .name("focal-seed-sync".into())
+                    .spawn_scoped(scope, move || -> std::io::Result<()> {
+                        for file in share {
+                            file.file.sync_all()?;
+                        }
+                        Ok(())
+                    })?;
+                workers.push(worker);
+            }
+            for worker in workers {
+                // A sync thread that did not return is a failed sync.
+                worker
+                    .join()
+                    .map_err(|_| ContentError::Failed)?
+                    .map_err(ContentError::Io)?;
+            }
+            Ok(())
+        })?;
+        for file in pending {
+            focal_platform::fs::atomic_replace(&file.temp, &file.path)?;
+        }
+        sync_directory(root)?;
+        Ok(())
+    }
+}
+
 fn seed_path(root: &Path, hash: ContentHash) -> PathBuf {
     root.join(format!("{hash}.seed"))
 }
@@ -167,6 +383,82 @@ mod tests {
 
     fn disk() -> DiskBudget {
         DiskBudget::new(DiskBudgetConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn a_batch_promises_its_chunks_only_once_committed_and_skips_what_is_there() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("seeds");
+        let mut store = SeedStore::open(&root, disk()).unwrap();
+        let present = vec![1u8; 4096];
+        let present_hash = store.install(&present).unwrap();
+        let chunks: Vec<Vec<u8>> = (0..20u8).map(|n| vec![n.wrapping_add(2); 8192]).collect();
+        // Uncommitted: nothing is named, so nothing is promised.
+        {
+            let mut batch = store.batch().unwrap();
+            for chunk in &chunks {
+                batch.add(chunk).unwrap();
+            }
+        }
+        for chunk in &chunks {
+            assert!(!store.contains(ContentHash(*blake3::hash(chunk).as_bytes())));
+        }
+        // Committed: every chunk named and verified on read, the one already
+        // present taken as it is, the same chunk twice in a batch once.
+        let mut batch = store.batch().unwrap();
+        let mut hashes = Vec::new();
+        for chunk in &chunks {
+            hashes.push(batch.add(chunk).unwrap());
+        }
+        assert_eq!(batch.add(&present).unwrap(), present_hash);
+        assert_eq!(batch.add(&chunks[0]).unwrap(), hashes[0]);
+        assert!(matches!(batch.add(&[]), Err(ContentError::Capacity)));
+        batch.commit().unwrap();
+        for (chunk, hash) in chunks.iter().zip(&hashes) {
+            assert_eq!(store.read(*hash, SEED_CHUNK_BYTES).unwrap(), *chunk);
+        }
+        assert_eq!(store.read(present_hash, 4096).unwrap(), present);
+        // No unnamed file is left beside the chunks.
+        let leftovers = std::fs::read_dir(&root)
+            .unwrap()
+            .filter(|e| {
+                let path = e.as_ref().unwrap().path();
+                path.extension()
+                    .is_some_and(|x| x == "install" || x == "batch")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        // A different file under a chunk's name is corruption, as for `install`.
+        let path = seed_path(&root, hashes[1]);
+        std::fs::write(&path, b"not the chunk").unwrap();
+        let mut batch = store.batch().unwrap();
+        assert!(matches!(batch.add(&chunks[1]), Err(ContentError::Corrupt)));
+    }
+
+    #[test]
+    fn a_detached_commit_runs_on_another_thread_and_promises_only_when_done() {
+        fn sendable<T: Send>(_: &T) {}
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("seeds");
+        let mut store = SeedStore::open(&root, disk()).unwrap();
+        let chunks: Vec<Vec<u8>> = (0..6u8)
+            .map(|n| vec![n.wrapping_mul(3); 16 * 1024])
+            .collect();
+        let mut batch = store.batch().unwrap();
+        let hashes: Vec<ContentHash> = chunks.iter().map(|c| batch.add(c).unwrap()).collect();
+        let commit = batch.detach();
+        sendable(&commit);
+        assert_eq!(commit.chunks(), chunks.len());
+        // Before the commit returns nothing is named; the owner may go on.
+        assert!(hashes.iter().all(|h| !store.contains(*h)));
+        let done = std::thread::scope(|scope| scope.spawn(move || commit.run()).join().unwrap());
+        done.unwrap();
+        for (chunk, hash) in chunks.iter().zip(&hashes) {
+            assert_eq!(store.read(*hash, SEED_CHUNK_BYTES).unwrap(), *chunk);
+        }
+        // A commit that failed away from the store fails it through its owner.
+        store.fail();
+        assert!(matches!(store.batch(), Err(ContentError::Failed)));
     }
 
     #[test]

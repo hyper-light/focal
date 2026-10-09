@@ -216,6 +216,9 @@ pub struct CheckpointTiming {
     pub bytes: u64,
     pub native_micros: u64,
     pub envelope_micros: u64,
+    /// How long its seed chunks took to be made durable away from the owner,
+    /// while the replica went on; zero when the owner made them durable itself.
+    pub deferred_micros: u64,
     pub write_micros: u64,
 }
 
@@ -331,6 +334,8 @@ pub struct Session {
     reads_dropped: u64,
     /// The cost of the checkpoints this replica wrote last, for diagnostics.
     checkpoint_timings: CheckpointTimings,
+    /// A checkpoint whose seeds are being made durable off the owner's thread.
+    deferred: Option<DeferredCheckpoint>,
 }
 
 impl Session {
@@ -553,6 +558,7 @@ impl Session {
             reads_parked: 0,
             reads_dropped: 0,
             checkpoint_timings: CheckpointTimings::default(),
+            deferred: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
         // A delivery retained at startup (an import waiting for its host to seal

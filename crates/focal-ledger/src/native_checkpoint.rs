@@ -7,7 +7,7 @@ use focal_consensus::MembershipConfiguration;
 use focal_core::Core;
 use focal_core::native::input_codec as input;
 use focal_core::native::{NativeContentProfile, NativeState, record_codec};
-use focal_evidence::{ContentError, SEED_CHUNK_BYTES, SeedReader, SeedStore};
+use focal_evidence::{ContentError, SEED_CHUNK_BYTES, SeedCommit, SeedReader, SeedStore};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, RangeId};
 use focal_model::{ContentHash, LedgerId, SessionSeq};
 use record_codec::checkpoint as root;
@@ -485,8 +485,28 @@ impl<'a> EncodingPlan<'a> {
         budget: &MemoryBudget,
         seeds: &mut SeedStore,
     ) -> Result<EncodedCheckpoint, Error> {
+        let (encoded, commit) = self.encode_in_seeded_deferred(budget, seeds)?;
+        if let Some(commit) = commit
+            && let Err(error) = commit.run()
+        {
+            seeds.fail();
+            return Err(error.into());
+        }
+        Ok(encoded)
+    }
+
+    /// As `encode_in_seeded`, the root's seed chunks written but not yet
+    /// durable: the commit returned makes them so, and may run away from the
+    /// owner (25 §5; the session's deferred checkpoint). The bytes name the
+    /// chunks, so consensus must not take them before the commit succeeds.
+    /// An inline checkpoint has no commit.
+    pub fn encode_in_seeded_deferred(
+        &self,
+        budget: &MemoryBudget,
+        seeds: &mut SeedStore,
+    ) -> Result<(EncodedCheckpoint, Option<SeedCommit>), Error> {
         let Form::Seeded { chunks } = self.form else {
-            return self.encode_in(budget);
+            return self.encode_in(budget).map(|encoded| (encoded, None));
         };
         let core_bytes = self.core.quote().bytes;
         let table_bytes = fields::add(fields::mul(chunks, size_of::<SeedChunk>())?, ALLOCATION)?;
@@ -504,6 +524,11 @@ impl<'a> EncodingPlan<'a> {
             .try_reserve_exact(SEED_CHUNK_BYTES)
             .map_err(|_| MemoryError::AllocationFailed)?;
         let mut sealed = 0usize;
+        // The chunks are written as they are sealed and made durable together
+        // once the root is whole, by the batch's commit: overlapping file syncs
+        // and one directory sync, not a sync and two directory syncs each in
+        // turn on the owner's thread.
+        let mut batch = seeds.batch()?;
         let mut seal = |buffer: &mut Vec<u8>, table: &mut Vec<SeedChunk>| -> Result<(), Error> {
             if buffer.is_empty() {
                 return Ok(());
@@ -511,7 +536,7 @@ impl<'a> EncodingPlan<'a> {
             if table.len() >= chunks {
                 return Err(Error::Invalid("seed chunk count"));
             }
-            let hash = seeds.install(buffer)?;
+            let hash = batch.add(buffer)?;
             table.push(SeedChunk {
                 hash,
                 length: u32::try_from(buffer.len()).map_err(|_| Error::Capacity)?,
@@ -539,6 +564,7 @@ impl<'a> EncodingPlan<'a> {
                 root::WriteError::Codec(error) => Error::Core(error),
             })?;
         seal(&mut buffer, &mut table)?;
+        let commit = batch.detach();
         if sealed != core_bytes || table.len() != chunks {
             return Err(Error::Invalid("seeded core length"));
         }
@@ -583,7 +609,7 @@ impl<'a> EncodingPlan<'a> {
         if length != self.quote.bytes || bytes.len() != self.quote.bytes {
             return Err(Error::Invalid("encoded length"));
         }
-        Ok(EncodedCheckpoint { bytes, allocation })
+        Ok((EncodedCheckpoint { bytes, allocation }, Some(commit)))
     }
     pub fn encode_in(&self, budget: &MemoryBudget) -> Result<EncodedCheckpoint, Error> {
         if self.seeded() {

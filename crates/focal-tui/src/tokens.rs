@@ -172,6 +172,15 @@ impl Paint {
         }
     }
 
+    /// `c` as the background.
+    pub fn bg(&self, out: &mut String, c: Rgb) {
+        if self.truecolor {
+            let _ = write!(out, "\x1b[48;2;{};{};{}m", c.0, c.1, c.2);
+        } else {
+            let _ = write!(out, "\x1b[48;5;{}m", xterm256(c));
+        }
+    }
+
     pub fn bold(&self, out: &mut String, on: bool) {
         out.push_str(if on { "\x1b[1m" } else { "\x1b[22m" });
     }

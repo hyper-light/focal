@@ -56,4 +56,4 @@ retry 30 f1 activate native
 # The generator's client, enrolled over QUIC like every competitor's client.
 f1 invite client --name bench --output /invite/client.invite
 $DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/client.invite bench
-f1 identity
+f1 inspect identity

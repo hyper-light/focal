@@ -159,6 +159,11 @@ impl<M: Medium> HandOver<M> {
             || crate::core_state::names_every_member(&self.image_configuration, current)
     }
 
+    /// The point of the group's latest image, if it has one.
+    pub(crate) fn imaged(&self) -> Option<Point> {
+        self.imaged
+    }
+
     /// The last entry handed over.
     pub(crate) fn applied(&self) -> Point {
         self.applied

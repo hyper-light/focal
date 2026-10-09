@@ -249,6 +249,10 @@ pub struct AdminCheckpointTiming {
     pub bytes: u64,
     pub native_micros: u64,
     pub envelope_micros: u64,
+    /// How long its seed chunks took to be made durable away from the owner,
+    /// while the replica went on (zero when the owner did it itself).
+    #[serde(default)]
+    pub deferred_micros: u64,
     pub write_micros: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

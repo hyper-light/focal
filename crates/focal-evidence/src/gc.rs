@@ -1078,14 +1078,20 @@ impl SeedStore {
             let Some((stem, extension)) = split_name(&entry) else {
                 continue;
             };
-            if extension != "seed" {
+            // An unnamed file a crash left behind (an install's or a batch's,
+            // never synced into a chunk) is removed past the same grace; a live
+            // batch commits in far less than it, so nothing in use is taken.
+            let unnamed = matches!(extension.as_str(), "install" | "batch");
+            if extension != "seed" && !unnamed {
                 continue;
             }
-            let Some(hash) = parse_hash(&stem) else {
-                continue;
-            };
-            if protected.binary_search(&hash).is_ok() {
-                continue;
+            if !unnamed {
+                let Some(hash) = parse_hash(&stem) else {
+                    continue;
+                };
+                if protected.binary_search(&hash).is_ok() {
+                    continue;
+                }
             }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
