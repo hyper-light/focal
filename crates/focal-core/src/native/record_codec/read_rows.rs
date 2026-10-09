@@ -453,7 +453,9 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
 /// Event body parsing, intrinsic checks and compact packing are allocation-free.
 /// The plan carries the exact original publication fact, without reexecuting it.
 pub(super) struct EventPlan {
-    event: history::StoredEvent,
+    event: NativeEvent,
+    ledger: LedgerId,
+    heap: usize,
 }
 
 impl EventPlan {
@@ -477,14 +479,15 @@ impl EventPlan {
             return Err(invalid());
         }
         check_event(event, ledger)?;
-        let packed = history::StoredEvent::pack(event)?;
-        if packed.expand(ledger) != event {
-            return Err(ContractError::WrongLedger.into());
-        }
-        Ok(Self { event: packed })
+        let heap = OwnedEvent::charge_for(event, ledger)?;
+        Ok(Self {
+            event,
+            ledger,
+            heap,
+        })
     }
     pub(super) const fn heap_bytes(&self) -> usize {
-        OwnedEvent::container_charge()
+        self.heap
     }
     pub(super) const fn build_visits(&self) -> usize {
         EVENT_BUILD_VISITS
@@ -497,7 +500,7 @@ impl EventPlan {
         if self.heap_bytes() > allowance || self.build_visits() > max_visits {
             return Err(ContractError::Capacity.into());
         }
-        let row = OwnedEvent::new(self.event)?;
+        let row = OwnedEvent::new(self.event, self.ledger)?;
         let actual = row.heap_charge()?;
         if actual > allowance {
             return Err(ContractError::Capacity.into());

@@ -199,6 +199,7 @@ impl RegistrySnapshotSource for ImportScopes {
 
 struct Rows {
     rows: Vec<(Key, Row)>,
+    ledger: LedgerId,
     events: u32,
     meta: Meta,
 }
@@ -243,8 +244,7 @@ impl Rows {
             ordinal,
             fact,
         };
-        let stored = StoredEvent::pack(event).map_err(NativeError::from)?;
-        let row = OwnedEvent::new(stored)?;
+        let row = OwnedEvent::new(event, self.ledger)?;
         self.push(Key::Event(IMPORT_SEQUENCE, ordinal), Row::Event(row))?;
         self.events = self
             .events
@@ -368,6 +368,7 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     }
     let mut out = Rows {
         rows,
+        ledger: request.ledger,
         events: 0,
         meta: Meta {
             logical_time: request.logical_time,

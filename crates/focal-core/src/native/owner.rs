@@ -1305,7 +1305,7 @@ impl<'a> NativeView<'a> {
     }
     pub fn event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.0.get(Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get().map(|row| row.expand(self.0.ledger())),
+            Some(Row::Event(event)) => event.get(self.0.ledger()),
             _ => None,
         }
     }

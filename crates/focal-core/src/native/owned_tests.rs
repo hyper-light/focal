@@ -237,7 +237,7 @@ fn invalid_containers_and_charge_overflow_are_errors() {
         Err(MemoryError::MissingKey)
     ));
     let invalid = OwnedEvent(Vec::new());
-    assert!(invalid.get().is_none());
+    assert!(invalid.get(crate::native::report_tests::ledger()).is_none());
     assert!(matches!(invalid.copy(), Err(MemoryError::MissingKey)));
     assert!(matches!(
         invalid.heap_charge(),
@@ -253,10 +253,6 @@ fn invalid_containers_and_charge_overflow_are_errors() {
     ));
     assert!(matches!(
         container_heap::<EvaluationState>(usize::MAX),
-        Err(MemoryError::CounterExhausted(_))
-    ));
-    assert!(matches!(
-        container_heap::<StoredEvent>(usize::MAX),
         Err(MemoryError::CounterExhausted(_))
     ));
 }
@@ -714,20 +710,43 @@ fn owned_event_copy_preserves_exact_history_after_original_is_dropped() {
             status: claim.status(),
         }),
     };
-    let original = OwnedEvent::new(StoredEvent::pack(expected).unwrap()).unwrap();
+    let original = OwnedEvent::new(expected, ledger).unwrap();
     let copied = original.copy().unwrap();
+    // Held at its own encoded width, below the widest event's reservation.
     assert_eq!(
         original.heap_charge().unwrap(),
-        OwnedEvent::container_charge()
+        original.0.len() + ALLOCATION
     );
+    assert!(original.heap_charge().unwrap() < OwnedEvent::container_charge());
     assert_eq!(
         copied.heap_charge().unwrap(),
         original.heap_charge().unwrap()
     );
     assert_ne!(original.0.as_ptr(), copied.0.as_ptr());
-    assert_eq!(size_of::<OwnedEvent>(), size_of::<Vec<StoredEvent>>());
-    assert!(size_of::<OwnedEvent>() < size_of::<StoredEvent>());
-    assert_eq!(original.get().unwrap().expand(ledger), expected);
+    assert_eq!(size_of::<OwnedEvent>(), size_of::<Vec<u8>>());
+    assert_eq!(original.get(ledger), Some(expected));
     drop(original);
-    assert_eq!(copied.get().unwrap().expand(ledger), expected);
+    assert_eq!(copied.get(ledger), Some(expected));
+}
+
+/// Measurement, not a check: inline widths of the values each heap row
+/// holds in its singleton allocation.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_owned_row_widths() {
+    use focal_model::lifecycle::{
+        aggregation::RegistrationSet, claim::ClaimState, claim_descriptor::ClaimDescriptor,
+        validation_descriptor::ValidationDescriptor,
+    };
+    for (name, width) in [
+        ("ClaimRow", size_of::<ClaimRow>()),
+        ("ClaimState", size_of::<ClaimState>()),
+        ("RegistrationSet", size_of::<RegistrationSet>()),
+        ("ClaimContentRow", size_of::<ClaimContentRow>()),
+        ("ClaimDescriptor", size_of::<ClaimDescriptor>()),
+        ("ClaimContentProfile", size_of::<ClaimContentProfile>()),
+        ("ValidationDescriptor", size_of::<ValidationDescriptor>()),
+    ] {
+        println!("{name:<22} {width}");
+    }
 }

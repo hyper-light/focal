@@ -70,7 +70,7 @@ fn record_fact(
     if *ordinal >= outcome.events || changes.len() == changes.capacity() {
         return Err(NativeError::Capacity("event preparation"));
     }
-    let stored = OwnedEvent::new(StoredEvent::pack(item)?)?;
+    let stored = OwnedEvent::new(item, outcome.ledger)?;
     let heap = stored.heap_charge()?;
     changes.push(Change::Put(entry(
         Key::Event(outcome.sequence, *ordinal),

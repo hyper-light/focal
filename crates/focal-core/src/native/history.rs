@@ -1,394 +1,35 @@
 //! Compact ledger-local history. The range already owns the ledger identity;
-//! it is not repeated in each before/after/child binding on every event. Reads
-//! expand it into the public exact-binding view without allocating.
+//! a retained event is held as its record encoding with every binding's ledger
+//! implied by the range (`EventBindings::Implied`), at exactly its own width
+//! rather than the widest fact's. Reads decode it into the public exact-binding
+//! view.
 use super::*;
+#[cfg(test)]
 use focal_model::lifecycle::audit::ResultTestamentState;
-use focal_model::{ObjectId, ObjectRevision};
 
-#[derive(Debug, Clone, Copy)]
-struct Revision {
-    object: ObjectId,
-    content: ContentHash,
-    revision: ObjectRevision,
-}
-impl Revision {
-    fn pack(binding: Binding) -> Self {
-        Self {
-            object: binding.object,
-            content: binding.content,
-            revision: binding.revision,
+/// Whether every binding the event names is under `ledger`: the condition for
+/// holding it with the ledger implied.
+pub(super) fn under(event: NativeEvent, ledger: LedgerId) -> bool {
+    let (first, second, third) = match event.fact {
+        NativeFact::ResultTestament { before, after, .. }
+        | NativeFact::Work { before, after, .. }
+        | NativeFact::Response { before, after, .. }
+        | NativeFact::Evaluation { before, after, .. } => (before, Some(after), None),
+        NativeFact::Diagnostic { binding, .. }
+        | NativeFact::Artifact { binding }
+        | NativeFact::Definition { binding, .. } => (Some(binding), None, None),
+        NativeFact::Registrations { claim }
+        | NativeFact::Receipt { claim, .. }
+        | NativeFact::ReceiptAdopted { claim, .. } => (Some(claim), None, None),
+        NativeFact::Claim(row) => (row.owned_child, row.before, Some(row.after)),
+        NativeFact::Missing { .. } | NativeFact::Delivery { .. } | NativeFact::Accepted { .. } => {
+            (None, None, None)
         }
-    }
-    fn expand(self, ledger: LedgerId) -> Binding {
-        Binding {
-            ledger,
-            object: self.object,
-            content: self.content,
-            revision: self.revision,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct StoredEvent {
-    invocation: NativeInvocation,
-    sequence: SessionSeq,
-    ordinal: u32,
-    fact: Fact,
-}
-#[derive(Debug, Clone, Copy)]
-enum Fact {
-    Missing {
-        key: NativeResultKey,
-    },
-    Registrations {
-        claim: Revision,
-    },
-    Delivery {
-        key: NativeResultKey,
-    },
-    Work {
-        claim: ClaimId,
-        before: Option<Revision>,
-        after: Revision,
-        state: WorkArtifactState,
-    },
-    Diagnostic {
-        claim: ClaimId,
-        binding: Revision,
-        reason: EvidenceFailure,
-    },
-    Response {
-        claim: ClaimId,
-        before: Option<Revision>,
-        after: Revision,
-        state: ResponseState,
-    },
-    ResultTestament {
-        claim: ClaimId,
-        before: Option<Revision>,
-        after: Revision,
-        state: ResultTestamentState,
-    },
-    Receipt {
-        claim: Revision,
-        fence: ReceiptFence,
-        holder: ParticipantId,
-    },
-    ReceiptAdopted {
-        claim: Revision,
-        previous: ReceiptEntitlement,
-        replacement: ReceiptEntitlement,
-        cause: ContentHash,
-    },
-    Artifact {
-        binding: Revision,
-    },
-    Accepted {
-        key: NativeResultKey,
-    },
-    Claim {
-        kind: NativeEventKind,
-        graph: Option<NativeGraphCapture>,
-        owned_child: Option<Revision>,
-        before: Option<Revision>,
-        after: Revision,
-        status: ClaimStatus,
-    },
-    Definition {
-        binding: Revision,
-        claim: ClaimId,
-        index: u32,
-        intent: ContentHash,
-    },
-    Evaluation {
-        kind: NativeEvaluationEventKind,
-        key: EvaluationKey,
-        before: Option<Revision>,
-        after: Revision,
-        state: validation::State,
-        phase: validation::Phase,
-        attempt: Option<validation::Attempt>,
-        fence: Option<validation::AuthorityFence>,
-    },
-}
-impl StoredEvent {
-    pub(super) fn pack(event: NativeEvent) -> Result<Self, ContractError> {
-        let fact = match event.fact {
-            NativeFact::Missing { key } => Fact::Missing { key },
-            NativeFact::Registrations { claim } => Fact::Registrations {
-                claim: Revision::pack(claim),
-            },
-            NativeFact::Delivery { key } => Fact::Delivery { key },
-            NativeFact::Work {
-                claim,
-                before,
-                after,
-                state,
-            } => {
-                if before.is_some_and(|value| value.ledger != after.ledger) {
-                    return Err(ContractError::WrongLedger);
-                }
-                Fact::Work {
-                    claim,
-                    before: before.map(Revision::pack),
-                    after: Revision::pack(after),
-                    state,
-                }
-            }
-            NativeFact::Diagnostic {
-                claim,
-                binding,
-                reason,
-            } => Fact::Diagnostic {
-                claim,
-                binding: Revision::pack(binding),
-                reason,
-            },
-            NativeFact::Response {
-                claim,
-                before,
-                after,
-                state,
-            } => {
-                if before.is_some_and(|value| value.ledger != after.ledger) {
-                    return Err(ContractError::WrongLedger);
-                }
-                Fact::Response {
-                    claim,
-                    before: before.map(Revision::pack),
-                    after: Revision::pack(after),
-                    state,
-                }
-            }
-            NativeFact::ResultTestament {
-                claim,
-                before,
-                after,
-                state,
-            } => {
-                if before.is_some_and(|value| value.ledger != after.ledger) {
-                    return Err(ContractError::WrongLedger);
-                }
-                Fact::ResultTestament {
-                    claim,
-                    before: before.map(Revision::pack),
-                    after: Revision::pack(after),
-                    state,
-                }
-            }
-            NativeFact::Receipt {
-                claim,
-                fence,
-                holder,
-            } => Fact::Receipt {
-                claim: Revision::pack(claim),
-                fence,
-                holder,
-            },
-            NativeFact::ReceiptAdopted {
-                claim,
-                previous,
-                replacement,
-                cause,
-            } => Fact::ReceiptAdopted {
-                claim: Revision::pack(claim),
-                previous,
-                replacement,
-                cause,
-            },
-            NativeFact::Artifact { binding } => Fact::Artifact {
-                binding: Revision::pack(binding),
-            },
-            NativeFact::Accepted { key } => Fact::Accepted { key },
-            NativeFact::Claim(row) => {
-                row.check_graph_capture(event.ordinal)?;
-                if row
-                    .before
-                    .is_some_and(|value| value.ledger != row.after.ledger)
-                    || row
-                        .owned_child
-                        .is_some_and(|value| value.ledger != row.after.ledger)
-                {
-                    return Err(ContractError::WrongLedger);
-                }
-                Fact::Claim {
-                    kind: row.kind,
-                    graph: row.graph,
-                    owned_child: row.owned_child.map(Revision::pack),
-                    before: row.before.map(Revision::pack),
-                    after: Revision::pack(row.after),
-                    status: row.status,
-                }
-            }
-            NativeFact::Definition {
-                binding,
-                claim,
-                index,
-                intent,
-            } => Fact::Definition {
-                binding: Revision::pack(binding),
-                claim,
-                index,
-                intent,
-            },
-            NativeFact::Evaluation {
-                kind,
-                key,
-                before,
-                after,
-                state,
-                phase,
-                attempt,
-                fence,
-            } => {
-                if before.is_some_and(|value| value.ledger != after.ledger) {
-                    return Err(ContractError::WrongLedger);
-                }
-                Fact::Evaluation {
-                    kind,
-                    key,
-                    before: before.map(Revision::pack),
-                    after: Revision::pack(after),
-                    state,
-                    phase,
-                    attempt,
-                    fence,
-                }
-            }
-        };
-        Ok(Self {
-            invocation: event.invocation,
-            sequence: event.sequence,
-            ordinal: event.ordinal,
-            fact,
-        })
-    }
-    pub(super) fn expand(self, ledger: LedgerId) -> NativeEvent {
-        NativeEvent {
-            invocation: self.invocation,
-            sequence: self.sequence,
-            ordinal: self.ordinal,
-            fact: match self.fact {
-                Fact::Missing { key } => NativeFact::Missing { key },
-                Fact::Registrations { claim } => NativeFact::Registrations {
-                    claim: claim.expand(ledger),
-                },
-                Fact::Delivery { key } => NativeFact::Delivery { key },
-                Fact::Work {
-                    claim,
-                    before,
-                    after,
-                    state,
-                } => NativeFact::Work {
-                    claim,
-                    before: before.map(|value| value.expand(ledger)),
-                    after: after.expand(ledger),
-                    state,
-                },
-                Fact::Diagnostic {
-                    claim,
-                    binding,
-                    reason,
-                } => NativeFact::Diagnostic {
-                    claim,
-                    binding: binding.expand(ledger),
-                    reason,
-                },
-                Fact::Response {
-                    claim,
-                    before,
-                    after,
-                    state,
-                } => NativeFact::Response {
-                    claim,
-                    before: before.map(|value| value.expand(ledger)),
-                    after: after.expand(ledger),
-                    state,
-                },
-                Fact::ResultTestament {
-                    claim,
-                    before,
-                    after,
-                    state,
-                } => NativeFact::ResultTestament {
-                    claim,
-                    before: before.map(|value| value.expand(ledger)),
-                    after: after.expand(ledger),
-                    state,
-                },
-                Fact::Receipt {
-                    claim,
-                    fence,
-                    holder,
-                } => NativeFact::Receipt {
-                    claim: claim.expand(ledger),
-                    fence,
-                    holder,
-                },
-                Fact::ReceiptAdopted {
-                    claim,
-                    previous,
-                    replacement,
-                    cause,
-                } => NativeFact::ReceiptAdopted {
-                    claim: claim.expand(ledger),
-                    previous,
-                    replacement,
-                    cause,
-                },
-                Fact::Artifact { binding } => NativeFact::Artifact {
-                    binding: binding.expand(ledger),
-                },
-                Fact::Accepted { key } => NativeFact::Accepted { key },
-                Fact::Claim {
-                    kind,
-                    graph,
-                    owned_child,
-                    before,
-                    after,
-                    status,
-                } => NativeFact::Claim(NativeClaimEvent {
-                    graph,
-                    kind,
-                    owned_child: owned_child.map(|value| value.expand(ledger)),
-                    before: before.map(|value| value.expand(ledger)),
-                    after: after.expand(ledger),
-                    status,
-                }),
-                Fact::Definition {
-                    binding,
-                    claim,
-                    index,
-                    intent,
-                } => NativeFact::Definition {
-                    binding: binding.expand(ledger),
-                    claim,
-                    index,
-                    intent,
-                },
-                Fact::Evaluation {
-                    kind,
-                    key,
-                    before,
-                    after,
-                    state,
-                    phase,
-                    attempt,
-                    fence,
-                } => NativeFact::Evaluation {
-                    kind,
-                    key,
-                    before: before.map(|value| value.expand(ledger)),
-                    after: after.expand(ledger),
-                    state,
-                    phase,
-                    attempt,
-                    fence,
-                },
-            },
-        }
-    }
+    };
+    [first, second, third]
+        .into_iter()
+        .flatten()
+        .all(|binding| binding.ledger == ledger)
 }
 
 #[cfg(test)]
@@ -407,8 +48,9 @@ mod tests {
 
     fn roundtrip(fact: NativeFact) {
         let expected = event(fact);
-        let stored = StoredEvent::pack(expected).unwrap();
-        assert_eq!(stored.expand(binding(1).ledger), expected);
+        let ledger = binding(1).ledger;
+        let stored = OwnedEvent::new(expected, ledger).unwrap();
+        assert_eq!(stored.get(ledger), Some(expected));
     }
 
     #[test]
@@ -498,8 +140,8 @@ mod tests {
                 },
             ] {
                 assert!(matches!(
-                    StoredEvent::pack(event(fact)),
-                    Err(ContractError::WrongLedger)
+                    OwnedEvent::new(event(fact), before.ledger),
+                    Err(NativeError::Contract(ContractError::WrongLedger))
                 ));
             }
         }

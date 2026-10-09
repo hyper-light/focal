@@ -669,10 +669,8 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
     else {
         panic!("actual registry seal fact")
     };
-    assert!(
-        matches!(event.get().unwrap().expand(core.state.ledger).fact,
-        NativeFact::Registrations { claim } if claim == candidate.claim(key(1).claim).unwrap().binding())
-    );
+    assert!(matches!(event.get(core.state.ledger).unwrap().fact,
+        NativeFact::Registrations { claim } if claim == candidate.claim(key(1).claim).unwrap().binding()));
     let plan = core
         .state
         .rows

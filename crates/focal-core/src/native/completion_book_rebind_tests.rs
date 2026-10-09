@@ -195,7 +195,7 @@ fn with_seals(
             .bind(view.definition(key.validation).unwrap())
             .unwrap();
         let event = OwnedEvent::new(
-            StoredEvent::pack(NativeEvent {
+            NativeEvent {
                 invocation: outcome.invocation,
                 sequence: outcome.sequence,
                 ordinal: outcome.events,
@@ -211,8 +211,8 @@ fn with_seals(
                         .then(|| evaluation.current_attempt().unwrap()),
                     fence: state.fence(),
                 },
-            })
-            .unwrap(),
+            },
+            outcome.ledger,
         )
         .unwrap();
         let heap = event.heap_charge().unwrap();

@@ -152,7 +152,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
             }
             (Key::Event(sequence, ordinal), Row::Event(value)) => {
                 require(sequence == read.outcome.sequence && ordinal < read.outcome.events)?;
-                let value = value.get().ok_or_else(invalid)?.expand(read.ledger);
+                let value = value.get(read.ledger).ok_or_else(invalid)?;
                 require(
                     value.sequence == sequence
                         && value.ordinal == ordinal

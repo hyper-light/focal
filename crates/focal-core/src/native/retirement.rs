@@ -552,9 +552,8 @@ impl Core<NativeState> {
                 return Err(RetirementRefusal::Corrupt);
             };
             let event = stored
-                .get()
-                .ok_or(RetirementRefusal::Corrupt)?
-                .expand(self.state.ledger);
+                .get(self.state.ledger)
+                .ok_or(RetirementRefusal::Corrupt)?;
             let object = record_codec::event_object(event);
             if closure.keys.contains(&object) {
                 if events.len() >= MAX_FAMILY_ROWS {

@@ -110,7 +110,7 @@ impl<O: Overlay> ReplayRead<'_, '_, O> {
         let Row::Event(value) = self.require(Key::Event(self.outcome.sequence, ordinal))? else {
             return Err(invalid());
         };
-        let value = value.get().ok_or_else(invalid)?.expand(self.ledger);
+        let value = value.get(self.ledger).ok_or_else(invalid)?;
         require(
             value.sequence == self.outcome.sequence
                 && value.invocation == self.outcome.invocation

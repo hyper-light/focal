@@ -203,7 +203,7 @@ impl<'a, O: Objects> Access<'a, O> {
             return Err(invalid());
         };
         debit(self.lookup, 256)?;
-        let value = row.get().ok_or_else(invalid)?.expand(self.ledger());
+        let value = row.get(self.ledger()).ok_or_else(invalid)?;
         if value.sequence != at.sequence || value.ordinal != at.ordinal {
             return Err(invalid());
         }

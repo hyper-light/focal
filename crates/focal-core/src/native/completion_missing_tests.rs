@@ -78,7 +78,7 @@ fn altered(
             let (row, heap) = match entry.key {
                 Key::Event(sequence, ordinal) if sequence == original.outcome.sequence => {
                     let event = *events.get(usize::try_from(ordinal).unwrap()).unwrap();
-                    let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+                    let row = OwnedEvent::new(event, original.outcome.ledger).unwrap();
                     let heap = row.heap_charge().unwrap();
                     (Row::Event(row), heap)
                 }

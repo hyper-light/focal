@@ -4,7 +4,23 @@ use super::*;
 use bytes::{Error, Sink, write_raw as raw, write_u8, write_u32, write_u64};
 use lifecycle_fields as f;
 
+/// How an event's bindings carry their ledger: written in full (records and
+/// checkpoints), or implied by the range that retains the event, whose rows
+/// hold no ledger and refuse a binding under any other.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::native) enum Bindings {
+    Written,
+    Implied(LedgerId),
+}
+
 pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> {
+    event_in(s, event, Bindings::Written)
+}
+pub(in crate::native) fn event_in(
+    s: &mut impl Sink,
+    event: NativeEvent,
+    b: Bindings,
+) -> Result<(), Error> {
     fixed::invocation(s, event.invocation)?;
     write_u64(s, event.sequence.0)?;
     write_u32(s, event.ordinal)?;
@@ -17,8 +33,8 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
         } => {
             write_u8(s, 0)?;
             raw(s, &claim.0)?;
-            f::optional_binding(s, before)?;
-            types::binding(s, after)?;
+            optional_binding(s, before, b)?;
+            write_binding(s, after, b)?;
             f::result_testament_state(s, state)
         }
         NativeFact::Missing { key } => {
@@ -27,7 +43,7 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
         }
         NativeFact::Registrations { claim } => {
             write_u8(s, 2)?;
-            types::binding(s, claim)
+            write_binding(s, claim, b)
         }
         NativeFact::Delivery { key } => {
             write_u8(s, 3)?;
@@ -41,8 +57,8 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
         } => {
             write_u8(s, 4)?;
             raw(s, &claim.0)?;
-            f::optional_binding(s, before)?;
-            types::binding(s, after)?;
+            optional_binding(s, before, b)?;
+            write_binding(s, after, b)?;
             f::work_state(s, state)
         }
         NativeFact::Diagnostic {
@@ -52,7 +68,7 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
         } => {
             write_u8(s, 5)?;
             raw(s, &claim.0)?;
-            types::binding(s, binding)?;
+            write_binding(s, binding, b)?;
             types::failure(s, reason)
         }
         NativeFact::Response {
@@ -63,8 +79,8 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
         } => {
             write_u8(s, 6)?;
             raw(s, &claim.0)?;
-            f::optional_binding(s, before)?;
-            types::binding(s, after)?;
+            optional_binding(s, before, b)?;
+            write_binding(s, after, b)?;
             f::response_state(s, state)
         }
         NativeFact::Receipt {
@@ -73,7 +89,7 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
             holder,
         } => {
             write_u8(s, 7)?;
-            types::binding(s, claim)?;
+            write_binding(s, claim, b)?;
             types::receipt(s, fence)?;
             raw(s, &holder.0)
         }
@@ -84,14 +100,14 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
             cause,
         } => {
             write_u8(s, 8)?;
-            types::binding(s, claim)?;
+            write_binding(s, claim, b)?;
             f::entitlement(s, previous)?;
             f::entitlement(s, replacement)?;
             raw(s, &cause.0)
         }
         NativeFact::Artifact { binding } => {
             write_u8(s, 9)?;
-            types::binding(s, binding)
+            write_binding(s, binding, b)
         }
         NativeFact::Accepted { key } => {
             write_u8(s, 10)?;
@@ -103,9 +119,9 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
                 .map_err(|_| Error::InvalidTag("graph capture"))?;
             write_u8(s, 11)?;
             claim_kind(s, v.kind)?;
-            f::optional_binding(s, v.owned_child)?;
-            f::optional_binding(s, v.before)?;
-            types::binding(s, v.after)?;
+            optional_binding(s, v.owned_child, b)?;
+            optional_binding(s, v.before, b)?;
+            write_binding(s, v.after, b)?;
             f::claim_status(s, v.status)?;
             f::optional(s, v.graph, |sink, value| {
                 bytes::write_u32(sink, value.before_ordinal)
@@ -118,7 +134,7 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
             intent,
         } => {
             write_u8(s, 12)?;
-            types::binding(s, binding)?;
+            write_binding(s, binding, b)?;
             raw(s, &claim.0)?;
             write_u32(s, index)?;
             raw(s, &intent.0)
@@ -146,8 +162,8 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
                 },
             )?;
             types::evaluation(s, key)?;
-            f::optional_binding(s, before)?;
-            types::binding(s, after)?;
+            optional_binding(s, before, b)?;
+            write_binding(s, after, b)?;
             f::evaluation_state(s, state)?;
             f::phase(s, phase)?;
             match attempt {
@@ -160,6 +176,22 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
             f::optional_fence(s, fence)
         }
     }
+}
+fn write_binding(s: &mut impl Sink, value: Binding, b: Bindings) -> Result<(), Error> {
+    match b {
+        Bindings::Written => types::binding(s, value),
+        Bindings::Implied(ledger) => {
+            if value.ledger != ledger {
+                return Err(Error::InvalidTag("event binding ledger"));
+            }
+            raw(s, &value.object.0)?;
+            raw(s, &value.content.0)?;
+            write_u64(s, value.revision.0)
+        }
+    }
+}
+fn optional_binding(s: &mut impl Sink, value: Option<Binding>, b: Bindings) -> Result<(), Error> {
+    f::optional(s, value, |s, value| write_binding(s, value, b))
 }
 fn claim_kind(s: &mut impl Sink, kind: NativeEventKind) -> Result<(), Error> {
     let tag = match kind {

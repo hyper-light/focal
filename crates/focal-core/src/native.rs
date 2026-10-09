@@ -141,7 +141,6 @@ use focal_model::{
     ReceiptFence, ReceiptId, RequestEpoch, RequestId, RequestKey, SessionSeq, TestamentId, TimerId,
     ValidationId, WaitPredicate,
 };
-use history::StoredEvent;
 pub use import::{ImportError, ImportRequest, Imported, InlinePayload, import, inline_payloads};
 pub use index_rows::{artifact_kind_hash, scope_key_hash};
 pub use index_scan::{NativeIndexHit, NativeIndexScan};
@@ -1933,7 +1932,7 @@ impl Core<NativeState> {
     }
     pub fn native_event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.state.rows.get(&Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get().map(|row| row.expand(self.state.ledger)),
+            Some(Row::Event(event)) => event.get(self.state.ledger),
             _ => None,
         }
     }

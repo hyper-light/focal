@@ -812,3 +812,35 @@ fn measure_row_variant_widths() {
         println!("{name:<20} {width}");
     }
 }
+
+/// Measurement, not a check: the inline width of each key family's fields,
+/// widest first, to see which families set `Key`'s width.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_key_variant_widths() {
+    use std::mem::size_of;
+    let mut widths: Vec<(&str, usize)> = vec![
+        ("Key", size_of::<Key>()),
+        ("ClaimId", size_of::<ClaimId>()),
+        ("ContentHash", size_of::<ContentHash>()),
+        ("ObjectId", size_of::<focal_model::ObjectId>()),
+        ("ParticipantId", size_of::<ParticipantId>()),
+        ("NativeInvocation", size_of::<NativeInvocation>()),
+        ("NativeResultKey", size_of::<NativeResultKey>()),
+        ("EvaluationKey", size_of::<EvaluationKey>()),
+        ("EvaluationTarget", size_of::<EvaluationTarget>()),
+        ("NativeCycleKey", size_of::<NativeCycleKey>()),
+        ("TimerTarget", size_of::<TimerTarget>()),
+        ("ByScope", size_of::<(u16, ContentHash, ClaimId)>()),
+        (
+            "ByCreated",
+            size_of::<(u16, SessionSeq, focal_model::ObjectId)>(),
+        ),
+        ("DueTimer", size_of::<(u64, TimerTarget)>()),
+        ("ByVerdict", size_of::<(u16, NativeResultKey)>()),
+    ];
+    widths.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+    for (name, width) in widths {
+        println!("{name:<20} {width}");
+    }
+}

@@ -190,7 +190,7 @@ fn altered(
         )),
     ];
     for (index, event) in events.into_iter().enumerate() {
-        let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+        let row = OwnedEvent::new(event, outcome.ledger).unwrap();
         let heap = row.heap_charge().unwrap();
         changes.push(Change::Put(Entry::new(
             Key::Event(outcome.sequence, u32::try_from(index).unwrap()),
@@ -274,7 +274,7 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
     else {
         panic!("actual Begun event")
     };
-    let original_event = event.get().unwrap().expand(original.outcome().ledger);
+    let original_event = event.get(original.outcome().ledger).unwrap();
     assert!(matches!(
         original_event.fact,
         NativeFact::Evaluation {
@@ -368,7 +368,7 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     else {
         panic!("actual Begun event")
     };
-    let mut fake = event.get().unwrap().expand(original.outcome().ledger);
+    let mut fake = event.get(original.outcome().ledger).unwrap();
     let NativeFact::Evaluation {
         after,
         state,
