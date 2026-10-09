@@ -84,6 +84,10 @@ EOF
     for n in focal1 focal2 focal3; do
       dc exec -T "$n" focal --data-dir /data inspect replicas --replicas \
         > "$out/$report.$n.replicas.json" 2>/dev/null || true
+      # The node's metrics: its log's flush and commit-wait quantiles and its
+      # owners' longest periods, for whether a stall was the disk's.
+      dc exec -T "$n" focal --data-dir /data inspect node --metrics \
+        > "$out/$report.$n.metrics.txt" 2>/dev/null || true
     done
     ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
