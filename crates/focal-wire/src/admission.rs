@@ -10,8 +10,16 @@
 //! authenticated it is charged to its **identity** (the principal its grant
 //! names, which a renewed certificate keeps):
 //!
-//! - a node holds at most [`AdmissionLimits::per_node`] connections, any
-//!   other identity at most [`AdmissionLimits::per_participant`];
+//! - a node holds at most [`AdmissionLimits::per_node`] connections (its
+//!   peer pool's few); any other identity its share of the listener: the
+//!   connections among the identities holding them, never less than
+//!   [`AdmissionLimits::per_participant`]. Alone, a participant may use the
+//!   whole listener (one principal running many callers or agents); as
+//!   others come each is left an equal part, and a full listener gives an
+//!   identity under its share a connection the identity holding the most,
+//!   over its own share, has idle (max-min fairness: Bertsekas and
+//!   Gallager, *Data Networks*, §6.5.2). A fixed bound of sixteen refused a
+//!   principal's seventeenth connection whatever room the listener had;
 //! - a connection past the bound replaces the one of that identity that has
 //!   been idle longest, which is closed. A client that exited, a node that
 //!   restarted or moved, leaves a connection behind that the listener holds
@@ -72,7 +80,11 @@ pub struct AdmissionLimits {
     pub identities: usize,
     /// Connections held in all, once authenticated.
     pub connections: usize,
+    /// The most connections a node holds: its peer pool's few.
     pub per_node: usize,
+    /// The least share of the listener a participant is ever left
+    /// ([`Admission`]'s module: its share is the listener among the
+    /// identities holding connections).
     pub per_participant: usize,
     /// How long a connection must have begun no request before it may be
     /// replaced: a live client between requests is not, one that left its
@@ -256,11 +268,7 @@ impl Admission {
     ) -> Result<(u64, Option<Connection>), AdmissionRefusal> {
         let mut state = self.0.state.lock().map_err(|_| AdmissionRefusal::Closed)?;
         bump(&mut state.changes);
-        let bound = if matches!(role, PeerRole::Node { .. }) {
-            self.0.limits.per_node
-        } else {
-            self.0.limits.per_participant
-        };
+        let bound = self.bound(&state, identity, role);
         let held = state
             .identities
             .get(&identity)
@@ -291,10 +299,32 @@ impl Admission {
         } else {
             None
         };
+        // A full listener: an identity under its share takes a connection
+        // from the identity holding the most, when that one holds more than
+        // its own share and has one idle (max-min fairness: no identity's
+        // share grows at the cost of one holding less; Bertsekas and
+        // Gallager, Data Networks, §6.5.2). Without one it is refused.
+        let mut taken = None;
         if !replacing && state.connections >= self.0.limits.connections {
-            bump(&mut state.refused_connections);
-            return Err(AdmissionRefusal::Connections);
+            taken = self.fair_victim(&state, identity);
+            if taken.is_none() {
+                bump(&mut state.refused_connections);
+                return Err(AdmissionRefusal::Connections);
+            }
         }
+        let taken = match taken {
+            Some((victim, position)) => {
+                let Some(held) = state.identities.get_mut(&victim) else {
+                    return Err(AdmissionRefusal::Closed);
+                };
+                let old = held.connections.remove(position);
+                if held.connections.is_empty() && held.bytes == 0 {
+                    state.identities.remove(&victim);
+                }
+                old.map(|old| old.connection)
+            }
+            None => None,
+        };
         let id = state.next;
         state.next = state.next.checked_add(1).ok_or(AdmissionRefusal::Closed)?;
         let entry = state.identities.entry(identity).or_insert_with(|| Held {
@@ -303,7 +333,8 @@ impl Admission {
         });
         let replaced = idle
             .and_then(|position| entry.connections.remove(position))
-            .map(|old| old.connection);
+            .map(|old| old.connection)
+            .or(taken);
         entry.connections.push_back(HeldConnection {
             id,
             connection: connection.clone(),
@@ -317,6 +348,52 @@ impl Admission {
         }
         bump(&mut state.admitted);
         Ok((id, replaced))
+    }
+    /// The most connections `identity` may hold now. A node holds its fixed
+    /// few ([`AdmissionLimits::per_node`]: its peer pool's). A participant
+    /// holds its share of the listener among the identities holding
+    /// connections, itself counted, never less than
+    /// [`AdmissionLimits::per_participant`]: alone it may use the whole
+    /// listener, and as others come each is left an equal part.
+    fn bound(&self, state: &State, identity: ParticipantId, role: PeerRole) -> usize {
+        if matches!(role, PeerRole::Node { .. }) {
+            return self.0.limits.per_node;
+        }
+        self.share(state, identity)
+    }
+    /// A participant's share of the listener while `identity` holds or asks
+    /// for a connection: the connections among the identities holding them,
+    /// `identity` counted, never less than the per-participant floor.
+    fn share(&self, state: &State, identity: ParticipantId) -> usize {
+        let identities = state
+            .identities
+            .len()
+            .saturating_add(usize::from(!state.identities.contains_key(&identity)));
+        self.0
+            .limits
+            .connections
+            .checked_div(identities.max(1))
+            .unwrap_or(0)
+            .max(self.0.limits.per_participant)
+    }
+    /// The connection a full listener gives `identity`, under its share: the
+    /// one used least, with no request under way, of the identity holding
+    /// the most connections when that one holds more than its own share.
+    fn fair_victim(
+        &self,
+        state: &State,
+        identity: ParticipantId,
+    ) -> Option<(ParticipantId, usize)> {
+        let (victim, held) = state
+            .identities
+            .iter()
+            .filter(|(other, _)| **other != identity)
+            .max_by_key(|(_, held)| held.connections.len())?;
+        if held.connections.len() <= self.share(state, identity) {
+            return None;
+        }
+        let position = held.connections.iter().position(|held| held.serving == 0)?;
+        Some((*victim, position))
     }
     /// The connection began a request (`begin`) or ended one: it is this
     /// identity's most recently used, and the requests it has under way

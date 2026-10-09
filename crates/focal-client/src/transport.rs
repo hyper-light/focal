@@ -121,22 +121,12 @@ impl ClientTransport for QuicTransport {
     ) -> TransportFuture<'a> {
         Box::pin(async move {
             let route = route.unwrap_or(&self.initial);
-            // A listener that refused the connection at admission answered
-            // before anything was sent (`Access(Capacity)`): the client
-            // resends it as the refusal it is. Any other dial failure is
-            // reported as it was.
-            let connected = self
-                .routes
-                .connect(&route.endpoint, &route.server_name)
-                .await?;
-            let result = connected.remote.request(request).await;
-            if result.is_err() {
-                // The connection that failed leaves the cache — unless a
-                // newer one took its place meanwhile.
-                self.routes
-                    .forget(&route.endpoint, &route.server_name, connected.generation);
-            }
-            result
+            // A dial the listener refused at admission is its answer
+            // (`Access(Capacity)`), resent as the refusal it is; the
+            // connection is forgotten only when it is what failed.
+            self.routes
+                .request(&route.endpoint, &route.server_name, request)
+                .await
         })
     }
 }

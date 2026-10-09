@@ -3541,6 +3541,45 @@ mod admission {
         assert_eq!(AdmissionLimits::for_connections(1).pending, 1);
     }
 
+    /// A participant's share is the listener among the identities holding
+    /// connections, never less than its floor: alone it uses the whole
+    /// listener, past the floor, and replaces nothing until it is full.
+    #[tokio::test]
+    async fn a_participant_alone_uses_the_whole_listener() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        // Eight connections; a participant's floor is two.
+        let (server, task) = admitting(
+            &pki,
+            registry,
+            AdmissionLimits {
+                connections: 8,
+                ..bounds()
+            },
+        )
+        .await;
+        let address = server.local_addr().unwrap();
+        let connector = connector(&pki, certificate, key);
+        let mut remotes = Vec::new();
+        for id in 0..8u128 {
+            let remote = connector.connect(address, "localhost").await.unwrap();
+            assert!(serves(&remote, 700 + id).await);
+            remotes.push(remote);
+        }
+        let stats = held(&server, 8).await;
+        assert_eq!((stats.admitted, stats.replaced), (8, 0), "{stats:?}");
+        // Full: the ninth replaces the one it used least.
+        let ninth = connector.connect(address, "localhost").await.unwrap();
+        assert!(serves(&ninth, 710).await);
+        assert_eq!(held(&server, 8).await.replaced, 1);
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
     /// A connection carrying a request is never replaced: an identity at its
     /// bound whose every connection has a request under way is refused a
     /// newer one, retryably, and the requests under way are answered; once
@@ -3567,7 +3606,17 @@ mod admission {
                 response(verified.request())
             }
         });
-        let (server, task) = admitting_with(&pki, registry, bounds(), handler).await;
+        // A listener of two: the identity's share, alone, is both.
+        let (server, task) = admitting_with(
+            &pki,
+            registry,
+            AdmissionLimits {
+                connections: 2,
+                ..bounds()
+            },
+            handler,
+        )
+        .await;
         let address = server.local_addr().unwrap();
         let client = connector(&pki, certificate, key);
         // The participant's bound is two: both connections carry a request.
@@ -3797,7 +3846,16 @@ mod admission {
         registry
             .register_certificate(&certificate, grant())
             .unwrap();
-        let (server, task) = admitting(&pki, registry, bounds()).await;
+        // A listener of two: the identity's share, alone, is both.
+        let (server, task) = admitting(
+            &pki,
+            registry,
+            AdmissionLimits {
+                connections: 2,
+                ..bounds()
+            },
+        )
+        .await;
         let address = server.local_addr().unwrap();
         let connector = connector(&pki, certificate, key);
         let first = connector.connect(address, "localhost").await.unwrap();
@@ -3851,28 +3909,41 @@ mod admission {
             registry,
             AdmissionLimits {
                 identities: 2,
+                connections: 4,
                 ..bounds()
             },
         )
         .await;
         let address = server.local_addr().unwrap();
-        // The first identity dials past its bound: it displaces its own
-        // connections, and the second identity still has its place.
+        // Alone, the first identity's share is the whole listener: it dials
+        // past it and displaces its own oldest connection.
         let mut firsts = Vec::new();
         for _ in 0..5 {
             firsts.push(connectors[0].connect(address, "localhost").await.unwrap());
         }
+        let stats = held(&server, 4).await;
+        assert_eq!((stats.identities, stats.replaced), (1, 1));
+        // A second identity finds the listener full and is under its share:
+        // it takes the connection the first, over its share, used least.
         let c = connectors[1].connect(address, "localhost").await.unwrap();
-        let stats = held(&server, 3).await;
-        assert_eq!((stats.identities, stats.replaced), (2, 3));
+        let stats = held(&server, 4).await;
+        assert_eq!((stats.identities, stats.replaced), (2, 2));
+        assert!(
+            !serves(&firsts[0], 598).await,
+            "replaced by its own identity"
+        );
+        assert!(
+            !serves(&firsts[1], 599).await,
+            "given to the second identity"
+        );
         // A third identity finds no place, and takes none from the others.
         assert!(connectors[2].connect(address, "localhost").await.is_err());
-        let stats = held(&server, 3).await;
+        let stats = held(&server, 4).await;
         assert_eq!(stats.refused_identities, 1);
         assert!(serves(&firsts[4], 600).await && serves(&c, 602).await);
         // An identity that leaves frees its place.
         c.close();
-        held(&server, 2).await;
+        held(&server, 3).await;
         let d = connectors[2].connect(address, "localhost").await.unwrap();
         assert!(serves(&d, 603).await);
         server.close();
@@ -3994,6 +4065,87 @@ async fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_noth
     let next = routes.connect(&address, "localhost").await.unwrap();
     assert_eq!(routes.dials(), 3, "gave up: {}", gave_up.is_ok());
     assert!(next.generation > fresh.generation);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// A request that fails alone keeps its connection: one that timed out on a
+/// connection answering the caller's other requests is not the connection's
+/// failure, so the route is not dialed again (a caller that dialed again
+/// while its other requests held the old connection took one connection of
+/// its identity more than the listener had room for). A connection that has
+/// closed is forgotten, and the next request dials anew.
+#[tokio::test]
+async fn a_request_that_fails_alone_keeps_its_connection() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    // Request 2 is answered after the client's deadline; the rest at once.
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        if verified.request().request_id == RequestId::from_u128(2) {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        response(verified.request())
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let quick = WireLimits {
+        request_timeout: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &quick,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, quick).unwrap();
+    let address = server.local_addr().unwrap().to_string();
+    let routes = RouteConnections::new(connector, 4).unwrap();
+    assert!(
+        routes
+            .request(&address, "localhost", &request(1))
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        routes.request(&address, "localhost", &request(2)).await,
+        Err(WireError::Timeout)
+    ));
+    assert!(
+        routes
+            .request(&address, "localhost", &request(3))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        routes.dials(),
+        1,
+        "a request that failed alone forgot its connection"
+    );
+    assert_eq!(server.admission().admitted, 1);
+    // The connection closes: forgotten at its next request, dialed anew.
+    routes
+        .connect(&address, "localhost")
+        .await
+        .unwrap()
+        .remote
+        .close();
+    assert!(
+        routes
+            .request(&address, "localhost", &request(4))
+            .await
+            .is_err()
+    );
+    assert!(
+        routes
+            .request(&address, "localhost", &request(5))
+            .await
+            .is_ok()
+    );
+    assert_eq!(routes.dials(), 2);
     server.close();
     task.await.unwrap().unwrap();
 }

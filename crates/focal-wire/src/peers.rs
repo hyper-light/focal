@@ -309,7 +309,7 @@ pub(crate) fn part_for(
 /// leaves no evidence that it carries anything. An exchange that timed out,
 /// lost its stream or could not be read while the peer answered others on
 /// the same connection failed alone.
-pub(crate) fn connection_failed(closed: bool, failure: &WireError, answered: bool) -> bool {
+pub fn connection_failed(closed: bool, failure: &WireError, answered: bool) -> bool {
     closed
         || matches!(
             failure,

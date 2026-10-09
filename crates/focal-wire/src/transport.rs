@@ -1174,6 +1174,30 @@ impl RouteConnections {
         }
         Err(last.error())
     }
+    /// `request` on the route's connection, dialed if none is cached. The
+    /// connection leaves the cache only when it is what failed — closed, or
+    /// not speaking the protocol ([`crate::connection_failed`], the peer
+    /// pool's rule) — and only while it is still the one cached. A request
+    /// that timed out or was refused on a connection that carries the
+    /// caller's other requests failed alone: forgetting the connection made
+    /// the caller dial again while those held the old one, one connection of
+    /// its identity more than the listener had room for. A dead peer's
+    /// connection closes at its idle timeout.
+    pub async fn request(
+        &self,
+        endpoint: &str,
+        server_name: &str,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, WireError> {
+        let connected = self.connect(endpoint, server_name).await?;
+        let result = connected.remote.request(request).await;
+        if let Err(failure) = &result
+            && crate::connection_failed(connected.remote.closed(), failure, true)
+        {
+            self.forget(endpoint, server_name, connected.generation);
+        }
+        result
+    }
     /// Forget the route's connection a request found failed — only while it
     /// is still the one cached; a newer connection another caller opened
     /// since stays.
