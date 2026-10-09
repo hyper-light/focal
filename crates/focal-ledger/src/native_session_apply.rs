@@ -337,6 +337,20 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.resolve_suffix(SuffixEvidence::LayoutChanged)?;
         }
         let max = self.limits.recovery.native.max_ranges;
+        // What decides whether this replica can hold the committed layout is
+        // checked first, against its committed layout and its member bound:
+        // a refusal there means it is configured below the authority, and it
+        // fails closed. What can fail after it is memory for the boundary
+        // pages the split copies: a resource the delivery waits for, retried
+        // at the next poll (the record is not applied until it succeeds).
+        let layout = self.committed_core()?.native_layout();
+        let checked = match record.operation {
+            range::LayoutOperation::Split { at, id } => layout.check_split(at, id, max),
+            range::LayoutOperation::Merge { left } => layout.check_merge(left).map(|_| ()),
+        };
+        if checked.is_err() {
+            return Err(NativeSessionError::Corrupt);
+        }
         let applied = match self.domain.as_mut() {
             Some(Domain::Passive(core)) => apply_layout_to(core, record.operation, max),
             Some(Domain::Active(owner, _)) => match record.operation {
@@ -352,7 +366,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             },
             None => return Err(NativeSessionError::Failed),
         };
-        applied.map_err(|_| NativeSessionError::Corrupt)?;
+        applied?;
         if let Some(movement) = self.movement.as_mut() {
             match record.operation {
                 range::LayoutOperation::Split { at, id } => movement.split(at, id)?,

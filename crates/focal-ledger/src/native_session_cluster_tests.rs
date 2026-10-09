@@ -2513,3 +2513,67 @@ fn a_range_split_and_merge_replicate_and_every_voter_converges() {
         "the reopened follower recovered the merged layout"
     );
 }
+
+/// Hold every byte of `lane` the engine's budget would still give.
+fn exhaust_lane(
+    cluster: &mut Cluster,
+    id: u64,
+    lane: focal_memory::BudgetLane,
+) -> Vec<focal_memory::Allocation> {
+    let budget = cluster.node(id).engine.budget.clone();
+    let mut held = Vec::new();
+    for chunk in [1 << 20, 64 << 10, 4 << 10, 256, 16, 1] {
+        while let Ok(reservation) = budget.reserve(focal_memory::BudgetKind::Pending, lane, chunk) {
+            held.push(reservation.commit());
+        }
+    }
+    held
+}
+
+/// A committed layout record is completion work: an authority whose fresh
+/// admissions filled its ordinary memory still applies it, and one with no
+/// memory at all for the boundary pages keeps the delivery and applies it
+/// once memory returns — never stopping the session (2026-10-08: a leader at
+/// its allowance stopped on a committed split as `Corrupt`).
+#[test]
+fn a_committed_split_applies_on_an_authority_whose_memory_is_spoken_for() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    cluster.received_claim(1);
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(1).0,
+            id: RangeId(31),
+        })
+        .unwrap();
+    cluster.pump(&[]);
+    assert!(!cluster.node(1).engine.failed());
+    assert_same_layout(&mut cluster, 1);
+    drop(ordinary);
+    // Nothing left in either lane once it commits: the split waits, the
+    // session stays up.
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(2).0,
+            id: RangeId(32),
+        })
+        .unwrap();
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    let completion = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Completion);
+    // A retryable refusal is what the authority may answer here, and nothing else.
+    cluster.retry_ok = vec![1];
+    cluster.pump(&[]);
+    assert!(!cluster.node(1).engine.failed());
+    assert_eq!(epoch(&mut cluster, 1), 1, "the split waits for memory");
+    drop(completion);
+    drop(ordinary);
+    cluster.retry_ok.clear();
+    cluster.pump(&[]);
+    assert_same_layout(&mut cluster, 2);
+    let next = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, next, &[]);
+    assert_same_digest(&mut cluster, &[1, 2, 3]);
+}
