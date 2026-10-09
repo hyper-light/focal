@@ -335,7 +335,8 @@ mod tests {
             assert!(text.contains("Post a claim"), "{text}");
             if cols >= 60 {
                 assert!(text.contains("P O S T"), "{text}");
-                assert!(text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)));
+                // The mark is the shaded prism, drawn in half blocks.
+                assert!(text.chars().any(|c| c == '▀' || c == '▄'), "{text}");
             }
         }
     }

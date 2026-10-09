@@ -168,7 +168,10 @@ impl Image {
     /// The image averaged over `s`×`s` blocks: its anti-aliased pixels.
     fn down(&self, s: usize) -> Image {
         let s = s.max(1);
-        let (w, h) = (self.w.checked_div(s).unwrap_or(0), self.h.checked_div(s).unwrap_or(0));
+        let (w, h) = (
+            self.w.checked_div(s).unwrap_or(0),
+            self.h.checked_div(s).unwrap_or(0),
+        );
         let mut out = Image::new(w, h);
         let n = s.saturating_mul(s) as f64;
         for y in 0..h {
