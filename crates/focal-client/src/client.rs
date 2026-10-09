@@ -722,6 +722,23 @@ impl<T: ClientTransport> Client<T> {
                         _ => return Ok(response),
                     }
                 }
+                // Refused before anything was sent (no connection to send it
+                // on, or a body the listener would not admit): without effect,
+                // and resent as a refusal in a reply is.
+                Ok(Err(WireError::Access(AccessError::Unavailable)))
+                    if unavailable_refusals < UNAVAILABLE_RESENDS =>
+                {
+                    unavailable_refusals = unavailable_refusals.saturating_add(1);
+                    last_refusal = Some(AccessError::Unavailable);
+                    refused = true;
+                }
+                Ok(Err(WireError::Access(AccessError::Capacity)))
+                    if capacity_refusals < CAPACITY_RESENDS =>
+                {
+                    capacity_refusals = capacity_refusals.saturating_add(1);
+                    last_refusal = Some(AccessError::Capacity);
+                    refused = true;
+                }
                 Ok(Err(WireError::Access(error))) => {
                     if uncertain && request.operation.is_mutation() {
                         break;

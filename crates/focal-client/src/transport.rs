@@ -121,10 +121,19 @@ impl ClientTransport for QuicTransport {
     ) -> TransportFuture<'a> {
         Box::pin(async move {
             let route = route.unwrap_or(&self.initial);
-            let connected = self
+            let connected = match self
                 .routes
                 .connect(&route.endpoint, &route.server_name)
-                .await?;
+                .await
+            {
+                Ok(connected) => connected,
+                Err(WireError::Limit) => return Err(WireError::Limit),
+                // No connection, so nothing of the request was sent: the
+                // listener refused it at admission (its identity using every
+                // connection it may hold) or it could not be reached. A
+                // definite refusal, never an unknown outcome.
+                Err(_) => return Err(WireError::Access(AccessError::Unavailable)),
+            };
             let result = connected.remote.request(request).await;
             if result.is_err() {
                 // The connection that failed leaves the cache — unless a

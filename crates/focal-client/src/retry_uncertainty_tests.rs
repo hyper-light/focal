@@ -11,6 +11,8 @@ enum Step {
     Committed,
     Duplicate,
     Capacity,
+    /// No connection could be made for the request: nothing was sent.
+    NotConnected,
 }
 struct Script<'a> {
     seen: &'a Mutex<Vec<RequestEnvelope>>,
@@ -33,6 +35,7 @@ impl ClientTransport for Script<'_> {
             let result = match step {
                 Step::Timeout => return Err(WireError::Timeout),
                 Step::Allocation => return Err(WireError::Allocation),
+                Step::NotConnected => return Err(WireError::Access(AccessError::Unavailable)),
                 Step::Redirect(epoch) => Response::Error(AccessError::RouteChanged(RouteHint {
                     epoch: RouteEpoch(epoch),
                     endpoint: "127.0.0.1:7777".into(),
@@ -142,6 +145,64 @@ async fn definite_admission_response_and_exact_committed_retry_remain_distinct()
         }
         assert_eq!(seen.lock().unwrap().len(), count);
     }
+}
+
+/// A write that found no connection to be sent on (its listener refused the
+/// connection at admission, or could not be reached) had no effect: it is
+/// sent again, and if no attempt reached the listener it is reported as the
+/// refusal, never as an unknown outcome. A write already uncertain stays so.
+#[tokio::test]
+async fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome() {
+    let quick = RetryPolicy {
+        max_attempts: 4,
+        max_elapsed: Duration::from_secs(5),
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    };
+    let client = |steps: Vec<Step>, seen| {
+        Client::new(
+            Script { seen, steps },
+            quick.clone(),
+            WireLimits::default(),
+            1,
+        )
+        .unwrap()
+    };
+    // Connected at the third attempt: committed, the same request each time.
+    let seen = Mutex::new(Vec::new());
+    let reply = client(
+        vec![Step::NotConnected, Step::NotConnected, Step::Committed],
+        &seen,
+    )
+    .request(request())
+    .await
+    .unwrap();
+    assert!(matches!(
+        reply.result,
+        Response::Submitted(MutationReply::Committed(_))
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // Never connected: the refusal it was.
+    let seen = Mutex::new(Vec::new());
+    assert!(matches!(
+        client(vec![Step::NotConnected; 80], &seen)
+            .request(request())
+            .await,
+        Err(ClientError::Access(AccessError::Unavailable))
+    ));
+    // Sent once and lost, then not connected: still unknown.
+    let seen = Mutex::new(Vec::new());
+    assert!(matches!(
+        client(
+            std::iter::once(Step::Timeout)
+                .chain(std::iter::repeat_n(Step::NotConnected, 80))
+                .collect(),
+            &seen
+        )
+        .request(request())
+        .await,
+        Err(ClientError::OutcomeUnknown { .. })
+    ));
 }
 
 #[tokio::test]
