@@ -800,6 +800,7 @@ dependencies = [
  "focal-native-client",
  "focal-node",
  "focal-wire",
+ "futures-util",
  "getrandom 0.3.4",
  "quinn",
  "serde",

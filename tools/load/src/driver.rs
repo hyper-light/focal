@@ -155,6 +155,8 @@ impl Conn {
 /// One worker's share of a phase, everything it needs owned.
 struct Job {
     index: u16,
+    /// Write phase: the most of this worker's writes under way at once.
+    inflight: u16,
     /// The callers of the phase, among which `index` is one.
     callers: u16,
     /// Writes to submit, or reads to issue.
@@ -339,24 +341,38 @@ impl Protocol {
     }
 }
 
-/// One worker's means of speaking to the owner: its runtime and client,
-/// its job, the run's generations and its own protocol request ids.
-struct Caller<'a> {
-    runtime: &'a tokio::runtime::Runtime,
-    conn: &'a Conn,
+/// What one worker's writes under way share on its thread: its job, client
+/// and the run's generations, its protocol request ids and its outcome.
+/// Nothing is held across a wait.
+struct Shared<'a> {
     job: &'a Job,
+    conn: &'a Conn,
     generations: &'a Generations,
-    protocol: Protocol,
+    run_start: Instant,
+    protocol: std::cell::Cell<u128>,
+    outcome: std::cell::RefCell<Outcome>,
 }
-impl Caller<'_> {
-    fn send(&self, envelope: RequestEnvelope) -> Result<ResponseEnvelope, ClientError> {
-        self.runtime.block_on(self.conn.request(envelope))
+impl Shared<'_> {
+    fn protocol_request(&self) -> Result<u128, LoadError> {
+        let mut protocol = Protocol {
+            next: self.protocol.get(),
+        };
+        let id = protocol.request(self.job)?;
+        self.protocol.set(protocol.next);
+        Ok(id)
+    }
+    fn note(&self, reason: String) {
+        note(&mut self.outcome.borrow_mut().refusals, reason);
     }
     /// The owner's window, read after a refusal by name: the run issues
     /// where the owner admits. `false` when the window could not be read.
-    fn learn(&mut self, outcome: &mut Outcome) -> Result<bool, LoadError> {
-        let request = self.protocol.request(self.job)?;
-        match self.send(window_envelope(&self.job.names, request)) {
+    async fn learn(&self) -> Result<bool, LoadError> {
+        let request = self.protocol_request()?;
+        match self
+            .conn
+            .request(window_envelope(&self.job.names, request))
+            .await
+        {
             Ok(envelope) => {
                 if let Response::NativeRead(page) = &envelope.result
                     && let Some(NativeObject::Epochs(window)) = page.objects.first()
@@ -366,44 +382,167 @@ impl Caller<'_> {
                     self.generations.learn(window.floor, &open)?;
                     return Ok(true);
                 }
-                note(
-                    &mut outcome.refusals,
-                    format!("window: unexpected reply {:?}", envelope.result),
-                );
+                self.note(format!("window: unexpected reply {:?}", envelope.result));
             }
-            Err(error) => note(&mut outcome.refusals, format!("window: client: {error}")),
+            Err(error) => self.note(format!("window: client: {error}")),
         }
         Ok(false)
     }
     /// The floor advance the journal sends once the generation below
     /// drained: committed, the floor stands at `minimum`; refused by name,
     /// the window is learned; otherwise the next reply sends it again.
-    fn advance(
-        &mut self,
-        outcome: &mut Outcome,
-        epoch: RequestEpoch,
-        minimum: RequestEpoch,
-    ) -> Result<(), LoadError> {
+    async fn advance(&self, epoch: RequestEpoch, minimum: RequestEpoch) -> Result<(), LoadError> {
         let request = RequestKey {
             principal: self.job.names.issuer,
             epoch,
-            id: RequestId::from_u128(self.protocol.request(self.job)?),
+            id: RequestId::from_u128(self.protocol_request()?),
         };
         let names = &self.job.names;
         let envelope = native::advance_envelope(names.ledger, names.profile, request, minimum)?;
-        match classify(self.send(envelope)) {
+        match classify(self.conn.request(envelope).await) {
             Reply::Committed => self.generations.advanced(minimum),
             Reply::Expired => {
                 self.generations.advance_failed()?;
-                self.learn(outcome).map(|_| ())
+                self.learn().await.map(|_| ())
             }
             Reply::Refused(reason) | Reply::Unknown(reason) => {
                 self.generations.advance_failed()?;
-                note(&mut outcome.refusals, format!("floor advance: {reason}"));
+                self.note(format!("floor advance: {reason}"));
                 Ok(())
             }
         }
     }
+    /// Write `i`, from its intended start `started`: issued in the
+    /// generation the run's journal stands at; one the owner refused by name
+    /// is issued once more, with the next request id, in the generation the
+    /// owner admits — never executed twice.
+    async fn write(&self, i: u64, started: Instant) -> Result<(), LoadError> {
+        let offset = u128::from(i);
+        let mut attempt = 0u128;
+        loop {
+            let request = offset
+                .checked_mul(ATTEMPTS)
+                .and_then(|slot| slot.checked_add(attempt))
+                .and_then(|slot| slot.checked_add(1))
+                .filter(|slot| *slot < CLAIM_OFFSET)
+                .and_then(|slot| self.job.base.checked_add(slot))
+                .ok_or(LoadError::Bound("request id space"))?;
+            let minted = self.generations.mint()?;
+            let key = RequestKey {
+                principal: self.job.names.issuer,
+                epoch: minted.epoch,
+                id: RequestId::from_u128(request),
+            };
+            let (envelope, claim) = build(self.job, offset, key)?;
+            let sent = Instant::now();
+            let response = self.conn.request(envelope).await;
+            let finished = Instant::now();
+            let reply = classify(response);
+            self.outcome.borrow_mut().writes.record(WriteSample {
+                start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
+                sent_ns: sent.saturating_duration_since(self.run_start).as_nanos(),
+                finished_ns: finished
+                    .saturating_duration_since(self.run_start)
+                    .as_nanos(),
+                worker: self.job.index,
+                write: i,
+                attempt,
+                epoch: minted.epoch,
+                request,
+                outcome: match &reply {
+                    Reply::Committed => WriteOutcome::Committed,
+                    Reply::Expired => WriteOutcome::Expired,
+                    Reply::Refused(_) => WriteOutcome::Refused,
+                    Reply::Unknown(_) => WriteOutcome::Unknown,
+                },
+            })?;
+            if let Finished::Advance { epoch, minimum } = self.generations.finish(minted.epoch)? {
+                self.advance(epoch, minimum).await?;
+            }
+            match reply {
+                Reply::Committed => {
+                    let mut outcome = self.outcome.borrow_mut();
+                    outcome.committed = outcome.committed.saturating_add(1);
+                    outcome.created.push(claim);
+                }
+                Reply::Expired => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt < ATTEMPTS && self.learn().await? {
+                        continue;
+                    }
+                    let mut outcome = self.outcome.borrow_mut();
+                    outcome.refused = outcome.refused.saturating_add(1);
+                    note(
+                        &mut outcome.refusals,
+                        "refused by name in the generation the owner named".into(),
+                    );
+                }
+                Reply::Refused(reason) => {
+                    let mut outcome = self.outcome.borrow_mut();
+                    outcome.refused = outcome.refused.saturating_add(1);
+                    note(&mut outcome.refusals, reason);
+                }
+                Reply::Unknown(reason) => {
+                    let mut outcome = self.outcome.borrow_mut();
+                    outcome.unknown = outcome.unknown.saturating_add(1);
+                    note(&mut outcome.refusals, reason);
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// A worker's writes, up to `inflight` under way at once: paced, each is sent
+/// at its place on the schedule whatever its earlier writes are doing (wrk2's
+/// constant throughput), and one due while all are out waits for the first
+/// to end, its latency still counted from its place; unpaced, `inflight` are
+/// kept under way. At one, a caller waits for each answer, as it always has.
+async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadError> {
+    use futures_util::StreamExt as _;
+    let job = shared.job;
+    let inflight = usize::from(inflight.max(1));
+    let mut flying = futures_util::stream::FuturesUnordered::new();
+    let mut i = 0u64;
+    loop {
+        // The next write's place, while one is left: on the schedule, or now.
+        let due = if i < job.count {
+            Some(match job.pace {
+                Some(interval) => place(shared.run_start, interval, job, i)?,
+                None => Instant::now(),
+            })
+        } else {
+            None
+        };
+        if due.is_none() && flying.is_empty() {
+            return Ok(());
+        }
+        let ready = due.is_some() && flying.len() < inflight;
+        tokio::select! {
+            () = tokio::time::sleep_until(due.unwrap_or_else(Instant::now).into()), if ready => {
+                flying.push(shared.write(i, due.unwrap_or_else(Instant::now)));
+                i = i.saturating_add(1);
+            }
+            Some(written) = flying.next(), if !flying.is_empty() => written?,
+        }
+    }
+}
+
+/// Write `i`'s place on a paced worker's schedule: the callers' schedules
+/// spread over the interval, caller `index` of `callers` at its share of it,
+/// so the offered rate arrives evenly, never as every caller's request at one
+/// instant.
+fn place(run_start: Instant, interval: Duration, job: &Job, i: u64) -> Result<Instant, LoadError> {
+    let phase = interval
+        .checked_mul(u32::from(job.index))
+        .and_then(|spread| spread.checked_div(u32::from(job.callers)))
+        .ok_or(LoadError::Bound("schedule"))?;
+    u32::try_from(i)
+        .ok()
+        .and_then(|i| interval.checked_mul(i))
+        .and_then(|offset| offset.checked_add(phase))
+        .and_then(|offset| run_start.checked_add(offset))
+        .ok_or(LoadError::Bound("schedule"))
 }
 
 fn worker(
@@ -431,118 +570,19 @@ fn worker(
         writes: WriteSamples::reserve(write_limit)?,
         ..Outcome::default()
     };
-    let mut caller = Caller {
-        runtime,
-        conn,
-        job: &job,
-        generations,
-        protocol: Protocol { next: 0 },
-    };
     match phase {
         Phase::Write => {
             outcome.created = Vec::with_capacity(count);
-            for i in 0..job.count {
-                let offset = u128::from(i);
-                // Every write is issued in the generation the run's
-                // journal stands at; one the owner refused by name is
-                // issued once more, with the next request id, in the
-                // generation the owner admits — never executed twice.
-                let mut attempt = 0u128;
-                loop {
-                    let request = offset
-                        .checked_mul(ATTEMPTS)
-                        .and_then(|slot| slot.checked_add(attempt))
-                        .and_then(|slot| slot.checked_add(1))
-                        .filter(|slot| *slot < CLAIM_OFFSET)
-                        .and_then(|slot| job.base.checked_add(slot))
-                        .ok_or(LoadError::Bound("request id space"))?;
-                    let minted = generations.mint()?;
-                    let key = RequestKey {
-                        principal: job.names.issuer,
-                        epoch: minted.epoch,
-                        id: RequestId::from_u128(request),
-                    };
-                    let (envelope, claim) = build(&job, offset, key)?;
-                    // Paced, a request starts at its place on the schedule
-                    // and its latency counts from there, however late the
-                    // worker reached it (wrk2); unpaced, from its send.
-                    let started = match job.pace {
-                        Some(interval) => {
-                            // The callers' schedules are spread over the
-                            // interval, caller `index` of `concurrency` at its
-                            // share of it: the offered rate arrives evenly, as
-                            // the other systems' generator sends it, never as
-                            // every caller's request at one instant.
-                            let phase = interval
-                                .checked_mul(u32::from(job.index))
-                                .and_then(|spread| spread.checked_div(u32::from(job.callers)))
-                                .ok_or(LoadError::Bound("schedule"))?;
-                            let place = u32::try_from(i)
-                                .ok()
-                                .and_then(|i| interval.checked_mul(i))
-                                .and_then(|offset| offset.checked_add(phase))
-                                .and_then(|offset| run_start.checked_add(offset))
-                                .ok_or(LoadError::Bound("schedule"))?;
-                            if let Some(wait) = place.checked_duration_since(Instant::now()) {
-                                std::thread::sleep(wait);
-                            }
-                            place
-                        }
-                        None => Instant::now(),
-                    };
-                    let sent = Instant::now();
-                    let response = caller.send(envelope);
-                    let finished = Instant::now();
-                    let reply = classify(response);
-                    outcome.writes.record(WriteSample {
-                        start_ns: started.saturating_duration_since(run_start).as_nanos(),
-                        sent_ns: sent.saturating_duration_since(run_start).as_nanos(),
-                        finished_ns: finished.saturating_duration_since(run_start).as_nanos(),
-                        worker: job.index,
-                        write: i,
-                        attempt,
-                        epoch: minted.epoch,
-                        request,
-                        outcome: match &reply {
-                            Reply::Committed => WriteOutcome::Committed,
-                            Reply::Expired => WriteOutcome::Expired,
-                            Reply::Refused(_) => WriteOutcome::Refused,
-                            Reply::Unknown(_) => WriteOutcome::Unknown,
-                        },
-                    })?;
-                    if let Finished::Advance { epoch, minimum } =
-                        generations.finish(minted.epoch)?
-                    {
-                        caller.advance(&mut outcome, epoch, minimum)?;
-                    }
-                    match reply {
-                        Reply::Committed => {
-                            outcome.committed = outcome.committed.saturating_add(1);
-                            outcome.created.push(claim);
-                        }
-                        Reply::Expired => {
-                            attempt = attempt.saturating_add(1);
-                            if attempt < ATTEMPTS && caller.learn(&mut outcome)? {
-                                continue;
-                            }
-                            outcome.refused = outcome.refused.saturating_add(1);
-                            note(
-                                &mut outcome.refusals,
-                                "refused by name in the generation the owner named".into(),
-                            );
-                        }
-                        Reply::Refused(reason) => {
-                            outcome.refused = outcome.refused.saturating_add(1);
-                            note(&mut outcome.refusals, reason);
-                        }
-                        Reply::Unknown(reason) => {
-                            outcome.unknown = outcome.unknown.saturating_add(1);
-                            note(&mut outcome.refusals, reason);
-                        }
-                    }
-                    break;
-                }
-            }
+            let shared = Shared {
+                job: &job,
+                conn,
+                generations,
+                run_start,
+                protocol: std::cell::Cell::new(0),
+                outcome: std::cell::RefCell::new(outcome),
+            };
+            runtime.block_on(write_open_loop(&shared, job.inflight))?;
+            outcome = shared.outcome.into_inner();
         }
         Phase::Read => {
             let mut cycle = job.created.iter().cycle();
@@ -878,6 +918,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     for index in 0..shape.concurrency {
         jobs.push(Job {
             index,
+            inflight: shape.inflight,
             callers: shape.concurrency,
             count: share(shape.claims, shape.concurrency, index)?,
             base: worker_base(shape.seed, u128::from(index))?,
@@ -932,6 +973,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             let index = u16::try_from(slot).map_err(|_| LoadError::Bound("readers"))?;
             jobs.push(Job {
                 index,
+                inflight: 1,
                 callers: reader_count,
                 count: share(shape.reads, reader_count, index)?,
                 base: worker_base(shape.seed, u128::from(index))?,

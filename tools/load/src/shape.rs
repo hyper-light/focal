@@ -13,6 +13,8 @@ pub const MAX_READS: u64 = 10_000_000;
 /// The most concurrent callers one run drives (each is an OS thread with its
 /// own client and runtime).
 pub const MAX_CONCURRENCY: u16 = 64;
+/// The most of one caller's writes under way at once (`inflight`).
+pub const MAX_INFLIGHT: u16 = 256;
 
 /// Which node the callers reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -79,6 +81,13 @@ pub struct WorkloadShape {
     /// requests over few connections.
     #[serde(default)]
     pub connections: Option<u16>,
+    /// The most of one caller's writes under way at once (default 1: each
+    /// caller waits for its write's answer). More, its writes are sent at
+    /// their places on the schedule whatever earlier ones are doing; one due
+    /// while all are out waits for the first to end, its latency counted
+    /// from its place.
+    #[serde(default = "default_inflight")]
+    pub inflight: u16,
     /// `enrolled`: the enrolled client's directory (its join journal, key and
     /// adopted issuers).
     #[serde(default)]
@@ -113,6 +122,9 @@ fn default_seed() -> u64 {
 fn default_concurrency() -> u16 {
     1
 }
+fn default_inflight() -> u16 {
+    1
+}
 
 impl WorkloadShape {
     pub fn validate(&self) -> Result<(), String> {
@@ -133,6 +145,9 @@ impl WorkloadShape {
             .is_some_and(|connections| connections == 0 || connections > self.concurrency)
         {
             return Err("connections must be 1..=concurrency".to_string());
+        }
+        if self.inflight == 0 || self.inflight > MAX_INFLIGHT {
+            return Err(format!("inflight must be 1..={MAX_INFLIGHT}"));
         }
         // The seed sits above bit 40 of the id space; a larger one would fold
         // onto another seed's identities.

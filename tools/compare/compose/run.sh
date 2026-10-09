@@ -61,10 +61,13 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     # had ten requests out where the other systems' generator allows 4096, and
     # a write past ten milliseconds left the rate unoffered, its backlog
     # counted as seconds of latency.
-    callers=64
-    # One participant holds at most sixteen connections to a node: the
-    # callers share them, each connection carrying several requests at once.
+    # One participant holds at most sixteen connections to a node: sixteen
+    # callers, each on its own, each with up to 64 writes under way, sent at
+    # their places on the schedule whatever the earlier ones are doing — the
+    # other systems' generator likewise sends open loop, up to 4096 out.
+    callers=16
     connections=16
+    inflight=64
     dc exec -T focal-load sh -c "cat > /reports/shape.yaml" <<EOF
 claims: $total
 transport: enrolled
@@ -73,6 +76,7 @@ worker: "$worker"
 profile: authored_v1
 concurrency: $callers
 connections: $connections
+inflight: $inflight
 rate: $rate
 warmup_ms: $(( warmup * 1000 ))
 EOF

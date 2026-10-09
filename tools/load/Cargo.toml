@@ -23,6 +23,7 @@ focal-native-client = { version = "0.1.0", path = "../../crates/focal-native-cli
 focal-node = { version = "0.1.0", path = "../../crates/focal-node" }
 focal-wire = { version = "0.1.0", path = "../../crates/focal-wire" }
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 clap = { workspace = true }
 getrandom = { workspace = true }
 serde = { workspace = true }
