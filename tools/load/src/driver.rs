@@ -155,6 +155,8 @@ impl Conn {
 /// One worker's share of a phase, everything it needs owned.
 struct Job {
     index: u16,
+    /// The callers of the phase, among which `index` is one.
+    callers: u16,
     /// Writes to submit, or reads to issue.
     count: u64,
     /// The first identity of this worker's space.
@@ -409,15 +411,9 @@ fn worker(
     phase: Phase,
     run_start: Instant,
     generations: &Generations,
+    runtime: &tokio::runtime::Runtime,
+    conn: &Conn,
 ) -> Result<Outcome, LoadError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    // A QUIC endpoint binds to the runtime it is made in.
-    let conn = {
-        let _entered = runtime.enter();
-        Conn::open(&job.connector, &job.names, &job.limits)?
-    };
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
     // The shape bounds logical writes at MAX_CLAIMS; each has at most
     // ATTEMPTS samples. The complete trace is funded before sending work.
@@ -436,8 +432,8 @@ fn worker(
         ..Outcome::default()
     };
     let mut caller = Caller {
-        runtime: &runtime,
-        conn: &conn,
+        runtime,
+        conn,
         job: &job,
         generations,
         protocol: Protocol { next: 0 },
@@ -472,9 +468,19 @@ fn worker(
                     // worker reached it (wrk2); unpaced, from its send.
                     let started = match job.pace {
                         Some(interval) => {
+                            // The callers' schedules are spread over the
+                            // interval, caller `index` of `concurrency` at its
+                            // share of it: the offered rate arrives evenly, as
+                            // the other systems' generator sends it, never as
+                            // every caller's request at one instant.
+                            let phase = interval
+                                .checked_mul(u32::from(job.index))
+                                .and_then(|spread| spread.checked_div(u32::from(job.callers)))
+                                .ok_or(LoadError::Bound("schedule"))?;
                             let place = u32::try_from(i)
                                 .ok()
                                 .and_then(|i| interval.checked_mul(i))
+                                .and_then(|offset| offset.checked_add(phase))
                                 .and_then(|offset| run_start.checked_add(offset))
                                 .ok_or(LoadError::Bound("schedule"))?;
                             if let Some(wait) = place.checked_duration_since(Instant::now()) {
@@ -571,7 +577,24 @@ fn run_phase(
     jobs: Vec<Job>,
     phase: Phase,
     generations: &Generations,
+    connections: u16,
 ) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
+    // The callers' clients, on one runtime they all drive: a QUIC endpoint
+    // binds to the runtime it is made in, and a client's requests from
+    // several callers are carried on its one connection together.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(usize::from(connections.clamp(1, 4)))
+        .enable_all()
+        .build()?;
+    let Some(first) = jobs.first() else {
+        return Err(LoadError::Bound("zero workers"));
+    };
+    let conns = {
+        let _entered = runtime.enter();
+        (0..connections.max(1))
+            .map(|_| Conn::open(&first.connector, &first.names, &first.limits))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let run_start_epoch_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| LoadError::Clock)?
@@ -580,9 +603,19 @@ fn run_phase(
     let outcomes = std::thread::scope(|scope| -> Result<Vec<Outcome>, LoadError> {
         let mut handles = Vec::with_capacity(jobs.len());
         for job in jobs {
+            let conn = conns
+                .get(
+                    usize::from(job.index)
+                        .checked_rem(conns.len())
+                        .ok_or(LoadError::Bound("connections"))?,
+                )
+                .ok_or(LoadError::Bound("connections"))?;
+            let runtime = &runtime;
             let handle = std::thread::Builder::new()
                 .name(format!("focal-load-{}", job.index))
-                .spawn_scoped(scope, move || worker(job, phase, run_start, generations))?;
+                .spawn_scoped(scope, move || {
+                    worker(job, phase, run_start, generations, runtime, conn)
+                })?;
             handles.push(handle);
         }
         let mut outcomes = Vec::with_capacity(handles.len());
@@ -839,11 +872,13 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
         None => None,
     };
 
+    let connections = shape.connections.unwrap_or(shape.concurrency);
     // Writes: every worker its share of the claims, in its own id space.
     let mut jobs = Vec::with_capacity(usize::from(shape.concurrency));
     for index in 0..shape.concurrency {
         jobs.push(Job {
             index,
+            callers: shape.concurrency,
             count: share(shape.claims, shape.concurrency, index)?,
             base: worker_base(shape.seed, u128::from(index))?,
             connector: connector.clone(),
@@ -857,7 +892,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     // participant share one (the audit's F12).
     let generations = Generations::new();
     let (write_outcomes, write_nanos, write_phase_start_epoch_ns) =
-        run_phase(jobs, Phase::Write, &generations)?;
+        run_phase(jobs, Phase::Write, &generations, connections)?;
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
@@ -897,6 +932,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             let index = u16::try_from(slot).map_err(|_| LoadError::Bound("readers"))?;
             jobs.push(Job {
                 index,
+                callers: reader_count,
                 count: share(shape.reads, reader_count, index)?,
                 base: worker_base(shape.seed, u128::from(index))?,
                 connector: connector.clone(),
@@ -907,7 +943,12 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 pace: None,
             });
         }
-        let (read_outcomes, read_nanos, _) = run_phase(jobs, Phase::Read, &generations)?;
+        let (read_outcomes, read_nanos, _) = run_phase(
+            jobs,
+            Phase::Read,
+            &generations,
+            reader_count.min(connections),
+        )?;
         let reads = merged(&read_outcomes);
         let issued = u64::try_from(reads.samples.len()).map_err(|_| LoadError::Bound("reads"))?;
         let mut latencies: Vec<u128> = reads.samples.iter().map(|(_, latency)| *latency).collect();

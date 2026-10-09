@@ -62,6 +62,9 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     # a write past ten milliseconds left the rate unoffered, its backlog
     # counted as seconds of latency.
     callers=64
+    # One participant holds at most sixteen connections to a node: the
+    # callers share them, each connection carrying several requests at once.
+    connections=16
     dc exec -T focal-load sh -c "cat > /reports/shape.yaml" <<EOF
 claims: $total
 transport: enrolled
@@ -69,6 +72,7 @@ enrollment: /client/CLIENT.contexts/enrollment-bench
 worker: "$worker"
 profile: authored_v1
 concurrency: $callers
+connections: $connections
 rate: $rate
 warmup_ms: $(( warmup * 1000 ))
 EOF

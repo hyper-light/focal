@@ -68,9 +68,17 @@ pub struct WorkloadShape {
     #[serde(default)]
     pub profile: Option<Profile>,
     /// Concurrent callers (1..=MAX_CONCURRENCY, default 1). The claims and the
-    /// reads are split evenly among them; each caller has its own client.
+    /// reads are split evenly among them.
     #[serde(default = "default_concurrency")]
     pub concurrency: u16,
+    /// The clients the callers share (1..=concurrency; by default one each),
+    /// caller `i` sending on client `i % connections`, each client's requests
+    /// carried concurrently on its one connection. One participant holds at
+    /// most sixteen connections to a node (its admission bound): more callers
+    /// than that share them, as the other systems' generators send many
+    /// requests over few connections.
+    #[serde(default)]
+    pub connections: Option<u16>,
     /// `enrolled`: the enrolled client's directory (its join journal, key and
     /// adopted issuers).
     #[serde(default)]
@@ -119,6 +127,12 @@ impl WorkloadShape {
         }
         if self.concurrency == 0 || self.concurrency > MAX_CONCURRENCY {
             return Err(format!("concurrency must be 1..={MAX_CONCURRENCY}"));
+        }
+        if self
+            .connections
+            .is_some_and(|connections| connections == 0 || connections > self.concurrency)
+        {
+            return Err("connections must be 1..=concurrency".to_string());
         }
         // The seed sits above bit 40 of the id space; a larger one would fold
         // onto another seed's identities.
