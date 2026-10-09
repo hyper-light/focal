@@ -55,9 +55,13 @@ import json, sys
 w = json.load(sys.stdin)["worker"]
 print(w if isinstance(w, str) else bytes(w).hex())')
     total=$(( rate * (seconds + warmup) ))
-    # As many callers as the rate needs at the bench's tens of milliseconds a
-    # request, within focal-load's bound of 64; each paced from its intended start.
-    callers=$(( rate / 100 )); [ "$callers" -lt 4 ] && callers=4; [ "$callers" -gt 64 ] && callers=64
+    # focal-load's most callers at every rate, each paced from its intended
+    # start, so the offered rate is the same whatever the callers. One request
+    # is out per caller: at one caller a hundred per second, focal at 1000/s
+    # had ten requests out where the other systems' generator allows 4096, and
+    # a write past ten milliseconds left the rate unoffered, its backlog
+    # counted as seconds of latency.
+    callers=64
     dc exec -T focal-load sh -c "cat > /reports/shape.yaml" <<EOF
 claims: $total
 transport: enrolled
