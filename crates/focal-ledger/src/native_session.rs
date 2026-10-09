@@ -3,6 +3,7 @@
 //! Followers own a passive Core. Admission credits are reconstructed once at a
 //! current-term read barrier, never by replaying participant commands.
 pub(crate) use apply::NativeOutput;
+pub(crate) use checkpoint::CapturedCheckpoint;
 use engine::NativeEngine;
 use focal_consensus::{
     ConsensusError, DurableNode, Message, NodeConfig, NodeEvents, NodeStatus, StateRole,

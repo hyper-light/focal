@@ -593,11 +593,13 @@ fn streaming_output_matches_exact_slice_bytes_hash_and_refuses_before_unfunded_c
             ..plan.quote()
         },
     ] {
-        let refused = EncodingPlan { core: &core, quote }.write_with(
-            |_| -> Result<(), std::convert::Infallible> {
-                panic!("insufficient codec allowance must refuse before output")
-            },
-        );
+        let refused = EncodingPlan {
+            source: Source::Core(&core.state),
+            quote,
+        }
+        .write_with(|_| -> Result<(), std::convert::Infallible> {
+            panic!("insufficient codec allowance must refuse before output")
+        });
         assert_eq!(refused, Err(WriteError::Codec(CodecError::Capacity)));
     }
     let failure = plan
@@ -778,4 +780,45 @@ fn the_work_bound_covers_what_an_encoding_takes() {
             quote.bytes
         );
     }
+}
+
+#[test]
+fn a_frozen_image_encodes_exactly_as_its_core_on_another_thread_while_the_core_goes_on() {
+    fn sendable<T: Send>() {}
+    sendable::<crate::native::NativeFrozen>();
+    let mut core = populated();
+    let expected = encode(&core);
+    let before = core.state.budget.stats();
+    let frozen = core.freeze_native().unwrap();
+    assert!(
+        core.state.budget.stats().used > before.used,
+        "the freeze is charged"
+    );
+    // The core goes on: a later publication copies the pages it changes.
+    let posted = fixture::prepared(core.prepare_native(
+        fixture::context(fixture::ISSUER, 2),
+        fixture::creation(2, 2, &[(ValidationMode::Required, false)], None),
+        &[],
+    ));
+    core.publish_native(posted).unwrap();
+    assert_ne!(encode(&core), expected);
+    let (bytes, frozen) = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let plan = EncodingPlan::prepare_frozen(&frozen, limits()).unwrap();
+                let mut output = vec![0; plan.quote().bytes];
+                assert_eq!(plan.write_into(&mut output).unwrap(), plan.quote().hash);
+                (output, frozen)
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(bytes, expected);
+    assert_eq!(frozen.native_sequence().0 + 1, core.native_sequence().0);
+    let held = core.state.budget.stats().used;
+    drop(frozen);
+    assert!(
+        core.state.budget.stats().used < held,
+        "the old pages go with it"
+    );
 }

@@ -1006,6 +1006,20 @@ fn a_deferred_seeded_checkpoint_lands_at_its_point_while_the_replica_goes_on() {
         let claim = creation(cluster.next(PARTIES.issuer), occurrence);
         cluster.commit(1, PARTIES.issuer, claim, &[]);
     }
+    // The envelope taken in two parts, its head at the point and the native
+    // section joined later, is the envelope taken at once, byte for byte.
+    {
+        let node = cluster.node(1);
+        let core = node.core.encode_checkpoint().unwrap();
+        let native = b"the native section, encoded elsewhere".as_slice();
+        let whole = super::durable_session_v1::snapshot(node, &core, Some(native)).unwrap();
+        let (head, slot_generation) =
+            super::durable_session_v1::snapshot_native_head(node, &core).unwrap();
+        let joined =
+            super::durable_session_v1::snapshot_native_finish(head, native, slot_generation)
+                .unwrap();
+        assert_eq!(joined, whole);
+    }
     let captured = cluster.node(1).applied_raft;
     cluster.node(1).begin_deferred_checkpoint().unwrap();
     assert!(cluster.node(1).deferred_checkpoint_pending());

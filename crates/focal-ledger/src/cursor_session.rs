@@ -628,29 +628,54 @@ impl DeltaSource for Session {
 struct EncodedCheckpoint {
     bytes: Vec<u8>,
     retained: Option<(Vec<u8>, Allocation)>,
-    /// How long the native engine's section took to encode, its seeds installed.
+    /// How long the native engine's section took on the owner: encoded with
+    /// its seeds installed, or, deferred, captured.
     native: std::time::Duration,
-    /// A deferred encoding's seed chunks, written but not yet durable.
-    commit: Option<focal_evidence::SeedCommit>,
+    /// A deferred checkpoint's native section, captured and still to encode,
+    /// and the envelope it joins; `bytes` is empty until then.
+    deferred: Option<DeferredNative>,
     _scratch: Allocation,
 }
 
-/// A checkpoint whose state the owner has encoded, its root's seed chunks being
-/// made durable on a thread of their own while the replica goes on (Ongaro's
-/// thesis §5.1: the state machine continues while its snapshot is written).
-/// Consensus is handed the bytes, at the point they were captured, only once
-/// the chunks they name are durable; the entries after the point stay in the
-/// log. Dropped, it waits for its thread: nothing writes the seed directory
-/// after its owner let it go.
+/// What a deferred checkpoint's thread is given and what the owner keeps:
+/// the native section captured at the point, the seed batch its root seals
+/// into, and the envelope's head and slot generation taken at the same point.
+struct DeferredNative {
+    captured: crate::native_session::CapturedCheckpoint,
+    batch: Result<focal_evidence::SeedBatch, focal_evidence::ContentError>,
+    head: Vec<u8>,
+    slot_generation: u64,
+}
+
+/// A deferred checkpoint thread's result: the native section's bytes with
+/// their permit, its seeds durable, and how long that took.
+type DeferredOutput = Result<(Vec<u8>, Allocation, std::time::Duration), NativeSessionError>;
+
+/// A checkpoint whose state the owner has captured at a point (the native
+/// rows frozen, the envelope's other sections encoded), its native root being
+/// encoded and its seed chunks made durable on a thread of their own while
+/// the replica goes on (Ongaro's thesis §5.1: the state machine continues
+/// while its snapshot is written; as Redis's fork-time image or a read
+/// transaction's snapshot in etcd's bbolt). Consensus is handed the bytes, at
+/// the point they were captured, only once the chunks they name are durable;
+/// the entries after the point stay in the log. Dropped, it waits for its
+/// thread: nothing writes the seed directory after its owner let it go.
 pub(crate) struct DeferredCheckpoint {
     point: focal_consensus::CheckpointPoint,
-    bytes: Vec<u8>,
+    head: Vec<u8>,
+    slot_generation: u64,
     native: std::time::Duration,
     envelope: std::time::Duration,
-    committing: std::time::Instant,
-    done: std::sync::mpsc::Receiver<Result<(), focal_evidence::ContentError>>,
+    done: std::sync::mpsc::Receiver<DeferredOutput>,
     worker: Option<std::thread::JoinHandle<()>>,
     _scratch: Allocation,
+}
+
+/// A deferred checkpoint's thread ended without telling its result.
+fn lost_worker() -> NativeSessionError {
+    NativeSessionError::from(crate::native_checkpoint::Error::from(
+        focal_evidence::ContentError::Failed,
+    ))
 }
 
 impl Drop for DeferredCheckpoint {
@@ -716,33 +741,49 @@ impl Session {
         let envelope = encoded_at
             .saturating_duration_since(started)
             .saturating_sub(native);
-        let Some(commit) = encoded.commit.take() else {
+        let Some(deferred) = encoded.deferred.take() else {
+            // No native engine: the envelope is whole already.
             let bytes = std::mem::take(&mut encoded.bytes);
             return self.write_checkpoint(point, bytes, native, envelope, encoded_at, None);
         };
+        let DeferredNative {
+            captured,
+            batch,
+            head,
+            slot_generation,
+        } = deferred;
         let (send, done) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("focal-checkpoint".into())
             .spawn(move || {
+                let started = std::time::Instant::now();
+                let output = captured.encode(batch).and_then(|(bytes, allocation, commit)| {
+                    if let Some(commit) = commit {
+                        commit.run().map_err(|error| {
+                            NativeSessionError::from(crate::native_checkpoint::Error::from(error))
+                        })?;
+                    }
+                    Ok((bytes, allocation, started.elapsed()))
+                });
+                // The frozen rows go before the result is told: their pages
+                // are released by the time the owner reads it.
+                drop(captured);
                 // The receiver may be gone (the session dropped): the result
                 // then has no one to tell, and the commit is complete or not.
-                let _ = send.send(commit.run());
+                let _ = send.send(output);
             })
-            // No thread: the commit was dropped with its closure, its files
-            // removed; the next period tries again.
+            // No thread: the capture and its batch were dropped with the
+            // closure, the batch's files removed; the next period tries again.
             .map_err(|_| LedgerError::Capacity)?;
-        let EncodedCheckpoint {
-            bytes, _scratch, ..
-        } = encoded;
         self.deferred = Some(DeferredCheckpoint {
             point,
-            bytes,
+            head,
+            slot_generation,
             native,
             envelope,
-            committing: std::time::Instant::now(),
             done,
             worker: Some(worker),
-            _scratch,
+            _scratch: encoded._scratch,
         });
         Ok(())
     }
@@ -757,9 +798,7 @@ impl Session {
         let result = match deferred.done.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(focal_evidence::ContentError::Failed)
-            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(lost_worker()),
         };
         self.finish_deferred(result).map(|()| true)
     }
@@ -770,36 +809,44 @@ impl Session {
         let Some(deferred) = self.deferred.as_ref() else {
             return Ok(());
         };
-        let result = deferred
-            .done
-            .recv()
-            .unwrap_or(Err(focal_evidence::ContentError::Failed));
+        let result = deferred.done.recv().unwrap_or_else(|_| Err(lost_worker()));
         self.finish_deferred(result)
     }
 
-    fn finish_deferred(
-        &mut self,
-        result: Result<(), focal_evidence::ContentError>,
-    ) -> Result<(), LedgerError> {
+    fn finish_deferred(&mut self, result: DeferredOutput) -> Result<(), LedgerError> {
         let Some(mut deferred) = self.deferred.take() else {
             return Ok(());
         };
-        let committed = deferred.committing.elapsed();
-        if let Err(error) = result {
-            if let Some(hosting) = self.hosting.as_mut() {
-                hosting.seeds.fail();
+        let (native, _native_permit, encoded) = match result {
+            Ok(output) => output,
+            Err(error) => {
+                // A seed write or commit that failed fails the store, as one
+                // on the owner's thread does: it refuses until reopened.
+                if let NativeSessionError::Checkpoint(crate::native_checkpoint::Error::Seeds(_)) =
+                    &error
+                    && let Some(hosting) = self.hosting.as_mut()
+                {
+                    hosting.seeds.fail();
+                }
+                return Err(error.into());
             }
-            return Err(NativeSessionError::from(crate::native_checkpoint::Error::from(error)).into());
-        }
-        let bytes = std::mem::take(&mut deferred.bytes);
+        };
+        let writing = std::time::Instant::now();
+        self.native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?
+            .note_checkpoint_seeds(&native)?;
+        let head = std::mem::take(&mut deferred.head);
+        let bytes = durable_session_v1::snapshot_native_finish(head, &native, deferred.slot_generation)?;
+        drop(native);
         let point = deferred.point.clone();
         let written = self.write_checkpoint(
             point,
             bytes,
             deferred.native,
             deferred.envelope,
-            std::time::Instant::now(),
-            Some(committed),
+            writing,
+            Some(encoded),
         );
         match written {
             // A later checkpoint or snapshot already covers the point, or the
@@ -888,12 +935,14 @@ impl Session {
         // The native section is encoded under its own permit; the envelope
         // copies it once more into the final bytes.
         let native_started = std::time::Instant::now();
-        let (native, commit) = match (self.native.as_deref_mut(), self.hosting.as_mut()) {
-            (Some(engine), Some(hosting)) if defer => {
-                let (bytes, allocation, commit) =
-                    engine.encode_checkpoint_deferred(&self.consensus, &mut hosting.seeds)?;
-                (Some((bytes, allocation)), commit)
-            }
+        let (native, captured) = match (self.native.as_deref_mut(), self.hosting.as_mut()) {
+            (Some(engine), Some(hosting)) if defer && !retain_bytes => (
+                None,
+                Some((
+                    engine.capture_checkpoint(&self.consensus)?,
+                    hosting.seeds.batch(),
+                )),
+            ),
             (Some(engine), Some(hosting)) => (
                 Some(engine.encode_checkpoint(&self.consensus, &mut hosting.seeds)?),
                 None,
@@ -921,6 +970,21 @@ impl Session {
             .reserve(BudgetKind::Recovery, BudgetLane::Completion, amount)?
             .commit();
         let core = self.core.encode_checkpoint()?;
+        if let Some((captured, batch)) = captured {
+            let (head, slot_generation) = durable_session_v1::snapshot_native_head(self, &core)?;
+            return Ok(Some(EncodedCheckpoint {
+                bytes: Vec::new(),
+                retained: None,
+                native: native_elapsed,
+                deferred: Some(DeferredNative {
+                    captured,
+                    batch,
+                    head,
+                    slot_generation,
+                }),
+                _scratch,
+            }));
+        }
         let bytes = durable_session_v1::snapshot(
             self,
             &core,
@@ -950,7 +1014,7 @@ impl Session {
             bytes,
             retained,
             native: native_elapsed,
-            commit,
+            deferred: None,
             _scratch,
         }))
     }

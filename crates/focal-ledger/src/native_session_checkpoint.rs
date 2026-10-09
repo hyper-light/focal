@@ -7,7 +7,50 @@ use super::engine::{Domain, NativeEngine};
 use super::*;
 use crate::native_checkpoint::{self as enclosing, Activation, AncillaryProfile, Metadata};
 use focal_consensus::AppliedSnapshot;
-use focal_evidence::SeedCommit;
+use focal_evidence::{SeedBatch, SeedCommit};
+
+/// A native checkpoint captured on its session's owner
+/// ([`NativeSession::capture_checkpoint`]): everything its encoding reads,
+/// owned, so the walk of every row runs on another thread while the session
+/// goes on. Its frozen rows keep their pages charged until it drops.
+pub(crate) struct CapturedCheckpoint {
+    frozen: focal_core::native::NativeFrozen,
+    metadata: Metadata,
+    configuration: focal_consensus::MembershipConfiguration,
+    movement: Option<Vec<u8>>,
+    _movement_permit: Allocation,
+    retention: Option<enclosing::RetentionSection>,
+    limits: enclosing::Limits,
+    budget: MemoryBudget,
+}
+
+impl CapturedCheckpoint {
+    /// The enclosing checkpoint's bytes with their output permit. A root
+    /// beyond the inline bound is sealed as seeds into `batch` (25 §5), the
+    /// returned commit making them durable; until it has, the bytes must not
+    /// reach consensus (they name the chunks). An inline root takes no batch.
+    pub(crate) fn encode(
+        &self,
+        batch: Result<SeedBatch, focal_evidence::ContentError>,
+    ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
+        let plan = enclosing::EncodingPlan::prepare_frozen_with_sections(
+            &self.frozen,
+            self.metadata,
+            &self.configuration,
+            self.movement.as_deref(),
+            self.retention,
+            self.limits,
+        )?;
+        if !plan.seeded() {
+            let (bytes, allocation) = plan.encode_in(&self.budget)?.into_parts();
+            return Ok((bytes, allocation, None));
+        }
+        let batch = batch.map_err(enclosing::Error::from)?;
+        let (encoded, commit) = plan.encode_in_batch(&self.budget, batch)?;
+        let (bytes, allocation) = encoded.into_parts();
+        Ok((bytes, allocation, Some(commit)))
+    }
+}
 
 /// The producer incarnation of a replica that installed an authoritative
 /// snapshot: derived from the attested genesis and the exact install event, so
@@ -111,15 +154,32 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &DurableNode,
         seeds: &mut SeedStore,
     ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
-        let (bytes, allocation, commit) = self.encode_checkpoint_inner(consensus, seeds)?;
+        let captured = self.capture_checkpoint(consensus)?;
+        let result = captured.encode(seeds.batch());
+        if let Err(NativeSessionError::Checkpoint(enclosing::Error::Seeds(
+            focal_evidence::ContentError::Io(_),
+        ))) = &result
+        {
+            seeds.fail();
+        }
+        let (bytes, allocation, commit) = result?;
         self.note_seeds(&bytes)?;
         Ok((bytes, allocation, commit))
     }
-    fn encode_checkpoint_inner(
+    /// Take note of a captured checkpoint's encoded bytes, as an encoding
+    /// here does: the seed chunks they name are the ones a sweep keeps.
+    pub(crate) fn note_checkpoint_seeds(&mut self, bytes: &[u8]) -> Result<(), NativeSessionError> {
+        self.note_seeds(bytes)
+    }
+    /// The checkpoint of the committed Core at the fully delivered prefix,
+    /// captured here, on the owner: the point's metadata and sections, and
+    /// the rows frozen (each page charged where it was). Its encoding, the
+    /// walk of every row, runs wherever the capture is sent
+    /// ([`CapturedCheckpoint::encode`]) while this session goes on.
+    pub(crate) fn capture_checkpoint(
         &self,
         consensus: &DurableNode,
-        seeds: &mut SeedStore,
-    ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
+    ) -> Result<CapturedCheckpoint, NativeSessionError> {
         self.check()?;
         let status = consensus.status();
         if self.applied_raft == 0
@@ -156,7 +216,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Some(movement) => Some(movement.checkpoint_bytes()?),
             None => None,
         };
-        let _movement_permit = self.budget.reserve(
+        let movement_permit = self.budget.reserve(
             BudgetKind::Recovery,
             BudgetLane::Completion,
             array::<u8>(movement.as_ref().map_or(0, Vec::len))?,
@@ -169,19 +229,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 retired_families: self.retired_families,
             },
         );
-        let plan = enclosing::EncodingPlan::prepare_with_sections(
-            core,
+        Ok(CapturedCheckpoint {
+            frozen: core.freeze_native()?,
             metadata,
-            &configuration,
-            movement.as_deref(),
+            configuration,
+            movement,
+            _movement_permit: movement_permit.commit(),
             retention,
-            self.limits.checkpoint,
-        )?;
-        // A root beyond the inline bound is sealed as seeds first (25 §5);
-        // the bytes consensus carries then name them.
-        let (encoded, commit) = plan.encode_in_seeded_deferred(&self.budget, seeds)?;
-        let (bytes, allocation) = encoded.into_parts();
-        Ok((bytes, allocation, commit))
+            limits: self.limits.checkpoint,
+            budget: self.budget.clone(),
+        })
     }
 
     /// Validate and install an authoritative snapshot. Every identity, floor,

@@ -15,9 +15,9 @@
 use super::prepare::{self, array};
 use super::{ContractError, Key, NativeError, Row, layout};
 use focal_memory::{
-    Allocation, BudgetKind, BudgetLane, Change, Entry, MemoryBudget, MemoryError, PreparedRange,
-    RangeConfig, RangeId, RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope,
-    RangeWriteLimits, SnapshotLease,
+    Allocation, BudgetKind, BudgetLane, Change, Entry, FrozenRange, MemoryBudget, MemoryError,
+    PreparedRange, RangeConfig, RangeId, RangePreparationPlan, RangeStats, RangeStore,
+    RangeWriteEnvelope, RangeWriteLimits, SnapshotLease,
 };
 
 #[cfg(test)]
@@ -211,6 +211,43 @@ fn route<T>(members: &[T], start: impl Fn(&T) -> Option<Affinity>, affinity: &Af
         .saturating_sub(1)
 }
 
+/// A range group frozen at its committed prefix ([`NativeRanges::freeze`]):
+/// read-only and sendable, every page charged where it was.
+pub(super) struct FrozenRanges {
+    producer: RangeId,
+    epoch: u64,
+    members: Vec<RangeBoundary>,
+    stores: Vec<FrozenRange<Key, Row>>,
+    _charges: [Allocation; 2],
+}
+
+impl FrozenRanges {
+    pub(super) fn id(&self) -> RangeId {
+        self.producer
+    }
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub(super) fn members(&self) -> &[RangeBoundary] {
+        &self.members
+    }
+    pub(super) fn prefix(&self) -> u64 {
+        self.stores.first().map_or(0, FrozenRange::prefix)
+    }
+    pub(super) fn len(&self) -> usize {
+        self.stores.iter().map(FrozenRange::len).sum()
+    }
+    pub(super) fn pages(&self) -> usize {
+        self.stores
+            .iter()
+            .fold(0, |pages, store| pages.saturating_add(store.pages()))
+    }
+    /// Every row in key order.
+    pub(super) fn entries(&self) -> impl Iterator<Item = &Entry<Key, Row>> {
+        self.stores.iter().flat_map(FrozenRange::entries)
+    }
+}
+
 /// The rows of one native state: the range group.
 pub(super) struct NativeRanges {
     producer: RangeId,
@@ -346,6 +383,32 @@ impl NativeRanges {
     /// Every row in key order.
     pub(super) fn entries(&self) -> impl Iterator<Item = &Entry<Key, Row>> {
         self.stores.iter().flat_map(RangeStore::entries)
+    }
+    /// Every member frozen at the committed prefix, in the layout they lie
+    /// in: an image a checkpoint encodes from while the group goes on.
+    pub(super) fn freeze(&self, budget: &MemoryBudget) -> Result<FrozenRanges, MemoryError> {
+        let count = self.stores.len();
+        let boundaries_charge = reserve::<RangeBoundary>(budget, count, BudgetLane::Ordinary)?;
+        let stores_charge = reserve::<FrozenRange<Key, Row>>(budget, count, BudgetLane::Ordinary)?;
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        members.extend(self.layout.members.iter().copied());
+        let mut stores = Vec::new();
+        stores
+            .try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for store in &self.stores {
+            stores.push(store.freeze()?);
+        }
+        Ok(FrozenRanges {
+            producer: self.producer,
+            epoch: self.layout.epoch,
+            members,
+            stores,
+            _charges: [boundaries_charge, stores_charge],
+        })
     }
     /// Rows at or after `key` in key order, across members.
     pub(super) fn entries_from<'a>(

@@ -622,6 +622,75 @@ struct SnapshotV7Ref<'a> {
     slot_generation: u64,
 }
 
+/// Every V7 section before the native one, in order: the head the native
+/// section joins in [`snapshot_native_finish`].
+#[derive(Serialize)]
+struct SnapshotV7HeadRef<'a> {
+    state: SnapshotV4Ref<'a>,
+    requests: RequestCheckpointRef<'a>,
+    activation: CoreBytes<'a>,
+}
+
+/// A native ledger's envelope taken now, before its native section exists:
+/// the head (magic and every section before the native one) and the request
+/// slot generation that follows it. The native section is encoded elsewhere,
+/// from rows frozen at this same point; [`snapshot_native_finish`] joins
+/// them into exactly the bytes [`snapshot`] writes at once (postcard writes
+/// a struct as its fields in order).
+pub(super) fn snapshot_native_head(
+    session: &Session,
+    core: &[u8],
+) -> Result<(Vec<u8>, u64), LedgerError> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let activation = session
+        .activation_record
+        .as_deref()
+        .ok_or(LedgerError::Corrupt)?;
+    let head = encode_view(
+        SNAPSHOT_V7_MAGIC,
+        &SnapshotV7HeadRef {
+            state: SnapshotV4Ref {
+                state: SnapshotV3Ref {
+                    state: SnapshotV2Ref {
+                        schema: 2,
+                        ledger: Frozen(&session.ledger),
+                        raft_index: session.applied_raft,
+                        core: CoreBytes(core),
+                        cursors: Frozen(session.cursors.checkpoint()),
+                        cursor_meta: Frozen(&session.cursor_meta),
+                        delta_floor: Decoded(session.stream_bounds().floor),
+                        deltas: DeltaTail(&session.deltas),
+                    },
+                    membership: Frozen(&session.membership_state),
+                },
+                placement: Frozen(&session.placement_state),
+            },
+            requests: RequestCheckpointRef {
+                activated: session.request_streams.activated,
+                slots: StreamRows(&session.request_streams),
+            },
+            activation: CoreBytes(activation),
+        },
+        LIMIT.saturating_mul(2),
+    )?;
+    Ok((head, session.request_streams.next_generation()))
+}
+
+/// The envelope a [`snapshot_native_head`] began, its native section joined.
+pub(super) fn snapshot_native_finish(
+    mut head: Vec<u8>,
+    native: &[u8],
+    slot_generation: u64,
+) -> Result<Vec<u8>, LedgerError> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let available = LIMIT.saturating_mul(2).saturating_sub(head.len());
+    let tail = encode_view(&[], &(CoreBytes(native), slot_generation), available)?;
+    head.try_reserve_exact(tail.len())
+        .map_err(|_| LedgerError::Capacity)?;
+    head.extend_from_slice(&tail);
+    Ok(head)
+}
+
 pub(super) fn snapshot(
     session: &Session,
     core: &[u8],

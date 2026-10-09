@@ -194,7 +194,7 @@ impl Session {
             bytes,
             retained,
             native: _,
-            commit: _,
+            deferred: _,
             _scratch,
         } = encoded;
         let (checkpoint, allocation) = retained.ok_or(LedgerError::Corrupt)?;

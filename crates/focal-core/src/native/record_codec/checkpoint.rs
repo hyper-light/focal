@@ -38,8 +38,73 @@ pub struct CheckpointHeader {
 /// checkpoint persistence/retention and accounts any surrounding Session data.
 /// This plan does not acquire any buffer, permit, root handle or snapshot.
 pub struct EncodingPlan<'a> {
-    core: &'a Core<NativeState>,
+    source: Source<'a>,
     quote: EncodingQuote,
+}
+
+/// The rows a plan encodes: a live core's, or a frozen image of them that
+/// another thread holds ([`crate::native::NativeFrozen`]). Both encode alike.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Core(&'a NativeState),
+    Frozen(&'a crate::native::NativeFrozen),
+}
+
+impl<'a> Source<'a> {
+    fn ledger(self) -> LedgerId {
+        match self {
+            Self::Core(state) => state.ledger,
+            Self::Frozen(frozen) => frozen.ledger,
+        }
+    }
+    fn profile(self) -> NativeContentProfile {
+        match self {
+            Self::Core(state) => state.profile,
+            Self::Frozen(frozen) => frozen.profile,
+        }
+    }
+    fn range(self) -> RangeId {
+        match self {
+            Self::Core(state) => state.rows.id(),
+            Self::Frozen(frozen) => frozen.rows.id(),
+        }
+    }
+    fn prefix(self) -> u64 {
+        match self {
+            Self::Core(state) => state.rows.prefix(),
+            Self::Frozen(frozen) => frozen.rows.prefix(),
+        }
+    }
+    fn len(self) -> usize {
+        match self {
+            Self::Core(state) => state.rows.len(),
+            Self::Frozen(frozen) => frozen.rows.len(),
+        }
+    }
+    fn root_frame(self) -> Result<RootFrame<'a>, CodecError> {
+        let (layout, layout_epoch, pages) = match self {
+            Self::Core(state) => (
+                state.rows.layout().members(),
+                state.rows.layout().epoch(),
+                state.rows.stats().pages,
+            ),
+            Self::Frozen(frozen) => (
+                frozen.rows.members(),
+                frozen.rows.epoch(),
+                frozen.rows.pages(),
+            ),
+        };
+        Ok(RootFrame {
+            ledger: self.ledger(),
+            profile: self.profile(),
+            range: self.range(),
+            prefix: self.prefix(),
+            count: self.len(),
+            layout,
+            layout_epoch,
+            seeks: seeks(pages, layout.len())?,
+        })
+    }
 }
 
 /// Preserve an output adapter's original error without boxing, cloning or
@@ -100,17 +165,27 @@ impl<'a> EncodingPlan<'a> {
         core: &'a Core<NativeState>,
         limits: EncodingLimits,
     ) -> Result<Self, CodecError> {
-        if core.state.rows.len() > limits.rows {
+        Self::prepare_from(Source::Core(&core.state), limits)
+    }
+    /// A plan over a frozen image, encodable on the thread that holds it.
+    pub fn prepare_frozen(
+        frozen: &'a crate::native::NativeFrozen,
+        limits: EncodingLimits,
+    ) -> Result<Self, CodecError> {
+        Self::prepare_from(Source::Frozen(frozen), limits)
+    }
+    fn prepare_from(source: Source<'a>, limits: EncodingLimits) -> Result<Self, CodecError> {
+        if source.len() > limits.rows {
             return Err(CodecError::Capacity);
         }
         let mut sink = CountingSink::new(limits.bytes, limits.visits);
-        let hash = frame(&mut sink, core)?;
+        let hash = frame(&mut sink, source)?;
         Ok(Self {
-            core,
+            source,
             quote: EncodingQuote {
                 bytes: sink.len(),
                 visits: sink.visits_used(),
-                rows: core.state.rows.len(),
+                rows: source.len(),
                 hash,
             },
         })
@@ -124,10 +199,10 @@ impl<'a> EncodingPlan<'a> {
     /// checkpoint layers can bind their metadata before writing any bytes.
     pub fn header(&self) -> Result<CheckpointHeader, CodecError> {
         Ok(CheckpointHeader {
-            ledger: self.core.state.ledger,
-            profile: self.core.state.profile,
-            range: self.core.state.rows.id(),
-            prefix: self.core.native_sequence(),
+            ledger: self.source.ledger(),
+            profile: self.source.profile(),
+            range: self.source.range(),
+            prefix: SessionSeq(self.source.prefix()),
             rows: u64::try_from(self.quote.rows).map_err(|_| CodecError::Capacity)?,
             hash: self.quote.hash,
         })
@@ -140,7 +215,7 @@ impl<'a> EncodingPlan<'a> {
             return Err(CodecError::Capacity);
         }
         let mut sink = SliceSink::new(output, self.quote.visits);
-        let hash = frame(&mut sink, self.core)?;
+        let hash = frame(&mut sink, self.source)?;
         if sink.len() != self.quote.bytes
             || sink.visits_used() != self.quote.visits
             || hash != self.quote.hash
@@ -171,7 +246,7 @@ impl<'a> EncodingPlan<'a> {
             output: &mut output,
             error: None,
         };
-        let result = frame(&mut sink, self.core);
+        let result = frame(&mut sink, self.source);
         if let Some(error) = sink.error.take() {
             return Err(WriteError::Output(error));
         }
@@ -381,10 +456,14 @@ const ROW_STEP: usize = 64;
 /// The seeks an in-order walk of `state`'s rows can take: one into each
 /// member, one per page it steps to, and the terminating probe.
 fn store_seeks(state: &NativeState) -> Result<usize, CodecError> {
-    let stats = state.rows.stats();
-    stats
-        .pages
-        .checked_add(state.rows.layout().members().len())
+    seeks(
+        state.rows.stats().pages,
+        state.rows.layout().members().len(),
+    )
+}
+fn seeks(pages: usize, members: usize) -> Result<usize, CodecError> {
+    pages
+        .checked_add(members)
         .and_then(|seeks| seeks.checked_add(1))
         .ok_or(CodecError::Capacity)
 }
@@ -400,22 +479,20 @@ fn iteration_work() -> Result<usize, CodecError> {
         .ok_or(CodecError::Capacity)
 }
 
-fn frame(sink: &mut impl Sink, core: &Core<NativeState>) -> Result<ContentHash, CodecError> {
-    let state = &core.state;
-    frame_entries(
-        sink,
-        RootFrame {
-            ledger: state.ledger,
-            profile: state.profile,
-            range: state.rows.id(),
-            prefix: state.rows.prefix(),
-            count: state.rows.len(),
-            layout: state.rows.layout().members(),
-            layout_epoch: state.rows.layout().epoch(),
-            seeks: store_seeks(state)?,
-        },
-        state.rows.entries().map(|entry| (entry.key, &entry.value)),
-    )
+fn frame(sink: &mut impl Sink, source: Source<'_>) -> Result<ContentHash, CodecError> {
+    let root = source.root_frame()?;
+    match source {
+        Source::Core(state) => frame_entries(
+            sink,
+            root,
+            state.rows.entries().map(|entry| (entry.key, &entry.value)),
+        ),
+        Source::Frozen(frozen) => frame_entries(
+            sink,
+            root,
+            frozen.rows.entries().map(|entry| (entry.key, &entry.value)),
+        ),
+    }
 }
 
 /// The content hash of the Core's rows alone, under a fixed range identity

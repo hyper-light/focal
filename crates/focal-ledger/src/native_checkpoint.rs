@@ -6,8 +6,10 @@
 use focal_consensus::MembershipConfiguration;
 use focal_core::Core;
 use focal_core::native::input_codec as input;
-use focal_core::native::{NativeContentProfile, NativeState, record_codec};
-use focal_evidence::{ContentError, SEED_CHUNK_BYTES, SeedCommit, SeedReader, SeedStore};
+use focal_core::native::{NativeContentProfile, NativeFrozen, NativeState, record_codec};
+use focal_evidence::{
+    ContentError, SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader, SeedStore,
+};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, RangeId};
 use focal_model::{ContentHash, LedgerId, SessionSeq};
 use record_codec::checkpoint as root;
@@ -60,13 +62,18 @@ pub enum Error {
 
 /// Which of the encoder's bounds the root `core` is past, measured again with none: on the failure
 /// path only, a walk of the root its memory budget already bounds.
-fn exceeded(core: &Core<NativeState>, limits: record_codec::EncodingLimits) -> Error {
+fn exceeded<'a>(
+    measure: impl Fn(
+        record_codec::EncodingLimits,
+    ) -> Result<root::EncodingPlan<'a>, record_codec::CodecError>,
+    limits: record_codec::EncodingLimits,
+) -> Error {
     let unbounded = record_codec::EncodingLimits {
         bytes: usize::MAX,
         visits: usize::MAX,
         rows: usize::MAX,
     };
-    let quote = match root::EncodingPlan::prepare(core, unbounded) {
+    let quote = match measure(unbounded) {
         Ok(plan) => plan.quote(),
         Err(error) => return Error::Core(error),
     };
@@ -340,6 +347,44 @@ impl<'a> EncodingPlan<'a> {
         retention: Option<RetentionSection>,
         limits: Limits,
     ) -> Result<Self, Error> {
+        Self::prepare_root(
+            |encoding| root::EncodingPlan::prepare(core, encoding),
+            metadata,
+            configuration,
+            movement,
+            retention,
+            limits,
+        )
+    }
+    /// As [`Self::prepare_with_sections`], over a frozen image of the core's
+    /// rows: a plan the thread holding the image encodes.
+    pub fn prepare_frozen_with_sections(
+        frozen: &'a NativeFrozen,
+        metadata: Metadata,
+        configuration: &'a MembershipConfiguration,
+        movement: Option<&'a [u8]>,
+        retention: Option<RetentionSection>,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        Self::prepare_root(
+            |encoding| root::EncodingPlan::prepare_frozen(frozen, encoding),
+            metadata,
+            configuration,
+            movement,
+            retention,
+            limits,
+        )
+    }
+    fn prepare_root(
+        measure: impl Fn(
+            record_codec::EncodingLimits,
+        ) -> Result<root::EncodingPlan<'a>, record_codec::CodecError>,
+        metadata: Metadata,
+        configuration: &'a MembershipConfiguration,
+        movement: Option<&'a [u8]>,
+        retention: Option<RetentionSection>,
+        limits: Limits,
+    ) -> Result<Self, Error> {
         if movement.is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes) {
             return Err(Error::Invalid("movement section"));
         }
@@ -348,10 +393,9 @@ impl<'a> EncodingPlan<'a> {
             visits: limits.visits,
             rows: limits.rows,
         };
-        let root = core;
-        let core = match root::EncodingPlan::prepare(root, encoding) {
+        let core = match measure(encoding) {
             Ok(plan) => plan,
-            Err(record_codec::CodecError::Capacity) => return Err(exceeded(root, encoding)),
+            Err(record_codec::CodecError::Capacity) => return Err(exceeded(measure, encoding)),
             Err(error) => return Err(error.into()),
         };
         let available = limits
@@ -505,8 +549,25 @@ impl<'a> EncodingPlan<'a> {
         budget: &MemoryBudget,
         seeds: &mut SeedStore,
     ) -> Result<(EncodedCheckpoint, Option<SeedCommit>), Error> {
-        let Form::Seeded { chunks } = self.form else {
+        if !self.seeded() {
             return self.encode_in(budget).map(|encoded| (encoded, None));
+        }
+        let result = self.encode_in_batch(budget, seeds.batch()?);
+        if let Err(Error::Seeds(ContentError::Io(_))) = &result {
+            seeds.fail();
+        }
+        result.map(|(encoded, commit)| (encoded, Some(commit)))
+    }
+    /// The seeded encoding into `batch`, which may be filled on whichever
+    /// thread holds this plan; a batch's IO failure fails its store, which
+    /// its receiver applies. An inline root is refused: it needs no batch.
+    pub fn encode_in_batch(
+        &self,
+        budget: &MemoryBudget,
+        mut batch: SeedBatch,
+    ) -> Result<(EncodedCheckpoint, SeedCommit), Error> {
+        let Form::Seeded { chunks } = self.form else {
+            return Err(Error::Invalid("inline root has no seeds"));
         };
         let core_bytes = self.core.quote().bytes;
         let table_bytes = fields::add(fields::mul(chunks, size_of::<SeedChunk>())?, ALLOCATION)?;
@@ -528,7 +589,6 @@ impl<'a> EncodingPlan<'a> {
         // once the root is whole, by the batch's commit: overlapping file syncs
         // and one directory sync, not a sync and two directory syncs each in
         // turn on the owner's thread.
-        let mut batch = seeds.batch()?;
         let mut seal = |buffer: &mut Vec<u8>, table: &mut Vec<SeedChunk>| -> Result<(), Error> {
             if buffer.is_empty() {
                 return Ok(());
@@ -609,7 +669,7 @@ impl<'a> EncodingPlan<'a> {
         if length != self.quote.bytes || bytes.len() != self.quote.bytes {
             return Err(Error::Invalid("encoded length"));
         }
-        Ok((EncodedCheckpoint { bytes, allocation }, Some(commit)))
+        Ok((EncodedCheckpoint { bytes, allocation }, commit))
     }
     pub fn encode_in(&self, budget: &MemoryBudget) -> Result<EncodedCheckpoint, Error> {
         if self.seeded() {

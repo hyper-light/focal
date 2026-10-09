@@ -55,7 +55,7 @@ pub use disk::{
 pub use index::StableIndex;
 pub use owner::OwnerId;
 pub use range::{
-    Change, Entry, PreparedRange, RangeConfig, RangeHydration, RangeHydrationLimits,
+    Change, Entry, FrozenRange, PreparedRange, RangeConfig, RangeHydration, RangeHydrationLimits,
     RangeHydrationLookup, RangeHydrationSource, RangeHydrationView, RangeId,
     RangePreparationCharges, RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope,
     RangeWriteLimits,
