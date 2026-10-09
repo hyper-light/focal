@@ -523,11 +523,28 @@ pub(super) async fn promise_of(fleet: &Fleet, asker: usize, member: u64) {
         if index as u64 + 1 == member {
             continue;
         }
-        replica
-            .host
-            .record_managed_support(member, fact.clone())
-            .await
-            .unwrap();
+        // A replica that has not applied the configuration the promise was
+        // made at answers that it is not ready: asked again, the wait charged
+        // to the replicas' periods.
+        let mut wait = fleet.wait(Duration::from_secs(10));
+        loop {
+            match replica
+                .host
+                .record_managed_support(member, fact.clone())
+                .await
+            {
+                Ok(_) => break,
+                Err(focal_ledger::LedgerError::NotReady { .. }) => {
+                    if let Err(spent) = wait.check(fleet) {
+                        panic!(
+                            "replica {index} never applied the promise's configuration: {spent}"
+                        );
+                    }
+                    tokio::time::sleep(TICK).await;
+                }
+                Err(error) => panic!("recording {member}'s promise on replica {index}: {error:?}"),
+            }
+        }
     }
 }
 

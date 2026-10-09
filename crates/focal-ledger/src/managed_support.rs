@@ -218,6 +218,18 @@ impl Session {
             && fact.learners_next.is_empty()
             && !fact.auto_leave;
         let native = fact.format_hash == ContentHash(native_format_hash());
+        // A promise made at a configuration this replica has not applied yet
+        // is not refused: the replica is behind, not the promise wrong. It is
+        // asked again once the replica has applied it.
+        if !prospective
+            && authenticated_peer_node != 0
+            && authenticated_peer_node == fact.node
+            && fact.configuration_index > expected.configuration_index
+        {
+            return Err(LedgerError::NotReady {
+                leader: self.status().leader_id,
+            });
+        }
         if authenticated_peer_node == 0
             || authenticated_peer_node != fact.node
             || fact.cluster != expected.cluster

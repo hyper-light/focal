@@ -466,6 +466,14 @@ fn managed_all_voter_support_and_partitioned_seal_survive_leader_change_and_rest
     let mut wrong = facts[1].clone();
     wrong.cluster = [8; 16];
     assert!(sessions[0].record_managed_support(2, wrong).is_err());
+    // A promise made at a configuration this replica has not applied yet is
+    // not refused: the replica is behind, and is asked again.
+    let mut later = facts[1].clone();
+    later.configuration_index += 1;
+    assert!(matches!(
+        sessions[0].record_managed_support(2, later),
+        Err(LedgerError::NotReady { .. })
+    ));
     assert!(
         sessions[0]
             .record_managed_support(3, facts[1].clone())
