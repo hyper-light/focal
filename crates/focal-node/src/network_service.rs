@@ -140,15 +140,19 @@ pub struct ServiceStopped {
 /// every hand-off a silence its survivors waited out.
 async fn stop_owners(handles: &NetworkHandles) -> StoppedOwners {
     let fleet = handles.fleet.stop_all().await.map_err(ServiceError::from);
-    let directory = match handles.directory.host() {
+    // The founder hosts the first partition in its own slot; a member hosts
+    // it, when seated, as a replica like any other, and it stops below.
+    let founder_slot = handles.directory.host();
+    let directory = match &founder_slot {
         Some(host) => host.stop().await.map_err(ServiceError::from),
         None => Ok(()),
     };
-    // Every partition a split added on this node stops with the first.
+    // Every partition this node hosts stops, but the founder's slot it
+    // stopped above.
     let mut hosted = Ok(());
     let first = handles.directory.plan().partition();
     for partition in handles.directory.hosted() {
-        if partition.plan.partition() != first
+        if (partition.plan.partition() != first || founder_slot.is_none())
             && let Err(error) = partition.host.stop().await
         {
             hosted = Err(ServiceError::from(error));

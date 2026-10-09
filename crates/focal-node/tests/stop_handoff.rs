@@ -195,3 +195,83 @@ fn stop_the_leader() -> bool {
     }
     true
 }
+
+/// A joined member told to stop stops every owner it runs, the directory
+/// partition it was seated in among them: it says it stopped and exits
+/// cleanly. (2026-10-08: the stop skipped the first partition on a member,
+/// which hosts it as a seated replica rather than as the founder's slot, and
+/// every member waited out the 30-second shutdown deadline and exited with
+/// its timeout.)
+#[test]
+fn a_joined_member_told_to_stop_stops_its_directory_replica_and_exits_cleanly() {
+    let founder = Node::new("founder");
+    let hosts = [Node::new("host-a"), Node::new("host-b")];
+    let addresses: Vec<String> = (0..3).map(|_| address()).collect();
+    activate_native(&founder);
+    let _founder_server = start(&founder, &["--advertise", &addresses[0]]);
+    let (founder_node, tenant, ledger) = identity(&founder);
+    let (server_a, node_a) = join_start(&founder, &hosts[0], "host-a", &addresses[1]);
+    let (_server_b, node_b) = join_start(&founder, &hosts[1], "host-b", &addresses[2]);
+    let all = [founder_node, node_a, node_b];
+    wait_for(&founder, "three hosts", Duration::from_secs(120), |view| {
+        settled(view, &ledger, &all, 0)
+    });
+    // A deployment seats the root and the directory partition on the
+    // members before the session (F24): host-a then runs a directory replica.
+    let _ = tenant;
+    let intent = founder.root().join("node-1.yaml");
+    std::fs::write(
+        &intent,
+        "version: 1\ndurability:\n  survive: node\n  max_failures: 1\n",
+    )
+    .unwrap();
+    let plan_file = founder.root().join("node-1.plan");
+    admin(
+        &founder,
+        &[
+            "plan",
+            "deployment",
+            "--config",
+            intent.to_str().unwrap(),
+            "--output",
+            plan_file.to_str().unwrap(),
+        ],
+    );
+    let applied = admin(
+        &founder,
+        &[
+            "apply",
+            "deployment",
+            "--plan-file",
+            plan_file.to_str().unwrap(),
+            "--wait",
+            "300",
+        ],
+    );
+    assert_eq!(applied["result"]["outcome"], "Complete", "{applied}");
+    wait_for(
+        &founder,
+        "node survival",
+        Duration::from_secs(180),
+        |view| settled(view, &ledger, &all, 1),
+    );
+    let mut server_a = server_a;
+    let signalled = Instant::now();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &server_a.pid().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let stopped = server_a
+        .1
+        .as_ref()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the stopped member printed no Stopped line");
+    assert_eq!(stopped["condition"], "Stopped", "{stopped}");
+    let status = server_a.0.wait().unwrap();
+    eprintln!("member stop took {:?}", signalled.elapsed());
+    assert!(status.success(), "the stopped member exited {status}");
+}
