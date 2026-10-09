@@ -14,16 +14,21 @@ x-limits: &limits
   cap_add: [NET_ADMIN]
   networks: [bench]
 
+# The competitors' images, pinned by digest. NATS and Redis are Docker's
+# official images, pulled from their ECR Public mirror (byte-identical: the
+# same digests as Docker Hub's), since Docker Hub's anonymous pull limit,
+# shared by the runners, refused them mid-comparison; Kafka's is not mirrored
+# there.
 x-nats: &nats
   <<: *limits
-  image: nats:2.12-alpine
+  image: public.ecr.aws/docker/library/nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
   profiles: [nats]
   command: ["-c", "/etc/nats/nats.conf"]
   volumes: ["./nats.conf:/etc/nats/nats.conf:ro"]
 
 x-kafka: &kafka
   <<: *limits
-  image: apache/kafka:4.1.0
+  image: apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
   profiles: [kafka]
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: broker,controller
@@ -40,7 +45,7 @@ x-kafka: &kafka
 
 x-redis: &redis
   <<: *limits
-  image: redis:8.2-alpine
+  image: public.ecr.aws/docker/library/redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
   profiles: [redis]
 
 x-focal: &focal

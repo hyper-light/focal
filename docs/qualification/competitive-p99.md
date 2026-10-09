@@ -150,6 +150,44 @@ p50 42 ms, p99 114 ms. At 1,000/s offered, 10 paced callers achieved 124/s. The 
 on the runners was 2.4–5 ms. A floor of tens of milliseconds at low load is a cost in the
 request's path, not the disk's or the network's, and it is the first thing to find and remove.
 
+## Linux runners after the harness and admission fixes (2026-10-09)
+
+Run 37996273200, one run per system, same runners and limits as above. Before it, focal's arm was
+not measured on equal terms, and focal itself failed under many callers of one principal:
+
+- **The generator.** focal's arm offered its rate from one caller per hundred writes a second
+  (ten at 1,000/s), each with one request out, where the other systems' generator keeps up to
+  4,096 out: a write slower than ten milliseconds left the rate unoffered and its backlog was
+  counted as seconds of latency. `focal-load` now sends a caller's writes open loop (up to
+  `inflight` out, each at its place on the schedule, latency counted from that place), spreads the
+  callers' schedules over the interval instead of sending every caller's write at one instant,
+  and lets callers share clients. The arm runs sixteen callers on sixteen connections, up to 64
+  writes each.
+- **The listener.** A participant could hold sixteen connections; past them the listener closed
+  the one it had used least, whether or not a request was under way on it. Sixty-four callers of
+  one principal had the leader replace 27,765 connections in 30 s; a third of their writes ended
+  unknown, and the leader, busy with handshakes, answered its followers late. A connection with a
+  request under way is never replaced now, a participant's bound is its fair share of the
+  listener (max-min), and a client forgets a connection only when the connection failed.
+- **The images.** Docker Hub's anonymous pull limit, shared by the runners, refused NATS's and
+  Redis's images mid-run; they are pulled by digest from the official images' ECR Public mirror.
+
+p50 / p99 / p99.9 in milliseconds, every write durable at a quorum:
+
+| offered | focal | Kafka | NATS JetStream | Redis |
+|---|---|---|---|---|
+| 100/s | 3.7 / 7.6 / 27.8 | 7.5 / 16.1 / 51.5 | 1.7 / 44.1 / 105.8 | 51.2 / 645.9 / 950.0 |
+| 200/s | 3.4 / 35.0 / 88.6 | 7.6 / 14.1 / 34.5 | 1.9 / 30.4 / 51.2 | 17.8 / 373.8 / 485.0 |
+| 1,000/s | 50.1 / 282.8 / 504.7, 45% refused | 5.3 / 11.4 / 30.1 | 2.2 / 3.2 / 60.1 | 13.3 / 324.3 / 567.8 |
+
+One run is not a result (the spread between runs is as wide as the gaps between systems). What
+it shows: at 100/s focal's p99 and p99.9 are the lowest of the four; from 200/s Kafka and NATS
+are ahead, and at 1,000/s focal is bound by throughput. Its refusals there are the native owner's
+bound of 32 candidates prepared and not yet committed: by Little's law 32 candidates over a commit
+cycle of about 50 ms is about 640 writes a second, and focal achieved 545. The bound is a fixed
+count beside an exact memory charge, and each prepare re-validates the whole pending chain; both
+are next.
+
 **A session's open claims are bounded** (about 11,800 authored claims before admission refuses,
 `native owner memory`). The competitors append to a log without state. focal's write is a
 claim's state transition, which stays open until it is closed, so a long run at a high rate
