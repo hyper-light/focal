@@ -628,16 +628,13 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::os::unix::fs::chown(root, Some(uid), Some(gid))?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+        File::open(root)?.sync_all()?;
+        print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
     }
     #[cfg(not(unix))]
     {
-        let _ = (uid, gid);
-        return Err("prepare volume needs a Unix filesystem".into());
-    }
-    #[cfg(unix)]
-    {
-        File::open(root)?.sync_all()?;
-        print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
+        let _ = (uid, gid, owner);
+        Err("prepare volume needs a Unix filesystem".into())
     }
 }
 async fn start_network(settings: Settings, show: Option<cli::startup::Show>) -> Result<()> {

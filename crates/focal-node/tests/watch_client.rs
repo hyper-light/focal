@@ -1,3 +1,5 @@
+// Its fixture keeps a private data directory by Unix file modes.
+#![cfg(unix)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,

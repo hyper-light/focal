@@ -20,8 +20,10 @@ use focal_wire::{
 };
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     net::SocketAddr,
     path::Path,

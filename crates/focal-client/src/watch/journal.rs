@@ -1126,7 +1126,9 @@ fn native_family(object: &NativeObject) -> Option<ObjectKind> {
     })
 }
 
-#[cfg(test)]
+// Every test here checks Unix file modes; Windows ownership is
+// focal-platform's (DACLs and SIDs).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

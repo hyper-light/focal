@@ -255,6 +255,7 @@ fn staging_crash_boundaries_reopen_only_the_durable_prefix_and_never_regenerate_
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn prefix_bitrot_missing_state_and_external_links_fail_closed() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -306,6 +307,7 @@ fn prefix_bitrot_missing_state_and_external_links_fail_closed() {
         Err(TransferError::Permissions)
     ));
 }
+#[cfg(unix)]
 fn begin_result(path: &Path, bytes: &[u8]) -> Result<UploadJournal, TransferError> {
     UploadJournal::begin(
         path,
@@ -593,6 +595,7 @@ async fn client_retrieves_all_verified_chunks_and_caps_aggregate_before_network(
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn immutable_attachment_binding_and_external_bootstrap_survive_restart_and_reject_loss() {
     use std::os::unix::fs::PermissionsExt;

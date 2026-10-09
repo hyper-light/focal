@@ -509,6 +509,7 @@ fn cursor_and_domain_share_the_ack_manifest_without_acknowledging_delta_consumpt
     assert_eq!(store.request(cursor).unwrap().request, prepared.request);
 }
 
+#[cfg(unix)]
 #[test]
 fn private_files_reject_symlinks_and_preserve_legacy_layout_separation() {
     use std::os::unix::fs::{PermissionsExt, symlink};
