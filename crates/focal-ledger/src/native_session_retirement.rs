@@ -56,7 +56,7 @@ impl RetirementRecord {
         let limit = self
             .outcome_limit
             .filter(|limit| self.expected_prefix.0 < *limit)
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let mut offset = 0usize;
         put(output, &mut offset, &MAGIC);
         put(output, &mut offset, &VERSION.to_le_bytes());
@@ -93,43 +93,43 @@ impl RetirementRecord {
             .get(8..10)
             .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
             .map(u16::from_le_bytes)
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let (length, domain) = match version {
             1 => (BYTES_V1, HASH_DOMAIN_V1),
             VERSION => (BYTES, HASH_DOMAIN),
-            _ => return Err(NativeSessionError::Corrupt),
+            _ => return Err(crate::native_session::diag_corrupt(file!(), line!())),
         };
         if bytes.len() != length {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let (payload, trailer) = bytes
             .split_at_checked(length.saturating_sub(DIGEST))
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         if digest(domain, payload) != trailer {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let mut offset = 0usize;
         let mut take = |length: usize| -> Result<&[u8], NativeSessionError> {
             let end = offset
                 .checked_add(length)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             let value = payload
                 .get(offset..end)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             offset = end;
             Ok(value)
         };
         let fixed16 = |bytes: &[u8]| -> Result<[u8; 16], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let fixed32 = |bytes: &[u8]| -> Result<[u8; 32], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let fixed8 = |bytes: &[u8]| -> Result<[u8; 8], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         if take(8)? != MAGIC || take(2)? != version.to_le_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let ledger = LedgerId {
             tenant: focal_model::TenantId(fixed16(take(16)?)?),
@@ -156,7 +156,7 @@ impl RetirementRecord {
             // the prefix, fits the bound it carries.
             || outcome_limit.is_some_and(|limit| expected_prefix.0 >= limit)
         {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         Ok(Self {
             ledger,
@@ -233,7 +233,7 @@ mod tests {
             assert!(
                 matches!(
                     unfit.write_into(&mut bytes),
-                    Err(NativeSessionError::Corrupt)
+                    Err(crate::native_session::diag_corrupt(file!(), line!()))
                 ),
                 "{limit:?}"
             );
@@ -253,7 +253,7 @@ mod tests {
         forged[BYTES - DIGEST..].copy_from_slice(&trailer);
         assert!(matches!(
             RetirementRecord::decode(&forged),
-            Err(NativeSessionError::Corrupt)
+            Err(crate::native_session::diag_corrupt(file!(), line!()))
         ));
     }
     /// A version-1 record, as the logs written before the bound still carry

@@ -61,33 +61,33 @@ impl Genesis {
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, NativeSessionError> {
         if bytes.len() != BYTES {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let (payload, trailer) = bytes
             .split_at_checked(BYTES.saturating_sub(32))
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         if digest(payload) != trailer {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let mut offset = 0usize;
         let mut take = |length: usize| -> Result<&[u8], NativeSessionError> {
             let end = offset
                 .checked_add(length)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             let value = payload
                 .get(offset..end)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             offset = end;
             Ok(value)
         };
         let fixed16 = |bytes: &[u8]| -> Result<[u8; 16], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let fixed32 = |bytes: &[u8]| -> Result<[u8; 32], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         if take(8)? != MAGIC || take(2)? != VERSION.to_le_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let cluster = fixed16(take(16)?)?;
         let group = fixed16(take(16)?)?;
@@ -98,7 +98,7 @@ impl Genesis {
         let profile = match take(1)? {
             [0] => NativeContentProfile::ProjectionOnly,
             [1] => NativeContentProfile::AuthoredV1,
-            _ => return Err(NativeSessionError::Corrupt),
+            _ => return Err(crate::native_session::diag_corrupt(file!(), line!())),
         };
         let decoder = ContentHash(fixed32(take(32)?)?);
         let genesis = ContentHash(fixed32(take(32)?)?);
@@ -111,7 +111,7 @@ impl Genesis {
             genesis,
         };
         if value != Self::derive(cluster, group, ledger, profile, decoder) {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         Ok(value)
     }

@@ -70,10 +70,10 @@ fn incarnation(
     let digest = hasher.finalize();
     let bytes: [u8; 16] = digest.as_bytes()[..16]
         .try_into()
-        .map_err(|_| NativeSessionError::Corrupt)?;
+        .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
     let value = u128::from_le_bytes(bytes);
     if value == 0 {
-        return Err(NativeSessionError::Corrupt);
+        return Err(crate::native_session::diag_corrupt(file!(), line!()));
     }
     Ok(RangeId(value))
 }
@@ -101,7 +101,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             decoder,
         );
         if self.genesis.is_some_and(|applied| applied != derived) {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         Ok(Activation {
             decoder,
@@ -300,7 +300,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                         ));
                     }
                     Err(enclosing::SeedError::Invalid(_)) => {
-                        return Err(NativeSessionError::Corrupt);
+                        return Err(crate::native_session::diag_corrupt(file!(), line!()));
                     }
                 }
             }
@@ -326,7 +326,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             || meta.applied_term != term
             || meta.applied_raft < self.applied_raft
         {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         checkpoint.configuration_matches(configuration)?;
         let range = incarnation(
@@ -352,7 +352,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         };
         let restored = restored?;
         if restored.native_sequence() != header.prefix {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         // The movement coordinator resumes from the checkpoint's section, or
         // starts fresh from the restored layout when the checkpoint carried

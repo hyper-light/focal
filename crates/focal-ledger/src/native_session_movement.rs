@@ -42,7 +42,7 @@ pub struct MovementRecord {
 impl MovementRecord {
     pub fn encode(&self) -> Result<Vec<u8>, NativeSessionError> {
         let body =
-            postcard::to_allocvec(&self.operation).map_err(|_| NativeSessionError::Corrupt)?;
+            postcard::to_allocvec(&self.operation).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         let length = u32::try_from(body.len())
             .map_err(|_| NativeSessionError::Capacity("movement record"))?;
         let total = add(add(HEAD, body.len())?, 32)?;
@@ -65,29 +65,29 @@ impl MovementRecord {
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, NativeSessionError> {
         if bytes.len() > MAX_RECORD_BYTES || bytes.len() < add(HEAD, 32)? {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let (payload, digest) = bytes
             .split_at_checked(bytes.len().saturating_sub(32))
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let expected = blake3::Hasher::new_derive_key(HASH_DOMAIN)
             .update(payload)
             .finalize();
         if digest != expected.as_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let take = |from: usize, len: usize| -> Result<&[u8], NativeSessionError> {
             payload
                 .get(from..add(from, len)?)
-                .ok_or(NativeSessionError::Corrupt)
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let fixed = |from: usize| -> Result<[u8; 16], NativeSessionError> {
             take(from, 16)?
                 .try_into()
-                .map_err(|_| NativeSessionError::Corrupt)
+                .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         if take(0, 8)? != MAGIC || take(8, 2)? != VERSION.to_le_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let ledger = LedgerId {
             tenant: focal_model::TenantId(fixed(10)?),
@@ -96,24 +96,24 @@ impl MovementRecord {
         let ordinal = u64::from_le_bytes(
             take(42, 8)?
                 .try_into()
-                .map_err(|_| NativeSessionError::Corrupt)?,
+                .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?,
         );
         let length = u32::from_le_bytes(
             take(50, 4)?
                 .try_into()
-                .map_err(|_| NativeSessionError::Corrupt)?,
+                .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?,
         );
         let body = take(
             HEAD,
-            usize::try_from(length).map_err(|_| NativeSessionError::Corrupt)?,
+            usize::try_from(length).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?,
         )?;
         if add(HEAD, body.len())? != payload.len() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let (operation, rest): (RangeOperation, _) =
-            postcard::take_from_bytes(body).map_err(|_| NativeSessionError::Corrupt)?;
+            postcard::take_from_bytes(body).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         if !rest.is_empty() || ledger.tenant.is_zero() || ledger.session.is_zero() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         Ok(Self {
             ledger,
@@ -131,7 +131,7 @@ fn attest<T: Serialize>(
     genesis: &ContentHash,
     value: &T,
 ) -> Result<ContentHash, NativeSessionError> {
-    let bytes = postcard::to_allocvec(value).map_err(|_| NativeSessionError::Corrupt)?;
+    let bytes = postcard::to_allocvec(value).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
     let mut hasher = blake3::Hasher::new_derive_key(domain);
     hasher.update(&genesis.0);
     hasher.update(&bytes);
@@ -320,13 +320,13 @@ impl Movement {
             return Err(NativeSessionError::Capacity("movement checkpoint"));
         }
         let (state, rest): (RangeCheckpoint, _) =
-            postcard::take_from_bytes(bytes).map_err(|_| NativeSessionError::Corrupt)?;
+            postcard::take_from_bytes(bytes).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         if !rest.is_empty() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let coordinator =
             RangeCoordinator::restore(state, Self::incarnation(&genesis), limits, budget)
-                .map_err(|_| NativeSessionError::Corrupt)?;
+                .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         Ok(Self {
             coordinator,
             verifier: LedgerRangeVerifier::new(genesis),
@@ -339,7 +339,7 @@ impl Movement {
     /// The coordinator state as the checkpoint carries it.
     pub(crate) fn checkpoint_bytes(&self) -> Result<Vec<u8>, NativeSessionError> {
         let state = self.coordinator.checkpoint();
-        let bytes = postcard::to_allocvec(state).map_err(|_| NativeSessionError::Corrupt)?;
+        let bytes = postcard::to_allocvec(state).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         if bytes.len() > self.limits.max_checkpoint_bytes {
             return Err(NativeSessionError::Capacity("movement checkpoint"));
         }
@@ -370,7 +370,7 @@ impl Movement {
             .map()
             .route(key)
             .cloned()
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let left = RangeDescriptor {
             id: parent.id,
             generation: parent
@@ -403,15 +403,15 @@ impl Movement {
         let position = ranges
             .iter()
             .position(|range| range.id == left)
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let left_range = ranges
             .get(position)
             .cloned()
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let right_range = ranges
             .get(position.saturating_add(1))
             .cloned()
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let joined = RangeDescriptor {
             id: left_range.id,
             generation: left_range
@@ -477,7 +477,7 @@ impl Movement {
                 Ok(false)
             }
             Err(RangeError::Memory(error)) => Err(NativeSessionError::Memory(error)),
-            Err(_) => Err(NativeSessionError::Corrupt),
+            Err(_) => Err(crate::native_session::diag_corrupt(file!(), line!())),
         }
     }
     fn note_applied(&mut self, ordinal: u64, hash: Option<ContentHash>) {

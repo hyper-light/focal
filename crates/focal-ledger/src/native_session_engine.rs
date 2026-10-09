@@ -607,7 +607,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let sequence = self.sequence()?;
         let pinned = self.committed_core()?.native_stats().pinned_snapshots;
         let ledger = self.ledger;
-        let movement = self.movement.as_mut().ok_or(NativeSessionError::Corrupt)?;
+        let movement = self.movement.as_mut().ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         if movement.in_flight.is_some() {
             return Err(NativeSessionError::RangeMoving);
         }
@@ -646,7 +646,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok(self
             .movement
             .as_ref()
-            .ok_or(NativeSessionError::Corrupt)?
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             .coordinator
             .map())
     }
@@ -657,7 +657,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok(self
             .movement
             .as_ref()
-            .ok_or(NativeSessionError::Corrupt)?
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             .pending())
     }
     pub(crate) fn movement_checkpoint(
@@ -667,7 +667,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok(self
             .movement
             .as_ref()
-            .ok_or(NativeSessionError::Corrupt)?
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             .coordinator
             .checkpoint())
     }
@@ -688,7 +688,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok(self
             .movement
             .as_ref()
-            .ok_or(NativeSessionError::Corrupt)?
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             .verifier)
     }
     /// The `Activate` step of the pending transfer over the proofs the
@@ -701,7 +701,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok(self
             .movement
             .as_ref()
-            .ok_or(NativeSessionError::Corrupt)?
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             .coordinator
             .activation_operation(unchanged)?)
     }

@@ -174,7 +174,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// already be resolved; this is reconstruction, not disposition.
     fn passive_for_replay(&mut self) -> Result<(), NativeSessionError> {
         if !self.pending.is_empty() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         self.resolve_suffix(SuffixEvidence::ConflictingCommittedPrefix)
     }
@@ -188,7 +188,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             // The readiness barrier of this term lies at or beyond the applied
             // current-term entry; older-term candidates can no longer commit.
             if self.applied_raft == 0 || consensus.published_term(self.applied_raft)? != term {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             self.resolve_suffix(SuffixEvidence::NewerTermBarrier)?;
         }
@@ -247,7 +247,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             || membership.index > applied_index
             || membership.index <= self.applied_raft
         {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         self.configuration_index = membership.index;
         self.applied_raft = membership.index;
@@ -268,12 +268,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             crate::native_checkpoint::format_hash(),
         );
         if record != expected {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         match self.genesis {
             // A duplicate identical genesis from a concurrent leader is inert.
             Some(existing) if existing == record.genesis => Ok(()),
-            Some(_) => Err(NativeSessionError::Corrupt),
+            Some(_) => Err(crate::native_session::diag_corrupt(file!(), line!())),
             None => {
                 self.genesis = Some(record.genesis);
                 // A hosted engine already carries its activation record's
@@ -316,7 +316,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     fn apply_layout(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
         let record = range::LayoutRecord::decode(data)?;
         if record.ledger != self.ledger {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         if self.layout_change == Some(record) {
             self.layout_change = None;
@@ -352,7 +352,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             },
             None => return Err(NativeSessionError::Failed),
         };
-        applied.map_err(|_| NativeSessionError::Corrupt)?;
+        applied.map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         if let Some(movement) = self.movement.as_mut() {
             match record.operation {
                 range::LayoutOperation::Split { at, id } => movement.split(at, id)?,
@@ -380,7 +380,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     fn apply_retirement(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
         let record = retirement::RetirementRecord::decode(data)?;
         if record.ledger != self.ledger {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         if self.retirement == Some(record) {
             self.retirement = None;
@@ -433,7 +433,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
                 return Err(error.into());
             }
-            Err(_) => return Err(NativeSessionError::Corrupt),
+            Err(_) => return Err(crate::native_session::diag_corrupt(file!(), line!())),
         }
         self.retired_families = self.retired_families.saturating_add(1);
         Ok(())
@@ -453,7 +453,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     fn apply_seal(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
         let record = seal::SealRecord::decode(data)?;
         if record.ledger != self.ledger {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         if self.seal.as_ref() == Some(&record) {
             self.seal = None;
@@ -491,7 +491,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     local,
                 });
             }
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let applied = core.apply_seal(focal_core::native::seal::SealRecord {
             floors: &record.floors,
@@ -506,7 +506,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
                 return Err(error.into());
             }
-            Err(_) => return Err(NativeSessionError::Corrupt),
+            Err(_) => return Err(crate::native_session::diag_corrupt(file!(), line!())),
         }
         self.seals_applied = self.seals_applied.saturating_add(1);
         Ok(())
@@ -522,10 +522,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     ) -> Result<(), NativeSessionError> {
         let record = movement::MovementRecord::decode(data)?;
         if record.ledger != self.ledger {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let sequence = self.sequence()?;
-        let movement = self.movement.as_mut().ok_or(NativeSessionError::Corrupt)?;
+        let movement = self.movement.as_mut().ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         if movement.apply(&record, sequence, index, term)? {
             self.adopt_map_identities()?;
         }
@@ -551,10 +551,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 None => return Err(NativeSessionError::Failed),
             };
             if current.len() != count {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             let (Some(wanted), Some(held)) = (wanted, current.ids().nth(position)) else {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             };
             if wanted == held {
                 continue;
@@ -633,7 +633,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         configuration_index: u64,
     ) -> Result<(), NativeSessionError> {
         if core.native_sequence() != SessionSeq(1) || !self.pending.is_empty() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         self.reconstruction_needed = true;
         self.domain = Some(Domain::Passive(core));
@@ -653,7 +653,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         output: &mut NativeOutput,
     ) -> Result<(), NativeSessionError> {
         if entry.index <= self.applied_raft || entry.index > applied_index {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         if entry.data.starts_with(&genesis::MAGIC) {
             self.apply_genesis(&entry.data, entry.index, consensus)?;
@@ -662,7 +662,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if entry.data.starts_with(&range::MAGIC) {
             if self.genesis.is_none() {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             self.apply_layout(&entry.data)?;
             self.applied_raft = entry.index;
@@ -670,7 +670,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if entry.data.starts_with(&movement::MAGIC) {
             if self.genesis.is_none() {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             self.apply_movement(&entry.data, entry.index, entry.term)?;
             self.applied_raft = entry.index;
@@ -678,7 +678,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if entry.data.starts_with(&retirement::MAGIC) {
             if self.genesis.is_none() {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             self.apply_retirement(&entry.data)?;
             self.applied_raft = entry.index;
@@ -686,7 +686,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if entry.data.starts_with(&seal::MAGIC) {
             if self.genesis.is_none() {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             self.apply_seal(&entry.data)?;
             self.applied_raft = entry.index;
@@ -696,7 +696,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Legacy);
         }
         if self.genesis.is_none() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
         let header = record.header();
@@ -709,7 +709,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             || (entry.term == self.recording_term && self.recording_range != Some(header.range))
             || (self.recording_range.is_none() && header.base != self.records_floor)
         {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let matches = self.pending.front().is_some_and(|pending| {
             pending.submitted
@@ -721,10 +721,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             let candidate = self
                 .pending
                 .front()
-                .ok_or(NativeSessionError::Corrupt)?
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
                 .candidate;
             let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             };
             let outcome = owner.publish_after_durable(candidate)?;
             self.pending.pop_front();
@@ -743,7 +743,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             // Within a recording term the producer range is bound; a new term
             // may introduce a new producer only through this committed entry.
             let expected_range = if entry.term == self.recording_term {
-                self.recording_range.ok_or(NativeSessionError::Corrupt)?
+                self.recording_range.ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             } else {
                 header.range
             };
@@ -845,7 +845,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         output: &mut NativeOutput,
     ) -> Result<(usize, Option<NativeSessionError>), NativeSessionError> {
         if self.genesis.is_none() || !self.pending.is_empty() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         // The same header rules `apply_entry` applies to one record, walked
         // ahead over the run so every record's producer range is known.
@@ -865,7 +865,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let mut expected_index: Option<u64> = None;
         for entry in entries {
             let want = match expected_index {
-                Some(previous) => previous.checked_add(1).ok_or(NativeSessionError::Corrupt)?,
+                Some(previous) => previous.checked_add(1).ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?,
                 None => entry.index,
             };
             if entry.index != want
@@ -873,7 +873,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 || entry.index > applied_index
                 || !entry.data.starts_with(&record::MAGIC)
             {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
             let header = record.header();
@@ -886,10 +886,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 || (entry.term == recording_term && recording_range != Some(header.range))
                 || (recording_range.is_none() && header.base != self.records_floor)
             {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             let expected_range = if entry.term == recording_term {
-                recording_range.ok_or(NativeSessionError::Corrupt)?
+                recording_range.ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?
             } else {
                 header.range
             };
@@ -969,7 +969,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// entries this engine never sees (no-ops, ancillary metadata).
     pub(crate) fn finish_entries(&mut self, applied_index: u64) -> Result<(), NativeSessionError> {
         if applied_index < self.applied_raft {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         self.applied_raft = applied_index;
         Ok(())
@@ -982,13 +982,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         output: &mut NativeOutput,
     ) -> Result<(), NativeSessionError> {
         if barrier.index > self.applied_raft {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let correlation = barrier
             .context
             .strip_prefix(CORRELATION.as_slice())
             .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let boundary = NativeReadBoundary {
             correlation: ReadCorrelation(correlation),
             raft_index: barrier.index,
@@ -1103,7 +1103,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     .events
                     .committed
                     .get(delivery.entry..add(delivery.entry, run)?)
-                    .ok_or(NativeSessionError::Corrupt)?;
+                    .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
                 let (applied, failure) = self.apply_run(entries, applied_index, output);
                 delivery.entry = add(delivery.entry, applied)?;
                 if let Some(error) = failure {
@@ -1180,7 +1180,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
             self.apply_correlated_read(barrier, output)?;
         } else {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         Ok(())
     }

@@ -1123,3 +1123,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         self.seeds.reader()
     }
 }
+
+/// DIAGNOSTIC (not for merge): name where a Corrupt was raised.
+#[allow(clippy::disallowed_macros)]
+pub(crate) fn diag_corrupt(file: &'static str, line: u32) -> NativeSessionError {
+    eprintln!("focal-diag: native session Corrupt at {file}:{line}");
+    NativeSessionError::Corrupt
+}

@@ -59,7 +59,7 @@ impl SealRecord {
             || self.bound.rows == 0
             || self.outcome_limit == 0
         {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let total = add(
             add(HEAD, self.floors.len().saturating_mul(FLOOR_BYTES))?,
@@ -89,7 +89,7 @@ impl SealRecord {
                     || fold.bundle.0 == [0; 32]
                     || fold.bytes == 0
                 {
-                    return Err(NativeSessionError::Corrupt);
+                    return Err(crate::native_session::diag_corrupt(file!(), line!()));
                 }
                 bytes.push(1);
                 bytes.extend_from_slice(&fold.first.to_le_bytes());
@@ -107,7 +107,7 @@ impl SealRecord {
         bytes.extend_from_slice(&floors.to_le_bytes());
         for (principal, minimum) in &self.floors {
             if principal.is_zero() || minimum.0 == 0 {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             bytes.extend_from_slice(&principal.0);
             bytes.extend_from_slice(&minimum.0.to_le_bytes());
@@ -117,47 +117,47 @@ impl SealRecord {
             .finalize();
         bytes.extend_from_slice(digest.as_bytes());
         if bytes.len() != total {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, NativeSessionError> {
         if bytes.len() > MAX_RECORD_BYTES || bytes.len() < add(HEAD, DIGEST)? {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let (payload, digest) = bytes
             .split_at_checked(bytes.len().saturating_sub(DIGEST))
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let expected = blake3::Hasher::new_derive_key(HASH_DOMAIN)
             .update(payload)
             .finalize();
         if digest != expected.as_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let mut offset = 0usize;
         let mut take = |length: usize| -> Result<&[u8], NativeSessionError> {
             let end = offset
                 .checked_add(length)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             let value = payload
                 .get(offset..end)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             offset = end;
             Ok(value)
         };
         let fixed16 = |bytes: &[u8]| -> Result<[u8; 16], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let fixed32 = |bytes: &[u8]| -> Result<[u8; 32], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let u64_of = |bytes: &[u8]| -> Result<u64, NativeSessionError> {
             Ok(u64::from_le_bytes(
-                bytes.try_into().map_err(|_| NativeSessionError::Corrupt)?,
+                bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?,
             ))
         };
         if take(8)? != MAGIC || take(2)? != VERSION.to_le_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let ledger = LedgerId {
             tenant: focal_model::TenantId(fixed16(take(16)?)?),
@@ -169,13 +169,13 @@ impl SealRecord {
         let length = u64_of(take(8)?)?;
         let count = u64_of(take(8)?)?;
         let principals =
-            usize::try_from(u64_of(take(8)?)?).map_err(|_| NativeSessionError::Corrupt)?;
-        let rows = usize::try_from(u64_of(take(8)?)?).map_err(|_| NativeSessionError::Corrupt)?;
+            usize::try_from(u64_of(take(8)?)?).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
+        let rows = usize::try_from(u64_of(take(8)?)?).map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         let outcome_limit = u64_of(take(8)?)?;
         let flag = take(1)?
             .first()
             .copied()
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let first = u64_of(take(8)?)?;
         let last = u64_of(take(8)?)?;
         let fold_bundle = ContentHash(fixed32(take(32)?)?);
@@ -183,7 +183,7 @@ impl SealRecord {
         let fold = match flag {
             0 => {
                 if first != 0 || last != 0 || fold_bundle.0 != [0; 32] || fold_bytes != 0 {
-                    return Err(NativeSessionError::Corrupt);
+                    return Err(crate::native_session::diag_corrupt(file!(), line!()));
                 }
                 None
             }
@@ -193,18 +193,18 @@ impl SealRecord {
                 bundle: fold_bundle,
                 bytes: fold_bytes,
             }),
-            _ => return Err(NativeSessionError::Corrupt),
+            _ => return Err(crate::native_session::diag_corrupt(file!(), line!())),
         };
         let floor_count = usize::try_from(u32::from_le_bytes(
             take(4)?
                 .try_into()
-                .map_err(|_| NativeSessionError::Corrupt)?,
+                .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?,
         ))
-        .map_err(|_| NativeSessionError::Corrupt)?;
+        .map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))?;
         if floor_count > MAX_FLOORS
             || add(HEAD, floor_count.saturating_mul(FLOOR_BYTES))? != payload.len()
         {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let mut floors = reserved::<(ParticipantId, RequestEpoch)>(floor_count)?;
         for _ in 0..floor_count {
@@ -218,7 +218,7 @@ impl SealRecord {
                         *previous == principal
                     })
             {
-                return Err(NativeSessionError::Corrupt);
+                return Err(crate::native_session::diag_corrupt(file!(), line!()));
             }
             floors.push((principal, minimum));
         }

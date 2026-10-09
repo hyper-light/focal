@@ -31,10 +31,10 @@ pub fn origin_member(genesis: &ContentHash) -> Result<RangeId, NativeSessionErro
     let bytes: [u8; 16] = digest
         .get(..16)
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or(NativeSessionError::Corrupt)?;
+        .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
     let value = u128::from_le_bytes(bytes);
     if value == 0 {
-        return Err(NativeSessionError::Corrupt);
+        return Err(crate::native_session::diag_corrupt(file!(), line!()));
     }
     Ok(RangeId(value))
 }
@@ -73,33 +73,33 @@ impl LayoutRecord {
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, NativeSessionError> {
         if bytes.len() != BYTES {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let (payload, trailer) = bytes
             .split_at_checked(BYTES.saturating_sub(32))
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         if digest(payload) != trailer {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let mut offset = 0usize;
         let mut take = |length: usize| -> Result<&[u8], NativeSessionError> {
             let end = offset
                 .checked_add(length)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             let value = payload
                 .get(offset..end)
-                .ok_or(NativeSessionError::Corrupt)?;
+                .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
             offset = end;
             Ok(value)
         };
         let fixed16 = |bytes: &[u8]| -> Result<[u8; 16], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         let fixed8 = |bytes: &[u8]| -> Result<[u8; 8], NativeSessionError> {
-            bytes.try_into().map_err(|_| NativeSessionError::Corrupt)
+            bytes.try_into().map_err(|_| crate::native_session::diag_corrupt(file!(), line!()))
         };
         if take(8)? != MAGIC || take(2)? != VERSION.to_le_bytes() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let ledger = LedgerId {
             tenant: focal_model::TenantId(fixed16(take(16)?)?),
@@ -109,16 +109,16 @@ impl LayoutRecord {
         let tag = take(1)?
             .first()
             .copied()
-            .ok_or(NativeSessionError::Corrupt)?;
+            .ok_or_else(|| crate::native_session::diag_corrupt(file!(), line!()))?;
         let at = fixed16(take(16)?)?;
         let range = RangeId(u128::from_le_bytes(fixed16(take(16)?)?));
         if range.0 == 0 || ledger.tenant.is_zero() || ledger.session.is_zero() {
-            return Err(NativeSessionError::Corrupt);
+            return Err(crate::native_session::diag_corrupt(file!(), line!()));
         }
         let operation = match tag {
             1 => LayoutOperation::Split { at, id: range },
             2 if at == [0; 16] => LayoutOperation::Merge { left: range },
-            _ => return Err(NativeSessionError::Corrupt),
+            _ => return Err(crate::native_session::diag_corrupt(file!(), line!())),
         };
         Ok(Self {
             ledger,
@@ -175,12 +175,12 @@ mod tests {
                 forged[at] ^= 0x01;
                 assert!(matches!(
                     LayoutRecord::decode(&forged),
-                    Err(NativeSessionError::Corrupt)
+                    Err(crate::native_session::diag_corrupt(file!(), line!()))
                 ));
             }
             assert!(matches!(
                 LayoutRecord::decode(&bytes[..BYTES - 1]),
-                Err(NativeSessionError::Corrupt)
+                Err(crate::native_session::diag_corrupt(file!(), line!()))
             ));
         }
         // A merge carries no affinity; a zero range names nothing; an
@@ -201,21 +201,21 @@ mod tests {
         resign(&mut with_affinity);
         assert!(matches!(
             LayoutRecord::decode(&with_affinity),
-            Err(NativeSessionError::Corrupt)
+            Err(crate::native_session::diag_corrupt(file!(), line!()))
         ));
         let mut zero_range = merge;
         zero_range[67..83].copy_from_slice(&[0; 16]);
         resign(&mut zero_range);
         assert!(matches!(
             LayoutRecord::decode(&zero_range),
-            Err(NativeSessionError::Corrupt)
+            Err(crate::native_session::diag_corrupt(file!(), line!()))
         ));
         let mut bad_tag = merge;
         bad_tag[50] = 3;
         resign(&mut bad_tag);
         assert!(matches!(
             LayoutRecord::decode(&bad_tag),
-            Err(NativeSessionError::Corrupt)
+            Err(crate::native_session::diag_corrupt(file!(), line!()))
         ));
     }
 }
