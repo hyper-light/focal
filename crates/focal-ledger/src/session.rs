@@ -245,6 +245,13 @@ pub struct CheckpointTiming {
     pub deferred_micros: u64,
     /// Joining the envelope and handing it to consensus, on the owner.
     pub write_micros: u64,
+    /// Of `deferred_micros`, the seed chunks' commit: their files synced,
+    /// renamed and their directory synced.
+    pub commit_micros: u64,
+    /// The seed chunks the checkpoint's root names, and how many of them its
+    /// commit wrote (the rest were sealed already, by an earlier checkpoint).
+    pub chunks: u64,
+    pub written_chunks: u64,
 }
 
 /// The checkpoints a session remembers the cost of: the most recent, in a ring that
@@ -267,6 +274,14 @@ impl CheckpointTimings {
             .saturating_add(1)
             .checked_rem(CHECKPOINT_TIMINGS)
             .unwrap_or(0);
+    }
+    /// The latest recorded, to complete what was learned after it was pushed.
+    pub(crate) fn latest_mut(&mut self) -> Option<&mut CheckpointTiming> {
+        let at = self
+            .next
+            .checked_add(CHECKPOINT_TIMINGS - 1)?
+            .checked_rem(CHECKPOINT_TIMINGS)?;
+        self.slots.get_mut(at)?.as_mut()
     }
     /// Oldest first.
     pub(crate) fn recent(&self) -> impl Iterator<Item = CheckpointTiming> + '_ {

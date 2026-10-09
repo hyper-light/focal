@@ -105,6 +105,9 @@ impl Owner {
                     envelope_micros: timing.envelope_micros,
                     deferred_micros: timing.deferred_micros,
                     write_micros: timing.write_micros,
+                    commit_micros: timing.commit_micros,
+                    chunks: timing.chunks,
+                    written_chunks: timing.written_chunks,
                 })
                 .collect(),
             slow_steps: self

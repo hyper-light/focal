@@ -267,6 +267,16 @@ pub struct AdminCheckpointTiming {
     #[serde(default)]
     pub deferred_micros: u64,
     pub write_micros: u64,
+    /// Of `deferred_micros`, the seed chunks' commit (files synced, renamed,
+    /// directory synced).
+    #[serde(default)]
+    pub commit_micros: u64,
+    /// The seed chunks its root names, and how many its commit wrote: the
+    /// rest were sealed already by an earlier checkpoint.
+    #[serde(default)]
+    pub chunks: u64,
+    #[serde(default)]
+    pub written_chunks: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

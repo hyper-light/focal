@@ -656,6 +656,15 @@ struct Staged {
     _native_permit: Allocation,
     image: StagedCheckpoint,
     elapsed: std::time::Duration,
+    commit: Commit,
+}
+
+/// A deferred checkpoint's seed commit: how long it took and how many chunks
+/// it wrote.
+#[derive(Debug, Clone, Copy, Default)]
+struct Commit {
+    elapsed: std::time::Duration,
+    written: u64,
 }
 
 /// A deferred checkpoint's image as its thread left it.
@@ -704,6 +713,7 @@ pub(crate) struct DeferredCheckpoint {
 /// An adopted image's native section and the owner's time spent on it.
 struct Adoption {
     bytes: u64,
+    commit: Commit,
     native: Vec<u8>,
     _native_permit: Allocation,
     owner: std::time::Duration,
@@ -750,18 +760,22 @@ fn run_deferred(
     let encoded = captured
         .encode(batch)
         .and_then(|(bytes, allocation, commit)| {
+            let mut committed = Commit::default();
             if let Some(commit) = commit {
+                let started = std::time::Instant::now();
+                committed.written = u64::try_from(commit.written()).unwrap_or(u64::MAX);
                 commit.run().map_err(|error| {
                     NativeSessionError::from(crate::native_checkpoint::Error::from(error))
                 })?;
+                committed.elapsed = started.elapsed();
             }
-            Ok((bytes, allocation))
+            Ok((bytes, allocation, committed))
         })
         .map_err(LedgerError::from);
     // The frozen rows go before anything is told: their pages are released by
     // the time the owner reads it.
     drop(captured);
-    let staged = encoded.and_then(|(native, native_permit)| {
+    let staged = encoded.and_then(|(native, native_permit, commit)| {
         let whole = durable_session_v1::snapshot_native_finish(head, &native, slot_generation)?;
         let image = match stager {
             Some(stager) => StagedCheckpoint::Staged(stager.stage(point, &whole)?),
@@ -772,6 +786,7 @@ fn run_deferred(
             _native_permit: native_permit,
             image,
             elapsed: started.elapsed(),
+            commit,
         })
     });
     let waits = matches!(
@@ -818,6 +833,9 @@ impl Session {
             envelope_micros: micros(encoding.saturating_sub(native)),
             deferred_micros: 0,
             write_micros: micros(encoded_at.elapsed()),
+            commit_micros: 0,
+            chunks: 0,
+            written_chunks: 0,
         });
         Ok(())
     }
@@ -966,6 +984,7 @@ impl Session {
                     .note_checkpoint_seeds(&adoption.native)?;
                 let owner = adoption.owner.saturating_add(writing.elapsed());
                 self.note_checkpoint_timing(&deferred, adoption.bytes, adoption.deferred, owner);
+                self.note_checkpoint_commit(adoption.commit);
                 Ok(true)
             }
         }
@@ -984,6 +1003,7 @@ impl Session {
             _native_permit,
             image,
             elapsed,
+            commit,
         } = staged;
         let image = match image {
             StagedCheckpoint::Whole(bytes) => {
@@ -1008,13 +1028,14 @@ impl Session {
                     )) => Ok(true),
                     Err(error) => Err(error),
                     // Written and durable: its chunks are the ones kept.
-                    Ok(()) => self
-                        .native
-                        .as_deref_mut()
-                        .ok_or(LedgerError::NativeUnsupported)?
-                        .note_checkpoint_seeds(&native)
-                        .map(|()| true)
-                        .map_err(LedgerError::from),
+                    Ok(()) => {
+                        self.native
+                            .as_deref_mut()
+                            .ok_or(LedgerError::NativeUnsupported)?
+                            .note_checkpoint_seeds(&native)?;
+                        self.note_checkpoint_commit(commit);
+                        Ok(true)
+                    }
                 };
             }
             StagedCheckpoint::Staged(image) => image,
@@ -1039,6 +1060,7 @@ impl Session {
             Ok(()) => {
                 deferred.adoption = Some(Adoption {
                     bytes: image.bytes(),
+                    commit,
                     native,
                     _native_permit,
                     owner: writing.elapsed(),
@@ -1083,7 +1105,24 @@ impl Session {
             envelope_micros: micros(deferred.envelope),
             deferred_micros: micros(elapsed),
             write_micros: micros(owner),
+            commit_micros: 0,
+            chunks: 0,
+            written_chunks: 0,
         });
+    }
+
+    /// The latest checkpoint's seed commit, completed once its chunks are the
+    /// ones kept.
+    fn note_checkpoint_commit(&mut self, commit: Commit) {
+        let chunks = self
+            .native
+            .as_deref()
+            .map_or(0, |engine| engine.seed_chunks().len());
+        if let Some(timing) = self.checkpoint_timings.latest_mut() {
+            timing.commit_micros = micros(commit.elapsed);
+            timing.chunks = u64::try_from(chunks).unwrap_or(u64::MAX);
+            timing.written_chunks = commit.written;
+        }
     }
 
     fn write_checkpoint(
@@ -1106,6 +1145,9 @@ impl Session {
             envelope_micros: micros(envelope),
             deferred_micros: deferred.map_or(0, micros),
             write_micros: micros(writing.elapsed()),
+            commit_micros: 0,
+            chunks: 0,
+            written_chunks: 0,
         });
         Ok(())
     }

@@ -313,6 +313,11 @@ impl SeedBatch {
 }
 
 impl SeedCommit {
+    /// The chunks this commit makes durable: those its batch wrote, not the
+    /// ones it found already sealed.
+    pub fn written(&self) -> usize {
+        self.pending.0.len()
+    }
     /// Make every chunk of the batch durable; see [`SeedBatch::commit`].
     pub fn run(self) -> Result<(), ContentError> {
         let SeedCommit { root, mut pending } = self;
