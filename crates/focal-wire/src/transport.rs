@@ -931,7 +931,35 @@ pub struct Connected {
 enum DialOutcome {
     Pending,
     Connected(QuicRemote),
-    Failed,
+    Failed(DialFailure),
+}
+/// Why a dial failed, as its waiters are told: the listener's answer, when
+/// it gave one, or that none came.
+#[derive(Clone, Debug)]
+enum DialFailure {
+    Authentication,
+    Refused(AccessError),
+    Other,
+}
+impl DialFailure {
+    fn of(error: &WireError) -> Self {
+        match error {
+            WireError::Authentication => Self::Authentication,
+            WireError::Access(error) => Self::Refused(error.clone()),
+            _ => Self::Other,
+        }
+    }
+    /// The listener answered: dialing again is answered alike.
+    fn answered(&self) -> bool {
+        !matches!(self, Self::Other)
+    }
+    fn error(self) -> WireError {
+        match self {
+            Self::Authentication => WireError::Authentication,
+            Self::Refused(error) => WireError::Access(error),
+            Self::Other => WireError::Connection,
+        }
+    }
 }
 /// A dial in flight for a route. Whoever calls the route while it dials
 /// waits on it, holding nothing of the cache but a receiver, and then takes
@@ -1009,6 +1037,7 @@ impl RouteConnections {
             return Err(WireError::Limit);
         }
         let key: RouteKey = (endpoint.to_owned(), server_name.to_owned());
+        let mut last = DialFailure::Other;
         for _ in 0..2 {
             let mut receiver = {
                 let mut routes = self.routes.lock().map_err(|_| WireError::Connection)?;
@@ -1031,8 +1060,12 @@ impl RouteConnections {
                         routes.dialing.remove(&key);
                         return Ok(routes.store(&key, remote));
                     }
-                    Some(DialOutcome::Failed) => {
+                    Some(DialOutcome::Failed(failure)) => {
                         routes.dialing.remove(&key);
+                        if failure.answered() {
+                            return Err(failure.error());
+                        }
+                        last = failure;
                     }
                     Some(DialOutcome::Pending) | None => {}
                 }
@@ -1078,7 +1111,7 @@ impl RouteConnections {
                         .await;
                         sender.send_replace(match outcome {
                             Ok(remote) => DialOutcome::Connected(remote),
-                            Err(_) => DialOutcome::Failed,
+                            Err(error) => DialOutcome::Failed(DialFailure::of(&error)),
                         });
                     });
                     routes.dialing.insert(
@@ -1127,15 +1160,19 @@ impl RouteConnections {
                         }
                         break;
                     }
-                    DialOutcome::Failed => {
+                    DialOutcome::Failed(failure) => {
                         let mut routes = self.routes.lock().map_err(|_| WireError::Connection)?;
                         routes.dialing.remove(&key);
+                        if failure.answered() {
+                            return Err(failure.error());
+                        }
+                        last = failure;
                         break;
                     }
                 }
             }
         }
-        Err(WireError::Connection)
+        Err(last.error())
     }
     /// Forget the route's connection a request found failed — only while it
     /// is still the one cached; a newer connection another caller opened
@@ -1150,6 +1187,17 @@ impl RouteConnections {
         {
             routes.entries.remove(&key);
         }
+    }
+}
+/// Why the listener closed `connection` before greeting it, when it said.
+fn closed_at_greeting(connection: &Connection) -> Option<WireError> {
+    match connection.close_reason()? {
+        quinn::ConnectionError::ApplicationClosed(close) => match u64::from(close.error_code) {
+            1 => Some(WireError::Authentication),
+            4 => Some(WireError::Access(AccessError::Capacity)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 async fn open_remote(
@@ -1186,9 +1234,14 @@ async fn open_remote(
             HelloReply::Rejected(error) => Err(WireError::Access(error)),
         }
     };
-    let negotiated = tokio::time::timeout(limits.request_timeout, handshake)
-        .await
-        .map_err(|_| WireError::Timeout)??;
+    let negotiated = match tokio::time::timeout(limits.request_timeout, handshake).await {
+        Ok(Ok(negotiated)) => negotiated,
+        // A listener that closed the connection before greeting it said why:
+        // its credential refused (1, `unauthorized`), or its identity holding
+        // every connection it may with none idle (4, `capacity`).
+        Ok(Err(error)) => return Err(closed_at_greeting(&connection).unwrap_or(error)),
+        Err(_) => return Err(closed_at_greeting(&connection).unwrap_or(WireError::Timeout)),
+    };
     if !matches!(
         negotiated.protocol,
         PROTOCOL_VERSION

@@ -234,7 +234,10 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
             assert!(
                 matches!(
                     result["structuredContent"]["result"]["code"].as_str(),
-                    Some("unauthorized" | "transport")
+                    // The redial the revoked certificate makes is refused at
+                    // its handshake, and said so (`unauthenticated`); a
+                    // request on the closed connection is `transport`.
+                    Some("unauthorized" | "unauthenticated" | "transport")
                 ),
                 "{result}"
             );

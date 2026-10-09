@@ -156,13 +156,15 @@ struct Held {
     /// Bytes of bodies permitted to this identity and not yet given back.
     bytes: usize,
 }
-/// One connection an identity holds: its requests under way and when it
-/// last began one.
+/// One connection an identity holds: its requests under way, and when it
+/// last began or ended one. Its place among its identity's connections is
+/// when it last began one (an answer carried late does not make it the more
+/// recently used); its idleness counts from either.
 struct HeldConnection {
     id: u64,
     connection: Connection,
     serving: usize,
-    used: Instant,
+    active: Instant,
 }
 #[derive(Default)]
 struct State {
@@ -276,7 +278,7 @@ impl Admission {
             let after = self.0.limits.replace_after;
             let found = state.identities.get(&identity).and_then(|held| {
                 held.connections.iter().position(|held| {
-                    held.serving == 0 && now.saturating_duration_since(held.used) >= after
+                    held.serving == 0 && now.saturating_duration_since(held.active) >= after
                 })
             });
             match found {
@@ -306,7 +308,7 @@ impl Admission {
             id,
             connection: connection.clone(),
             serving: 0,
-            used: now,
+            active: now,
         });
         if replaced.is_some() {
             bump(&mut state.replaced);
@@ -330,16 +332,18 @@ impl Admission {
         let Some(position) = held.connections.iter().position(|held| held.id == id) else {
             return;
         };
-        let Some(mut entry) = held.connections.remove(position) else {
-            return;
-        };
-        entry.serving = if begin {
-            entry.serving.saturating_add(1)
-        } else {
-            entry.serving.saturating_sub(1)
-        };
-        entry.used = Instant::now();
-        held.connections.push_back(entry);
+        if begin {
+            // Begun: the identity's most recently used.
+            let Some(mut entry) = held.connections.remove(position) else {
+                return;
+            };
+            entry.serving = entry.serving.saturating_add(1);
+            entry.active = Instant::now();
+            held.connections.push_back(entry);
+        } else if let Some(entry) = held.connections.get_mut(position) {
+            entry.serving = entry.serving.saturating_sub(1);
+            entry.active = Instant::now();
+        }
     }
     fn release(&self, identity: ParticipantId, id: u64) {
         let Ok(mut state) = self.0.state.lock() else {
