@@ -94,6 +94,9 @@ services:
   focal1:
     <<: *focal
     command: ["focal", "--config", "/etc/focal/focal1.yaml", "--data-dir", "/data", "start", "node", "--listen", "0.0.0.0:7443", "--advertise", "focal1:7443"]
+    # The leader is sampled by perf while a run is under way (run.sh).
+    cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE, PERFMON]
+    security_opt: ["seccomp:unconfined"]
     volumes: ["./focal1.yaml:/etc/focal/focal1.yaml:ro", "focal1:/data", "invites:/invite"]
   focal2:
     <<: *focal

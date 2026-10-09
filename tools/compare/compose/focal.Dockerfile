@@ -26,7 +26,7 @@ RUN --mount=type=cache,id=focal-bench-target,target=/src/target \
 FROM alpine:3.22
 # The data and client directories private, as the shipped image makes its
 # own: a named volume takes the mode of the directory it first mounts over.
-RUN apk add --no-cache iproute2 && install -d -m 0700 /data /client
+RUN apk add --no-cache iproute2 perf && install -d -m 0700 /data /client
 COPY --from=build /out/focal /usr/local/bin/focal
 COPY --from=build /out/focal-load /usr/local/bin/focal-load
 COPY --from=build /out/focal-compare /usr/local/bin/focal-compare
