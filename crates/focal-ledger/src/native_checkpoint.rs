@@ -62,6 +62,100 @@ pub enum Error {
 
 /// Which of the encoder's bounds the root `core` is past, measured again with none: on the failure
 /// path only, a walk of the root its memory budget already bounds.
+/// A frozen image's rows and the envelope's other sections, taken at one
+/// point: what a seeded checkpoint is encoded from on the thread that holds
+/// the image.
+pub struct FrozenRoot<'a> {
+    pub frozen: &'a NativeFrozen,
+    pub metadata: Metadata,
+    pub configuration: &'a MembershipConfiguration,
+    pub movement: Option<&'a [u8]>,
+    pub retention: Option<RetentionSection>,
+    pub limits: Limits,
+}
+
+/// The bounds a root is encoded under: the larger of what travels inline and
+/// what a seeded root may assemble to.
+fn root_limits(limits: Limits) -> record_codec::EncodingLimits {
+    record_codec::EncodingLimits {
+        bytes: limits.inline_bytes.max(limits.assembled_bytes),
+        visits: limits.visits,
+        rows: limits.rows,
+    }
+}
+
+/// A root cut into seed chunks as it is encoded: full chunks from its start
+/// and a remainder, each written into the batch as it fills (made durable
+/// together by the batch's commit, once the root is whole), at most `most`.
+struct Sealer {
+    batch: SeedBatch,
+    table: Vec<SeedChunk>,
+    buffer: Vec<u8>,
+    most: usize,
+    _charge: Allocation,
+}
+
+impl Sealer {
+    fn new(budget: &MemoryBudget, batch: SeedBatch, most: usize) -> Result<Self, Error> {
+        let table_bytes = fields::add(fields::mul(most, size_of::<SeedChunk>())?, ALLOCATION)?;
+        let charge = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                fields::add(table_bytes, fields::add(SEED_CHUNK_BYTES, ALLOCATION)?)?,
+            )?
+            .commit();
+        let mut table = Vec::new();
+        table
+            .try_reserve_exact(most)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(SEED_CHUNK_BYTES)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        Ok(Self {
+            batch,
+            table,
+            buffer,
+            most,
+            _charge: charge,
+        })
+    }
+    fn push(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
+        while !bytes.is_empty() {
+            let room = SEED_CHUNK_BYTES.saturating_sub(self.buffer.len());
+            let take = room.min(bytes.len());
+            let (head, tail) = bytes.split_at_checked(take).ok_or(Error::Truncated)?;
+            self.buffer.extend_from_slice(head);
+            bytes = tail;
+            if self.buffer.len() == SEED_CHUNK_BYTES {
+                self.seal()?;
+            }
+        }
+        Ok(())
+    }
+    fn seal(&mut self) -> Result<(), Error> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if self.table.len() >= self.most {
+            return Err(Error::Invalid("seed chunk count"));
+        }
+        let hash = self.batch.add(&self.buffer)?;
+        self.table.push(SeedChunk {
+            hash,
+            length: u32::try_from(self.buffer.len()).map_err(|_| Error::Capacity)?,
+        });
+        self.buffer.clear();
+        Ok(())
+    }
+    /// The chunks' table and the batch's commit, the remainder sealed.
+    fn finish(mut self) -> Result<(Vec<SeedChunk>, SeedCommit), Error> {
+        self.seal()?;
+        Ok((self.table, self.batch.detach()))
+    }
+}
+
 fn exceeded<'a>(
     measure: impl Fn(
         record_codec::EncodingLimits,
@@ -388,11 +482,7 @@ impl<'a> EncodingPlan<'a> {
         if movement.is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes) {
             return Err(Error::Invalid("movement section"));
         }
-        let encoding = record_codec::EncodingLimits {
-            bytes: limits.inline_bytes.max(limits.assembled_bytes),
-            visits: limits.visits,
-            rows: limits.rows,
-        };
+        let encoding = root_limits(limits);
         let core = match measure(encoding) {
             Ok(plan) => plan,
             Err(record_codec::CodecError::Capacity) => return Err(exceeded(measure, encoding)),
@@ -564,68 +654,89 @@ impl<'a> EncodingPlan<'a> {
     pub fn encode_in_batch(
         &self,
         budget: &MemoryBudget,
-        mut batch: SeedBatch,
+        batch: SeedBatch,
     ) -> Result<(EncodedCheckpoint, SeedCommit), Error> {
         let Form::Seeded { chunks } = self.form else {
             return Err(Error::Invalid("inline root has no seeds"));
         };
-        let core_bytes = self.core.quote().bytes;
-        let table_bytes = fields::add(fields::mul(chunks, size_of::<SeedChunk>())?, ALLOCATION)?;
-        let _table_charge = budget.reserve(
-            BudgetKind::Recovery,
-            BudgetLane::Completion,
-            fields::add(table_bytes, fields::add(SEED_CHUNK_BYTES, ALLOCATION)?)?,
-        )?;
-        let mut table: Vec<SeedChunk> = Vec::new();
-        table
-            .try_reserve_exact(chunks)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        let mut buffer: Vec<u8> = Vec::new();
-        buffer
-            .try_reserve_exact(SEED_CHUNK_BYTES)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        let mut sealed = 0usize;
-        // The chunks are written as they are sealed and made durable together
-        // once the root is whole, by the batch's commit: overlapping file syncs
-        // and one directory sync, not a sync and two directory syncs each in
-        // turn on the owner's thread.
-        let mut seal = |buffer: &mut Vec<u8>, table: &mut Vec<SeedChunk>| -> Result<(), Error> {
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            if table.len() >= chunks {
-                return Err(Error::Invalid("seed chunk count"));
-            }
-            let hash = batch.add(buffer)?;
-            table.push(SeedChunk {
-                hash,
-                length: u32::try_from(buffer.len()).map_err(|_| Error::Capacity)?,
-            });
-            sealed = fields::add(sealed, buffer.len())?;
-            buffer.clear();
-            Ok(())
-        };
+        let mut sealer = Sealer::new(budget, batch, chunks)?;
         self.core
-            .write_with(|mut bytes| -> Result<(), Error> {
-                while !bytes.is_empty() {
-                    let room = SEED_CHUNK_BYTES.saturating_sub(buffer.len());
-                    let take = room.min(bytes.len());
-                    let (head, tail) = bytes.split_at_checked(take).ok_or(Error::Truncated)?;
-                    buffer.extend_from_slice(head);
-                    bytes = tail;
-                    if buffer.len() == SEED_CHUNK_BYTES {
-                        seal(&mut buffer, &mut table)?;
-                    }
-                }
-                Ok(())
-            })
+            .write_with(|bytes| sealer.push(bytes))
             .map_err(|error| match error {
                 root::WriteError::Output(error) => error,
                 root::WriteError::Codec(error) => Error::Core(error),
             })?;
-        seal(&mut buffer, &mut table)?;
-        let commit = batch.detach();
-        if sealed != core_bytes || table.len() != chunks {
+        let (table, commit) = sealer.finish()?;
+        Ok((self.finish_seeded(budget, &table)?, commit))
+    }
+    /// The seeded encoding of a frozen image's rows, walked once: the root is
+    /// written into `batch` as it is encoded and the frame, which names its
+    /// chunks and digest, is written after it ([`Self::encode_in_batch`]
+    /// walks them twice, once to measure). A root that turns out to fit
+    /// inline is none: its batch is dropped, the files it wrote with it, and
+    /// the caller encodes the inline form, whose bytes are small.
+    pub fn encode_frozen_in_batch(
+        root: FrozenRoot<'a>,
+        budget: &MemoryBudget,
+        batch: SeedBatch,
+    ) -> Result<Option<(EncodedCheckpoint, SeedCommit)>, Error> {
+        let FrozenRoot {
+            frozen,
+            metadata,
+            configuration,
+            movement,
+            retention,
+            limits,
+        } = root;
+        let encoding = root_limits(limits);
+        let mut sealer = Sealer::new(budget, batch, limits.max_seed_chunks())?;
+        let core =
+            match root::EncodingPlan::write_frozen(frozen, encoding, |bytes| sealer.push(bytes)) {
+                Ok(core) => core,
+                Err(root::WriteError::Output(error)) => return Err(error),
+                Err(root::WriteError::Codec(record_codec::CodecError::Capacity)) => {
+                    return Err(exceeded(
+                        |encoding| root::EncodingPlan::prepare_frozen(frozen, encoding),
+                        encoding,
+                    ));
+                }
+                Err(root::WriteError::Codec(error)) => return Err(error.into()),
+            };
+        let (table, commit) = sealer.finish()?;
+        let plan = Self::prepare_root(
+            |_| Ok(core),
+            metadata,
+            configuration,
+            movement,
+            retention,
+            limits,
+        )?;
+        let Form::Seeded { chunks } = plan.form else {
+            // Inline after all: nothing of the batch is committed.
+            return Ok(None);
+        };
+        if chunks != table.len() {
+            return Err(Error::Invalid("seeded core length"));
+        }
+        Ok(Some((plan.finish_seeded(budget, &table)?, commit)))
+    }
+    /// The seeded frame over the chunks `table` names, the root already
+    /// sealed into them.
+    fn finish_seeded(
+        &self,
+        budget: &MemoryBudget,
+        table: &[SeedChunk],
+    ) -> Result<EncodedCheckpoint, Error> {
+        let Form::Seeded { chunks } = self.form else {
+            return Err(Error::Invalid("inline root has no seeds"));
+        };
+        let sealed = table.iter().try_fold(0usize, |sum, chunk| {
+            fields::add(
+                sum,
+                usize::try_from(chunk.length).map_err(|_| Error::Capacity)?,
+            )
+        })?;
+        if sealed != self.core.quote().bytes || table.len() != chunks {
             return Err(Error::Invalid("seeded core length"));
         }
         let allocation = budget
@@ -669,7 +780,7 @@ impl<'a> EncodingPlan<'a> {
         if length != self.quote.bytes || bytes.len() != self.quote.bytes {
             return Err(Error::Invalid("encoded length"));
         }
-        Ok((EncodedCheckpoint { bytes, allocation }, commit))
+        Ok(EncodedCheckpoint { bytes, allocation })
     }
     pub fn encode_in(&self, budget: &MemoryBudget) -> Result<EncodedCheckpoint, Error> {
         if self.seeded() {

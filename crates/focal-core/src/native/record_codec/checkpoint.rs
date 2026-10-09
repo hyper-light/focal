@@ -37,6 +37,7 @@ pub struct CheckpointHeader {
 /// its quoted work. The caller separately funds its output buffering through
 /// checkpoint persistence/retention and accounts any surrounding Session data.
 /// This plan does not acquire any buffer, permit, root handle or snapshot.
+#[derive(Clone, Copy)]
 pub struct EncodingPlan<'a> {
     source: Source<'a>,
     quote: EncodingQuote,
@@ -173,6 +174,40 @@ impl<'a> EncodingPlan<'a> {
         limits: EncodingLimits,
     ) -> Result<Self, CodecError> {
         Self::prepare_from(Source::Frozen(frozen), limits)
+    }
+    /// The frozen image's root written to `output` in one pass, measured as
+    /// it goes: the plan [`Self::prepare_frozen`] would have made, without
+    /// its separate measuring walk. Its bytes are out once it returns; a
+    /// caller that frames them after (a seeded checkpoint names its chunks
+    /// and the root's digest after the root) needs the root walked once.
+    pub fn write_frozen<E>(
+        frozen: &'a crate::native::NativeFrozen,
+        limits: EncodingLimits,
+        mut output: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<Self, WriteError<E>> {
+        let source = Source::Frozen(frozen);
+        if source.len() > limits.rows {
+            return Err(WriteError::Codec(CodecError::Capacity));
+        }
+        let mut sink = CallbackSink {
+            meter: CountingSink::new(limits.bytes, limits.visits),
+            output: &mut output,
+            error: None,
+        };
+        let result = frame(&mut sink, source);
+        if let Some(error) = sink.error.take() {
+            return Err(WriteError::Output(error));
+        }
+        let hash = result.map_err(WriteError::Codec)?;
+        Ok(Self {
+            source,
+            quote: EncodingQuote {
+                bytes: sink.meter.len(),
+                visits: sink.meter.visits_used(),
+                rows: source.len(),
+                hash,
+            },
+        })
     }
     fn prepare_from(source: Source<'a>, limits: EncodingLimits) -> Result<Self, CodecError> {
         if source.len() > limits.rows {

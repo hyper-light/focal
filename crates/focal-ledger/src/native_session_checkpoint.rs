@@ -33,6 +33,43 @@ impl CapturedCheckpoint {
         &self,
         batch: Result<SeedBatch, focal_evidence::ContentError>,
     ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
+        // The rows are walked once: sealed into the batch as they are encoded,
+        // the frame written after them. A root that fits inline after all
+        // drops its batch and is encoded inline.
+        // No batch (the seed store refused one): only an inline root can be
+        // encoded, as before.
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(refused) => {
+                let plan = enclosing::EncodingPlan::prepare_frozen_with_sections(
+                    &self.frozen,
+                    self.metadata,
+                    &self.configuration,
+                    self.movement.as_deref(),
+                    self.retention,
+                    self.limits,
+                )?;
+                if plan.seeded() {
+                    return Err(enclosing::Error::from(refused).into());
+                }
+                let (bytes, allocation) = plan.encode_in(&self.budget)?.into_parts();
+                return Ok((bytes, allocation, None));
+            }
+        };
+        let root = enclosing::FrozenRoot {
+            frozen: &self.frozen,
+            metadata: self.metadata,
+            configuration: &self.configuration,
+            movement: self.movement.as_deref(),
+            retention: self.retention,
+            limits: self.limits,
+        };
+        if let Some((encoded, commit)) =
+            enclosing::EncodingPlan::encode_frozen_in_batch(root, &self.budget, batch)?
+        {
+            let (bytes, allocation) = encoded.into_parts();
+            return Ok((bytes, allocation, Some(commit)));
+        }
         let plan = enclosing::EncodingPlan::prepare_frozen_with_sections(
             &self.frozen,
             self.metadata,
@@ -41,14 +78,8 @@ impl CapturedCheckpoint {
             self.retention,
             self.limits,
         )?;
-        if !plan.seeded() {
-            let (bytes, allocation) = plan.encode_in(&self.budget)?.into_parts();
-            return Ok((bytes, allocation, None));
-        }
-        let batch = batch.map_err(enclosing::Error::from)?;
-        let (encoded, commit) = plan.encode_in_batch(&self.budget, batch)?;
-        let (bytes, allocation) = encoded.into_parts();
-        Ok((bytes, allocation, Some(commit)))
+        let (bytes, allocation) = plan.encode_in(&self.budget)?.into_parts();
+        Ok((bytes, allocation, None))
     }
 }
 

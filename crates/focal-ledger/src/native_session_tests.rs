@@ -1343,6 +1343,59 @@ fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
         },
     )
     .map(|plan| plan.quote());
+    // The root's encoding, timed by stage: the plan (its measuring pass),
+    // then the write (its walk, encoding and hashing) into a sink that keeps
+    // nothing.
+    let limits = focal_core::native::record_codec::EncodingLimits {
+        bytes: usize::MAX,
+        visits: usize::MAX,
+        rows: usize::MAX,
+    };
+    let frozen = core.freeze_native().unwrap();
+    for _ in 0..3 {
+        let mut bytes = 0usize;
+        let started = std::time::Instant::now();
+        focal_core::native::record_codec::checkpoint::EncodingPlan::write_frozen(
+            &frozen,
+            limits,
+            |chunk: &[u8]| -> Result<(), ()> {
+                bytes += chunk.len();
+                Ok(())
+            },
+        )
+        .unwrap();
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "frozen root {bytes} B in one walk: {:?}\n",
+                started.elapsed()
+            ),
+        )
+        .unwrap();
+    }
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let plan =
+            focal_core::native::record_codec::checkpoint::EncodingPlan::prepare(core, limits)
+                .unwrap();
+        let prepared = started.elapsed();
+        let mut bytes = 0usize;
+        let started = std::time::Instant::now();
+        plan.write_with(|chunk: &[u8]| -> Result<(), ()> {
+            bytes += chunk.len();
+            Ok(())
+        })
+        .unwrap();
+        let written = started.elapsed();
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "root {bytes} B: prepare {prepared:?}, write {written:?} ({:.0} MB/s)\n",
+                bytes as f64 / written.as_secs_f64() / 1e6
+            ),
+        )
+        .unwrap();
+    }
     std::io::Write::write_fmt(
         &mut std::io::stderr(),
         format_args!(
