@@ -502,7 +502,7 @@ fn audit_rejects_corrupt_history_publications_and_artifact_identity() {
                 event.fact = NativeFact::Registrations {
                     claim: core.native_claim(CLAIM).unwrap().binding(),
                 };
-                let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+                let row = OwnedEvent::new(event, core.state.ledger).unwrap();
                 let heap = row.heap_charge().unwrap();
                 Change::Put(Entry::new(
                     Key::Event(first.sequence(), first.ordinal()),

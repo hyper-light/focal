@@ -142,11 +142,11 @@ fn equal_bindings_and_prefixes_do_not_replace_the_exact_pending_source_or_owner(
 
 fn copy_row(row: &Row) -> Result<Row, MemoryError> {
     match row {
-        Row::Meta(value) => Ok(Row::Meta(*value)),
+        Row::Meta(value) => Ok(Row::Meta(Box::new(**value))),
         Row::Claim(value) => value.copy().map(Row::Claim),
-        Row::Definition(value) => value.copy().map(Row::Definition),
+        Row::Definition(value) => value.copy().map(|row| Row::Definition(Box::new(row))),
         Row::Evaluation(value) => value.copy().map(Row::Evaluation),
-        Row::Outcome(value) => Ok(Row::Outcome(*value)),
+        Row::Outcome(value) => Ok(Row::Outcome(Box::new(**value))),
         Row::Event(value) => value.copy().map(Row::Event),
         // The claim's other rows share its span under the storage layout.
         other => crate::native::prepare::copy(other),
@@ -167,7 +167,7 @@ fn altered(
     let Some(Row::Meta(meta)) = original.fragments.get(&Key::Meta) else {
         panic!("metadata")
     };
-    let mut meta = *meta;
+    let mut meta = **meta;
     let Some(Row::Meta(source_meta)) = source.fragments.get(&Key::Meta) else {
         panic!("metadata")
     };
@@ -175,10 +175,12 @@ fn altered(
     let row = OwnedEvaluation::new(state).unwrap();
     let heap = row.heap_charge().unwrap();
     let mut changes = vec![
-        Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)),
+        Change::Put(Entry::new(Key::Meta, Row::Meta(Box::new(meta)), 0)),
         Change::Put(Entry::new(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(OutcomeRow::stored(&outcome, outcome.ledger).unwrap()),
+            Row::Outcome(Box::new(
+                OutcomeRow::stored(&outcome, outcome.ledger).unwrap(),
+            )),
             0,
         )),
         Change::Put(Entry::new(
@@ -188,7 +190,7 @@ fn altered(
         )),
     ];
     for (index, event) in events.into_iter().enumerate() {
-        let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+        let row = OwnedEvent::new(event, outcome.ledger).unwrap();
         let heap = row.heap_charge().unwrap();
         changes.push(Change::Put(Entry::new(
             Key::Event(outcome.sequence, u32::try_from(index).unwrap()),
@@ -272,7 +274,7 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
     else {
         panic!("actual Begun event")
     };
-    let original_event = event.get().unwrap().expand(original.outcome().ledger);
+    let original_event = event.get(original.outcome().ledger).unwrap();
     assert!(matches!(
         original_event.fact,
         NativeFact::Evaluation {
@@ -366,7 +368,7 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     else {
         panic!("actual Begun event")
     };
-    let mut fake = event.get().unwrap().expand(original.outcome().ledger);
+    let mut fake = event.get(original.outcome().ledger).unwrap();
     let NativeFact::Evaluation {
         after,
         state,

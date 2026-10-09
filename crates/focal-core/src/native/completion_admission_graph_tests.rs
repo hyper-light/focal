@@ -151,7 +151,7 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
     else {
         panic!("failure fact")
     };
-    let NativeFact::Claim(event) = event.get().unwrap().expand(core.state.ledger).fact else {
+    let NativeFact::Claim(event) = event.get(core.state.ledger).unwrap().fact else {
         panic!("claim fact")
     };
     assert_eq!(

@@ -11,7 +11,7 @@ use focal_model::{ArtifactRef, ObjectRevision};
 fn cycle(view: &View<'_>, key: NativeCycleKey) -> Result<NativeCycle, NativeError> {
     match view.get(Key::Cycle(key)) {
         None => Ok(NativeCycle::default()),
-        Some(Row::Cycle(value)) if value.response.is_none() => Ok(*value),
+        Some(Row::Cycle(value)) if value.response.is_none() => Ok(**value),
         _ => Err(ContractError::InvalidManifest.into()),
     }
 }
@@ -319,7 +319,7 @@ pub(super) fn prepare(
             current.response = Some(TestamentId(response.object.0));
             extras.push(Extra {
                 key: Key::Cycle(key),
-                row: Row::Cycle(current),
+                row: Row::Cycle(Box::new(current)),
                 heap: 0,
                 fact: None,
             })?;

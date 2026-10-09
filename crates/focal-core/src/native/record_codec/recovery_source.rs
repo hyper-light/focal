@@ -92,7 +92,12 @@ impl<'s, 'bytes, C: read_evidence::Custody> RangeHydrationSource<Key, Row>
                 dependencies,
                 quote,
             },
-            quote.heap_bytes,
+            // A wide row's box is charged to its entry (`Row`): the key's
+            // family names the box it may take.
+            quote
+                .heap_bytes
+                .checked_add(self.row.key.boxed_heap())
+                .ok_or(MemoryError::AllocationFailed)?,
         ))
     }
     fn build<'a>(plan: Self::Plan<'a>, allowance: usize) -> Result<(Row, usize), MemoryError>
@@ -109,7 +114,10 @@ impl<'s, 'bytes, C: read_evidence::Custody> RangeHydrationSource<Key, Row>
             &context(&objects, shared),
             plan.quote,
             allowance,
-            |row, actual| Ok((row, actual)),
+            |row, actual| {
+                let boxed = row.boxed_heap();
+                Ok((row, crate::native::prepare::add(actual, boxed)?))
+            },
         )
         .map_err(|error| shared.refuse(error))
     }

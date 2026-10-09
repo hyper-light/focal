@@ -3,13 +3,15 @@
 //! semantic stamps or publication coordinates. Recovery proves those separately.
 use super::{
     bytes::{Cursor, Error},
+    events::Bindings,
     fixed, read_fields as f,
 };
 use crate::native::{
     NativeClaimEvent, NativeEvaluationEventKind, NativeEvent, NativeEventKind, NativeFact,
     NativeMonitorEvent,
 };
-use focal_model::{ClaimId, MonitorId, SessionSeq};
+use focal_model::lifecycle::Binding;
+use focal_model::{ClaimId, MonitorId, ObjectId, ObjectRevision, SessionSeq};
 
 #[cfg(test)]
 #[path = "read_events_tests.rs"]
@@ -18,64 +20,68 @@ mod tests;
 /// Full ledgers are present in the encoded bindings. The importer cross-checks
 /// each against its retained root ledger before packing the immutable event.
 pub(super) fn event(c: &mut Cursor<'_>) -> Result<NativeEvent, Error> {
+    event_in(c, Bindings::Written)
+}
+/// The event as [`super::events::event_in`] wrote it under `b`.
+pub(in crate::native) fn event_in(c: &mut Cursor<'_>, b: Bindings) -> Result<NativeEvent, Error> {
     let invocation = fixed::read_invocation(c)?;
     let sequence = f::sequence(c)?;
     let ordinal = c.u32()?;
     let fact = match c.u8()? {
         0 => NativeFact::ResultTestament {
             claim: ClaimId(c.fixed()?),
-            before: f::optional_binding(c)?,
-            after: f::binding(c)?,
+            before: optional_binding(c, b)?,
+            after: binding(c, b)?,
             state: f::result_testament_state(c)?,
         },
         1 => NativeFact::Missing {
             key: f::result_key(c)?,
         },
         2 => NativeFact::Registrations {
-            claim: f::binding(c)?,
+            claim: binding(c, b)?,
         },
         3 => NativeFact::Delivery {
             key: f::result_key(c)?,
         },
         4 => NativeFact::Work {
             claim: ClaimId(c.fixed()?),
-            before: f::optional_binding(c)?,
-            after: f::binding(c)?,
+            before: optional_binding(c, b)?,
+            after: binding(c, b)?,
             state: f::work_state(c)?,
         },
         5 => NativeFact::Diagnostic {
             claim: ClaimId(c.fixed()?),
-            binding: f::binding(c)?,
+            binding: binding(c, b)?,
             reason: f::failure(c)?,
         },
         6 => NativeFact::Response {
             claim: ClaimId(c.fixed()?),
-            before: f::optional_binding(c)?,
-            after: f::binding(c)?,
+            before: optional_binding(c, b)?,
+            after: binding(c, b)?,
             state: f::response_state(c)?,
         },
         7 => NativeFact::Receipt {
-            claim: f::binding(c)?,
+            claim: binding(c, b)?,
             fence: f::receipt(c)?,
             holder: f::participant(c)?,
         },
         8 => NativeFact::ReceiptAdopted {
-            claim: f::binding(c)?,
+            claim: binding(c, b)?,
             previous: f::entitlement(c)?,
             replacement: f::entitlement(c)?,
             cause: f::hash(c)?,
         },
         9 => NativeFact::Artifact {
-            binding: f::binding(c)?,
+            binding: binding(c, b)?,
         },
         10 => NativeFact::Accepted {
             key: f::result_key(c)?,
         },
         11 => NativeFact::Claim(NativeClaimEvent {
             kind: claim_kind(c)?,
-            owned_child: f::optional_binding(c)?,
-            before: f::optional_binding(c)?,
-            after: f::binding(c)?,
+            owned_child: optional_binding(c, b)?,
+            before: optional_binding(c, b)?,
+            after: binding(c, b)?,
             status: f::claim_status(c)?,
             graph: f::optional(c, |c| {
                 Ok(crate::native::NativeGraphCapture {
@@ -84,7 +90,7 @@ pub(super) fn event(c: &mut Cursor<'_>) -> Result<NativeEvent, Error> {
             })?,
         }),
         12 => NativeFact::Definition {
-            binding: f::binding(c)?,
+            binding: binding(c, b)?,
             claim: ClaimId(c.fixed()?),
             index: c.u32()?,
             intent: f::hash(c)?,
@@ -92,8 +98,8 @@ pub(super) fn event(c: &mut Cursor<'_>) -> Result<NativeEvent, Error> {
         13 => NativeFact::Evaluation {
             kind: evaluation_kind(c)?,
             key: f::evaluation(c)?,
-            before: f::optional_binding(c)?,
-            after: f::binding(c)?,
+            before: optional_binding(c, b)?,
+            after: binding(c, b)?,
             state: f::evaluation_state(c)?,
             phase: f::phase(c)?,
             attempt: f::optional(c, f::attempt)?,
@@ -107,6 +113,20 @@ pub(super) fn event(c: &mut Cursor<'_>) -> Result<NativeEvent, Error> {
         ordinal,
         fact,
     })
+}
+fn binding(c: &mut Cursor<'_>, b: Bindings) -> Result<Binding, Error> {
+    match b {
+        Bindings::Written => f::binding(c),
+        Bindings::Implied(ledger) => Ok(Binding {
+            ledger,
+            object: ObjectId(c.fixed()?),
+            content: f::hash(c)?,
+            revision: ObjectRevision(c.u64()?),
+        }),
+    }
+}
+fn optional_binding(c: &mut Cursor<'_>, b: Bindings) -> Result<Option<Binding>, Error> {
+    f::optional(c, |c| binding(c, b))
 }
 pub(super) fn evaluation_kind(c: &mut Cursor<'_>) -> Result<NativeEvaluationEventKind, Error> {
     Ok(match c.u8()? {

@@ -642,3 +642,205 @@ pub(in crate::native) fn replay_fixture() -> (Core<NativeState>, [NativeInput; 3
         ],
     )
 }
+
+/// Measurement, not a check: the owner's CPU per authored claim creation,
+/// prepare (decode-free: the input is built) and publish apart, over a core
+/// that grows to `CLAIMS`. Run with `--release --ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_time_per_authored_claim() {
+    let claims: u128 = std::env::var("FOCAL_MEASURE_CLAIMS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    // Rounds over fresh cores, for a profiler to sample long enough.
+    let rounds: u32 = std::env::var("FOCAL_MEASURE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    for _ in 1..rounds {
+        let mut core = core();
+        for id in 1..=claims {
+            let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+            core.publish_native(prepared).unwrap();
+        }
+    }
+    let mut core = core();
+    let (mut prepare_ns, mut publish_ns) = (0u128, 0u128);
+    let mut window = (0u128, 0u128);
+    for id in 1..=claims {
+        let input = create(id, vec![proposal(id, 10_000 + id)]);
+        let started = std::time::Instant::now();
+        let prepared = prepare(&core, input, &[]);
+        let prepared_at = std::time::Instant::now();
+        core.publish_native(prepared).unwrap();
+        let p = prepared_at.duration_since(started).as_nanos();
+        let q = prepared_at.elapsed().as_nanos();
+        prepare_ns += p;
+        publish_ns += q;
+        if id > claims - 1000 {
+            window.0 += p;
+            window.1 += q;
+        }
+    }
+    println!(
+        "{claims} claims: prepare {:.1} µs, publish {:.1} µs per claim; last 1000: prepare {:.1} µs, publish {:.1} µs",
+        prepare_ns as f64 / claims as f64 / 1e3,
+        publish_ns as f64 / claims as f64 / 1e3,
+        window.0 as f64 / 1000.0 / 1e3,
+        window.1 as f64 / 1000.0 / 1e3,
+    );
+}
+
+/// What one authored claim (one declaration) costs the session's memory, by row family:
+/// rows, inline entry bytes and owned heap bytes. A measurement, not an assertion.
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_memory_per_authored_claim_by_family() {
+    let mut core = core();
+    const CLAIMS: u128 = 200;
+    for id in 1..=CLAIMS {
+        let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        core.publish_native(prepared).unwrap();
+    }
+    let mut families: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    let entry = std::mem::size_of::<focal_memory::Entry<Key, Row>>();
+    for item in core.state.rows.entries() {
+        let name = format!("{:?}", item.key);
+        let family = name
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or("?")
+            .to_string();
+        let slot = families.entry(family).or_default();
+        slot.0 += 1;
+        slot.1 += item.heap_bytes;
+    }
+    let claims = CLAIMS as f64;
+    let mut total_rows = 0;
+    let mut total_heap = 0;
+    println!(
+        "entry={entry} B (Key {} B, Row {} B)",
+        std::mem::size_of::<Key>(),
+        std::mem::size_of::<Row>()
+    );
+    println!(
+        "{:<22} {:>9} {:>12} {:>12}",
+        "family", "rows/claim", "inline B/cl", "heap B/cl"
+    );
+    for (family, (rows, heap)) in &families {
+        total_rows += rows;
+        total_heap += heap;
+        println!(
+            "{family:<22} {:>9.2} {:>12.0} {:>12.0}",
+            *rows as f64 / claims,
+            (*rows * entry) as f64 / claims,
+            *heap as f64 / claims
+        );
+    }
+    println!(
+        "{:<22} {:>9.2} {:>12.0} {:>12.0}",
+        "TOTAL",
+        total_rows as f64 / claims,
+        (total_rows * entry) as f64 / claims,
+        total_heap as f64 / claims
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_row_variant_widths() {
+    let mut widths: Vec<(&str, usize)> = vec![
+        (
+            "IncomingHead",
+            std::mem::size_of::<incoming_graph::IncomingHead>(),
+        ),
+        (
+            "IncomingLink",
+            std::mem::size_of::<incoming_graph::IncomingLink>(),
+        ),
+        (
+            "Monitor",
+            std::mem::size_of::<monitor_index::MonitorAllocation>(),
+        ),
+        (
+            "MonitorHead",
+            std::mem::size_of::<monitor_index::MonitorHead>(),
+        ),
+        (
+            "MonitorLink",
+            std::mem::size_of::<Option<monitor_index::MonitorLink>>(),
+        ),
+        ("MissingResult", std::mem::size_of::<OwnedMissingResult>()),
+        ("Meta", std::mem::size_of::<Meta>()),
+        ("Claim", std::mem::size_of::<OwnedClaim>()),
+        ("Definition", std::mem::size_of::<OwnedDeclaration>()),
+        ("Evaluation", std::mem::size_of::<OwnedEvaluation>()),
+        ("Artifact", std::mem::size_of::<OwnedArtifact>()),
+        ("ArtifactIdentity", std::mem::size_of::<ArtifactId>()),
+        ("Accepted", std::mem::size_of::<OwnedAccepted>()),
+        ("DeliveryResult", std::mem::size_of::<OwnedDeliveryResult>()),
+        ("Receipt", std::mem::size_of::<NativeReceipt>()),
+        ("Cycle", std::mem::size_of::<NativeCycle>()),
+        ("RetiredCycleHead", std::mem::size_of::<RetiredCycleHead>()),
+        ("RetiredCycle", std::mem::size_of::<RetiredCycle>()),
+        ("Work", std::mem::size_of::<OwnedWork>()),
+        ("WorkSlot", std::mem::size_of::<ArtifactId>()),
+        ("Diagnostic", std::mem::size_of::<OwnedDiagnostic>()),
+        ("Response", std::mem::size_of::<OwnedResponse>()),
+        (
+            "ResultTestament",
+            std::mem::size_of::<OwnedResultTestament>(),
+        ),
+        ("ClaimResultTestament", std::mem::size_of::<TestamentId>()),
+        ("Outcome", std::mem::size_of::<OutcomeRow>()),
+        ("Event", std::mem::size_of::<OwnedEvent>()),
+        ("ClaimContent", std::mem::size_of::<OwnedClaimContent>()),
+        ("ClaimIdentity", std::mem::size_of::<ClaimId>()),
+        ("DefinitionIdentity", std::mem::size_of::<ValidationId>()),
+        ("CreationResult", std::mem::size_of::<OwnedCreationResult>()),
+        ("LegacyTestament", std::mem::size_of::<OwnedLegacy>()),
+        ("LegacyEvidenceSet", std::mem::size_of::<OwnedLegacy>()),
+        ("LegacyRun", std::mem::size_of::<OwnedLegacy>()),
+        ("LegacyDefinition", std::mem::size_of::<OwnedLegacy>()),
+        ("Retired", std::mem::size_of::<RetiredClaim>()),
+        ("Epochs", std::mem::size_of::<EpochWindow>()),
+        ("Seal", std::mem::size_of::<SealRow>()),
+    ];
+    widths.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+    for (name, width) in widths {
+        println!("{name:<20} {width}");
+    }
+}
+
+/// Measurement, not a check: the inline width of each key family's fields,
+/// widest first, to see which families set `Key`'s width.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_key_variant_widths() {
+    use std::mem::size_of;
+    let mut widths: Vec<(&str, usize)> = vec![
+        ("Key", size_of::<Key>()),
+        ("ClaimId", size_of::<ClaimId>()),
+        ("ContentHash", size_of::<ContentHash>()),
+        ("ObjectId", size_of::<focal_model::ObjectId>()),
+        ("ParticipantId", size_of::<ParticipantId>()),
+        ("NativeInvocation", size_of::<NativeInvocation>()),
+        ("NativeResultKey", size_of::<NativeResultKey>()),
+        ("EvaluationKey", size_of::<EvaluationKey>()),
+        ("EvaluationTarget", size_of::<EvaluationTarget>()),
+        ("NativeCycleKey", size_of::<NativeCycleKey>()),
+        ("TimerTarget", size_of::<TimerTarget>()),
+        ("ByScope", size_of::<(u16, ContentHash, ClaimId)>()),
+        (
+            "ByCreated",
+            size_of::<(u16, SessionSeq, focal_model::ObjectId)>(),
+        ),
+        ("DueTimer", size_of::<(u64, TimerTarget)>()),
+        ("ByVerdict", size_of::<(u16, NativeResultKey)>()),
+    ];
+    widths.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+    for (name, width) in widths {
+        println!("{name:<20} {width}");
+    }
+}

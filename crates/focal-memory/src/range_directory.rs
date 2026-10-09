@@ -202,7 +202,7 @@ impl<K: Ord, V> PageDirectory<K, V> {
         }
         self.check_page(index, false, &page)?;
         let Some(root) = &self.root else {
-            let node = leaf(1, |_| Some(Arc::clone(&page)), build)?;
+            let node = leaf(1, |_| Some(Arc::clone(&page)), |_| true, build)?;
             return Ok(Self { root: Some(node) });
         };
         let (left, right) = insert_node(root, index, page, build)?;
@@ -215,6 +215,7 @@ impl<K: Ord, V> PageDirectory<K, V> {
                     1 => Some(Arc::clone(&right)),
                     _ => None,
                 },
+                |_| true,
                 build,
             )?,
         };
@@ -367,7 +368,12 @@ impl<K: Ord, V> PageDirectory<K, V> {
         let mut offset = 0usize;
         for group in 0..groups {
             let width = group_width(count, groups, group);
-            let node = leaf(width, |index| item(checked_add(offset, index).ok()?), build)?;
+            let node = leaf(
+                width,
+                |index| item(checked_add(offset, index).ok()?),
+                |_| true,
+                build,
+            )?;
             bounded_push(&mut level, node, groups)?;
             offset = checked_add(offset, width)?;
         }
@@ -380,6 +386,7 @@ impl<K: Ord, V> PageDirectory<K, V> {
                 let node = branch(
                     width,
                     |index| level.get(checked_add(offset, index).ok()?).map(Arc::clone),
+                    |_| true,
                     build,
                 )?;
                 bounded_push(&mut next, node, groups)?;
@@ -442,9 +449,15 @@ fn node_charge<K, V>(width: usize) -> Result<usize, MemoryError> {
     )
 }
 
+/// A node of `count` pages. Their order is checked where `seam` says the
+/// sequence is new: everywhere for a node built whole, and only around the
+/// replaced span for a splice of a node whose order was checked when it was
+/// built (a page replaced in a node of 64 is checked against its two
+/// neighbours, not the 63 pairs that did not change).
 fn leaf<K: Ord, V>(
     count: usize,
     mut item: impl FnMut(usize) -> Option<Arc<Page<K, V>>>,
+    seam: impl Fn(usize) -> bool,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Arc<Node<K, V>>, MemoryError> {
     if count == 0 || count > MAX {
@@ -458,10 +471,11 @@ fn leaf<K: Ord, V>(
             .entries
             .first()
             .ok_or(invalid("empty directory page"))?;
-        if pages
-            .last()
-            .and_then(|previous| previous.entries.last())
-            .is_some_and(|previous| previous.key >= first.key)
+        if seam(index)
+            && pages
+                .last()
+                .and_then(|previous| previous.entries.last())
+                .is_some_and(|previous| previous.key >= first.key)
         {
             return Err(MemoryError::InvalidNeighbors);
         }
@@ -475,9 +489,12 @@ fn leaf<K: Ord, V>(
     }))
 }
 
+/// A node of `count` children, their heights and counts checked; their
+/// order where `seam` says the sequence is new, as for [`leaf`].
 fn branch<K: Ord, V>(
     count: usize,
     mut item: impl FnMut(usize) -> Option<Arc<Node<K, V>>>,
+    seam: impl Fn(usize) -> bool,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Arc<Node<K, V>>, MemoryError> {
     if count == 0 || count > MAX {
@@ -496,13 +513,15 @@ fn branch<K: Ord, V>(
         {
             return Err(invalid("invalid directory child height or count"));
         }
-        let first = child.first_key().ok_or(invalid("empty directory child"))?;
-        if children
-            .last()
-            .and_then(|previous| previous.last_key())
-            .is_some_and(|previous| previous >= first)
-        {
-            return Err(MemoryError::InvalidNeighbors);
+        if seam(index) {
+            let first = child.first_key().ok_or(invalid("empty directory child"))?;
+            if children
+                .last()
+                .and_then(|previous| previous.last_key())
+                .is_some_and(|previous| previous >= first)
+            {
+                return Err(MemoryError::InvalidNeighbors);
+            }
         }
         pages = checked_add(pages, child.pages)?;
         level = Some(child_level);
@@ -551,6 +570,12 @@ impl<'a, T> Splice<'a, T> {
         checked_add(self.old.len().saturating_sub(self.removed), self.count)
     }
 
+    /// Whether the pair ending at `index` is new: an inserted item, or the
+    /// old item after the span. Every other pair is the old sequence's.
+    fn seam(&self, index: usize) -> bool {
+        index >= self.at && index <= self.at.saturating_add(self.count)
+    }
+
     fn get(&self, index: usize) -> Option<&T> {
         if index < self.at {
             return self.old.get(index);
@@ -572,12 +597,25 @@ fn split_leaves<K: Ord, V>(
 ) -> Result<Split<K, V>, MemoryError> {
     let count = items.len()?;
     if count <= MAX {
-        return Ok((leaf(count, |i| items.get(i).map(Arc::clone), build)?, None));
+        return Ok((
+            leaf(
+                count,
+                |i| items.get(i).map(Arc::clone),
+                |i| items.seam(i),
+                build,
+            )?,
+            None,
+        ));
     }
     if count != checked_add(MAX, 1)? {
         return Err(invalid("directory split width exceeded"));
     }
-    let left = leaf(MIN, |i| items.get(i).map(Arc::clone), build)?;
+    let left = leaf(
+        MIN,
+        |i| items.get(i).map(Arc::clone),
+        |i| items.seam(i),
+        build,
+    )?;
     let right = leaf(
         count.saturating_sub(MIN),
         |i| {
@@ -585,6 +623,7 @@ fn split_leaves<K: Ord, V>(
                 .and_then(|i| items.get(i))
                 .map(Arc::clone)
         },
+        |i| i.checked_add(MIN).is_some_and(|i| items.seam(i)),
         build,
     )?;
     Ok((left, Some(right)))
@@ -597,14 +636,24 @@ fn split_branches<K: Ord, V>(
     let count = items.len()?;
     if count <= MAX {
         return Ok((
-            branch(count, |i| items.get(i).map(Arc::clone), build)?,
+            branch(
+                count,
+                |i| items.get(i).map(Arc::clone),
+                |i| items.seam(i),
+                build,
+            )?,
             None,
         ));
     }
     if count != checked_add(MAX, 1)? {
         return Err(invalid("directory split width exceeded"));
     }
-    let left = branch(MIN, |i| items.get(i).map(Arc::clone), build)?;
+    let left = branch(
+        MIN,
+        |i| items.get(i).map(Arc::clone),
+        |i| items.seam(i),
+        build,
+    )?;
     let right = branch(
         count.saturating_sub(MIN),
         |i| {
@@ -612,6 +661,7 @@ fn split_branches<K: Ord, V>(
                 .and_then(|i| items.get(i))
                 .map(Arc::clone)
         },
+        |i| i.checked_add(MIN).is_some_and(|i| items.seam(i)),
         build,
     )?;
     Ok((left, Some(right)))
@@ -661,14 +711,24 @@ fn replace_node<K: Ord, V>(
     match &node.links {
         Links::Leaves(pages) => {
             let items = Splice::new(pages, rank, 1, Some(page), None)?;
-            leaf(items.len()?, |i| items.get(i).map(Arc::clone), build)
+            leaf(
+                items.len()?,
+                |i| items.get(i).map(Arc::clone),
+                |i| items.seam(i),
+                build,
+            )
         }
         Links::Branches(children) => {
             let (index, rank) = child_at(children, rank, false)?;
             let child = children.get(index).ok_or(MemoryError::MissingKey)?;
             let child = replace_node(child, rank, page, build)?;
             let items = Splice::new(children, index, 1, Some(child), None)?;
-            branch(items.len()?, |i| items.get(i).map(Arc::clone), build)
+            branch(
+                items.len()?,
+                |i| items.get(i).map(Arc::clone),
+                |i| items.seam(i),
+                build,
+            )
         }
     }
 }
@@ -687,6 +747,7 @@ fn remove_node<K: Ord, V>(
             Ok(Some(leaf(
                 items.len()?,
                 |i| items.get(i).map(Arc::clone),
+                |i| items.seam(i),
                 build,
             )?))
         }
@@ -706,6 +767,7 @@ fn remove_node<K: Ord, V>(
             Ok(Some(branch(
                 items.len()?,
                 |i| items.get(i).map(Arc::clone),
+                |i| items.seam(i),
                 build,
             )?))
         }
@@ -770,6 +832,7 @@ fn redistribute<K: Ord, V>(
             let first = leaf(
                 first_count,
                 |i| joined(left, right, i).map(Arc::clone),
+                |_| true,
                 build,
             )?;
             let second = if second_count == 0 {
@@ -782,6 +845,7 @@ fn redistribute<K: Ord, V>(
                             .and_then(|i| joined(left, right, i))
                             .map(Arc::clone)
                     },
+                    |_| true,
                     build,
                 )?)
             };
@@ -791,6 +855,7 @@ fn redistribute<K: Ord, V>(
             let first = branch(
                 first_count,
                 |i| joined(left, right, i).map(Arc::clone),
+                |_| true,
                 build,
             )?;
             let second = if second_count == 0 {
@@ -803,6 +868,7 @@ fn redistribute<K: Ord, V>(
                             .and_then(|i| joined(left, right, i))
                             .map(Arc::clone)
                     },
+                    |_| true,
                     build,
                 )?)
             };

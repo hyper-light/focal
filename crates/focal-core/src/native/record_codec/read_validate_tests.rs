@@ -166,7 +166,7 @@ fn zero_prefix_rejects_a_fabricated_meta_row_and_discards_detached_state() {
     .insert_phase(
         1,
         std::iter::once(Ok(Entry::new(Key::Meta, Meta::default(), 0))),
-        |_, _, meta, _| Ok((Row::Meta(meta), 0)),
+        |_, _, meta, _| Ok((Row::Meta(Box::new(meta)), 0)),
         prepare::copy,
     )
     .unwrap();

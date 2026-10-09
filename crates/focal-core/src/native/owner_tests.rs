@@ -360,7 +360,9 @@ fn retained_neighbor_copy_failure_keeps_the_entire_existing_chain_and_refunds_ca
     let mut owner = NativeOwner::new(core).unwrap();
     let (first, first_outcome) = stage(&mut owner, 30, creation(3, 3, &[], None));
     let before = budget.stats();
-    let failed = super::super::prepare::fail_copies_after(1, || {
+    // The first retained neighbor this write copies fails: how many it copies depends on
+    // the page layout (the entry width), the rollback it must leave does not.
+    let failed = super::super::prepare::fail_copies_after(0, || {
         owner.prepare(context(ISSUER, 900), creation(4, 4, &[], None), None)
     });
     assert!(matches!(

@@ -216,7 +216,7 @@ impl HistoryIndex {
             let Row::Event(stored) = &row.value else {
                 return Err(invalid());
             };
-            let event = stored.get().ok_or_else(invalid)?.expand(read.ledger);
+            let event = stored.get(read.ledger).ok_or_else(invalid)?;
             if event.sequence != sequence
                 || event.ordinal != ordinal
                 || sequence.0 == 0

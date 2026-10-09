@@ -698,8 +698,7 @@ impl CompletionBook {
             .get(&Key::Event(prepared.outcome.sequence, ordinal))
         {
             Some(Row::Event(event)) => event
-                .get()
-                .map(|row| row.expand(prepared.outcome.ledger))
+                .get(prepared.outcome.ledger)
                 .ok_or(ContractError::InvalidCut.into()),
             _ => Err(ContractError::InvalidCut.into()),
         }

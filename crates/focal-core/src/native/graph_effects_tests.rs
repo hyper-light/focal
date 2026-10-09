@@ -266,7 +266,7 @@ fn incomplete_reverse_links_and_closure_limits_refuse_without_partial_publicatio
             let Some(Row::IncomingHead(head)) = view.get(Key::IncomingHead(id)) else {
                 panic!("head")
             };
-            let mut head = *head;
+            let mut head = **head;
             head.count += 1;
             let bad = core
                 .state
@@ -275,7 +275,7 @@ fn incomplete_reverse_links_and_closure_limits_refuse_without_partial_publicatio
                     core.state.rows.prefix() + 1,
                     vec![Change::Put(Entry::new(
                         Key::IncomingHead(id),
-                        Row::IncomingHead(head),
+                        Row::IncomingHead(Box::new(head)),
                         0,
                     ))],
                     BudgetLane::Completion,

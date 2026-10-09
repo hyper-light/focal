@@ -94,20 +94,80 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
             copy_failure()?;
             row.copy().map(Row::CreationResult)
         }
-        Row::Monitor(row) => Ok(Row::Monitor(*row)),
-        Row::MonitorHead(row) => Ok(Row::MonitorHead(*row)),
-        Row::MonitorLink(row) => Ok(Row::MonitorLink(*row)),
-        Row::IncomingHead(row) => Ok(Row::IncomingHead(*row)),
+        Row::Monitor(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Monitor(Box::new(**row)))
+        }
+        Row::MonitorHead(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::MonitorHead(Box::new(**row)))
+        }
+        Row::MonitorLink(row) => {
+            #[cfg(test)]
+            if row.is_some() {
+                copy_failure()?;
+            }
+            Ok(Row::MonitorLink(row.as_deref().copied().map(Box::new)))
+        }
+        Row::IncomingHead(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::IncomingHead(Box::new(**row)))
+        }
         Row::IncomingLink(row) => Ok(Row::IncomingLink(*row)),
         Row::MissingResult(row) => row.copy().map(Row::MissingResult),
-        Row::Meta(meta) => Ok(Row::Meta(*meta)),
-        Row::Receipt(receipt) => Ok(Row::Receipt(*receipt)),
-        Row::Cycle(cycle) => Ok(Row::Cycle(*cycle)),
-        Row::RetiredCycleHead(row) => Ok(Row::RetiredCycleHead(*row)),
-        Row::Retired(row) => Ok(Row::Retired(*row)),
-        Row::Seal(row) => Ok(Row::Seal(*row)),
-        Row::Epochs(row) => row.copy().map(Row::Epochs),
-        Row::RetiredCycle(row) => Ok(Row::RetiredCycle(*row)),
+        Row::Meta(meta) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Meta(Box::new(**meta)))
+        }
+        Row::Receipt(receipt) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Receipt(Box::new(**receipt)))
+        }
+        Row::Cycle(cycle) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Cycle(Box::new(**cycle)))
+        }
+        Row::RetiredCycleHead(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::RetiredCycleHead(Box::new(**row)))
+        }
+        Row::Retired(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Retired(Box::new(**row)))
+        }
+        Row::Seal(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Seal(Box::new(**row)))
+        }
+        Row::Epochs(row) => {
+            #[cfg(test)]
+            copy_failure()?;
+            row.copy().map(|row| Row::Epochs(Box::new(row)))
+        }
+        Row::RetiredCycle(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::RetiredCycle(Box::new(**row)))
+        }
         Row::WorkSlot(id) => Ok(Row::WorkSlot(*id)),
         Row::ClaimResultTestament(id) => Ok(Row::ClaimResultTestament(*id)),
         Row::ResultTestament(row) => {
@@ -119,7 +179,12 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
         Row::Diagnostic(row) => row.copy().map(Row::Diagnostic),
         Row::Response(row) => row.copy().map(Row::Response),
         Row::DeliveryResult(row) => row.copy().map(Row::DeliveryResult),
-        Row::Outcome(outcome) => Ok(Row::Outcome(*outcome)),
+        Row::Outcome(outcome) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Outcome(Box::new(**outcome)))
+        }
         Row::Event(event) => {
             #[cfg(test)]
             copy_failure()?;
@@ -128,7 +193,7 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
         Row::Definition(row) => {
             #[cfg(test)]
             copy_failure()?;
-            row.copy().map(Row::Definition)
+            row.copy().map(|row| Row::Definition(Box::new(row)))
         }
         Row::Evaluation(row) => {
             #[cfg(test)]

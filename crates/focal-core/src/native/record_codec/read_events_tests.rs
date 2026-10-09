@@ -47,8 +47,8 @@ fn graph_capture_preserves_exact_exclusive_boundary_and_refuses_impossible_prove
     let bytes = encoded(value);
     // Independent literal suffix: Some tag, then the exclusive u32 LE cut.
     assert_eq!(&bytes[bytes.len() - 5..], &[1, 17, 0, 0, 0]);
-    let packed = crate::native::history::StoredEvent::pack(value).unwrap();
-    assert_eq!(packed.expand(f::ledger()), value);
+    let held = crate::native::OwnedEvent::new(value, f::ledger()).unwrap();
+    assert_eq!(held.get(f::ledger()), Some(value));
     let NativeFact::Claim(mut claim) = value.fact else {
         panic!("claim");
     };
@@ -58,17 +58,20 @@ fn graph_capture_preserves_exact_exclusive_boundary_and_refuses_impossible_prove
             fact: NativeFact::Claim(claim),
             ..value
         };
-        assert!(crate::native::history::StoredEvent::pack(invalid).is_err());
+        assert!(crate::native::OwnedEvent::new(invalid, f::ledger()).is_err());
         let mut sink = CountingSink::new(usize::MAX, usize::MAX);
         assert!(events::event(&mut sink, invalid).is_err());
     }
     claim.graph = Some(NativeGraphCapture { before_ordinal: 0 });
     claim.kind = NativeEventKind::Posted;
     assert!(
-        crate::native::history::StoredEvent::pack(NativeEvent {
-            fact: NativeFact::Claim(claim),
-            ..value
-        })
+        crate::native::OwnedEvent::new(
+            NativeEvent {
+                fact: NativeFact::Claim(claim),
+                ..value
+            },
+            f::ledger()
+        )
         .is_err()
     );
     let mut invalid = bytes;
@@ -381,4 +384,93 @@ fn actual_published_events_roundtrip_and_parser_preserves_its_outer_boundary() {
     reject_tag!(claim_kind);
     reject_tag!(evaluation_kind);
     reject_tag!(monitor);
+}
+
+/// Every event field is fixed-width per variant, so the widest event is the
+/// widest invocation framing the widest fact. Each must fit the row
+/// reservation (`OwnedEvent::container_charge`), held with its ledger implied.
+#[test]
+fn the_widest_event_fits_the_retained_row_reservation() {
+    let key = EvaluationKey {
+        target: EvaluationTarget::Work {
+            response: TestamentId::from_u128(3),
+            slot: u32::MAX,
+            artifact: ArtifactId::from_u128(5),
+        },
+        ..f::key(1)
+    };
+    let invocation = NativeInvocation::EvaluationDeadline(NativeDeadlineKey {
+        evaluation: key,
+        timer: TimerId::from_u128(7),
+        generation: u64::MAX,
+    });
+    let fence = validation::AuthorityFence {
+        reason: validation::FenceReason::Deadline(Deadline {
+            timer: TimerId::from_u128(11),
+            generation: u64::MAX,
+            at: u64::MAX,
+        }),
+        cause: ContentHash([13; 32]),
+    };
+    let widest_monitor = NativeEventKind::Monitor(NativeMonitorEvent::Rebound {
+        id: MonitorId::from_u128(2),
+        change: scope::Rebinding {
+            predecessor: ClaimId::from_u128(3),
+            successor: ClaimId::from_u128(4),
+            cut: cut(),
+        },
+    });
+    let facts = [
+        NativeFact::Evaluation {
+            kind: NativeEvaluationEventKind::Reported,
+            key,
+            before: Some(f::binding(13)),
+            after: f::binding(14),
+            state: validation::State::ErroredNotRequired,
+            phase: validation::Phase::Quality,
+            attempt: Some(attempt()),
+            fence: Some(fence),
+        },
+        NativeFact::Claim(NativeClaimEvent {
+            // A graph capture is a monitor-free kind's; it is narrower.
+            graph: None,
+            kind: widest_monitor,
+            owned_child: Some(f::binding(9)),
+            before: Some(f::binding(10)),
+            after: f::binding(11),
+            status: ClaimStatus::Superseded,
+        }),
+        NativeFact::ReceiptAdopted {
+            claim: f::binding(1),
+            previous: entitlement(),
+            replacement: entitlement(),
+            cause: ContentHash([67; 32]),
+        },
+        NativeFact::Missing {
+            key: NativeResultKey {
+                evaluation: key,
+                revision: ObjectRevision(u64::MAX),
+            },
+        },
+    ];
+    for fact in facts {
+        let value = NativeEvent {
+            invocation,
+            sequence: SessionSeq(u64::MAX),
+            ordinal: 23,
+            fact,
+        };
+        // Written in full it is wider still; implied, it must fit the row.
+        let held = match crate::native::OwnedEvent::new(value, f::ledger()) {
+            Ok(held) => held,
+            Err(error) => panic!("{error:?} holding {value:?}"),
+        };
+        assert_eq!(held.get(f::ledger()), Some(value));
+        assert!(held.heap_charge().unwrap() <= crate::native::OwnedEvent::container_charge());
+        println!(
+            "{} written, {} held",
+            encoded(value).len(),
+            held.heap_charge().unwrap()
+        );
+    }
 }

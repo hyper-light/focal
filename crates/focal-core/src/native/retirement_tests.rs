@@ -80,7 +80,7 @@ fn events_of(core: &Core<NativeState>, claim: ClaimId) -> usize {
             let Row::Event(stored) = &entry.value else {
                 return false;
             };
-            let event = stored.get().unwrap().expand(core.state.ledger);
+            let event = stored.get(core.state.ledger).unwrap();
             record_codec::event_object(event) == Key::Claim(claim)
         })
         .count()
@@ -130,7 +130,7 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
             let Row::Event(stored) = &entry.value else {
                 return false;
             };
-            let event = stored.get().unwrap().expand(core.state.ledger);
+            let event = stored.get(core.state.ledger).unwrap();
             family.keys.contains(&record_codec::event_object(event))
         })
         .count();

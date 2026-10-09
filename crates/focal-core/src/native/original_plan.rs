@@ -357,7 +357,7 @@ impl<'source> OriginalPlan<'source> {
                 };
                 let row = OwnedClaim::new(row, registrations)?;
                 let heap_bytes = row.heap_charge()?;
-                changes.push(Change::Put(Entry::new(
+                changes.push(Change::Put(entry(
                     Key::Claim(id),
                     Row::Claim(row),
                     heap_bytes,
@@ -382,17 +382,17 @@ impl<'source> OriginalPlan<'source> {
         if changes.len().checked_add(control) != Some(count) || count > changes.capacity() {
             return Err(ContractError::InvalidManifest.into());
         }
-        changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
-        changes.push(Change::Put(Entry::new(
+        changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
+        changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(OutcomeRow::stored(&outcome, view.ledger())?),
+            Row::Outcome(Box::new(OutcomeRow::stored(&outcome, view.ledger())?)),
             0,
         )));
         if let Some((principal, window)) = window {
             let heap = window.heap_charge()?;
-            changes.push(Change::Put(Entry::new(
+            changes.push(Change::Put(entry(
                 Key::Epochs(principal),
-                Row::Epochs(window),
+                Row::Epochs(Box::new(window)),
                 heap,
             )));
         }

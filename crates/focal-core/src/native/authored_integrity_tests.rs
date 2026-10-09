@@ -43,7 +43,7 @@ fn reconstruction_requires_actual_bodies_indices_and_authored_definition_variant
                 .unwrap();
                 Change::Put(Entry::new(
                     Key::Definition(ValidationId::from_u128(1)),
-                    Row::Definition(owned),
+                    Row::Definition(Box::new(owned)),
                     OwnedDeclaration::container_charge(),
                 ))
             }

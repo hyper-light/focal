@@ -578,13 +578,13 @@ fn report_changes(
             continue;
         }
         let row = match &entry.value {
-            Row::Meta(row) => Row::Meta(*row),
+            Row::Meta(row) => Row::Meta(Box::new(**row)),
             Row::Claim(row) => Row::Claim(row.copy().unwrap()),
             Row::Evaluation(row) => Row::Evaluation(row.copy().unwrap()),
             Row::Artifact(row) => Row::Artifact(row.copy().unwrap()),
             Row::ArtifactIdentity(row) => Row::ArtifactIdentity(*row),
             Row::Accepted(row) => Row::Accepted(row.copy().unwrap()),
-            Row::Outcome(row) => Row::Outcome(*row),
+            Row::Outcome(row) => Row::Outcome(Box::new(**row)),
             Row::Event(row) => Row::Event(row.copy().unwrap()),
             _ => panic!("unexpected report row"),
         };
@@ -669,10 +669,8 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
     else {
         panic!("actual registry seal fact")
     };
-    assert!(
-        matches!(event.get().unwrap().expand(core.state.ledger).fact,
-        NativeFact::Registrations { claim } if claim == candidate.claim(key(1).claim).unwrap().binding())
-    );
+    assert!(matches!(event.get(core.state.ledger).unwrap().fact,
+        NativeFact::Registrations { claim } if claim == candidate.claim(key(1).claim).unwrap().binding()));
     let plan = core
         .state
         .rows
@@ -720,7 +718,7 @@ fn parent_cap_and_storage_envelope_reject_another_owner() {
             other.native_sequence().0 + 1,
             vec![Change::Put(Entry::new(
                 Key::Meta,
-                Row::Meta(Meta::default()),
+                Row::Meta(Box::default()),
                 0,
             ))],
             BudgetLane::Completion,

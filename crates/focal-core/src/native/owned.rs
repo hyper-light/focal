@@ -2,7 +2,9 @@
 //! owned storage without infallible allocation, unsafe code or shared pointers.
 //! Entry already charges the inline Vec header; these charges cover allocated
 //! elements, nested heaps and allocator metadata.
-use super::history::StoredEvent;
+use super::input_codec::bytes::{CountingSink, Cursor, Error as CodecError, SliceSink};
+use super::record_codec::{EventBindings, decode_event, encode_event};
+use super::{ContractError, LedgerId, NativeError, NativeEvent, NativeFact};
 use focal_memory::MemoryError;
 use focal_model::lifecycle::{
     aggregation::RegistrationSet,
@@ -20,7 +22,12 @@ const DECLARATION_CONTAINER: usize = size_of::<Declaration>() + ALLOCATION;
 const AUTHORED_DECLARATION_CONTAINER: usize = size_of::<ValidationDescriptor>() + ALLOCATION;
 const CLAIM_CONTENT_CONTAINER: usize = size_of::<ClaimContentRow>() + ALLOCATION;
 const EVALUATION_CONTAINER: usize = size_of::<EvaluationState>() + ALLOCATION;
-const EVENT_CONTAINER: usize = size_of::<StoredEvent>() + ALLOCATION;
+/// The widest retained event's encoding with its ledger implied (every fact
+/// field is fixed-width, so the bound is finite; `owned_tests` proves each
+/// fact's widest form within it), and the codec visits that many bytes take.
+const EVENT_BYTES: usize = 504;
+const EVENT_VISITS: usize = 4 * EVENT_BYTES;
+const EVENT_CONTAINER: usize = EVENT_BYTES + ALLOCATION;
 
 #[derive(Debug)]
 struct ClaimRow {
@@ -52,7 +59,9 @@ pub(super) struct OwnedClaimContent(Vec<ClaimContentRow>);
 #[derive(Debug)]
 pub(super) struct OwnedEvaluation(Vec<EvaluationState>);
 #[derive(Debug)]
-pub(super) struct OwnedEvent(Vec<StoredEvent>);
+/// A retained event as its record encoding with the ledger implied by the
+/// range, allocated at exactly its own length.
+pub(super) struct OwnedEvent(Vec<u8>);
 
 fn add(left: usize, right: usize) -> Result<usize, MemoryError> {
     left.checked_add(right)
@@ -397,24 +406,75 @@ impl OwnedEvaluation {
 }
 
 impl OwnedEvent {
+    /// The most one event row can charge: what a write envelope reserves.
     pub(super) const fn container_charge() -> usize {
         EVENT_CONTAINER
     }
-    pub(super) fn new(event: StoredEvent) -> Result<Self, MemoryError> {
-        Ok(Self(singleton(event, Self::container_charge())?))
+    /// Hold `event` under `ledger`. Every binding it names must be under that
+    /// ledger, and a claim fact's graph capture must name an earlier ordinal.
+    pub(super) fn new(event: NativeEvent, ledger: LedgerId) -> Result<Self, NativeError> {
+        if let NativeFact::Claim(row) = event.fact {
+            row.check_graph_capture(event.ordinal)?;
+        }
+        if !super::history::under(event, ledger) {
+            return Err(ContractError::WrongLedger.into());
+        }
+        let bindings = EventBindings::Implied(ledger);
+        let len = Self::held_len(event, bindings)?;
+        within(container_heap::<u8>(len)?, EVENT_CONTAINER)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        within(container_heap::<u8>(bytes.capacity())?, EVENT_CONTAINER)?;
+        // Within the reserved capacity: no reallocation.
+        bytes.resize(len, 0);
+        let mut sink = SliceSink::new(&mut bytes, EVENT_VISITS);
+        encode_event(&mut sink, event, bindings).map_err(event_codec)?;
+        sink.finish().map_err(event_codec)?;
+        Ok(Self(bytes))
     }
-    pub(super) fn get(&self) -> Option<&StoredEvent> {
-        get(&self.0)
+    /// Exactly what [`Self::new`] charges for `event` under `ledger`, without
+    /// allocating: what a recovery plan quotes before building the row.
+    pub(super) fn charge_for(event: NativeEvent, ledger: LedgerId) -> Result<usize, NativeError> {
+        let len = Self::held_len(event, EventBindings::Implied(ledger))?;
+        Ok(container_heap::<u8>(len)?)
+    }
+    fn held_len(event: NativeEvent, bindings: EventBindings) -> Result<usize, NativeError> {
+        let mut count = CountingSink::new(EVENT_BYTES, EVENT_VISITS);
+        encode_event(&mut count, event, bindings).map_err(event_codec)?;
+        Ok(count.len())
+    }
+    /// The event, its bindings under `ledger`; `None` if the bytes do not
+    /// decode to exactly one event.
+    pub(super) fn get(&self, ledger: LedgerId) -> Option<NativeEvent> {
+        let mut cursor = Cursor::new(&self.0, EVENT_BYTES, EVENT_VISITS).ok()?;
+        let event = decode_event(&mut cursor, EventBindings::Implied(ledger)).ok()?;
+        cursor.finish().ok()?;
+        Some(event)
     }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        self.get().ok_or(MemoryError::MissingKey)?;
-        container_heap::<StoredEvent>(self.0.capacity())
+        if self.0.is_empty() {
+            return Err(MemoryError::MissingKey);
+        }
+        container_heap::<u8>(self.0.capacity())
     }
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
         let old = self.heap_charge()?;
-        let copied = Self::new(*self.get().ok_or(MemoryError::MissingKey)?)?;
-        within(copied.heap_charge()?, old)?;
-        Ok(copied)
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.0.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        within(container_heap::<u8>(bytes.capacity())?, old)?;
+        bytes.extend_from_slice(&self.0);
+        Ok(Self(bytes))
+    }
+}
+fn event_codec(error: CodecError) -> NativeError {
+    match error {
+        CodecError::Capacity => NativeError::Capacity("event row"),
+        CodecError::Allocation => NativeError::Memory(MemoryError::AllocationFailed),
+        _ => NativeError::Contract(ContractError::InvalidManifest),
     }
 }
 

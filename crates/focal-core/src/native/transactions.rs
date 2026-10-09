@@ -316,7 +316,7 @@ pub(super) fn prepare(
                 let heap = row.heap_charge()?;
                 extras.push(prepare::Extra {
                     key: Key::Definition(ValidationId(binding.object.0)),
-                    row: Row::Definition(row),
+                    row: Row::Definition(Box::new(row)),
                     heap,
                     fact: Some(fact),
                 })?;

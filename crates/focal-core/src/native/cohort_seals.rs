@@ -455,7 +455,7 @@ impl CohortSeals {
             };
             let owned = OwnedClaim::new(claim, registrations)?;
             let heap = owned.heap_charge()?;
-            put(changes, Entry::new(Key::Claim(id), Row::Claim(owned), heap))?;
+            put(changes, entry(Key::Claim(id), Row::Claim(owned), heap))?;
         }
         if original_registries.next().is_some() || sealed_registries.next().is_some() {
             return Err(ContractError::InvalidTarget.into());
@@ -472,7 +472,7 @@ impl CohortSeals {
                 // now drop the old container and install the checked sealed row.
                 continue;
             }
-            put(changes, Entry::new(extra.key, extra.row, extra.heap))?;
+            put(changes, entry(extra.key, extra.row, extra.heap))?;
         }
         for update in self.updates {
             self.visits.take(1)?;
@@ -486,7 +486,7 @@ impl CohortSeals {
             within(heap, OwnedEvaluation::container_charge())?;
             put(
                 changes,
-                Entry::new(Key::Evaluation(update.key), Row::Evaluation(owned), heap),
+                entry(Key::Evaluation(update.key), Row::Evaluation(owned), heap),
             )?;
         }
         Ok(self.tokens)

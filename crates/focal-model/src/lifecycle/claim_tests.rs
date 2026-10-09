@@ -1775,3 +1775,26 @@ fn receipt_requires_the_complete_pinned_admission_policy() {
     );
     assert_eq!(claim, before);
 }
+
+/// Measurement, not a check: the inline width of each `ClaimState` field.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_claim_state_field_widths() {
+    use std::mem::size_of;
+    for (name, width) in [
+        ("ClaimState", size_of::<ClaimState>()),
+        ("binding", size_of::<Binding>()),
+        ("graph", size_of::<graph::Declaration>()),
+        ("lineage", size_of::<succession::Lineage>()),
+        ("acceptance", size_of::<aggregation::AcceptancePolicy>()),
+        ("scopes", size_of::<scope::Registry>()),
+        ("status", size_of::<ClaimStatus>()),
+        ("receipt", size_of::<Option<ReceiptEntitlement>>()),
+        ("responses", size_of::<Vec<ResponseRecord>>()),
+        ("deadline", size_of::<Option<Deadline>>()),
+        ("terminal_cut", size_of::<Option<ClaimTerminalCut>>()),
+        ("origin", size_of::<ClaimOrigin>()),
+    ] {
+        println!("{name:<14} {width}");
+    }
+}

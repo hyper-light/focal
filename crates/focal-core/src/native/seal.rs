@@ -10,7 +10,7 @@
 //! bounds of the derivation, never the rows.
 use super::prepare::{Scratch, add, within};
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::Change;
 use focal_model::RequestEpoch;
 
 /// The most bytes one seal bundle takes: the archive read's bound
@@ -168,7 +168,7 @@ impl Core<NativeState> {
     }
     fn meta_row(&self) -> Meta {
         match self.state.rows.get(&Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
+            Some(Row::Meta(meta)) => **meta,
             _ => Meta::default(),
         }
     }
@@ -188,7 +188,7 @@ impl Core<NativeState> {
             .next()
             .and_then(|entry| match (entry.key, &entry.value) {
                 (Key::Seal(key), Row::Seal(row)) if row.first <= ordinal && ordinal <= key => {
-                    Some((key, *row))
+                    Some((key, **row))
                 }
                 _ => None,
             })
@@ -211,7 +211,7 @@ impl Core<NativeState> {
             if rows.len() == rows.capacity() {
                 return Err(NativeError::Capacity("seal rows"));
             }
-            rows.push((ordinal, *row));
+            rows.push((ordinal, **row));
         }
         Ok(rows)
     }
@@ -222,7 +222,7 @@ impl Core<NativeState> {
             .rows
             .entries_from(&Key::Epochs(ZERO), false)
             .map_while(|entry| match (entry.key, &entry.value) {
-                (Key::Epochs(principal), Row::Epochs(window)) => Some((principal, window)),
+                (Key::Epochs(principal), Row::Epochs(window)) => Some((principal, &**window)),
                 _ => None,
             })
     }
@@ -466,7 +466,7 @@ impl Core<NativeState> {
             if row.first != expected || members.len() == members.capacity() {
                 return Err(SealRefusal::Corrupt);
             }
-            members.push((ordinal, *row));
+            members.push((ordinal, **row));
             expected = ordinal.checked_add(1).ok_or(SealRefusal::Corrupt)?;
         }
         if members.len() < 2 || members.last().is_none_or(|(ordinal, _)| *ordinal != last) {
@@ -721,9 +721,9 @@ impl Core<NativeState> {
         }
         for (principal, window) in windows {
             let heap = window.heap_charge()?;
-            changes.push(Change::Put(Entry::new(
+            changes.push(Change::Put(entry(
                 Key::Epochs(principal),
-                Row::Epochs(window),
+                Row::Epochs(Box::new(window)),
                 heap,
             )));
         }
@@ -736,29 +736,29 @@ impl Core<NativeState> {
             let Some(folded) = record.fold else {
                 return Err(corrupt());
             };
-            changes.push(Change::Put(Entry::new(
+            changes.push(Change::Put(entry(
                 Key::Seal(fold.last),
-                Row::Seal(SealRow {
+                Row::Seal(Box::new(SealRow {
                     bundle: folded.bundle,
                     bytes: folded.bytes,
                     through: fold.through,
                     count: fold.count,
                     sealed_at: sequence,
                     first: fold.first,
-                }),
+                })),
                 0,
             )));
         }
-        changes.push(Change::Put(Entry::new(
+        changes.push(Change::Put(entry(
             Key::Seal(plan.ordinal),
-            Row::Seal(SealRow {
+            Row::Seal(Box::new(SealRow {
                 bundle: record.bundle,
                 bytes: record.bytes,
                 through: plan.through,
                 count: record.count,
                 sealed_at: sequence,
                 first: plan.ordinal,
-            }),
+            })),
             0,
         )));
         meta.sealed = add(meta.sealed, plan.outcomes())?;
@@ -798,10 +798,10 @@ impl Core<NativeState> {
             result_testaments: 0,
             events: 0,
         };
-        changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
-        changes.push(Change::Put(Entry::new(
+        changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
+        changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(OutcomeRow::stored(&outcome, self.state.ledger)?),
+            Row::Outcome(Box::new(OutcomeRow::stored(&outcome, self.state.ledger)?)),
             0,
         )));
         let left = plan.keys.len();

@@ -89,7 +89,7 @@ fn declares(claim: &ClaimState, target: ClaimId, visits: &mut Visits) -> Result<
 fn head(view: &View<'_>, target: ClaimId) -> Result<IncomingHead, ContractError> {
     match view.get(Key::IncomingHead(target)) {
         None => Ok(IncomingHead::default()),
-        Some(Row::IncomingHead(head)) if head.head.is_some() == (head.count != 0) => Ok(*head),
+        Some(Row::IncomingHead(head)) if head.head.is_some() == (head.count != 0) => Ok(**head),
         _ => Err(ContractError::InvalidManifest),
     }
 }
@@ -368,7 +368,7 @@ pub(super) fn stage_created(
         }
         extras.push(Extra {
             key: Key::IncomingHead(head.target),
-            row: Row::IncomingHead(head.result),
+            row: Row::IncomingHead(Box::new(head.result)),
             heap: 0,
             fact: None,
         })?;

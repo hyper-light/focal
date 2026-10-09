@@ -74,37 +74,40 @@ fn outcome_row(
     if outcome.invocation != invocation {
         return Err(invalid());
     }
-    Ok(Row::Outcome(row))
+    Ok(Row::Outcome(Box::new(row)))
 }
 
 fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError> {
     Ok(Some(match key {
-        Key::IncomingHead(_) => Row::IncomingHead(incoming_graph::IncomingHead {
+        Key::IncomingHead(_) => Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
             head: optional_id(c)?.map(ClaimId),
             count: count(c)?,
-        }),
+        })),
         Key::IncomingLink(..) => Row::IncomingLink(incoming_graph::IncomingLink {
             next: optional_id(c)?.map(ClaimId),
         }),
-        Key::Monitor(_) => Row::Monitor(monitor_index::MonitorAllocation {
+        Key::Monitor(_) => Row::Monitor(Box::new(monitor_index::MonitorAllocation {
             owner: f::binding(c)?,
             registered: f::sequence(c)?,
             deadline: f::deadline(c)?,
-        }),
-        Key::MonitorHead(_) => Row::MonitorHead(monitor_index::MonitorHead {
+        })),
+        Key::MonitorHead(_) => Row::MonitorHead(Box::new(monitor_index::MonitorHead {
             head: optional_id(c)?.map(MonitorId),
             count: count(c)?,
-        }),
-        Key::MonitorLink(..) => Row::MonitorLink(f::optional(c, |c| {
-            Ok(monitor_index::MonitorLink {
-                owner: ClaimId(c.fixed()?),
-                registered: f::sequence(c)?,
-                stamp: f::sequence(c)?,
-                previous: optional_id(c)?.map(MonitorId),
-                next: optional_id(c)?.map(MonitorId),
-            })
-        })?),
-        Key::Meta => Row::Meta(Meta {
+        })),
+        Key::MonitorLink(..) => Row::MonitorLink(
+            f::optional(c, |c| {
+                Ok(monitor_index::MonitorLink {
+                    owner: ClaimId(c.fixed()?),
+                    registered: f::sequence(c)?,
+                    stamp: f::sequence(c)?,
+                    previous: optional_id(c)?.map(MonitorId),
+                    next: optional_id(c)?.map(MonitorId),
+                })
+            })?
+            .map(Box::new),
+        ),
+        Key::Meta => Row::Meta(Box::new(Meta {
             claims: count(c)?,
             outcomes: count(c)?,
             events: count(c)?,
@@ -124,28 +127,28 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
             seals: count(c)?,
             principals: count(c)?,
             logical_time: c.u64()?,
-        }),
-        Key::Seal(_) => Row::Seal(fixed::read_seal_row(c)?),
+        })),
+        Key::Seal(_) => Row::Seal(Box::new(fixed::read_seal_row(c)?)),
         Key::ArtifactIdentity(_) => Row::ArtifactIdentity(ArtifactId(c.fixed()?)),
-        Key::Receipt(_) => Row::Receipt(NativeReceipt {
+        Key::Receipt(_) => Row::Receipt(Box::new(NativeReceipt {
             claim: ClaimId(c.fixed()?),
             fence: f::receipt(c)?,
             holder: f::participant(c)?,
             acquired: f::sequence(c)?,
-        }),
-        Key::Cycle(_) => Row::Cycle(NativeCycle {
+        })),
+        Key::Cycle(_) => Row::Cycle(Box::new(NativeCycle {
             work_head: optional_id(c)?.map(ArtifactId),
             work_count: count(c)?,
             diagnostic_head: optional_id(c)?.map(ArtifactId),
             diagnostic_count: count(c)?,
             response: optional_id(c)?.map(TestamentId),
-        }),
-        Key::RetiredCycleHead(_) => Row::RetiredCycleHead(RetiredCycleHead {
+        })),
+        Key::RetiredCycleHead(_) => Row::RetiredCycleHead(Box::new(RetiredCycleHead {
             head: optional_cycle(c)?,
             count: count(c)?,
             work_count: count(c)?,
-        }),
-        Key::Retired(_) => Row::Retired(RetiredClaim {
+        })),
+        Key::Retired(_) => Row::Retired(Box::new(RetiredClaim {
             bundle: read_fields::hash(c)?,
             bytes: c.u64()?,
             through: SessionSeq(c.u64()?),
@@ -153,11 +156,11 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
             status: read_fields::claim_status(c)?,
             retired_at: SessionSeq(c.u64()?),
             events: c.u32()?,
-        }),
-        Key::RetiredCycle(_) => Row::RetiredCycle(RetiredCycle {
+        })),
+        Key::RetiredCycle(_) => Row::RetiredCycle(Box::new(RetiredCycle {
             holder: f::participant(c)?,
             next: optional_cycle(c)?,
-        }),
+        })),
         Key::WorkSlot(..) => Row::WorkSlot(ArtifactId(c.fixed()?)),
         Key::ClaimResultTestament(_) => Row::ClaimResultTestament(TestamentId(c.fixed()?)),
         // Read by `outcome_row`, which checks what the row does not keep.
@@ -280,7 +283,7 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
         (Key::MonitorLink(target, id), Row::MonitorLink(row)) => {
             !target.is_zero()
                 && !id.is_zero()
-                && row.is_none_or(|row| {
+                && row.as_deref().is_none_or(|row| {
                     !row.owner.is_zero()
                         && row.registered.0 != 0
                         && row.stamp >= row.registered
@@ -450,7 +453,9 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
 /// Event body parsing, intrinsic checks and compact packing are allocation-free.
 /// The plan carries the exact original publication fact, without reexecuting it.
 pub(super) struct EventPlan {
-    event: history::StoredEvent,
+    event: NativeEvent,
+    ledger: LedgerId,
+    heap: usize,
 }
 
 impl EventPlan {
@@ -474,14 +479,15 @@ impl EventPlan {
             return Err(invalid());
         }
         check_event(event, ledger)?;
-        let packed = history::StoredEvent::pack(event)?;
-        if packed.expand(ledger) != event {
-            return Err(ContractError::WrongLedger.into());
-        }
-        Ok(Self { event: packed })
+        let heap = OwnedEvent::charge_for(event, ledger)?;
+        Ok(Self {
+            event,
+            ledger,
+            heap,
+        })
     }
     pub(super) const fn heap_bytes(&self) -> usize {
-        OwnedEvent::container_charge()
+        self.heap
     }
     pub(super) const fn build_visits(&self) -> usize {
         EVENT_BUILD_VISITS
@@ -494,7 +500,7 @@ impl EventPlan {
         if self.heap_bytes() > allowance || self.build_visits() > max_visits {
             return Err(ContractError::Capacity.into());
         }
-        let row = OwnedEvent::new(self.event)?;
+        let row = OwnedEvent::new(self.event, self.ledger)?;
         let actual = row.heap_charge()?;
         if actual > allowance {
             return Err(ContractError::Capacity.into());
@@ -586,7 +592,7 @@ impl<'a> EpochsPlan<'a> {
         if actual > allowance {
             return Err(ContractError::Capacity.into());
         }
-        Ok((Row::Epochs(window), actual))
+        Ok((Row::Epochs(Box::new(window)), actual))
     }
 }
 fn check_event(event: NativeEvent, ledger: LedgerId) -> Result<(), NativeError> {

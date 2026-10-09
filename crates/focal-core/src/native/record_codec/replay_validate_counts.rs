@@ -78,7 +78,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
             && read.base.0.checked_add(1) == Some(read.outcome.sequence.0),
     )?;
     let previous = match read.before(Key::Meta)? {
-        Some(Row::Meta(value)) if read.base.0 != 0 => *value,
+        Some(Row::Meta(value)) if read.base.0 != 0 => **value,
         None if read.base.0 == 0 => Meta::default(),
         _ => return Err(invalid()),
     };
@@ -141,7 +141,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
                     require(read.outcome.operation == NativeOperation::AdvanceEpochFloor)?;
                     expected.advance(after.floor)?;
                 }
-                require(*after == expected)?;
+                require(**after == expected)?;
             }
             (Key::Outcome(invocation), Row::Outcome(value)) => {
                 require(
@@ -152,7 +152,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
             }
             (Key::Event(sequence, ordinal), Row::Event(value)) => {
                 require(sequence == read.outcome.sequence && ordinal < read.outcome.events)?;
-                let value = value.get().ok_or_else(invalid)?.expand(read.ledger);
+                let value = value.get(read.ledger).ok_or_else(invalid)?;
                 require(
                     value.sequence == sequence
                         && value.ordinal == ordinal

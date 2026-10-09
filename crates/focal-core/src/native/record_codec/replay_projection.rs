@@ -111,7 +111,7 @@ impl<O: Overlay> WholeWorkView for Rows<'_, '_, '_, O> {
                     count: 0,
                     work_count: 0,
                 },
-                Some(Row::RetiredCycleHead(value)) => *value,
+                Some(Row::RetiredCycleHead(value)) => **value,
                 _ => return Err(invalid()),
             };
             require((retired.count == 0) == retired.head.is_none())?;
@@ -265,7 +265,7 @@ impl<O: Overlay> WholeWorkView for Rows<'_, '_, '_, O> {
                         };
                     let value = match self.read.get(Key::Cycle(key))? {
                         None if optional => continue,
-                        Some(Row::Cycle(value)) => *value,
+                        Some(Row::Cycle(value)) => **value,
                         _ => return Err(invalid()),
                     };
                     if value.work_count > self.read.limits.work_artifacts_per_cycle

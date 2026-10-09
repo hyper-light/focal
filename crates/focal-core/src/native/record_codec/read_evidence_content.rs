@@ -280,7 +280,12 @@ impl DefinitionPlan<'_, '_> {
             }
         };
         let actual = owned.heap_charge()?;
-        finish(Row::Definition(owned), actual, self.quote, max_bytes)
+        finish(
+            Row::Definition(Box::new(owned)),
+            actual,
+            self.quote,
+            max_bytes,
+        )
     }
 }
 

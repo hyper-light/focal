@@ -65,7 +65,7 @@ fn window(core: &Core<NativeState>, actor: ParticipantId) -> EpochWindow {
 }
 fn meta(core: &Core<NativeState>) -> Meta {
     match core.state.rows.get(&Key::Meta) {
-        Some(Row::Meta(meta)) => *meta,
+        Some(Row::Meta(meta)) => **meta,
         _ => panic!("meta row"),
     }
 }

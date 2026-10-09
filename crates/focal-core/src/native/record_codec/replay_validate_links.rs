@@ -65,7 +65,7 @@ pub(super) fn check<O: Overlay>(
     match (key, value) {
         (Key::IncomingHead(target), Row::IncomingHead(head)) => {
             let previous = match read.before(key)? {
-                Some(Row::IncomingHead(head)) => *head,
+                Some(Row::IncomingHead(head)) => **head,
                 None => incoming_graph::IncomingHead::default(),
                 _ => return Err(invalid()),
             };
@@ -96,7 +96,7 @@ pub(super) fn check<O: Overlay>(
         }
         (Key::Cycle(key), Row::Cycle(cycle)) => {
             let previous = match read.before(Key::Cycle(key))? {
-                Some(Row::Cycle(value)) => *value,
+                Some(Row::Cycle(value)) => **value,
                 None => NativeCycle::default(),
                 _ => return Err(invalid()),
             };
@@ -179,7 +179,7 @@ pub(super) fn check<O: Overlay>(
         (Key::Diagnostic(_), Row::Diagnostic(_)) => count(&mut counts.diagnostic, 1)?,
         (Key::RetiredCycleHead(claim), Row::RetiredCycleHead(head)) => {
             let previous = match read.before(key)? {
-                Some(Row::RetiredCycleHead(value)) => *value,
+                Some(Row::RetiredCycleHead(value)) => **value,
                 None => RetiredCycleHead {
                     head: None,
                     count: 0,
@@ -243,9 +243,9 @@ pub(super) fn check<O: Overlay>(
             })?;
             require(found)?;
         }
-        (Key::MonitorHead(target), Row::MonitorHead(head)) => monitor_head(target, *head, read)?,
+        (Key::MonitorHead(target), Row::MonitorHead(head)) => monitor_head(target, **head, read)?,
         (Key::MonitorLink(target, id), Row::MonitorLink(link)) => {
-            monitor_link(target, id, *link, read)?
+            monitor_link(target, id, link.as_deref().copied(), read)?
         }
         _ => (),
     }
@@ -257,7 +257,7 @@ fn monitor_head<O: Overlay>(
     read: &ReplayRead<'_, '_, O>,
 ) -> Result<(), NativeError> {
     let old = match read.before(Key::MonitorHead(target))? {
-        Some(Row::MonitorHead(value)) => *value,
+        Some(Row::MonitorHead(value)) => **value,
         None => monitor_index::MonitorHead::default(),
         _ => return Err(invalid()),
     };
@@ -302,7 +302,7 @@ fn monitor_link<O: Overlay>(
     read: &ReplayRead<'_, '_, O>,
 ) -> Result<(), NativeError> {
     let old = match read.before(Key::MonitorLink(target_id, id))? {
-        Some(Row::MonitorLink(value)) => *value,
+        Some(Row::MonitorLink(value)) => value.as_deref().copied(),
         None => None,
         _ => return Err(invalid()),
     };

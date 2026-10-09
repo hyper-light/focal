@@ -334,7 +334,7 @@ pub(in crate::native) fn prepare(
                 extras.push(super::super::prepare::Extra {
                     key: Key::Definition(ValidationId(binding.object.0)),
                     heap: owned.heap_charge()?,
-                    row: Row::Definition(owned),
+                    row: Row::Definition(Box::new(owned)),
                     fact: Some(fact),
                 })?;
                 extras.push(super::super::prepare::Extra {

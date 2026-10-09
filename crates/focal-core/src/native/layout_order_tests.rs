@@ -396,3 +396,86 @@ fn the_field_comparison_of_one_family_is_the_slot_order() {
         }
     }
 }
+
+/// Identities and hashes that differ in their first byte against ones that differ in their last:
+/// the field comparison reads them most significant byte first, as the slots do, in every family
+/// whose fields are identities or hashes, nested enums included.
+#[test]
+fn the_field_comparison_reads_identities_from_their_first_byte() {
+    let ids: Vec<[u8; 16]> = vec![
+        [0; 16],
+        {
+            let mut id = [0; 16];
+            id[0] = 1;
+            id
+        },
+        {
+            let mut id = [0; 16];
+            id[15] = 2;
+            id
+        },
+        {
+            let mut id = [0xff; 16];
+            id[7] = 0;
+            id
+        },
+    ];
+    let hashes: Vec<ContentHash> = ids
+        .iter()
+        .flat_map(|low| {
+            ids.iter().map(move |high| {
+                let mut hash = [0; 32];
+                hash[..16].copy_from_slice(low);
+                hash[16..].copy_from_slice(high);
+                ContentHash(hash)
+            })
+        })
+        .collect();
+    let mut keys = Vec::new();
+    for a in &ids {
+        for b in &ids {
+            let (x, y) = (ClaimId(*a), ClaimId(*b));
+            let evaluation = EvaluationKey {
+                claim: x,
+                validation: ValidationId(*b),
+                target: EvaluationTarget::Work {
+                    response: focal_model::TestamentId(*a),
+                    slot: 1,
+                    artifact: focal_model::ArtifactId(*b),
+                },
+                generation: 1,
+            };
+            keys.extend([
+                Key::Claim(x),
+                Key::IncomingLink(x, y),
+                Key::ByIssuer(ParticipantId(*a), y),
+                Key::Evaluation(evaluation),
+                Key::Outcome(NativeInvocation::Request(RequestKey {
+                    principal: ParticipantId(*a),
+                    epoch: RequestEpoch(1),
+                    id: RequestId(*b),
+                })),
+                Key::Outcome(NativeInvocation::EvaluationDeadline(NativeDeadlineKey {
+                    evaluation,
+                    timer: focal_model::TimerId(*a),
+                    generation: 2,
+                })),
+                Key::DueTimer(3, TimerTarget::Monitor(x, focal_model::MonitorId(*b))),
+            ]);
+        }
+    }
+    for (index, hash) in hashes.iter().enumerate() {
+        let claim = ClaimId(*ids.get(index % ids.len()).unwrap());
+        keys.extend([
+            Key::ClaimIdentity(1, *hash),
+            Key::ArtifactIdentity(*hash),
+            Key::ByScope(2, *hash, claim),
+            Key::BySchema(*hash, focal_model::ArtifactId(claim.0)),
+        ]);
+    }
+    for a in &keys {
+        for b in &keys {
+            assert_eq!(a.cmp(b), order_key(a).cmp(&order_key(b)), "{a:?} vs {b:?}");
+        }
+    }
+}

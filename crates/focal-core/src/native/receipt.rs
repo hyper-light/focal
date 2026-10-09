@@ -248,12 +248,12 @@ pub(super) fn prepare(
     transactions::increment(&mut meta.receipts, 1, limits.receipts, "receipts")?;
     extras.push(Extra {
         key: Key::Receipt(receipt),
-        row: Row::Receipt(NativeReceipt {
+        row: Row::Receipt(Box::new(NativeReceipt {
             claim: id,
             fence,
             holder: old.subject(),
             acquired: cut.position,
-        }),
+        })),
         heap: 0,
         fact: Some(NativeFact::Receipt {
             claim: after,

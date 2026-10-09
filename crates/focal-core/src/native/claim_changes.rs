@@ -1,6 +1,6 @@
 use super::prepare::*;
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::Change;
 use focal_model::ObjectRevision;
 
 #[path = "history_assembly.rs"]
@@ -70,9 +70,9 @@ fn record_fact(
     if *ordinal >= outcome.events || changes.len() == changes.capacity() {
         return Err(NativeError::Capacity("event preparation"));
     }
-    let stored = OwnedEvent::new(StoredEvent::pack(item)?)?;
+    let stored = OwnedEvent::new(item, outcome.ledger)?;
     let heap = stored.heap_charge()?;
-    changes.push(Change::Put(Entry::new(
+    changes.push(Change::Put(entry(
         Key::Event(outcome.sequence, *ordinal),
         Row::Event(stored),
         heap,
@@ -119,7 +119,7 @@ fn append_rows(
         if changes.len() == changes.capacity() {
             return Err(NativeError::Capacity("extra row preparation"));
         }
-        changes.push(Change::Put(Entry::new(extra.key, extra.row, extra.heap)));
+        changes.push(Change::Put(entry(extra.key, extra.row, extra.heap)));
     }
     Ok(())
 }

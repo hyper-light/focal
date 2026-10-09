@@ -42,7 +42,7 @@ fn receipt(
         return Err(invalid());
     };
     require(value.claim == claim && value.fence == fence && value.holder == holder)?;
-    Ok(*value)
+    Ok(**value)
 }
 fn one(
     index: &HistoryIndex,

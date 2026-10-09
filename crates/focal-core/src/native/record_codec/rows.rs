@@ -137,12 +137,7 @@ pub(super) fn value(s: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) ->
             };
             fixed::outcome(s, v.expand(ledger, invocation))
         }
-        Row::Event(v) => events::event(
-            s,
-            v.get()
-                .ok_or(Error::InvalidTag("event row"))?
-                .expand(ledger),
-        ),
+        Row::Event(v) => events::event(s, v.get(ledger).ok_or(Error::InvalidTag("event row"))?),
         Row::ClaimContent(v) => evidence::claim_content(s, v),
         Row::ClaimIdentity(id) => raw(s, &id.0),
         Row::DefinitionIdentity(id) => raw(s, &id.0),
