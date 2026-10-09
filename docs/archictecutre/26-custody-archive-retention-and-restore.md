@@ -142,6 +142,26 @@ at a period that found none. The bound is the log's retirement boundary
 (instruction 4); `inspect replicas --replicas` shows
 `log_entries_since_checkpoint`.
 
+**By the log's size against the image (2026-10-09).** Past the entry floor,
+a replica checkpoints once its applied log outweighs its last image times
+`ReplicaConfig::checkpoint_expansion` (one by default), as Ongaro's thesis
+§5.1.2 ("When to snapshot") puts it and hyper-durable and slates do: the
+log's bytes are what consensus charges its applied entries past the image,
+and the image's are the latest checkpoint's envelope and seeded root. A
+checkpoint re-encodes the whole state, so at a fixed entry count its cost
+grew with the state and its total with the state's square; the Linux
+comparison at 1000/s had every node spending 2–4 s of each ~4 s encoding as
+a session grew to 50,000 claims, on a runner the three nodes share. Under
+the rule an image is written for every image's worth of log, half of what
+the session writes whatever its size. Two bounds stand beside it: the log
+is cut once it holds an eighth of the session's memory (its entries are
+charged to the budget the state grows into), and at 100,000 entries
+whatever their bytes (what a restart replays; etcd's snapshot count). A
+replica that opened has no image of its own yet and checkpoints at the
+floor first. `fleet_tests::a_log_is_checkpointed_once_it_outweighs_its_last_image`
+holds the rule; the cadence tests state an expansion of zero, the floor
+alone.
+
 **The retention floor.** `RetentionReport` names, per native session, the
 published prefix, the prefix registered consumers still need
 (`CursorRegistry::retention_limit`), the prefix the archive reports holding
