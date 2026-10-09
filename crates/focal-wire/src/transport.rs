@@ -454,7 +454,8 @@ impl QuicServer {
         limits: WireLimits,
         budget: MemoryBudget,
     ) -> Result<Self, WireError> {
-        let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
+        let admission = crate::AdmissionLimits::for_connections(limits.max_connections)
+            .replacing_after(limits.request_timeout);
         Self::bind_admitting(address, tls, registry, limits, admission, budget)
     }
     /// [`Self::bind`] with the admission bounds stated.
@@ -675,10 +676,13 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
             streams=connection.accept_bi()=>{
                 let Ok((mut send,mut recv))=streams else{break};
-                if let Some(admitted) = &admitted { admitted.used(); }
+                // Under way until its task ends: the connection is not
+                // replaced while it carries the request.
+                let serving = admitted.as_ref().map(crate::Admitted::serving);
                 if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
                 let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();let lane=lane.clone();let counts=counts.clone();
                 tasks.spawn(async move {
+                    let _serving = serving;
                     // Each part of an exchange has its own wait: what is
                     // asked as it arrives, its handler the time of a
                     // request (`dispatch`), and its answer as long as the

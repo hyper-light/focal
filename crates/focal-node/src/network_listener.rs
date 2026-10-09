@@ -224,7 +224,8 @@ impl NetworkListener {
         // The listener's budget funds the request bodies it admits (the
         // audit's F03), beside the charge of each connection.
         let admission = focal_wire::Admission::new(
-            focal_wire::AdmissionLimits::for_connections(limits.max_connections),
+            focal_wire::AdmissionLimits::for_connections(limits.max_connections)
+                .replacing_after(limits.request_timeout),
             budget.clone(),
         )
         .map_err(|_| WireError::Limit)?;

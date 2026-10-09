@@ -1030,7 +1030,7 @@ impl MetricsSnapshot {
         );
         text.counter(
             "focal_listener_replaced_total",
-            "Connections closed for a newer one of the same identity: the one idle longest.",
+            "Connections closed for a newer one of the same identity: the one idle longest, with no request under way and none begun for the request timeout.",
             self.listener.replaced,
         );
         text.header(
@@ -1042,6 +1042,7 @@ impl MetricsSnapshot {
             ("handshakes", self.listener.refused_pending),
             ("identities", self.listener.refused_identities),
             ("connections", self.listener.refused_connections),
+            ("busy", self.listener.refused_busy),
             ("bytes", self.listener.refused_bytes),
             ("memory", self.listener.refused_memory),
         ] {

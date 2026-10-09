@@ -3423,6 +3423,19 @@ mod admission {
         Arc<QuicServer>,
         tokio::task::JoinHandle<Result<(), WireError>>,
     ) {
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        admitting_with(pki, registry, admission, handler).await
+    }
+    async fn admitting_with(
+        pki: &Pki,
+        registry: PeerRegistry,
+        admission: AdmissionLimits,
+        handler: Arc<dyn RequestHandler>,
+    ) -> (
+        Arc<QuicServer>,
+        tokio::task::JoinHandle<Result<(), WireError>>,
+    ) {
         let (certificate, key) = pki.issue(true);
         let tls = server_tls(
             TlsIdentity::from_pkcs8(vec![certificate], key),
@@ -3442,8 +3455,6 @@ mod admission {
             .unwrap(),
         );
         let running = server.clone();
-        let handler: Arc<dyn RequestHandler> =
-            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
         let task = tokio::spawn(async move { running.serve(handler).await });
         (server, task)
     }
@@ -3454,6 +3465,8 @@ mod admission {
             connections: 16,
             per_node: 4,
             per_participant: 2,
+            // Replaced as soon as idle: the rule's timing is its own test's.
+            replace_after: Duration::ZERO,
         }
     }
     /// What the server holds, once it says so: a connection's end reaches
@@ -3468,7 +3481,8 @@ mod admission {
         );
         loop {
             let stats = server.admission();
-            if stats.connections == connections && stats.pending == 0 {
+            // Held, and idle: no request under way, its answer carried.
+            if stats.connections == connections && stats.pending == 0 && stats.serving == 0 {
                 return stats;
             }
             if let Err(spent) = wait.check(&[stats.changes]) {
@@ -3521,9 +3535,84 @@ mod admission {
                 connections: 128,
                 per_node: 4,
                 per_participant: 16,
+                replace_after: Duration::ZERO,
             }
         );
         assert_eq!(AdmissionLimits::for_connections(1).pending, 1);
+    }
+
+    /// A connection carrying a request is never replaced: an identity at its
+    /// bound whose every connection has a request under way is refused a
+    /// newer one, retryably, and the requests under way are answered; once
+    /// a connection is idle, a newer one replaces it.
+    #[tokio::test]
+    async fn a_connection_with_a_request_under_way_is_never_replaced() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        // Requests above id 100 wait for the gate, counted as they reach it.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (gated, reached) = (gate.clone(), entered.clone());
+        let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+            let (gate, reached) = (gated.clone(), reached.clone());
+            async move {
+                if verified.request().request_id > RequestId::from_u128(100) {
+                    reached.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let _permit = gate.acquire().await;
+                }
+                response(verified.request())
+            }
+        });
+        let (server, task) = admitting_with(&pki, registry, bounds(), handler).await;
+        let address = server.local_addr().unwrap();
+        let client = connector(&pki, certificate, key);
+        // The participant's bound is two: both connections carry a request.
+        let first = Arc::new(client.connect(address, "localhost").await.unwrap());
+        let second = Arc::new(client.connect(address, "localhost").await.unwrap());
+        assert!(serves(&first, 1).await && serves(&second, 2).await);
+        let under_way = [first.clone(), second.clone()]
+            .map(|remote| tokio::spawn(async move { remote.request(&request(101)).await }));
+        // Both requests are under way once the handler holds them, the wait
+        // charged to the listener's own changes.
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &[server.admission().changes],
+            u64::MAX,
+            Duration::from_secs(30),
+        );
+        while entered.load(std::sync::atomic::Ordering::Acquire) < 2 {
+            if let Err(spent) = wait.check(&[server.admission().changes]) {
+                panic!("the requests never began: {spent}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A third is refused: each held connection has a request under way.
+        let third = client.connect(address, "localhost").await;
+        let refused = match &third {
+            Ok(remote) => !serves(remote, 3).await,
+            Err(_) => true,
+        };
+        assert!(
+            refused,
+            "a connection with a request under way was replaced"
+        );
+        assert_eq!(server.admission().refused_busy, 1);
+        assert_eq!(server.admission().replaced, 0);
+        // The requests under way are answered, not lost.
+        gate.add_permits(2);
+        for request in under_way {
+            assert!(request.await.unwrap().is_ok());
+        }
+        // Idle now: a newer connection replaces the one used least.
+        held(&server, 2).await;
+        let fourth = client.connect(address, "localhost").await.unwrap();
+        assert!(serves(&fourth, 4).await);
+        assert_eq!(server.admission().replaced, 1);
+        server.close();
+        let _ = task.await;
     }
 
     /// The audit's F20: the connections held in all are bounded after the
@@ -3572,7 +3661,8 @@ mod admission {
         assert_eq!(stats.refused_connections, 1);
         assert!(serves(&first_a, 5).await && serves(&second_a, 6).await);
         // The first identity, at its bound, replaces the connection it
-        // used least recently although the listener is full.
+        // used least recently although the listener is full, once idle.
+        held(&server, 3).await;
         let first_c = first.connect(address, "localhost").await.unwrap();
         assert!(serves(&first_c, 7).await);
         let stats = held(&server, 3).await;
@@ -3673,8 +3763,9 @@ mod admission {
         for (index, remote) in remotes.iter().enumerate() {
             assert!(serves(remote, 400 + index as u128).await);
         }
-        // The node dials again: it is served, and its oldest connection is
-        // the one that ends.
+        // The node dials again once its connections are idle: it is
+        // served, and its oldest connection is the one that ends.
+        held(&server, 4).await;
         let fifth = connector.connect(address, "localhost").await.unwrap();
         assert!(serves(&fifth, 410).await);
         let stats = held(&server, 4).await;

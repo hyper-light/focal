@@ -17,8 +17,16 @@
 //!   restarted or moved, leaves a connection behind that the listener holds
 //!   until its idle timeout: refusing the newcomer would make an identity
 //!   wait out what it left behind, and the connection it uses least is the
-//!   one most likely to be that. A live client whose idle connection is
-//!   closed dials again at its next request;
+//!   one most likely to be that. Only a connection that is idle may be
+//!   replaced: none of its requests under way, and none begun for
+//!   [`AdmissionLimits::replace_after`]. A connection carrying a request is
+//!   alive by that request, and closing it made the request's outcome
+//!   unknown to its caller; a client that came back holds nothing on what it
+//!   left behind. With no idle connection to replace the newcomer is refused,
+//!   retryably: an identity using every connection it may hold is told so,
+//!   where replacing made its own callers close each other's connections
+//!   (64 callers of one principal against a bound of 16 replaced 27,765
+//!   connections in 30 s, and a third of their writes ended unknown);
 //! - the connections held in all are bounded by [`AdmissionLimits::connections`],
 //!   and the bound is met after the replacement rule, never before it: an
 //!   identity at its own bound reaches its replacement however full the
@@ -53,6 +61,7 @@ use quinn::Connection;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +74,10 @@ pub struct AdmissionLimits {
     pub connections: usize,
     pub per_node: usize,
     pub per_participant: usize,
+    /// How long a connection must have begun no request before it may be
+    /// replaced: a live client between requests is not, one that left its
+    /// connection behind is. The listener's request timeout.
+    pub replace_after: Duration,
 }
 impl AdmissionLimits {
     /// For a listener of `connections` in total: a quarter of them may be
@@ -76,6 +89,15 @@ impl AdmissionLimits {
             connections: connections.max(1),
             per_node: 4,
             per_participant: 16,
+            replace_after: Duration::ZERO,
+        }
+    }
+    /// These limits, a connection replaceable once it has begun no request
+    /// for `idle`.
+    pub fn replacing_after(self, idle: Duration) -> Self {
+        Self {
+            replace_after: idle,
+            ..self
         }
     }
     fn valid(&self) -> bool {
@@ -96,6 +118,8 @@ pub enum AdmissionRefusal {
     Identities,
     #[error("too many connections are held")]
     Connections,
+    #[error("the identity holds every connection it may, and is using each")]
+    Busy,
     #[error("the identity's share of the ingress is taken")]
     Bytes,
     #[error("the listener's budget cannot fund the body")]
@@ -110,11 +134,16 @@ pub struct AdmissionStats {
     pub connections: usize,
     /// Bytes of request bodies permitted and not yet given back.
     pub bytes: usize,
+    /// Requests under way on the connections held, their answers until
+    /// carried: what keeps a connection from being replaced.
+    pub serving: usize,
     pub admitted: u64,
     pub replaced: u64,
     pub refused_pending: u64,
     pub refused_identities: u64,
     pub refused_connections: u64,
+    /// Connections refused for an identity at its bound with none idle.
+    pub refused_busy: u64,
     pub refused_bytes: u64,
     pub refused_memory: u64,
     /// Every admission, refusal and release so far: what a wait on this
@@ -123,9 +152,17 @@ pub struct AdmissionStats {
 }
 struct Held {
     /// Least recently used first.
-    connections: VecDeque<(u64, Connection)>,
+    connections: VecDeque<HeldConnection>,
     /// Bytes of bodies permitted to this identity and not yet given back.
     bytes: usize,
+}
+/// One connection an identity holds: its requests under way and when it
+/// last began one.
+struct HeldConnection {
+    id: u64,
+    connection: Connection,
+    serving: usize,
+    used: Instant,
 }
 #[derive(Default)]
 struct State {
@@ -139,6 +176,7 @@ struct State {
     refused_pending: u64,
     refused_identities: u64,
     refused_connections: u64,
+    refused_busy: u64,
     refused_bytes: u64,
     refused_memory: u64,
     changes: u64,
@@ -174,6 +212,12 @@ impl Admission {
             return AdmissionStats::default();
         };
         AdmissionStats {
+            serving: state
+                .identities
+                .values()
+                .flat_map(|held| held.connections.iter())
+                .map(|held| held.serving)
+                .fold(0usize, usize::saturating_add),
             pending: state.pending,
             identities: state.identities.len(),
             connections: state.connections,
@@ -183,6 +227,7 @@ impl Admission {
             refused_pending: state.refused_pending,
             refused_identities: state.refused_identities,
             refused_connections: state.refused_connections,
+            refused_busy: state.refused_busy,
             refused_bytes: state.refused_bytes,
             refused_memory: state.refused_memory,
             changes: state.changes,
@@ -223,8 +268,27 @@ impl Admission {
             return Err(AdmissionRefusal::Identities);
         }
         // The replacement rule first: an identity at its bound takes its
-        // own place back however full the listener is.
+        // own place back however full the listener is, from the connection
+        // it has used least of those that are idle.
         let replacing = held >= bound;
+        let now = Instant::now();
+        let idle = if replacing {
+            let after = self.0.limits.replace_after;
+            let found = state.identities.get(&identity).and_then(|held| {
+                held.connections.iter().position(|held| {
+                    held.serving == 0 && now.saturating_duration_since(held.used) >= after
+                })
+            });
+            match found {
+                Some(position) => Some(position),
+                None => {
+                    bump(&mut state.refused_busy);
+                    return Err(AdmissionRefusal::Busy);
+                }
+            }
+        } else {
+            None
+        };
         if !replacing && state.connections >= self.0.limits.connections {
             bump(&mut state.refused_connections);
             return Err(AdmissionRefusal::Connections);
@@ -235,12 +299,15 @@ impl Admission {
             connections: VecDeque::new(),
             bytes: 0,
         });
-        let replaced = if replacing {
-            entry.connections.pop_front().map(|(_, old)| old)
-        } else {
-            None
-        };
-        entry.connections.push_back((id, connection.clone()));
+        let replaced = idle
+            .and_then(|position| entry.connections.remove(position))
+            .map(|old| old.connection);
+        entry.connections.push_back(HeldConnection {
+            id,
+            connection: connection.clone(),
+            serving: 0,
+            used: now,
+        });
         if replaced.is_some() {
             bump(&mut state.replaced);
         } else {
@@ -249,23 +316,30 @@ impl Admission {
         bump(&mut state.admitted);
         Ok((id, replaced))
     }
-    /// The connection served a request: it is this identity's most
-    /// recently used.
-    fn used(&self, identity: ParticipantId, id: u64) {
+    /// The connection began a request (`begin`) or ended one: it is this
+    /// identity's most recently used, and the requests it has under way
+    /// keep it from being replaced.
+    fn serving(&self, identity: ParticipantId, id: u64, begin: bool) {
         let Ok(mut state) = self.0.state.lock() else {
             return;
         };
+        bump(&mut state.changes);
         let Some(held) = state.identities.get_mut(&identity) else {
             return;
         };
-        if held.connections.back().is_some_and(|(last, _)| *last == id) {
+        let Some(position) = held.connections.iter().position(|held| held.id == id) else {
             return;
-        }
-        if let Some(position) = held.connections.iter().position(|(held, _)| *held == id)
-            && let Some(entry) = held.connections.remove(position)
-        {
-            held.connections.push_back(entry);
-        }
+        };
+        let Some(mut entry) = held.connections.remove(position) else {
+            return;
+        };
+        entry.serving = if begin {
+            entry.serving.saturating_add(1)
+        } else {
+            entry.serving.saturating_sub(1)
+        };
+        entry.used = Instant::now();
+        held.connections.push_back(entry);
     }
     fn release(&self, identity: ParticipantId, id: u64) {
         let Ok(mut state) = self.0.state.lock() else {
@@ -276,7 +350,7 @@ impl Admission {
             return;
         };
         let before = held.connections.len();
-        held.connections.retain(|(held, _)| *held != id);
+        held.connections.retain(|held| held.id != id);
         let removed = before.saturating_sub(held.connections.len());
         if held.connections.is_empty() && held.bytes == 0 {
             state.identities.remove(&identity);
@@ -382,9 +456,15 @@ pub struct Admitted {
     id: u64,
 }
 impl Admitted {
-    /// The connection served a request.
-    pub fn used(&self) {
-        self.admission.used(self.identity, self.id);
+    /// A request this connection began, under way until the returned guard
+    /// is dropped: the connection is not replaced meanwhile.
+    pub fn serving(&self) -> Serving {
+        self.admission.serving(self.identity, self.id, true);
+        Serving {
+            admission: self.admission.clone(),
+            identity: self.identity,
+            id: self.id,
+        }
     }
     /// Where this connection's bodies are admitted: the completion lane for
     /// a node, the ordinary one for any other identity.
@@ -398,6 +478,17 @@ impl Admitted {
                 BudgetLane::Ordinary
             },
         }
+    }
+}
+/// A request a connection has under way ([`Admitted::serving`]).
+pub struct Serving {
+    admission: Admission,
+    identity: ParticipantId,
+    id: u64,
+}
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.admission.serving(self.identity, self.id, false);
     }
 }
 impl Drop for Admitted {
