@@ -42,8 +42,26 @@ evidence() {
   echo "::endgroup::"
 }
 cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
+# Each image the profile runs, pulled once and one at a time before the cluster
+# starts: a registry's anonymous pulls are rate-limited per address (ECR Public
+# answers `Rate exceeded` past about one a second, Docker Hub refuses past its
+# own quota), and `compose up` pulls one image for three containers at once.
+# Bounded: five attempts each, the pause doubling from two seconds.
+pull_images() {
+  local image tries pause
+  for image in $(dc config --images | sort -u); do
+    docker image inspect "$image" >/dev/null 2>&1 && continue
+    tries=0; pause=2
+    until docker pull --quiet "$image" >/dev/null; do
+      tries=$((tries + 1))
+      if [ "$tries" -ge 5 ]; then echo "gave up pulling $image" >&2; return 1; fi
+      sleep "$pause"; pause=$((pause * 2))
+    done
+  done
+}
 trap cleanup EXIT
 cleanup
+pull_images
 dc up -d
 report="$system-$rate-$payload.json"
 
