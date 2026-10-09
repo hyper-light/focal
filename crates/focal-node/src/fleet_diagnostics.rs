@@ -107,6 +107,15 @@ impl Owner {
                     write_micros: timing.write_micros,
                 })
                 .collect(),
+            slow_steps: self
+                .slow
+                .recent()
+                .map(|step| focal_client::admin::AdminSlowStep {
+                    what: step.what.to_owned(),
+                    micros: step.micros,
+                    at_ms: step.at_ms,
+                })
+                .collect(),
         };
         ReplicaDiagnosticsReply {
             value,

@@ -321,6 +321,35 @@ pub struct ActivateNativeCall {
 }
 /// Largest total of inline legacy payloads copied out for host sealing.
 const IMPORT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// What a [`Work`] is, for the owner's slow steps.
+impl Work {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Diagnostics(..) => "diagnostics",
+            Self::Registration(..) => "registration",
+            Self::Request(..) => "request",
+            Self::Probe(..) => "probe",
+            Self::Transfer(..) => "transfer",
+            Self::Membership(..) => "membership",
+            Self::ManagedSupport(..) => "managed support",
+            Self::ActivateNative(..) => "activate native",
+            Self::ImportPayloads(..) => "import payloads",
+            Self::Checkpoint(..) => "checkpoint",
+            Self::ArtifactPointer(..) => "artifact pointer",
+            Self::SeedChunks(..) => "seed chunks",
+            Self::InstallSeed(..) => "install seed",
+            Self::CustodyObjects(..) => "custody objects",
+            Self::CustodyPulled(..) => "custody pulled",
+            Self::Admit(..) => "admit",
+            Self::Windows(..) => "windows",
+            Self::Refence(..) => "refence",
+            Self::Placement(..) => "placement",
+            Self::Range(..) => "range",
+            Self::Evidence(..) => "evidence",
+            Self::Stop(..) => "stop",
+        }
+    }
+}
 enum Work {
     Diagnostics(
         oneshot::Sender<Result<ReplicaDiagnosticsReply, LedgerError>>,
@@ -770,6 +799,8 @@ impl Pending {
 }
 struct Owner {
     session: Session,
+    /// The owner's slowest recent steps, for the replica's diagnostics.
+    slow: crate::owner_steps::SlowSteps,
     config: ReplicaConfig,
     limits: WireLimits,
     client_limits: WireLimits,
@@ -1060,6 +1091,7 @@ impl ReplicaHost {
             dropped: 0,
             unreachable: 0,
             members_named: None,
+            slow: crate::owner_steps::SlowSteps::default(),
             #[cfg(test)]
             dropped_snapshots: 0,
             budget: budget.clone(),
@@ -1767,14 +1799,18 @@ impl Owner {
             self.drain()?;
             loop {
                 if Instant::now() >= next_tick {
+                    let started = Instant::now();
                     self.tick()?;
+                    self.slow.note("tick", started);
                     next_tick = Instant::now()
                         .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                         .ok_or(LedgerError::Failed)?;
                 }
                 self.beat_if_due()?;
                 if self.session.has_ready() {
+                    let started = Instant::now();
                     self.drain()?;
+                    self.slow.note("drain", started);
                 }
                 let wake = if self.beats() {
                     next_tick.min(self.next_beat)
@@ -1783,11 +1819,18 @@ impl Owner {
                 };
                 match receiver.recv_timeout(wake.saturating_duration_since(Instant::now())) {
                     Ok(work) => {
+                        let started = Instant::now();
+                        let what = work.kind();
                         if self.take(work, &receiver)? {
                             return Ok(());
                         }
+                        self.slow.note(what, started);
+                        let started = Instant::now();
                         self.progress_managed()?;
+                        self.slow.note("managed progress", started);
+                        let started = Instant::now();
                         self.checkpoint_for_members()?;
+                        self.slow.note("member checkpoint", started);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -1952,7 +1995,10 @@ impl Owner {
         // A tick that was refused the room, or that came while the one
         // before it is still persisted, changed nothing: the period has
         // passed without it (27 §3.1 P3), and the replica goes on.
-        match self.session.tick() {
+        let started = Instant::now();
+        let ticked = self.session.tick();
+        self.slow.note("tick: consensus", started);
+        match ticked {
             Ok(()) => {}
             Err(
                 LedgerError::Capacity
@@ -1972,16 +2018,25 @@ impl Owner {
             }
             // Trusted native timers fire from the leader's clock; a deferred
             // or refused timer waits for a later tick or its primary row.
-            match crate::native_timers::sweep(&mut self.session) {
+            let started = Instant::now();
+            let swept = crate::native_timers::sweep(&mut self.session);
+            self.slow.note("tick: timers", started);
+            match swept {
                 Ok(_) | Err(LedgerError::Capacity | LedgerError::NotReady { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
+        let started = Instant::now();
         self.views
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
+        self.slow.note("tick: read views", started);
+        let started = Instant::now();
         self.drain()?;
+        self.slow.note("tick: drain", started);
+        let started = Instant::now();
         self.checkpoint_by_cadence()?;
+        self.slow.note("tick: checkpoint", started);
         // At every period, not only beside work: a replica no request
         // reaches still seeds the members its configuration added.
         self.checkpoint_for_members()?;

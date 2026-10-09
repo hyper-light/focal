@@ -238,6 +238,19 @@ pub struct AdminReplicaDiagnostics {
     /// what each cost its owner by stage (at most eight).
     #[serde(default)]
     pub checkpoints: Vec<AdminCheckpointTiming>,
+    /// The owner's slowest recent steps (at least 10 ms, the latest
+    /// sixteen, oldest first): what held every request queued behind it.
+    #[serde(default)]
+    pub slow_steps: Vec<AdminSlowStep>,
+}
+/// One step a replica's owner took at least 10 ms over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSlowStep {
+    pub what: String,
+    pub micros: u64,
+    /// When it ended, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
 }
 /// One checkpoint's cost by stage, in microseconds: the native engine's
 /// section (its root and seed installs), the rest of the envelope, and the
