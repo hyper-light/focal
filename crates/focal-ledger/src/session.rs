@@ -339,9 +339,11 @@ pub struct Session {
     reads_parked: u64,
     reads_dropped: u64,
     /// The cost of the checkpoints this replica wrote last, for diagnostics.
-    checkpoint_timings: CheckpointTimings,
+    // Boxed, as the deferred checkpoint is: a session moves by value through
+    // its hosts' frames, which a Windows debug build keeps on a worker stack.
+    checkpoint_timings: Box<CheckpointTimings>,
     /// A checkpoint whose seeds are being made durable off the owner's thread.
-    deferred: Option<DeferredCheckpoint>,
+    deferred: Option<Box<DeferredCheckpoint>>,
 }
 
 impl Session {
@@ -563,7 +565,7 @@ impl Session {
             parked_charge: None,
             reads_parked: 0,
             reads_dropped: 0,
-            checkpoint_timings: CheckpointTimings::default(),
+            checkpoint_timings: Box::default(),
             deferred: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
@@ -2426,5 +2428,20 @@ mod checkpoint_timing_tests {
         assert_eq!(kept, (4..=11).collect::<Vec<_>>());
         assert_eq!(micros(std::time::Duration::from_millis(3)), 3000);
         assert_eq!(micros(std::time::Duration::MAX), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod size_bound {
+    /// A session moves by value through its hosts' frames, and a Windows
+    /// debug build keeps those on a worker stack: 2026-10-08 a session grown by
+    /// 600 bytes (an inline timing ring and deferred checkpoint) overflowed it in
+    /// `the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`.
+    /// What a session holds beyond its scalars belongs behind a pointer; this
+    /// bound says so before Windows CI does.
+    #[test]
+    fn a_session_stays_within_its_inline_bound() {
+        let size = size_of::<super::Session>();
+        assert!(size <= 11_264, "Session is {size} bytes inline");
     }
 }
