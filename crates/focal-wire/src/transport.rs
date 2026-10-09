@@ -1200,6 +1200,27 @@ fn closed_at_greeting(connection: &Connection) -> Option<WireError> {
         _ => None,
     }
 }
+/// A connection that could not be made: refused for its credentials (a TLS
+/// alert, either side's: QUIC's crypto error codes, RFC 9000 §20.1), refused
+/// by the listener's answer, or not made at all — refused for room,
+/// unreachable, timed out — which is no answer about the client.
+fn connect_failure(error: &quinn::ConnectionError) -> WireError {
+    let crypto = |code: u64| (0x100..=0x1ff).contains(&code);
+    match error {
+        quinn::ConnectionError::TransportError(error) if crypto(u64::from(error.code)) => {
+            WireError::Authentication
+        }
+        quinn::ConnectionError::ConnectionClosed(close) if crypto(u64::from(close.error_code)) => {
+            WireError::Authentication
+        }
+        quinn::ConnectionError::ApplicationClosed(close) => match u64::from(close.error_code) {
+            1 => WireError::Authentication,
+            4 => WireError::Access(AccessError::Capacity),
+            _ => WireError::Connection,
+        },
+        _ => WireError::Connection,
+    }
+}
 async fn open_remote(
     endpoint: &Endpoint,
     tls: quinn::ClientConfig,
@@ -1214,7 +1235,7 @@ async fn open_remote(
     let connection = tokio::time::timeout(limits.request_timeout, connecting)
         .await
         .map_err(|_| WireError::Timeout)?
-        .map_err(|_| WireError::Authentication)?;
+        .map_err(|error| connect_failure(&error))?;
     let handshake = async {
         let (mut send, mut recv) = connection
             .open_bi()
