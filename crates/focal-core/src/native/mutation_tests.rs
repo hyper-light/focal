@@ -92,14 +92,14 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
 #[test]
 fn malformed_or_unfunded_capture_refuses_and_returns_its_complete_debit() {
     let source = MemoryBudget::new(1 << 20, 0).unwrap();
-    let meta = || Change::Put(Entry::new(Key::Meta, Row::Meta(Meta::default()), 0));
+    let meta = || Change::Put(Entry::new(Key::Meta, Row::Meta(Box::default()), 0));
     for changes in [
         vec![],
         vec![meta(), meta()],
         vec![Change::Delete(Key::End)],
         vec![Change::Put(Entry::new(
             Key::ArtifactIdentity(ContentHash([1; 32])),
-            Row::Meta(Meta::default()),
+            Row::Meta(Box::default()),
             0,
         ))],
         vec![Change::Delete(Key::Claim(ClaimId::from_u128(1))), meta()],

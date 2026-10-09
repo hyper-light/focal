@@ -12,17 +12,17 @@ mod composition_tests;
 
 fn copy_row(row: &Row) -> Result<Row, MemoryError> {
     match row {
-        Row::Meta(value) => Ok(Row::Meta(*value)),
+        Row::Meta(value) => Ok(Row::Meta(Box::new(**value))),
         Row::Claim(value) => value.copy().map(Row::Claim),
-        Row::Definition(value) => value.copy().map(Row::Definition),
+        Row::Definition(value) => value.copy().map(|row| Row::Definition(Box::new(row))),
         Row::Evaluation(value) => value.copy().map(Row::Evaluation),
         Row::Artifact(value) => value.copy().map(Row::Artifact),
         Row::ArtifactIdentity(value) => Ok(Row::ArtifactIdentity(*value)),
         Row::Accepted(value) => value.copy().map(Row::Accepted),
-        Row::Outcome(value) => Ok(Row::Outcome(*value)),
+        Row::Outcome(value) => Ok(Row::Outcome(Box::new(**value))),
         Row::Event(value) => value.copy().map(Row::Event),
         Row::Index => Ok(Row::Index),
-        Row::Epochs(value) => value.copy().map(Row::Epochs),
+        Row::Epochs(value) => value.copy().map(|row| Row::Epochs(Box::new(row))),
         _ => panic!("unexpected row in Admission-only book fixture"),
     }
 }
@@ -228,9 +228,9 @@ fn with_seals(
         if let RangeChange::Put(entry) = change {
             match &mut entry.value {
                 Row::Outcome(value) => {
-                    *value = OutcomeRow::stored(&outcome, outcome.ledger).unwrap()
+                    **value = OutcomeRow::stored(&outcome, outcome.ledger).unwrap()
                 }
-                Row::Meta(value) => *value = meta,
+                Row::Meta(value) => **value = meta,
                 _ => {}
             }
         }

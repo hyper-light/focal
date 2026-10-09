@@ -142,10 +142,10 @@ fn diagnostic_only_retired_cycles_consume_quote_and_exact_chain_budget() {
     assert!(measured_projection(&rows, quoted) <= quoted.lookup_visits());
     rows.replace(
         Key::RetiredCycleHead(ClaimId::from_u128(1)),
-        Row::RetiredCycleHead(RetiredCycleHead {
+        Row::RetiredCycleHead(Box::new(RetiredCycleHead {
             work_count: 1,
             ..head
-        }),
+        })),
         0,
     );
     let view = rows.view();
@@ -164,10 +164,10 @@ fn repeated_retired_link_refuses_once_without_hiding_the_tail() {
     let key = head.head.unwrap();
     rows.replace(
         Key::RetiredCycle(key),
-        Row::RetiredCycle(RetiredCycle {
+        Row::RetiredCycle(Box::new(RetiredCycle {
             holder: SUBJECT,
             next: Some(key),
-        }),
+        })),
         0,
     );
     let view = rows.view();

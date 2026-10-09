@@ -21,10 +21,10 @@ fn extra(id: u128) -> Extra {
     let binding = binding(id);
     Extra {
         key: Key::Definition(ValidationId(binding.object.0)),
-        row: Row::Meta(Meta {
+        row: Row::Meta(Box::new(Meta {
             definitions: usize::try_from(id).unwrap(),
             ..Meta::default()
-        }),
+        })),
         heap: 0,
         fact: Some(NativeFact::Definition {
             binding,
@@ -40,7 +40,7 @@ fn assert_extra(row: &Extra, id: u128) {
     assert_eq!(row.key, expected.key);
     assert_eq!(row.fact, expected.fact);
     assert_eq!(row.heap, 0);
-    match row.row {
+    match &row.row {
         Row::Meta(meta) => assert_eq!(meta.definitions, usize::try_from(id).unwrap()),
         _ => panic!("staged payload changed"),
     }

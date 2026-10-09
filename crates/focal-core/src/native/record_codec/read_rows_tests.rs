@@ -47,7 +47,9 @@ fn outcome(invocation: NativeInvocation, operation: NativeOperation) -> NativeOu
     }
 }
 fn outcome_row(invocation: NativeInvocation, operation: NativeOperation) -> Row {
-    Row::Outcome(OutcomeRow::stored(&outcome(invocation, operation), ledger()).unwrap())
+    Row::Outcome(Box::new(
+        OutcomeRow::stored(&outcome(invocation, operation), ledger()).unwrap(),
+    ))
 }
 fn encode(key: Key, row: &Row) -> Vec<u8> {
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
@@ -63,17 +65,17 @@ fn values() -> Vec<(Key, Row)> {
     vec![
         (
             Key::IncomingHead(claim(1)),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: None,
                 count: 0,
-            }),
+            })),
         ),
         (
             Key::IncomingHead(claim(2)),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: Some(claim(1)),
                 count: 1,
-            }),
+            })),
         ),
         (
             Key::IncomingLink(claim(1), claim(1)),
@@ -87,7 +89,7 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::Monitor(monitor(1)),
-            Row::Monitor(monitor_index::MonitorAllocation {
+            Row::Monitor(Box::new(monitor_index::MonitorAllocation {
                 owner: fixture::binding(1),
                 registered: SessionSeq(1),
                 deadline: Deadline {
@@ -95,21 +97,21 @@ fn values() -> Vec<(Key, Row)> {
                     generation: 1,
                     at: 0,
                 },
-            }),
+            })),
         ),
         (
             Key::MonitorHead(claim(1)),
-            Row::MonitorHead(monitor_index::MonitorHead {
+            Row::MonitorHead(Box::new(monitor_index::MonitorHead {
                 head: None,
                 count: 0,
-            }),
+            })),
         ),
         (
             Key::MonitorHead(claim(2)),
-            Row::MonitorHead(monitor_index::MonitorHead {
+            Row::MonitorHead(Box::new(monitor_index::MonitorHead {
                 head: Some(monitor(1)),
                 count: 1,
-            }),
+            })),
         ),
         (
             Key::MonitorLink(claim(1), monitor(1)),
@@ -117,17 +119,17 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::MonitorLink(claim(1), monitor(2)),
-            Row::MonitorLink(Some(monitor_index::MonitorLink {
+            Row::MonitorLink(Some(Box::new(monitor_index::MonitorLink {
                 owner: claim(2),
                 registered: SessionSeq(1),
                 stamp: SessionSeq(3),
                 previous: Some(monitor(1)),
                 next: Some(monitor(3)),
-            })),
+            }))),
         ),
         (
             Key::Meta,
-            Row::Meta(Meta {
+            Row::Meta(Box::new(Meta {
                 claims: 1,
                 outcomes: 2,
                 events: 3,
@@ -147,7 +149,7 @@ fn values() -> Vec<(Key, Row)> {
                 seals: 17,
                 principals: 18,
                 logical_time: u64::MAX,
-            }),
+            })),
         ),
         (
             Key::ArtifactIdentity(ContentHash([1; 32])),
@@ -155,7 +157,7 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::Receipt(ReceiptId::from_u128(1)),
-            Row::Receipt(NativeReceipt {
+            Row::Receipt(Box::new(NativeReceipt {
                 claim: claim(1),
                 fence: ReceiptFence {
                     receipt: ReceiptId::from_u128(1),
@@ -163,48 +165,48 @@ fn values() -> Vec<(Key, Row)> {
                 },
                 holder: fixture::SUBJECT,
                 acquired: SessionSeq(1),
-            }),
+            })),
         ),
-        (Key::Cycle(cycle_key(1)), Row::Cycle(NativeCycle::default())),
+        (Key::Cycle(cycle_key(1)), Row::Cycle(Box::default())),
         (
             Key::Cycle(cycle_key(2)),
-            Row::Cycle(NativeCycle {
+            Row::Cycle(Box::new(NativeCycle {
                 work_head: Some(artifact(1)),
                 work_count: 1,
                 diagnostic_head: Some(artifact(2)),
                 diagnostic_count: 2,
                 response: Some(testament(1)),
-            }),
+            })),
         ),
         (
             Key::RetiredCycleHead(claim(1)),
-            Row::RetiredCycleHead(RetiredCycleHead {
+            Row::RetiredCycleHead(Box::new(RetiredCycleHead {
                 head: None,
                 count: 0,
                 work_count: 0,
-            }),
+            })),
         ),
         (
             Key::RetiredCycleHead(claim(1)),
-            Row::RetiredCycleHead(RetiredCycleHead {
+            Row::RetiredCycleHead(Box::new(RetiredCycleHead {
                 head: Some(cycle_key(2)),
                 count: 2,
                 work_count: 0,
-            }),
+            })),
         ),
         (
             Key::RetiredCycle(cycle_key(1)),
-            Row::RetiredCycle(RetiredCycle {
+            Row::RetiredCycle(Box::new(RetiredCycle {
                 holder: fixture::SUBJECT,
                 next: None,
-            }),
+            })),
         ),
         (
             Key::RetiredCycle(cycle_key(2)),
-            Row::RetiredCycle(RetiredCycle {
+            Row::RetiredCycle(Box::new(RetiredCycle {
                 holder: fixture::SUBJECT,
                 next: Some(cycle_key(1)),
-            }),
+            })),
         ),
         (Key::WorkSlot(cycle_key(1), 0), Row::WorkSlot(artifact(1))),
         (
@@ -269,10 +271,10 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
     let invalid_rows = [
         (
             Key::IncomingHead(claim(1)),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: Some(claim(2)),
                 count: 0,
-            }),
+            })),
         ),
         (
             Key::IncomingLink(claim(1), claim(2)),
@@ -282,39 +284,39 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
         ),
         (
             Key::MonitorLink(claim(1), monitor(2)),
-            Row::MonitorLink(Some(monitor_index::MonitorLink {
+            Row::MonitorLink(Some(Box::new(monitor_index::MonitorLink {
                 owner: claim(2),
                 registered: SessionSeq(3),
                 stamp: SessionSeq(2),
                 previous: None,
                 next: None,
-            })),
+            }))),
         ),
         (
             Key::Cycle(cycle_key(1)),
-            Row::Cycle(NativeCycle {
+            Row::Cycle(Box::new(NativeCycle {
                 work_count: 1,
                 ..NativeCycle::default()
-            }),
+            })),
         ),
         (
             Key::RetiredCycleHead(claim(2)),
-            Row::RetiredCycleHead(RetiredCycleHead {
+            Row::RetiredCycleHead(Box::new(RetiredCycleHead {
                 head: Some(cycle_key(1)),
                 count: 1,
                 work_count: 0,
-            }),
+            })),
         ),
         (
             Key::RetiredCycle(cycle_key(1)),
-            Row::RetiredCycle(RetiredCycle {
+            Row::RetiredCycle(Box::new(RetiredCycle {
                 holder: fixture::SUBJECT,
                 next: Some(cycle_key(1)),
-            }),
+            })),
         ),
         (
             Key::Receipt(ReceiptId::from_u128(2)),
-            Row::Receipt(NativeReceipt {
+            Row::Receipt(Box::new(NativeReceipt {
                 claim: claim(1),
                 fence: ReceiptFence {
                     receipt: ReceiptId::from_u128(1),
@@ -322,7 +324,7 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
                 },
                 holder: fixture::SUBJECT,
                 acquired: SessionSeq(1),
-            }),
+            })),
         ),
         (
             Key::ClaimIdentity(0, ContentHash([1; 32])),
@@ -417,10 +419,10 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
     #[cfg(target_pointer_width = "64")]
     {
         let large = usize::try_from(u64::from(u32::MAX) + 19).unwrap();
-        let row = Row::IncomingHead(incoming_graph::IncomingHead {
+        let row = Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
             head: Some(claim(1)),
             count: large,
-        });
+        }));
         let bytes = encode(Key::IncomingHead(claim(2)), &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let Some(Row::IncomingHead(actual)) =

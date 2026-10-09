@@ -272,24 +272,23 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
                 limits: self.limits,
             };
             let quote = read_dispatch::prepare(&slot.encoded, &context)?;
+            // A wide row's box is charged to its entry beside the heap the
+            // codec quotes (`Row`): the key's family names the box it may take.
+            let heap = prepare::add(quote.heap_bytes, slot.encoded.key.boxed_heap())?;
             prepare::within(
-                prepare::add(size_of::<Entry<Key, Row>>(), quote.heap_bytes)?,
+                prepare::add(size_of::<Entry<Key, Row>>(), heap)?,
                 self.limits.native.range.max_entry_bytes,
             )?;
             prepare::within(
-                prepare::add(entries.allocation.bytes(), quote.heap_bytes)?,
+                prepare::add(entries.allocation.bytes(), heap)?,
                 self.limits.native.preparation_bytes,
             )?;
-            let mut funding = if quote.heap_bytes == 0 {
+            let mut funding = if heap == 0 {
                 None
             } else {
                 Some(
                     self.budget
-                        .reserve(
-                            BudgetKind::Pending,
-                            BudgetLane::Completion,
-                            quote.heap_bytes,
-                        )?
+                        .reserve(BudgetKind::Pending, BudgetLane::Completion, heap)?
                         .commit(),
                 )
             };
@@ -309,6 +308,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
                 .slots
                 .get_mut(position)
                 .ok_or(ContractError::InvalidManifest)?;
+            // The box is added once, when the slot becomes an entry (`entry`).
             slot.value = Some(row);
             slot.heap_bytes = actual;
             count = count.checked_add(1).ok_or(ContractError::Capacity)?;
@@ -488,7 +488,7 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         .map_err(read_evidence::codec)?;
     for slot in &mut entries.slots {
         let change = match (slot.encoded.deleted(), slot.value.take()) {
-            (false, Some(row)) => Change::Put(Entry::new(slot.encoded.key, row, slot.heap_bytes)),
+            (false, Some(row)) => Change::Put(entry(slot.encoded.key, row, slot.heap_bytes)),
             (true, None) => Change::Delete(slot.encoded.key),
             _ => return Err(ContractError::InvalidManifest.into()),
         };

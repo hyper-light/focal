@@ -873,6 +873,30 @@ impl NativeRanges {
         limits: RangeWriteLimits,
         max_members: usize,
     ) -> Result<RangeWriteEnvelope, MemoryError> {
+        // A row wider than a pointer is boxed (`Row`): each key a write puts may
+        // bring at most the widest box, and each it deletes may release as much.
+        let wide = super::wide_heap_max();
+        let limits = RangeWriteLimits {
+            incoming_heap: limits
+                .incoming_heap
+                .checked_add(
+                    limits
+                        .changed_keys
+                        .checked_mul(wide)
+                        .ok_or(MemoryError::AllocationFailed)?,
+                )
+                .ok_or(MemoryError::AllocationFailed)?,
+            deleted_heap: limits
+                .deleted_heap
+                .checked_add(
+                    limits
+                        .deleted_keys
+                        .checked_mul(wide)
+                        .ok_or(MemoryError::AllocationFailed)?,
+                )
+                .ok_or(MemoryError::AllocationFailed)?,
+            ..limits
+        };
         let members = max_members.max(self.stores.len());
         let group = group_bytes(members).map_err(|_| MemoryError::Capacity {
             requested: members,

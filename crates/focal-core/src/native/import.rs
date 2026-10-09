@@ -400,10 +400,12 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     out.meta.outcomes = 1;
     out.push(
         Key::Outcome(outcome.invocation),
-        Row::Outcome(OutcomeRow::stored(&outcome, request.ledger).map_err(NativeError::from)?),
+        Row::Outcome(Box::new(
+            OutcomeRow::stored(&outcome, request.ledger).map_err(NativeError::from)?,
+        )),
     )?;
     let meta = out.meta;
-    out.push(Key::Meta, Row::Meta(meta))?;
+    out.push(Key::Meta, Row::Meta(Box::new(meta)))?;
     let Rows { mut rows, .. } = out;
     rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     if rows
@@ -727,12 +729,12 @@ fn claims(
         if let Some(receipt) = &lifecycle.receipt {
             out.push(
                 Key::Receipt(receipt.fence.receipt),
-                Row::Receipt(NativeReceipt {
+                Row::Receipt(Box::new(NativeReceipt {
                     claim: *id,
                     fence: receipt.fence,
                     holder: receipt.holder,
                     acquired: IMPORT_SEQUENCE,
-                }),
+                })),
             )?;
             out.meta.receipts = add(out.meta.receipts, 1)?;
             out.event(NativeFact::Receipt {
@@ -779,10 +781,10 @@ fn graph_index(legacy: &LegacyState, out: &mut Rows) -> Result<(), ImportError> 
         }
         out.push(
             Key::IncomingHead(target),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: next,
                 count: members.len(),
-            }),
+            })),
         )?;
         position = end;
     }
@@ -808,7 +810,7 @@ fn monitors(
         }
         out.push(
             Key::Monitor(*id),
-            Row::Monitor(monitor_index::MonitorAllocation {
+            Row::Monitor(Box::new(monitor_index::MonitorAllocation {
                 owner: Binding {
                     ledger,
                     object: ObjectId(monitor.owner.0),
@@ -817,7 +819,7 @@ fn monitors(
                 },
                 registered: IMPORT_SEQUENCE,
                 deadline: monitor.deadline,
-            }),
+            })),
         )?;
         out.meta.monitors = add(out.meta.monitors, 1)?;
         let mut targets: Vec<ClaimId> = Vec::new();
@@ -869,23 +871,23 @@ fn monitors(
             let next = members.get(add(index, 1)?).map(|link| link.1);
             out.push(
                 Key::MonitorLink(target, *id),
-                Row::MonitorLink(Some(monitor_index::MonitorLink {
+                Row::MonitorLink(Some(Box::new(monitor_index::MonitorLink {
                     owner,
                     registered: IMPORT_SEQUENCE,
                     stamp: IMPORT_SEQUENCE,
                     previous,
                     next,
-                })),
+                }))),
             )?;
             out.meta.monitor_links = add(out.meta.monitor_links, 1)?;
             previous = Some(*id);
         }
         out.push(
             Key::MonitorHead(target),
-            Row::MonitorHead(monitor_index::MonitorHead {
+            Row::MonitorHead(Box::new(monitor_index::MonitorHead {
                 head: members.first().map(|link| link.1),
                 count: members.len(),
-            }),
+            })),
         )?;
         position = end;
     }

@@ -455,8 +455,8 @@ fn structural_checkpoint_rejects_deletions_duplicates_and_missing_accounting_row
 fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
     for row in [
         None,
-        Some(Row::Meta(Meta::default())),
-        Some(Row::Outcome(
+        Some(Row::Meta(Box::default())),
+        Some(Row::Outcome(Box::new(
             OutcomeRow::stored(
                 &NativeOutcome {
                     ledger: fixture::binding(1).ledger,
@@ -479,7 +479,7 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
                 fixture::binding(1).ledger,
             )
             .unwrap(),
-        )),
+        ))),
     ] {
         let mut core = fixture::core();
         let initial = if row.is_none() { 1 } else { 0 };

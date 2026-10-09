@@ -11,7 +11,7 @@
 //! Outcome and creation-result rows stay: every native sequence keeps its
 //! one outcome, and an exact retry keeps finding it.
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::Change;
 use focal_model::Cause;
 use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
 use std::collections::BTreeSet;
@@ -730,7 +730,7 @@ impl Core<NativeState> {
         through: SessionSeq,
     ) -> Result<usize, NativeError> {
         let mut meta = match self.state.rows.get(&Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
+            Some(Row::Meta(meta)) => **meta,
             _ => return Err(ContractError::InvalidManifest.into()),
         };
         if u64::try_from(meta.outcomes).ok() != Some(self.native_sequence().0) {
@@ -856,9 +856,9 @@ impl Core<NativeState> {
         for (member, events) in family.members.iter().zip(family.events.iter()) {
             let claim = as_claim(self.state.rows.get(&Key::Claim(*member)))
                 .ok_or(NativeError::Contract(ContractError::InvalidManifest))?;
-            changes.push(Change::Put(Entry::new(
+            changes.push(Change::Put(entry(
                 Key::Retired(*member),
-                Row::Retired(RetiredClaim {
+                Row::Retired(Box::new(RetiredClaim {
                     bundle,
                     bytes,
                     through,
@@ -866,14 +866,14 @@ impl Core<NativeState> {
                     status: claim.status(),
                     retired_at: sequence,
                     events: *events,
-                }),
+                })),
                 0,
             )));
         }
-        changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
-        changes.push(Change::Put(Entry::new(
+        changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
+        changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(OutcomeRow::stored(&outcome, self.state.ledger)?),
+            Row::Outcome(Box::new(OutcomeRow::stored(&outcome, self.state.ledger)?)),
             0,
         )));
         self.state

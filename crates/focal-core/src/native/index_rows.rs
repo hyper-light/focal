@@ -26,7 +26,7 @@
 //! transitions never pay for claim timers. All other families are written
 //! once at creation.
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::Change;
 use focal_model::lifecycle::artifact_descriptor::{self, ArtifactDescriptor};
 use focal_model::lifecycle::claim_descriptor::ClaimDescriptor;
 use focal_model::lifecycle::scope;
@@ -47,7 +47,7 @@ impl IndexChange {
     }
     pub(super) fn into_change(self) -> Change<Key, Row> {
         match self {
-            Self::Put(key) => Change::Put(Entry::new(key, Row::Index, 0)),
+            Self::Put(key) => Change::Put(entry(key, Row::Index, 0)),
             Self::Delete(key) => Change::Delete(key),
         }
     }

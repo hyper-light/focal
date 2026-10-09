@@ -292,7 +292,7 @@ pub(super) fn validate(
         };
     }
     let expected = match read.require(Key::Meta)? {
-        Row::Meta(value) => *value,
+        Row::Meta(value) => **value,
         _ => return Err(invalid()),
     };
     let mut counts = Counts::default();
@@ -420,22 +420,22 @@ pub(super) fn validate(
             }
             (Key::IncomingHead(target), Row::IncomingHead(head)) => {
                 read_rows::check_fixed(key, row, ledger)?;
-                incoming = sum(incoming, links::incoming(target, *head, &read)?)?;
+                incoming = sum(incoming, links::incoming(target, **head, &read)?)?;
             }
             (Key::MonitorHead(target), Row::MonitorHead(head)) => {
                 read_rows::check_fixed(key, row, ledger)?;
-                monitors = sum(monitors, links::monitors(target, *head, &read)?)?;
+                monitors = sum(monitors, links::monitors(target, **head, &read)?)?;
             }
             (Key::RetiredCycleHead(target), Row::RetiredCycleHead(head)) => {
                 read_rows::check_fixed(key, row, ledger)?;
-                retired = sum(retired, links::retired(target, *head, &read)?)?;
+                retired = sum(retired, links::retired(target, **head, &read)?)?;
             }
             // A principal's window (F12): valid in itself, its ranges naming
             // seals that exist, and holding the resident request outcomes
             // of its open generations, counted under its affinity.
             (Key::Epochs(principal), Row::Epochs(window)) => {
                 read_rows::check_fixed(key, row, ledger)?;
-                if entry.heap_bytes != window.heap_charge()?
+                if entry.heap_bytes != sum(window.heap_charge()?, entry.value.boxed_heap())?
                     || window
                         .ranges()
                         .iter()
@@ -495,7 +495,7 @@ pub(super) fn validate(
             }
             (Key::Cycle(key), Row::Cycle(value)) => {
                 read_rows::check_fixed(Key::Cycle(key), row, ledger)?;
-                let (work_count, diagnostic_count) = links::cycle(key, *value, &read)?;
+                let (work_count, diagnostic_count) = links::cycle(key, **value, &read)?;
                 works = sum(works, work_count)?;
                 diagnostics = sum(diagnostics, diagnostic_count)?;
             }

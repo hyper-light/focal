@@ -479,7 +479,7 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                     limits.definitions.min(limits.range.max_batch_entries),
                 )?;
                 visits.charge(claim.requirements().len())?;
-                if entry.heap_bytes != owned.heap_charge()?
+                if entry.heap_bytes != add(owned.heap_charge()?, entry.value.boxed_heap())?
                     || body.binding().object.0 != id.0
                     || !claim.requirements().iter().any(|pin| pin.id == *id)
                     || !matches!(view.get(Key::DefinitionIdentity(body.schema(), body.content_hash())), Some(Row::DefinitionIdentity(found)) if found == id)

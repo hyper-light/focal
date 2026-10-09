@@ -1310,33 +1310,37 @@ pub struct RetiredClaim {
     /// counting them, so validation reconciles the two.
     pub events: u32,
 }
+/// A row of the native store. Every entry is as wide as its widest row, and a claim
+/// writes mostly index rows that carry nothing (`Index`) or a pointer (`Owned*`): a
+/// payload wider than a pointer is kept behind one, charged to its entry's heap
+/// (`wide_heap`), so that the commonest rows are not 160 bytes each (2.3 KB a claim).
 #[derive(Debug)]
 enum Row {
-    IncomingHead(incoming_graph::IncomingHead),
+    IncomingHead(Box<incoming_graph::IncomingHead>),
     IncomingLink(incoming_graph::IncomingLink),
-    Monitor(monitor_index::MonitorAllocation),
-    MonitorHead(monitor_index::MonitorHead),
-    MonitorLink(Option<monitor_index::MonitorLink>),
+    Monitor(Box<monitor_index::MonitorAllocation>),
+    MonitorHead(Box<monitor_index::MonitorHead>),
+    MonitorLink(Option<Box<monitor_index::MonitorLink>>),
     MissingResult(OwnedMissingResult),
-    Meta(Meta),
+    Meta(Box<Meta>),
     Claim(OwnedClaim),
-    Definition(OwnedDeclaration),
+    Definition(Box<OwnedDeclaration>),
     Evaluation(OwnedEvaluation),
     Artifact(OwnedArtifact),
     ArtifactIdentity(ArtifactId),
     Accepted(OwnedAccepted),
     DeliveryResult(OwnedDeliveryResult),
-    Receipt(NativeReceipt),
-    Cycle(NativeCycle),
-    RetiredCycleHead(RetiredCycleHead),
-    RetiredCycle(RetiredCycle),
+    Receipt(Box<NativeReceipt>),
+    Cycle(Box<NativeCycle>),
+    RetiredCycleHead(Box<RetiredCycleHead>),
+    RetiredCycle(Box<RetiredCycle>),
     Work(OwnedWork),
     WorkSlot(ArtifactId),
     Diagnostic(OwnedDiagnostic),
     Response(OwnedResponse),
     ResultTestament(OwnedResultTestament),
     ClaimResultTestament(TestamentId),
-    Outcome(OutcomeRow),
+    Outcome(Box<OutcomeRow>),
     Event(OwnedEvent),
     ClaimContent(OwnedClaimContent),
     ClaimIdentity(ClaimId),
@@ -1348,9 +1352,94 @@ enum Row {
     LegacyDefinition(OwnedLegacy),
     /// The unit value of every secondary index row.
     Index,
-    Retired(RetiredClaim),
-    Epochs(EpochWindow),
-    Seal(SealRow),
+    Retired(Box<RetiredClaim>),
+    Epochs(Box<EpochWindow>),
+    Seal(Box<SealRow>),
+}
+
+/// The heap a row's boxed payload of type `T` takes: its bytes and the allocator's own.
+const fn wide_heap<T>() -> usize {
+    match size_of::<T>().checked_add(focal_memory::ALLOCATOR_OVERHEAD) {
+        Some(bytes) => bytes,
+        None => usize::MAX,
+    }
+}
+
+/// The most heap any one row's box takes: the widest boxed payload's.
+fn wide_heap_max() -> usize {
+    [
+        wide_heap::<incoming_graph::IncomingHead>(),
+        wide_heap::<monitor_index::MonitorAllocation>(),
+        wide_heap::<monitor_index::MonitorHead>(),
+        wide_heap::<monitor_index::MonitorLink>(),
+        wide_heap::<Meta>(),
+        wide_heap::<OwnedDeclaration>(),
+        wide_heap::<NativeReceipt>(),
+        wide_heap::<NativeCycle>(),
+        wide_heap::<RetiredCycleHead>(),
+        wide_heap::<RetiredCycle>(),
+        wide_heap::<OutcomeRow>(),
+        wide_heap::<RetiredClaim>(),
+        wide_heap::<EpochWindow>(),
+        wide_heap::<SealRow>(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
+}
+
+impl Key {
+    /// The most heap the row under this key may take in a box (`Row`): what a
+    /// quote made before the row is built allows for it.
+    fn boxed_heap(&self) -> usize {
+        match self {
+            Key::IncomingHead(..) => wide_heap::<incoming_graph::IncomingHead>(),
+            Key::Monitor(..) => wide_heap::<monitor_index::MonitorAllocation>(),
+            Key::MonitorHead(..) => wide_heap::<monitor_index::MonitorHead>(),
+            Key::MonitorLink(..) => wide_heap::<monitor_index::MonitorLink>(),
+            Key::Meta => wide_heap::<Meta>(),
+            Key::Definition(..) => wide_heap::<OwnedDeclaration>(),
+            Key::Receipt(..) => wide_heap::<NativeReceipt>(),
+            Key::Cycle(..) => wide_heap::<NativeCycle>(),
+            Key::RetiredCycleHead(..) => wide_heap::<RetiredCycleHead>(),
+            Key::RetiredCycle(..) => wide_heap::<RetiredCycle>(),
+            Key::Outcome(..) => wide_heap::<OutcomeRow>(),
+            Key::Retired(..) => wide_heap::<RetiredClaim>(),
+            Key::Epochs(..) => wide_heap::<EpochWindow>(),
+            Key::Seal(..) => wide_heap::<SealRow>(),
+            _ => 0,
+        }
+    }
+}
+
+impl Row {
+    /// The heap this row's boxed payload takes, if it has one.
+    fn boxed_heap(&self) -> usize {
+        match self {
+            Row::IncomingHead(_) => wide_heap::<incoming_graph::IncomingHead>(),
+            Row::Monitor(_) => wide_heap::<monitor_index::MonitorAllocation>(),
+            Row::MonitorHead(_) => wide_heap::<monitor_index::MonitorHead>(),
+            Row::MonitorLink(Some(_)) => wide_heap::<monitor_index::MonitorLink>(),
+            Row::Meta(_) => wide_heap::<Meta>(),
+            Row::Definition(_) => wide_heap::<OwnedDeclaration>(),
+            Row::Receipt(_) => wide_heap::<NativeReceipt>(),
+            Row::Cycle(_) => wide_heap::<NativeCycle>(),
+            Row::RetiredCycleHead(_) => wide_heap::<RetiredCycleHead>(),
+            Row::RetiredCycle(_) => wide_heap::<RetiredCycle>(),
+            Row::Outcome(_) => wide_heap::<OutcomeRow>(),
+            Row::Retired(_) => wide_heap::<RetiredClaim>(),
+            Row::Epochs(_) => wide_heap::<EpochWindow>(),
+            Row::Seal(_) => wide_heap::<SealRow>(),
+            _ => 0,
+        }
+    }
+}
+
+/// A store entry: `heap` is what the row's own owned bytes take; a boxed payload's
+/// allocation is added here, once, for every row however it was made.
+fn entry(key: Key, row: Row, heap: usize) -> focal_memory::Entry<Key, Row> {
+    let boxed = row.boxed_heap();
+    focal_memory::Entry::new(key, row, heap.saturating_add(boxed))
 }
 
 /// All allocated candidate rows, outcomes and events have one immutable root.
@@ -2077,7 +2166,7 @@ impl<'a> View<'a> {
     }
     fn meta(&self) -> Meta {
         match self.get(Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
+            Some(Row::Meta(meta)) => **meta,
             _ => Meta::default(),
         }
     }
@@ -2223,7 +2312,7 @@ impl NativeRead {
 
 fn as_receipt(row: Option<&Row>) -> Option<NativeReceipt> {
     match row {
-        Some(Row::Receipt(value)) => Some(*value),
+        Some(Row::Receipt(value)) => Some(**value),
         _ => None,
     }
 }

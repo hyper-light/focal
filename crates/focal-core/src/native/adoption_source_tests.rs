@@ -227,7 +227,7 @@ fn adoption_rejects_corrupted_delivery_cycle_link_without_changing_terminal_rece
     for replacement in [None, Some(TestamentId::from_u128(999))] {
         let mut core = copy_actual_core(&fixture);
         let mut cycle = match core.state.rows.get(&Key::Cycle(key)) {
-            Some(Row::Cycle(cycle)) => *cycle,
+            Some(Row::Cycle(cycle)) => **cycle,
             _ => panic!("actual cycle"),
         };
         cycle.response = replacement;
@@ -235,7 +235,7 @@ fn adoption_rejects_corrupted_delivery_cycle_link_without_changing_terminal_rece
             &mut core,
             vec![Change::Put(Entry::new(
                 Key::Cycle(key),
-                Row::Cycle(cycle),
+                Row::Cycle(Box::new(cycle)),
                 0,
             ))],
         );

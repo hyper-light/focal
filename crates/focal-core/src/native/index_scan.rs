@@ -292,7 +292,7 @@ impl Core<NativeState> {
             .entries_from(&start, after.is_some())
             .take_while(|entry| matches!(entry.key, Key::Receipt(_)))
             .filter_map(|entry| match (entry.key, &entry.value) {
-                (Key::Receipt(id), Row::Receipt(receipt)) => Some((id, *receipt)),
+                (Key::Receipt(id), Row::Receipt(receipt)) => Some((id, **receipt)),
                 _ => None,
             })
     }

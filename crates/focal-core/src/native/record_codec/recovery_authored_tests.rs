@@ -211,9 +211,9 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
         .native_validation_descriptor(ValidationId::from_u128(1))
         .unwrap();
     let legacy = descriptor.declaration();
-    let legacy_row = Row::Definition(
+    let legacy_row = Row::Definition(Box::new(
         OwnedDeclaration::new(legacy.try_copy(legacy.retained_bytes().unwrap()).unwrap()).unwrap(),
-    );
+    ));
     let mut mappings = core
         .native_creation_result(request(3))
         .unwrap()

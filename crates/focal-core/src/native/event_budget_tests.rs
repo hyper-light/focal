@@ -285,10 +285,10 @@ fn zero_event_configuration_and_counter_overflow_fail_closed() {
             1,
             vec![Change::Put(Entry::new(
                 Key::Meta,
-                Row::Meta(Meta {
+                Row::Meta(Box::new(Meta {
                     events: usize::MAX,
                     ..Meta::default()
-                }),
+                })),
                 0,
             ))],
             BudgetLane::Completion,

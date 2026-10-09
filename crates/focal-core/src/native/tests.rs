@@ -636,7 +636,9 @@ fn retained_page_copy_failure_discards_partial_candidate_and_keeps_pinned_facts(
     publish(&mut core, create(1, vec![proposal(1), proposal(2)]));
     let old = core.pin_native(0, 100).unwrap();
     let before = core.native_budget();
-    let failed = prepare::fail_copies_after(1, || {
+    // The first retained neighbor this write copies fails: how many it copies depends on
+    // the page layout (the entry width), the rollback it must leave does not.
+    let failed = prepare::fail_copies_after(0, || {
         core.prepare_native(
             context(Principal::Actor(ISSUER)),
             create(2, vec![proposal(3)]),

@@ -691,3 +691,124 @@ fn measure_time_per_authored_claim() {
         window.1 as f64 / 1000.0 / 1e3,
     );
 }
+
+/// What one authored claim (one declaration) costs the session's memory, by row family:
+/// rows, inline entry bytes and owned heap bytes. A measurement, not an assertion.
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_memory_per_authored_claim_by_family() {
+    let mut core = core();
+    const CLAIMS: u128 = 200;
+    for id in 1..=CLAIMS {
+        let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        core.publish_native(prepared).unwrap();
+    }
+    let mut families: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    let entry = std::mem::size_of::<focal_memory::Entry<Key, Row>>();
+    for item in core.state.rows.entries() {
+        let name = format!("{:?}", item.key);
+        let family = name
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or("?")
+            .to_string();
+        let slot = families.entry(family).or_default();
+        slot.0 += 1;
+        slot.1 += item.heap_bytes;
+    }
+    let claims = CLAIMS as f64;
+    let mut total_rows = 0;
+    let mut total_heap = 0;
+    println!(
+        "entry={entry} B (Key {} B, Row {} B)",
+        std::mem::size_of::<Key>(),
+        std::mem::size_of::<Row>()
+    );
+    println!(
+        "{:<22} {:>9} {:>12} {:>12}",
+        "family", "rows/claim", "inline B/cl", "heap B/cl"
+    );
+    for (family, (rows, heap)) in &families {
+        total_rows += rows;
+        total_heap += heap;
+        println!(
+            "{family:<22} {:>9.2} {:>12.0} {:>12.0}",
+            *rows as f64 / claims,
+            (*rows * entry) as f64 / claims,
+            *heap as f64 / claims
+        );
+    }
+    println!(
+        "{:<22} {:>9.2} {:>12.0} {:>12.0}",
+        "TOTAL",
+        total_rows as f64 / claims,
+        (total_rows * entry) as f64 / claims,
+        total_heap as f64 / claims
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_row_variant_widths() {
+    let mut widths: Vec<(&str, usize)> = vec![
+        (
+            "IncomingHead",
+            std::mem::size_of::<incoming_graph::IncomingHead>(),
+        ),
+        (
+            "IncomingLink",
+            std::mem::size_of::<incoming_graph::IncomingLink>(),
+        ),
+        (
+            "Monitor",
+            std::mem::size_of::<monitor_index::MonitorAllocation>(),
+        ),
+        (
+            "MonitorHead",
+            std::mem::size_of::<monitor_index::MonitorHead>(),
+        ),
+        (
+            "MonitorLink",
+            std::mem::size_of::<Option<monitor_index::MonitorLink>>(),
+        ),
+        ("MissingResult", std::mem::size_of::<OwnedMissingResult>()),
+        ("Meta", std::mem::size_of::<Meta>()),
+        ("Claim", std::mem::size_of::<OwnedClaim>()),
+        ("Definition", std::mem::size_of::<OwnedDeclaration>()),
+        ("Evaluation", std::mem::size_of::<OwnedEvaluation>()),
+        ("Artifact", std::mem::size_of::<OwnedArtifact>()),
+        ("ArtifactIdentity", std::mem::size_of::<ArtifactId>()),
+        ("Accepted", std::mem::size_of::<OwnedAccepted>()),
+        ("DeliveryResult", std::mem::size_of::<OwnedDeliveryResult>()),
+        ("Receipt", std::mem::size_of::<NativeReceipt>()),
+        ("Cycle", std::mem::size_of::<NativeCycle>()),
+        ("RetiredCycleHead", std::mem::size_of::<RetiredCycleHead>()),
+        ("RetiredCycle", std::mem::size_of::<RetiredCycle>()),
+        ("Work", std::mem::size_of::<OwnedWork>()),
+        ("WorkSlot", std::mem::size_of::<ArtifactId>()),
+        ("Diagnostic", std::mem::size_of::<OwnedDiagnostic>()),
+        ("Response", std::mem::size_of::<OwnedResponse>()),
+        (
+            "ResultTestament",
+            std::mem::size_of::<OwnedResultTestament>(),
+        ),
+        ("ClaimResultTestament", std::mem::size_of::<TestamentId>()),
+        ("Outcome", std::mem::size_of::<OutcomeRow>()),
+        ("Event", std::mem::size_of::<OwnedEvent>()),
+        ("ClaimContent", std::mem::size_of::<OwnedClaimContent>()),
+        ("ClaimIdentity", std::mem::size_of::<ClaimId>()),
+        ("DefinitionIdentity", std::mem::size_of::<ValidationId>()),
+        ("CreationResult", std::mem::size_of::<OwnedCreationResult>()),
+        ("LegacyTestament", std::mem::size_of::<OwnedLegacy>()),
+        ("LegacyEvidenceSet", std::mem::size_of::<OwnedLegacy>()),
+        ("LegacyRun", std::mem::size_of::<OwnedLegacy>()),
+        ("LegacyDefinition", std::mem::size_of::<OwnedLegacy>()),
+        ("Retired", std::mem::size_of::<RetiredClaim>()),
+        ("Epochs", std::mem::size_of::<EpochWindow>()),
+        ("Seal", std::mem::size_of::<SealRow>()),
+    ];
+    widths.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+    for (name, width) in widths {
+        println!("{name:<20} {width}");
+    }
+}
