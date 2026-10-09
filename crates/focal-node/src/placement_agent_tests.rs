@@ -424,6 +424,58 @@ fn install_records_before_created_sessions_decode_as_assigned_copies() {
     assert!(InstallRecord::decode(&postcard::to_stdvec(&future).unwrap()).is_err());
 }
 
+/// Schema 2 copies predate recorded allowances: every session was founded
+/// and registered under the standard one, which they decode with; a schema 3
+/// copy keeps its own.
+#[test]
+fn install_records_before_allowances_decode_with_the_standard_allowance() {
+    #[derive(Serialize)]
+    struct CopyV2 {
+        group: [u8; 16],
+        bootstrap_voters: Vec<u64>,
+        route_epoch: RouteEpoch,
+        policy_revision: u64,
+        voters: BTreeSet<u64>,
+        copies: BTreeSet<u64>,
+        created: bool,
+    }
+    #[derive(Serialize)]
+    struct RecordV2 {
+        schema: u16,
+        node: u64,
+        installed: BTreeMap<LedgerId, CopyV2>,
+    }
+    let ledger = LedgerId {
+        tenant: TenantId::from_u128(1),
+        session: focal_model::SessionId::from_u128(2),
+    };
+    let legacy = RecordV2 {
+        schema: 2,
+        node: 4,
+        installed: BTreeMap::from([(
+            ledger,
+            CopyV2 {
+                group: [3; 16],
+                bootstrap_voters: vec![1],
+                route_epoch: RouteEpoch(2),
+                policy_revision: 2,
+                voters: BTreeSet::from([1, 4]),
+                copies: BTreeSet::from([4]),
+                created: true,
+            },
+        )]),
+    };
+    let record = InstallRecord::decode(&postcard::to_stdvec(&legacy).unwrap()).unwrap();
+    assert_eq!(record.schema, INSTALL_RECORD_SCHEMA);
+    let copy = &record.installed[&ledger];
+    assert!(copy.created);
+    assert_eq!(copy.memory, standard_memory());
+    let mut current = record;
+    current.installed.get_mut(&ledger).unwrap().memory = 3 << 30;
+    let again = InstallRecord::decode(&postcard::to_stdvec(&current).unwrap()).unwrap();
+    assert_eq!(again.installed[&ledger].memory, 3 << 30);
+}
+
 /// Doc 24 §16: an operator admits a tenant as an enrollment fact and
 /// creates sessions by name; the agent hosts, registers and serves them,
 /// the local socket's grant follows the registry, and a restart reopens

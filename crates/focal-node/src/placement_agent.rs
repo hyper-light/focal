@@ -218,6 +218,9 @@ struct InstalledCopy {
     /// Created on this node by an operator rather than assigned by a plan:
     /// the agent registers it with the directory as it did the founder's.
     created: bool,
+    /// The session's memory allowance, every copy's alike: its committed
+    /// requirement (`crate::memory_envelope`).
+    memory: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct InstallRecord {
@@ -225,7 +228,29 @@ struct InstallRecord {
     node: u64,
     installed: BTreeMap<LedgerId, InstalledCopy>,
 }
-const INSTALL_RECORD_SCHEMA: u16 = 2;
+const INSTALL_RECORD_SCHEMA: u16 = 3;
+/// What every session before schema 3 was registered with: the standard
+/// session allowance.
+fn standard_memory() -> u64 {
+    u64::try_from(SessionLimits::default().memory_bytes).unwrap_or(u64::MAX)
+}
+/// Schema 2 (before copies carried their session's allowance).
+#[derive(Deserialize)]
+struct InstalledCopyV2 {
+    group: [u8; 16],
+    bootstrap_voters: Vec<u64>,
+    route_epoch: RouteEpoch,
+    policy_revision: u64,
+    voters: BTreeSet<u64>,
+    copies: BTreeSet<u64>,
+    created: bool,
+}
+#[derive(Deserialize)]
+struct InstallRecordV2 {
+    schema: u16,
+    node: u64,
+    installed: BTreeMap<LedgerId, InstalledCopyV2>,
+}
 /// Schema 1 (before created sessions): every recorded copy was assigned.
 #[derive(Deserialize)]
 struct InstalledCopyV1 {
@@ -268,6 +293,36 @@ impl InstallRecord {
                                     voters: copy.voters,
                                     copies: copy.copies,
                                     created: false,
+                                    memory: standard_memory(),
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+            }
+            2 => {
+                let (legacy, rest): (InstallRecordV2, _) = postcard::take_from_bytes(bytes)?;
+                if !rest.is_empty() || legacy.schema != 2 {
+                    return Err(AgentError::Identity);
+                }
+                Ok(Self {
+                    schema: INSTALL_RECORD_SCHEMA,
+                    node: legacy.node,
+                    installed: legacy
+                        .installed
+                        .into_iter()
+                        .map(|(ledger, copy)| {
+                            (
+                                ledger,
+                                InstalledCopy {
+                                    group: copy.group,
+                                    bootstrap_voters: copy.bootstrap_voters,
+                                    route_epoch: copy.route_epoch,
+                                    policy_revision: copy.policy_revision,
+                                    voters: copy.voters,
+                                    copies: copy.copies,
+                                    created: copy.created,
+                                    memory: standard_memory(),
                                 },
                             )
                         })
@@ -1601,7 +1656,9 @@ impl PlacementAgent {
         // A copy is charged to its tenant's allowance. The tenant was admitted
         // before the copy was recorded; after a restart the record is the
         // admission, under the same node bound and budget.
-        let tenant = self.admit_tenant(handles, ledger.tenant).await?;
+        let tenant = self
+            .admit_tenant(handles, ledger.tenant, copy.memory)
+            .await?;
         let consensus = self.storage.open_member(
             NodeConfig::joining(
                 self.state.node,
@@ -1627,18 +1684,14 @@ impl PlacementAgent {
     ) -> Result<ReplicaHost, AgentError> {
         let mut identity = self.identity.clone();
         identity.ledger = ledger;
+        let limits = SessionLimits::within(crate::memory_envelope::session_bytes(copy.memory));
         let hosting = crate::network_service::native_hosting(
             &self.root,
             &identity,
             self.storage.disk_budget(),
+            &limits,
         )?;
-        let session = Session::from_node_in_hosted(
-            ledger,
-            consensus,
-            SessionLimits::default(),
-            tenant,
-            hosting,
-        )?;
+        let session = Session::from_node_in_hosted(ledger, consensus, limits, tenant, hosting)?;
         // A reopened copy serves the route its log has committed; a fresh copy
         // has none yet and takes the plan's target scope for its custody.
         let mut config = ReplicaConfig::new(self.identity.root);
@@ -1882,9 +1935,8 @@ impl PlacementAgent {
         &mut self,
         handles: &NetworkHandles,
         tenant: TenantId,
+        required: u64,
     ) -> Result<MemoryBudget, AgentError> {
-        let required = u64::try_from(SessionLimits::default().memory_bytes)
-            .map_err(|_| AgentError::Capacity)?;
         let admitted = self.admission.admit(tenant, required)?;
         if !handles.fleet.is_admitted(tenant) {
             handles.fleet.admit_tenant(admitted.clone()).await?;
@@ -2106,7 +2158,11 @@ impl PlacementAgent {
                 .as_ref()
                 .map(|policy| policy.home_regions.clone())
                 .unwrap_or_default(),
-            required_memory: 0,
+            // A re-plan keeps the session's committed allowance: a copy is
+            // seated only where it can be funded.
+            required_memory: base
+                .as_ref()
+                .map_or_else(standard_memory, |policy| policy.required_memory),
         };
         let incumbents: BTreeMap<u64, u64> = current
             .iter()
@@ -2426,7 +2482,11 @@ impl PlacementAgent {
         {
             return Err(AgentError::Capacity);
         }
-        self.admit_tenant(handles, tenant).await?;
+        let memory = u64::try_from(crate::memory_envelope::founded_session_bytes(
+            &self.settings,
+        ))
+        .map_err(|_| AgentError::Capacity)?;
+        self.admit_tenant(handles, tenant, memory).await?;
         let copy = InstalledCopy {
             group: session.0,
             bootstrap_voters: vec![node],
@@ -2435,6 +2495,7 @@ impl PlacementAgent {
             voters: BTreeSet::from([node]),
             copies: BTreeSet::from([node]),
             created: true,
+            memory,
         };
         let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
         if installs.record.installed.get(&ledger) != Some(&copy) {
@@ -2534,13 +2595,25 @@ impl PlacementAgent {
                 "this node already records a copy of the session or its log group",
             ));
         }
-        let tenant = self.admit_tenant(handles, ledger.tenant).await?;
+        // A restored session is founded here again: its allowance is the one
+        // this node gives a session it founds.
+        let restored_memory = u64::try_from(crate::memory_envelope::founded_session_bytes(
+            &self.settings,
+        ))
+        .map_err(|_| AgentError::Capacity)?;
+        let tenant = self
+            .admit_tenant(handles, ledger.tenant, restored_memory)
+            .await?;
         let objects_imported = handles
             .content
             .restore_content(request.input.clone(), manifest.clone())
             .await?;
         let domain = focal_model::ContentDomainId(ledger.tenant.0);
-        let limits = crate::network_service::native_limits(domain)?;
+        let limits = crate::network_service::native_limits(
+            domain,
+            SessionLimits::within(crate::memory_envelope::session_bytes(restored_memory))
+                .native_memory_bytes(),
+        )?;
         let decoder = focal_ledger::backup::decoder_pair();
         let seed_root = crate::custody::seed_directory(&self.root.join("seeds"), ledger);
         let disk = self.storage.disk_budget();
@@ -2608,6 +2681,7 @@ impl PlacementAgent {
             voters: BTreeSet::from([node]),
             copies: BTreeSet::from([node]),
             created: true,
+            memory: restored_memory,
         };
         let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
         installs.record.installed.insert(ledger, copy.clone());
@@ -2978,6 +3052,7 @@ impl PlacementAgent {
                     .copied()
                     .collect(),
                 created: false,
+                memory: plan.desired.policy.required_memory.max(standard_memory()),
             };
             let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
             if installs.record.installed.len() >= MAX_INSTALLED {

@@ -224,12 +224,11 @@ impl Phase {
         }
     }
 }
-/// One collector phase transition: advance to the next phase, or the pass is
-/// complete.
-enum Step {
-    Advance(Phase),
-    Done,
-}
+/// One collector phase transition: the next phase, or `None` when the pass is
+/// complete. (A phase holds an open directory, which on Windows carries its
+/// find data inline, some 600 bytes: the step is the phase or nothing, never
+/// a second, wider enum around it.)
+type Step = Option<Phase>;
 
 pub(super) struct CollectorState {
     phase: Phase,
@@ -359,8 +358,8 @@ impl ContentStore {
             // re-entry, only scalar progress is preserved.
             let resume = phase.resume_point();
             match self.advance_phase(phase, protection, config, now_ms, &mut budget) {
-                Ok(Step::Advance(next)) => self.collector.phase = next,
-                Ok(Step::Done) => {
+                Ok(Some(next)) => self.collector.phase = next,
+                Ok(None) => {
                     self.collector.report.complete = true;
                     let report = self.collector.report;
                     self.collector.phase = Phase::Idle;
@@ -386,20 +385,20 @@ impl ContentStore {
             Phase::Idle => {
                 self.collector.report = CollectorReport::default();
                 self.collector.round = None;
-                Step::Advance(Phase::Uploads)
+                Some(Phase::Uploads)
             }
             Phase::Uploads => {
                 self.expire_uploads(config, now_ms, budget)?;
-                Step::Advance(Phase::Terminals(None))
+                Some(Phase::Terminals(None))
             }
             Phase::Terminals(dir) => match self.release_terminals(dir, config, now_ms, budget)? {
-                Some(dir) => Step::Advance(Phase::Terminals(Some(dir))),
+                Some(dir) => Some(Phase::Terminals(Some(dir))),
                 None => {
                     let domains = self.domains()?;
-                    Step::Advance(Phase::Domains { domains, index: 0 })
+                    Some(Phase::Domains { domains, index: 0 })
                 }
             },
-            Phase::Domains { domains, index } => Step::Advance(match domains.get(index).copied() {
+            Phase::Domains { domains, index } => Some(match domains.get(index).copied() {
                 None => Phase::Records { kinds: 0 },
                 Some(domain) if protection.is_opaque(domain) => {
                     self.collector.report.opaque_domains =
@@ -438,7 +437,7 @@ impl ContentStore {
                     now_ms,
                     budget,
                 )?;
-                Step::Advance(if exhausted {
+                Some(if exhausted {
                     if overflow {
                         self.collector.report.chunks_deferred =
                             self.collector.report.chunks_deferred.saturating_add(1);
@@ -474,7 +473,7 @@ impl ContentStore {
                 let domain = *domains.get(index).ok_or(ContentError::Invalid)?;
                 let exhausted =
                     self.sweep_chunks(domain, &mut dir, &marks, config, now_ms, budget)?;
-                Step::Advance(if exhausted {
+                Some(if exhausted {
                     Phase::Domains {
                         domains,
                         index: index.saturating_add(1),
@@ -491,7 +490,7 @@ impl ContentStore {
             Phase::Records { kinds } => {
                 const KINDS: [CustodyRecordKind; 2] =
                     [CustodyRecordKind::Checkpoint, CustodyRecordKind::Manifest];
-                Step::Advance(match KINDS.get(kinds) {
+                Some(match KINDS.get(kinds) {
                     Some(kind) => {
                         self.sweep_records(*kind, protection, config, now_ms, budget)?;
                         Phase::Records {
@@ -502,10 +501,10 @@ impl ContentStore {
                 })
             }
             Phase::Receipts(dir) => match self.sweep_receipts(dir, config, now_ms, budget)? {
-                Some(dir) => Step::Advance(Phase::Receipts(Some(dir))),
+                Some(dir) => Some(Phase::Receipts(Some(dir))),
                 None => {
                     let rounds = self.expired_rounds(config, now_ms)?;
-                    Step::Advance(Phase::Quarantine {
+                    Some(Phase::Quarantine {
                         rounds,
                         index: 0,
                         dir: None,
@@ -513,10 +512,10 @@ impl ContentStore {
                 }
             },
             Phase::Quarantine { rounds, index, dir } => match rounds.get(index).copied() {
-                None => Step::Done,
+                None => None,
                 Some(round) => {
                     let done = self.delete_round(round, dir, budget)?;
-                    Step::Advance(match done {
+                    Some(match done {
                         None => Phase::Quarantine {
                             rounds,
                             index: index.saturating_add(1),

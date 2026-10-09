@@ -249,6 +249,32 @@ impl NativeSessionLimits {
         }
     }
 }
+impl NativeSessionLimits {
+    /// The standard limits for an engine allowed `memory_bytes`: its completion
+    /// reserve an eighth of it, as the standard 16 of 128 MiB, and its
+    /// checkpoint's bounds following it. A root is charged to the engine's
+    /// budget, so it holds at most as many rows as that budget keeps resident,
+    /// and admission refuses a mutation whose projected checkpoint would pass
+    /// the assembled bound (`checkpointable`): both grow with the allowance,
+    /// never below the standard ones.
+    pub fn standard_within(
+        content_domain: focal_model::ContentDomainId,
+        memory_bytes: usize,
+    ) -> Self {
+        let mut limits = Self::standard(content_domain);
+        let memory_bytes = memory_bytes.max(limits.memory_bytes);
+        limits.memory_bytes = memory_bytes;
+        limits.completion_reserve_bytes = memory_bytes / 8;
+        limits.checkpoint.rows = limits.checkpoint.rows.max(
+            memory_bytes
+                .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+                .unwrap_or(0),
+        );
+        limits.checkpoint.assembled_bytes = limits.checkpoint.assembled_bytes.max(memory_bytes);
+        limits.checkpoint = limits.checkpoint.derived();
+        limits
+    }
+}
 /// Fresh admissions between free-space samples while far above the watermark.
 
 #[derive(Debug, thiserror::Error)]

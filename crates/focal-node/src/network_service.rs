@@ -534,7 +534,7 @@ impl Prepared {
             if startup.changed {
                 state.install(&joined.directory)?;
             }
-            let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
+            let budget = crate::memory_envelope::node_budget(settings)?;
             let allocation = budget
                 .reserve(BudgetKind::Recovery, BudgetLane::Completion, 256 * 1024)?
                 .commit();
@@ -831,7 +831,10 @@ impl NetworkService {
         } else {
             None
         };
-        let tenant = budget.child(512 * 1024 * 1024, 128 * 1024 * 1024)?;
+        // The founder's tenant may use the whole node; the node budget still
+        // arbitrates its live use against every other tenant's.
+        let node_bytes = crate::memory_envelope::node_bytes(settings);
+        let tenant = budget.child(node_bytes, node_bytes / 4)?;
         // The content store and the founder's durable application session both
         // recover by replaying the WAL - unbounded CPU- and IO-blocking work
         // that must not run on the async executor (it would stall the runtime
@@ -845,6 +848,7 @@ impl NetworkService {
             let storage = storage.clone();
             let identity = identity.clone();
             let tenant = tenant.clone();
+            let settings = settings.clone();
             tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
                 let content = ContentStore::open_with_disk(
                     root.join("content"),
@@ -867,13 +871,16 @@ impl NetworkService {
                         &tenant,
                         focal_ledger::entry_needs,
                     )?;
+                    let limits = crate::memory_envelope::found_limits(&root, &settings, &consensus)
+                        .map_err(ServiceError::from)?;
+                    let hosting = native_hosting(&root, &identity, storage.disk_budget(), &limits)
+                        .map_err(NodeError::Content)?;
                     Some(Session::from_node_in_hosted(
                         identity.ledger,
                         consensus,
-                        SessionLimits::default(),
+                        limits,
                         &tenant,
-                        native_hosting(&root, &identity, storage.disk_budget())
-                            .map_err(NodeError::Content)?,
+                        hosting,
                     )?)
                 } else {
                     None
@@ -944,7 +951,10 @@ impl NetworkService {
                 node_budget: budget.clone(),
                 admission: crate::admission::TenantAdmission::new(
                     budget.clone(),
-                    crate::admission::AdmissionPolicy::standard(settings.node.max_tenants),
+                    crate::admission::AdmissionPolicy::standard(
+                        settings.node.max_tenants,
+                        crate::memory_envelope::node_bytes(settings),
+                    ),
                     identity.ledger.tenant,
                     tenant.clone(),
                 ),
@@ -2135,9 +2145,13 @@ pub(crate) fn native_hosting(
     root: &Path,
     identity: &crate::embedded::NodeIdentity,
     disk: focal_memory::DiskBudget,
+    session: &SessionLimits,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
     Ok(focal_ledger::NativeHosting {
-        limits: native_limits(focal_model::ContentDomainId(identity.ledger.tenant.0))?,
+        limits: native_limits(
+            focal_model::ContentDomainId(identity.ledger.tenant.0),
+            session.native_memory_bytes(),
+        )?,
         reader: focal_evidence::ContentReader::open(root.join("content"))?,
         seeds: focal_evidence::SeedStore::open(
             crate::custody::seed_directory(&root.join("seeds"), identity.ledger),
@@ -2204,11 +2218,13 @@ pub(crate) fn disk_headroom_bytes() -> Result<u64, focal_evidence::ContentError>
 pub(crate) fn disk_budget() -> Result<DiskBudget, focal_evidence::ContentError> {
     DiskBudget::new(DiskBudgetConfig::default()).map_err(|_| focal_evidence::ContentError::Invalid)
 }
-/// The standard native session limits with the operator's disk headroom.
+/// The standard native session limits for an engine allowed `memory_bytes`,
+/// with the operator's disk headroom.
 pub(crate) fn native_limits(
     domain: focal_model::ContentDomainId,
+    memory_bytes: usize,
 ) -> Result<focal_ledger::NativeSessionLimits, focal_evidence::ContentError> {
-    let mut limits = focal_ledger::NativeSessionLimits::standard(domain);
+    let mut limits = focal_ledger::NativeSessionLimits::standard_within(domain, memory_bytes);
     limits.disk_headroom_bytes = disk_headroom_bytes()?;
     limits.checkpoint.inline_bytes = seed_inline_bytes()?;
     // The work bound follows the inline bound it is derived from.

@@ -154,7 +154,7 @@ impl FoundingNetwork {
         local_readiness: bool,
     ) -> NetworkResult<Self> {
         let identity = directory.identity();
-        let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
+        let budget = crate::memory_envelope::node_budget(settings)?;
         // Covers bounded manifest decode, founding PKI/draft buffers and duplicate
         // serialized bootstrap inputs during recovery. Shrunk before publication.
         let mut bootstrap_allocation = budget

@@ -61,6 +61,11 @@ pub struct NodeSettings {
     /// default 8, at most 1024. A placement that would need one more is
     /// refused by this node as `NodeCapacity`.
     pub max_tenants: Option<usize>,
+    /// The memory this node's budget holds, every tenant and session it
+    /// hosts included. Unset, three quarters of what the process may use:
+    /// the least of physical memory and its control group's limit
+    /// (`focal_platform::memory_limit`). At least 64 MiB. Node-local.
+    pub memory_bytes: Option<u64>,
     /// An optional loopback endpoint for the read-only metrics text (doc
     /// 08 §9); node-local, never a cluster fact.
     pub metrics_listen: Option<SocketAddr>,
@@ -231,6 +236,16 @@ impl Settings {
             return Err(ConfigError::Invalid {
                 field: "node.max_tenants",
                 reason: "must be between 1 and 1024",
+            });
+        }
+        if self
+            .node
+            .memory_bytes
+            .is_some_and(|bytes| bytes < crate::memory_envelope::MIN_NODE_BYTES)
+        {
+            return Err(ConfigError::Invalid {
+                field: "node.memory_bytes",
+                reason: "must be at least 64 MiB",
             });
         }
         if self

@@ -6,7 +6,7 @@ use crate::{
 };
 use focal_consensus::{DurableNode, NodeConfig};
 use focal_evidence::{ContentStore, StoreLimits};
-use focal_ledger::{LedgerError, Session, SessionLimits};
+use focal_ledger::{LedgerError, Session};
 use focal_log::{SharedWal, WalIdentity, WalOptions};
 use focal_model::*;
 use serde::{Deserialize, Serialize};
@@ -160,12 +160,10 @@ impl EmbeddedNode {
             },
             wal.disk_budget(),
         )?;
-        let mut session = Session::from_node_hosted(
-            identity.ledger,
-            consensus,
-            SessionLimits::default(),
-            crate::network_service::native_hosting(root, &identity, wal.disk_budget())?,
-        )?;
+        let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
+        let hosting =
+            crate::network_service::native_hosting(root, &identity, wal.disk_budget(), &limits)?;
+        let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
         session.campaign()?;
         // One voter can establish the committed current-term read barrier locally.
         for _ in 0..4 {

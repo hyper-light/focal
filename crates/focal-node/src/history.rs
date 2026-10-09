@@ -18,7 +18,7 @@
 use crate::embedded::NodeIdentity;
 use focal_consensus::{DurableNode, NodeConfig};
 use focal_core::native::NativeOutcome;
-use focal_ledger::{Session, SessionLimits};
+use focal_ledger::Session;
 use focal_log::{SharedWal, WalIdentity, WalOptions};
 use std::path::Path;
 
@@ -41,6 +41,8 @@ pub enum PublicationsError {
     Ledger(#[from] focal_ledger::LedgerError),
     #[error("the reopened node did not become authoritative within the poll bound")]
     NotAuthoritative,
+    #[error("the node's session allowance: {0}")]
+    Allowance(Box<crate::embedded::NodeError>),
 }
 
 /// The committed native prefix of the stopped node rooted at `root`, as ordered
@@ -62,13 +64,11 @@ pub fn offline_native_publications(
     )?;
     let config = NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0);
     let consensus = DurableNode::open_on_wal(config, wal.clone())?;
-    let hosting = crate::network_service::native_hosting(root, identity, wal.disk_budget())?;
-    let mut session = Session::from_node_hosted(
-        identity.ledger,
-        consensus,
-        SessionLimits::default(),
-        hosting,
-    )?;
+    let limits = crate::memory_envelope::founded_limits(root)
+        .map_err(|error| PublicationsError::Allowance(Box::new(error)))?;
+    let hosting =
+        crate::network_service::native_hosting(root, identity, wal.disk_budget(), &limits)?;
+    let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
     session.campaign()?;
     let mut authoritative = false;
     for _ in 0..MAX_DRIVE_POLLS {
