@@ -203,6 +203,44 @@ The workflow now measures every system on one runner in turn. It records the run
 what one writer and three writers at once sync on it (`disk.txt`), above the table. A table
 compares systems on one machine; tables from runners with different disks are not compared.
 
+Run 38024634728, the first on one runner (`sda`, the virtual disk: one writer's 500 synchronous
+4 KiB writes 10.6 MB/s), focal at a3266c0. p50 / p99 / p99.9 in milliseconds, every write durable
+at a quorum:
+
+| offered | focal | Kafka | NATS JetStream | Redis |
+|---|---|---|---|---|
+| 100/s | 3.8 / 47.1 / 122.8 | 7.7 / 12.5 / 35.9 | 2.3 / 4.3 / 11.5 | 11.5 / 55.5 / 111.7 |
+| 200/s | 3.4 / 37.9 / 96.1 | 7.3 / 11.4 / 22.2 | 2.2 / 4.3 / 6.6 | 6.8 / 8.7 / 11.3 |
+| 1,000/s | 63.9 / 354.4 / 769.1, 49% refused | 5.7 / 12.6 / 38.2 | 2.8 / 5.4 / 7.5 | 2.7 / 5.4 / 7.3 |
+| 4,000/s | 97% refused | 5.7 / 12.1 / 45.1 | 1,533 / 1,622 / 1,661, 33% refused | 2.3 / 5.5 / 9.7 |
+
+On one machine focal's p99 is the highest of the four at every rate, for two causes, measured
+apart.
+
+- **At 1,000/s, checkpoints.** Second by second focal commits close to the offered rate at a
+  median of 7–13 ms between collapses (run 38014716408's generator log), and the collapses are its
+  checkpoints. A session checkpoints every ~4,200 entries by encoding the whole of its state off
+  the owner (claims insert at random places, so 81 of 93 one-MiB chunks were new at the last one);
+  on this run's leader that encode grew from 0.59 s to 2.73 s of one CPU as the root grew from 19
+  to 82 MiB. focal-log, the storage these nodes run on, then rewrites the snapshot and every entry
+  retained past it on the owner and waits for the sync (7.5 ms growing to 75 ms here), the
+  session taking no work meanwhile; the tail it rewrites is what arrived during the encode.
+  Participants' requests and followers' acknowledgements waited for the session in its queue of 32
+  (`focal_sessions_requests_refused_total`, `focal_sessions_frames_refused_total`: 39,844 and
+  18,778 at 1,000/s), and an acknowledgement refused is a follower's answer lost. Since
+  2026-10-09 a peer's frame waits in a room of its own, as many places as its session's peer
+  reserve (doc 27 §12). The checkpoint's own remedy is the shell storage: an image staged off the
+  owner and a cadence relative to the image's size (Ongaro §5.1.2, doc 27 §15), so a checkpoint's
+  cost is spread over a log as large as the state. Writing only the pages that changed does not
+  pay at this size: a page holds up to 128 rows, and 4,200 claims at random places touch nearly
+  every page of an 82 MiB root.
+- **At 100/s and 200/s, something else.** No checkpoint falls in the slow seconds. The slow writes
+  come in spikes of 50–163 ms every ~2 s at 100/s (122 of the 125 writes past 20 ms in seconds
+  11–27) and of 30–85 ms every ~5 s at 200/s; no owner stalled (its longest period 116 ms against
+  a 100 ms tick), and the followers refused no frames, yet the leader lost 22 of its messages to
+  them. Nothing the nodes then exported timed their log's syncs or said why a message was lost:
+  `focal_wal_sync_seconds` and `focal_peer_messages_lost_by_cause_total` now do, for the next run.
+
 **A session's open claims are bounded** (about 11,800 authored claims before admission refuses,
 `native owner memory`). The competitors append to a log without state. focal's write is a
 claim's state transition, which stays open until it is closed, so a long run at a high rate
