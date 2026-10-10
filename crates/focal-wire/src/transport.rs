@@ -316,10 +316,8 @@ pub(crate) fn endpoint_driver(
         limits: endpoint_limits(limits, admission)?,
         congestion: congestion(),
     };
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the endpoint is made at the instant the driver anchors to the shard's clock"
-    )]
+    // Made the instant before the driver anchors its clock to the shard's: every later instant
+    // the driver gives it is that anchor's or after.
     let endpoint: Endpoint<FocalClasses, NetBudget, NetDirectory> = Endpoint::new(
         config,
         NetBudget::new(budget),

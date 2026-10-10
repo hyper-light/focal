@@ -2746,6 +2746,56 @@ fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
     .unwrap()
 }
 
+/// A peer of the first data protocol (`focal/1`: focal's frames on QUIC streams of their own)
+/// shares no protocol with this one: its handshake is refused, so no byte it sends is read as a
+/// message and its handler is never called, while the same identity on this protocol is served.
+#[test]
+fn a_peer_of_the_first_data_protocol_is_refused_at_the_handshake() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(4).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move { response(verified.request()) }
+        });
+        let (server, task) = server(&pki, registry, handler).await;
+        let mut first = client_identity(&pki, certificate.clone(), key.clone()).into_config();
+        first.alpn_protocols = vec![b"focal/1".to_vec()];
+        let old = QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ClientTls::from_config(first),
+            limits(),
+            budget(),
+        )
+        .unwrap();
+        let refused = old.connect(server.local_addr().unwrap(), "localhost").await;
+        assert!(refused.is_err(), "a focal/1 peer was connected");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let current = connector(&pki, certificate, key);
+        let remote = current
+            .connect(server.local_addr().unwrap(), "localhost")
+            .await
+            .unwrap();
+        assert_eq!(
+            remote.request(&request(1)).await.unwrap(),
+            response(&request(1))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        remote.close().unwrap();
+        old.close().unwrap();
+        current.close().unwrap();
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 /// A handle polled off a hyper-rt shard — by a plain thread's executor, say — refuses at once,
 /// typed, and queues nothing for its owner: it has no shard's timers or sockets to keep a wait
 /// with. On its shard the same handle still serves.

@@ -97,7 +97,7 @@ addresses; changes require an explicit reachability transition. Bootstrap
 buffers carry owned memory allowances. The returned directory owner must remain
 alive until all extracted stores and drivers have stopped.
 
-`NetworkListener` serves issued-node data (`focal/1`) and pinned bootstrap
+`NetworkListener` serves issued-node data (`focal/2`) and pinned bootstrap
 enrollment (`focal-enroll/1`) on one UDP port. ALPN selects distinct server
 certificates. Enrollment may connect without a client certificate; data requires
 a client certificate and a live registry grant even on the shared listener.

@@ -9,7 +9,12 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Explicit syntax capability for independently registered request streams.
 /// Legacy envelopes and handshake structures retain their original encoding.
 pub const MANAGED_PROTOCOL_VERSION: u16 = 2;
-pub const ALPN: &[u8] = b"focal/1";
+/// The data protocol's name in the TLS handshake. Its second generation: every message is a
+/// hyper-transport exchange whose class its kind and its sender's role decide. A peer of the first
+/// (`focal/1`, focal's frames on QUIC streams of their own) shares no protocol with it, so the
+/// handshake refuses it (`no_application_protocol`, RFC 7301 §3.2) before either reads a byte the
+/// other could not.
+pub const ALPN: &[u8] = b"focal/2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadToken {
