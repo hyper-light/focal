@@ -820,3 +820,79 @@ async fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_c
     assert_eq!(counted.frames_refused, 0);
     assert_eq!(counted.requests_dropped, 0);
 }
+
+/// A peer's frame reaches its session's owner as it comes, while the
+/// session's write is in flight too: the owner steps it or keeps it, and
+/// answers at once a frame it refuses — here one from a node the session
+/// does not name. Queued behind the write, a frame waited for it, holding a
+/// place of the queue participants' work shares (`GroupOwner::enqueue`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peers_frame_reaches_its_owner_while_the_sessions_write_is_out() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = fixture(path.path(), 1);
+    settle(&fixture).await;
+    let host = fixture.hosts[&ledger(1)].clone();
+    let node = AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId::from_u128(2),
+        tenants: [ledger(1).tenant].into_iter().collect(),
+        role: PeerRole::Node { node_id: 2 },
+    })
+    .unwrap();
+    let lease = blocker(&fixture.wal);
+    let (resume, disk) = pause(lease);
+    // One write takes the session's write out; the paused writer holds it.
+    let mut observation = host.progress.clone();
+    observation.borrow_and_update();
+    let first = host.clone();
+    let write = tokio::spawn(async move {
+        dispatch(
+            &first,
+            peer(),
+            RequestEnvelope {
+                request_id: RequestId::from_u128(300),
+                ..envelope(
+                    1,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                )
+            },
+            &ReplicaHost::wire_limits(),
+        )
+        .await
+    });
+    let steps = TICK * (2 * crate::test_waits::STEP);
+    crate::test_waits::within(&[&host], steps, TICK, observation.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let frame = RequestEnvelope {
+        request_id: RequestId::from_u128(301),
+        ..envelope(
+            1,
+            Operation::Raft {
+                group: ledger(1).session.0,
+                message: vec![1],
+            },
+        )
+    };
+    let answered = crate::test_waits::within(
+        &[&host],
+        steps,
+        TICK,
+        dispatch(&host, node, frame, &ReplicaHost::wire_limits()),
+    )
+    .await;
+    let write_out = !write.is_finished();
+    resume.send(()).unwrap();
+    drop(disk.join().unwrap());
+    write.await.unwrap();
+    drop(host);
+    shutdown(fixture).await;
+    let answered = answered.expect("the frame waited for the session's write");
+    assert!(
+        matches!(answered.result, Response::Error(AccessError::Unauthorized)),
+        "{answered:?}"
+    );
+    assert!(write_out, "answered while the session's write was out");
+}
