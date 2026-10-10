@@ -2,7 +2,7 @@
 //!
 //! - A connection this side dialed names the peer it was dialed as: TLS has verified the server's
 //!   chain and its name ([`NetDirectory::dial`]), and a dial that pinned the server's leaf (an
-//!   enrollment, 24 §11) is refused unless the leaf is that one.
+//!   enrollment, 24 §11) is refused unless the leaf is one its pins accept ([`LeafPins`]).
 //! - A connection a peer opened on the data protocol ([`crate::ALPN`]) names the certificate it
 //!   presented, through the registry's grants ([`PeerRegistry::authenticate_certificate`]); one
 //!   without a certificate, or whose certificate no grant names, names no peer and is refused,
@@ -22,13 +22,32 @@ use hyper_transport::{Authenticated, Directory, PeerId};
 use super::classes::Sender;
 use crate::{AuthenticatedPeer, PeerRegistry, PeerRole, certificate_fingerprint};
 
+/// The leaves a dial accepts, beside the chain and name its TLS verified: a leaf is accepted when
+/// its BLAKE3 key derivation under `context` — the caller's own fingerprint domain — is one of
+/// `accepted`, a pinned certificate's and the successor's staged to replace it (24 §11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafPins {
+    pub context: &'static str,
+    pub accepted: [Option<[u8; 32]>; 2],
+}
+impl LeafPins {
+    /// Whether `leaf` (DER) is one these pins accept.
+    pub fn accepts(&self, leaf: &[u8]) -> bool {
+        let fingerprint = blake3::derive_key(self.context, leaf);
+        self.accepted
+            .iter()
+            .flatten()
+            .any(|pin| *pin == fingerprint)
+    }
+}
+
 /// A peer this side dials.
 #[derive(Debug)]
 struct Dialed {
     /// The name its certificate is checked against.
     name: String,
-    /// The fingerprint ([`certificate_fingerprint`]) of the leaf it must present, when pinned.
-    pin: Option<[u8; 32]>,
+    /// The leaves it may present, when pinned.
+    pin: Option<LeafPins>,
     /// Its last connection was refused for a leaf other than the pinned one.
     unpinned: bool,
 }
@@ -103,10 +122,9 @@ impl NetDirectory {
         Some(id)
     }
 
-    /// A peer to dial, checked against `name`, and pinned to the leaf whose fingerprint is `pin`
-    /// when one is given: its id, or `None` when the table holds `bound` peers with a connection
-    /// up each.
-    pub(crate) fn dial(&mut self, name: &str, pin: Option<[u8; 32]>) -> Option<PeerId> {
+    /// A peer to dial, checked against `name`, and pinned to the leaves `pin` accepts when it is
+    /// given: its id, or `None` when the table holds `bound` peers with a connection up each.
+    pub(crate) fn dial(&mut self, name: &str, pin: Option<LeafPins>) -> Option<PeerId> {
         if self.dialed.len() >= self.bound {
             let idle = self
                 .dialed
@@ -203,11 +221,11 @@ impl Directory for NetDirectory {
 
     fn identify(&mut self, authenticated: &Authenticated<'_>) -> Option<(PeerId, Sender)> {
         if let Some(dialed) = authenticated.dialed {
-            // TLS verified the server's chain and name; a pinned dial needs its exact leaf.
+            // TLS verified the server's chain and name; a pinned dial needs a leaf it pins.
             let entry = self.dialed.get_mut(&dialed)?;
-            if let Some(pin) = entry.pin {
+            if let Some(pins) = entry.pin {
                 let leaf = authenticated.certificate?;
-                if certificate_fingerprint(leaf) != pin {
+                if !pins.accepts(leaf) {
                     entry.unpinned = true;
                     return None;
                 }

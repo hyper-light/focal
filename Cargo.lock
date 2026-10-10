@@ -803,18 +803,19 @@ dependencies = [
  "aws-lc-rs",
  "blake3",
  "focal-log",
+ "focal-memory",
  "focal-platform",
+ "focal-rt",
  "focal-wire",
  "getrandom 0.3.4",
+ "hyper-rt",
+ "hyper-tls",
  "postcard",
- "quinn",
  "rcgen 0.14.10",
- "rustls",
  "serde",
  "tempfile",
  "thiserror",
  "time",
- "tokio",
  "x509-parser",
  "zeroize",
 ]
@@ -1127,6 +1128,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

@@ -11,8 +11,8 @@
     )
 )]
 //! Durable, single-use enrollment with client-owned keys and constrained X.509 identity.
-//! Network adapters require a Tokio runtime with enabled IO and time drivers;
-//! absent runtime context returns a typed transport error before socket work.
+//! Network adapters run on a hyper-rt shard, on focal-wire's endpoint; off one
+//! they return a typed transport error before socket work.
 mod files;
 mod founding;
 mod invitation;
@@ -33,7 +33,11 @@ pub type ClusterId = [u8; 16];
 pub type InvitationId = [u8; 16];
 pub type JoinId = [u8; 16];
 pub type Fingerprint = [u8; 32];
-pub const ENROLLMENT_ALPN: &[u8] = b"focal-enroll/1";
+/// The enrollment protocol's name in the TLS handshake. Its second generation: each message is a
+/// hyper-transport exchange of an enrollment kind on focal-wire's endpoint. A peer of the first
+/// (`focal-enroll/1`, framed messages on a QUIC stream of their own) shares no protocol with it and
+/// is refused at the handshake.
+pub const ENROLLMENT_ALPN: &[u8] = b"focal-enroll/2";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]

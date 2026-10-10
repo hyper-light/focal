@@ -225,6 +225,17 @@ impl RawPeer {
         }
     }
 
+    /// A message of the enrollment protocol of kind `tag`, carried whole, and its answer.
+    pub(super) async fn enrollment(&mut self, tag: u8, body: &[u8]) -> Result<Vec<u8>, Refusal> {
+        let exchange = self.open(
+            Kind::Enrollment(tag),
+            TrafficClass::Control,
+            body.len() as u64,
+        );
+        self.write_all(exchange, body).await?;
+        self.answer(exchange).await
+    }
+
     /// `request`, carried whole, and its response.
     pub(super) async fn request(
         &mut self,

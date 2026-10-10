@@ -36,6 +36,10 @@ pub enum WireError {
     Timeout,
     #[error("TLS authentication or configuration failed")]
     Authentication,
+    /// The server a pinned dial reached presented a chain its TLS verified, under a leaf the
+    /// dial does not pin ([`crate::net::LeafPins`]): nothing was sent to it.
+    #[error("the server's certificate is not a pinned one")]
+    Unpinned,
     #[error("connection unavailable")]
     Connection,
     #[error("protocol rejected: {0}")]

@@ -4,8 +4,8 @@
 //! slow work on one exchange does not hold up another, and the connection's credit is taken in the
 //! order of the classes' urgency.
 use crate::net::{
-    Answer, Command, Driver, Failed, FocalClasses, Inbound, Kind, Linked, NetBudget, NetDirectory,
-    Network, Reply, Sender, Serve, ServeFuture, Served,
+    Answer, Asked, Command, Driver, Failed, FocalClasses, Inbound, Kind, LeafPins, Linked,
+    NetBudget, NetDirectory, Network, Reply, Sender, Serve, ServeFuture, Served,
 };
 use crate::*;
 use focal_memory::MemoryBudget;
@@ -157,6 +157,38 @@ pub fn endpoint_limits(
     })
 }
 
+/// What an endpoint under `limits` and `admission` holds of its budget at most, bytes, in two
+/// parts: the transport's own — its receive pool and each connection's receive window, charged to
+/// the ordinary lane — and its messages', a body each way on each stream of each connection at the
+/// frame bound, charged to the lane its class is funded from. A budget of both funds the endpoint
+/// so that the transport's own bounds refuse before the budget does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndpointBytes {
+    pub transport: u64,
+    pub messages: u64,
+}
+pub fn endpoint_bytes(
+    limits: &WireLimits,
+    admission: &AdmissionLimits,
+) -> Result<EndpointBytes, WireError> {
+    let endpoint = endpoint_limits(limits, admission)?;
+    let connections = u64::try_from(endpoint.admission.connections).unwrap_or(u64::MAX);
+    let pool = u64::try_from(endpoint.receive_chunks)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(hyper_transport::RECEIVE_CHUNK).unwrap_or(u64::MAX));
+    let messages = u64::from(limits.max_frame_bytes)
+        .saturating_mul(2)
+        .saturating_mul(u64::from(endpoint.streams_per_connection))
+        .saturating_mul(connections);
+    Ok(EndpointBytes {
+        transport: endpoint
+            .window_ceiling
+            .saturating_mul(connections)
+            .saturating_add(pool),
+        messages,
+    })
+}
+
 /// The server side of focal's TLS: what a listener presents and verifies its clients by.
 pub struct ServerTls(rustls::ServerConfig);
 /// The client side of focal's TLS: what a dial presents and verifies its server by.
@@ -285,6 +317,7 @@ const IO_BATCH: usize = 32;
 
 /// An endpoint on `address`, its owner started on the current shard, woken at every withdrawal of
 /// a grant by `revocations` when it serves under a registry.
+#[allow(clippy::too_many_arguments)]
 fn start(
     address: SocketAddr,
     tls: Tls,
@@ -293,11 +326,27 @@ fn start(
     admission: &AdmissionLimits,
     budget: MemoryBudget,
     revocations: Option<hyper_rt::sync::WatchReceiver>,
+    enrollment: Option<u32>,
 ) -> Result<(Network, SocketAddr), WireError> {
     let driver = endpoint_driver(address, tls, directory, limits, admission, budget)?;
     let local = driver.local_addr().map_err(|_| WireError::Connection)?;
-    let network = Network::start(driver, limits.clone(), command_queue(limits), revocations)?;
+    let network = Network::start(
+        driver,
+        limits.clone(),
+        command_queue(limits),
+        revocations,
+        enrollment,
+    )?;
     Ok((network, local))
+}
+
+/// The enrollment protocol a listener serves beside the data protocol: its name in the TLS
+/// handshake and the most one of its messages carries — what its own frames were held to, never
+/// the data protocol's frame bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnrollmentProtocol {
+    pub alpn: &'static [u8],
+    pub max_message_bytes: u32,
 }
 
 /// An endpoint carrying focal's traffic on `address`, bound to the current shard's socket and not
@@ -360,14 +409,15 @@ impl QuicServer {
     ) -> Result<Self, WireError> {
         Self::bind_serving(address, tls, registry, None, limits, admission, budget)
     }
-    /// [`Self::bind_admitting`] for a listener that also serves the enrollment protocol `alpn`
-    /// (its `tls` names it beside the data protocol): a joiner on it is a peer of its own, whose
-    /// role lets it enroll and nothing else.
+    /// [`Self::bind_admitting`] for a listener that also serves the `enrollment` protocol (its
+    /// `tls` names it beside the data protocol): a joiner on it is a peer of its own, whose role
+    /// lets it send the enrollment kinds and nothing else, each message held to the protocol's
+    /// bound.
     pub fn bind_serving(
         address: SocketAddr,
         tls: ServerTls,
         registry: PeerRegistry,
-        enrollment: Option<&'static [u8]>,
+        enrollment: Option<EnrollmentProtocol>,
         limits: WireLimits,
         admission: crate::AdmissionLimits,
         budget: MemoryBudget,
@@ -378,7 +428,7 @@ impl QuicServer {
         // never the directory, which would tell a granted certificate it is refused.
         let directory = NetDirectory::serving(
             registry.clone(),
-            enrollment,
+            enrollment.map(|protocol| protocol.alpn),
             admission.identities.saturating_add(admission.pending),
         );
         let tls = Tls {
@@ -393,6 +443,7 @@ impl QuicServer {
             &admission,
             budget,
             registry.watch(),
+            enrollment.map(|protocol| protocol.max_message_bytes),
         )?;
         Ok(Self {
             network,
@@ -565,7 +616,9 @@ impl QuicConnector {
             server: None,
             client: tls.0,
         };
-        let (network, _) = start(address, tls, directory, &limits, &admission, budget, None)?;
+        let (network, _) = start(
+            address, tls, directory, &limits, &admission, budget, None, None,
+        )?;
         Ok(Self {
             network,
             limits,
@@ -642,6 +695,39 @@ impl QuicConnector {
         )
         .await
     }
+    /// A connection of the enrollment protocol to the server at `address` named `server_name`:
+    /// the caller's alone, and ungreeted, its joiner sending the enrollment kinds alone. The
+    /// server must present a leaf `pins` accepts beside the chain and name the connector's TLS
+    /// verified: one that chains but is not pinned is refused [`WireError::Unpinned`], and no
+    /// message is made for it.
+    pub async fn enrollment(
+        &self,
+        address: SocketAddr,
+        server_name: &str,
+        pins: LeafPins,
+    ) -> Result<EnrollmentLink, WireError> {
+        if server_name.len() > 253 {
+            return Err(WireError::Limit);
+        }
+        let name = server_name.to_owned();
+        let linked: Linked = self
+            .network
+            .call(|reply| Command::Connect {
+                address,
+                name,
+                pin: Some(pins),
+                offers: Vec::new(),
+                alone: true,
+                greet: false,
+                reply,
+            })
+            .await??;
+        Ok(EnrollmentLink {
+            network: self.network.clone(),
+            peer: linked.peer,
+            epoch: linked.epoch,
+        })
+    }
     /// What the connector's endpoint holds and refused.
     pub async fn stats(&self) -> crate::net::NetStats {
         self.network
@@ -656,6 +742,49 @@ impl QuicConnector {
             Err(WireError::Connection) => Ok(()),
             closed => closed,
         }
+    }
+}
+/// A connection of the enrollment protocol ([`QuicConnector::enrollment`]), closed as it is
+/// dropped. A close its shard cannot queue (its tasks all taken) leaves the connection to its idle
+/// timeout, as an abandoned connection is.
+pub struct EnrollmentLink {
+    network: Network,
+    peer: PeerId,
+    epoch: hyper_transport::Epoch,
+}
+impl EnrollmentLink {
+    /// One message of the enrollment protocol, `body` of kind `tag`, and its answer's body, held
+    /// to the connector's `max_frame_bytes`; `period` is the server's time to answer once it has
+    /// the message. The message is wiped however the exchange ends.
+    pub async fn ask(
+        &self,
+        tag: u8,
+        body: Vec<u8>,
+        period: Duration,
+    ) -> Result<Vec<u8>, WireError> {
+        let kind = Kind::Enrollment(tag);
+        let body = Asked::of(kind, body);
+        let answered: Result<Answer, Failed> = self
+            .network
+            .call(|reply| Command::Ask {
+                peer: self.peer,
+                epoch: self.epoch,
+                kind,
+                body,
+                period,
+                reply,
+            })
+            .await?;
+        answered
+            .map(|answer| answer.body)
+            .map_err(|failed| failed.error)
+    }
+}
+impl Drop for EnrollmentLink {
+    fn drop(&mut self) {
+        let _ = self
+            .network
+            .send_now(Command::Disconnect { peer: self.peer });
     }
 }
 /// The connector's endpoint, as a handle: connections it opens are the connector's own (same
@@ -703,11 +832,13 @@ async fn open_remote(
             pin: None,
             offers,
             alone,
+            greet: true,
             reply,
         })
         .await??;
+    let negotiated = linked.negotiated.ok_or(WireError::InvalidFrame)?;
     if !matches!(
-        linked.negotiated.protocol,
+        negotiated.protocol,
         PROTOCOL_VERSION
             | MANAGED_PROTOCOL_VERSION
             | PEER_PROTOCOL_VERSION
@@ -720,7 +851,7 @@ async fn open_remote(
         network: network.clone(),
         peer: linked.peer,
         epoch: linked.epoch,
-        negotiated: linked.negotiated,
+        negotiated,
         limits: limits.clone(),
     })
 }
@@ -814,7 +945,7 @@ impl QuicRemote {
                 peer: self.peer,
                 epoch: self.epoch,
                 kind,
-                body,
+                body: Asked::of(kind, body),
                 period,
                 reply,
             })

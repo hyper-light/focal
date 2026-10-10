@@ -678,9 +678,7 @@ impl CredentialMaterial {
         self.private_key.clone()
     }
     pub fn server_config(&self) -> Result<rustls::ServerConfig, EnrollmentError> {
-        // rustls retains this shared provider inside its TLS configuration.
-        let provider = std::sync::Arc::new(focal_wire::crypto_provider());
-        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        let mut config = rustls::ServerConfig::builder_with_provider(focal_wire::crypto_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| EnrollmentError::Crypto)?
             .with_no_client_auth()

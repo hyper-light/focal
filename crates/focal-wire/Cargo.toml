@@ -25,6 +25,7 @@ hyper-transport.workspace = true
 # hyper-quic names it): owned verifiers and resolvers, a &'static provider.
 rustls = { package = "hyper-tls", version = "0.1.0", path = "../../vendor/hyper-tls" }
 x509-parser = { version = "0.18", features = ["verify-aws"] }
+zeroize = "1.8"
 
 [dev-dependencies]
 focal-model = { version = "0.1.0", path = "../focal-model" }

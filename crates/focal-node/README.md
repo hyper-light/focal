@@ -98,7 +98,7 @@ buffers carry owned memory allowances. The returned directory owner must remain
 alive until all extracted stores and drivers have stopped.
 
 `NetworkListener` serves issued-node data (`focal/2`) and pinned bootstrap
-enrollment (`focal-enroll/1`) on one UDP port. ALPN selects distinct server
+enrollment (`focal-enroll/2`) on one UDP port. ALPN selects distinct server
 certificates. Enrollment may connect without a client certificate; data requires
 a client certificate and a live registry grant even on the shared listener.
 Peer metadata discovery uses bounded Node-only `Operation::PeerControl` reads

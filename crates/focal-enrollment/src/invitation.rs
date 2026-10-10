@@ -4,8 +4,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use serde::{Deserialize, Serialize};
-// rustls requires shared verifier/provider ownership across connection tasks.
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +130,15 @@ impl ServerTrust {
             .map(|issuer| issuer.certificate.clone())
             .collect()
     }
+    /// The leaves a connection to the sponsor accepts beside the chain and
+    /// name TLS verifies: the pinned certificate and its staged successor,
+    /// fingerprinted as [`server_fingerprint`] does.
+    pub fn pins(&self) -> focal_wire::net::LeafPins {
+        focal_wire::net::LeafPins {
+            context: SERVER_FINGERPRINT_CONTEXT,
+            accepted: [Some(self.server_fingerprint), self.successor_fingerprint],
+        }
+    }
     /// Whether `fingerprint` is a pin this trust accepts: the pinned
     /// certificate's, or its staged successor's.
     pub fn accepts(&self, fingerprint: Fingerprint) -> bool {
@@ -186,59 +194,28 @@ impl ServerTrust {
     /// The verifier of a bootstrap connection's chain: the issuers this
     /// trust holds; a successor issuer's endorsement by one of them is an
     /// ordinary intermediate to it (24 §11).
-    fn verifier(
-        &self,
-        provider: Arc<rustls::crypto::CryptoProvider>,
-    ) -> Result<Arc<rustls::client::WebPkiServerVerifier>, EnrollmentError> {
+    fn verifier(&self) -> Result<Box<rustls::client::WebPkiServerVerifier>, EnrollmentError> {
         rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::new(self.roots()?),
-            provider,
+            self.roots()?,
+            focal_wire::crypto_provider(),
         )
         .build()
         .map_err(|_| EnrollmentError::Crypto)
     }
-    /// Ordinary TLS 1.3 chain/name verification against the pinned CA, for
-    /// an enrollment connection made by a node that already holds a
-    /// credential; the exact leaf pin is checked on the connection.
+    /// Ordinary TLS 1.3 chain/name verification against the trust's
+    /// issuers, for an enrollment connection; the leaf pin is the dial's
+    /// ([`Self::pins`]), checked before anything is sent.
     pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
         self.validate()?;
-        let provider = Arc::new(focal_wire::crypto_provider());
-        let verifier = self.verifier(provider.clone())?;
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        let mut config = rustls::ClientConfig::builder_with_provider(focal_wire::crypto_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| EnrollmentError::Crypto)?
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_custom_certificate_verifier(self.verifier()?)
             .with_no_client_auth();
         config.alpn_protocols = vec![ENROLLMENT_ALPN.to_vec()];
         config.enable_early_data = false;
         Ok(config)
-    }
-    /// Verify an established enrollment connection carries the pinned leaf:
-    /// one that chains to a held issuer and is not pinned is
-    /// [`EnrollmentError::Unpinned`], the rest `Unauthorized`.
-    pub fn verify_quic(
-        &self,
-        connection: &quinn::Connection,
-        now: i64,
-    ) -> Result<(), EnrollmentError> {
-        if connection.close_reason().is_some() {
-            return Err(EnrollmentError::Unauthorized);
-        }
-        let handshake = connection
-            .handshake_data()
-            .ok_or(EnrollmentError::Unauthorized)?
-            .downcast::<quinn::crypto::rustls::HandshakeData>()
-            .map_err(|_| EnrollmentError::Unauthorized)?;
-        if handshake.protocol.as_deref() != Some(ENROLLMENT_ALPN) {
-            return Err(EnrollmentError::Unauthorized);
-        }
-        let peer = connection
-            .peer_identity()
-            .ok_or(EnrollmentError::Unauthorized)?
-            .downcast::<Vec<CertificateDer<'static>>>()
-            .map_err(|_| EnrollmentError::Unauthorized)?;
-        self.verify_chain(&peer, now)
     }
     fn roots(&self) -> Result<rustls::RootCertStore, EnrollmentError> {
         let mut roots = rustls::RootCertStore::empty();
@@ -257,8 +234,7 @@ impl ServerTrust {
         let (first, intermediates) = certificates
             .split_first()
             .ok_or(EnrollmentError::Unauthorized)?;
-        let provider = Arc::new(focal_wire::crypto_provider());
-        let verifier = self.verifier(provider)?;
+        let verifier = self.verifier()?;
         let now = UnixTime::since_unix_epoch(Duration::from_secs(
             u64::try_from(now).map_err(|_| EnrollmentError::Invalid)?,
         ));
@@ -278,8 +254,10 @@ impl ServerTrust {
         Ok(())
     }
 }
+/// The domain a bootstrap server certificate's fingerprint is derived under.
+const SERVER_FINGERPRINT_CONTEXT: &str = "focal.enrollment.bootstrap-server.v1";
 pub fn server_fingerprint(certificate: &[u8]) -> Fingerprint {
-    hash("focal.enrollment.bootstrap-server.v1", certificate)
+    hash(SERVER_FINGERPRINT_CONTEXT, certificate)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -465,31 +443,6 @@ impl Invitation {
                 .ok_or(EnrollmentError::Unauthorized)?,
             now,
         )?;
-        self.request(key, now)
-    }
-    pub fn request_after_quic(
-        &self,
-        connection: &quinn::Connection,
-        key: &JoinKey,
-        now: i64,
-    ) -> Result<JoinRequest, EnrollmentError> {
-        if connection.close_reason().is_some() {
-            return Err(EnrollmentError::Unauthorized);
-        }
-        let handshake = connection
-            .handshake_data()
-            .ok_or(EnrollmentError::Unauthorized)?
-            .downcast::<quinn::crypto::rustls::HandshakeData>()
-            .map_err(|_| EnrollmentError::Unauthorized)?;
-        if handshake.protocol.as_deref() != Some(ENROLLMENT_ALPN) {
-            return Err(EnrollmentError::Unauthorized);
-        }
-        let peer = connection
-            .peer_identity()
-            .ok_or(EnrollmentError::Unauthorized)?
-            .downcast::<Vec<CertificateDer<'static>>>()
-            .map_err(|_| EnrollmentError::Unauthorized)?;
-        self.data.trust.verify_chain(&peer, now)?;
         self.request(key, now)
     }
     pub(crate) fn request(&self, key: &JoinKey, now: i64) -> Result<JoinRequest, EnrollmentError> {

@@ -32,7 +32,7 @@ use hyper_transport::{
 
 use super::budget::{NetBudget, NetBudgetStats};
 use super::classes::{FocalClasses, Kind, Sender};
-use super::directory::{Inbound, NetDirectory};
+use super::directory::{Inbound, LeafPins, NetDirectory};
 use crate::{
     AccessError, Hello, HelloReply, Negotiated, TrafficClass, WireError, WireLimits,
     decode_payload, encode_payload,
@@ -89,12 +89,13 @@ pub trait Serve: Send + 'static {
     fn serve(&self, request: Served) -> ServeFuture;
 }
 
-/// A connection this side dialed and greeted.
+/// A connection this side dialed: up, and greeted when its dial greets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Linked {
     pub(crate) peer: PeerId,
     pub(crate) epoch: Epoch,
-    pub(crate) negotiated: Negotiated,
+    /// The profile its greeting negotiated; `None` on a connection its dial does not greet.
+    pub(crate) negotiated: Option<Negotiated>,
 }
 
 /// A request's answer, and what the path to its peer measured when it came.
@@ -133,18 +134,21 @@ pub struct NetStats {
 
 /// What a handle asks of the owner.
 pub(crate) enum Command {
-    /// Dial `name` at `address` (its certificate pinned to `pin` when given), greet it offering
+    /// Dial `name` at `address` (its leaf one `pin` accepts when given), greet it offering
     /// `offers`, and answer once the connection is greeted or failed. A route dialed before is
     /// the same peer: a greeted connection to it answers at once, one being dialed answers when
     /// it does.
     Connect {
         address: SocketAddr,
         name: String,
-        pin: Option<[u8; 32]>,
+        pin: Option<LeafPins>,
         offers: Vec<u16>,
         /// A connection of the caller's alone: never a route's, never shared, forgotten as it
         /// closes (a probe of exactly an address, 24 §24).
         alone: bool,
+        /// Greet it: the data protocol's connections are. One of the enrollment protocol, whose
+        /// joiner may send the enrollment kinds alone, is answered as it comes up.
+        greet: bool,
         reply: OneshotSender<Result<Linked, WireError>>,
     },
     /// Ask `peer`, on the connection of `epoch`, a request of `kind` whose body is `body`, its
@@ -153,7 +157,7 @@ pub(crate) enum Command {
         peer: PeerId,
         epoch: Epoch,
         kind: Kind,
-        body: Vec<u8>,
+        body: Asked,
         period: Duration,
         reply: OneshotSender<Result<Answer, Failed>>,
     },
@@ -191,16 +195,19 @@ impl Network {
     /// in a queue of `queue`, past which a handle's send waits its turn, and the answers of the
     /// requests it serves in one of their own as long. `revocations` is the registry's revision,
     /// watched, for a listener: the owner closes the connections a withdrawal no longer grants as
-    /// it moves. The owner serves nothing until it is given what to serve ([`Command::Serve`]).
+    /// it moves. `enrollment` is the most a message of the enrollment protocol carries, for a
+    /// listener that serves it; elsewhere its kinds are refused. The owner serves nothing until it
+    /// is given what to serve ([`Command::Serve`]).
     pub(crate) fn start(
         driver: Driver,
         limits: WireLimits,
         queue: usize,
         revocations: Option<WatchReceiver>,
+        enrollment: Option<u32>,
     ) -> Result<Self, WireError> {
         let (commands, receiver) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
         let (answers, answered) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
-        let owner = Owner::new(driver, limits, answers);
+        let owner = Owner::new(driver, limits, answers, enrollment);
         hyper_rt::futures::spawn_detached(owner.run(receiver, answered, revocations))
             .map_err(|_| WireError::Connection)?;
         Ok(Self { commands })
@@ -277,17 +284,43 @@ struct DialState {
     offers: Vec<u16>,
     /// A connection of its caller's alone: in no route, forgotten as it closes.
     alone: bool,
+    /// Its connection is greeted as it comes up.
+    greet: bool,
     /// The endpoint is dialing it: from the dial's start to its connection up or its failure.
     dialing: bool,
     hello: Option<ExchangeId>,
     waiting: Vec<OneshotSender<Result<Linked, WireError>>>,
 }
 
+/// What an exchange this side asks sends: wiped when it goes if it is a message of the enrollment
+/// protocol, which carries an invitation's secret (focal-enrollment's frames were `Zeroizing`),
+/// however the exchange ends — answered, refused, or never opened.
+pub(crate) struct Asked {
+    bytes: Vec<u8>,
+    secret: bool,
+}
+impl Asked {
+    /// The body of a request of `kind`.
+    pub(crate) fn of(kind: Kind, bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            secret: matches!(kind, Kind::Enrollment(_)),
+        }
+    }
+}
+impl Drop for Asked {
+    fn drop(&mut self) {
+        if self.secret {
+            zeroize::Zeroize::zeroize(&mut self.bytes);
+        }
+    }
+}
+
 /// An exchange this side asked.
 struct Asking {
     peer: PeerId,
     class: TrafficClass,
-    body: Vec<u8>,
+    body: Asked,
     written: usize,
     /// The answer's body, as it is read.
     reading: Option<Reservation>,
@@ -332,6 +365,8 @@ struct Owner {
     closing: bool,
     /// The registry revision last acted on: a withdrawal since closes what it no longer grants.
     revision: Option<u64>,
+    /// The most a message of the enrollment protocol carries, on a listener that serves it.
+    enrollment: Option<u64>,
 }
 
 /// The lane a class's bodies are funded from: 1 for the completion lane, 0 for the ordinary.
@@ -384,6 +419,7 @@ impl Owner {
         driver: Driver,
         limits: WireLimits,
         answers: CommandSender<(ExchangeId, Option<Reply>)>,
+        enrollment: Option<u32>,
     ) -> Self {
         let last = driver.clock().unwrap_or_else(|_| Instant::now());
         Self {
@@ -401,6 +437,7 @@ impl Owner {
             stats: NetStats::default(),
             closing: false,
             revision: None,
+            enrollment: enrollment.map(u64::from),
         }
     }
 
@@ -522,8 +559,9 @@ impl Owner {
                 pin,
                 offers,
                 alone,
+                greet,
                 reply,
-            } => self.connect(address, name, pin, offers, alone, reply),
+            } => self.connect(address, name, pin, offers, alone, greet, reply),
             Command::Ask {
                 peer,
                 epoch,
@@ -589,13 +627,15 @@ impl Owner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         &mut self,
         address: SocketAddr,
         name: String,
-        pin: Option<[u8; 32]>,
+        pin: Option<LeafPins>,
         offers: Vec<u16>,
         alone: bool,
+        greet: bool,
         reply: OneshotSender<Result<Linked, WireError>>,
     ) {
         if self.closing {
@@ -644,6 +684,7 @@ impl Owner {
                     route,
                     offers,
                     alone,
+                    greet,
                     dialing: false,
                     hello: None,
                     waiting: vec![reply],
@@ -701,7 +742,7 @@ impl Owner {
             let _ = reply.send(Ok(Linked {
                 peer,
                 epoch,
-                negotiated,
+                negotiated: Some(negotiated),
             }));
             return;
         }
@@ -742,7 +783,7 @@ impl Owner {
         peer: PeerId,
         epoch: Epoch,
         kind: Kind,
-        body: Vec<u8>,
+        body: Asked,
         period: Duration,
         reply: OneshotSender<Result<Answer, Failed>>,
     ) {
@@ -782,7 +823,7 @@ impl Owner {
         peer: PeerId,
         kind: Kind,
         class: TrafficClass,
-        body: Vec<u8>,
+        body: Asked,
         period: Duration,
         reply: Option<OneshotSender<Result<Answer, Failed>>>,
     ) -> Result<ExchangeId, (Refusal, Option<OneshotSender<Result<Answer, Failed>>>)> {
@@ -791,7 +832,7 @@ impl Owner {
             Err(refusal) => return Err((refusal, reply)),
         };
         let now = self.now();
-        let length = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let length = u64::try_from(body.bytes.len()).unwrap_or(u64::MAX);
         let exchange =
             match self
                 .driver
@@ -820,7 +861,7 @@ impl Owner {
         let Some(asking) = self.asking.get_mut(&exchange) else {
             return;
         };
-        let rest = asking.body.get(asking.written..).unwrap_or(&[]);
+        let rest = asking.body.bytes.get(asking.written..).unwrap_or(&[]);
         if rest.is_empty() {
             return;
         }
@@ -1047,6 +1088,17 @@ impl Owner {
         let Some(dial) = state.dialed.as_mut() else {
             return;
         };
+        if !dial.greet {
+            let linked = Linked {
+                peer,
+                epoch,
+                negotiated: None,
+            };
+            for waiter in dial.waiting.drain(..) {
+                let _ = waiter.send(Ok(linked));
+            }
+            return;
+        }
         let hello = Hello {
             versions: dial.offers.clone(),
             max_frame_bytes: self.limits.max_frame_bytes,
@@ -1060,6 +1112,7 @@ impl Owner {
                 return;
             }
         };
+        let body = Asked::of(Kind::Hello, body);
         match self.open(peer, Kind::Hello, TrafficClass::Control, body, period, None) {
             Ok(exchange) => {
                 if let Some(dial) = self
@@ -1107,7 +1160,7 @@ impl Owner {
         self.dialed(peer);
         let unpinned = self.driver.endpoint().directory_mut().take_unpinned(peer);
         let error = if unpinned {
-            WireError::Authentication
+            WireError::Unpinned
         } else {
             unreachable(refusal)
         };
@@ -1152,10 +1205,19 @@ impl Owner {
     ) {
         let negotiated = self.peers.get(&peer).and_then(|state| state.negotiated);
         // What the body may be: a greeting's bound, an enrollment message's, or the profile the
-        // connection negotiated; a request before its connection's greeting is refused.
+        // connection negotiated; a request before its connection's greeting is refused, as is a
+        // message of the enrollment protocol where it is not served.
         let bound = match kind {
             Kind::Hello => u64::from(HELLO_BYTES),
-            Kind::Enrollment(_) => u64::from(self.limits.max_frame_bytes),
+            Kind::Enrollment(_) => match self.enrollment {
+                Some(bound) => bound,
+                None => {
+                    self.driver
+                        .endpoint()
+                        .refuse_exchange(exchange, Refusal::Kind);
+                    return;
+                }
+            },
             Kind::Operation(_) => match negotiated {
                 Some(negotiated) => u64::from(negotiated.max_frame_bytes),
                 None => {
@@ -1458,7 +1520,7 @@ impl Owner {
                 let linked = Linked {
                     peer,
                     epoch,
-                    negotiated,
+                    negotiated: Some(negotiated),
                 };
                 for waiter in dial.waiting.drain(..) {
                     let _ = waiter.send(Ok(linked));
@@ -1483,6 +1545,7 @@ pub(crate) fn clone_error(error: &WireError) -> WireError {
         WireError::InvalidFrame => WireError::InvalidFrame,
         WireError::Timeout => WireError::Timeout,
         WireError::Authentication => WireError::Authentication,
+        WireError::Unpinned => WireError::Unpinned,
         WireError::Connection => WireError::Connection,
         WireError::Access(access) => WireError::Access(access.clone()),
     }

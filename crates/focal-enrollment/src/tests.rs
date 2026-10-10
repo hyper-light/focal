@@ -8,9 +8,22 @@ use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use std::{
     collections::BTreeSet,
     io::Cursor,
+    rc::Rc,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// A task on the test's shard, its output awaited later (what tokio's `spawn` gave).
+fn spawn<T: 'static>(
+    future: impl std::future::Future<Output = T> + 'static,
+) -> hyper_rt::sync::OneshotReceiver<T> {
+    let (sender, output) = hyper_rt::sync::oneshot().unwrap();
+    hyper_rt::futures::spawn_detached(async move {
+        let _ = sender.send(future.await);
+    })
+    .unwrap();
+    output
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -112,27 +125,28 @@ fn commit(registry: &mut EnrollmentRegistry, preparation: JoinPreparation) {
 }
 fn handshake(
     invitation: &Invitation,
-    server: rustls::ServerConfig,
+    mut server: rustls::ServerConfig,
 ) -> Result<rustls::ClientConnection, rustls::Error> {
+    let mut config = invitation.client_config().unwrap();
     let mut client = rustls::ClientConnection::new(
-        Arc::new(invitation.client_config().unwrap()),
+        &mut config,
         ServerName::try_from(invitation.trust().server_name.clone()).unwrap(),
     )?;
-    let mut server = rustls::ServerConnection::new(Arc::new(server))?;
+    let mut serving = rustls::ServerConnection::new(&server)?;
     for _ in 0..32 {
         if client.wants_write() {
             let mut bytes = Vec::new();
             client.write_tls(&mut bytes).unwrap();
-            server.read_tls(&mut Cursor::new(bytes)).unwrap();
-            server.process_new_packets()?;
+            serving.read_tls(&mut Cursor::new(bytes)).unwrap();
+            serving.process_new_packets(&mut server)?;
         }
-        if server.wants_write() {
+        if serving.wants_write() {
             let mut bytes = Vec::new();
-            server.write_tls(&mut bytes).unwrap();
+            serving.write_tls(&mut bytes).unwrap();
             client.read_tls(&mut Cursor::new(bytes)).unwrap();
-            client.process_new_packets()?;
+            client.process_new_packets(&mut config)?;
         }
-        if !client.is_handshaking() && !server.is_handshaking() {
+        if !client.is_handshaking() && !serving.is_handshaking() {
             return Ok(client);
         }
     }
@@ -498,17 +512,15 @@ fn tls_ca_and_name_verification_does_not_replace_the_exact_invited_leaf_pin() {
         },
     };
     let config = |certificate: Vec<u8>, key: &KeyPair| {
-        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![certificate.into()],
-            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
-        )
-        .unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(focal_wire::crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.into()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
         config.alpn_protocols = vec![ENROLLMENT_ALPN.to_vec()];
         config
     };
@@ -651,8 +663,11 @@ fn prepared_publication_checks_lineage_revision_and_metadata_budget() {
     EnrollmentRegistry::restore(&bytes, [1; 16], limits).unwrap();
 }
 
-#[tokio::test]
-async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment() {
+#[test]
+fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment() {
+    focal_rt::block_on(pin_precedes_token_and_unknown_commit_retries()).unwrap();
+}
+async fn pin_precedes_token_and_unknown_commit_retries() {
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -684,7 +699,7 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
             }
         }
     });
-    let server = Arc::new(
+    let server = Rc::new(
         EnrollmentServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             &authority.server_identity(),
@@ -693,7 +708,7 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
         .unwrap(),
     );
     let running = server.clone();
-    let task = tokio::spawn(async move { running.serve(handler).await });
+    let task = spawn(async move { running.serve(handler).await });
     let client =
         EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap();
     let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
@@ -707,34 +722,32 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     // Even a correctly authenticated server connection cannot force an oversized
-    // body allocation or reach metadata by declaring an unbounded frame length.
-    let mut raw_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    let tls = quinn::ClientConfig::new(Arc::new(
-        focal_wire::quic_client(invitation.client_config().unwrap()).unwrap(),
-    ));
-    raw_endpoint.set_default_client_config(tls);
-    let raw = raw_endpoint
-        .connect(server.local_addr().unwrap(), "localhost")
-        .unwrap()
+    // body allocation or reach metadata: a message declared past the protocol's
+    // bound is refused from its declaration, before its body is reserved.
+    let limits = TransportLimits::default();
+    let connector = focal_wire::QuicConnector::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        focal_wire::ClientTls::from_config(invitation.client_config().unwrap()),
+        limits.wire().unwrap(),
+        limits.budget().unwrap(),
+    )
+    .unwrap();
+    let link = connector
+        .enrollment(
+            server.local_addr().unwrap(),
+            "localhost",
+            invitation.trust().pins(),
+        )
         .await
         .unwrap();
-    let (mut send, mut receive) = raw.open_bi().await.unwrap();
-    let mut header = [0u8; 16];
-    header[..8].copy_from_slice(b"FCLENR01");
-    header[8..10].copy_from_slice(&1u16.to_be_bytes());
-    header[10..12].copy_from_slice(&1u16.to_be_bytes());
-    header[12..].copy_from_slice(&u32::MAX.to_be_bytes());
-    send.write_all(&header).await.unwrap();
-    send.finish().unwrap();
-    let rejected = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        receive.read_chunk(1, true),
-    )
-    .await
-    .unwrap();
-    assert!(rejected.is_err());
+    let oversized = vec![0u8; MAX_MESSAGE_BYTES + 1];
+    assert!(matches!(
+        link.ask(1, oversized, limits.timeout).await,
+        Err(focal_wire::WireError::Limit)
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    raw.close(0u8.into(), b"done");
+    drop(link);
+    connector.close().unwrap();
     assert!(matches!(
         client
             .redeem(server.local_addr().unwrap(), &invitation, &key, now())
@@ -751,7 +764,7 @@ async fn quic_pin_precedes_token_and_unknown_commit_retries_the_same_enrollment(
     key.complete(&receipt, authority.issuers().unwrap().trusted(), now())
         .unwrap();
     client.close();
-    server.close();
+    server.close().unwrap();
     task.await.unwrap().unwrap();
 }
 
@@ -1247,8 +1260,11 @@ fn renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_refuses() {
+#[test]
+fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_refuses() {
+    focal_rt::block_on(renews_and_join_only_refuses()).unwrap();
+}
+async fn renews_and_join_only_refuses() {
     use std::sync::Mutex;
     let dir = tempfile::tempdir().unwrap();
     let authority = Arc::new(authority(&dir, [1; 16]));
@@ -1280,7 +1296,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
             Box::pin(async move { response })
         }
     }
-    let server = Arc::new(
+    let server = Rc::new(
         EnrollmentServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             &authority.server_identity(),
@@ -1293,7 +1309,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
         authority: authority.clone(),
     });
     let running = server.clone();
-    let task = tokio::spawn(async move { running.serve(handler).await });
+    let task = spawn(async move { running.serve(handler).await });
     let client =
         EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap();
     let trust = ServerTrust {
@@ -1328,10 +1344,10 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
         Err(JoinTransportError::Enrollment(EnrollmentError::Unpinned))
     ));
     client.close();
-    server.close();
+    server.close().unwrap();
     task.await.unwrap().unwrap();
     // A handler that only enrolls refuses renewals by default.
-    let server = Arc::new(
+    let server = Rc::new(
         EnrollmentServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             &authority.server_identity(),
@@ -1342,7 +1358,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
     let join_only: Arc<dyn JoinHandler> =
         Arc::new(|_: JoinRequest| async { JoinResponse::Rejected(JoinFailure::Unauthorized) });
     let running = server.clone();
-    let task = tokio::spawn(async move { running.serve(join_only).await });
+    let task = spawn(async move { running.serve(join_only).await });
     let client =
         EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap();
     let trust = ServerTrust {
@@ -1357,7 +1373,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
         Err(JoinTransportError::Rejected(JoinFailure::Unauthorized))
     ));
     client.close();
-    server.close();
+    server.close().unwrap();
     task.await.unwrap().unwrap();
 }
 
