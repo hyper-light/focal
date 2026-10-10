@@ -1379,7 +1379,12 @@ fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
         rows: usize::MAX,
     };
     let frozen = core.freeze_native().unwrap();
-    for _ in 0..3 {
+    // As many walks as asked (`WALKS`), for a profiler to sample them.
+    let walks: usize = std::env::var("WALKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    for _ in 0..walks {
         let mut bytes = 0usize;
         let started = std::time::Instant::now();
         focal_core::native::record_codec::checkpoint::EncodingPlan::write_frozen(

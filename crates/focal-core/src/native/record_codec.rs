@@ -164,17 +164,77 @@ fn add(a: usize, b: usize) -> Result<usize, CodecError> {
     a.checked_add(b).ok_or(CodecError::Capacity)
 }
 
+/// Bytes gathered before the digest takes them: four BLAKE3 chunks, so it hashes
+/// them in parallel (its SIMD paths, NEON or AVX, take whole chunks side by side;
+/// a field at a time it compresses one 64-byte block after another, serially).
+const HASH_BATCH: usize = 4096;
+
 /// Every byte entering the digest is charged before hashing. The trailer is the
-/// hash of all preceding bytes under a separate native-record domain.
+/// hash of all preceding bytes under a separate native-record domain. The bytes
+/// reach the hasher in batches: the digest of a stream is the same however it is
+/// divided, so batching changes its cost and nothing else.
 struct HashSink<'a, S> {
     sink: &'a mut S,
     hash: blake3::Hasher,
+    batch: [u8; HASH_BATCH],
+    held: usize,
+}
+impl<'a, S> HashSink<'a, S> {
+    fn new(sink: &'a mut S, hash: blake3::Hasher) -> Self {
+        Self {
+            sink,
+            hash,
+            batch: [0; HASH_BATCH],
+            held: 0,
+        }
+    }
+    fn flush(&mut self) {
+        if let Some(held) = self.batch.get(..self.held) {
+            self.hash.update(held);
+        }
+        self.held = 0;
+    }
+    /// The digest of every byte written.
+    fn digest(&mut self) -> ContentHash {
+        self.flush();
+        ContentHash(*self.hash.finalize().as_bytes())
+    }
 }
 impl<S: Sink> Sink for HashSink<'_, S> {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+    fn write(&mut self, mut bytes: &[u8]) -> Result<(), CodecError> {
         self.sink.visit(add(1, bytes.len())?)?;
         self.sink.write(bytes)?;
-        self.hash.update(bytes);
+        // The digest is handed whole batches only until its end, so every
+        // update begins on a batch boundary: BLAKE3 hashes an update that
+        // begins on a power-of-two boundary as whole subtrees, side by side,
+        // while one that begins inside a chunk is compressed a block at a
+        // time until the boundary, and a part flushed early left every later
+        // batch inside one (blake3 `Hasher::update`; a profile of a root's
+        // encoding spent half its time in the portable single-block path).
+        while !bytes.is_empty() {
+            if self.held == 0 && bytes.len() >= HASH_BATCH {
+                let whole = bytes
+                    .len()
+                    .checked_sub(bytes.len().checked_rem(HASH_BATCH).unwrap_or(0))
+                    .ok_or(CodecError::Capacity)?;
+                let (batches, rest) = bytes.split_at_checked(whole).ok_or(CodecError::Capacity)?;
+                self.hash.update(batches);
+                bytes = rest;
+                continue;
+            }
+            let take = HASH_BATCH.saturating_sub(self.held).min(bytes.len());
+            let (head, rest) = bytes.split_at_checked(take).ok_or(CodecError::Capacity)?;
+            let end = add(self.held, take)?;
+            self.batch
+                .get_mut(self.held..end)
+                .ok_or(CodecError::Capacity)?
+                .copy_from_slice(head);
+            self.held = end;
+            bytes = rest;
+            if self.held == HASH_BATCH {
+                self.flush();
+            }
+        }
         Ok(())
     }
     fn visit(&mut self, amount: usize) -> Result<(), CodecError> {
@@ -214,10 +274,7 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
     // Hash construction/finalization have fixed bounded work in addition to the
     // separately metered byte stream. No user-controlled derive-key context.
     sink.visit(256)?;
-    let mut hashed = HashSink {
-        sink,
-        hash: blake3::Hasher::new_derive_key(HASH_DOMAIN),
-    };
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(HASH_DOMAIN));
     write_raw(&mut hashed, &MAGIC)?;
     write_u16(&mut hashed, VERSION)?;
     write_u8(
@@ -282,7 +339,7 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
     if !meta || !recorded {
         return Err(CodecError::InvalidTag("record accounting rows"));
     }
-    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    let digest = hashed.digest();
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }

@@ -836,10 +836,7 @@ pub(in crate::native) fn archive_frame<'a>(
         add(add(256, frame.members.len())?, frame.content.len())?,
         frame.inline.len(),
     )?)?;
-    let mut hashed = HashSink {
-        sink,
-        hash: blake3::Hasher::new_derive_key(ARCHIVE_HASH_DOMAIN),
-    };
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(ARCHIVE_HASH_DOMAIN));
     write_raw(&mut hashed, &ARCHIVE_MAGIC)?;
     write_u16(&mut hashed, ARCHIVE_VERSION)?;
     write_u8(
@@ -882,7 +879,7 @@ pub(in crate::native) fn archive_frame<'a>(
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("archive row count"));
     }
-    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    let digest = hashed.digest();
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }
@@ -922,10 +919,7 @@ pub(in crate::native) fn seal_frame<'a>(
     frame: SealFrame<'_>,
     mut entries: impl Iterator<Item = (Key, &'a Row)>,
 ) -> Result<ContentHash, CodecError> {
-    let mut hashed = HashSink {
-        sink,
-        hash: blake3::Hasher::new_derive_key(SEAL_HASH_DOMAIN),
-    };
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(SEAL_HASH_DOMAIN));
     write_raw(&mut hashed, &SEAL_MAGIC)?;
     write_u16(&mut hashed, SEAL_VERSION)?;
     let (ledger, profile) = match &frame {
@@ -1055,7 +1049,7 @@ pub(in crate::native) fn seal_frame<'a>(
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("seal row count"));
     }
-    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    let digest = hashed.digest();
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }
@@ -1074,10 +1068,7 @@ fn frame_entries<'a>(
     }
     let count_u64 = u64::try_from(count).map_err(|_| CodecError::Capacity)?;
     sink.visit(256)?;
-    let mut hashed = HashSink {
-        sink,
-        hash: blake3::Hasher::new_derive_key(HASH_DOMAIN),
-    };
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(HASH_DOMAIN));
     write_raw(&mut hashed, &MAGIC)?;
     write_u16(&mut hashed, VERSION)?;
     write_u8(
@@ -1126,7 +1117,7 @@ fn frame_entries<'a>(
     if prefix != 0 && (!meta || !outcome) {
         return Err(CodecError::InvalidTag("checkpoint accounting rows"));
     }
-    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    let digest = hashed.digest();
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }
