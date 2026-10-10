@@ -199,14 +199,13 @@ pub fn path_from_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
     }
     #[cfg(windows)]
     {
-        if !bytes.len().is_multiple_of(2) {
+        // Pairs of bytes, and an odd one left over is no wide string.
+        let (pairs, rest) = bytes.as_chunks::<2>();
+        if !rest.is_empty() {
             return None;
         }
         use std::os::windows::ffi::OsStringExt;
-        let wide: Vec<u16> = bytes
-            .chunks_exact(2)
-            .filter_map(|pair| <[u8; 2]>::try_from(pair).ok().map(u16::from_le_bytes))
-            .collect();
+        let wide: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         if wide.contains(&0) {
             return None;
         }
