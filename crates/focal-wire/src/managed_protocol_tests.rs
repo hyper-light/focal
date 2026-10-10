@@ -103,8 +103,8 @@ fn quic_capability_is_negotiated_before_request_and_legacy_requests_remain_valid
                     "no unsupported managed request reached ingress"
                 );
             }
-            remote.close();
-            server.close();
+            remote.close().unwrap();
+            server.close().unwrap();
             task.join().await.unwrap();
         }
     })

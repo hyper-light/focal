@@ -142,6 +142,9 @@ pub(crate) enum Command {
         name: String,
         pin: Option<[u8; 32]>,
         offers: Vec<u16>,
+        /// A connection of the caller's alone: never a route's, never shared, forgotten as it
+        /// closes (a probe of exactly an address, 24 §24).
+        alone: bool,
         reply: OneshotSender<Result<Linked, WireError>>,
     },
     /// Ask `peer`, on the connection of `epoch`, a request of `kind` whose body is `body`, its
@@ -213,15 +216,37 @@ impl Network {
             .map_err(|_| WireError::Connection)
     }
 
-    /// Sends `command` without waiting: `Limit` when the queue is full, `Connection` when the
-    /// owner has ended.
-    pub(crate) fn try_send(&self, command: Command) -> Result<(), WireError> {
-        self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                hyper_rt::sync::SyncError::Full(_) => WireError::Limit,
-                _ => WireError::Connection,
-            })
+    /// Queues `command` if the queue has room now: a test's way to fill it.
+    #[cfg(test)]
+    pub(crate) fn try_queue(&self, command: Command) -> bool {
+        self.commands.try_send(command).is_ok()
+    }
+
+    /// Sends `command` without waiting for the queue: now when it has room, else by a task of its
+    /// own on this shard that waits its turn (a plain thread waits for room itself). Refused only
+    /// when the owner has ended (`Connection`) or neither can take it — the shard's tasks all
+    /// taken (`Limit`): a command is never dropped unseen, as one a full queue refused was.
+    pub(crate) fn send_now(&self, command: Command) -> Result<(), WireError> {
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(hyper_rt::sync::SyncError::Full(command)) => {
+                if hyper_rt::futures::shard_id().is_some() {
+                    let commands = self.commands.clone();
+                    hyper_rt::futures::spawn_detached(async move {
+                        // The owner reads its queue until it ends; one that ended has nothing to
+                        // close.
+                        let _ = commands.send(command).await;
+                    })
+                    .map(|_| ())
+                    .map_err(|_| WireError::Limit)
+                } else {
+                    self.commands
+                        .blocking_send(command)
+                        .map_err(|_| WireError::Connection)
+                }
+            }
+            Err(_) => Err(WireError::Connection),
+        }
     }
 
     /// Asks the owner with the command `make` builds around a one-shot, and awaits its answer.
@@ -250,6 +275,8 @@ struct PeerState {
 struct DialState {
     route: (SocketAddr, String),
     offers: Vec<u16>,
+    /// A connection of its caller's alone: in no route, forgotten as it closes.
+    alone: bool,
     /// The endpoint is dialing it: from the dial's start to its connection up or its failure.
     dialing: bool,
     hello: Option<ExchangeId>,
@@ -494,8 +521,9 @@ impl Owner {
                 name,
                 pin,
                 offers,
+                alone,
                 reply,
-            } => self.connect(address, name, pin, offers, reply),
+            } => self.connect(address, name, pin, offers, alone, reply),
             Command::Ask {
                 peer,
                 epoch,
@@ -567,6 +595,7 @@ impl Owner {
         name: String,
         pin: Option<[u8; 32]>,
         offers: Vec<u16>,
+        alone: bool,
         reply: OneshotSender<Result<Linked, WireError>>,
     ) {
         if self.closing {
@@ -584,7 +613,7 @@ impl Owner {
             return;
         }
         let route = (address, name);
-        if let Some(peer) = self.routes.get(&route).copied() {
+        if let Some(peer) = self.routes.get(&route).copied().filter(|_| !alone) {
             if self.peers.contains_key(&peer) {
                 self.rejoin(peer, address, offers, reply);
                 return;
@@ -602,7 +631,10 @@ impl Owner {
             self.driver.endpoint().directory_mut().forget(peer);
             return;
         }
-        self.routes.insert(route.clone(), peer);
+        // A connection of its caller's alone is in no route: no other call finds it.
+        if !alone {
+            self.routes.insert(route.clone(), peer);
+        }
         self.peers.insert(
             peer,
             PeerState {
@@ -611,6 +643,7 @@ impl Owner {
                 dialed: Some(DialState {
                     route,
                     offers,
+                    alone,
                     dialing: false,
                     hello: None,
                     waiting: vec![reply],
@@ -1054,12 +1087,19 @@ impl Owner {
         // A dial whose connection closed before its greeting was answered: its certificate
         // refused by the listener (RFC 8446 §4.4.4), or the listener full.
         self.fail_waiting(peer, unreachable(refusal));
-        let inbound = self
+        // An inbound peer, or a connection of its caller's alone, is forgotten as it closes.
+        let forgotten = self
             .peers
             .get(&peer)
-            .is_some_and(|state| state.dialed.is_none());
-        if inbound {
-            self.peers.remove(&peer);
+            .is_some_and(|state| state.dialed.as_ref().is_none_or(|dial| dial.alone));
+        if forgotten {
+            let alone = self
+                .peers
+                .remove(&peer)
+                .is_some_and(|state| state.dialed.is_some());
+            if alone {
+                self.driver.endpoint().directory_mut().forget(peer);
+            }
         }
     }
 

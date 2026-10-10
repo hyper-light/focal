@@ -79,7 +79,7 @@ where
     loop {
         let judged = wait.next_judgement_ns().saturating_sub(elapsed(started));
         // A reply in hand is read before the wait is judged: the race polls it first.
-        match race2(exchanges.next(), hyper_rt::futures::sleep(judged)).await {
+        match race2(exchanges.join_next(), hyper_rt::futures::sleep(judged)).await {
             Either::First(reported) => {
                 let Some((peer, answer)) = reported else {
                     return Ok(round);

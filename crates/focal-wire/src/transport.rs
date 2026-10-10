@@ -403,6 +403,11 @@ impl QuicServer {
             limits,
         })
     }
+    /// The server's owner, for a test that fills its queue.
+    #[cfg(test)]
+    pub(crate) fn network(&self) -> &Network {
+        &self.network
+    }
     /// Who holds this server's connections, and what it refused.
     pub async fn admission(&self) -> AdmissionStats {
         let stats = self
@@ -425,9 +430,13 @@ impl QuicServer {
             .call(|reply| Command::SetTls { tls, reply })
             .await?
     }
-    pub fn close(&self) {
-        // A full queue is an owner already moving; it reads this in its turn.
-        let _ = self.network.try_send(Command::Close);
+    /// Closes the server: its connections close and `serve` returns. Refused only when the shard
+    /// has no task left to queue it (`Limit`); a server already closed is closed.
+    pub fn close(&self) -> Result<(), WireError> {
+        match self.network.send_now(Command::Close) {
+            Err(WireError::Connection) => Ok(()),
+            closed => closed,
+        }
     }
     /// Serves requests with `handler` until the server is closed.
     pub async fn serve<H: RequestHandler + Clone>(&self, handler: H) -> Result<(), WireError> {
@@ -612,6 +621,26 @@ impl QuicConnector {
             &self.offers,
             address,
             server_name,
+            false,
+        )
+        .await
+    }
+    /// A connection to `address` of the caller's alone: never the route's to `address` that
+    /// [`Self::connect`] shares, never found by another call, and forgotten once it closes — a
+    /// probe of exactly an address that closes its connection after (24 §24) leaves the route's
+    /// alone.
+    pub async fn connect_alone(
+        &self,
+        address: SocketAddr,
+        server_name: &str,
+    ) -> Result<QuicRemote, WireError> {
+        open_remote(
+            &self.network,
+            &self.limits,
+            &self.offers,
+            address,
+            server_name,
+            true,
         )
         .await
     }
@@ -622,8 +651,13 @@ impl QuicConnector {
             .await
             .unwrap_or_default()
     }
-    pub fn close(&self) {
-        let _ = self.network.try_send(Command::Close);
+    /// Closes the connector's endpoint, its connections with it. Refused only when the shard has
+    /// no task left to queue it (`Limit`); an endpoint already closed is closed.
+    pub fn close(&self) -> Result<(), WireError> {
+        match self.network.send_now(Command::Close) {
+            Err(WireError::Connection) => Ok(()),
+            closed => closed,
+        }
     }
 }
 /// The connector's endpoint, as a handle: connections it opens are the connector's own (same
@@ -646,6 +680,7 @@ impl QuicDialer {
             &self.offers,
             address,
             server_name,
+            false,
         )
         .await
     }
@@ -656,6 +691,7 @@ async fn open_remote(
     offers: &[u16],
     address: SocketAddr,
     server_name: &str,
+    alone: bool,
 ) -> Result<QuicRemote, WireError> {
     if server_name.len() > 253 {
         return Err(WireError::Limit);
@@ -668,6 +704,7 @@ async fn open_remote(
             name,
             pin: None,
             offers,
+            alone,
             reply,
         })
         .await??;
@@ -716,11 +753,16 @@ impl QuicRemote {
     pub fn negotiated(&self) -> Negotiated {
         self.negotiated
     }
-    /// Closes the connection; exchanges under way on it are refused.
-    pub fn close(&self) {
-        let _ = self
+    /// Closes the connection; exchanges under way on it are refused. Refused only when the shard
+    /// has no task left to queue it (`Limit`); a connection already gone is closed.
+    pub fn close(&self) -> Result<(), WireError> {
+        match self
             .network
-            .try_send(Command::Disconnect { peer: self.peer });
+            .send_now(Command::Disconnect { peer: self.peer })
+        {
+            Err(WireError::Connection) => Ok(()),
+            closed => closed,
+        }
     }
     /// What the path to the peer measures now, while the connection is up.
     pub async fn path(&self) -> Option<PathFacts> {
@@ -808,6 +850,9 @@ pub struct RouteConnections {
     /// The connection each route was last handed, by its endpoint and server name; at most
     /// `max_routes`, the one handed longest ago going first.
     handed: std::sync::Mutex<std::collections::VecDeque<((String, String), QuicRemote)>>,
+    /// Connections it closed whose close their endpoint could not queue (the shard's tasks all
+    /// taken): each idles out at its connection's idle timeout instead.
+    closes_refused: std::sync::atomic::AtomicU64,
 }
 /// A connection the cache handed out.
 pub struct Connected {
@@ -825,6 +870,7 @@ impl RouteConnections {
             connector,
             max_routes,
             handed: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            closes_refused: std::sync::atomic::AtomicU64::new(0),
         })
     }
     pub fn limits(&self) -> &WireLimits {
@@ -834,6 +880,21 @@ impl RouteConnections {
     /// went.
     pub async fn dials(&self) -> u64 {
         self.connector.stats().await.dials
+    }
+    /// Connections it closed whose close their endpoint could not queue.
+    pub fn closes_refused(&self) -> u64 {
+        self.closes_refused
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Closes `remote`, counting a close its endpoint could not queue.
+    fn close(&self, remote: &QuicRemote) {
+        if remote.close().is_err() {
+            let _ = self.closes_refused.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| Some(count.saturating_add(1)),
+            );
+        }
     }
     /// The routes this cache may hold.
     pub fn max_routes(&self) -> usize {
@@ -878,7 +939,7 @@ impl RouteConnections {
             Ok(exchanged) => Ok(exchanged.response),
             Err(unanswered) => {
                 if crate::connection_failed(unanswered.closed, &unanswered.error, true) {
-                    connected.remote.close();
+                    self.close(&connected.remote);
                 }
                 Err(unanswered.error)
             }
@@ -894,7 +955,7 @@ impl RouteConnections {
             held == endpoint && name == server_name && remote.epoch == generation
         });
         if let Some((_, remote)) = at.and_then(|at| handed.remove(at)) {
-            remote.close();
+            self.close(&remote);
         }
     }
 }

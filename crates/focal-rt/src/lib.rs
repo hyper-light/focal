@@ -181,7 +181,7 @@ impl<F: Future> Concurrent<F> {
         })
     }
 
-    /// Adds `future`, first polled by the next [`Concurrent::next`].
+    /// Adds `future`, first polled by the next [`Concurrent::join_next`].
     pub fn push(&mut self, future: F) -> Result<(), RtError> {
         if self.running >= self.capacity {
             return Err(RtError::Capacity {
@@ -227,7 +227,7 @@ impl<F: Future> Concurrent<F> {
     }
 
     /// The output of the next future to end; `None` when none is running.
-    pub fn next(&mut self) -> impl Future<Output = Option<F::Output>> + '_ {
+    pub fn join_next(&mut self) -> impl Future<Output = Option<F::Output>> + '_ {
         std::future::poll_fn(move |cx| self.poll_next(cx))
     }
 
@@ -387,7 +387,7 @@ mod tests {
             }))
             .unwrap();
             let mut order = Vec::new();
-            while let Some(ended) = set.next().await {
+            while let Some(ended) = set.join_next().await {
                 order.push(ended.unwrap());
             }
             (order, hyper_rt::futures::now_ns())
@@ -409,21 +409,21 @@ mod tests {
                 set.push(std::future::ready(4)),
                 Err(RtError::Capacity { bound: 3, .. })
             ));
-            assert_eq!(set.next().await, Some(1));
+            assert_eq!(set.join_next().await, Some(1));
             // Into the first slot, which the next poll reaches last: the futures after the one
             // that ended go first.
             set.push(std::future::ready(4)).unwrap();
             assert_eq!(set.len(), 3);
-            assert_eq!(set.next().await, Some(2));
-            assert_eq!(set.next().await, Some(3));
-            assert_eq!(set.next().await, Some(4));
-            assert_eq!(set.next().await, None);
+            assert_eq!(set.join_next().await, Some(2));
+            assert_eq!(set.join_next().await, Some(3));
+            assert_eq!(set.join_next().await, Some(4));
+            assert_eq!(set.join_next().await, None);
             assert!(set.is_empty());
             // Never past its first reservation.
             assert_eq!(set.slots.capacity(), 3);
             set.push(std::future::ready(5)).unwrap();
             set.clear();
-            assert_eq!(set.next().await, None);
+            assert_eq!(set.join_next().await, None);
         })
         .unwrap();
     }

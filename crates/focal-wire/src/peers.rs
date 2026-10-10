@@ -150,6 +150,9 @@ pub struct PeerPoolStats {
     /// cooldown, each spared a dial.
     pub refused_unreachable: u64,
     pub connections_opened: u64,
+    /// Connections no longer wanted whose close their endpoint could not queue — the shard's
+    /// tasks all taken: each idles out at its connection's idle timeout instead.
+    pub closes_refused: u64,
     pub cached_connections: usize,
     pub inflight: usize,
     /// Content in flight or waiting its turn on a peer's lane.
@@ -166,6 +169,7 @@ struct Counters {
     dials: AtomicU64,
     unreachable: AtomicU64,
     opened: AtomicU64,
+    closes_refused: AtomicU64,
 }
 struct Connected {
     generation: u64,
@@ -247,6 +251,8 @@ struct Slot {
     unreachable_until: Mutex<Option<u64>>,
     /// What the path to the peer measured when its last answer came.
     facts: Mutex<Option<PathFacts>>,
+    /// The pool's counts: a close its endpoint refused is counted there.
+    counters: Rc<Counters>,
     _reservation: Reservation,
 }
 impl Slot {
@@ -284,7 +290,7 @@ impl Slot {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(connection) = connection {
-            connection.remote.close();
+            close(&connection.remote, &self.counters);
         }
     }
 }
@@ -298,7 +304,7 @@ impl Drop for Slot {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(connection) = connection {
-            connection.remote.close();
+            close(&connection.remote, &self.counters);
         }
     }
 }
@@ -925,9 +931,11 @@ impl PeerConnectionPool {
             .try_acquire()
             .ok_or(PeerSendError::Busy)?;
         hyper_rt::futures::within(nanos(self.limits.timeout), async {
+            // A connection of the probe's alone: the route's to this address, if one is up,
+            // stays the route's, and this one is closed after.
             let remote = self
                 .connector
-                .connect(address, &server_name)
+                .connect_alone(address, &server_name)
                 .await
                 .map_err(|_| PeerSendError::Lost)?;
             let result = match remote.request(request).await {
@@ -939,7 +947,7 @@ impl PeerConnectionPool {
                 Err(WireError::Access(error)) => Err(PeerSendError::Rejected(error)),
                 Err(_) => Err(PeerSendError::Lost),
             };
-            remote.close();
+            close(&remote, &self.counters);
             result
         })
         .await
@@ -1301,7 +1309,7 @@ impl PeerConnectionPool {
                 // it.
                 let answered = slot.answered.load(Ordering::Acquire) != before;
                 if connection_failed(closed, &failure, answered) {
-                    remote.close();
+                    close(&remote, &slot.counters);
                     if let Ok(mut cached) = slot.connection.lock()
                         && cached
                             .as_ref()
@@ -1397,6 +1405,7 @@ impl PeerConnectionPool {
             answered: AtomicU64::new(0),
             unreachable_until: Mutex::new(None),
             facts: Mutex::new(None),
+            counters: self.counters.clone(),
             _reservation: reservation,
         });
         state.cached.insert(
@@ -1495,10 +1504,11 @@ impl PeerConnectionPool {
         let cooldown = self.limits.unreachable_cooldown;
         let task = hyper_rt::futures::spawn_detached(async move {
             let endpoint = task_slot.endpoint.clone();
-            let (outcome, rest) = dial_candidates(dialer, endpoint, timeout).await;
+            let (outcome, rest) =
+                dial_candidates(dialer, endpoint, timeout, counters.clone()).await;
             let state = match outcome {
                 Ok(remote) if task_slot.retired.load(Ordering::Acquire) => {
-                    remote.close();
+                    close(&remote, &counters);
                     DialState::Failed
                 }
                 Ok(remote) => {
@@ -1521,12 +1531,12 @@ impl PeerConnectionPool {
                                 DialState::Connected
                             }
                             _ => {
-                                remote.close();
+                                close(&remote, &counters);
                                 DialState::Failed
                             }
                         },
                         Err(_) => {
-                            remote.close();
+                            close(&remote, &counters);
                             DialState::Failed
                         }
                     }
@@ -1542,7 +1552,7 @@ impl PeerConnectionPool {
             // The candidates still dialing when one connected are closed as they connect, within
             // the dial's own deadline, rather than left to idle out.
             if let Some(rest) = rest {
-                drain_candidates(rest, timeout).await;
+                drain_candidates(rest, timeout, &counters).await;
             }
         })
         .map_err(|_| PeerSendError::Busy)?;
@@ -1563,6 +1573,7 @@ impl PeerConnectionPool {
             dials: self.counters.dials.load(Ordering::Relaxed),
             refused_unreachable: self.counters.unreachable.load(Ordering::Relaxed),
             connections_opened: self.counters.opened.load(Ordering::Relaxed),
+            closes_refused: self.counters.closes_refused.load(Ordering::Relaxed),
             cached_connections: self
                 .state
                 .lock()
@@ -1611,6 +1622,7 @@ async fn dial_candidates(
     dialer: QuicDialer,
     endpoint: PeerEndpoint,
     timeout: Duration,
+    counters: Rc<Counters>,
 ) -> (Result<QuicRemote, PeerSendError>, Option<Candidates>) {
     let Ok(mut candidates) = Candidates::new(DIAL_CANDIDATES) else {
         return (Err(PeerSendError::Busy), None);
@@ -1660,7 +1672,9 @@ async fn dial_candidates(
             // them, they are abandoned: a connection one of them makes later is its endpoint's to
             // reuse or idle out.
             if !rest.is_empty() {
-                let _ = hyper_rt::futures::spawn_detached(drain_candidates(rest, timeout));
+                let _ = hyper_rt::futures::spawn_detached(async move {
+                    drain_candidates(rest, timeout, &counters).await;
+                });
             }
             winner
         });
@@ -1679,7 +1693,7 @@ async fn dial_candidates(
 async fn first_connection(
     mut candidates: Candidates,
 ) -> (Result<QuicRemote, PeerSendError>, Candidates) {
-    while let Some(dialed) = candidates.next().await {
+    while let Some(dialed) = candidates.join_next().await {
         if let Ok(remote) = dialed {
             return (Ok(remote), candidates);
         }
@@ -1688,11 +1702,11 @@ async fn first_connection(
 }
 /// Closes each candidate that connects after the winner, within `timeout`; one still dialing then
 /// is abandoned.
-async fn drain_candidates(mut rest: Candidates, timeout: Duration) {
+async fn drain_candidates(mut rest: Candidates, timeout: Duration, counters: &Counters) {
     let drained = async {
-        while let Some(dialed) = rest.next().await {
+        while let Some(dialed) = rest.join_next().await {
             if let Ok(extra) = dialed {
-                extra.close();
+                close(&extra, counters);
             }
         }
     };
@@ -1701,6 +1715,13 @@ async fn drain_candidates(mut rest: Candidates, timeout: Duration) {
 /// A pause on the shard's clock; a shard with no timer left gives none.
 async fn pause(period: Duration) {
     let _ = hyper_rt::futures::sleep(nanos(period)).await;
+}
+/// Closes `remote`, a connection no longer wanted; one its endpoint could not queue — the shard's
+/// tasks all taken — idles out at its connection's idle timeout instead, and is counted.
+fn close(remote: &QuicRemote, counters: &Counters) {
+    if remote.close().is_err() {
+        increment(&counters.closes_refused);
+    }
 }
 fn increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

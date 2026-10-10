@@ -7,6 +7,7 @@ use rcgen::{
 };
 use std::{
     collections::BTreeSet,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -399,7 +400,7 @@ fn a_reply_held_by_flow_control_keeps_its_charge_until_read_or_the_connection_is
             .await;
             drop(raw);
         }
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -508,7 +509,7 @@ fn mutual_tls_tenant_isolation_live_revocation_and_independent_streams() {
         registry.revoke(fingerprint).unwrap();
         assert!(remote.request(&request(4)).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -612,7 +613,7 @@ fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connec
         })
         .await;
         assert_eq!(stats.bytes, stats.pooled);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -663,7 +664,7 @@ fn a_complete_request_is_authorized_by_the_grant_current_at_dispatch() {
         assert!(remote.request(&request(2)).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         admission_settles(&server, |stats| stats.connections == 0).await;
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -694,7 +695,7 @@ fn certificates_outside_the_trusted_ca_never_dispatch() {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -960,7 +961,7 @@ fn unsupported_protocol_is_rejected_before_dispatch() {
             HelloReply::Rejected(AccessError::UnsupportedProtocol)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1194,7 +1195,7 @@ fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes()
         );
         pool.close();
         assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Closed));
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1267,7 +1268,7 @@ fn an_operation_refused_or_unanswered_takes_no_other_exchange_with_its_connectio
             &wire,
         )
         .unwrap();
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire, budget()).unwrap(),
                 PeerPoolLimits {
@@ -1366,7 +1367,7 @@ fn an_operation_refused_or_unanswered_takes_no_other_exchange_with_its_connectio
         assert_eq!(pool.stats().connections_opened, 1);
         assert_eq!(pool.stats().cached_connections, 1);
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1489,7 +1490,7 @@ fn peer_pool_re_resolves_a_named_endpoint_when_its_address_stops_answering() {
         .unwrap();
         assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1571,7 +1572,7 @@ fn peer_pool_reaches_a_peer_that_moved_behind_its_name_while_every_caller_gives_
         assert_eq!(stats.connections_opened, 1);
         assert_eq!(stats.delivered, 1);
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1619,7 +1620,7 @@ fn peer_pool_callers_that_give_up_share_one_dial_whose_outcome_is_still_recorded
             group: [2; 16],
             message: vec![1],
         };
-        let pool = Arc::new(pool);
+        let pool = Rc::new(pool);
         let callers: Vec<_> = (0..6)
             .map(|_| {
                 let pool = pool.clone();
@@ -1684,7 +1685,7 @@ fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadline() 
         });
         let (server, task) = server(&pki, registry, handler).await;
         let deadline = Duration::from_secs(60);
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 connector(&pki, certificate, key),
                 PeerPoolLimits {
@@ -1730,7 +1731,7 @@ fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadline() 
             assert_eq!(pool.stats().cached_connections, 0);
         }
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1756,7 +1757,7 @@ fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
                 verified.request().reply(Response::PeerAccepted)
             });
         let (server, task) = server(&pki, registry, handler).await;
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(connector(&pki, certificate, key), PeerPoolLimits::default())
                 .unwrap(),
         );
@@ -1799,7 +1800,7 @@ fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
             .unwrap();
         assert_eq!(pool.send(2, &packet).await, Ok(()));
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1856,7 +1857,7 @@ fn a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused() {
             }
         });
         let (server, task) = server(&pki, registry, handler).await;
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 connector(&pki, certificate, key),
                 PeerPoolLimits {
@@ -1904,7 +1905,7 @@ fn a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused() {
         let seen = order.lock().unwrap().clone();
         assert_eq!(seen.len(), 3, "{seen:?}");
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -1936,7 +1937,7 @@ fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connections()
             }
         });
         let (server, task) = server(&pki, registry, handler).await;
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 connector(&pki, certificate, key),
                 PeerPoolLimits {
@@ -1984,7 +1985,7 @@ fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connections()
             Err(PeerSendError::InvalidRequest)
         );
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -2031,7 +2032,7 @@ async fn shaped(
     server: std::net::SocketAddr,
     shape: Shape,
 ) -> (std::net::SocketAddr, Vec<Spawned<()>>) {
-    use std::{cell::Cell, rc::Rc};
+    use std::cell::Cell;
     let front = Rc::new(hyper_rt::udp::UdpSocket::bind(([127, 0, 0, 1], 0)).unwrap());
     let back = Rc::new(hyper_rt::udp::UdpSocket::bind(([127, 0, 0, 1], 0)).unwrap());
     let address = front.local_addr().unwrap();
@@ -2274,8 +2275,8 @@ fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
         );
         // One handler waits: the one asked to cancel.
         silent.notify_one();
-        remote.close();
-        server.close();
+        remote.close().unwrap();
+        server.close().unwrap();
         task.join().await.unwrap();
         for relay in relays {
             relay.abort();
@@ -2332,7 +2333,7 @@ fn content_waits_its_turn_and_refuses_nothing_a_group_sends() {
         .unwrap();
         let connector =
             QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire, budget()).unwrap();
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 connector,
                 PeerPoolLimits {
@@ -2401,7 +2402,7 @@ fn content_waits_its_turn_and_refuses_nothing_a_group_sends() {
         }
         assert_eq!(pool.stats().bulk_inflight, 0);
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -2738,7 +2739,7 @@ fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
                     .is_err()
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         }
     })
@@ -2796,8 +2797,8 @@ fn a_handle_polled_off_its_shard_refuses_at_once_and_still_serves_on_it() {
         );
         // The refused dial queued nothing: the connector still holds its one connection.
         assert_eq!(connector.stats().await.endpoint.connections, 1);
-        remote.close();
-        server.close();
+        remote.close().unwrap();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -3057,7 +3058,7 @@ fn a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it() {
         assert_eq!(pool.stats().refused_unreachable, 1, "the cooldown ended");
         assert_eq!(pool.stats().connections_opened, 1);
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -3097,7 +3098,7 @@ fn an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take() {
         });
         let (server, task) = server(&pki, registry, handler).await;
         let ceiling = Duration::from_secs(30);
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 connector(&pki, certificate, key),
                 PeerPoolLimits {
@@ -3182,7 +3183,7 @@ fn an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take() {
         assert_eq!(pool.exchange_tail(2), None);
         let _ = replication;
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -3363,7 +3364,7 @@ mod admission {
             );
             assert!(serves(&processes[7].1, 712).await);
             drop((ninth_process, processes));
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         })
         .unwrap()
@@ -3460,7 +3461,7 @@ mod admission {
             assert!(serves(&fourth.unwrap(), 4).await);
             assert_eq!(server.admission().await.replaced, 1);
             drop((first_process, second_process, third_process, fourth_process));
-            server.close();
+            server.close().unwrap();
             let _ = task.await;
         })
         .unwrap()
@@ -3530,7 +3531,7 @@ mod admission {
                     && serves(&second_a, 7).await
             );
             // A connection that closes makes room: the second identity is admitted.
-            first_b.close();
+            first_b.close().unwrap();
             held(&server, 2).await;
             let (second_b_process, second_b) =
                 dial(&pki, &second_certificate, &second_key, address).await;
@@ -3544,7 +3545,7 @@ mod admission {
                 refused_first,
                 second_b_process,
             ));
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         })
         .unwrap()
@@ -3620,7 +3621,7 @@ mod admission {
             let stats = admission_settles(&server, |stats| stats.bytes == stats.pooled).await;
             assert_eq!(stats.refused_bytes, 1);
             drop(raw);
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         })
         .unwrap()
@@ -3683,7 +3684,7 @@ mod admission {
             assert_eq!(stats.identities, 1);
             assert!(stats.replaced >= 8, "{stats:?}");
             drop((first_process, second_process, third_process, left));
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         })
         .unwrap()
@@ -3755,12 +3756,12 @@ mod admission {
             assert_eq!(stats.refused_identities, 1);
             assert!(serves(&firsts[4].1, 600).await && serves(&c, 602).await);
             // An identity that leaves frees its place.
-            c.close();
+            c.close().unwrap();
             held(&server, 3).await;
             let (d_process, d) = dial(&pki, third, third_key, address).await;
             assert!(serves(&d.unwrap(), 603).await);
             drop((firsts, c_process, refused_process, d_process));
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         })
         .unwrap()
@@ -3785,7 +3786,7 @@ mod admission {
             }
             let stats = held(&server, 0).await;
             assert_eq!((stats.identities, stats.admitted), (0, 0));
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         })
         .unwrap()
@@ -3890,7 +3891,7 @@ fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing() 
         let next = routes.connect(&address, "localhost").await.unwrap();
         assert_eq!(routes.dials().await, 3, "gave up: {}", gave_up.is_some());
         assert!(next.generation > fresh.generation);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -3962,7 +3963,8 @@ fn a_request_that_fails_alone_keeps_its_connection() {
             .await
             .unwrap()
             .remote
-            .close();
+            .close()
+            .unwrap();
         assert!(
             routes
                 .request(&address, "localhost", &request(4))
@@ -3976,7 +3978,7 @@ fn a_request_that_fails_alone_keeps_its_connection() {
                 .is_ok()
         );
         assert_eq!(routes.dials().await, 2);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -4231,7 +4233,7 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
         "{:?}",
         refused.lock().unwrap()
     );
-    remote.close();
+    remote.close().unwrap();
     peer.abort();
     for relay in relays {
         relay.abort();
@@ -4410,7 +4412,7 @@ fn a_peers_time_to_answer_begins_when_it_has_what_was_asked() {
         let least = Duration::from_millis(SIZE as u64 * 8 * 1_000 / BITS);
         assert!(least >= PERIOD * 8);
         assert!(took >= least, "{took:?}");
-        server.close();
+        server.close().unwrap();
         for relay in relays {
             relay.abort();
         }
@@ -4507,7 +4509,7 @@ impl SlowRig {
     }
     async fn close(self) {
         self.pool.close();
-        self.server.close();
+        self.server.close().unwrap();
         for relay in self.relays {
             relay.abort();
         }
@@ -4855,7 +4857,7 @@ async fn direct_case(
             )
         }
     };
-    server.close();
+    server.close().unwrap();
     for relay in relays {
         relay.abort();
     }
@@ -5071,7 +5073,7 @@ fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_e
         let reply = remote.request(&request(1)).await.unwrap();
         assert_eq!(reply.request_id, request(1).request_id);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
         // The other direction: a server issued under the successor, dialed by
         // a client that trusts the genesis issuer alone.
@@ -5143,7 +5145,7 @@ fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_e
                 let reply = remote.request(&request(2)).await.unwrap();
                 assert_eq!(reply.request_id, request(2).request_id);
             }
-            server.close();
+            server.close().unwrap();
             task.join().await.unwrap();
         }
     })
@@ -5595,7 +5597,7 @@ fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
             "a focal client accepted a classical exchange"
         );
         accepting.abort();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -5632,7 +5634,7 @@ fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
             }
         });
         let (server, task) = server(&pki, registry, handler).await;
-        let pool = Arc::new(
+        let pool = Rc::new(
             PeerConnectionPool::new(
                 connector(&pki, certificate, key),
                 PeerPoolLimits {
@@ -5695,7 +5697,7 @@ fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
             "the exchange ended unanswered, and nothing of it is left"
         );
         pool.close();
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()
@@ -5757,7 +5759,7 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
                 let running = server.clone();
                 let task = spawn(async move { running.serve(handler).await });
                 let _ = stop_rx.await;
-                server.close();
+                server.close().unwrap();
                 let _ = task.await;
             })
             .unwrap();
@@ -5842,7 +5844,7 @@ fn loopback_round_trip_floor() {
             at(0.999),
             samples[samples.len() - 1]
         );
-        server.close();
+        server.close().unwrap();
         task.join().await.unwrap();
     })
     .unwrap()

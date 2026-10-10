@@ -49,8 +49,39 @@ fn a_request_before_the_handler_waits_for_it() {
                 .await
         });
         assert_eq!(asked.await.unwrap().unwrap(), RequestId::from_u128(5));
-        server.close();
+        server.close().unwrap();
         serve.join().await.unwrap();
+    })
+    .unwrap();
+}
+
+/// A close is never lost to a full queue: what the owner's queue cannot take now is given to a task
+/// that waits its turn. Do: fill the owner's queue while it cannot run, and close the server. Expect:
+/// the owner drains its queue and closes, and `serve` returns; a close the queue refused was dropped,
+/// and the server served on.
+#[test]
+fn a_close_is_never_lost_to_a_full_queue() {
+    focal_rt::block_on(async {
+        let pki = Pki::new();
+        let registry = PeerRegistry::new(4).unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let (server, task) = server(&pki, registry, handler).await;
+        let mut answers = Vec::new();
+        loop {
+            let (reply, answer) = hyper_rt::sync::oneshot().unwrap();
+            if !server
+                .network()
+                .try_queue(crate::net::Command::Stats { reply })
+            {
+                break;
+            }
+            answers.push(answer);
+        }
+        assert!(!answers.is_empty());
+        server.close().unwrap();
+        let served = timeout(Duration::from_secs(10), task).await;
+        assert!(matches!(served, Some(Ok(Ok(())))), "the close was lost");
     })
     .unwrap();
 }
