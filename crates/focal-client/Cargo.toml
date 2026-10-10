@@ -11,7 +11,7 @@ focal-wire = { version = "0.1.0", path = "../focal-wire" }
 focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
 postcard.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+hyper-rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_saphyr.workspace = true
@@ -21,6 +21,7 @@ getrandom.workspace = true
 
 [dev-dependencies]
 focal-core = { version = "0.1.0", path = "../focal-core" }
+focal-rt = { version = "0.1.0", path = "../focal-rt" }
 tempfile.workspace = true
 
 [lints]

@@ -624,7 +624,8 @@ impl<T: ClientTransport> Client<T> {
         request: &mut RequestEnvelope,
         write_uncertain: &mut bool,
     ) -> Result<ResponseEnvelope, ClientError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        // Off a shard no deadline or backoff can be kept: refused before anything is sent.
+        if !crate::time::on_a_shard() {
             return Err(ClientError::Transport);
         }
         // Reject an oversized request before the retry loop. `payload_len`
@@ -644,7 +645,7 @@ impl<T: ClientTransport> Client<T> {
                 route = None;
             }
         }
-        let start = tokio::time::Instant::now();
+        let start = crate::time::Instant::now();
         let mut uncertain = false;
         // A capacity or availability refusal has no effect (nothing was
         // admitted), so bounded backed-off resends ride out a full ingress
@@ -663,8 +664,9 @@ impl<T: ClientTransport> Client<T> {
             }
             let mut refused = false;
             let response =
-                tokio::time::timeout(remaining, self.transport.request(route.as_ref(), request))
-                    .await;
+                crate::time::within(remaining, self.transport.request(route.as_ref(), request))
+                    .await?
+                    .ok_or(());
             match response {
                 Ok(Ok(response)) => {
                     if validate_response(request, &response, None, &self.limits).is_err() {
@@ -751,7 +753,7 @@ impl<T: ClientTransport> Client<T> {
                     }
                     return Err(ClientError::InvalidResponse);
                 }
-                Ok(Err(WireError::Authentication)) => {
+                Ok(Err(WireError::Authentication | WireError::Unpinned)) => {
                     if uncertain && request.operation.is_mutation() {
                         break;
                     }
@@ -781,7 +783,7 @@ impl<T: ClientTransport> Client<T> {
                 entropy(),
             );
             backoffs = backoffs.saturating_add(1);
-            tokio::time::sleep(backoff).await;
+            crate::time::sleep(backoff).await?;
         }
         if !uncertain && let Some(refusal) = last_refusal {
             // Every attempt was a definite refusal without effect: report

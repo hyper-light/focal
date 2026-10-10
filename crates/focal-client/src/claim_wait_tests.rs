@@ -111,7 +111,9 @@ impl ClientTransport for &Mock {
                 .pop_front()
                 .expect("bounded probe count");
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                hyper_rt::futures::sleep(crate::time::nanos(delay))
+                    .await
+                    .unwrap();
             }
             Ok(request.reply(response))
         })
@@ -132,8 +134,14 @@ fn client(mock: &Mock) -> Client<&Mock> {
     .unwrap()
 }
 
-#[tokio::test]
-async fn predicates_use_observed_status_and_release_without_inventing_work() {
+#[test]
+fn predicates_use_observed_status_and_release_without_inventing_work() {
+    focal_rt::block_on(
+        predicates_use_observed_status_and_release_without_inventing_work_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn predicates_use_observed_status_and_release_without_inventing_work_on_a_shard() {
     for (until, status, released, expected) in [
         (
             ClaimWaitUntil::Satisfied,
@@ -185,8 +193,14 @@ async fn predicates_use_observed_status_and_release_without_inventing_work() {
     }
 }
 
-#[tokio::test]
-async fn probes_are_fresh_paced_and_monotone_and_deadline_keeps_last_observation() {
+#[test]
+fn probes_are_fresh_paced_and_monotone_and_deadline_keeps_last_observation() {
+    focal_rt::block_on(
+        probes_are_fresh_paced_and_monotone_and_deadline_keeps_last_observation_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn probes_are_fresh_paced_and_monotone_and_deadline_keeps_last_observation_on_a_shard() {
     let mock = Mock::new(vec![
         response(ClaimStatus::Posted, false, 10),
         response(ClaimStatus::Satisfied, true, 11),
@@ -229,8 +243,14 @@ async fn probes_are_fresh_paced_and_monotone_and_deadline_keeps_last_observation
     assert_eq!(result.observation.token.sequence, SessionSeq(10));
 }
 
-#[tokio::test]
-async fn later_transport_errors_and_regressing_prefix_are_not_disguised_as_pending() {
+#[test]
+fn later_transport_errors_and_regressing_prefix_are_not_disguised_as_pending() {
+    focal_rt::block_on(
+        later_transport_errors_and_regressing_prefix_are_not_disguised_as_pending_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn later_transport_errors_and_regressing_prefix_are_not_disguised_as_pending_on_a_shard() {
     let mock = Mock::new(vec![
         response(ClaimStatus::Posted, false, 10),
         Response::Error(AccessError::Unavailable),
@@ -253,8 +273,12 @@ async fn later_transport_errors_and_regressing_prefix_are_not_disguised_as_pendi
     ));
 }
 
-#[tokio::test]
-async fn missing_claim_and_cancellation_leave_no_followup_probe() {
+#[test]
+fn missing_claim_and_cancellation_leave_no_followup_probe() {
+    focal_rt::block_on(missing_claim_and_cancellation_leave_no_followup_probe_on_a_shard())
+        .unwrap();
+}
+async fn missing_claim_and_cancellation_leave_no_followup_probe_on_a_shard() {
     let mut missing = response(ClaimStatus::Posted, false, 10);
     if let Response::Read(page) = &mut missing {
         page.objects.clear();
@@ -268,8 +292,8 @@ async fn missing_claim_and_cancellation_leave_no_followup_probe() {
     ));
     let mock = Mock::new(vec![response(ClaimStatus::Posted, false, 10)]);
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(30),
+        hyper_rt::futures::within(
+            crate::time::nanos(Duration::from_millis(30)),
             client(&mock).claim_wait(
                 request(),
                 ClaimWaitUntil::Satisfied,
@@ -277,13 +301,20 @@ async fn missing_claim_and_cancellation_leave_no_followup_probe() {
             )
         )
         .await
-        .is_err()
+        .unwrap()
+        .is_none()
     );
     assert_eq!(mock.seen.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn same_prefix_projection_changes_and_terminal_rewrites_are_rejected() {
+#[test]
+fn same_prefix_projection_changes_and_terminal_rewrites_are_rejected() {
+    focal_rt::block_on(
+        same_prefix_projection_changes_and_terminal_rewrites_are_rejected_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn same_prefix_projection_changes_and_terminal_rewrites_are_rejected_on_a_shard() {
     for (first, second, until) in [
         (
             response(ClaimStatus::Posted, false, 10),
@@ -306,14 +337,12 @@ async fn same_prefix_projection_changes_and_terminal_rewrites_are_rejected() {
     }
 }
 
+/// Off a shard, and with a wait out of bounds, nothing is sent.
 #[test]
-fn absent_time_driver_and_invalid_input_fail_without_transmitting() {
+fn a_wait_off_a_shard_and_invalid_input_fail_without_transmitting() {
     let mock = Mock::new(vec![]);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     assert!(matches!(
-        runtime.block_on(client(&mock).claim_wait(
+        crate::time::off_a_shard(client(&mock).claim_wait(
             request(),
             ClaimWaitUntil::Satisfied,
             Duration::from_secs(1)
@@ -322,7 +351,7 @@ fn absent_time_driver_and_invalid_input_fail_without_transmitting() {
     ));
     for duration in [Duration::ZERO, Duration::from_secs(31)] {
         assert!(matches!(
-            runtime.block_on(client(&mock).claim_wait(
+            crate::time::off_a_shard(client(&mock).claim_wait(
                 request(),
                 ClaimWaitUntil::Satisfied,
                 duration

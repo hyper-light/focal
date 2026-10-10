@@ -48,8 +48,14 @@ fn policy() -> RetryPolicy {
     }
 }
 
-#[tokio::test]
-async fn authentication_errors_are_distinct_but_cannot_erase_an_unknown_write() {
+#[test]
+fn authentication_errors_are_distinct_but_cannot_erase_an_unknown_write() {
+    focal_rt::block_on(
+        authentication_errors_are_distinct_but_cannot_erase_an_unknown_write_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn authentication_errors_are_distinct_but_cannot_erase_an_unknown_write_on_a_shard() {
     struct Authentication {
         first_unknown: std::sync::atomic::AtomicBool,
     }
@@ -99,8 +105,12 @@ async fn authentication_errors_are_distinct_but_cannot_erase_an_unknown_write() 
     );
 }
 
+/// A panicking transport is contained on a shard: a write's outcome stays unknown under its own
+/// identity and a read is a transport failure. Off a shard, where no deadline could be kept, both
+/// are refused before the transport is called.
 #[test]
-fn missing_time_driver_and_panicking_transport_do_not_unwind_or_replace_write_identity() {
+fn a_panicking_transport_does_not_unwind_or_replace_write_identity_and_off_a_shard_nothing_is_sent()
+{
     struct Panics;
     impl ClientTransport for Panics {
         fn request<'a>(
@@ -111,34 +121,49 @@ fn missing_time_driver_and_panicking_transport_do_not_unwind_or_replace_write_id
             Box::pin(async { panic!("injected transport dependency failure") })
         }
     }
-    for timers in [false, true] {
-        let mut builder = tokio::runtime::Builder::new_current_thread();
-        if timers {
-            builder.enable_all();
-        }
-        let runtime = builder.build().unwrap();
-        let client = Client::new(Panics, policy(), WireLimits::default(), 1).unwrap();
-        let original = request();
-        let result = runtime.block_on(client.request(original.clone()));
-        let Err(ClientError::OutcomeUnknown { request: retained }) = result else {
-            panic!("write outcome must remain unknown")
-        };
-        assert_eq!(*retained, original);
-        let mut read = original;
+    fn read(original: &RequestEnvelope) -> RequestEnvelope {
+        let mut read = original.clone();
         read.operation = Operation::Read(ReadRequest {
             consistency: ReadConsistency::Linearizable,
             query: ReadQuery::Objects(vec![]),
             max_items: 1,
         });
+        read
+    }
+    focal_rt::block_on(async {
+        let client = Client::new(Panics, policy(), WireLimits::default(), 1).unwrap();
+        let original = request();
+        let result = client.request(original.clone()).await;
+        let Err(ClientError::OutcomeUnknown { request: retained }) = result else {
+            panic!("write outcome must remain unknown")
+        };
+        assert_eq!(*retained, original);
         assert!(matches!(
-            runtime.block_on(client.request(read)),
+            client.request(read(&original)).await,
             Err(ClientError::Transport)
         ));
-    }
+    })
+    .unwrap();
+    let client = Client::new(Panics, policy(), WireLimits::default(), 1).unwrap();
+    let original = request();
+    assert!(matches!(
+        crate::time::off_a_shard(client.request(original.clone())),
+        Err(ClientError::Transport)
+    ));
+    assert!(matches!(
+        crate::time::off_a_shard(client.request(read(&original))),
+        Err(ClientError::Transport)
+    ));
 }
 
-#[tokio::test]
-async fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
+#[test]
+fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
+    focal_rt::block_on(
+        embedded_transport_checks_managed_syntax_capability_before_dispatch_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn embedded_transport_checks_managed_syntax_capability_before_dispatch_on_a_shard() {
     struct Legacy;
     impl RequestHandler for Legacy {
         fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
@@ -174,8 +199,14 @@ async fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
     ));
 }
 
-#[tokio::test]
-async fn reconciliation_binds_expected_principal_after_transport_shape_validation() {
+#[test]
+fn reconciliation_binds_expected_principal_after_transport_shape_validation() {
+    focal_rt::block_on(
+        reconciliation_binds_expected_principal_after_transport_shape_validation_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn reconciliation_binds_expected_principal_after_transport_shape_validation_on_a_shard() {
     struct Observe {
         principal: ParticipantId,
     }
@@ -286,8 +317,12 @@ impl ClientTransport for LostReply {
         })
     }
 }
-#[tokio::test]
-async fn lost_reply_retries_the_identical_command_and_request_identity() {
+#[test]
+fn lost_reply_retries_the_identical_command_and_request_identity() {
+    focal_rt::block_on(lost_reply_retries_the_identical_command_and_request_identity_on_a_shard())
+        .unwrap();
+}
+async fn lost_reply_retries_the_identical_command_and_request_identity_on_a_shard() {
     let client = Client::new(
         LostReply {
             requests: Mutex::new(vec![]),
@@ -332,8 +367,14 @@ impl ClientTransport for UnavailableThen {
 /// resent with backoff past the attempts kept for lost replies, and one
 /// that outlasts the clock is reported as the refusal, never as an unknown
 /// outcome or a transport failure.
-#[tokio::test]
-async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refusals() {
+#[test]
+fn availability_refusals_are_resent_within_the_clock_and_reported_as_refusals() {
+    focal_rt::block_on(
+        availability_refusals_are_resent_within_the_clock_and_reported_as_refusals_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refusals_on_a_shard() {
     let client = Client::new(
         UnavailableThen {
             requests: Mutex::new(vec![]),
@@ -371,8 +412,14 @@ async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refus
     let sent = client.transport().requests.lock().unwrap().len();
     assert!(sent > 3 && sent <= 64, "{sent}");
 }
-#[tokio::test]
-async fn exhausted_retry_retains_exact_request_and_redacts_error_payload() {
+#[test]
+fn exhausted_retry_retains_exact_request_and_redacts_error_payload() {
+    focal_rt::block_on(
+        exhausted_retry_retains_exact_request_and_redacts_error_payload_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn exhausted_retry_retains_exact_request_and_redacts_error_payload_on_a_shard() {
     let client = Client::new(
         LostReply {
             requests: Mutex::new(vec![]),
@@ -425,8 +472,11 @@ impl ClientTransport for Redirect {
         })
     }
 }
-#[tokio::test]
-async fn route_changes_preserve_retry_identity_and_command() {
+#[test]
+fn route_changes_preserve_retry_identity_and_command() {
+    focal_rt::block_on(route_changes_preserve_retry_identity_and_command_on_a_shard()).unwrap();
+}
+async fn route_changes_preserve_retry_identity_and_command_on_a_shard() {
     let client = Client::new(
         Redirect {
             seen: Mutex::new(vec![]),
@@ -483,8 +533,12 @@ impl ClientTransport for Handoff {
         })
     }
 }
-#[tokio::test]
-async fn a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused() {
+#[test]
+fn a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused() {
+    focal_rt::block_on(a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused_on_a_shard()).unwrap();
+}
+async fn a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused_on_a_shard()
+ {
     let seen = std::sync::Arc::new(Mutex::new(vec![]));
     let client = Client::new(
         Handoff {
@@ -579,8 +633,12 @@ impl ClientTransport for LostAppendReply {
     }
 }
 
-#[tokio::test]
-async fn upload_retry_preserves_offset_bytes_and_unknown_outcome() {
+#[test]
+fn upload_retry_preserves_offset_bytes_and_unknown_outcome() {
+    focal_rt::block_on(upload_retry_preserves_offset_bytes_and_unknown_outcome_on_a_shard())
+        .unwrap();
+}
+async fn upload_retry_preserves_offset_bytes_and_unknown_outcome_on_a_shard() {
     for always_fail in [false, true] {
         let client = Client::new(
             LostAppendReply {
@@ -688,8 +746,12 @@ impl TraceSink for RecordingSink {
     }
 }
 
-#[tokio::test]
-async fn trace_records_committed_exchange_with_envelope_identity() {
+#[test]
+fn trace_records_committed_exchange_with_envelope_identity() {
+    focal_rt::block_on(trace_records_committed_exchange_with_envelope_identity_on_a_shard())
+        .unwrap();
+}
+async fn trace_records_committed_exchange_with_envelope_identity_on_a_shard() {
     let sink = std::sync::Arc::new(RecordingSink::default());
     struct Shared(std::sync::Arc<RecordingSink>);
     impl TraceSink for Shared {
@@ -727,8 +789,12 @@ async fn trace_records_committed_exchange_with_envelope_identity() {
     );
 }
 
-#[tokio::test]
-async fn trace_numbers_calls_monotonically_and_records_refusals() {
+#[test]
+fn trace_numbers_calls_monotonically_and_records_refusals() {
+    focal_rt::block_on(trace_numbers_calls_monotonically_and_records_refusals_on_a_shard())
+        .unwrap();
+}
+async fn trace_numbers_calls_monotonically_and_records_refusals_on_a_shard() {
     let sink = std::sync::Arc::new(RecordingSink::default());
     struct Shared(std::sync::Arc<RecordingSink>);
     impl TraceSink for Shared {
@@ -770,8 +836,11 @@ async fn trace_numbers_calls_monotonically_and_records_refusals() {
     assert_eq!(entries[1].outcome, TraceOutcome::Refused);
 }
 
-#[tokio::test]
-async fn untraced_client_needs_no_sink() {
+#[test]
+fn untraced_client_needs_no_sink() {
+    focal_rt::block_on(untraced_client_needs_no_sink_on_a_shard()).unwrap();
+}
+async fn untraced_client_needs_no_sink_on_a_shard() {
     // The default client has no trace; requests still complete normally.
     let client = Client::new(AlwaysCommits, policy(), WireLimits::default(), 1).unwrap();
     let response = client.request(request()).await.unwrap();
@@ -783,8 +852,11 @@ async fn untraced_client_needs_no_sink() {
 
 // Finding 2 (audit 2026-09-13): a Duplicate domain reply is a committed-on-retry
 // proof; it must trace as Committed, not Unknown.
-#[tokio::test]
-async fn a_duplicate_domain_reply_traces_as_committed() {
+#[test]
+fn a_duplicate_domain_reply_traces_as_committed() {
+    focal_rt::block_on(a_duplicate_domain_reply_traces_as_committed_on_a_shard()).unwrap();
+}
+async fn a_duplicate_domain_reply_traces_as_committed_on_a_shard() {
     struct DuplicateReply;
     impl ClientTransport for DuplicateReply {
         fn request<'a>(

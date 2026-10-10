@@ -61,8 +61,14 @@ impl ClientTransport for Script<'_> {
     }
 }
 
-#[tokio::test]
-async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity() {
+#[test]
+fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity() {
+    focal_rt::block_on(
+        later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity_on_a_shard() {
     for steps in [
         vec![Step::Timeout, Step::Redirect(2), Step::Redirect(2)],
         vec![Step::Timeout, Step::Redirect(2), Step::Redirect(1)],
@@ -101,8 +107,14 @@ async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identit
     }
 }
 
-#[tokio::test]
-async fn definite_admission_response_and_exact_committed_retry_remain_distinct() {
+#[test]
+fn definite_admission_response_and_exact_committed_retry_remain_distinct() {
+    focal_rt::block_on(
+        definite_admission_response_and_exact_committed_retry_remain_distinct_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn definite_admission_response_and_exact_committed_retry_remain_distinct_on_a_shard() {
     for steps in [
         vec![Step::Refuse],
         vec![Step::Inform],
@@ -151,8 +163,14 @@ async fn definite_admission_response_and_exact_committed_retry_remain_distinct()
 /// connection at admission, or could not be reached) had no effect: it is
 /// sent again, and if no attempt reached the listener it is reported as the
 /// refusal, never as an unknown outcome. A write already uncertain stays so.
-#[tokio::test]
-async fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome() {
+#[test]
+fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome() {
+    focal_rt::block_on(
+        a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome_on_a_shard() {
     let quick = RetryPolicy {
         max_attempts: 4,
         max_elapsed: Duration::from_secs(5),
@@ -205,8 +223,12 @@ async fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome() 
     ));
 }
 
-#[tokio::test]
-async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes() {
+#[test]
+fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes() {
+    focal_rt::block_on(capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes_on_a_shard()).unwrap();
+}
+async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes_on_a_shard()
+ {
     let quick = RetryPolicy {
         max_attempts: 4,
         max_elapsed: Duration::from_secs(5),

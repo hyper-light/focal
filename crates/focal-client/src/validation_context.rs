@@ -71,13 +71,12 @@ impl<T: ClientTransport> Client<T> {
             request.route_epoch = token.route_epoch;
         }
         let duration = self.retry_timeout().min(Duration::from_secs(30));
-        // Tokio's timer creation/poll can unwind without a time driver. Keep
-        // that dependency failure inside this read-only interface and drop the
-        // in-flight wait and all retained response ownership on failure.
+        // A dependency's unwind stays inside this read-only interface: the
+        // in-flight wait and all retained response ownership drop on failure.
         let future = async {
-            tokio::time::timeout(duration, self.context_inner(request, id, exact))
-                .await
-                .map_err(|_| ClientError::Transport)?
+            crate::time::within(duration, self.context_inner(request, id, exact))
+                .await?
+                .ok_or(ClientError::Transport)?
         };
         let mut future = pin!(future);
         poll_fn(

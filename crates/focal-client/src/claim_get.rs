@@ -83,9 +83,9 @@ impl<T: ClientTransport> Client<T> {
         };
         let duration = self.retry_timeout().min(Duration::from_secs(30));
         let future = async {
-            tokio::time::timeout(duration, self.claim_inner(request, exact))
-                .await
-                .map_err(|_| ClaimGetError::Incomplete)?
+            crate::time::within(duration, self.claim_inner(request, exact))
+                .await?
+                .ok_or(ClaimGetError::Incomplete)?
         };
         let mut future = pin!(future);
         poll_fn(

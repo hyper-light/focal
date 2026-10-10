@@ -157,8 +157,14 @@ fn refusal() -> NativeMutationReply {
     })
 }
 
-#[tokio::test]
-async fn a_pending_ticket_is_resent_as_the_identical_frame_until_it_commits() {
+#[test]
+fn a_pending_ticket_is_resent_as_the_identical_frame_until_it_commits() {
+    focal_rt::block_on(
+        a_pending_ticket_is_resent_as_the_identical_frame_until_it_commits_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_pending_ticket_is_resent_as_the_identical_frame_until_it_commits_on_a_shard() {
     let pending = NativeMutationReply::Pending(NativeTicket {
         key: key(),
         intent: ContentHash([4; 32]),
@@ -175,8 +181,16 @@ async fn a_pending_ticket_is_resent_as_the_identical_frame_until_it_commits() {
     assert_eq!(frames[0], frame(ledger(), key(), 23));
 }
 
-#[tokio::test]
-async fn a_ticket_that_never_commits_is_reported_unknown_with_the_exact_request_retained() {
+#[test]
+fn a_ticket_that_never_commits_is_reported_unknown_with_the_exact_request_retained() {
+    focal_rt::block_on(
+        a_ticket_that_never_commits_is_reported_unknown_with_the_exact_request_retained_on_a_shard(
+        ),
+    )
+    .unwrap();
+}
+async fn a_ticket_that_never_commits_is_reported_unknown_with_the_exact_request_retained_on_a_shard()
+ {
     let pending = NativeMutationReply::Pending(NativeTicket {
         key: key(),
         intent: ContentHash([4; 32]),
@@ -195,8 +209,12 @@ async fn a_ticket_that_never_commits_is_reported_unknown_with_the_exact_request_
     );
 }
 
-#[tokio::test]
-async fn refusals_are_final_replies_even_after_an_uncertain_attempt() {
+#[test]
+fn refusals_are_final_replies_even_after_an_uncertain_attempt() {
+    focal_rt::block_on(refusals_are_final_replies_even_after_an_uncertain_attempt_on_a_shard())
+        .unwrap();
+}
+async fn refusals_are_final_replies_even_after_an_uncertain_attempt_on_a_shard() {
     let pending = NativeMutationReply::Pending(NativeTicket {
         key: key(),
         intent: ContentHash([4; 32]),
@@ -213,8 +231,14 @@ async fn refusals_are_final_replies_even_after_an_uncertain_attempt() {
     );
 }
 
-#[tokio::test]
-async fn native_reads_return_pages_and_wrong_operations_are_configuration_errors() {
+#[test]
+fn native_reads_return_pages_and_wrong_operations_are_configuration_errors() {
+    focal_rt::block_on(
+        native_reads_return_pages_and_wrong_operations_are_configuration_errors_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn native_reads_return_pages_and_wrong_operations_are_configuration_errors_on_a_shard() {
     let (client, _) = client(true, vec![refusal()]);
     let page = client
         .native_read(envelope(Operation::NativeRead(NativeReadRequest {
@@ -240,8 +264,16 @@ async fn native_reads_return_pages_and_wrong_operations_are_configuration_errors
     ));
 }
 
-#[tokio::test]
-async fn a_handler_without_the_native_engine_refuses_the_profile_before_any_frame_is_seen() {
+#[test]
+fn a_handler_without_the_native_engine_refuses_the_profile_before_any_frame_is_seen() {
+    focal_rt::block_on(
+        a_handler_without_the_native_engine_refuses_the_profile_before_any_frame_is_seen_on_a_shard(
+        ),
+    )
+    .unwrap();
+}
+async fn a_handler_without_the_native_engine_refuses_the_profile_before_any_frame_is_seen_on_a_shard()
+ {
     let (client, frames) = client(false, vec![refusal()]);
     let error = client.submit_native(submit()).await.unwrap_err();
     assert!(matches!(

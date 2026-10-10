@@ -60,20 +60,21 @@ impl<H: RequestHandler> ClientTransport for EmbeddedTransport<H> {
     }
 }
 
-pub struct UnixTransport {
-    remote: UnixRemote,
+/// The node's local socket: `AF_UNIX` on every OS, its peer named by the kernel.
+pub struct LocalTransport {
+    remote: LocalRemote,
 }
-impl UnixTransport {
+impl LocalTransport {
     pub fn connect(
         path: impl AsRef<std::path::Path>,
         limits: WireLimits,
     ) -> Result<Self, WireError> {
         Ok(Self {
-            remote: UnixRemote::new(path, limits)?,
+            remote: LocalRemote::new(path, limits)?,
         })
     }
 }
-impl ClientTransport for UnixTransport {
+impl ClientTransport for LocalTransport {
     fn request<'a>(
         &'a self,
         route: Option<&'a RouteHint>,
@@ -109,8 +110,8 @@ impl QuicTransport {
         })
     }
     /// Physical dials this transport has started.
-    pub fn dials(&self) -> u64 {
-        self.routes.dials()
+    pub async fn dials(&self) -> u64 {
+        self.routes.dials().await
     }
 }
 impl ClientTransport for QuicTransport {

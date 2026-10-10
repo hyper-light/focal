@@ -123,12 +123,13 @@ impl<T: crate::ClientTransport> crate::Client<T> {
             time::Duration,
         };
         let future = async {
-            tokio::time::timeout(
+            crate::time::within(
                 self.retry_timeout().min(Duration::from_secs(30)),
                 self.payload_bytes_inner(request, payload, max_bytes),
             )
             .await
-            .map_err(|_| TransferError::Client(crate::ClientError::Transport))?
+            .map_err(TransferError::Client)?
+            .ok_or(TransferError::Client(crate::ClientError::Transport))?
         };
         let mut future = pin!(future);
         poll_fn(|cx| {
