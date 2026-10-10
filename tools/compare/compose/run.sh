@@ -100,11 +100,25 @@ warmup_ms: $(( warmup * 1000 ))
 EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
+    # The leader's processor with call graphs, twenty seconds into the
+    # measured window: who copies and who hashes.
+    if [ "$rate" -ge 1000 ]; then
+      dc exec -d focal1 sh -c "sleep $(( warmup + 20 )); perf record -F 99 --call-graph dwarf,16384 -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
+    fi
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
       evidence
       exit 1
+    fi
+    if [ "$rate" -ge 1000 ]; then
+      echo "::group::leader callers (focal at $rate/s)"
+      dc exec -T focal1 sh -c "cat /data/perf.log; perf report -i /data/perf.data --stdio --no-children --sort comm -g none 2>/dev/null | head -20" || true
+      for symbol in memcpy blake3_compress_in_place_avx512 blake3::ChunkState::update; do
+        dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --comm focal-node-sess --symbols '$symbol' -G --percent-limit 0.3 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -70" || true
+      done
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --comm focal-node-sess --sort symbol -g caller,0.5,callee,function,percent --percent-limit 2 2>/dev/null | grep -v '^#' | head -160" || true
+      echo "::endgroup::"
     fi
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
