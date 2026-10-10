@@ -28,6 +28,9 @@ use std::task::{Context, Poll};
 use hyper_rt::runtime::{LocalRuntime, interests_for};
 pub use hyper_rt::{RtError, Runtime, RuntimeConfig};
 
+pub mod time;
+pub mod watch;
+
 /// Tasks one shard of the local runtime holds at once: what a test or a command keeps in flight,
 /// its connections' exchanges among them. A task past it is refused `TooManyTasks`, typed, and the
 /// refusal is the caller's to handle (`docs/archictecutre/27` §15: a bound reached is a refusal).
