@@ -900,11 +900,12 @@ dependencies = [
  "crc32fast",
  "focal-memory",
  "focal-platform",
+ "focal-rt",
+ "hyper-rt",
  "postcard",
  "serde",
  "tempfile",
  "thiserror",
- "tokio",
 ]
 
 [[package]]
@@ -1019,7 +1020,6 @@ version = "0.1.0"
 dependencies = [
  "rustix 1.1.4",
  "tempfile",
- "tokio",
  "windows-sys 0.61.2",
 ]
 

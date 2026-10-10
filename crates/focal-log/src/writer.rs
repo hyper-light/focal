@@ -5,6 +5,7 @@ use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, DiskKind, DiskReservation,
     MemoryBudget,
 };
+use hyper_rt::sync::{OneshotReceiver, OneshotSender, SyncError, oneshot};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -13,7 +14,6 @@ use std::{
     task::{Context, Poll},
     thread::JoinHandle,
 };
-use tokio::sync::oneshot;
 
 const CONTROL_SLOTS: usize = 4;
 const GROUP_BYTES: usize = 4096;
@@ -149,7 +149,7 @@ struct LeaseAdmission {
 /// Cancelling this future cancels interest in the receipt, not an admitted write.
 /// Recovery decides ambiguous outcomes using the unchanged durable CURRENT fence.
 pub struct WalAppend {
-    receiver: Option<oneshot::Receiver<Result<DurablePosition, LogError>>>,
+    receiver: Option<OneshotReceiver<Result<DurablePosition, LogError>>>,
     completed: mpsc::Receiver<()>,
     _allocation: Allocation,
 }
@@ -161,6 +161,13 @@ impl Future for WalAppend {
         };
         let outcome = match Pin::new(receiver).poll(cx) {
             Poll::Ready(Ok(result)) => result,
+            // Pending, and off a shard no wake can be registered for this task. Inside a replay
+            // the wait is refused as it always was, wherever it is polled; elsewhere refused,
+            // typed, and the receipt kept for a poll on a shard, `wait_blocking` or `try_complete`.
+            Poll::Ready(Err(SyncError::NotOnShardThread(()))) => match reject_replay_reentry() {
+                Err(error) => Err(error),
+                Ok(()) => return Poll::Ready(Err(LogError::OffShard)),
+            },
             Poll::Ready(Err(_)) => Err(LogError::Failed),
             Poll::Pending => match reject_replay_reentry() {
                 Ok(()) => return Poll::Pending,
@@ -172,9 +179,9 @@ impl Future for WalAppend {
     }
 }
 impl WalAppend {
-    /// Wait for this exact admitted write from a synchronous owner, including
-    /// callers currently inside a Tokio runtime. The one-slot completion signal
-    /// avoids runtime-dependent blocking_recv panics and adds no writer handle.
+    /// Wait for this exact admitted write from a synchronous owner, on a
+    /// shard's thread or any other: it waits on the writer's one-slot
+    /// completion signal, asks no runtime to block, and adds no writer handle.
     pub fn wait_blocking(&mut self) -> Result<DurablePosition, LogError> {
         if let Some(result) = self.try_complete() {
             return result;
@@ -184,15 +191,15 @@ impl WalAppend {
         self.try_complete().ok_or(LogError::Failed)?
     }
     /// A completed observation consumes the receipt. Later polling is a typed
-    /// `ReceiptConsumed` error and never re-polls Tokio's completed receiver.
+    /// `ReceiptConsumed` error and never reads the completed receiver again.
     pub fn try_complete(&mut self) -> Option<Result<DurablePosition, LogError>> {
         let Some(receiver) = self.receiver.as_mut() else {
             return Some(Err(LogError::ReceiptConsumed));
         };
         let outcome = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(oneshot::error::TryRecvError::Empty) => return None,
-            Err(oneshot::error::TryRecvError::Closed) => Err(LogError::Failed),
+            Ok(Some(result)) => result,
+            Ok(None) => return None,
+            Err(_) => Err(LogError::Failed),
         };
         self.receiver = None;
         Some(outcome)
@@ -207,7 +214,7 @@ pub type Persisted = Box<dyn FnOnce() + Send>;
 enum Reply<T> {
     Blocking(mpsc::SyncSender<Result<T, LogError>>),
     Async(
-        oneshot::Sender<Result<T, LogError>>,
+        OneshotSender<Result<T, LogError>>,
         mpsc::SyncSender<()>,
         Option<Persisted>,
     ),
@@ -1248,7 +1255,8 @@ impl WalLease {
         persisted: Option<Persisted>,
     ) -> Result<WalAppend, LogError> {
         let allocation = reserve(&self.shared.0.budget, BudgetKind::Pending, lane, 1024)?;
-        let (sender, receiver) = oneshot::channel();
+        // A one-shot holds a waiter cell of the runtime's bounded table until both halves go.
+        let (sender, receiver) = oneshot().map_err(|_| LogError::Capacity)?;
         let (completed, completion) = mpsc::sync_channel(1);
         self.shared.batch(
             self.log,

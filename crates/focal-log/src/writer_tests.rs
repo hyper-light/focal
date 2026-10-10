@@ -86,8 +86,12 @@ fn records(lease: &WalLease) -> Vec<Record> {
         .unwrap();
     output
 }
-#[tokio::test]
-async fn queued_groups_share_flush_without_acknowledging_before_fence() {
+#[test]
+fn queued_groups_share_flush_without_acknowledging_before_fence() {
+    focal_rt::block_on(queued_groups_share_flush_without_acknowledging_before_fence_on_a_shard())
+        .unwrap();
+}
+async fn queued_groups_share_flush_without_acknowledging_before_fence_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let shared = SharedWal::open(dir.path(), options()).unwrap();
     let mut a = shared.lease(LogicalLogId([1; 16])).unwrap();
@@ -109,8 +113,15 @@ async fn queued_groups_share_flush_without_acknowledging_before_fence() {
     assert_eq!(records(&a), vec![record(1, 1), record(1, 2)]);
     assert_eq!(records(&b), vec![record(2, 1)]);
 }
-#[tokio::test]
-async fn queue_backpressure_reserves_metadata_slots_and_cancelled_tickets_still_persist() {
+#[test]
+fn queue_backpressure_reserves_metadata_slots_and_cancelled_tickets_still_persist() {
+    focal_rt::block_on(
+        queue_backpressure_reserves_metadata_slots_and_cancelled_tickets_still_persist_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn queue_backpressure_reserves_metadata_slots_and_cancelled_tickets_still_persist_on_a_shard()
+{
     let dir = tempfile::tempdir().unwrap();
     let budget = memory();
     let shared = SharedWal::open_with_budget(
@@ -142,8 +153,14 @@ async fn queue_backpressure_reserves_metadata_slots_and_cancelled_tickets_still_
     drop(shared);
     assert_eq!(budget.stats().used, 0);
 }
-#[tokio::test]
-async fn every_affected_receipt_fails_on_ambiguous_flush_and_recovery_uses_fence() {
+#[test]
+fn every_affected_receipt_fails_on_ambiguous_flush_and_recovery_uses_fence() {
+    focal_rt::block_on(
+        every_affected_receipt_fails_on_ambiguous_flush_and_recovery_uses_fence_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn every_affected_receipt_fails_on_ambiguous_flush_and_recovery_uses_fence_on_a_shard() {
     for point in [
         FaultPoint::AfterAppend,
         FaultPoint::AfterDataSync,
@@ -205,8 +222,14 @@ fn startup_scans_once_and_each_log_replays_only_its_indexed_frames_after_compact
     assert_eq!(records(&c), vec![record(3, 1), record(3, 2)]);
     assert_eq!(shared.stats().unwrap().indexed_records, 5);
 }
-#[tokio::test]
-async fn final_handle_joins_with_outstanding_ticket_and_lease_reuse_is_ordered() {
+#[test]
+fn final_handle_joins_with_outstanding_ticket_and_lease_reuse_is_ordered() {
+    focal_rt::block_on(
+        final_handle_joins_with_outstanding_ticket_and_lease_reuse_is_ordered_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn final_handle_joins_with_outstanding_ticket_and_lease_reuse_is_ordered_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let budget = memory();
     let shared = SharedWal::open_with_budget(
@@ -250,8 +273,12 @@ fn rejected_oversized_wrong_group_and_failed_visitor_leave_writer_usable() {
     assert_eq!(records(&a).len(), 3);
 }
 
-#[tokio::test]
-async fn batch_request_limit_splits_flushes_without_reordering_a_group() {
+#[test]
+fn batch_request_limit_splits_flushes_without_reordering_a_group() {
+    focal_rt::block_on(batch_request_limit_splits_flushes_without_reordering_a_group_on_a_shard())
+        .unwrap();
+}
+async fn batch_request_limit_splits_flushes_without_reordering_a_group_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let shared = SharedWal::open_with_budget(
         dir.path(),
@@ -337,8 +364,11 @@ fn unconsumed_completed_ticket_keeps_its_charge_after_final_writer_handle_drops(
     SharedWal::open(dir.path(), options()).unwrap();
 }
 
-#[tokio::test]
-async fn checkpoint_is_a_fifo_barrier_between_pending_appends() {
+#[test]
+fn checkpoint_is_a_fifo_barrier_between_pending_appends() {
+    focal_rt::block_on(checkpoint_is_a_fifo_barrier_between_pending_appends_on_a_shard()).unwrap();
+}
+async fn checkpoint_is_a_fifo_barrier_between_pending_appends_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let shared = SharedWal::open(dir.path(), options()).unwrap();
     let mut a = shared.lease(LogicalLogId([1; 16])).unwrap();
@@ -411,8 +441,14 @@ fn checkpoint_preserves_every_active_empty_group_index() {
     assert_eq!(shared.stats().unwrap().indexed_records, 2);
 }
 
-#[tokio::test]
-async fn durable_completion_and_metadata_receipts_use_reserved_ram_under_pressure() {
+#[test]
+fn durable_completion_and_metadata_receipts_use_reserved_ram_under_pressure() {
+    focal_rt::block_on(
+        durable_completion_and_metadata_receipts_use_reserved_ram_under_pressure_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn durable_completion_and_metadata_receipts_use_reserved_ram_under_pressure_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let budget = memory();
     let shared = SharedWal::open_with_budget(
@@ -536,8 +572,14 @@ fn replay_can_enqueue_async_work_but_cannot_wait_on_the_disk_owner() {
     );
 }
 
-#[tokio::test]
-async fn consumed_append_receipts_return_typed_errors_for_every_poll_order() {
+#[test]
+fn consumed_append_receipts_return_typed_errors_for_every_poll_order() {
+    focal_rt::block_on(
+        consumed_append_receipts_return_typed_errors_for_every_poll_order_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn consumed_append_receipts_return_typed_errors_for_every_poll_order_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let shared = SharedWal::open(dir.path(), options()).unwrap();
     let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
@@ -572,8 +614,35 @@ async fn consumed_append_receipts_return_typed_errors_for_every_poll_order() {
     assert_eq!(records(&lease), vec![record(1, 1), record(1, 2)]);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn blocking_ticket_wait_is_runtime_independent_and_receipt_is_consumed_once() {
+/// A receipt awaited off a hyper-rt shard is refused, typed, and kept: no wake could be registered
+/// for the task polling it, and the write it stands for is answered all the same. Do: poll a
+/// pending receipt with a context of no shard, then let the write go. Expect: `OffShard`, never
+/// `Failed`, and the same receipt then answers.
+#[test]
+fn a_receipt_polled_off_a_shard_is_refused_typed_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = SharedWal::open(dir.path(), options()).unwrap();
+    let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
+    let resume = pause(&shared);
+    let mut ticket = Box::pin(lease.append_async(&[record(1, 1)]).unwrap());
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        ticket.as_mut().poll(&mut context),
+        Poll::Ready(Err(LogError::OffShard))
+    ));
+    resume.send(()).unwrap();
+    assert!(ticket.wait_blocking().is_ok());
+    assert_eq!(records(&lease), vec![record(1, 1)]);
+}
+
+#[test]
+fn blocking_ticket_wait_is_runtime_independent_and_receipt_is_consumed_once() {
+    focal_rt::block_on(
+        blocking_ticket_wait_is_runtime_independent_and_receipt_is_consumed_once_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn blocking_ticket_wait_is_runtime_independent_and_receipt_is_consumed_once_on_a_shard() {
     let dir = tempfile::tempdir().unwrap();
     let shared = SharedWal::open(dir.path(), options()).unwrap();
     let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();

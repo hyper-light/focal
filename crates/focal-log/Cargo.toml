@@ -15,10 +15,11 @@ focal-platform = { version = "0.1.0", path = "../focal-platform" }
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+hyper-rt.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+focal-rt = { version = "0.1.0", path = "../focal-rt" }
 
 [lints]
 workspace = true

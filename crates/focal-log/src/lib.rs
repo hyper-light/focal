@@ -226,6 +226,11 @@ pub enum LogError {
     ReplayReentry,
     #[error("WAL append receipt was already consumed")]
     ReceiptConsumed,
+    /// A WAL receipt was awaited off a hyper-rt shard, where no wake can be registered for the
+    /// task polling it: the receipt is kept, for a poll on a shard, `wait_blocking` or
+    /// `try_complete`.
+    #[error("WAL append receipt is awaited on a hyper-rt shard; elsewhere wait or ask for it")]
+    OffShard,
     #[error("WAL holds moved frames; its groups replay through the shared writer's index")]
     Relocated,
     #[error("WAL was converted to hyper-log; its groups are read there (27 §15.8)")]

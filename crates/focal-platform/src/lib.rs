@@ -246,15 +246,6 @@ pub use memory::memory_limit;
 #[cfg(windows)]
 mod windows;
 
-/// The authenticated local-transport named-pipe primitives (Windows only):
-/// an owner-only pipe server and same-user peer verification. The
-/// [focal-wire](../../focal-wire/src/local/windows.rs) local transport is the
-/// only caller; the `unsafe` FFI stays confined to [windows].
-#[cfg(windows)]
-pub use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
-#[cfg(windows)]
-pub use windows::{create_pipe_server, pipe_client_is_current_owner, pipe_server_is_current_owner};
-
 #[cfg(test)]
 mod tests {
     use super::*;
