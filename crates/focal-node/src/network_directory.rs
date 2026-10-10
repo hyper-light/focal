@@ -9,9 +9,10 @@
 use super::*;
 use crate::directory_bootstrap::{DirectoryBootstrapError, PartitionPlan};
 use focal_directory::{Delegation, PartitionCheckpoint, PartitionId};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use focal_rt::watch;
+use hyper_rt::combine::{Either, Either3, race2, race3};
+use hyper_rt::sync::{ChannelReceiver, SyncError};
 use std::{collections::BTreeMap, path::PathBuf, pin::Pin};
-use tokio::sync::watch;
 
 /// Partitions one node hosts besides the first; the owner registry keeps a
 /// slot for each.
@@ -22,7 +23,7 @@ const RECORD_SCHEMA: u16 = 3;
 const RECORD_DIRECTORY: &str = "cluster/partitions";
 /// Root permits are retried this often while the root is not ready.
 const PERMIT_PAUSE: Duration = Duration::from_millis(250);
-type HostedFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ServiceError>> + Send + 'a>>;
+type HostedFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ServiceError>> + 'a>>;
 
 #[derive(Clone)]
 pub struct HostedPartition {
@@ -99,7 +100,7 @@ pub struct DirectoryHandle {
     first_authority: watch::Receiver<AuthorityRefresh>,
     hosted: watch::Receiver<BTreeMap<PartitionId, HostedPartition>>,
     pending: watch::Receiver<BTreeMap<PartitionId, HostingAttempt>>,
-    requests: async_mpsc::Sender<HostRequest>,
+    requests: hyper_rt::sync::Sender<HostRequest>,
 }
 /// A partition this node was asked to host and has not opened yet: how
 /// often its permit was asked for and why it was last refused (F24).
@@ -187,8 +188,8 @@ impl DirectoryHandle {
         self.requests
             .try_send(request)
             .map_err(|error| match error {
-                async_mpsc::error::TrySendError::Full(_) => DirectoryBootstrapError::Capacity,
-                async_mpsc::error::TrySendError::Closed(_) => DirectoryBootstrapError::Unavailable,
+                SyncError::Full(_) => DirectoryBootstrapError::Capacity,
+                _ => DirectoryBootstrapError::Unavailable,
             })
     }
 }
@@ -203,7 +204,7 @@ pub(super) struct DirectoryStartup {
     first_authority: watch::Sender<AuthorityRefresh>,
     hosted: watch::Sender<BTreeMap<PartitionId, HostedPartition>>,
     pending: watch::Sender<BTreeMap<PartitionId, HostingAttempt>>,
-    requests: async_mpsc::Receiver<HostRequest>,
+    requests: ChannelReceiver<HostRequest>,
     storage: focal_consensus::NodeStorage,
     budget: MemoryBudget,
     root: PathBuf,
@@ -218,12 +219,13 @@ impl DirectoryStartup {
         root: PathBuf,
     ) -> Result<(DirectoryHandle, Self), DirectoryBootstrapError> {
         let plan = PartitionPlan::derive(cluster, founder)?;
-        let (state, receiver) = watch::channel(None);
+        let capacity = |_| DirectoryBootstrapError::Capacity;
+        let (state, receiver) = watch::channel(None).map_err(capacity)?;
         let (first_authority, first_authority_receiver) =
-            watch::channel(AuthorityRefresh::default());
-        let (hosted, hosted_receiver) = watch::channel(BTreeMap::new());
-        let (pending, pending_receiver) = watch::channel(BTreeMap::new());
-        let (requests, request_receiver) = async_mpsc::channel(8);
+            watch::channel(AuthorityRefresh::default()).map_err(capacity)?;
+        let (hosted, hosted_receiver) = watch::channel(BTreeMap::new()).map_err(capacity)?;
+        let (pending, pending_receiver) = watch::channel(BTreeMap::new()).map_err(capacity)?;
+        let (requests, request_receiver) = hyper_rt::sync::channel(8).map_err(capacity)?;
         let handle = DirectoryHandle {
             plan,
             state: receiver,
@@ -286,17 +288,20 @@ impl DirectoryStartup {
                     refresh_authority(plan, root, &host, installed_index, expires_at, |now| {
                         first_authority.send_replace(now);
                     });
-                tokio::pin!(replication, refresh);
-                tokio::select! {
-                    result = &mut replication => result.map_err(ServiceError::from).and(Err(ServiceError::Owner("directory egress ended"))),
-                    result = &mut refresh => result,
+                match race2(replication, refresh).await {
+                    Either::First(result) => result
+                        .map_err(ServiceError::from)
+                        .and(Err(ServiceError::Owner("directory egress ended"))),
+                    Either::Second(result) => result,
                 }
             })
         } else {
             Box::pin(std::future::pending())
         };
-        tokio::pin!(first);
-        let mut extras: FuturesUnordered<HostedFuture<'_>> = FuturesUnordered::new();
+        let mut first = first;
+        // At most one drive a partition, and no more partitions than the owner registry's slots.
+        let mut extras: focal_rt::Concurrent<HostedFuture<'_>> =
+            focal_rt::Concurrent::new(MAX_HOSTED_PARTITIONS)?;
         let records = load_records(&self.root, self.plan, self.node)?;
         let hosted = &self.hosted;
         let pending = &self.pending;
@@ -308,19 +313,32 @@ impl DirectoryStartup {
             driving.insert(plan.partition());
             extras.push(Box::pin(drive_hosted(
                 plan, image, root, pool, owners, storage, budget, hosted, pending, plan_root,
-            )));
+            )))?;
         }
         loop {
-            tokio::select! {
-                result = &mut first => return result,
-                Some(result) = extras.next(), if !extras.is_empty() => {
-                    // A hosted drive that ended well — its seat gone, its
-                    // record forgotten — ends nothing else; one that failed
-                    // ends the service, as the first partition's would.
-                    result?;
+            // Whichever comes first: the first partition's end, a hosted drive's, or a request.
+            let next = std::future::poll_fn(|context| {
+                if let Poll::Ready(result) = first.as_mut().poll(context) {
+                    return Poll::Ready(Either3::First(result));
                 }
-                request = self.requests.recv() => {
-                    let Some(request) = request else {
+                if !extras.is_empty()
+                    && let Poll::Ready(Some(result)) = extras.poll_next(context)
+                {
+                    return Poll::Ready(Either3::Second(result));
+                }
+                if let Poll::Ready(request) = std::pin::pin!(self.requests.recv()).poll(context) {
+                    return Poll::Ready(Either3::Third(request));
+                }
+                Poll::Pending
+            })
+            .await;
+            match next {
+                Either3::First(result) => return result,
+                // A hosted drive that ended well — its seat gone, its record forgotten — ends
+                // nothing else; one that failed ends the service, as the first partition's would.
+                Either3::Second(result) => result?,
+                Either3::Third(request) => {
+                    let Ok(request) = request else {
                         return Err(ServiceError::Owner("partition host requests ended"));
                     };
                     match request {
@@ -341,7 +359,7 @@ impl DirectoryStartup {
                             extras.push(Box::pin(drive_hosted(
                                 *plan, image, root, pool, owners, storage, budget, hosted, pending,
                                 plan_root,
-                            )));
+                            )))?;
                         }
                         HostRequest::Retire { partition } => {
                             let path = record_path(plan_root, partition);
@@ -403,7 +421,7 @@ async fn permit(
                     }
                     *left = left.saturating_sub(1);
                 }
-                tokio::time::sleep(PERMIT_PAUSE).await;
+                focal_rt::time::pause(PERMIT_PAUSE).await;
             }
             Err(error) => return Err(error.into()),
         }
@@ -449,7 +467,7 @@ async fn drive_hosted(
     });
     let replication =
         crate::replication::drive_directory_replication(output, pool, pool.limits().max_inflight);
-    tokio::pin!(replication);
+    let mut replication = std::pin::pin!(replication);
     // Whichever replica leads the group refreshes the root's authority in
     // it; one that follows is told so and waits.
     let refresh = refresh_authority(plan, root, &host, installed_index, expires_at, |now| {
@@ -459,7 +477,7 @@ async fn drive_hosted(
             }
         });
     });
-    tokio::pin!(refresh);
+    let mut refresh = std::pin::pin!(refresh);
     if plan.host() != plan.founder_node() {
         // A member's replica runs while the root's grant seats this node in
         // the group, and stops when the seat is gone (removed by the
@@ -468,19 +486,21 @@ async fn drive_hosted(
         // first: once the seat says it is ending, theirs is its end, and
         // the seat's word is waited for.
         let ending = std::sync::atomic::AtomicBool::new(false);
-        let seat = watch_seat(plan, root, &host, &ending);
-        tokio::pin!(seat);
-        let result = tokio::select! {
-            biased;
-            result = &mut seat => result,
-            result = &mut replication => {
+        let mut seat = std::pin::pin!(watch_seat(plan, root, &host, &ending));
+        // The seat first: its own end is the cause when it ends beside the others.
+        let raced = race3(seat.as_mut(), replication.as_mut(), refresh.as_mut()).await;
+        let result = match raced {
+            Either3::First(result) => result,
+            Either3::Second(result) => {
                 if ending.load(std::sync::atomic::Ordering::Acquire) {
                     seat.await
                 } else {
-                    result.map_err(ServiceError::from).and(Err(egress_ended(&host)))
+                    result
+                        .map_err(ServiceError::from)
+                        .and(Err(egress_ended(&host)))
                 }
             }
-            result = &mut refresh => {
+            Either3::Third(result) => {
                 if ending.load(std::sync::atomic::Ordering::Acquire) {
                     seat.await
                 } else {
@@ -504,9 +524,11 @@ async fn drive_hosted(
         }
         return result;
     }
-    tokio::select! {
-        result = &mut replication => result.map_err(ServiceError::from).and(Err(egress_ended(&host))),
-        result = &mut refresh => result,
+    match race2(replication, refresh).await {
+        Either::First(result) => result
+            .map_err(ServiceError::from)
+            .and(Err(egress_ended(&host))),
+        Either::Second(result) => result,
     }
 }
 /// Why a hosted partition's egress ended while its seat held: its owner
@@ -565,7 +587,7 @@ async fn watch_seat(
                 return Ok(());
             }
         }
-        tokio::time::sleep(PERMIT_PAUSE).await;
+        focal_rt::time::pause(PERMIT_PAUSE).await;
     }
 }
 fn record_path(root: &Path, partition: PartitionId) -> PathBuf {
@@ -764,7 +786,7 @@ async fn refresh_authority(
                 told = now;
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        focal_rt::time::pause(Duration::from_millis(250)).await;
     }
 }
 

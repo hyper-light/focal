@@ -181,7 +181,7 @@ pub struct NetworkEnrollmentControl<'a> {
     /// controller publishes it once the registry grants it: the genesis
     /// certificate until the founder renews its credential, the renewal
     /// after (24 §11).
-    presented: tokio::sync::watch::Receiver<[u8; 32]>,
+    presented: focal_rt::watch::Receiver<[u8; 32]>,
     route_epoch: RouteEpoch,
     budget: &'a MemoryBudget,
     route_cursor: AtomicU64,
@@ -192,7 +192,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
         local: &'a ControlHost,
         authority: FounderControlAuthority,
         registry: &'a PeerRegistry,
-        presented: tokio::sync::watch::Receiver<[u8; 32]>,
+        presented: focal_rt::watch::Receiver<[u8; 32]>,
         route_epoch: RouteEpoch,
         budget: &'a MemoryBudget,
     ) -> Result<Self, ControlFailure> {
@@ -226,7 +226,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
         Ok(peer)
     }
     async fn call(&self, id: RequestId, rpc: ControlRpc) -> Result<ControlReply, ControlFailure> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(ControlFailure::Unavailable);
         }
         // A borrowed adapter may move to a runtime without a timer driver.
@@ -235,7 +235,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
             // A round has the time of one probe at least, however far
             // the peer it asks first.
             let round = ROUTE_ROUND_TIMEOUT.max(self.pool.limits().timeout);
-            tokio::time::timeout(round, self.call_round(id, rpc))
+            focal_rt::time::timeout(round, self.call_round(id, rpc))
                 .await
                 .unwrap_or(Err(ControlFailure::OutcomeUnknown))
         })
@@ -327,7 +327,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
                 continue;
             }
             *attempted.get_mut(slot).ok_or(ControlFailure::Invalid)? = target;
-            let result = tokio::time::timeout(
+            let result = focal_rt::time::timeout(
                 self.pool
                     .exchange_wait(target, ROUTE_ROUND_TIMEOUT, MAX_ROUTE_PROBES),
                 self.pool.send_enrollment_control(target, &packet),

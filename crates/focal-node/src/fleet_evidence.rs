@@ -8,7 +8,7 @@ pub(super) struct EvidenceCall {
     ttl: u64,
     /// The owner's period at which the call is given up (`fleet::Pending`).
     deadline: u64,
-    response: oneshot::Sender<Result<DurableEvidenceSnapshot, LedgerError>>,
+    response: OneshotSender<Result<DurableEvidenceSnapshot, LedgerError>>,
 }
 pub(super) struct PendingEvidenceCall {
     call: EvidenceCall,
@@ -34,9 +34,7 @@ impl ReplicaHost {
         if ttl.is_zero() || ttl > Duration::from_secs(30) {
             return Err(LedgerError::Capacity);
         }
-        tokio::runtime::Handle::try_current().map_err(|_| LedgerError::Failed)?;
-        std::panic::catch_unwind(|| drop(tokio::time::sleep(Duration::ZERO)))
-            .map_err(|_| LedgerError::Failed)?;
+        hyper_rt::futures::shard_id().ok_or(LedgerError::Failed)?;
         let ttl = u64::try_from(ttl.as_millis()).map_err(|_| LedgerError::Capacity)?;
         if ttl == 0 {
             return Err(LedgerError::Capacity);
@@ -56,7 +54,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Evidence(
                 Box::new(EvidenceCall {

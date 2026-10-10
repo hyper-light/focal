@@ -8,7 +8,7 @@ use crate::directory_bootstrap::{
 };
 
 type RefreshResult = Result<DirectoryAuthorityReceipt, DirectoryBootstrapError>;
-pub(super) type RefreshReply = oneshot::Sender<(RefreshResult, Allocation)>;
+pub(super) type RefreshReply = OneshotSender<(RefreshResult, Allocation)>;
 
 enum RefreshPhase {
     Initial(Box<PartitionBootstrapPermit>),
@@ -52,7 +52,7 @@ impl ControlHost {
         let reply_charge = input
             .split_off(512)
             .map_err(|_| DirectoryBootstrapError::Capacity)?;
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
         self.sender
             .try_send(Work::RefreshDirectory {
                 permit: Box::new(permit),

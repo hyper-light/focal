@@ -189,6 +189,27 @@ pub fn endpoint_bytes(
     })
 }
 
+/// What one endpoint of `limits` may hold, as an allowance: [`endpoint_bytes`] at the admission
+/// a connector of these limits keeps (`AdmissionLimits::for_connections`), its messages on the
+/// completion lane kept for them. A child of `parent` where the endpoint is charged to its owner's
+/// budget (a node's), a budget of its own where the endpoint is its own owner (a client's, a
+/// join's); either way the transport's bounds refuse before the allowance does.
+pub fn endpoint_budget(
+    limits: &WireLimits,
+    parent: Option<&MemoryBudget>,
+) -> Result<MemoryBudget, WireError> {
+    let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
+    let bytes = endpoint_bytes(limits, &admission)?;
+    let limit = usize::try_from(bytes.transport.saturating_add(bytes.messages))
+        .map_err(|_| WireError::Limit)?;
+    let reserve = usize::try_from(bytes.messages).map_err(|_| WireError::Limit)?;
+    match parent {
+        Some(parent) => parent.child(limit, reserve),
+        None => MemoryBudget::new(limit, reserve),
+    }
+    .map_err(|_| WireError::Limit)
+}
+
 /// The server side of focal's TLS: what a listener presents and verifies its clients by.
 pub struct ServerTls(rustls::ServerConfig);
 /// The client side of focal's TLS: what a dial presents and verifies its server by.
@@ -319,7 +340,7 @@ const IO_BATCH: usize = 32;
 /// a grant by `revocations` when it serves under a registry.
 #[allow(clippy::too_many_arguments)]
 fn start(
-    address: SocketAddr,
+    bind: Bind,
     tls: Tls,
     directory: NetDirectory,
     limits: &WireLimits,
@@ -328,7 +349,7 @@ fn start(
     revocations: Option<hyper_rt::sync::WatchReceiver>,
     enrollment: Option<u32>,
 ) -> Result<(Network, SocketAddr), WireError> {
-    let driver = endpoint_driver(address, tls, directory, limits, admission, budget)?;
+    let driver = endpoint_driver(bind, tls, directory, limits, admission, budget)?;
     let local = driver.local_addr().map_err(|_| WireError::Connection)?;
     let network = Network::start(
         driver,
@@ -349,10 +370,29 @@ pub struct EnrollmentProtocol {
     pub max_message_bytes: u32,
 }
 
-/// An endpoint carrying focal's traffic on `address`, bound to the current shard's socket and not
-/// yet driven: what [`start`] gives an owner.
+/// Where an endpoint's socket comes from: an address bound for it on the current shard, or a socket
+/// its caller bound and held from the moment it learnt the port (`hyper_rt::udp::UdpSocket::adopt`:
+/// binding by number again would give the port up between the check and the use).
+#[derive(Debug)]
+pub enum Bind {
+    Address(SocketAddr),
+    Socket(std::net::UdpSocket),
+}
+impl From<SocketAddr> for Bind {
+    fn from(address: SocketAddr) -> Self {
+        Self::Address(address)
+    }
+}
+impl From<std::net::UdpSocket> for Bind {
+    fn from(socket: std::net::UdpSocket) -> Self {
+        Self::Socket(socket)
+    }
+}
+
+/// An endpoint carrying focal's traffic on `bind`, its socket the current shard's, and not yet
+/// driven: what [`start`] gives an owner.
 pub(crate) fn endpoint_driver(
-    address: SocketAddr,
+    bind: impl Into<Bind>,
     tls: Tls,
     directory: NetDirectory,
     limits: &WireLimits,
@@ -374,8 +414,14 @@ pub(crate) fn endpoint_driver(
         std::time::Instant::now(),
     )
     .map_err(|_| WireError::Authentication)?;
-    Driver::bind(endpoint, address, hyper_rt::udp::Io { batch: IO_BATCH })
-        .map_err(|_| WireError::Connection)
+    let io = hyper_rt::udp::Io { batch: IO_BATCH };
+    match bind.into() {
+        Bind::Address(address) => Driver::bind(endpoint, address, io),
+        Bind::Socket(socket) => hyper_rt::udp::UdpSocket::adopt(socket.into())
+            .and_then(|socket| hyper_rt::udp::Batched::new(socket, io, false))
+            .and_then(|socket| Driver::new(endpoint, socket)),
+    }
+    .map_err(|_| WireError::Connection)
 }
 
 pub struct QuicServer {
@@ -388,7 +434,7 @@ impl QuicServer {
     /// `budget` funds what the server reads (the audit's F03): every body is reserved from it
     /// before any of it is read, against its sender's share.
     pub fn bind(
-        address: SocketAddr,
+        address: impl Into<Bind>,
         tls: ServerTls,
         registry: PeerRegistry,
         limits: WireLimits,
@@ -400,7 +446,7 @@ impl QuicServer {
     }
     /// [`Self::bind`] with the admission bounds stated.
     pub fn bind_admitting(
-        address: SocketAddr,
+        address: impl Into<Bind>,
         tls: ServerTls,
         registry: PeerRegistry,
         limits: WireLimits,
@@ -414,7 +460,7 @@ impl QuicServer {
     /// lets it send the enrollment kinds and nothing else, each message held to the protocol's
     /// bound.
     pub fn bind_serving(
-        address: SocketAddr,
+        address: impl Into<Bind>,
         tls: ServerTls,
         registry: PeerRegistry,
         enrollment: Option<EnrollmentProtocol>,
@@ -436,7 +482,7 @@ impl QuicServer {
             client: listener_client()?,
         };
         let (network, address) = start(
-            address,
+            address.into(),
             tls,
             directory,
             &limits,
@@ -637,7 +683,14 @@ impl QuicConnector {
             client: tls.0,
         };
         let (network, _) = start(
-            address, tls, directory, &limits, &admission, budget, None, None,
+            Bind::Address(address),
+            tls,
+            directory,
+            &limits,
+            &admission,
+            budget,
+            None,
+            None,
         )?;
         Ok(Self {
             network,
@@ -1136,8 +1189,9 @@ async fn resolve(endpoint: &str, period: Duration) -> Result<SocketAddr, WireErr
         .ok_or(WireError::Connection)
 }
 /// `endpoint` (`host:port`) as at most `most` addresses: itself when it is one, else what the
-/// platform's resolver gives its host, in its order, waited for no longer than `period`.
-pub(crate) async fn resolve_all(
+/// platform's resolver gives its host, in its order, waited for no longer than `period`
+/// (`Timeout` past it). The resolver runs on the process's blocking pool under its DNS share.
+pub async fn resolve_all(
     endpoint: &str,
     most: usize,
     period: Duration,

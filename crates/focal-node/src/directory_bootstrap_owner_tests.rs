@@ -61,7 +61,7 @@ async fn directory_owner_is_registered_before_blocking_recovery_and_retains_esca
                 if progress.applied_index > 0 && progress.leader == progress.node {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                focal_rt::time::pause(Duration::from_millis(10)).await;
             }
         },
     )

@@ -171,7 +171,7 @@ impl Fleet {
             if let Err(spent) = wait.check(&self.periods()) {
                 panic!("leadership never left {from}: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
     }
     async fn leader(&self, excluding: Option<usize>) -> usize {
@@ -207,7 +207,7 @@ impl Fleet {
                         self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
                     );
                 }
-                tokio::time::sleep(TICK).await;
+                focal_rt::time::pause(TICK).await;
             }
         }
     }
@@ -220,7 +220,7 @@ impl Fleet {
                     self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
                 );
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
     }
     async fn retry_exact(&self, candidate: usize, request: &RequestEnvelope) -> ResponseEnvelope {
@@ -414,7 +414,7 @@ async fn a_replica_under_a_steady_load_checkpoints_by_cadence() {
                             panic!("{envelope:?}: {refused:?} after {spent}");
                         }
                         if !matches!(refused, AccessError::OutcomeUnknown) {
-                            tokio::time::sleep(policy.pause(backoffs)).await;
+                            focal_rt::time::pause(policy.pause(backoffs)).await;
                             backoffs = backoffs.saturating_add(1);
                         }
                     }
@@ -431,7 +431,7 @@ async fn a_replica_under_a_steady_load_checkpoints_by_cadence() {
                     kept = kept.max(reply.value().log_entries_since_checkpoint);
                 }
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
         kept
     };

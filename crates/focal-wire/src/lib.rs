@@ -45,8 +45,6 @@ pub use peer_mutations::*;
 pub use peers::*;
 pub use reconcile::*;
 pub use round::*;
-// Historic names kept so the ~25 call sites do not churn across the port.
-pub use local::{LocalRemote as UnixRemote, LocalServer as UnixServer};
 pub use transport::*;
 pub use traversal::*;
 pub use trust::*;

@@ -152,7 +152,10 @@ pub fn simulate<T: Send + 'static>(
 ///
 /// At most `capacity` futures at once: a push past it is refused, typed. The slots are reserved
 /// when the set is made and reused as futures end, so a set never grows past its first reservation.
-pub struct Concurrent<F> {
+///
+/// Futures of different kinds share a set as one `dyn Future` type, each pushed boxed once
+/// ([`Concurrent::push_pinned`]).
+pub struct Concurrent<F: ?Sized> {
     slots: Vec<Option<Pin<Box<F>>>>,
     /// Slots whose future has ended, taken before the slots grow.
     free: Vec<usize>,
@@ -162,7 +165,7 @@ pub struct Concurrent<F> {
     capacity: usize,
 }
 
-impl<F: Future> Concurrent<F> {
+impl<F: Future + ?Sized> Concurrent<F> {
     /// An empty set of at most `capacity` futures.
     pub fn new(capacity: usize) -> Result<Self, RtError> {
         let refused = RtError::Capacity {
@@ -185,14 +188,22 @@ impl<F: Future> Concurrent<F> {
     }
 
     /// Adds `future`, first polled by the next [`Concurrent::join_next`].
-    pub fn push(&mut self, future: F) -> Result<(), RtError> {
+    pub fn push(&mut self, future: F) -> Result<(), RtError>
+    where
+        F: Sized,
+    {
+        self.push_pinned(Box::pin(future))
+    }
+
+    /// Adds a future already boxed: one of a set of `dyn Future`s.
+    pub fn push_pinned(&mut self, future: Pin<Box<F>>) -> Result<(), RtError> {
         if self.running >= self.capacity {
             return Err(RtError::Capacity {
                 what: "concurrent futures",
                 bound: self.capacity,
             });
         }
-        let future = Some(Box::pin(future));
+        let future = Some(future);
         match self.free.pop() {
             Some(index) => match self.slots.get_mut(index) {
                 Some(slot) => *slot = future,
@@ -303,6 +314,28 @@ pub fn blocking() -> Result<(), RtError> {
             })
         })
         .clone()
+}
+
+/// Why work handed to the blocking pool gave no result.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PoolError {
+    /// The pool refused the job: its share or its queue full, or no pool running.
+    #[error("the blocking pool refused the job: {0}")]
+    Refused(RtError),
+    /// The job ended without its result: it unwound on its worker.
+    #[error("the blocking job ended without its result")]
+    Lost,
+}
+
+/// Runs `job` on the process's blocking pool under `share` (the pool started if it was not) and
+/// waits for its result as a task: whole-file work, a computation, what must not hold a shard.
+pub async fn on_pool<T: Send + 'static>(
+    share: &hyper_rt::blocking::Share,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, PoolError> {
+    blocking().map_err(PoolError::Refused)?;
+    let output = hyper_rt::blocking::run(share.name, job).map_err(PoolError::Refused)?;
+    output.await.map_err(|_| PoolError::Lost)
 }
 
 #[cfg(test)]

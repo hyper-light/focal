@@ -3,43 +3,36 @@
 use super::*;
 use serde::Serialize;
 
-fn fetch(
-    runtime: &tokio::runtime::Runtime,
+async fn fetch(
     context: &Context,
     query: ReconcileQuery,
 ) -> Result<ReconcileReply> {
     let request = context.envelope(Operation::Reconcile(query))?;
-    Ok(runtime.block_on(
-        context
+    Ok(context
             .client
-            .reconcile(request, context.operation.principal),
-    )?)
+            .reconcile(request, context.operation.principal).await?)
 }
 
-pub(super) fn query(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn query(
     context: &Context,
     query: ReconcileQuery,
     format: OutputFormat,
 ) -> Result<()> {
-    render(&fetch(runtime, context, query)?, format)
+    render(&fetch(context, query).await?, format)
 }
 
-pub(super) fn inspect(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn inspect(
     context: &Context,
     journal: &OperationJournal,
     format: OutputFormat,
 ) -> Result<()> {
     let request = journal.business_request()?;
-    let reply = fetch(
-        runtime,
-        context,
+    let reply = fetch(context,
         ReconcileQuery::Receipt {
             epoch: request.request_epoch,
             request: request.request_id,
         },
-    )?;
+    ).await?;
     if let ReconcileResult::Receipt { resolution, .. } = &reply.page.result {
         match resolution {
             ReceiptResolution::Committed(receipt) => journal.validate_business_receipt(receipt)?,

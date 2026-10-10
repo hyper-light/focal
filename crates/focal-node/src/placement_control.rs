@@ -14,7 +14,7 @@ use focal_directory::{
 use focal_ledger::SessionPlacementRequest;
 use focal_wire::{MAX_PLACEMENT_CONTROL_REQUEST_BYTES, PeerRole, VerifiedRequest};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 
 /// One session fact a voter can witness from its own hosted replica.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,12 +198,12 @@ pub fn root_intent_client(principal: [u8; 16]) -> [u8; 16] {
 /// One signing job handed to the node's credential owner.
 pub struct SignJob {
     pub permit: crate::placement_proof::SessionProofPermit,
-    pub reply: oneshot::Sender<Result<AccountedAuthorityProof, PlacementProofError>>,
+    pub reply: OneshotSender<Result<AccountedAuthorityProof, PlacementProofError>>,
 }
 /// Assemble a voter-majority proof of one session fact.
 pub struct CollectJob {
     pub request: CollectRequest,
-    pub reply: oneshot::Sender<Result<AuthorityProof, crate::placement_collect::CollectError>>,
+    pub reply: OneshotSender<Result<AuthorityProof, crate::placement_collect::CollectError>>,
 }
 /// One statement to be signed by a majority of a session group's voters.
 #[derive(Debug, Clone)]
@@ -234,11 +234,11 @@ pub struct AgentStatus {
 pub enum AgentJob {
     Sign(Box<SignJob>),
     Collect(Box<CollectJob>),
-    Status(oneshot::Sender<AgentStatus>),
+    Status(OneshotSender<AgentStatus>),
     /// The node's renewed credential: every later signature uses it.
     Credentials(Box<focal_enrollment::CredentialMaterial>),
     /// Every partition the agent last observed, for the operator's view.
-    Directory(oneshot::Sender<DirectoryReport>),
+    Directory(OneshotSender<DirectoryReport>),
     /// Create (or find again) an application session on this node.
     CreateSession(Box<CreateSessionJob>),
     /// Plan a session's placement under a requested durability.
@@ -255,7 +255,7 @@ pub enum AgentJob {
 pub struct RestoreSessionJob {
     pub request: crate::backup::RestoreRequest,
     pub reply:
-        oneshot::Sender<Result<crate::backup::RestoredSession, crate::placement_agent::AgentError>>,
+        OneshotSender<Result<crate::backup::RestoredSession, crate::placement_agent::AgentError>>,
 }
 /// One operator request to move a member: answered by the authority's next
 /// controller pass over the session, which knows the node's generation.
@@ -264,7 +264,7 @@ pub struct MoveRangeJob {
     pub member: focal_memory::RangeId,
     pub node: u64,
     pub reply:
-        oneshot::Sender<Result<focal_ranges::TransferId, crate::placement_agent::AgentError>>,
+        OneshotSender<Result<focal_ranges::TransferId, crate::placement_agent::AgentError>>,
 }
 /// One operator request to place a session under a durability: answered by
 /// the agent's next pass over the partition holding the session.
@@ -273,7 +273,7 @@ pub struct PlanSessionJob {
     pub durability: focal_directory::DurabilityIntent,
     /// Propose and report without journaling a plan (doc 08 §9).
     pub dry_run: bool,
-    pub reply: oneshot::Sender<Result<PlannedSession, crate::placement_agent::AgentError>>,
+    pub reply: OneshotSender<Result<PlannedSession, crate::placement_agent::AgentError>>,
 }
 /// One operator request for the root group's voters under a durability,
 /// answered from the partition as last observed and the root as observed
@@ -281,7 +281,7 @@ pub struct PlanSessionJob {
 /// request through the root (F24).
 pub struct PlanControlJob {
     pub durability: focal_directory::DurabilityIntent,
-    pub reply: oneshot::Sender<Result<PlannedControl, crate::placement_agent::AgentError>>,
+    pub reply: OneshotSender<Result<PlannedControl, crate::placement_agent::AgentError>>,
 }
 /// The root voters a durability needs, at the root configuration they were
 /// planned against: `Satisfied` with the voters there are when those already
@@ -329,7 +329,7 @@ pub struct PlannedSession {
 pub struct CreateSessionJob {
     pub tenant: focal_model::TenantId,
     pub name: String,
-    pub reply: oneshot::Sender<Result<CreatedSession, crate::placement_agent::AgentError>>,
+    pub reply: OneshotSender<Result<CreatedSession, crate::placement_agent::AgentError>>,
 }
 /// The session a create request names, whether this call opened it or an
 /// earlier one did.
@@ -378,17 +378,20 @@ pub struct DirectoryReport {
 /// A bounded handle to the placement agent; every clone shares one queue.
 #[derive(Clone)]
 pub struct PlacementHandle {
-    sender: mpsc::Sender<AgentJob>,
+    sender: hyper_rt::sync::Sender<AgentJob>,
 }
 impl PlacementHandle {
-    pub fn channel(depth: usize) -> (Self, mpsc::Receiver<AgentJob>) {
-        let (sender, receiver) = mpsc::channel(depth.max(1));
-        (Self { sender }, receiver)
+    /// A handle and the agent's queue of `depth` jobs; refused at the runtime's cell bound.
+    pub fn channel(
+        depth: usize,
+    ) -> Result<(Self, ChannelReceiver<AgentJob>), focal_rt::RtError> {
+        let (sender, receiver) = hyper_rt::sync::channel(depth.max(1))?;
+        Ok((Self { sender }, receiver))
     }
     fn send(&self, job: AgentJob) -> Result<(), PlacementProofError> {
         self.sender.try_send(job).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => PlacementProofError::Capacity,
-            mpsc::error::TrySendError::Closed(_) => PlacementProofError::Unavailable,
+            SyncError::Full(_) => PlacementProofError::Capacity,
+            _ => PlacementProofError::Unavailable,
         })
     }
     /// Hand the agent the node's renewed credential.
@@ -405,7 +408,7 @@ impl PlacementHandle {
         tenant: focal_model::TenantId,
         name: String,
     ) -> Result<CreatedSession, crate::placement_agent::AgentError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::CreateSession(Box::new(CreateSessionJob {
             tenant,
             name,
@@ -424,7 +427,7 @@ impl PlacementHandle {
         &self,
         request: crate::backup::RestoreRequest,
     ) -> Result<crate::backup::RestoredSession, crate::placement_agent::AgentError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::RestoreSession(Box::new(RestoreSessionJob {
             request,
             reply,
@@ -445,7 +448,7 @@ impl PlacementHandle {
         durability: focal_directory::DurabilityIntent,
         dry_run: bool,
     ) -> Result<PlannedSession, crate::placement_agent::AgentError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::PlanSession(Box::new(PlanSessionJob {
             ledger,
             durability,
@@ -465,7 +468,7 @@ impl PlacementHandle {
         &self,
         durability: focal_directory::DurabilityIntent,
     ) -> Result<PlannedControl, crate::placement_agent::AgentError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::PlanControl(Box::new(PlanControlJob {
             durability,
             reply,
@@ -486,7 +489,7 @@ impl PlacementHandle {
         member: focal_memory::RangeId,
         node: u64,
     ) -> Result<focal_ranges::TransferId, crate::placement_agent::AgentError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::MoveRange(Box::new(MoveRangeJob {
             ledger,
             member,
@@ -503,13 +506,13 @@ impl PlacementHandle {
     }
     /// The partitions as the agent last observed them.
     pub async fn directory(&self) -> Result<DirectoryReport, PlacementProofError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.send(AgentJob::Directory(reply))?;
         receive.await.map_err(|_| PlacementProofError::Unavailable)
     }
     /// The agent's current diagnostic view.
     pub async fn status(&self) -> Result<AgentStatus, PlacementProofError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.send(AgentJob::Status(reply))?;
         receive.await.map_err(|_| PlacementProofError::Unavailable)
     }
@@ -518,7 +521,7 @@ impl PlacementHandle {
         &self,
         permit: crate::placement_proof::SessionProofPermit,
     ) -> Result<AccountedAuthorityProof, PlacementProofError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.send(AgentJob::Sign(Box::new(SignJob { permit, reply })))?;
         receive
             .await
@@ -530,7 +533,7 @@ impl PlacementHandle {
         &self,
         request: CollectRequest,
     ) -> Result<AuthorityProof, crate::placement_collect::CollectError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_collect::CollectError::Proof(PlacementProofError::Capacity))?;
         self.send(AgentJob::Collect(Box::new(CollectJob { request, reply })))
             .map_err(crate::placement_collect::CollectError::Proof)?;
         receive.await.map_err(|_| {

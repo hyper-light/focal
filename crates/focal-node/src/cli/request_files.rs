@@ -127,8 +127,7 @@ pub(super) fn check(path: &Path) -> Result<()> {
         "locally checked; authentication, authority, epoch admission and server acceptance unchecked",
     )
 }
-pub(super) fn send(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn send(
     settings: &Settings,
     selection: Option<&str>,
     file: &Path,
@@ -146,7 +145,7 @@ pub(super) fn send(
         )
         .into());
     }
-    let response = runtime.block_on(context.client.request(request))?;
+    let response = context.client.request(request).await?;
     super::super::output_response(response).map_err(CliError::Other)
 }
 fn report(

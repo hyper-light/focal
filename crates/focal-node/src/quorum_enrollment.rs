@@ -15,15 +15,16 @@ use std::{
     pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 
-pub type ControlFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, ControlFailure>> + Send + 'a>>;
+/// A control call's future: awaited by the signer on its shard, never moved
+/// to another thread.
+pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlFailure>> + 'a>>;
 /// The router binds this private signer's dedicated sequence principal, using
 /// either local Runtime authority or the immutable founder's narrow remote
 /// enrollment grant. State reads must use the owner's ReadIndex API.
 /// Endpoint discovery never changes this pinned identity or grants membership.
-pub trait EnrollmentControl: Send + Sync {
+pub trait EnrollmentControl {
     fn identity(&self) -> ControlIdentity;
     fn principal(&self) -> ParticipantId;
     fn read_state(&self, request: RequestId) -> ControlFuture<'_, ControlSnapshot>;
@@ -144,22 +145,22 @@ struct Answer<T> {
     _charge: Allocation,
 }
 enum Action {
-    Invite(RequestId, InviteIntent, oneshot::Sender<Answer<Invitation>>),
-    Redeem(JoinRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
-    Renew(RenewRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
-    Revoke(InvitationId, oneshot::Sender<Answer<()>>),
-    Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
-    AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
-    ActivateFence(u32, oneshot::Sender<Answer<focal_enrollment::UpgradeFence>>),
-    MaintainBootstrapServer(i64, oneshot::Sender<Answer<Option<CredentialMaterial>>>),
+    Invite(RequestId, InviteIntent, OneshotSender<Answer<Invitation>>),
+    Redeem(JoinRequest, OneshotSender<Answer<EnrollmentReceipt>>),
+    Renew(RenewRequest, OneshotSender<Answer<EnrollmentReceipt>>),
+    Revoke(InvitationId, OneshotSender<Answer<()>>),
+    Authorize(Vec<u8>, OneshotSender<Answer<PeerGrant>>),
+    AdmitTenant([u8; 16], OneshotSender<Answer<()>>),
+    ActivateFence(u32, OneshotSender<Answer<focal_enrollment::UpgradeFence>>),
+    MaintainBootstrapServer(i64, OneshotSender<Answer<Option<CredentialMaterial>>>),
     /// One step of the issuer succession (24 §11), staged now when the
     /// operator asked (`true`).
     MaintainIssuer(
         i64,
         bool,
-        oneshot::Sender<Answer<focal_enrollment::IssuerSuccession>>,
+        OneshotSender<Answer<focal_enrollment::IssuerSuccession>>,
     ),
-    Stop(oneshot::Sender<()>),
+    Stop(OneshotSender<()>),
 }
 struct Work {
     action: Action,
@@ -167,7 +168,7 @@ struct Work {
 }
 #[derive(Clone)]
 pub struct QuorumEnrollmentHost {
-    sender: mpsc::Sender<Work>,
+    sender: hyper_rt::sync::Sender<Work>,
     budget: MemoryBudget,
     reply_allowance: usize,
 }
@@ -177,7 +178,7 @@ pub struct QuorumEnrollmentDriver {
     config: QuorumEnrollmentConfig,
     disk: PrivateJournal,
     journal: Journal,
-    receiver: mpsc::Receiver<Work>,
+    receiver: ChannelReceiver<Work>,
     budget: MemoryBudget,
     _state_charge: Allocation,
     failed: bool,
@@ -260,7 +261,8 @@ impl QuorumEnrollmentHost {
             .checked_mul(128)
             .ok_or(EnrollmentError::Capacity)?
             .max(64 * 1024);
-        let (sender, receiver) = mpsc::channel(config.queue_items);
+        let (sender, receiver) = hyper_rt::sync::channel(config.queue_items)
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         Ok((
             Self {
                 sender,
@@ -291,8 +293,8 @@ impl QuorumEnrollmentHost {
                 _charge: reserve(&self.budget, BudgetKind::Pending, charge)?,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => EnrollmentError::Capacity.into(),
-                mpsc::error::TrySendError::Closed(_) => QuorumEnrollmentError::Stopped,
+                SyncError::Full(_) => EnrollmentError::Capacity.into(),
+                _ => QuorumEnrollmentError::Stopped,
             })
     }
     pub async fn invite(
@@ -303,7 +305,7 @@ impl QuorumEnrollmentHost {
         if request.is_zero() || intent.endpoint.len() > 512 {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Invite(request, intent, send), 4096)?;
         receive
             .await
@@ -315,7 +317,7 @@ impl QuorumEnrollmentHost {
         request: JoinRequest,
     ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
         let bytes = request.encode()?.len();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Redeem(request, send), bytes)?;
         receive
             .await
@@ -329,7 +331,7 @@ impl QuorumEnrollmentHost {
         request: RenewRequest,
     ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
         let bytes = request.encode()?.len();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Renew(request, send), bytes)?;
         receive
             .await
@@ -337,7 +339,7 @@ impl QuorumEnrollmentHost {
             .result
     }
     pub async fn revoke(&self, invitation: InvitationId) -> Result<(), QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Revoke(invitation, send), 16)?;
         receive
             .await
@@ -351,7 +353,7 @@ impl QuorumEnrollmentHost {
         if tenant == [0; 16] {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::AdmitTenant(tenant, send), 16)?;
         receive
             .await
@@ -368,7 +370,7 @@ impl QuorumEnrollmentHost {
         if level == 0 {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::ActivateFence(level, send), 16)?;
         receive
             .await
@@ -384,7 +386,7 @@ impl QuorumEnrollmentHost {
         &self,
         now: i64,
     ) -> Result<Option<CredentialMaterial>, QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::MaintainBootstrapServer(now, send), 4096)?;
         receive
             .await
@@ -399,7 +401,7 @@ impl QuorumEnrollmentHost {
         &self,
         now: i64,
     ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::MaintainIssuer(now, false, send), 8192)?;
         receive
             .await
@@ -414,7 +416,7 @@ impl QuorumEnrollmentHost {
         &self,
         now: i64,
     ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::MaintainIssuer(now, true, send), 8192)?;
         receive
             .await
@@ -429,7 +431,7 @@ impl QuorumEnrollmentHost {
             return Err(EnrollmentError::Capacity.into());
         }
         let bytes = certificate.len();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Authorize(certificate, send), bytes)?;
         receive
             .await
@@ -437,7 +439,7 @@ impl QuorumEnrollmentHost {
             .result
     }
     pub async fn stop(&self) -> Result<(), QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Stop(send), 0)?;
         receive.await.map_err(|_| QuorumEnrollmentError::Stopped)
     }
@@ -471,11 +473,11 @@ impl QuorumEnrollmentDriver {
         mut self,
         control: &impl EnrollmentControl,
     ) -> Result<(), QuorumEnrollmentError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(QuorumEnrollmentError::Stopped);
         }
         self.check_router(control)?;
-        while let Some(work) = self.receiver.recv().await {
+        while let Ok(work) = self.receiver.recv().await {
             match work.action {
                 Action::Invite(id, intent, send) => {
                     let result = self.invite(control, id, intent).await;
@@ -571,7 +573,7 @@ impl QuorumEnrollmentDriver {
         let charge = reserve(&self.budget, BudgetKind::Control, bytes)?;
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|_| EnrollmentError::Crypto)?;
-        let state = tokio::time::timeout(
+        let state = focal_rt::time::timeout(
             self.config.request_timeout,
             control.read_state(RequestId(id)),
         )
@@ -609,7 +611,7 @@ impl QuorumEnrollmentDriver {
             return Ok(());
         };
         let result =
-            tokio::time::timeout(self.config.request_timeout, control.submit(request.clone()))
+            focal_rt::time::timeout(self.config.request_timeout, control.submit(request.clone()))
                 .await
                 .map_err(|_| ControlFailure::OutcomeUnknown)?;
         match result {

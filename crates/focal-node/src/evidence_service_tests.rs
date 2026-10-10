@@ -1004,10 +1004,10 @@ async fn a_transfer_keeps_as_many_chunks_in_flight_as_the_path_holds() {
             if index == 5 {
                 // The first is answered last: the others go on beside it.
                 while moved.borrow().answered.len() < 294 {
-                    tokio::task::yield_now().await;
+                    hyper_rt::futures::yield_now().await;
                 }
             } else {
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
             }
             moved.borrow_mut().end(index, true);
             Ok(())
@@ -1032,7 +1032,7 @@ async fn a_transfer_moves_only_the_chunks_the_copy_lacks() {
         |index| index % 3 == 0,
         async |index: u32| {
             moved.borrow_mut().begin(index);
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
             moved.borrow_mut().end(index, true);
             Ok(())
         },
@@ -1060,7 +1060,7 @@ async fn a_chunk_refused_the_room_is_moved_again_and_the_room_is_found() {
         |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
             // The copy has room for four at once.
             let refused = moved.borrow().flying > 4;
             moved.borrow_mut().end(index, !refused);
@@ -1093,7 +1093,7 @@ async fn a_transfer_that_is_refused_the_room_throughout_is_refused_and_ends() {
             |_| false,
             async |index: u32| {
                 moved.borrow_mut().begin(index);
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
                 moved.borrow_mut().end(index, false);
                 Err(AccessError::Capacity)
             },
@@ -1112,7 +1112,7 @@ async fn a_transfer_that_is_refused_the_room_throughout_is_refused_and_ends() {
         |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
             moved.borrow_mut().end(index, index != 7);
             if index == 7 {
                 Err(AccessError::Capacity)
@@ -1138,7 +1138,7 @@ async fn a_copy_that_takes_chunks_in_their_order_only_is_sent_them_one_after_ano
         |_| false,
         async |index: u32| {
             moved.borrow_mut().begin(index);
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
             // The copy of the release before: a chunk past the first it
             // lacks is refused, one it has is taken again.
             let taken = index <= next.get();
@@ -1204,7 +1204,7 @@ async fn a_transfer_goes_by_as_many_streams_as_the_path_holds_when_a_chunk_is_be
             let answered = moved.borrow().answered.len();
             let flying = moved.borrow().flying;
             seen.borrow_mut().push((answered, flying));
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
             moved.borrow_mut().end(index, true);
             Ok(())
         },

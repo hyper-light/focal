@@ -1,6 +1,7 @@
-//! A value watched across threads, as tokio's `sync::watch` was: one sender publishes it from any
+//! A value watched across threads, as tokio's `sync::watch` was: a sender publishes it from any
 //! thread (an owner on its own thread, a task), any number of receivers read the latest from any
-//! thread, and a receiver waits for the next change as a hyper-rt task.
+//! thread, and a receiver waits for the next change as a hyper-rt task. A sender is cloned for
+//! another publisher; the value's word closes as the last of them goes.
 //!
 //! The value is behind a lock; its version is a hyper-rt watched word, bumped by each change and
 //! closed as the sender goes. A receiver is a handle, cloned freely with whatever holds it; it takes
@@ -12,6 +13,7 @@
 //! may panic (focal's code does not); a lock found poisoned is taken as it stands, since a change is
 //! a whole replacement or a closure's whole edit.
 use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use hyper_rt::sync::{SyncError, WatchReceiver, WatchSender};
@@ -27,9 +29,11 @@ struct Shared<T> {
     word: Mutex<Option<WatchSender>>,
     /// A receiver of the word that never waits: each wait's place is cloned from it.
     template: Mutex<WatchReceiver>,
+    /// The senders still live; the last to go closes the word.
+    senders: AtomicUsize,
 }
 
-/// The publishing half: one per value.
+/// A publishing half: clone it for another publisher.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
@@ -76,6 +80,7 @@ pub fn channel_with<T>(initial: T, waiters: usize) -> Result<(Sender<T>, Receive
         value: RwLock::new(initial),
         word: Mutex::new(Some(word)),
         template: Mutex::new(template),
+        senders: AtomicUsize::new(1),
     });
     Ok((
         Sender {
@@ -125,6 +130,11 @@ impl<T> Sender<T> {
     pub fn borrow(&self) -> Ref<'_, T> {
         Ref(read(&self.shared.value))
     }
+    /// The receivers alive now: a snapshot, as another thread may clone or drop one at once.
+    pub fn receiver_count(&self) -> usize {
+        Arc::strong_count(&self.shared)
+            .saturating_sub(self.shared.senders.load(Ordering::Acquire))
+    }
     /// A receiver that has seen the latest version.
     pub fn subscribe(&self) -> Receiver<T> {
         Receiver {
@@ -145,10 +155,33 @@ impl<T> Sender<T> {
     }
 }
 
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        // Each live sender is a value in memory, so the count cannot reach its end.
+        let _ = self
+            .shared
+            .senders
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                Some(live.saturating_add(1))
+            });
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        // The word closes as its sender drops: every wait sees the end.
-        drop(hold(&self.shared.word).take());
+        let before = self
+            .shared
+            .senders
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                Some(live.saturating_sub(1))
+            });
+        // The word closes as its last sender drops: every wait sees the end.
+        if matches!(before, Ok(1) | Ok(0)) {
+            drop(hold(&self.shared.word).take());
+        }
     }
 }
 
@@ -222,6 +255,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen, (3, Err(RecvError::Closed)));
+    }
+
+    /// A cloned sender publishes as the first does, and the word closes only as the last sender
+    /// goes.
+    #[test]
+    fn the_word_closes_as_the_last_sender_goes() {
+        let (first, mut receiver) = channel(0u32).unwrap();
+        let second = first.clone();
+        let outcome = crate::block_on(async move {
+            drop(first);
+            second.send(7);
+            receiver.changed().await.unwrap();
+            let seen = *receiver.borrow();
+            let open = !receiver.is_closed();
+            drop(second);
+            (seen, open, receiver.changed().await, receiver.is_closed())
+        })
+        .unwrap();
+        assert_eq!(outcome, (7, true, Err(RecvError::Closed), true));
     }
 
     /// A wait takes a place only while it waits: clones are free, and a wait past the places is

@@ -23,6 +23,8 @@ use focal_node::{
     network_state::{network_requested, resolve_addresses},
 };
 use focal_wire::*;
+use hyper_rt::combine::{Either3, race3};
+use hyper_rt::signal::Signal;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -272,25 +274,12 @@ fn execute(args: Args) -> Result<()> {
             _ => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
         };
     }
-    let service = matches!(&args.command, Commands::Start { .. });
-    // Tokio's fallible builder can still unwind when an OS worker cannot be
-    // started. Contain that dependency boundary before acquiring node state.
-    let runtime = std::panic::catch_unwind(|| {
-        // A manual invocation owns one sequential network conversation. Avoid
-        // starting a worker pool for every get/list/submit process.
-        let mut builder = if service {
-            tokio::runtime::Builder::new_multi_thread()
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-        };
-        builder.enable_all().build()
-    })
-    .map_err(|_| "async runtime initialization failed")??;
-    let result = run(&runtime, args);
-    // A timed-out blocking owner must not make Runtime::drop wait forever.
-    // Normal service shutdown has already joined its owner before returning.
-    runtime.shutdown_background();
-    result
+    // The command is one root task on one shard of this thread: its
+    // connections' endpoints live on that shard for as long as it runs, and
+    // whatever it spawned is cancelled and joined when it returns. A runtime
+    // whose tables cannot be reserved refuses, typed, before any node state
+    // is touched.
+    focal_rt::block_on(run(args)).map_err(|error| format!("async runtime: {error}"))?
 }
 /// Resolve the settings for this invocation (doc 08 §2). On an initialized
 /// store the committed policy fills every policy field the file omits; a
@@ -357,7 +346,7 @@ fn load_settings(
     };
     Ok(resolved.settings)
 }
-fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
+async fn run(args: Args) -> Result<()> {
     let data_dir_override = args.data_dir.clone();
     let resolution = if matches!(
         &args.command,
@@ -382,7 +371,7 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
         }
         Commands::Context { command } => {
-            cli::context::run(runtime, &settings, command).map_err(Into::into)
+            cli::context::run(&settings, command).await.map_err(Into::into)
         }
         Commands::Start {
             advertise,
@@ -401,9 +390,9 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             if let Some(invite_file) = invite_file
                 && !settings.data_dir()?.join("IDENTITY").exists()
             {
-                runtime.block_on(join(&settings, &invite_file))?;
+                join(&settings, &invite_file).await?;
             }
-            runtime.block_on(start(settings))
+            start(settings).await
         }
         Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
         Commands::Create {
@@ -417,11 +406,11 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         }
         Commands::Diagnose { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
-            cli::cluster::diagnose(runtime, &selected, command)
+            cli::cluster::diagnose(&selected, command).await
         }
         Commands::Cluster { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
-            cli::cluster::run(runtime, &selected, command)
+            cli::cluster::run(&selected, command).await
         }
         Commands::Join {
             invite_file,
@@ -432,7 +421,7 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             if let Some(listen) = listen {
                 settings.node.listen = Some(listen);
             }
-            runtime.block_on(join(&settings, &invite_file))
+            join(&settings, &invite_file).await
         }
         Commands::Demo => {
             let mut node = EmbeddedNode::open(&settings)?;
@@ -449,41 +438,33 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
                     shape_only: false,
                     native,
                 },
-        } => cli::schema_validate(
-            runtime,
-            &settings,
+        } => cli::schema_validate(&settings,
             args.client_context.as_deref(),
             &operation,
             input,
             native,
-        )
+        ).await
         .map_err(Into::into),
         Commands::Schema { command } => cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => cli::discovery::completion(shell).map_err(Into::into),
         Commands::Status => {
-            cli::status(runtime, &settings, args.client_context.as_deref()).map_err(Into::into)
+            cli::status(&settings, args.client_context.as_deref()).await.map_err(Into::into)
         }
-        Commands::Request(command) => Ok(cli::request(
-            runtime,
-            &settings,
+        Commands::Request(command) => Ok(cli::request(&settings,
             command,
             args.client_context.as_deref(),
-        )?),
-        Commands::Manual(command) => Ok(cli::run(
-            runtime,
-            &settings,
+        ).await?),
+        Commands::Manual(command) => Ok(cli::run(&settings,
             *command,
             args.client_context.as_deref(),
-        )?),
-        Commands::Deployment { command } => cli::deployment::run(
-            runtime,
-            &settings,
+        ).await?),
+        Commands::Deployment { command } => cli::deployment::run(&settings,
             cli::deployment::Inputs {
                 config: args.config.as_deref(),
                 data_dir_override,
             },
             command,
-        ),
+        ).await,
     }
 }
 fn output_response(reply: ResponseEnvelope) -> Result<()> {
@@ -543,11 +524,10 @@ async fn start(settings: Settings) -> Result<()> {
         role: PeerRole::Runtime,
     };
     let limits = WireLimits::default();
-    let server = UnixServer::bind(&path, grant, limits.clone())?;
+    let server = LocalServer::bind(&path, grant, limits.clone())?;
     let identity = node.identity.clone();
     let (host, owner) = LocalHost::spawn(node, limits)?;
-    let serving = server.serve(host.clone());
-    tokio::pin!(serving);
+    let mut serving = std::pin::pin!(server.serve(host.clone()));
     let ready = serde_json::json!({"condition":"Ready","ledger":identity.ledger,"node":identity.node,"socket":path,"durability":{"survive":"node","max_failures":0},"meaning":"Acknowledged writes are synced to this disk; loss of this disk can lose the ledger."});
     match &show {
         Some(show) => show.status(&ready),
@@ -556,10 +536,13 @@ async fn start(settings: Settings) -> Result<()> {
     // An ingress task failure is a shutdown trigger as well as a signal. Do
     // not advertise readiness forever after the listening service has failed.
     let mut finished = None;
-    let signal_result = tokio::select! {
-        result = shutdown_signal() => result,
-        result = &mut serving => { finished = Some(result); Ok(()) }
-        _ = host.closed() => Err(std::io::Error::other("node owner stopped")),
+    let signal_result = match race3(shutdown_signal(), serving.as_mut(), host.closed()).await {
+        Either3::First(result) => result,
+        Either3::Second(result) => {
+            finished = Some(result);
+            Ok(())
+        }
+        Either3::Third(()) => Err(std::io::Error::other("node owner stopped")),
     };
     server.close();
     // Dropping a timed-out filesystem future would not stop its blocking owner.
@@ -577,7 +560,7 @@ async fn start(settings: Settings) -> Result<()> {
         signal_result?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
-    let stopped = tokio::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
+    let stopped = focal_rt::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
         .await
         .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?;
     if let Some(show) = show {
@@ -594,7 +577,7 @@ async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
     let identity = decode_identity(&root.join("IDENTITY"))?;
     let command = AdminCommand::invitation(name)?;
     let request = command.request(&identity)?;
-    let reply = UnixRemote::new(root.join(ADMIN_SOCKET), admin_wire_limits())?
+    let reply = LocalRemote::new(root.join(ADMIN_SOCKET), admin_wire_limits())?
         .request(&request)
         .await?;
     let bytes = match reply.result {
@@ -729,28 +712,25 @@ async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let joined = pending.install(receipt?, focal_node::network_bootstrap::unix_time()?)?;
     print_json(joined.directory.identity())
 }
+/// The signals that stop a node: Ctrl-C and `SIGTERM` (a supervisor's stop)
+/// on Unix; Ctrl-C, Ctrl-Break, the console's close and the system's
+/// shutdown on Windows.
+#[cfg(not(windows))]
+const STOP_SIGNALS: &[Signal] = &[Signal::Interrupt, Signal::Terminate];
+#[cfg(windows)]
+const STOP_SIGNALS: &[Signal] = &[
+    Signal::Interrupt,
+    Signal::Break,
+    Signal::Close,
+    Signal::Shutdown,
+];
 async fn shutdown_signal() -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { result=tokio::signal::ctrl_c()=>result, _=terminate.recv()=>Ok(()) }
-    }
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows;
-        let mut ctrl_break = windows::ctrl_break()?;
-        let mut ctrl_close = windows::ctrl_close()?;
-        let mut ctrl_shutdown = windows::ctrl_shutdown()?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = ctrl_break.recv() => Ok(()),
-            _ = ctrl_close.recv() => Ok(()),
-            _ = ctrl_shutdown.recv() => Ok(()),
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    tokio::signal::ctrl_c().await
+    let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(std::io::Error::other)?;
+    signals
+        .recv()
+        .await
+        .map(|_| ())
+        .map_err(std::io::Error::other)
 }
 fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
     let file = File::open(path)?;

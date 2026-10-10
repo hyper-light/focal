@@ -19,7 +19,7 @@ impl ManagedSupportReply {
 }
 pub(super) struct SupportCall {
     received: Option<(u64, ManagedFormatSupport)>,
-    response: oneshot::Sender<Result<ManagedSupportReply, LedgerError>>,
+    response: OneshotSender<Result<ManagedSupportReply, LedgerError>>,
 }
 impl ReplicaHost {
     /// Trusted in-process composition only. The wire probe itself is Node-only;
@@ -41,7 +41,7 @@ impl ReplicaHost {
         &self,
         received: Option<(u64, ManagedFormatSupport)>,
     ) -> Result<ManagedSupportReply, LedgerError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(LedgerError::Failed);
         }
         let charge = self
@@ -60,7 +60,7 @@ impl ReplicaHost {
                 return Err(LedgerError::Capacity);
             }
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::ManagedSupport(
                 Box::new(SupportCall {

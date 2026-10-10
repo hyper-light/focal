@@ -53,8 +53,7 @@ pub(crate) struct ContractFilters {
     #[command(flatten)]
     output: OutputOptions,
 }
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn run(
     context: &Context,
     command: ValidatorCommand,
 ) -> Result<()> {
@@ -85,11 +84,9 @@ pub(super) fn run(
         max_visits: filters.max_visits,
     }
     .build(&context.build, exact)?;
-    let page = runtime.block_on(
-        context
+    let page = context
             .client
-            .validators(context.envelope(Operation::Validators(query.clone()))?),
-    )?;
+            .validators(context.envelope(Operation::Validators(query.clone()))?).await?;
     match filters.output.format {
         OutputFormat::Json | OutputFormat::Yaml => {
             #[derive(serde::Serialize)]

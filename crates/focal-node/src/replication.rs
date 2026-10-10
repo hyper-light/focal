@@ -2,11 +2,13 @@
 use crate::control_host::{ControlReplicationFrame, DirectoryReplication};
 use crate::fleet::{FleetReplication, ReplicationFrame};
 use focal_wire::{PeerConnectionPool, PeerSendError};
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use futures_util::FutureExt;
+use hyper_rt::sync::ChannelReceiver;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use tokio::sync::mpsc;
+use std::pin::pin;
+use std::task::{Context, Poll};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplicationReport {
@@ -32,6 +34,10 @@ pub enum ReplicationDriverError {
     Configuration,
     #[error("replication send task failed")]
     Worker,
+    /// The set of sends under way could not be reserved, or the owner's
+    /// channel refused the driver's wait (off a shard).
+    #[error("replication driver refused: {0}")]
+    Runtime(#[from] focal_rt::RtError),
 }
 
 /// Drain the host's bounded channel, holding at most `max_inflight` frames:
@@ -65,7 +71,7 @@ pub enum ReplicationDriverError {
 /// future drops the owned futures and frames and releases their allocations
 /// immediately. The pool is borrowed; no task is spawned.
 pub async fn drive_replication(
-    receiver: mpsc::Receiver<ReplicationFrame>,
+    receiver: ChannelReceiver<ReplicationFrame>,
     pool: &PeerConnectionPool,
     max_inflight: usize,
 ) -> Result<ReplicationReport, ReplicationDriverError> {
@@ -84,7 +90,7 @@ pub async fn drive_fleet_replication(
 }
 
 pub async fn drive_control_replication(
-    receiver: mpsc::Receiver<ControlReplicationFrame>,
+    receiver: ChannelReceiver<ControlReplicationFrame>,
     pool: &PeerConnectionPool,
     max_inflight: usize,
 ) -> Result<ReplicationReport, ReplicationDriverError> {
@@ -102,15 +108,16 @@ pub async fn drive_directory_replication(
 }
 
 /// What carries a frame to its peer: the node's connection pool, or what
-/// stands for it where the driver itself is tested.
-trait Carrier: Sync {
+/// stands for it where the driver itself is tested. Both live on the
+/// driver's shard: the sends are futures of the driver's own task.
+trait Carrier {
     /// The exchanges with one peer the carrier has under way at once.
     fn lane(&self) -> usize;
     fn carry<'a>(
         &'a self,
         target: u64,
         request: &'a focal_wire::RequestEnvelope,
-    ) -> impl Future<Output = Result<(), PeerSendError>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), PeerSendError>> + 'a;
 }
 impl Carrier for PeerConnectionPool {
     fn lane(&self) -> usize {
@@ -120,7 +127,7 @@ impl Carrier for PeerConnectionPool {
         &'a self,
         target: u64,
         request: &'a focal_wire::RequestEnvelope,
-    ) -> impl Future<Output = Result<(), PeerSendError>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), PeerSendError>> + 'a {
         self.send(target, request)
     }
 }
@@ -208,20 +215,36 @@ impl Waiting {
 }
 
 enum Receiver {
-    Single(mpsc::Receiver<ReplicationFrame>),
+    Single(ChannelReceiver<ReplicationFrame>),
     Fleet(FleetReplication),
-    Control(mpsc::Receiver<ControlReplicationFrame>),
+    Control(ChannelReceiver<ControlReplicationFrame>),
     Directory(DirectoryReplication),
 }
 impl Receiver {
-    async fn recv(&mut self) -> Option<Frame> {
-        match self {
-            Self::Single(receiver) => receiver.recv().await.map(Frame::Session),
-            Self::Fleet(receiver) => receiver.recv().await.map(Frame::Session),
-            Self::Control(receiver) => receiver.recv().await.map(Frame::Control),
-            Self::Directory(receiver) => receiver.recv().await.map(Frame::Control),
-        }
+    /// The next frame; `None` once every sender is gone and the channel
+    /// is drained. A wait the channel refuses (off a shard) is an error.
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Frame>, focal_rt::RtError>> {
+        let polled = match self {
+            Self::Single(receiver) => pin!(receiver.recv()).poll(cx).map(|r| r.map(Frame::Session)),
+            Self::Fleet(receiver) => receiver.poll_recv(cx).map(|r| r.map(Frame::Session)),
+            Self::Control(receiver) => pin!(receiver.recv()).poll(cx).map(|r| r.map(Frame::Control)),
+            Self::Directory(receiver) => receiver.poll_recv(cx).map(|r| r.map(Frame::Control)),
+        };
+        polled.map(|received| match received {
+            Ok(frame) => Ok(Some(frame)),
+            Err(hyper_rt::sync::SyncError::Closed(())) => Ok(None),
+            Err(_) => Err(focal_rt::RtError::NotOnShardThread),
+        })
     }
+}
+
+/// What the driver learnt: a frame from the owner (in the turn's slot, so
+/// a turn is a word and a frame is moved once), the end of the owner's
+/// egress, or a send that ended.
+enum Event<T> {
+    Received,
+    Ended,
+    Sent(Option<T>),
 }
 
 async fn drive<C: Carrier>(
@@ -232,13 +255,15 @@ async fn drive<C: Carrier>(
     if !(1..=65536).contains(&max_inflight) {
         return Err(ReplicationDriverError::Configuration);
     }
-    if tokio::runtime::Handle::try_current().is_err() {
+    if hyper_rt::futures::shard_id().is_none() {
         return Err(ReplicationDriverError::Worker);
     }
     // As many to one peer at once as the pool's lane to it holds: a send
     // under way never waits for that lane behind another of this driver's.
     let lane = pool.lane().clamp(1, max_inflight);
-    let mut tasks = FuturesUnordered::new();
+    // The sends under way: at most `max_inflight`, the most the driver
+    // holds, so a push is refused only past that bound.
+    let mut tasks = focal_rt::Concurrent::new(max_inflight)?;
     let mut peers: BTreeMap<u64, Waiting> = BTreeMap::new();
     let mut waiting = 0usize;
     let mut receiving = true;
@@ -264,10 +289,34 @@ async fn drive<C: Carrier>(
     // What waits is sent only as a send to its peer ends, so nothing waits
     // once nothing is being sent.
     while receiving || !tasks.is_empty() {
-        tokio::select! {
-            frame = receiver.recv(), if receiving => {
-                let Some(frame) = frame else {
-                    receiving = false;
+        // A send that ended is taken before the next frame: its place is
+        // free for the frame, which is then given up only when the driver
+        // is full. The owner's channel is never left waiting for longer
+        // than the ends already in hand take, each of them bounded by the
+        // frames the driver holds.
+        let mut slot = None;
+        let event = std::future::poll_fn(|cx| {
+            if !tasks.is_empty()
+                && let Poll::Ready(ended) = tasks.poll_next(cx)
+            {
+                return Poll::Ready(Ok(Event::Sent(ended)));
+            }
+            if receiving && let Poll::Ready(received) = receiver.poll_recv(cx) {
+                return Poll::Ready(received.map(|frame| match frame {
+                    Some(frame) => {
+                        slot = Some(frame);
+                        Event::Received
+                    }
+                    None => Event::Ended,
+                }));
+            }
+            Poll::Pending
+        })
+        .await?;
+        match event {
+            Event::Ended => receiving = false,
+            Event::Received => {
+                let Some(frame) = slot.take() else {
                     continue;
                 };
                 report.attempted = report.attempted.saturating_add(1);
@@ -316,7 +365,7 @@ async fn drive<C: Carrier>(
                 if peer.sending < lane {
                     peer.sending = peer.sending.saturating_add(1);
                     report.sent = report.sent.saturating_add(1);
-                    tasks.push(send(frame));
+                    tasks.push(send(frame))?;
                     report.peak_inflight = report.peak_inflight.max(tasks.len());
                     continue;
                 }
@@ -331,7 +380,7 @@ async fn drive<C: Carrier>(
                     }
                 }
             }
-            completed = tasks.next(), if !tasks.is_empty() => {
+            Event::Sent(completed) => {
                 let (target, result) = completed
                     .ok_or(ReplicationDriverError::Worker)?
                     .map_err(|_| ReplicationDriverError::Worker)?;
@@ -347,7 +396,7 @@ async fn drive<C: Carrier>(
                         Some(frame) => {
                             waiting = waiting.saturating_sub(1);
                             report.sent = report.sent.saturating_add(1);
-                            tasks.push(send(frame));
+                            tasks.push(send(frame))?;
                         }
                         None => {
                             peer.sending = peer.sending.saturating_sub(1);

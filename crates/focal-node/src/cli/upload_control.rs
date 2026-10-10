@@ -10,6 +10,7 @@ use focal_client::{
     artifact_transfer::{TransferError, UploadJournal, UploadStore, UploadStoreLimits},
 };
 use focal_wire::{Operation, UploadRequest};
+use futures_util::FutureExt;
 use std::{fs, io::Write, panic::AssertUnwindSafe, time::Duration};
 
 #[derive(Subcommand)]
@@ -96,8 +97,7 @@ fn open(context: &Context, origin: Origin, id: [u8; 16]) -> Result<UploadJournal
     .map_err(error)?;
     store.open_upload(id, &context.operation).map_err(error)
 }
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn run(
     context: &Context,
     command: UploadCommand,
 ) -> Result<()> {
@@ -108,7 +108,7 @@ pub(super) fn run(
     let id = identifier(&args.upload_id)?;
     let mut journal = open(context, args.origin, id)?;
     let result = if cancel {
-        cancel_upload(runtime, context, &mut journal)
+        cancel_upload(context, &mut journal).await
     } else {
         Ok(())
     };
@@ -165,8 +165,7 @@ pub(super) fn run(
     // output error. Keep the original failure and exact recovery identity.
     result.and(output)
 }
-fn cancel_upload(
-    runtime: &tokio::runtime::Runtime,
+async fn cancel_upload(
     context: &Context,
     journal: &mut UploadJournal,
 ) -> Result<()> {
@@ -179,20 +178,21 @@ fn cancel_upload(
     {
         return Err(CliError::InvalidResponse);
     }
-    let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                context.client.upload(request.clone()),
-            )
-            .await
-            .map_err(|_| ClientError::OutcomeUnknown {
-                request: Box::new(request.clone()),
-            })?
-        })
-    }))
-    .map_err(|_| ClientError::OutcomeUnknown {
-        request: Box::new(request.clone()),
-    })??;
+    let upload = async {
+        focal_rt::time::timeout(
+            Duration::from_secs(30),
+            context.client.upload(request.clone()),
+        )
+        .await
+        .map_err(|_| ClientError::OutcomeUnknown {
+            request: Box::new(request.clone()),
+        })?
+    };
+    let reply = AssertUnwindSafe(upload)
+        .catch_unwind()
+        .await
+        .map_err(|_| ClientError::OutcomeUnknown {
+            request: Box::new(request.clone()),
+        })??;
     journal.record_reply(&request, &reply).map_err(error)
 }

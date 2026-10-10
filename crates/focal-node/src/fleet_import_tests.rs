@@ -368,7 +368,7 @@ async fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_th
     activate(&host, call).await.unwrap();
     let mut active = false;
     for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
         let diagnostics = host.diagnostics().await.unwrap();
         if diagnostics.value().native_active && diagnostics.value().native_authoritative {
             active = true;

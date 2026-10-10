@@ -7,7 +7,7 @@ use crate::directory_bootstrap::{
 };
 
 type DirectoryResult = Result<PartitionBootstrapPermit, DirectoryBootstrapError>;
-pub(super) type DirectoryReply = oneshot::Sender<(DirectoryResult, Allocation)>;
+pub(super) type DirectoryReply = OneshotSender<(DirectoryResult, Allocation)>;
 
 fn admission_error(error: ControlError) -> DirectoryBootstrapError {
     use focal_consensus::ConsensusError;
@@ -69,7 +69,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 1024)
             .map_err(|_| DirectoryBootstrapError::Capacity)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
         self.sender
             .try_send(Work::PrepareDirectory {
                 plan: Box::new(plan),

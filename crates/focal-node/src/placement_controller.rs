@@ -104,7 +104,7 @@ impl PlacementAgent {
                 request: body,
             },
         };
-        let bytes = tokio::time::timeout(
+        let bytes = focal_rt::time::timeout(
             SESSION_CONTROL_TIMEOUT,
             pool.send_placement(leader, &request),
         )
@@ -596,7 +596,7 @@ impl PlacementAgent {
                 },
             };
             async move {
-                let bytes = tokio::time::timeout(
+                let bytes = focal_rt::time::timeout(
                     std::time::Duration::from_secs(5),
                     pool.send_placement(node, &request),
                 )

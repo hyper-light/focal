@@ -102,7 +102,7 @@ async fn state(adapter: &NetworkEnrollmentControl<'_>, replicas: &[Running]) -> 
                 if let Err(spent) = wait.check(&periods(replicas)) {
                     panic!("the root's state was not read: {spent}: {error:?}");
                 }
-                tokio::time::sleep(replicas[0].host.tick_period()).await;
+                focal_rt::time::pause(replicas[0].host.tick_period()).await;
             }
             Err(error) => panic!("root state failed: {error:?}"),
         }
@@ -139,7 +139,7 @@ async fn decided<T>(
                             .collect::<Vec<_>>()
                     );
                 }
-                tokio::time::sleep(replicas[0].host.tick_period()).await;
+                focal_rt::time::pause(replicas[0].host.tick_period()).await;
             }
             other => return other,
         }
@@ -710,7 +710,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
                         .collect::<Vec<_>>()
                 );
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            focal_rt::time::pause(Duration::from_millis(10)).await;
         }
         let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut stale = routes.clone();
@@ -861,7 +861,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
     for id in [202, 203] {
         let previous = adapter.route_cursor.load(Ordering::Relaxed);
         let sent = replicas[0].pool.stats();
-        let answer = tokio::time::timeout(
+        let answer = focal_rt::time::timeout(
             Duration::from_secs(5),
             adapter.read_state(RequestId::from_u128(id)),
         )

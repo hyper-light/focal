@@ -642,12 +642,16 @@ impl JoinedNode {
                     &limits,
                 )?,
                 limits.clone(),
+                // One exchange's endpoint, its own owner.
+                focal_wire::endpoint_budget(&limits, None)?,
             )?;
             let remote = connector
                 .connect(address, &founder.identity.server_name)
                 .await?;
             let response = remote.request(request).await;
-            remote.close();
+            // A close the shard could not queue is the connector's to end:
+            // its endpoint goes with it at the end of this exchange.
+            let _ = remote.close();
             let response = response?;
             if response.ledger != request.ledger
                 || response.request_id != request.request_id

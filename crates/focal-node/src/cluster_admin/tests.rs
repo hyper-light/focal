@@ -102,7 +102,7 @@ async fn reconciliation_proves_supersession_and_recovers_lost_receipt_without_re
     .unwrap()
     .with_control(control.clone())
     .unwrap();
-    let server = UnixServer::bind(
+    let server = LocalServer::bind(
         disk.path().join(ADMIN_SOCKET),
         PeerGrant {
             principal: identity.issuer,

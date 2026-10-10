@@ -103,45 +103,45 @@ pub enum RangeControlReply {
 pub(super) enum RangeCall {
     View {
         digests: bool,
-        reply: oneshot::Sender<Result<RangeView, LedgerError>>,
+        reply: OneshotSender<Result<RangeView, LedgerError>>,
     },
     Propose {
         operation: Box<RangeOperation>,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     Move {
         member: RangeId,
         replica: ReplicaId,
-        reply: oneshot::Sender<Result<TransferId, LedgerError>>,
+        reply: OneshotSender<Result<TransferId, LedgerError>>,
     },
     Fact {
         request: RangeFactRequest,
-        reply: oneshot::Sender<Result<RangeFact, LedgerError>>,
+        reply: OneshotSender<Result<RangeFact, LedgerError>>,
     },
     Activate {
         unchanged: Vec<RangeProgress>,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     Layout {
         operation: focal_ledger::LayoutOperation,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     SplitPoint {
         member: RangeId,
-        reply: oneshot::Sender<Result<Option<[u8; 16]>, LedgerError>>,
+        reply: OneshotSender<Result<Option<[u8; 16]>, LedgerError>>,
     },
     /// Terminal, released claims from the status index (26 §4).
     Candidates {
         cursor: Option<RetirementCursor>,
         max_visits: usize,
-        reply: oneshot::Sender<Result<RetirementCandidates, LedgerError>>,
+        reply: OneshotSender<Result<RetirementCandidates, LedgerError>>,
     },
     /// One family's bundle, when it may leave now: eligible, past the
     /// retention floor, and settled at least `min_age_ms` ago.
     Archive {
         root: ClaimId,
         min_age_ms: u64,
-        reply: oneshot::Sender<Result<Option<ArchivedFamily>, LedgerError>>,
+        reply: OneshotSender<Result<Option<ArchivedFamily>, LedgerError>>,
     },
     /// Propose one family's retirement (26 §4).
     Retire {
@@ -149,16 +149,16 @@ pub(super) enum RangeCall {
         bundle: ContentHash,
         bytes: u64,
         through: SessionSeq,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     /// The continuation of a retired claim.
     Retired {
         claim: ClaimId,
-        reply: oneshot::Sender<Result<Option<RetiredClaim>, LedgerError>>,
+        reply: OneshotSender<Result<Option<RetiredClaim>, LedgerError>>,
     },
     /// The seal the committed state yields now, with its bundle (F12).
     SealBundle {
-        reply: oneshot::Sender<Result<Option<SealedOutcomes>, LedgerError>>,
+        reply: OneshotSender<Result<Option<SealedOutcomes>, LedgerError>>,
     },
     /// Propose one seal (F12).
     Seal {
@@ -166,20 +166,20 @@ pub(super) enum RangeCall {
         bundle: ContentHash,
         bytes: u64,
         fold: Option<Fold>,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     /// One page of the content roots the committed rows name (26 §5).
     ContentRoots {
         cursor: Option<NativeRowCursor>,
         max_visits: usize,
-        reply: oneshot::Sender<Result<ContentRootsPage, LedgerError>>,
+        reply: OneshotSender<Result<ContentRootsPage, LedgerError>>,
     },
     /// One bounded sweep of this replica's seed store (26 §5).
     CollectSeeds {
         grace_ms: u64,
         now_ms: u64,
         max_items: usize,
-        reply: oneshot::Sender<Result<focal_evidence::SeedReport, LedgerError>>,
+        reply: OneshotSender<Result<focal_evidence::SeedReport, LedgerError>>,
     },
 }
 impl RangeCall {
@@ -276,13 +276,13 @@ fn derive(
 impl ReplicaHost {
     async fn range_call<T>(
         &self,
-        make: impl FnOnce(oneshot::Sender<Result<T, LedgerError>>) -> RangeCall,
+        make: impl FnOnce(OneshotSender<Result<T, LedgerError>>) -> RangeCall,
     ) -> Result<T, LedgerError> {
         let charge = self
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 256 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Range(Box::new(make(send)), charge))
             .map_err(|error| match error {

@@ -121,7 +121,7 @@ pub(in crate::fleet) struct ManagementPermit {
     _bytes: Allocation,
     _slot: Allocation,
 }
-type Reply<T> = oneshot::Sender<Result<FleetReply<T>, FleetError>>;
+type Reply<T> = OneshotSender<Result<FleetReply<T>, FleetError>>;
 pub(in crate::fleet) enum ManagementWork {
     Install {
         sequence: u64,
@@ -158,11 +158,11 @@ pub(in crate::fleet) enum ManagementWork {
         permit: ManagementPermit,
     },
     Quiesce {
-        reply: oneshot::Sender<()>,
+        reply: OneshotSender<()>,
         _permit: ManagementPermit,
     },
     Shutdown {
-        reply: oneshot::Sender<()>,
+        reply: OneshotSender<()>,
         _permit: ManagementPermit,
     },
 }
@@ -380,7 +380,12 @@ impl FleetManager {
                 });
             }
         };
-        let (reply, response) = oneshot::channel();
+        let Ok((reply, response)) = hyper_rt::sync::oneshot() else {
+            return Err(FleetInstallFailure {
+                error: FleetError::Capacity,
+                replica: Some(Box::new(replica)),
+            });
+        };
         let input = FleetInput::Management(ManagementWork::Install {
             sequence,
             replica: Box::new(replica),
@@ -417,7 +422,7 @@ impl FleetManager {
             return Err(FleetError::InvalidSession);
         }
         let permit = self.permit()?;
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::AdmitTenant {
             tenant,
             reply,
@@ -431,7 +436,7 @@ impl FleetManager {
     /// The queue usage of every admitted tenant, from the worker.
     pub async fn tenant_usage(&self) -> Result<BTreeMap<TenantId, QueueUsage>, FleetError> {
         let permit = self.permit()?;
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::TenantUsage { reply, permit })?;
         response
             .await
@@ -451,7 +456,7 @@ impl FleetManager {
         sequence: u64,
     ) -> Result<FleetReply<FleetInstallation>, FleetError> {
         let permit = self.permit()?;
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Retry {
             sequence,
             reply,
@@ -464,7 +469,7 @@ impl FleetManager {
         ledger: LedgerId,
     ) -> Result<FleetReply<Option<FleetInstallation>>, FleetError> {
         let permit = self.permit()?;
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Inspect {
             ledger,
             reply,
@@ -481,7 +486,7 @@ impl FleetManager {
         incarnation: FleetIncarnation,
     ) -> Result<FleetReply<FleetRemoval>, FleetError> {
         let permit = self.permit()?;
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Remove {
             sequence,
             removal: FleetRemoval {
@@ -504,7 +509,7 @@ impl FleetManager {
     pub async fn stop_all(&self) -> Result<FleetStopReport, FleetError> {
         let mut report = FleetStopReport::default();
         let permit = self.permit()?;
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Quiesce {
             reply,
             _permit: permit,
@@ -547,7 +552,7 @@ impl FleetManager {
     /// returned ReplicaOwner waits for physical WAL owner teardown.
     pub async fn shutdown(&self) -> Result<(), FleetError> {
         let permit = self.permit()?;
-        let (reply, response) = oneshot::channel();
+        let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Shutdown {
             reply,
             _permit: permit,
@@ -573,7 +578,7 @@ pub(super) struct ManagementOwner {
     owner: OwnerId,
     max_sessions: usize,
     sender: OwnerQueue,
-    outbound: async_mpsc::Sender<ReplicationFrame>,
+    outbound: hyper_rt::sync::Sender<ReplicationFrame>,
     /// The queue-slot allowance every tenant's per-session slots descend from.
     items: MemoryBudget,
 }
@@ -1002,7 +1007,7 @@ impl ReplicaFleet {
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
         let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
-        let (outbound, outgoing) = async_mpsc::channel(QUEUED);
+        let (outbound, outgoing) = hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
             entries: BTreeMap::new(),
@@ -1018,7 +1023,8 @@ impl ReplicaFleet {
             tenants: tenant_budgets,
             writers: writer_ids,
             _backing: backing.clone(),
-        });
+        })
+        .map_err(|_| LedgerError::Capacity)?;
         let manager = FleetManager {
             sender: sender.clone(),
             state: changes,

@@ -8,7 +8,6 @@ use crate::{
 use focal_control::{ControlBootstrap, ControlIdentity, ControlScope};
 use focal_enrollment::{EnrollmentLimits, EnrollmentRegistry, EnrollmentRole};
 use focal_model::{LedgerId, SessionId};
-use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::Path, time::Duration};
 
@@ -176,27 +175,26 @@ pub async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, NodeError> {
     if !focal_wire::valid_endpoint_name(endpoint) {
         return Err(NodeError::Identity);
     }
-    let lookup = async {
-        tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(endpoint))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "endpoint resolution timed out",
-                )
-            })?
-    };
-    Ok(std::panic::AssertUnwindSafe(lookup)
-        .catch_unwind()
+    Ok(resolve_first(endpoint, "endpoint").await?)
+}
+/// The first address the platform's resolver gives `endpoint`'s host, waited
+/// for no longer than five seconds.
+async fn resolve_first(endpoint: &str, what: &str) -> Result<SocketAddr, std::io::Error> {
+    let resolved = focal_wire::resolve_all(endpoint, 1, Duration::from_secs(5))
         .await
-        .map_err(|_| std::io::Error::other("Tokio endpoint resolution failed"))??
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "endpoint resolved to no addresses",
-            )
-        })?)
+        .map_err(|error| match error {
+            focal_wire::WireError::Timeout => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{what} resolution timed out"),
+            ),
+            _ => std::io::Error::other(format!("{what} resolution failed")),
+        })?;
+    resolved.first().copied().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("{what} resolved to no addresses"),
+        )
+    })
 }
 impl NetworkState {
     pub fn load(directory: &NodeDirectory) -> Result<Option<Self>, NodeError> {
@@ -413,32 +411,7 @@ pub async fn resolve_addresses(settings: &Settings) -> Result<(SocketAddr, Socke
     let advertise = if let Ok(address) = advertised.parse::<SocketAddr>() {
         address
     } else {
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| std::io::Error::other("endpoint resolution requires a Tokio runtime"))?;
-        // Tokio's timer and resolver can panic when a caller supplied a runtime
-        // without the corresponding driver, or the blocking pool cannot start.
-        // Contain that dependency failure before it reaches the node owner.
-        let lookup = async {
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(advertised))
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "advertised endpoint resolution timed out",
-                    )
-                })?
-        };
-        std::panic::AssertUnwindSafe(lookup)
-            .catch_unwind()
-            .await
-            .map_err(|_| std::io::Error::other("Tokio endpoint resolution failed"))??
-            .next()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrNotAvailable,
-                    "advertised endpoint resolved to no addresses",
-                )
-            })?
+        resolve_first(advertised, "advertised endpoint").await?
     };
     if !valid_advertise(advertise) {
         return Err(NodeError::Identity);

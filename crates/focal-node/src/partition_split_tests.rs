@@ -389,7 +389,7 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    focal_rt::time::pause(Duration::from_millis(1500)).await;
     assert_eq!(delegations(&founder).await.len(), 1);
     // The merged-away group's seat is gone with it: the member hosts
     // nothing of it any more.

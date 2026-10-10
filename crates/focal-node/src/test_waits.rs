@@ -70,9 +70,9 @@ pub(crate) async fn charged<F: Future>(
     );
     let mut what = std::pin::pin!(what);
     loop {
-        tokio::select! {
-            output = &mut what => return Ok(output),
-            () = tokio::time::sleep(tick) => wait.check(&counters())?,
+        match hyper_rt::combine::race2(what.as_mut(), focal_rt::time::pause(tick)).await {
+            hyper_rt::combine::Either::First(output) => return Ok(output),
+            hyper_rt::combine::Either::Second(()) => wait.check(&counters())?,
         }
     }
 }

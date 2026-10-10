@@ -13,7 +13,8 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc as async_mpsc, oneshot, watch};
+use focal_rt::watch;
+use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 
 /// Entries a control group applies past its last checkpoint before it checkpoints again
 /// ([`ControlHostConfig::checkpoint_interval`]'s default).
@@ -120,7 +121,7 @@ struct ControlProgressState {
 pub struct ControlReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
-    snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
+    snapshot: Option<OneshotSender<focal_consensus::SnapshotStatus>>,
     /// Where the driver says the frame did not reach its peer (`ReplicationFrame::lost`).
     lost: Option<mpsc::SyncSender<u64>>,
     /// `ReplicationFrame::urgent`.
@@ -158,22 +159,22 @@ pub(crate) use local_intent_host::{LocalIntentError, save_local_intent};
 
 enum Work {
     PersistLocalIntent(Box<LocalIntentWrite>),
-    Request(Box<VerifiedRequest>, oneshot::Sender<Completed>, Allocation),
+    Request(Box<VerifiedRequest>, OneshotSender<Completed>, Allocation),
     ObserveRoot(
-        oneshot::Sender<Result<RootObservation, ControlFailure>>,
+        OneshotSender<Result<RootObservation, ControlFailure>>,
         Allocation,
     ),
     /// The configuration this replica applied and the entry that last
     /// changed it: what a voter witnesses from its own log before it signs
     /// the group's membership fact for the root (F24).
     WitnessMembership(
-        oneshot::Sender<Result<MembershipWitness, ControlFailure>>,
+        OneshotSender<Result<MembershipWitness, ControlFailure>>,
         Allocation,
     ),
     PrepareSessionProof {
         witness: Box<focal_ledger::CommittedPlacement>,
         window: crate::placement_proof::ProofWindow,
-        response: oneshot::Sender<
+        response: OneshotSender<
             Result<
                 crate::placement_proof::SessionProofPermit,
                 crate::placement_proof::PlacementProofError,
@@ -185,7 +186,7 @@ enum Work {
         ready: Box<focal_directory::ReplicaReady>,
         group: focal_directory::LogGroupId,
         window: crate::placement_proof::ProofWindow,
-        response: oneshot::Sender<
+        response: OneshotSender<
             Result<
                 crate::placement_proof::SessionProofPermit,
                 crate::placement_proof::PlacementProofError,
@@ -197,7 +198,7 @@ enum Work {
         next: Box<focal_directory::GroupAuthorityGrant>,
         record: crate::placement_proof::MembershipRecord,
         window: crate::placement_proof::ProofWindow,
-        response: oneshot::Sender<
+        response: OneshotSender<
             Result<
                 crate::placement_proof::SessionProofPermit,
                 crate::placement_proof::PlacementProofError,
@@ -210,7 +211,7 @@ enum Work {
         fence: Box<focal_directory::DelegationFence>,
         source: bool,
         window: crate::placement_proof::ProofWindow,
-        response: oneshot::Sender<
+        response: OneshotSender<
             Result<
                 crate::placement_proof::SessionProofPermit,
                 crate::placement_proof::PlacementProofError,
@@ -229,8 +230,8 @@ enum Work {
         input: Allocation,
         reply_charge: Allocation,
     },
-    Campaign(oneshot::Sender<Result<(), ControlFailure>>),
-    Stop(oneshot::Sender<Result<(), ControlFailure>>),
+    Campaign(OneshotSender<Result<(), ControlFailure>>),
+    Stop(OneshotSender<Result<(), ControlFailure>>),
 }
 struct Completed {
     response: ResponseEnvelope,
@@ -324,7 +325,7 @@ struct HeldControlFrame {
     source: u64,
     message: Vec<u8>,
     header: ResponseEnvelope,
-    response: oneshot::Sender<Completed>,
+    response: OneshotSender<Completed>,
     charge: Allocation,
 }
 /// The most frames that wait for a write in flight (`waiting_frames`): what
@@ -333,7 +334,7 @@ const WAITING_FRAMES: usize =
     focal_consensus::DEFAULT_INFLIGHT_WINDOW.saturating_mul(crate::fleet::LOST_PEERS);
 struct Pending {
     header: ResponseEnvelope,
-    response: oneshot::Sender<Completed>,
+    response: OneshotSender<Completed>,
     waiting: Waiting,
     term: u64,
     /// The owner's period at which the request is given up: the request
@@ -367,7 +368,7 @@ struct Owner<V> {
     directory: Option<PendingDirectory>,
     authority_refresh: Option<PendingAuthority>,
     snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback,
-    outbound: async_mpsc::Sender<ControlReplicationFrame>,
+    outbound: hyper_rt::sync::Sender<ControlReplicationFrame>,
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
@@ -388,7 +389,7 @@ struct Owner<V> {
     /// than the resequencer itself may hold (`WAITING_FRAMES`).
     waiting_frames: VecDeque<HeldControlFrame>,
     /// Held frames stepped since the last drain, answered once it has run.
-    stepped: Vec<(ResponseEnvelope, oneshot::Sender<Completed>, Allocation)>,
+    stepped: Vec<(ResponseEnvelope, OneshotSender<Completed>, Allocation)>,
     /// `ControlProgress::appends_rejected`, `frames_held`, `frames_let_go`
     /// and `frames_stale`.
     appends_rejected: u64,
@@ -414,7 +415,7 @@ struct Owner<V> {
     /// The reply to a stop, and the owner's period at which a leader's
     /// hand-off is given up on: the stop completes once the log leads
     /// elsewhere, or then.
-    stopping: Option<(oneshot::Sender<Result<(), ControlFailure>>, u64)>,
+    stopping: Option<(OneshotSender<Result<(), ControlFailure>>, u64)>,
 }
 impl ControlHost {
     /// Validate a durable session-owner witness against this control owner's
@@ -436,7 +437,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareSessionProof {
                 // The witness already owns its full structural export charge.
@@ -471,7 +472,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareReplicaReady {
                 ready: Box::new(ready),
@@ -505,7 +506,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareMembershipProof {
                 next: Box::new(next),
@@ -541,7 +542,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareDelegationProof {
                 group,
@@ -568,7 +569,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| ControlFailure::Capacity)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| ControlFailure::Capacity)?;
         self.sender
             .try_send(Work::ObserveRoot(send, charge))
             .map_err(|error| match error {
@@ -585,7 +586,7 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| ControlFailure::Capacity)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| ControlFailure::Capacity)?;
         self.sender
             .try_send(Work::WitnessMembership(send, charge))
             .map_err(|error| match error {
@@ -612,7 +613,7 @@ impl ControlHost {
         (
             Self,
             ControlOwner,
-            async_mpsc::Receiver<ControlReplicationFrame>,
+            ChannelReceiver<ControlReplicationFrame>,
         ),
         ControlError,
     > {
@@ -631,7 +632,7 @@ impl ControlHost {
         (
             Self,
             ControlOwner,
-            async_mpsc::Receiver<ControlReplicationFrame>,
+            ChannelReceiver<ControlReplicationFrame>,
         ),
         ControlError,
     > {
@@ -650,7 +651,7 @@ impl ControlHost {
         (
             Self,
             ControlOwner,
-            async_mpsc::Receiver<ControlReplicationFrame>,
+            ChannelReceiver<ControlReplicationFrame>,
         ),
         ControlError,
     > {
@@ -668,7 +669,7 @@ impl ControlHost {
         let limits = Self::wire_limits();
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
-        let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
+        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue).map_err(|_| ControlError::Capacity)?;
         let status = replica.status();
         let pace = TickPeriod::default();
         let (progress, changes) = watch::channel(ControlProgressState {
@@ -693,7 +694,7 @@ impl ControlHost {
                 failure: None,
             },
             _allocation: None,
-        });
+        }).map_err(|_| ControlError::Capacity)?;
         let (lost_sender, lost) = mpsc::sync_channel(crate::fleet::LOST_PEERS);
         let owner = Owner {
             replica,
@@ -822,14 +823,14 @@ impl ControlHost {
         }
     }
     pub async fn campaign(&self) -> Result<(), ControlFailure> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| ControlFailure::Capacity)?;
         self.sender
             .try_send(Work::Campaign(send))
             .map_err(queue_error)?;
         receive.await.map_err(|_| ControlFailure::Unavailable)?
     }
     pub async fn stop(&self) -> Result<(), ControlFailure> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| ControlFailure::Capacity)?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(queue_error)?;
@@ -950,7 +951,9 @@ impl RequestHandler for ControlHost {
             ) else {
                 return OwnedResponse::new(capacity);
             };
-            let (send, receive) = oneshot::channel();
+            let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
+                return OwnedResponse::new(capacity);
+            };
             let queue = if peer { &self.peers } else { &self.sender };
             match queue.try_send(Work::Request(
                 Box::new(request.clone()),
@@ -1492,7 +1495,7 @@ impl<V: AuthorityVerifier> Owner<V> {
     fn request(
         &mut self,
         verified: VerifiedRequest,
-        response: oneshot::Sender<Completed>,
+        response: OneshotSender<Completed>,
         charge: Allocation,
     ) {
         let header = verified
@@ -2483,7 +2486,7 @@ impl<V: AuthorityVerifier> Owner<V> {
     fn send(
         &self,
         mut header: ResponseEnvelope,
-        response: oneshot::Sender<Completed>,
+        response: OneshotSender<Completed>,
         result: Result<ControlReply, ControlFailure>,
         input: Allocation,
         output: Option<Allocation>,

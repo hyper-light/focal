@@ -11,7 +11,7 @@ use focal_client::admin::{
 };
 use focal_control::*;
 use focal_enrollment::PrivateJournal;
-use focal_wire::{AccessError, Response, UnixRemote, WireError};
+use focal_wire::{AccessError, Response, LocalRemote, WireError};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -1401,7 +1401,7 @@ impl ClusterAdmin {
                 });
             }
             waited = waited.saturating_add(1);
-            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
             placement = self.placement_view().await?;
         }
         let mut record = None;
@@ -1621,7 +1621,7 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
         }
         Err(ClusterAdminError::LeaderLeaving(leaving))
     }
@@ -1669,7 +1669,7 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
         }
         let AdminResult::Membership { leader, .. } = self.read(AdminRead::Membership).await? else {
             return Err(ClusterAdminError::Invalid);
@@ -1969,7 +1969,7 @@ impl ClusterAdmin {
     }
     async fn exchange_bytes(&self, command: AdminCommand) -> Result<Vec<u8>> {
         let request = command.request(&self.identity)?;
-        let response = UnixRemote::new(self.root.join(ADMIN_SOCKET), admin_wire_limits())?
+        let response = LocalRemote::new(self.root.join(ADMIN_SOCKET), admin_wire_limits())?
             .request(&request)
             .await?;
         focal_wire::validate_response(&request, &response, None, &admin_wire_limits())?;

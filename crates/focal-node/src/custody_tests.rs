@@ -794,7 +794,7 @@ async fn abandoned_transfer_expires_without_another_network_request() {
         .unwrap();
     drop(opened);
     assert!(budget.stats().used > baseline);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    focal_rt::time::pause(Duration::from_millis(400)).await;
     assert_eq!(budget.stats().used, baseline);
     host.stop().await.unwrap();
     owner.join().unwrap();
@@ -2325,7 +2325,7 @@ async fn measure_small_request_waits_while_a_large_upload_seals() {
         let asked = std::time::Instant::now();
         host.disk_stats().await.unwrap();
         waits.push(asked.elapsed());
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        focal_rt::time::pause(std::time::Duration::from_millis(1)).await;
     }
     let sealed = sealing.await.unwrap().unwrap();
     waits.sort();

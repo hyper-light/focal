@@ -109,6 +109,10 @@ impl Future for Notified<'_> {
 
 // ------------------------------------------------------------------------------------------ oneshot
 
+/// Format: a one-shot's cell state once its receiver has gone ([`OneshotSender::is_closed`]); a bit of
+/// its own beside the sender's [`CLOSED`].
+const RECEIVER_GONE: u64 = 1 << 5;
+
 /// The sending half of a one-shot.
 #[derive(Debug)]
 pub struct OneshotSender<T> {
@@ -142,6 +146,15 @@ pub fn oneshot<T>() -> Result<(OneshotSender<T>, OneshotReceiver<T>), RtError> {
 }
 
 impl<T> OneshotSender<T> {
+    /// Whether the receiver has gone, so a value sent now would be refused: what an owner holding replies
+    /// for its callers sweeps by, before their deadlines, once a caller stopped waiting.
+    pub fn is_closed(&self) -> bool {
+        self.cell
+            .0
+            .cell()
+            .is_none_or(|cell| cell.state.load(Ordering::Acquire) & RECEIVER_GONE != 0)
+    }
+
     /// Sends the value; `Closed` when the receiver is gone.
     pub fn send(self, value: T) -> Result<(), SyncError<T>> {
         let sent = match self.value.try_send(value) {
@@ -228,6 +241,10 @@ impl<T> OneshotReceiver<T> {
 
 impl<T> Drop for OneshotReceiver<T> {
     fn drop(&mut self) {
+        // Marked before the handle goes: the sender holds its own, so the cell outlives the mark.
+        if let Some(cell) = self.cell.cell() {
+            cell.state.fetch_or(RECEIVER_GONE, Ordering::AcqRel);
+        }
         self.cell.release();
     }
 }

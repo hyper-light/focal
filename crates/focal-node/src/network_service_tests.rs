@@ -130,7 +130,7 @@ impl Running {
     async fn stopped(
         task: &mut tokio::task::JoinHandle<Result<ServiceStopped, ServiceError>>,
     ) -> Result<(), ServiceError> {
-        match tokio::time::timeout(SHUTDOWN_DEADLINE.saturating_add(FROZEN), task).await {
+        match focal_rt::time::timeout(SHUTDOWN_DEADLINE.saturating_add(FROZEN), task).await {
             Ok(joined) => joined.unwrap().map(|_| ()),
             Err(_) => panic!(
                 "the service did not return within its shutdown deadline of {SHUTDOWN_DEADLINE:?} and a frozen allowance of {FROZEN:?}"
@@ -212,7 +212,7 @@ pub(crate) async fn try_until<T>(
             return Ok(value);
         }
         wait.check(&periods_of(services))?;
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
     }
 }
 impl Drop for Running {
@@ -361,7 +361,7 @@ async fn wait_unlocked(settings: &Settings) {
                     drop(directory);
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                focal_rt::time::pause(Duration::from_millis(10)).await;
             }
         },
     )
@@ -452,7 +452,7 @@ async fn callback_unwind_still_stops_and_joins_all_physical_owners() {
     let directory = tempfile::tempdir().unwrap();
     let settings = settings(directory.path());
     let service = settings.open().await.unwrap();
-    let result = tokio::time::timeout(
+    let result = focal_rt::time::timeout(
         Duration::from_secs(10),
         service.run_until(std::future::pending(), |_| {
             panic!("injected status callback")
@@ -622,7 +622,7 @@ async fn service_preserves_laptop_identity_receipts_content_and_owner_lock() {
     );
     drop(root);
     assert!(NodeDirectory::open(&network).is_err());
-    let remote = UnixRemote::new(&running.status.socket, WireLimits::default()).unwrap();
+    let remote = LocalRemote::new(&running.status.socket, WireLimits::default()).unwrap();
     let directory_reply = remote
         .request(&wire_request(
             running.handles.directory.namespace(),
@@ -699,7 +699,7 @@ async fn service_preserves_laptop_identity_receipts_content_and_owner_lock() {
     let recovered_directory = reopened.handles.directory.host().unwrap();
     assert_eq!(recovered_directory.progress().identity, directory_identity);
     assert!(recovered_directory.progress().applied_index >= directory_index);
-    let reply = UnixRemote::new(&reopened.status.socket, WireLimits::default())
+    let reply = LocalRemote::new(&reopened.status.socket, WireLimits::default())
         .unwrap()
         .request(&wire_request(
             identity.ledger,
@@ -715,7 +715,7 @@ async fn service_preserves_laptop_identity_receipts_content_and_owner_lock() {
         Response::Submitted(MutationReply::Committed(receipt))
     );
     assert_eq!(
-        UnixRemote::new(&reopened.status.socket, WireLimits::default())
+        LocalRemote::new(&reopened.status.socket, WireLimits::default())
             .unwrap()
             .request(&claim_request)
             .await
@@ -733,7 +733,7 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
     let founder_settings = settings(founder_dir.path());
     let founder = Running::start(&founder_settings).await;
     let identity = crate::embedded::decode_identity(&founder_dir.path().join("IDENTITY")).unwrap();
-    let admin = UnixRemote::new(
+    let admin = LocalRemote::new(
         founder.status.admin_socket.as_ref().unwrap(),
         admin_wire_limits(),
     )
@@ -1116,14 +1116,14 @@ async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leade
     .await;
     let admin = ClusterAdmin::open(&host_settings).unwrap();
     // Alive while the root leader is reachable.
-    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
+    focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
         .await
         .expect("alive answers at once")
         .expect("the host is alive");
     // The root leader goes away: the host's own process is untouched.
     founder.stop().await;
-    let started = tokio::time::Instant::now();
-    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
+    let started = focal_rt::time::Instant::now();
+    focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
         .await
         .expect("alive answers at once with the root leader down")
         .expect("the host is still alive");
@@ -1134,8 +1134,8 @@ async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leade
     // The readiness report waits on what is unreachable only up to its
     // budget, then reports what it could not see as absent: bounded, and it
     // does not claim the node is ready.
-    let started = tokio::time::Instant::now();
-    let readiness = tokio::time::timeout(PROBE_TIMEOUT, admin.probe("catching-up")).await;
+    let started = focal_rt::time::Instant::now();
+    let readiness = focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("catching-up")).await;
     assert!(
         readiness.is_ok(),
         "the readiness report returns within its budget with the root leader down"
@@ -1148,7 +1148,7 @@ async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leade
     // Serving asks whether the owners run, never for a quorum: a healthy
     // follower with the root leader down is ready to serve (the audit's
     // F25), so its supervisor keeps it in the endpoints its peers need.
-    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("serving"))
+    focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("serving"))
         .await
         .expect("serving answers within the readiness budget")
         .expect("a healthy host serves with the root leader down");
@@ -1165,7 +1165,7 @@ async fn a_node_whose_session_owner_stopped_is_alive_and_not_serving() {
     let settings = settings(dir.path());
     let founder = Running::start(&settings).await;
     let admin = ClusterAdmin::open(&settings).unwrap();
-    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("serving"))
+    focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("serving"))
         .await
         .expect("serving answers within the readiness budget")
         .expect("a founder whose owners run serves");
@@ -1175,11 +1175,11 @@ async fn a_node_whose_session_owner_stopped_is_alive_and_not_serving() {
         .next_host(None)
         .expect("the founder's session");
     session.stop().await.unwrap();
-    tokio::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
+    focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("alive"))
         .await
         .expect("alive answers at once")
         .expect("the process answers while a session owner is stopped");
-    let serving = tokio::time::timeout(PROBE_TIMEOUT, admin.probe("serving")).await;
+    let serving = focal_rt::time::timeout(PROBE_TIMEOUT, admin.probe("serving")).await;
     assert!(
         matches!(serving, Ok(Err(ClusterAdminError::ProbeFailed("serving")))),
         "a stopped session owner is not serving: {serving:?}"

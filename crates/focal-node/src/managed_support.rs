@@ -5,7 +5,11 @@ use focal_ledger::LedgerError;
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{RequestEpoch, RequestId};
 use focal_wire::{MANAGED_PROTOCOL_VERSION, Operation, PeerConnectionPool, RequestEnvelope};
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use focal_rt::Concurrent;
+use hyper_rt::combine::{Either, join2, race2};
+use std::future::Future;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::Duration;
 
 pub(crate) async fn drive(
@@ -17,10 +21,11 @@ pub(crate) async fn drive(
     // What a replica waits for to be brought to it takes as long as the
     // path takes to carry it, and the exchange of facts is asked at its
     // own pace: neither waits for the other.
-    tokio::join!(
+    join2(
         support(manager, pool, budget),
-        bring(manager, pool, content)
-    );
+        bring(manager, pool, content),
+    )
+    .await;
 }
 /// Bring every replica what it retained a delivery for: as many replicas
 /// at once as content has streams to one peer, each of them once.
@@ -31,7 +36,11 @@ async fn bring(
 ) {
     let mut after = None;
     let mut served = std::collections::BTreeSet::new();
-    let mut serving = FuturesUnordered::new();
+    // As many as content has streams to one peer: the loop below fills no
+    // more than that.
+    let Ok(mut serving) = Concurrent::new(pool.bulk_lane()) else {
+        return;
+    };
     loop {
         // Whether every replica was looked at since the last wait.
         let mut all = false;
@@ -48,18 +57,47 @@ async fn bring(
                 || progress.custody_pending.is_some())
                 && served.insert(ledger)
             {
-                serving.push(async move {
+                let pushed = serving.push(async move {
                     serve(&host, pool, content, ledger).await;
                     ledger
                 });
+                if pushed.is_err() {
+                    // Within the set's bound by the loop's own count; a
+                    // refusal leaves the ledger to be looked at again.
+                    served.remove(&ledger);
+                    break;
+                }
             }
         }
-        tokio::select! {
-            Some(ledger) = serving.next(), if !serving.is_empty() => {
-                served.remove(&ledger);
+        // A replica that was served is looked at again once its serving
+        // ends; when every replica was looked at, the next look is a
+        // period away unless one ends first. Nothing serving and not every
+        // replica looked at cannot follow from the fill above, and waits
+        // the period too rather than turning the loop without a wait.
+        if serving.is_empty() || all {
+            match race2(
+                serving.join_next(),
+                focal_rt::time::sleep(Duration::from_millis(100)),
+            )
+            .await
+            {
+                Either::First(Some(ledger)) => {
+                    served.remove(&ledger);
+                }
+                // Nothing was serving: the period is waited out.
+                Either::First(None) => {
+                    if focal_rt::time::sleep(Duration::from_millis(100)).await.is_err() {
+                        return;
+                    }
+                }
+                Either::Second(slept) => {
+                    if slept.is_err() {
+                        return;
+                    }
+                }
             }
-            () = tokio::time::sleep(Duration::from_millis(100)), if all => {}
-            else => {}
+        } else if let Some(ledger) = serving.join_next().await {
+            served.remove(&ledger);
         }
     }
 }
@@ -105,17 +143,19 @@ async fn serve(
 /// due, the loop waits for the fleet to change or for the next to be due.
 async fn support(manager: &FleetManager, pool: &PeerConnectionPool, budget: &MemoryBudget) {
     let most = pool.limits().per_peer_inflight.max(1);
-    let mut running = FuturesUnordered::new();
+    let Ok(mut running) = Concurrent::new(most) else {
+        return;
+    };
     let mut busy = std::collections::BTreeSet::new();
     // When each ledger may be asked again; what is past is pruned each pass,
     // so it holds no more than the ledgers hosted within one period.
-    let mut due: std::collections::BTreeMap<focal_model::LedgerId, tokio::time::Instant> =
+    let mut due: std::collections::BTreeMap<focal_model::LedgerId, focal_rt::time::Instant> =
         std::collections::BTreeMap::new();
     let mut changes = manager.changes();
     let mut after = None;
     let mut serial = 0u128;
     loop {
-        let now = tokio::time::Instant::now();
+        let now = focal_rt::time::Instant::now();
         due.retain(|_, at| *at > now);
         // Whether every ledger was looked at since the last wait.
         let mut all = false;
@@ -142,33 +182,64 @@ async fn support(manager: &FleetManager, pool: &PeerConnectionPool, budget: &Mem
             let first = serial;
             serial = next;
             busy.insert(ledger);
-            running.push(async move {
+            let pushed = running.push(async move {
                 let _charge = charge.commit();
                 discover(&host, pool, ledger, first).await;
                 (ledger, host.tick_period())
             });
+            if pushed.is_err() {
+                // Within the set's bound by the loop's own count; the
+                // ledger is asked on a later pass.
+                busy.remove(&ledger);
+                all = true;
+                break;
+            }
         }
         let soonest = due.values().min().copied();
-        tokio::select! {
-            Some((ledger, tick)) = running.next(), if !running.is_empty() => {
+        let waiting = all && running.is_empty();
+        let mut changed = pin!(changes.changed());
+        let mut due_next = pin!(async {
+            match soonest {
+                Some(at) => focal_rt::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        });
+        // A discovery that ended, the fleet's change (once every ledger was
+        // looked at), or the next ledger's turn (once nothing runs).
+        let event = std::future::poll_fn(|cx| {
+            if !running.is_empty()
+                && let Poll::Ready(Some(ended)) = running.poll_next(cx)
+            {
+                return Poll::Ready(Woke::Ended(ended));
+            }
+            if all && let Poll::Ready(changed) = changed.as_mut().poll(cx) {
+                return Poll::Ready(Woke::Changed(changed.is_ok()));
+            }
+            if waiting && let Poll::Ready(slept) = due_next.as_mut().poll(cx) {
+                return Poll::Ready(Woke::Due(slept.is_ok()));
+            }
+            Poll::Pending
+        })
+        .await;
+        match event {
+            Woke::Ended((ledger, tick)) => {
                 busy.remove(&ledger);
-                if let Some(at) = tokio::time::Instant::now().checked_add(tick) {
+                if let Some(at) = focal_rt::time::Instant::now().checked_add(tick) {
                     due.insert(ledger, at);
                 }
             }
-            changed = changes.changed(), if all => {
-                if changed.is_err() {
-                    return;
-                }
-            }
-            () = async {
-                match soonest {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            }, if all && running.is_empty() => {}
+            // The fleet's manager is gone, or no wait could be kept: the
+            // driver ends, and the service with it.
+            Woke::Changed(false) | Woke::Due(false) => return,
+            Woke::Changed(true) | Woke::Due(true) => {}
         }
     }
+}
+/// What woke the support loop.
+enum Woke<T> {
+    Ended(T),
+    Changed(bool),
+    Due(bool),
 }
 /// One discovery for `ledger`: the replica's fact, every peer it names
 /// asked at once, each answer recorded as it comes.
@@ -184,7 +255,10 @@ async fn discover(
     let fact = local.fact();
     // A sorted bounded configuration has no untrusted route discovery. A
     // changed configuration/incarnation is rejected by the receiving owner.
-    let mut exchanges = FuturesUnordered::new();
+    // One exchange for each peer the fact names, at most four.
+    let Ok(mut exchanges) = Concurrent::new(local.targets().count()) else {
+        return;
+    };
     for (offset, target) in local.targets().enumerate() {
         let Some(serial) = u128::try_from(offset)
             .ok()
@@ -200,14 +274,17 @@ async fn discover(
             request_id: RequestId::from_u128(serial),
             operation: Operation::ManagedSupport { group: fact.group },
         };
-        exchanges.push(async move {
+        let pushed = exchanges.push(async move {
             let Ok(remote) = pool.send_managed_support(target, &request).await else {
                 return;
             };
             let _ = host.record_managed_support(target, remote).await;
         });
+        if pushed.is_err() {
+            break;
+        }
     }
-    while exchanges.next().await.is_some() {}
+    while exchanges.join_next().await.is_some() {}
 }
 
 /// As many of `wanted` at once as a transfer to the peers has streams
@@ -231,16 +308,24 @@ where
             .unwrap_or(1)
     };
     let mut wanted = wanted.into_iter();
-    let mut pulling = FuturesUnordered::new();
+    // A transfer's width to a peer is never more than its bulk lane.
+    let lane = pool.bulk_lane();
+    let Ok(mut pulling) = Concurrent::new(lane) else {
+        return false;
+    };
     let mut brought = false;
     loop {
-        while pulling.len() < width() {
+        while pulling.len() < width().min(lane) {
             match wanted.next() {
-                Some(next) => pulling.push(pull(next)),
+                Some(next) => {
+                    if pulling.push(pull(next)).is_err() {
+                        break;
+                    }
+                }
                 None => break,
             }
         }
-        match pulling.next().await {
+        match pulling.join_next().await {
             Some(pulled) => brought |= pulled,
             None => return brought,
         }

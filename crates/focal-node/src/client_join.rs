@@ -172,7 +172,7 @@ pub fn adopt_issuer(directory: &Path, adopted: &focal_wire::Adopted) -> Result<b
 }
 /// An enrolled client's way to the cluster ([`PendingClientJoin::remote_client`]).
 pub struct EnrolledClient {
-    pub tls: quinn::ClientConfig,
+    pub tls: focal_wire::ClientTls,
     /// The endorsed issuers the verifier found and the context does not hold
     /// yet, to record once a request succeeded.
     pub adopted: focal_wire::AdoptedRoots,

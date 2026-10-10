@@ -206,17 +206,14 @@ pub(super) fn authored(args: RegisterArgs) -> Result<(AuthoredOperation, Mutatio
         args.mutation,
     ))
 }
-pub(super) fn get(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn get(
     context: &Context,
     args: GetArgs,
 ) -> Result<()> {
     let id = MonitorId(parse_id(&args.id)?);
-    let response = runtime.block_on(
-        context
+    let response = context
             .client
-            .request(context.envelope(Operation::Monitor { id })?),
-    )?;
+            .request(context.envelope(Operation::Monitor { id })?).await?;
     let Response::Monitor(page) = response.result else {
         return Err(CliError::InvalidResponse);
     };

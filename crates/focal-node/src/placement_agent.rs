@@ -60,7 +60,8 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use tokio::sync::mpsc;
+use hyper_rt::combine::{Either, race2};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 
 /// Seconds between routine load reports; a report is also due whenever the
 /// node's enrollment generation changes or no report exists.
@@ -79,7 +80,7 @@ const MAX_INSTALLED: usize = 1024;
 /// Operator plan requests waiting for a pass, and waiters per session.
 const MAX_PLAN_REQUESTS: usize = 64;
 const MAX_PLAN_WAITERS: usize = 8;
-type PlanReply = tokio::sync::oneshot::Sender<Result<PlannedSession, AgentError>>;
+type PlanReply = OneshotSender<Result<PlannedSession, AgentError>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -425,7 +426,7 @@ pub struct AgentInputs {
     /// Where the node's groups live: every copy this agent installs opens through it.
     pub storage: NodeStorage,
     /// Signing and collection jobs, served with the node credential.
-    pub jobs: mpsc::Receiver<AgentJob>,
+    pub jobs: ChannelReceiver<AgentJob>,
 }
 
 pub struct PlacementAgent {
@@ -448,7 +449,7 @@ pub struct PlacementAgent {
     admission: TenantAdmission,
     storage: NodeStorage,
     budget: MemoryBudget,
-    jobs: Option<mpsc::Receiver<AgentJob>>,
+    jobs: Option<ChannelReceiver<AgentJob>>,
     journals: Option<Journals>,
     installs: Option<InstallJournal>,
     reopened: bool,
@@ -652,7 +653,7 @@ impl PlacementAgent {
         handles: &NetworkHandles,
         pool: &PeerConnectionPool,
     ) -> Result<(), AgentError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(AgentError::Runtime);
         }
         let mut jobs = self.jobs.take().ok_or(AgentError::Identity)?;
@@ -660,48 +661,49 @@ impl PlacementAgent {
             // The next tick is a deadline, not a timer restarted by every job:
             // a steady stream of jobs (status polls, signatures) must never
             // starve the agent's own work.
-            let mut next = tokio::time::Instant::now()
+            let mut next = focal_rt::time::Instant::now()
                 .checked_add(TICK)
-                .unwrap_or_else(tokio::time::Instant::now);
+                .unwrap_or_else(focal_rt::time::Instant::now);
             loop {
-                tokio::select! {
-                    biased;
-                    job = jobs.recv() => {
+                // A job first, then the tick once it is due.
+                match race2(jobs.recv(), focal_rt::time::sleep_until(next)).await {
+                    Either::First(job) => {
                         match job {
-                            None => return Err(AgentError::Stopped),
-                            Some(AgentJob::Sign(job)) => {
+                            Err(SyncError::Closed(())) => return Err(AgentError::Stopped),
+                            Err(_) => return Err(AgentError::Runtime),
+                            Ok(AgentJob::Sign(job)) => {
                                 let SignJob { permit, reply } = *job;
                                 let _ = reply.send(permit.sign(&self.credentials));
                             }
-                            Some(AgentJob::Collect(job)) => {
+                            Ok(AgentJob::Collect(job)) => {
                                 let CollectJob { request, reply } = *job;
                                 let result = self.collect(handles, pool, request).await;
                                 let _ = reply.send(result);
                             }
-                            Some(AgentJob::Status(reply)) => {
+                            Ok(AgentJob::Status(reply)) => {
                                 let usage = handles.fleet.tenant_usage().await.unwrap_or_default();
                                 let _ = reply.send(self.status(usage));
                             }
-                            Some(AgentJob::Credentials(material)) => {
+                            Ok(AgentJob::Credentials(material)) => {
                                 self.credentials = *material;
                             }
-                            Some(AgentJob::Directory(reply)) => {
+                            Ok(AgentJob::Directory(reply)) => {
                                 let _ = reply.send(crate::placement_control::DirectoryReport {
                                     observed_at: self.observed_at,
                                     partitions: self.last_observed.clone(),
                                 });
                             }
-                            Some(AgentJob::CreateSession(job)) => {
+                            Ok(AgentJob::CreateSession(job)) => {
                                 let CreateSessionJob { tenant, name, reply } = *job;
                                 let result = self.create_session(handles, tenant, &name).await;
                                 let _ = reply.send(result);
                             }
-                            Some(AgentJob::RestoreSession(job)) => {
+                            Ok(AgentJob::RestoreSession(job)) => {
                                 let crate::placement_control::RestoreSessionJob { request, reply } = *job;
                                 let result = self.restore_session(handles, request).await;
                                 let _ = reply.send(result);
                             }
-                            Some(AgentJob::PlanSession(job)) => {
+                            Ok(AgentJob::PlanSession(job)) => {
                                 let PlanSessionJob {
                                     ledger,
                                     durability,
@@ -710,12 +712,12 @@ impl PlacementAgent {
                                 } = *job;
                                 self.queue_plan_request(ledger, durability, dry_run, reply);
                             }
-                            Some(AgentJob::PlanControl(job)) => {
+                            Ok(AgentJob::PlanControl(job)) => {
                                 let crate::placement_control::PlanControlJob { durability, reply } = *job;
                                 let result = self.plan_control(handles, pool, durability).await;
                                 let _ = reply.send(result);
                             }
-                            Some(AgentJob::MoveRange(job)) => {
+                            Ok(AgentJob::MoveRange(job)) => {
                                 if self.move_requests.len() >= MAX_MOVE_REQUESTS
                                     || self.move_requests.try_reserve(1).is_err()
                                 {
@@ -726,7 +728,8 @@ impl PlacementAgent {
                             }
                         }
                     }
-                    () = tokio::time::sleep_until(next) => {
+                    Either::Second(slept) => {
+                        slept.map_err(|_| AgentError::Runtime)?;
                         let pause = match self.tick(handles, pool).await {
                             Ok(_) => {
                                 self.last_error = None;
@@ -738,7 +741,7 @@ impl PlacementAgent {
                                 if retry { TICK } else { BACKOFF }
                             }
                         };
-                        let now = tokio::time::Instant::now();
+                        let now = focal_rt::time::Instant::now();
                         next = now.checked_add(pause).unwrap_or(now);
                     }
                 }
@@ -1539,7 +1542,7 @@ impl PlacementAgent {
             request_id: self.next_request_id()?,
             operation: Operation::PeerControl { group, request },
         };
-        let bytes = tokio::time::timeout(REMOTE_TIMEOUT, pool.send_peer_control(target, &envelope))
+        let bytes = focal_rt::time::timeout(REMOTE_TIMEOUT, pool.send_peer_control(target, &envelope))
             .await
             .map_err(|_| AgentError::Transport(PeerSendError::Lost))??;
         match ControlReply::decode(&bytes, ControlHost::wire_limits().max_frame_bytes as usize)
@@ -2623,7 +2626,7 @@ impl PlacementAgent {
         let input = request.input.clone();
         let manifest_for_rewrite = manifest.clone();
         let work = tenant.clone();
-        let (rewritten, seeds_installed) = tokio::task::spawn_blocking(move || {
+        let (rewritten, seeds_installed) = focal_rt::on_pool(&focal_rt::WORK, move || {
             use focal_ledger::backup::{
                 BackupContent, BackupMedium as _, BackupSeeds, FileMedium, Incarnation,
             };
@@ -3471,7 +3474,7 @@ async fn submit_partition(
                 },
             };
             let bytes =
-                match tokio::time::timeout(REMOTE_TIMEOUT, pool.send_placement(*target, &envelope))
+                match focal_rt::time::timeout(REMOTE_TIMEOUT, pool.send_placement(*target, &envelope))
                     .await
                 {
                     Ok(Ok(bytes)) => bytes,

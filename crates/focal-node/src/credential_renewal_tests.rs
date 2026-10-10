@@ -109,7 +109,7 @@ async fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converge
         .join("enrollment.bin");
     let held = std::fs::read(&receipt_path).unwrap();
     // A renewal must extend the credential beyond the second it was issued.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     // The controller asks the sponsor under the credential it holds, installs
     // the renewal under the same key and presents it at once.
     let renewed = peer.handles.credentials.renew().await.unwrap();
@@ -124,7 +124,7 @@ async fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converge
     assert_eq!(renewed.renewals, 1);
     assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
     // Give the controller a loop to announce; if it stopped, say why.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    focal_rt::time::pause(Duration::from_millis(600)).await;
     match peer.handles.credentials.current().await {
         Ok(current) => assert_eq!(current, renewed),
         Err(error) => panic!(
@@ -183,7 +183,7 @@ async fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converge
         renewed.certificate_fingerprint
     );
     // A later renewal under the renewed credential commits again.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     let again = peer.handles.credentials.renew().await.unwrap();
     assert!(again.expires_at > converged.expires_at);
     assert_eq!(again.renewals, 2);
@@ -231,7 +231,7 @@ async fn a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_commit
     let key_dir = peer_dir.path().join("JOIN").join("node-key");
     let held_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
     let held_receipt = std::fs::read(key_dir.join("enrollment.bin")).unwrap();
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     // The rotation: a new key under the same identity and principal,
     // presented at once and announced to the root.
     let rotated = peer.handles.credentials.rotate().await.unwrap();
@@ -273,7 +273,7 @@ async fn a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_commit
     )
     .await;
     // Under the rotated key a renewal is an ordinary renewal.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     let renewed = peer.handles.credentials.renew().await.unwrap();
     assert_eq!(renewed.key_identity, rotated.key_identity);
     assert_eq!(renewed.renewals, 1);
@@ -348,7 +348,7 @@ async fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_
         before.certificate_fingerprint
     );
     // A renewal must extend the credential beyond the second it was issued.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     // The founder asks the enrollment host it runs, installs the renewal
     // under its genesis key and presents it at once.
     let renewed = founder.handles.credentials.renew().await.unwrap();
@@ -425,7 +425,7 @@ async fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_
     // A rotation moves the founder to a fresh key under its identity; the
     // root re-grants it under the new key, and a restart finds the rotated
     // key beside the genesis draft.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     let rotated = founder.handles.credentials.rotate().await.unwrap();
     assert_eq!(rotated.principal, before.principal);
     assert_ne!(rotated.key_identity, before.key_identity);
@@ -460,7 +460,7 @@ async fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_
     );
     // Under the rotated key a renewal is an ordinary renewal, carrying the
     // founder's principal, and the joined host still renews through it.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    focal_rt::time::pause(Duration::from_millis(1100)).await;
     let again = founder.handles.credentials.renew().await.unwrap();
     assert_eq!(again.key_identity, rotated.key_identity);
     assert_eq!(again.principal, before.principal);
@@ -675,7 +675,7 @@ async fn the_bootstrap_certificate_succeeds_itself_and_the_host_renews_through_i
             Err(_) => {
                 // A renewal is decided in whole seconds: the next attempt
                 // is a second on, as the controller's own retries are.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                focal_rt::time::pause(Duration::from_secs(1)).await;
                 None
             }
         },
@@ -978,7 +978,7 @@ async fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_gene
         async || match peer.handles.credentials.renew().await {
             Ok(renewed) => Some(renewed),
             Err(_) => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                focal_rt::time::pause(Duration::from_secs(1)).await;
                 None
             }
         },

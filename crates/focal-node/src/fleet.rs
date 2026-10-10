@@ -30,7 +30,8 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc as async_mpsc, oneshot, watch};
+use focal_rt::watch;
+use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 
 #[path = "fleet_evidence.rs"]
 mod evidence_owner;
@@ -160,7 +161,7 @@ pub struct ReplicaConfig {
 }
 #[cfg(test)]
 #[derive(Clone, Debug)]
-struct CheckpointObserver(async_mpsc::Sender<LedgerId>);
+struct CheckpointObserver(hyper_rt::sync::Sender<LedgerId>);
 #[cfg(test)]
 impl PartialEq for CheckpointObserver {
     fn eq(&self, other: &Self) -> bool {
@@ -193,7 +194,7 @@ impl ReplicaConfig {
 pub struct ReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
-    snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
+    snapshot: Option<OneshotSender<focal_consensus::SnapshotStatus>>,
     /// Where the driver says the peer could not be reached: the owner
     /// reports it to the core, which probes the member instead of
     /// streaming to it. Bounded by the members a configuration names.
@@ -402,45 +403,45 @@ impl Work {
 }
 enum Work {
     Diagnostics(
-        oneshot::Sender<Result<ReplicaDiagnosticsReply, LedgerError>>,
+        OneshotSender<Result<ReplicaDiagnosticsReply, LedgerError>>,
         Allocation,
     ),
     Registration(
-        oneshot::Sender<Result<RegistrationFactsReply, LedgerError>>,
+        OneshotSender<Result<RegistrationFactsReply, LedgerError>>,
         Allocation,
     ),
     Request(
         Box<AdmittedRequest>,
-        oneshot::Sender<OwnedResponse>,
+        OneshotSender<OwnedResponse>,
         Allocation,
     ),
     Probe(
         Box<VerifiedRequest>,
-        oneshot::Sender<Result<ReceiptProbe, AccessError>>,
+        OneshotSender<Result<ReceiptProbe, AccessError>>,
         Allocation,
     ),
     Transfer(
         u64,
         Option<Box<CheckedTransfer>>,
-        oneshot::Sender<Result<(), LedgerError>>,
+        OneshotSender<Result<(), LedgerError>>,
     ),
     Membership(Box<MembershipCall>, Allocation),
     ManagedSupport(Box<SupportCall>, Allocation),
     ActivateNative(
         ActivateNativeCall,
-        oneshot::Sender<Result<(), LedgerError>>,
+        OneshotSender<Result<(), LedgerError>>,
         Allocation,
     ),
     ImportPayloads(
-        oneshot::Sender<Result<Option<LegacyImportPayloads>, LedgerError>>,
+        OneshotSender<Result<Option<LegacyImportPayloads>, LedgerError>>,
         Allocation,
     ),
     /// Checkpoint the applied prefix now (an operator's explicit request).
-    Checkpoint(oneshot::Sender<Result<(), LedgerError>>, Allocation),
+    Checkpoint(OneshotSender<Result<(), LedgerError>>, Allocation),
     /// Where a committed artifact's bytes live, for its custody obligation.
     ArtifactPointer(
         focal_model::ArtifactId,
-        oneshot::Sender<
+        OneshotSender<
             Result<
                 Option<focal_model::lifecycle::artifact_descriptor::ContentPointer>,
                 LedgerError,
@@ -450,29 +451,29 @@ enum Work {
     ),
     /// The chunks a pending seeded checkpoint still lacks.
     SeedChunks(
-        oneshot::Sender<Result<Vec<focal_model::ContentHash>, LedgerError>>,
+        OneshotSender<Result<Vec<focal_model::ContentHash>, LedgerError>>,
         Allocation,
     ),
     /// One pulled chunk, verified and sealed; the delivery retries at once.
     InstallSeed(
         focal_model::ContentHash,
         Vec<u8>,
-        oneshot::Sender<Result<(), LedgerError>>,
+        OneshotSender<Result<(), LedgerError>>,
         Allocation,
     ),
     /// The content objects a retained delivery lacks (24 §20).
     CustodyObjects(
-        oneshot::Sender<Result<Vec<focal_model::ContentRef>, LedgerError>>,
+        OneshotSender<Result<Vec<focal_model::ContentRef>, LedgerError>>,
         Allocation,
     ),
     /// The host pulled objects a retained delivery lacked; it retries at once.
-    CustodyPulled(oneshot::Sender<Result<(), LedgerError>>, Allocation),
+    CustodyPulled(OneshotSender<Result<(), LedgerError>>, Allocation),
     /// The members the committed directory names for this session, and
     /// those of them in its preferred leader's zone.
     Admit(
         Vec<u64>,
         Near,
-        oneshot::Sender<Result<(), LedgerError>>,
+        OneshotSender<Result<(), LedgerError>>,
         Allocation,
     ),
     /// What the paths to the replica's peers hold in flight and their
@@ -483,7 +484,7 @@ enum Work {
     Refence(
         RouteEpoch,
         u64,
-        oneshot::Sender<Result<(), LedgerError>>,
+        OneshotSender<Result<(), LedgerError>>,
         Allocation,
     ),
     Placement(Box<PlacementCall>, Allocation),
@@ -491,7 +492,7 @@ enum Work {
     /// a replica's own facts (25 §6).
     Range(Box<range_owner::RangeCall>, Allocation),
     Evidence(Box<EvidenceCall>, Allocation),
-    Stop(oneshot::Sender<Result<(), LedgerError>>),
+    Stop(OneshotSender<Result<(), LedgerError>>),
 }
 pub(crate) struct ReceiptProbe {
     pub request: Box<VerifiedRequest>,
@@ -505,7 +506,7 @@ struct AdmittedRequest {
 }
 struct MembershipCall {
     request: Option<SessionMembershipRequest>,
-    response: oneshot::Sender<Result<MembershipReply, LedgerError>>,
+    response: OneshotSender<Result<MembershipReply, LedgerError>>,
 }
 struct CheckedTransfer {
     expected_index: u64,
@@ -887,7 +888,7 @@ enum Replication {
 }
 struct Pending {
     header: ResponseEnvelope,
-    response: oneshot::Sender<OwnedResponse>,
+    response: OneshotSender<OwnedResponse>,
     waiting: WaitingFor,
     term: u64,
     /// The owner's period at which the request is given up: its time in
@@ -929,7 +930,7 @@ struct Owner {
     snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback,
     placement: Option<PendingPlacementCall>,
     evidence: Option<PendingEvidenceCall>,
-    outbound: async_mpsc::Sender<ReplicationFrame>,
+    outbound: hyper_rt::sync::Sender<ReplicationFrame>,
     /// Peers the driver could not reach, reported to the core each period.
     lost_sender: mpsc::SyncSender<u64>,
     lost: mpsc::Receiver<u64>,
@@ -1012,7 +1013,7 @@ struct Owner {
     drain_owed: bool,
     /// The reply to a stop, and the owner's period at which the stop is
     /// given up on.
-    stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
+    stopping: Option<(OneshotSender<Result<(), LedgerError>>, u64)>,
     /// While a stopping leader hands its log off: the owner's period at
     /// which the hand-off is given up on.
     handing_off: Option<u64>,
@@ -1040,7 +1041,7 @@ impl ReplicaHost {
         session: Session,
         config: ReplicaConfig,
         limits: WireLimits,
-    ) -> Result<(Self, ReplicaOwner, async_mpsc::Receiver<ReplicationFrame>), LedgerError> {
+    ) -> Result<(Self, ReplicaOwner, ChannelReceiver<ReplicationFrame>), LedgerError> {
         Self::spawn_with_runtime(session, config, limits, None)
     }
     /// The host owns runtime progress and all consensus message draining. A
@@ -1050,11 +1051,11 @@ impl ReplicaHost {
         config: ReplicaConfig,
         limits: WireLimits,
         runtime: Option<focal_runtime::Runtime>,
-    ) -> Result<(Self, ReplicaOwner, async_mpsc::Receiver<ReplicationFrame>), LedgerError> {
+    ) -> Result<(Self, ReplicaOwner, ChannelReceiver<ReplicationFrame>), LedgerError> {
         Self::validate(&config, &limits)?;
         let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024)?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
-        let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
+        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue).map_err(|_| LedgerError::Capacity)?;
         let (host, owner) = Self::assemble(
             session,
             config,
@@ -1100,7 +1101,7 @@ impl ReplicaHost {
         runtime: Option<focal_runtime::Runtime>,
         budget: MemoryBudget,
         sender: HostSender,
-        outbound: async_mpsc::Sender<ReplicationFrame>,
+        outbound: hyper_rt::sync::Sender<ReplicationFrame>,
     ) -> Result<(Self, Owner), LedgerError> {
         if session
             .active_route()
@@ -1143,7 +1144,8 @@ impl ReplicaHost {
                 custody_pending: None,
             },
             _allocation: None,
-        });
+        })
+        .map_err(|_| LedgerError::Capacity)?;
         let views = ReadViews::with_route_epoch(config.route_epoch);
         let streams = Streams::in_budget(&budget).map_err(|_| LedgerError::Capacity)?;
         // Replication snapshots need larger frames than ordinary data pages.
@@ -1326,7 +1328,7 @@ impl ReplicaHost {
     /// Trusted placement/control operation, serialized with all session work.
     /// Observe progress to confirm the transfer; queue acceptance is not election.
     pub async fn transfer_leader(&self, target: u64) -> Result<(), LedgerError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Transfer(target, None, send))
             .map_err(|error| match error {
@@ -1351,7 +1353,7 @@ impl ReplicaHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)?
             .commit();
         request.expected.validate()?;
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Transfer(
                 request.target,
@@ -1376,7 +1378,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::ActivateNative(call, send, charge))
             .map_err(|error| match error {
@@ -1415,7 +1417,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Admit(members, near, send, charge))
             .map_err(|error| match error {
@@ -1467,7 +1469,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 16 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Refence(route_epoch, policy_revision, send, charge))
             .map_err(|error| match error {
@@ -1487,7 +1489,7 @@ impl ReplicaHost {
                 IMPORT_PAYLOAD_BYTES.saturating_add(64 * 1024),
             )?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::ImportPayloads(send, charge))
             .map_err(|error| match error {
@@ -1507,7 +1509,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Checkpoint(send, charge))
             .map_err(|error| match error {
@@ -1527,7 +1529,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::ArtifactPointer(artifact, send, charge))
             .map_err(|error| match error {
@@ -1542,7 +1544,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::SeedChunks(send, charge))
             .map_err(|error| match error {
@@ -1569,7 +1571,7 @@ impl ReplicaHost {
                     .ok_or(LedgerError::Capacity)?,
             )?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::InstallSeed(hash, bytes, send, charge))
             .map_err(|error| match error {
@@ -1587,7 +1589,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::CustodyObjects(send, charge))
             .map_err(|error| match error {
@@ -1603,7 +1605,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::CustodyPulled(send, charge))
             .map_err(|error| match error {
@@ -1645,7 +1647,7 @@ impl ReplicaHost {
         if let Some(request) = &request {
             request.validate()?;
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Membership(
                 Box::new(MembershipCall {
@@ -1662,7 +1664,7 @@ impl ReplicaHost {
     }
     /// A full queue returns Capacity without enqueueing; drain ingress and retry.
     pub async fn stop(&self) -> Result<(), LedgerError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {
@@ -1834,7 +1836,12 @@ impl ReplicaHost {
             self.pace.refuse_input(replication);
             return OwnedResponse::new(full);
         };
-        let (send, receive) = oneshot::channel();
+        // A reply's cell is refused at the runtime's bound: the request is
+        // refused for the room, as one the budget refused.
+        let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
+            self.pace.refuse_input(replication);
+            return OwnedResponse::new(full);
+        };
         let work = Work::Request(
             Box::new(AdmittedRequest {
                 verified: request,
@@ -1884,7 +1891,7 @@ impl ReplicaHost {
             )
             .map_err(|_| AccessError::Capacity)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.sender
             .try_send(Work::Probe(Box::new(request), send, charge))
             .map_err(|error| match error {
@@ -2746,7 +2753,7 @@ impl Owner {
     }
     fn begin_stop(
         &mut self,
-        response: oneshot::Sender<Result<(), LedgerError>>,
+        response: OneshotSender<Result<(), LedgerError>>,
     ) -> Result<(), LedgerError> {
         if self.stopping.is_some() {
             let _ = response.send(Err(LedgerError::Capacity));
@@ -3174,7 +3181,7 @@ impl Owner {
     fn request(
         &mut self,
         verified: VerifiedRequest,
-        response: oneshot::Sender<OwnedResponse>,
+        response: OneshotSender<OwnedResponse>,
         charge: Allocation,
         witness: Option<EvidenceWitness>,
         native: Option<focal_evidence::VerifiedNativeArtifact>,

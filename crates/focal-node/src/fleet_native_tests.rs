@@ -184,7 +184,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
     host.activate_native(call_activation).await.unwrap();
     let mut active = false;
     for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
         let diagnostics = host.diagnostics().await.unwrap();
         if diagnostics.value().native_active && diagnostics.value().native_authoritative {
             active = true;
@@ -227,7 +227,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
         if !matches!(reply, Response::Error(AccessError::OutcomeUnknown)) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
         reply = call(
             &host,
             ISSUER,
@@ -290,7 +290,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
         if !matches!(reply, Response::Error(AccessError::OutcomeUnknown)) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
         reply = call(
             &host,
             ISSUER,
@@ -343,7 +343,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
         if !matches!(reply, Response::Error(AccessError::OutcomeUnknown)) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
         reply = call(
             &host,
             WORKER,
@@ -387,7 +387,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
             pending = Some(found);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
     }
     let pending = pending.expect("the begin record applied");
     assert_eq!(pending.operation, operation);
@@ -410,7 +410,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
             if !view.in_flight {
                 return view;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            focal_rt::time::pause(Duration::from_millis(25)).await;
         }
         panic!("a movement record never applied");
     }
@@ -499,7 +499,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
         if !matches!(reply, Response::Error(AccessError::OutcomeUnknown)) {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
         reply = call(
             &host,
             ISSUER,
@@ -555,7 +555,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
             split = Some(view);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
     }
     let split = split.expect("the split applied");
     assert_eq!(split.epoch.0, 3);
@@ -578,7 +578,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
             merged = Some(view);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
     }
     let merged = merged.expect("the merge applied");
     assert_eq!(merged.epoch.0, 4);
@@ -600,7 +600,7 @@ async fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizab
             compacted = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::pause(Duration::from_millis(25)).await;
     }
     assert!(compacted, "the replica never checkpointed by cadence");
 

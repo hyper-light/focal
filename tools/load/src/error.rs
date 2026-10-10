@@ -32,6 +32,8 @@ pub enum LoadError {
     Memory(focal_memory::MemoryError),
     /// The report could not be serialized.
     Report(serde_json::Error),
+    /// The run's shard could not be started: its tables refused.
+    Runtime(focal_rt::RtError),
 }
 
 impl fmt::Display for LoadError {
@@ -49,6 +51,7 @@ impl fmt::Display for LoadError {
             Self::Bound(what) => write!(f, "bound exceeded: {what}"),
             Self::Memory(error) => write!(f, "measurement memory: {error}"),
             Self::Report(error) => write!(f, "report: {error}"),
+            Self::Runtime(error) => write!(f, "runtime: {error}"),
         }
     }
 }

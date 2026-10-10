@@ -14,7 +14,8 @@ use focal_memory::{
 };
 use focal_wire::PeerPoolStats;
 use std::fmt::Write as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::FutureExt;
+use hyper_rt::combine::{Either, race2};
 
 /// How often the service samples a fresh snapshot.
 pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -37,6 +38,11 @@ pub mod rounds;
 /// as the socket closes one.
 pub fn max_scrapes() -> usize {
     crate::network_admin::admin_wire_limits().max_connections
+}
+/// The loopback endpoint's accept queue: as many connections as it serves
+/// at once wait in the kernel while those are served.
+pub fn loopback_backlog() -> u32 {
+    u32::try_from(max_scrapes()).unwrap_or(u32::MAX).max(1)
 }
 /// The longest request the loopback endpoint reads.
 const MAX_REQUEST_BYTES: usize = 4096;
@@ -462,29 +468,35 @@ impl MetricsPage {
 /// left unobserved and dropped with the set — never in the way of another,
 /// never passed over in silence, since the caller reads the gap. The asks
 /// are bounded by their number and each by the charge it made at its owner.
-pub async fn collect<T, F>(asks: Vec<F>, deadline: tokio::time::Instant) -> Vec<Option<T>>
+pub async fn collect<T, F>(asks: Vec<F>, deadline: focal_rt::time::Instant) -> Vec<Option<T>>
 where
-    T: Send + 'static,
-    F: Future<Output = Option<T>> + Send + 'static,
+    F: Future<Output = Option<T>>,
 {
     let mut answers: Vec<Option<T>> = Vec::new();
     if answers.try_reserve_exact(asks.len()).is_err() {
         return answers;
     }
     answers.resize_with(asks.len(), || None);
-    let mut tasks = tokio::task::JoinSet::new();
+    // The asks run together in this task, the set as large as they are
+    // many (a page's sessions); one that unwinds ends without an answer.
+    let Ok(mut asking) = focal_rt::Concurrent::new(asks.len()) else {
+        return answers;
+    };
     for (index, ask) in asks.into_iter().enumerate() {
-        tasks.spawn(async move { (index, ask.await) });
+        let ask = std::panic::AssertUnwindSafe(ask).catch_unwind();
+        if asking.push(async move { (index, ask.await) }).is_err() {
+            break;
+        }
     }
-    while !tasks.is_empty() {
-        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-            Ok(Some(Ok((index, answer)))) => {
+    while !asking.is_empty() {
+        match focal_rt::time::timeout_at(deadline, asking.join_next()).await {
+            Ok(Some((index, Ok(answer)))) => {
                 if let Some(slot) = answers.get_mut(index) {
                     *slot = answer;
                 }
             }
-            // A task that ended without an answer stays unobserved.
-            Ok(Some(Err(_))) => {}
+            // An ask that ended without an answer stays unobserved.
+            Ok(Some((_, Err(_)))) => {}
             Ok(None) | Err(_) => break,
         }
     }
@@ -1744,66 +1756,81 @@ fn owner_side(name: &str) -> bool {
 /// written; as many connections at once as the admin socket admits
 /// operators, one beyond them closed unanswered; no other path.
 pub async fn serve_loopback(
-    listener: tokio::net::TcpListener,
-    view: tokio::sync::watch::Receiver<Option<MetricsPage>>,
-) -> std::io::Result<()> {
+    listener: hyper_rt::tcp::TcpListener,
+    view: focal_rt::watch::Receiver<Option<MetricsPage>>,
+) -> Result<(), focal_rt::RtError> {
     let at_once = max_scrapes();
-    let mut serving = tokio::task::JoinSet::new();
+    // The listener closes a connection past the budget at once: the one
+    // beyond the operators the admin socket admits.
+    let budget =
+        hyper_rt::tcp::ConnectionBudget::new(u64::try_from(at_once).unwrap_or(u64::MAX))?;
+    let listener = listener.with_budget(budget);
+    let mut serving = focal_rt::Concurrent::new(at_once)?;
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        while serving.try_join_next().is_some() {}
-        if serving.len() >= at_once {
-            drop(stream);
-            continue;
-        }
-        let view = view.clone();
-        serving.spawn(async move {
-            let handled = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 512];
-                loop {
-                    let read = stream.read(&mut buffer).await?;
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
-                    if request.len() > MAX_REQUEST_BYTES
-                        || request.windows(4).any(|w| w == b"\r\n\r\n")
-                    {
-                        break;
-                    }
-                }
-                let line = request
-                    .split(|byte| *byte == b'\n')
-                    .next()
-                    .unwrap_or(&[]);
-                let line = String::from_utf8_lossy(line);
-                let mut parts = line.split_whitespace();
-                let (status, payload) = match (parts.next(), parts.next()) {
-                    (Some("GET"), Some("/metrics")) => {
-                        let text = view
-                            .borrow()
-                            .as_ref()
-                            .map(|page| page.text.clone())
-                            .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
-                        ("200 OK", text)
-                    }
-                    (Some("GET"), Some(_)) => ("404 Not Found", "not found\n".to_owned()),
-                    _ => ("405 Method Not Allowed", "GET /metrics only\n".to_owned()),
-                };
-                let head = format!(
-                    "HTTP/1.0 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                stream.write_all(head.as_bytes()).await?;
-                stream.write_all(payload.as_bytes()).await?;
-                stream.shutdown().await
-            })
-            .await;
-            // A slow or broken client costs this one connection, nothing else.
-            let _ = handled;
-        });
+        let accepted = if serving.is_empty() {
+            Either::First(listener.accept().await)
+        } else {
+            race2(listener.accept(), serving.join_next()).await
+        };
+        let stream = match accepted {
+            Either::First(stream) => stream?,
+            // A scrape answered, or a client that went: its place is free.
+            Either::Second(_) => continue,
+        };
+        // Within the budget the set has its room; a stream it has none for
+        // is closed unanswered, as the budget would close it.
+        let _ = serving.push(scrape(stream, &view));
     }
+}
+
+/// One scrape: the request read and judged under its bound, then the page's
+/// text written. A slow or broken client costs this one connection.
+async fn scrape(
+    stream: hyper_rt::tcp::TcpStream,
+    view: &focal_rt::watch::Receiver<Option<MetricsPage>>,
+) {
+    let handled = focal_rt::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(buffer.get(..read).unwrap_or(&[]));
+            if request.len() > MAX_REQUEST_BYTES || request.windows(4).any(|w| w == b"\r\n\r\n")
+            {
+                break;
+            }
+        }
+        let line = request
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or(&[]);
+        let line = String::from_utf8_lossy(line);
+        let mut parts = line.split_whitespace();
+        let (status, payload) = match (parts.next(), parts.next()) {
+            (Some("GET"), Some("/metrics")) => {
+                let text = view
+                    .borrow()
+                    .as_ref()
+                    .map(|page| page.text.clone())
+                    .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
+                ("200 OK", text)
+            }
+            (Some("GET"), Some(_)) => ("404 Not Found", "not found\n".to_owned()),
+            _ => ("405 Method Not Allowed", "GET /metrics only\n".to_owned()),
+        };
+        let head = format!(
+            "HTTP/1.0 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(payload.as_bytes()).await?;
+        stream.shutdown(hyper_rt::tcp::Shutdown::Write)
+    })
+    .await;
+    let _ = handled;
 }
 
 #[cfg(test)]
@@ -1988,22 +2015,22 @@ mod tests {
     /// paused clock the answers and the deadline fall in their order.
     #[tokio::test(start_paused = true)]
     async fn a_round_closes_at_its_deadline_with_the_late_unobserved() {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let deadline = focal_rt::time::Instant::now() + std::time::Duration::from_millis(100);
         let asks: Vec<std::pin::Pin<Box<dyn Future<Output = Option<u8>> + Send>>> = vec![
             Box::pin(async { Some(1) }),
             Box::pin(async {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                focal_rt::time::pause(std::time::Duration::from_secs(10)).await;
                 Some(2)
             }),
             Box::pin(async { None }),
             Box::pin(async {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                focal_rt::time::pause(std::time::Duration::from_millis(10)).await;
                 Some(4)
             }),
         ];
         let answers = collect(asks, deadline).await;
         assert_eq!(answers, vec![Some(1), None, None, Some(4)]);
-        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert_eq!(focal_rt::time::Instant::now(), deadline);
     }
     /// The loopback serves the page's text as it was rendered, judges the
     /// request before it writes, and a scrape that never speaks costs no

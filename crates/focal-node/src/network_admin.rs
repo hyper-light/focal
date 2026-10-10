@@ -1091,7 +1091,7 @@ pub struct LocalNetworkAdmin {
     /// The evidence coordinator, for repairs (24 §20).
     evidence: Option<crate::evidence_service::EvidenceCoordinator>,
     /// The latest metrics snapshot the service sampled (24 §23).
-    metrics: Option<tokio::sync::watch::Receiver<Option<crate::metrics::MetricsPage>>>,
+    metrics: Option<focal_rt::watch::Receiver<Option<crate::metrics::MetricsPage>>>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -1203,7 +1203,7 @@ impl LocalNetworkAdmin {
     }
     pub fn with_metrics(
         mut self,
-        metrics: tokio::sync::watch::Receiver<Option<crate::metrics::MetricsPage>>,
+        metrics: focal_rt::watch::Receiver<Option<crate::metrics::MetricsPage>>,
     ) -> Self {
         self.metrics = Some(metrics);
         self

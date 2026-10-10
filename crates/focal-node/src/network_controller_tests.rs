@@ -428,7 +428,7 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
                         }) {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        focal_rt::time::pause(Duration::from_millis(10)).await;
                     }
                 },
             )
@@ -627,7 +627,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
     });
     tokio::pin!(serving);
     tokio::select! {
-        result = tokio::time::timeout(pool_timeout, controller.announce_remote(&pool, &request, 99, 1)) => {
+        result = focal_rt::time::timeout(pool_timeout, controller.announce_remote(&pool, &request, 99, 1)) => {
             result.expect("blackholed preferred leader starved the reachable alternate").unwrap();
         }
         result = &mut serving => panic!("test server ended before delivery: {result:?}"),

@@ -20,16 +20,14 @@ use focal_wire::{Operation, PROTOCOL_VERSION, PeerConnectionPool, PeerSendError,
 #[cfg(test)]
 #[path = "swim_tests.rs"]
 mod swim_tests;
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use focal_rt::{time::Instant, watch};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
-    pin::Pin,
+    pin::pin,
+    task::Poll,
     time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio::{
-    sync::{mpsc, oneshot, watch},
-    time::Instant,
 };
 
 /// Members the driver will track; the directory bounds enrolled nodes.
@@ -246,7 +244,7 @@ pub enum ProbeError {
 enum Inbound {
     Probe {
         request: ProbeRequest,
-        reply: oneshot::Sender<ProbeReply>,
+        reply: OneshotSender<ProbeReply>,
     },
     /// Ask `node` at exactly `address` and say whether it answered as
     /// itself (24 §24): the root confirms a contact is gone before letting
@@ -256,7 +254,7 @@ enum Inbound {
     Confirm {
         node: u64,
         address: std::net::SocketAddr,
-        reply: oneshot::Sender<Result<Option<bool>, ProbeError>>,
+        reply: OneshotSender<Result<Option<bool>, ProbeError>>,
     },
 }
 /// One contact confirmation: the probe in flight (`verdict` unset) or its
@@ -271,7 +269,7 @@ struct Confirmation {
 pub struct LivenessHandle {
     facts: watch::Sender<LocalFacts>,
     view: watch::Receiver<LivenessView>,
-    inbox: mpsc::Sender<Inbound>,
+    inbox: Sender<Inbound>,
     config: LivenessConfig,
 }
 impl LivenessHandle {
@@ -289,9 +287,13 @@ impl LivenessHandle {
         let allocation = budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, STATE_BYTES)?
             .commit();
-        let (facts, facts_rx) = watch::channel(LocalFacts::default());
-        let (view_tx, view) = watch::channel(LivenessView::empty(node, &config));
-        let (inbox, inbox_rx) = mpsc::channel(INBOX_DEPTH);
+        // The runtime's cells, refused at their bound, are memory too.
+        let (facts, facts_rx) =
+            watch::channel(LocalFacts::default()).map_err(|_| MemoryError::AllocationFailed)?;
+        let (view_tx, view) = watch::channel(LivenessView::empty(node, &config))
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let (inbox, inbox_rx) =
+            hyper_rt::sync::channel(INBOX_DEPTH).map_err(|_| MemoryError::AllocationFailed)?;
         let driver = LivenessDriver {
             node,
             namespace,
@@ -346,14 +348,14 @@ impl LivenessHandle {
                     .saturating_add(DIRECT_ANSWER)
             }
         };
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| ProbeError::Capacity)?;
         self.inbox
             .try_send(Inbound::Probe { request, reply })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ProbeError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => ProbeError::Unavailable,
+                SyncError::Full(_) => ProbeError::Capacity,
+                _ => ProbeError::Unavailable,
             })?;
-        let reply = tokio::time::timeout(wait, receive)
+        let reply = focal_rt::time::timeout(wait, receive)
             .await
             .map_err(|_| ProbeError::Unavailable)?
             .map_err(|_| ProbeError::Unavailable)?;
@@ -367,7 +369,7 @@ impl LivenessHandle {
         node: u64,
         address: std::net::SocketAddr,
     ) -> Result<Option<bool>, ProbeError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| ProbeError::Capacity)?;
         self.inbox
             .try_send(Inbound::Confirm {
                 node,
@@ -375,12 +377,12 @@ impl LivenessHandle {
                 reply,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ProbeError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => ProbeError::Unavailable,
+                SyncError::Full(_) => ProbeError::Capacity,
+                _ => ProbeError::Unavailable,
             })?;
         // The driver answers from its state, never from the network: the
         // wait covers its turn on the loop, not a probe.
-        tokio::time::timeout(DIRECT_ANSWER, receive)
+        focal_rt::time::timeout(DIRECT_ANSWER, receive)
             .await
             .map_err(|_| ProbeError::Unavailable)?
             .map_err(|_| ProbeError::Unavailable)?
@@ -590,8 +592,9 @@ enum Done {
         target: u64,
         sequence: u64,
         sent_at_ms: u64,
-        request: ProbeRequest,
-        reply: oneshot::Sender<ProbeReply>,
+        /// The sequence of the probe this relays, which the answer names.
+        asked: u64,
+        reply: OneshotSender<ProbeReply>,
         result: Result<Vec<u8>, PeerSendError>,
     },
     Confirm {
@@ -600,7 +603,16 @@ enum Done {
         result: Result<Vec<u8>, PeerSendError>,
     },
 }
-type Inflight<'a> = FuturesUnordered<Pin<Box<dyn Future<Output = Done> + Send + 'a>>>;
+/// The probes in flight: at most [`MAX_INFLIGHT`], which the driver counts
+/// before each; a probe takes its place here before it is counted, so one
+/// the set refused is never waited for.
+type Inflight<'a> = focal_rt::Concurrent<dyn Future<Output = Done> + 'a>;
+/// What the driver takes next.
+enum Turn {
+    Inbound(Result<Inbound, SyncError<()>>),
+    Done(Done),
+    Tick(Result<(), focal_rt::RtError>),
+}
 
 pub struct LivenessDriver {
     node: u64,
@@ -608,7 +620,7 @@ pub struct LivenessDriver {
     config: LivenessConfig,
     facts: watch::Receiver<LocalFacts>,
     view: watch::Sender<LivenessView>,
-    inbox: mpsc::Receiver<Inbound>,
+    inbox: ChannelReceiver<Inbound>,
     state: State,
     /// The counters the published view was built from: the view is rebuilt
     /// once they differ, and before any answer leaves, so what an answer
@@ -621,39 +633,54 @@ impl LivenessDriver {
     pub async fn run(mut self, pool: &PeerConnectionPool) {
         let started = Instant::now();
         let period = self.config.period;
-        let mut inflight: Inflight<'_> = FuturesUnordered::new();
+        let Ok(mut inflight) = Inflight::new(MAX_INFLIGHT) else {
+            return;
+        };
         let mut next = started.checked_add(period).unwrap_or(started);
         loop {
             let now_ms = elapsed_ms(started);
             let mut refresh = false;
-            tokio::select! {
-                biased;
-                inbound = self.inbox.recv() => {
-                    match inbound {
-                        Some(Inbound::Probe { request, reply }) => {
-                            self.on_inbound(request, reply, now_ms, pool, &mut inflight);
-                        }
-                        Some(Inbound::Confirm {
-                            node,
-                            address,
-                            reply,
-                        }) => {
-                            let answer = self.confirm(node, address, now_ms, pool, &mut inflight);
-                            let _ = reply.send(answer);
-                        }
-                        None => return,
-                    }
+            // What came in first, then a probe that ended, then the tick.
+            let mut tick = pin!(focal_rt::time::sleep_until(next));
+            let turn = std::future::poll_fn(|cx| {
+                if let Poll::Ready(inbound) = pin!(self.inbox.recv()).poll(cx) {
+                    return Poll::Ready(Turn::Inbound(inbound));
                 }
-                Some(done) = inflight.next(), if !inflight.is_empty() => {
+                if !inflight.is_empty()
+                    && let Poll::Ready(Some(done)) = inflight.poll_next(cx)
+                {
+                    return Poll::Ready(Turn::Done(done));
+                }
+                if let Poll::Ready(slept) = tick.as_mut().poll(cx) {
+                    return Poll::Ready(Turn::Tick(slept));
+                }
+                Poll::Pending
+            })
+            .await;
+            match turn {
+                Turn::Inbound(Ok(Inbound::Probe { request, reply })) => {
+                    self.on_inbound(request, reply, now_ms, pool, &mut inflight);
+                }
+                Turn::Inbound(Ok(Inbound::Confirm {
+                    node,
+                    address,
+                    reply,
+                })) => {
+                    let answer = self.confirm(node, address, now_ms, pool, &mut inflight);
+                    let _ = reply.send(answer);
+                }
+                // Every handle is gone, or no wait could be kept.
+                Turn::Inbound(Err(_)) | Turn::Tick(Err(_)) => return,
+                Turn::Done(done) => {
                     self.state.inflight = self.state.inflight.saturating_sub(1);
                     if self.on_done(done, elapsed_ms(started), pool, &mut inflight) {
                         return;
                     }
                 }
-                () = tokio::time::sleep_until(next) => {
+                Turn::Tick(Ok(())) => {
                     refresh = true;
                     let at = Instant::now();
-                    let late = at.saturating_duration_since(next);
+                    let late = at.duration_since(next);
                     if late > period.checked_div(2).unwrap_or(period) {
                         self.state.health.on_late_tick();
                         let millis = u64::try_from(late.as_millis()).unwrap_or(u64::MAX);
@@ -677,7 +704,7 @@ impl LivenessDriver {
     /// An answer leaves after the view it changed is published: a reader
     /// that takes the view once it has the answer sees what the answer
     /// reports (an extension granted, a probe counted).
-    fn answer_published(&mut self, reply: oneshot::Sender<ProbeReply>, answer: ProbeReply) {
+    fn answer_published(&mut self, reply: OneshotSender<ProbeReply>, answer: ProbeReply) {
         if self.state.counters != self.published {
             self.publish();
         }
@@ -921,16 +948,8 @@ impl LivenessDriver {
         let Some(member) = self.state.members.get_mut(&target) else {
             return Ok(());
         };
-        member.probe = Some(Pending {
-            sequence,
-            indirect_outstanding: 0,
-            acknowledged: false,
-            started_ms: now_ms,
-        });
-        self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
-        self.state.inflight = self.state.inflight.saturating_add(1);
         let with_extension = extension.is_some();
-        inflight.push(Box::pin(async move {
+        let pushed = inflight.push_pinned(Box::pin(async move {
             let result = probe(pool, target, &envelope, timeout).await;
             Done::Direct {
                 target,
@@ -940,6 +959,17 @@ impl LivenessDriver {
                 extension: with_extension,
             }
         }));
+        if pushed.is_err() {
+            return Ok(());
+        }
+        member.probe = Some(Pending {
+            sequence,
+            indirect_outstanding: 0,
+            acknowledged: false,
+            started_ms: now_ms,
+        });
+        self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
+        self.state.inflight = self.state.inflight.saturating_add(1);
         Ok(())
     }
     /// One direct probe outside the detector's schedule: it teaches nothing
@@ -977,16 +1007,8 @@ impl LivenessDriver {
         // clone, a slow "there" only delays a move.
         let timeout = Duration::from_millis(self.config.timeout_cap_ms);
         let envelope = self.envelope(body);
-        self.state.inflight = self.state.inflight.saturating_add(1);
-        self.state.confirmations.insert(
-            (target, address),
-            Confirmation {
-                verdict: None,
-                at_ms: now_ms,
-            },
-        );
-        inflight.push(Box::pin(async move {
-            let result = match tokio::time::timeout(
+        let pushed = inflight.push_pinned(Box::pin(async move {
+            let result = match focal_rt::time::timeout(
                 timeout,
                 pool.probe_at(target, address, &envelope),
             )
@@ -1001,6 +1023,17 @@ impl LivenessDriver {
                 result,
             }
         }));
+        if pushed.is_err() {
+            return Err(ProbeError::Capacity);
+        }
+        self.state.inflight = self.state.inflight.saturating_add(1);
+        self.state.confirmations.insert(
+            (target, address),
+            Confirmation {
+                verdict: None,
+                at_ms: now_ms,
+            },
+        );
         Ok(None)
     }
     fn send_indirect<'a>(
@@ -1044,10 +1077,7 @@ impl LivenessDriver {
                     .min(self.config.timeout_cap_ms.saturating_mul(3)),
             );
             let envelope = self.envelope(body);
-            self.state.inflight = self.state.inflight.saturating_add(1);
-            self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
-            sent = sent.saturating_add(1);
-            inflight.push(Box::pin(async move {
+            let pushed = inflight.push_pinned(Box::pin(async move {
                 let result = probe(pool, via, &envelope, timeout).await;
                 Done::Indirect {
                     target,
@@ -1057,13 +1087,19 @@ impl LivenessDriver {
                     result,
                 }
             }));
+            if pushed.is_err() {
+                break;
+            }
+            self.state.inflight = self.state.inflight.saturating_add(1);
+            self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
+            sent = sent.saturating_add(1);
         }
         sent
     }
     fn on_inbound<'a>(
         &mut self,
         request: ProbeRequest,
-        reply: oneshot::Sender<ProbeReply>,
+        reply: OneshotSender<ProbeReply>,
         now_ms: u64,
         pool: &'a PeerConnectionPool,
         inflight: &mut Inflight<'a>,
@@ -1115,19 +1151,25 @@ impl LivenessDriver {
                 };
                 let timeout = Duration::from_millis(self.timeout_for(target));
                 let envelope = self.envelope(body);
-                self.state.inflight = self.state.inflight.saturating_add(1);
-                self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
-                inflight.push(Box::pin(async move {
+                let asked = request.sequence;
+                // A relay the set refused drops its reply with it, which
+                // the asker reads as no answer.
+                let pushed = inflight.push_pinned(Box::pin(async move {
                     let result = probe(pool, target, &envelope, timeout).await;
                     Done::Relay {
                         target,
                         sequence,
                         sent_at_ms: now_ms,
-                        request,
+                        asked,
                         reply,
                         result,
                     }
                 }));
+                if pushed.is_ok() {
+                    self.state.inflight = self.state.inflight.saturating_add(1);
+                    self.state.counters.probes_sent =
+                        self.state.counters.probes_sent.saturating_add(1);
+                }
             }
         }
     }
@@ -1275,7 +1317,7 @@ impl LivenessDriver {
                 target,
                 sequence,
                 sent_at_ms,
-                request,
+                asked,
                 reply,
                 result,
             } => {
@@ -1290,7 +1332,7 @@ impl LivenessDriver {
                         target,
                         acknowledged,
                     },
-                    request.sequence,
+                    asked,
                     None,
                 );
                 self.answer_published(reply, answer);
@@ -1624,7 +1666,7 @@ async fn probe(
     envelope: &RequestEnvelope,
     timeout: Duration,
 ) -> Result<Vec<u8>, PeerSendError> {
-    match tokio::time::timeout(timeout, pool.send_probe(target, envelope)).await {
+    match focal_rt::time::timeout(timeout, pool.send_probe(target, envelope)).await {
         Ok(result) => result,
         Err(_) => Err(PeerSendError::Lost),
     }

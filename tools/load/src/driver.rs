@@ -16,7 +16,7 @@ use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Profile, Transport, WorkloadShape};
 use focal_client::{
-    Client, ClientError, EmbeddedTransport, QuicTransport, RetryPolicy, UnixTransport,
+    Client, ClientError, EmbeddedTransport, QuicTransport, RetryPolicy, LocalTransport,
 };
 use focal_ledger::NativeContentProfile;
 use focal_model::{
@@ -31,9 +31,9 @@ use focal_node::{
 use focal_wire::{
     AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply, NativeObject,
     NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant, PeerRole,
-    QuicConnector, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope, RouteHint,
-    WireLimits,
+    QuicConnector, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope, WireLimits,
 };
+use hyper_rt::combine::{Either, race2};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -65,18 +65,14 @@ const MAX_WALK_ENTRIES: usize = 100_000;
 /// Directory depth the size walk descends to.
 const MAX_WALK_DEPTH: usize = 16;
 
-/// What a worker opens its connection to; owned, so every worker thread
-/// carries its own and nothing is shared across threads.
-#[derive(Clone)]
+/// What the run's connections are opened to.
 enum Connector {
     Embedded(LocalHost),
     Unix(PathBuf),
-    /// An enrolled client's TLS and first route; each worker dials its own
-    /// QUIC connection with them.
-    Enrolled {
-        tls: quinn::ClientConfig,
-        initial: RouteHint,
-    },
+    /// An enrolled client's journal: each connection is dialed with a TLS
+    /// configuration made for it from the journal's credential, as a
+    /// connector takes the one it is bound with.
+    Enrolled(Box<focal_node::network_join::PendingClientJoin>),
 }
 
 /// The identities every frame names.
@@ -92,7 +88,7 @@ struct Names {
 
 enum Conn {
     Embedded(Client<EmbeddedTransport<LocalHost>>),
-    Unix(Client<UnixTransport>),
+    Unix(Client<LocalTransport>),
     Enrolled(Client<QuicTransport>),
 }
 impl Conn {
@@ -114,7 +110,7 @@ impl Conn {
                 )?))
             }
             Connector::Unix(socket) => {
-                let transport = UnixTransport::connect(socket, limits.clone())?;
+                let transport = LocalTransport::connect(socket, limits.clone())?;
                 Ok(Self::Unix(Client::new(
                     transport,
                     RetryPolicy::default(),
@@ -122,7 +118,9 @@ impl Conn {
                     1,
                 )?))
             }
-            Connector::Enrolled { tls, initial } => {
+            Connector::Enrolled(pending) => {
+                let client = pending.remote_client(unix_now()?, limits)?;
+                let initial = client.initial;
                 let address = if initial.endpoint.starts_with('[') {
                     "[::]:0"
                 } else {
@@ -130,10 +128,17 @@ impl Conn {
                 }
                 .parse()
                 .map_err(|_| LoadError::Shape("local address".into()))?;
-                let connector = QuicConnector::bind(address, tls.clone(), limits.clone())?;
+                // The connection's endpoint is its own owner, funded for its
+                // limits.
+                let connector = QuicConnector::bind(
+                    address,
+                    client.tls,
+                    limits.clone(),
+                    focal_wire::endpoint_budget(limits, None)?,
+                )?;
                 // One route, one connection: the transport's bound is the
                 // routes a client may hold, as the CLI's enrolled context.
-                let transport = QuicTransport::new(connector, initial.clone(), 16)?;
+                let transport = QuicTransport::new(connector, initial, 16)?;
                 Ok(Self::Enrolled(Client::new(
                     transport,
                     RetryPolicy::default(),
@@ -163,7 +168,6 @@ struct Job {
     count: u64,
     /// The first identity of this worker's space.
     base: u128,
-    connector: Connector,
     names: Names,
     limits: WireLimits,
     /// Read phase: the claims this worker created, cycled through.
@@ -499,10 +503,12 @@ impl Shared<'_> {
 /// to end, its latency still counted from its place; unpaced, `inflight` are
 /// kept under way. At one, a caller waits for each answer, as it always has.
 async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadError> {
-    use futures_util::StreamExt as _;
     let job = shared.job;
     let inflight = usize::from(inflight.max(1));
-    let mut flying = futures_util::stream::FuturesUnordered::new();
+    // The writes under way, in this task: a wake polls each of them, at most
+    // `inflight`.
+    let mut flying =
+        focal_rt::Concurrent::new(inflight).map_err(|_| LoadError::Bound("writes in flight"))?;
     let mut i = 0u64;
     loop {
         // The next write's place, while one is left: on the schedule, or now.
@@ -517,13 +523,36 @@ async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadE
         if due.is_none() && flying.is_empty() {
             return Ok(());
         }
-        let ready = due.is_some() && flying.len() < inflight;
-        tokio::select! {
-            () = tokio::time::sleep_until(due.unwrap_or_else(Instant::now).into()), if ready => {
-                flying.push(shared.write(i, due.unwrap_or_else(Instant::now)));
-                i = i.saturating_add(1);
+        match due.filter(|_| flying.len() < inflight) {
+            // A write is due and has room: it is sent at its place, unless
+            // one under way ends first.
+            Some(at) => {
+                let wait = focal_rt::time::pause(at.saturating_duration_since(Instant::now()));
+                let ended = if flying.is_empty() {
+                    wait.await;
+                    None
+                } else {
+                    match race2(wait, flying.join_next()).await {
+                        Either::First(()) => None,
+                        Either::Second(written) => Some(written),
+                    }
+                };
+                match ended {
+                    Some(Some(written)) => written?,
+                    Some(None) => {}
+                    None => {
+                        flying
+                            .push(shared.write(i, at))
+                            .map_err(|_| LoadError::Bound("writes in flight"))?;
+                        i = i.saturating_add(1);
+                    }
+                }
             }
-            Some(written) = flying.next(), if !flying.is_empty() => written?,
+            None => {
+                if let Some(written) = flying.join_next().await {
+                    written?;
+                }
+            }
         }
     }
 }
@@ -545,12 +574,11 @@ fn place(run_start: Instant, interval: Duration, job: &Job, i: u64) -> Result<In
         .ok_or(LoadError::Bound("schedule"))
 }
 
-fn worker(
+async fn worker(
     job: Job,
     phase: Phase,
     run_start: Instant,
     generations: &Generations,
-    runtime: &tokio::runtime::Runtime,
     conn: &Conn,
 ) -> Result<Outcome, LoadError> {
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
@@ -581,7 +609,7 @@ fn worker(
                 protocol: std::cell::Cell::new(0),
                 outcome: std::cell::RefCell::new(outcome),
             };
-            runtime.block_on(write_open_loop(&shared, job.inflight))?;
+            write_open_loop(&shared, job.inflight).await?;
             outcome = shared.outcome.into_inner();
         }
         Phase::Read => {
@@ -597,7 +625,7 @@ fn worker(
                     .ok_or(LoadError::Bound("read request id space"))?;
                 let envelope = read_envelope(&job.names, request, claim);
                 let started = Instant::now();
-                let result = runtime.block_on(conn.request(envelope));
+                let result = conn.request(envelope).await;
                 outcome.samples.push((
                     started.saturating_duration_since(run_start).as_nanos(),
                     started.elapsed().as_nanos(),
@@ -612,63 +640,68 @@ fn worker(
 }
 
 /// Runs one phase on every job at once and waits for all of them; the wall
-/// time is the phase's, from the first spawn to the last join.
-fn run_phase(
+/// time is the phase's, from the first caller's start to the last's end.
+///
+/// The callers run together in this task, on this shard, with the run's
+/// connections and generations: a client's requests from several callers
+/// are carried on its one connection together. A wake polls each caller
+/// still running; more throughput than one shard drives comes from more
+/// processes, as the generations already model one participant's.
+async fn run_phase(
     jobs: Vec<Job>,
     phase: Phase,
     generations: &Generations,
+    connector: &Connector,
     connections: u16,
 ) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
-    // The callers' clients, on one runtime they all drive: a QUIC endpoint
-    // binds to the runtime it is made in, and a client's requests from
-    // several callers are carried on its one connection together.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(usize::from(connections.clamp(1, 4)))
-        .enable_all()
-        .build()?;
     let Some(first) = jobs.first() else {
         return Err(LoadError::Bound("zero workers"));
     };
-    let conns = {
-        let _entered = runtime.enter();
-        (0..connections.max(1))
-            .map(|_| Conn::open(&first.connector, &first.names, &first.limits))
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let conns = (0..connections.max(1))
+        .map(|_| Conn::open(connector, &first.names, &first.limits))
+        .collect::<Result<Vec<_>, _>>()?;
     let run_start_epoch_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| LoadError::Clock)?
         .as_nanos();
     let run_start = Instant::now();
-    let outcomes = std::thread::scope(|scope| -> Result<Vec<Outcome>, LoadError> {
-        let mut handles = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            let conn = conns
-                .get(
-                    usize::from(job.index)
-                        .checked_rem(conns.len())
-                        .ok_or(LoadError::Bound("connections"))?,
-                )
-                .ok_or(LoadError::Bound("connections"))?;
-            let runtime = &runtime;
-            let handle = std::thread::Builder::new()
-                .name(format!("focal-load-{}", job.index))
-                .spawn_scoped(scope, move || {
-                    worker(job, phase, run_start, generations, runtime, conn)
-                })?;
-            handles.push(handle);
-        }
-        let mut outcomes = Vec::with_capacity(handles.len());
-        for handle in handles {
-            outcomes.push(
-                handle
-                    .join()
-                    .map_err(|_| LoadError::Worker("a worker thread ended without a result"))??,
-            );
-        }
-        Ok(outcomes)
-    })?;
-    Ok((outcomes, run_start.elapsed().as_nanos(), run_start_epoch_ns))
+    let mut callers =
+        focal_rt::Concurrent::new(jobs.len()).map_err(|_| LoadError::Bound("callers"))?;
+    for job in jobs {
+        let conn = conns
+            .get(
+                usize::from(job.index)
+                    .checked_rem(conns.len())
+                    .ok_or(LoadError::Bound("connections"))?,
+            )
+            .ok_or(LoadError::Bound("connections"))?;
+        let index = job.index;
+        callers
+            .push(async move { (index, worker(job, phase, run_start, generations, conn).await) })
+            .map_err(|_| LoadError::Bound("callers"))?;
+    }
+    let mut outcomes = Vec::with_capacity(callers.len());
+    while let Some((index, outcome)) = callers.join_next().await {
+        outcomes.push((index, outcome?));
+    }
+    // In the callers' order, whichever ended first.
+    outcomes.sort_unstable_by_key(|(index, _)| *index);
+    Ok((
+        outcomes.into_iter().map(|(_, outcome)| outcome).collect(),
+        run_start.elapsed().as_nanos(),
+        run_start_epoch_ns,
+    ))
+}
+
+/// The wall clock in seconds since the epoch, for a credential's validity.
+fn unix_now() -> Result<i64, LoadError> {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| LoadError::Clock)?
+            .as_secs(),
+    )
+    .map_err(|_| LoadError::Clock)
 }
 
 /// `total` split evenly over `parts`; the first `total % parts` parts get one more.
@@ -795,7 +828,12 @@ fn halves(samples: &mut [(u128, u128)]) -> Result<(Latency, Latency, Latency), L
     ))
 }
 
+/// The run on one shard of this thread, its root owning the node, the
+/// connections and the generations every caller shares.
 pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
+    focal_rt::block_on(run_on_shard(shape)).map_err(LoadError::Runtime)?
+}
+async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     let limits = WireLimits::default();
     let profile = content_profile(shape.profile());
 
@@ -885,14 +923,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 root: client.build.root,
                 profile,
             };
-            (
-                Connector::Enrolled {
-                    tls: client.tls,
-                    initial: client.initial,
-                },
-                names,
-                None,
-            )
+            (Connector::Enrolled(Box::new(pending)), names, None)
         }
     };
     // Paced writes: each worker's share of the offered rate, as a fixed
@@ -922,7 +953,6 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             callers: shape.concurrency,
             count: share(shape.claims, shape.concurrency, index)?,
             base: worker_base(shape.seed, u128::from(index))?,
-            connector: connector.clone(),
             names,
             limits: limits.clone(),
             created: Vec::new(),
@@ -933,7 +963,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     // participant share one (the audit's F12).
     let generations = Generations::new();
     let (write_outcomes, write_nanos, write_phase_start_epoch_ns) =
-        run_phase(jobs, Phase::Write, &generations, connections)?;
+        run_phase(jobs, Phase::Write, &generations, &connector, connections).await?;
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
@@ -977,8 +1007,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 callers: reader_count,
                 count: share(shape.reads, reader_count, index)?,
                 base: worker_base(shape.seed, u128::from(index))?,
-                connector: connector.clone(),
-                names,
+                    names,
                 limits: limits.clone(),
                 created: outcome.created.clone(),
                 // Reads are not paced: they measure the read path closed-loop.
@@ -989,8 +1018,10 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             jobs,
             Phase::Read,
             &generations,
+            &connector,
             reader_count.min(connections),
-        )?;
+        )
+        .await?;
         let reads = merged(&read_outcomes);
         let issued = u64::try_from(reads.samples.len()).map_err(|_| LoadError::Bound("reads"))?;
         let mut latencies: Vec<u128> = reads.samples.iter().map(|(_, latency)| *latency).collect();
@@ -1020,9 +1051,6 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 .rev()
                 .find_map(|outcome| outcome.created.last().copied())
             {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
                 let probe = Connector::Embedded(hosted.host.clone());
                 let conn = Conn::open(&probe, &names, &limits)?;
                 let request = worker_base(shape.seed, PROBE_WORKER)?
@@ -1030,7 +1058,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                     .ok_or(LoadError::Bound("probe id space"))?;
                 let envelope = read_envelope(&names, request, claim);
                 let started = Instant::now();
-                let result = runtime.block_on(conn.request(envelope));
+                let result = conn.request(envelope).await;
                 first_read_after_reopen_ns = Some(started.elapsed().as_nanos());
                 reopen_read_hit = Some(read_hit(&result));
                 drop(conn);

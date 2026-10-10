@@ -115,7 +115,7 @@ fn backend(
     settings: &Settings,
     selection: Option<&str>,
 ) -> Result<focal_mcp::Backend<impl focal_client::ClientTransport + 'static>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
+    if hyper_rt::futures::shard_id().is_some() {
         return Err(CliError::Input(
             "MCP foreground startup requires a blocking process owner".into(),
         ));
@@ -571,7 +571,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        assert!(runtime.block_on(async { serve(&settings, None) }).is_err());
+        assert!(async { serve(&settings, None) }.await.is_err());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

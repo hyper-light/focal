@@ -15,11 +15,10 @@ use focal_wire::{
     AuthenticatedPeer, MAX_PEER_CONTROL_REQUEST_BYTES, Operation, PROTOCOL_VERSION,
     PeerConnectionPool, PeerGrant, PeerRole, RequestEnvelope, RouteHint,
 };
+use focal_rt::time::Instant;
+use hyper_rt::combine::{Either, race2};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender};
 use std::{collections::BTreeSet, time::Duration};
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::Instant,
-};
 
 /// How long a resolved route is trusted without a refresh.
 const ROUTE_TTL_MS: u64 = 30_000;
@@ -42,19 +41,19 @@ pub struct ResolvedRoute {
 enum Work {
     Resolve {
         ledger: LedgerId,
-        reply: oneshot::Sender<Option<ResolvedRoute>>,
+        reply: OneshotSender<Option<ResolvedRoute>>,
     },
     /// The hint that points a client at one node at one epoch, from the
     /// pool's installed reachability.
     Hint {
         node: u64,
         epoch: RouteEpoch,
-        reply: oneshot::Sender<Option<RouteHint>>,
+        reply: OneshotSender<Option<RouteHint>>,
     },
 }
 #[derive(Clone)]
 pub struct RouteCacheHandle {
-    sender: mpsc::Sender<Work>,
+    sender: Sender<Work>,
 }
 impl RouteCacheHandle {
     pub fn channel(
@@ -69,7 +68,8 @@ impl RouteCacheHandle {
             .reserve(BudgetKind::Control, BudgetLane::Completion, STATE_BYTES)?
             .commit();
         let cache = RouteCache::new(config, budget.clone())?;
-        let (sender, receiver) = mpsc::channel(QUEUE);
+        let (sender, receiver) =
+            hyper_rt::sync::channel(QUEUE).map_err(|_| DirectoryError::Capacity)?;
         let mut client = [0; 16];
         let mut hash = blake3::Hasher::new_derive_key("focal.route-cache.client.v1");
         hash.update(&cluster);
@@ -93,11 +93,11 @@ impl RouteCacheHandle {
     }
     /// A hint at `node` (another node this one can reach) at `epoch`.
     pub async fn hint(&self, node: u64, epoch: RouteEpoch) -> Option<RouteHint> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().ok()?;
         self.sender
             .try_send(Work::Hint { node, epoch, reply })
             .ok()?;
-        tokio::time::timeout(RESOLVE_TIMEOUT, receive)
+        focal_rt::time::timeout(RESOLVE_TIMEOUT, receive)
             .await
             .ok()?
             .ok()?
@@ -105,16 +105,16 @@ impl RouteCacheHandle {
     /// The directory's route for `ledger`, or none when nothing is known in
     /// time; never an error the request path has to interpret.
     pub async fn resolve(&self, ledger: LedgerId) -> Option<ResolvedRoute> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().ok()?;
         self.sender.try_send(Work::Resolve { ledger, reply }).ok()?;
-        tokio::time::timeout(RESOLVE_TIMEOUT, receive)
+        focal_rt::time::timeout(RESOLVE_TIMEOUT, receive)
             .await
             .ok()?
             .ok()?
     }
 }
 pub struct RouteCacheDriver {
-    receiver: mpsc::Receiver<Work>,
+    receiver: ChannelReceiver<Work>,
     cache: RouteCache,
     node: u64,
     founder: u64,
@@ -128,22 +128,19 @@ impl RouteCacheDriver {
         let started = Instant::now();
         let mut next = started.checked_add(REFRESH).unwrap_or(started);
         loop {
-            tokio::select! {
-                biased;
-                work = self.receiver.recv() => {
-                    match work {
-                        Some(Work::Resolve { ledger, reply }) => {
-                            let now = elapsed_ms(started);
-                            let resolved = self.resolve(handles, pool, ledger, now).await;
-                            let _ = reply.send(resolved);
-                        }
-                        Some(Work::Hint { node, epoch, reply }) => {
-                            let _ = reply.send(self.hint(pool, node, epoch));
-                        }
-                        None => return,
-                    }
+            // Work first, then the refresh once it is due.
+            match race2(self.receiver.recv(), focal_rt::time::sleep_until(next)).await {
+                Either::First(Ok(Work::Resolve { ledger, reply })) => {
+                    let now = elapsed_ms(started);
+                    let resolved = self.resolve(handles, pool, ledger, now).await;
+                    let _ = reply.send(resolved);
                 }
-                () = tokio::time::sleep_until(next) => {
+                Either::First(Ok(Work::Hint { node, epoch, reply })) => {
+                    let _ = reply.send(self.hint(pool, node, epoch));
+                }
+                // Every handle is gone, or no wait could be kept.
+                Either::First(Err(_)) | Either::Second(Err(_)) => return,
+                Either::Second(Ok(())) => {
                     let at = Instant::now();
                     next = at.checked_add(REFRESH).unwrap_or(at);
                     self.refresh(handles, pool, elapsed_ms(started)).await;
@@ -226,7 +223,7 @@ impl RouteCacheDriver {
                 request,
             },
         };
-        let bytes = tokio::time::timeout(
+        let bytes = focal_rt::time::timeout(
             REMOTE_TIMEOUT,
             pool.send_peer_control(self.founder, &envelope),
         )

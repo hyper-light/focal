@@ -529,7 +529,7 @@ pub async fn apply(
                     if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    tokio::time::sleep(POLL).await;
+                    focal_rt::time::pause(POLL).await;
                 }
             }
             Change::PlanPartition {
@@ -596,7 +596,7 @@ pub async fn apply(
                     if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    tokio::time::sleep(POLL).await;
+                    focal_rt::time::pause(POLL).await;
                 }
             }
             Change::PlanSession {
@@ -691,7 +691,7 @@ pub async fn apply(
                     {
                         break;
                     }
-                    tokio::time::sleep(POLL).await;
+                    focal_rt::time::pause(POLL).await;
                     current = Current::of(&observe(admin, network).await?);
                 }
             }

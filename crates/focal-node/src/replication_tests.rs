@@ -252,7 +252,7 @@ async fn a_frame_whose_peer_holds_as_much_as_another_takes_the_others_newest_pla
                 told = Some(peer);
                 break;
             }
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
         }
         assert_eq!(told, Some(2));
         paths.open(2, 1);

@@ -127,7 +127,7 @@ pub async fn create(
         .map_err(|_| AccessError::Capacity)?;
     let now = now_ms()?;
     let target = output.clone();
-    let report = tokio::task::spawn_blocking(move || {
+    let report = focal_rt::on_pool(&focal_rt::FILES, move || {
         let mut medium = FileMedium;
         backup::write(
             &mut medium,

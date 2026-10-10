@@ -24,6 +24,7 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ParticipantId, RequestEpoch, RequestId, RouteEpoch, TenantId};
 use focal_wire::*;
 use futures_util::FutureExt;
+use hyper_rt::combine::{Either, race2};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -190,7 +191,7 @@ async fn wait_registered_grant(
     }
     let fingerprint = certificate_fingerprint(&receipt.certificate);
     std::panic::AssertUnwindSafe(async {
-        tokio::time::timeout(deadline, async {
+        focal_rt::time::timeout(deadline, async {
             loop {
                 if let Ok(peer) = registry.authenticate(fingerprint)
                     && peer.principal() == grant.principal
@@ -198,7 +199,7 @@ async fn wait_registered_grant(
                 {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                focal_rt::time::pause(Duration::from_millis(25)).await;
             }
         })
         .await
@@ -222,7 +223,7 @@ async fn observe_projection(
     host: &ControlHost,
     registry: &PeerRegistry,
 ) -> Result<Option<RootObservation>, ControllerError> {
-    let failure = match tokio::time::timeout(ROOT_OBSERVATION, host.observe_root()).await {
+    let failure = match focal_rt::time::timeout(ROOT_OBSERVATION, host.observe_root()).await {
         Ok(Ok(observation)) => return Ok(Some(observation)),
         Ok(Err(failure)) => Some(failure),
         Err(_) => None,
@@ -968,7 +969,7 @@ pub struct NetworkController {
     /// Where the founder's enrollment control learns the certificate the
     /// founder presents on its own behalf: published by a refresh once the
     /// registry grants it, so the control never presents an ungranted one.
-    presented: Option<tokio::sync::watch::Sender<[u8; 32]>>,
+    presented: Option<focal_rt::watch::Sender<[u8; 32]>>,
     /// The enrollment identity this node's listener presents (the
     /// founder's bootstrap server certificate; none elsewhere), replaced
     /// when the certificate succeeds itself (24 §11).
@@ -1012,7 +1013,7 @@ pub struct NetworkController {
     pin_reads: u64,
     /// The local socket's grant and the tenants it was bound with: every
     /// tenant the committed registry admits joins them on each refresh.
-    local_grant: Option<(tokio::sync::watch::Sender<PeerGrant>, BTreeSet<TenantId>)>,
+    local_grant: Option<(LocalGrant, BTreeSet<TenantId>)>,
     /// The failure-domain labels this node announces with its contact
     /// (24 §22).
     topology: crate::config::Topology,
@@ -1039,7 +1040,7 @@ impl NetworkController {
     /// Where to publish the fingerprint of the certificate this node
     /// presents, once its own registry grants it (the founder's enrollment
     /// control reads it).
-    pub fn with_presented(mut self, presented: tokio::sync::watch::Sender<[u8; 32]>) -> Self {
+    pub fn with_presented(mut self, presented: focal_rt::watch::Sender<[u8; 32]>) -> Self {
         self.presented = Some(presented);
         self
     }
@@ -1062,8 +1063,8 @@ impl NetworkController {
     }
     /// Keep a local socket's grant in step with the registry's admitted
     /// tenants ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §16).
-    pub fn follow_local_grant(&mut self, grant: tokio::sync::watch::Sender<PeerGrant>) {
-        let base = grant.borrow().tenants.clone();
+    pub fn follow_local_grant(&mut self, grant: LocalGrant) {
+        let base = grant.get().map(|grant| grant.tenants).unwrap_or_default();
         self.local_grant = Some((grant, base));
     }
     fn publish_local_grant(&self, enrollment: &EnrollmentRegistry) {
@@ -1072,7 +1073,7 @@ impl NetworkController {
         };
         let mut tenants = base.clone();
         tenants.extend(enrollment.tenants().map(TenantId));
-        grant.send_if_modified(|current| {
+        grant.update(|current| {
             if current.tenants == tenants {
                 return false;
             }
@@ -1150,7 +1151,7 @@ impl NetworkController {
             let _projection = projection;
             // A handle can be moved into a runtime without a timer driver. Consume
             // the failed controller at this dependency boundary; never reuse it.
-            if tokio::runtime::Handle::try_current().is_err() {
+            if hyper_rt::futures::shard_id().is_none() {
                 Err(ControllerError::Runtime)
             } else {
                 std::panic::AssertUnwindSafe(self.run_inner(pool, host, registry, swap))
@@ -1173,6 +1174,7 @@ impl NetworkController {
         let mut previous_time = None;
         let mut last_bootstrap_announce: Option<std::time::Instant> = None;
         let mut asked: Option<CredentialRequest> = None;
+        let mut requests_open = true;
         loop {
             let progress = host.progress();
             if progress.stopped {
@@ -1203,13 +1205,13 @@ impl NetworkController {
                         {
                             last_bootstrap_announce = Some(std::time::Instant::now());
                             if let Ok(result) =
-                                tokio::time::timeout(ANNOUNCE_ROUND, self.announce_unobserved(pool))
+                                focal_rt::time::timeout(ANNOUNCE_ROUND, self.announce_unobserved(pool))
                                     .await
                             {
                                 result?;
                             }
                         }
-                        tokio::time::sleep(OBSERVATION_RETRY).await;
+                        focal_rt::time::pause(OBSERVATION_RETRY).await;
                         continue;
                     }
                 };
@@ -1229,7 +1231,7 @@ impl NetworkController {
                 // An unavailable route must not delay projection refresh or
                 // expiration for an entire discovery sweep. Cancellation is an
                 // unknown outcome; the next round uses this exact contact key.
-                if let Ok(result) = tokio::time::timeout(
+                if let Ok(result) = focal_rt::time::timeout(
                     ANNOUNCE_ROUND,
                     self.announce(current, pool, host, registry),
                 )
@@ -1247,7 +1249,7 @@ impl NetworkController {
                 .await;
             self.maintain_bootstrap_server(&swap, now).await;
             self.maintain_issuer(now).await;
-            self.present_trust(pool, &swap)?;
+            self.present_trust(pool, &swap).await?;
             // A credential request is served on the root as it is applied
             // now: one taken below is served at the top of the next pass,
             // after the refresh that reads what the root committed since.
@@ -1262,11 +1264,21 @@ impl NetworkController {
                     .await;
                 continue;
             }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(250)) => {}
-                request = swap.requests.recv() => {
-                    asked = request;
+            // A queue whose every handle went has nothing more to ask: the pause alone paces
+            // the loop then, never a closed queue's answer at once.
+            if requests_open {
+                match race2(
+                    focal_rt::time::pause(Duration::from_millis(250)),
+                    swap.requests.recv(),
+                )
+                .await
+                {
+                    Either::First(()) => {}
+                    Either::Second(Ok(request)) => asked = Some(request),
+                    Either::Second(Err(_)) => requests_open = false,
                 }
+            } else {
+                focal_rt::time::pause(Duration::from_millis(250)).await;
             }
         }
     }
@@ -1356,6 +1368,7 @@ impl NetworkController {
             && let (Some(listener), Some(identity)) = (&swap.listener, &self.enrollment_identity)
             && listener
                 .replace(&self.credentials, Some(identity), &roots)
+                .await
                 .is_ok()
         {
             self.enrollment_unpresented = false;
@@ -1368,11 +1381,14 @@ impl NetworkController {
         // Nothing to do, or a step that failed, is taken again at the
         // cadence above: the certificate presented serves on.
         if let Ok(Some(identity)) = sponsor.maintain_bootstrap_server(now).await {
-            self.enrollment_unpresented = !swap.listener.as_ref().is_some_and(|listener| {
-                listener
+            let presented = match swap.listener.as_ref() {
+                Some(listener) => listener
                     .replace(&self.credentials, Some(&identity), &roots)
-                    .is_ok()
-            });
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            self.enrollment_unpresented = !presented;
             self.enrollment_identity = Some(identity);
         }
     }
@@ -1393,7 +1409,7 @@ impl NetworkController {
     /// Present the issuers adopted from the registry (24 §11) to the
     /// listener — for the clients it verifies — and to the pool — for the
     /// peers it dials — once they changed.
-    fn present_trust(
+    async fn present_trust(
         &mut self,
         pool: &PeerConnectionPool,
         swap: &CredentialSwap,
@@ -1405,6 +1421,7 @@ impl NetworkController {
         if let Some(listener) = &swap.listener {
             listener
                 .replace(&self.credentials, self.enrollment_identity.as_ref(), &roots)
+                .await
                 .map_err(|_| ControllerError::Identity)?;
         }
         let tls = client_tls(
@@ -1417,13 +1434,14 @@ impl NetworkController {
         )
         .map_err(|_| ControllerError::Identity)?;
         pool.replace_identity(tls)
+            .await
             .map_err(|_| ControllerError::Identity)?;
         self.trust_changed = false;
         Ok(())
     }
     /// Present a credential everywhere at once: the listener, the peer
     /// pool and the placement agent.
-    fn present(
+    async fn present(
         &mut self,
         pool: &PeerConnectionPool,
         swap: &CredentialSwap,
@@ -1438,6 +1456,7 @@ impl NetworkController {
                 self.enrollment_identity.as_ref(),
                 &self.state.sponsor.root_certificates(),
             )
+            .await
             .map_err(|_| RenewalError::Install)?;
         let tls = client_tls(
             TlsIdentity::from_pkcs8(
@@ -1449,6 +1468,7 @@ impl NetworkController {
         )
         .map_err(|_| RenewalError::Install)?;
         pool.replace_identity(tls)
+            .await
             .map_err(|_| RenewalError::Install)?;
         swap.placement
             .replace_credentials(material.clone())
@@ -1512,7 +1532,7 @@ impl NetworkController {
             .map_err(|_| RenewalError::Install)?;
         drop(key);
         drop(next);
-        self.present(pool, swap, material, receipt)?;
+        self.present(pool, swap, material, receipt).await?;
         self.rotations = self.rotations.saturating_add(1);
         Ok(())
     }
@@ -1540,7 +1560,7 @@ impl NetworkController {
             .map_err(|_| RenewalError::Install)?;
         drop(key);
         drop(next);
-        self.present(pool, swap, material, receipt)?;
+        self.present(pool, swap, material, receipt).await?;
         self.rotations = self.rotations.saturating_add(1);
         Ok(())
     }
@@ -1681,7 +1701,7 @@ impl NetworkController {
             .renew(&receipt, self.state.sponsor.issuers.iter(), now)
             .map_err(|_| RenewalError::Install)?;
         drop(key);
-        self.present(pool, swap, material, receipt)?;
+        self.present(pool, swap, material, receipt).await?;
         self.renewals = self.renewals.saturating_add(1);
         Ok(())
     }
@@ -1737,7 +1757,7 @@ impl NetworkController {
             if issued_by_held(&self.state.sponsor.issuers) {
                 return Ok(());
             }
-            tokio::time::sleep(OBSERVATION_RETRY).await;
+            focal_rt::time::pause(OBSERVATION_RETRY).await;
         }
     }
     fn refresh(
@@ -2182,7 +2202,7 @@ impl NetworkController {
                     .ok()?,
             },
         };
-        let response = tokio::time::timeout(
+        let response = focal_rt::time::timeout(
             Duration::from_secs(1),
             pool.send_peer_control(target, &request),
         )
@@ -2216,7 +2236,7 @@ impl NetworkController {
         // The preferred peer has its own deadline below the round deadline;
         // stale leader progress cannot consume every round before discovery.
         if self.routes.contains_key(&leader)
-            && let Ok(Ok(response)) = tokio::time::timeout(
+            && let Ok(Ok(response)) = focal_rt::time::timeout(
                 pool.exchange_wait(leader, ANNOUNCE_ROUND, ANNOUNCE_PROBES),
                 pool.send_peer_control(leader, request),
             )
@@ -2244,7 +2264,7 @@ impl NetworkController {
             if target == leader {
                 continue;
             }
-            if let Ok(Ok(response)) = tokio::time::timeout(
+            if let Ok(Ok(response)) = focal_rt::time::timeout(
                 pool.exchange_wait(target, ANNOUNCE_ROUND, ANNOUNCE_PROBES),
                 pool.send_peer_control(target, request),
             )

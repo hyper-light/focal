@@ -25,7 +25,7 @@ impl ReplicaHost {
                 DIAGNOSTICS_BYTES,
             )?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Diagnostics(send, charge))
             .map_err(|error| match error {
@@ -154,7 +154,7 @@ mod tests {
         .unwrap();
         let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
         let (sender, _receiver) = mpsc::sync_channel(4);
-        let (outbound, _outgoing) = async_mpsc::channel(16);
+        let (outbound, _outgoing) = hyper_rt::sync::channel(16).map_err(|_| LedgerError::Capacity)?;
         let (_host, mut owner) = ReplicaHost::assemble(
             session,
             ReplicaConfig::new(RootCommandId::from_u128(503)),
@@ -167,7 +167,7 @@ mod tests {
         .unwrap();
         assert!(!owner.session.managed_support_demanded());
         let baseline = budget.stats().used;
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         let charge = budget
             .reserve(
                 BudgetKind::Control,

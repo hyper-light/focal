@@ -9,13 +9,16 @@ use crate::{
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use focal_rt::Concurrent;
+use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     pin::Pin,
 };
-use tokio::sync::{mpsc, oneshot};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError};
+use std::pin::pin;
+use std::task::Poll;
 
 const JOB_BYTES: usize = 8 * 1024 * 1024;
 
@@ -225,20 +228,20 @@ impl EvidenceWitness {
 }
 
 enum JobKind {
-    Seal(oneshot::Sender<Result<ContentRef, AccessError>>),
-    Attest(oneshot::Sender<Result<EvidencedRequest, AccessError>>),
-    AttestNative(oneshot::Sender<Result<NativeEvidencedRequest, AccessError>>),
+    Seal(OneshotSender<Result<ContentRef, AccessError>>),
+    Attest(OneshotSender<Result<EvidencedRequest, AccessError>>),
+    AttestNative(OneshotSender<Result<NativeEvidencedRequest, AccessError>>),
     /// The custody obligation of one object, with the request handed back.
     Obligation(
         ContentRef,
-        oneshot::Sender<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
+        OneshotSender<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
     ),
     /// Seal an archive bundle (26 §4) as content of the ledger under its
     /// current placement, replicate it to every required copy and report
     /// the obligation.
     Archive {
         bytes: Vec<u8>,
-        reply: oneshot::Sender<Result<ArchiveOutcome, AccessError>>,
+        reply: OneshotSender<Result<ArchiveOutcome, AccessError>>,
     },
     /// Re-verify every object the session's committed artifact projection
     /// names on this node, recopy what is missing from another required
@@ -247,7 +250,7 @@ enum JobKind {
         snapshot: Box<focal_ledger::DurableEvidenceSnapshot>,
         after: Option<ArtifactId>,
         limit: u32,
-        reply: oneshot::Sender<Result<RepairReport, AccessError>>,
+        reply: OneshotSender<Result<RepairReport, AccessError>>,
     },
 }
 /// A sealed archive bundle: the object that names it and which required
@@ -340,39 +343,39 @@ struct PlacementRow {
 struct Replacement {
     expected: Option<CustodyScope>,
     row: PlacementRow,
-    reply: oneshot::Sender<Result<(), AccessError>>,
+    reply: OneshotSender<Result<(), AccessError>>,
 }
 enum Completed {
     Seal {
         scope: Option<CustodyScope>,
         result: Result<ContentRef, AccessError>,
-        reply: oneshot::Sender<Result<ContentRef, AccessError>>,
+        reply: OneshotSender<Result<ContentRef, AccessError>>,
         _allocation: Allocation,
     },
     Attest {
         scope: Option<CustodyScope>,
         result: Box<Result<EvidencedRequest, AccessError>>,
-        reply: oneshot::Sender<Result<EvidencedRequest, AccessError>>,
+        reply: OneshotSender<Result<EvidencedRequest, AccessError>>,
     },
     AttestNative {
         scope: Option<CustodyScope>,
         result: Box<Result<NativeEvidencedRequest, AccessError>>,
-        reply: oneshot::Sender<Result<NativeEvidencedRequest, AccessError>>,
+        reply: OneshotSender<Result<NativeEvidencedRequest, AccessError>>,
     },
     Obligation {
         scope: Option<CustodyScope>,
         result: Box<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
-        reply: oneshot::Sender<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
+        reply: OneshotSender<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
     },
     Archive {
         scope: Option<CustodyScope>,
         result: Box<Result<ArchiveOutcome, AccessError>>,
-        reply: oneshot::Sender<Result<ArchiveOutcome, AccessError>>,
+        reply: OneshotSender<Result<ArchiveOutcome, AccessError>>,
     },
     Repair {
         scope: Option<CustodyScope>,
         result: Box<Result<RepairReport, AccessError>>,
-        reply: oneshot::Sender<Result<RepairReport, AccessError>>,
+        reply: OneshotSender<Result<RepairReport, AccessError>>,
     },
 }
 impl Completed {
@@ -475,13 +478,13 @@ impl Completed {
 }
 #[derive(Clone)]
 pub struct EvidenceCoordinator {
-    sender: mpsc::Sender<Job>,
-    control: mpsc::Sender<Replacement>,
+    sender: Sender<Job>,
+    control: Sender<Replacement>,
     budget: MemoryBudget,
 }
 pub struct EvidenceDriver {
-    receiver: mpsc::Receiver<Job>,
-    control: mpsc::Receiver<Replacement>,
+    receiver: ChannelReceiver<Job>,
+    control: ChannelReceiver<Replacement>,
     content: ContentHost,
     node: u64,
     placements: BTreeMap<LedgerId, PlacementRow>,
@@ -546,8 +549,9 @@ impl EvidenceCoordinator {
                 },
             );
         }
-        let (sender, receiver) = mpsc::channel(concurrency);
-        let (control, updates) = mpsc::channel(1);
+        let (sender, receiver) =
+            hyper_rt::sync::channel(concurrency).map_err(|_| AccessError::Capacity)?;
+        let (control, updates) = hyper_rt::sync::channel(1).map_err(|_| AccessError::Capacity)?;
         Ok((
             Self {
                 sender,
@@ -588,17 +592,17 @@ impl EvidenceCoordinator {
                 _allocation: allocation,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+                SyncError::Full(_) => AccessError::Capacity,
+                _ => AccessError::Unavailable,
             })
     }
     pub async fn seal(&self, request: VerifiedRequest) -> Result<ContentRef, AccessError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.admit(request, JobKind::Seal(send))?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
     pub async fn attest(&self, request: VerifiedRequest) -> Result<EvidencedRequest, AccessError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.admit(request, JobKind::Attest(send))?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
@@ -609,7 +613,7 @@ impl EvidenceCoordinator {
         &self,
         request: VerifiedRequest,
     ) -> Result<NativeEvidencedRequest, AccessError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.admit(request, JobKind::AttestNative(send))?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
@@ -622,7 +626,7 @@ impl EvidenceCoordinator {
         request: VerifiedRequest,
         reference: ContentRef,
     ) -> Result<(CustodyObligation, VerifiedRequest), AccessError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.admit(request, JobKind::Obligation(reference, send))?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
@@ -646,7 +650,7 @@ impl EvidenceCoordinator {
             .reserve(BudgetKind::Payload, BudgetLane::Ordinary, charge)
             .map_err(|_| AccessError::Capacity)?
             .commit();
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.sender
             .try_send(Job {
                 request: None,
@@ -656,8 +660,8 @@ impl EvidenceCoordinator {
                 _allocation: allocation,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+                SyncError::Full(_) => AccessError::Capacity,
+                _ => AccessError::Unavailable,
             })?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
@@ -681,7 +685,7 @@ impl EvidenceCoordinator {
             .commit();
         let ledger = snapshot.prefix().ledger;
         let route = snapshot.prefix().route;
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.sender
             .try_send(Job {
                 request: None,
@@ -696,8 +700,8 @@ impl EvidenceCoordinator {
                 _allocation: allocation,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+                SyncError::Full(_) => AccessError::Capacity,
+                _ => AccessError::Unavailable,
             })?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
@@ -723,7 +727,7 @@ impl EvidenceCoordinator {
             )
             .map_err(|_| AccessError::Capacity)?
             .commit();
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.control
             .try_send(Replacement {
                 expected,
@@ -734,15 +738,30 @@ impl EvidenceCoordinator {
                 reply,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+                SyncError::Full(_) => AccessError::Capacity,
+                _ => AccessError::Unavailable,
             })?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
 }
+/// What the evidence driver takes next: a placement's replacement or a job
+/// (in the turn's slots, so a turn is a word and each is moved once), the
+/// end of either queue, or a job that ended.
+enum Turn<D> {
+    Update,
+    Job,
+    Closed(Queue, SyncError<()>),
+    Done(D),
+}
+/// The driver's two queues.
+#[derive(Clone, Copy)]
+enum Queue {
+    Updates,
+    Jobs,
+}
 impl EvidenceDriver {
     pub async fn run(self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(AccessError::Unavailable);
         }
         std::panic::AssertUnwindSafe(self.run_inner(pool))
@@ -753,7 +772,7 @@ impl EvidenceDriver {
     async fn run_inner(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
         let content = self.content.clone();
         let node = self.node;
-        let mut tasks = FuturesUnordered::new();
+        let mut tasks = Concurrent::new(self.concurrency).map_err(|_| AccessError::Capacity)?;
         // The participant jobs in flight, by what each is, and the jobs of
         // the same identity that run after each: an exact retry that comes
         // while its first is in flight (its client gave up the exchange
@@ -770,46 +789,89 @@ impl EvidenceDriver {
         let mut receiving = true;
         let mut updates = true;
         while receiving || updates || !tasks.is_empty() {
-            tokio::select! {
-                biased;
-                update = self.control.recv(), if updates => {
-                    if let Some(update) = update {
-                        let result = self.replace(update.expected, update.row).await;
-                        let _ = update.reply.send(result);
-                    } else {updates=false;}
+            // A placement's replacement first, then a job while there is
+            // room for one, then a job that ended.
+            let mut update_slot = None;
+            let mut job_slot = None;
+            let turn = std::future::poll_fn(|cx| {
+                if updates && let Poll::Ready(update) = pin!(self.control.recv()).poll(cx) {
+                    return Poll::Ready(match update {
+                        Ok(update) => {
+                            update_slot = Some(update);
+                            Turn::Update
+                        }
+                        Err(closed) => Turn::Closed(Queue::Updates, closed),
+                    });
                 }
-                job = self.receiver.recv(), if receiving && tasks.len() < self.concurrency => {
-                    if let Some(job) = job {
-                        let identity = job.identity();
-                        match identity.and_then(|identity| same.get_mut(&identity)) {
-                            Some(after) => {
-                                if after.len() < self.concurrency && after.try_reserve(1).is_ok() {
-                                    after.push_back(job);
-                                } else {
-                                    job.refuse(AccessError::Capacity);
-                                }
-                            }
-                            None => {
-                                if let Some(identity) = identity {
-                                    same.insert(identity, VecDeque::new());
-                                }
-                                let placement = self.snapshot(job.ledger, job.route);
-                                tasks.push(begin(placement, identity, job));
+                if receiving
+                    && tasks.len() < self.concurrency
+                    && let Poll::Ready(job) = pin!(self.receiver.recv()).poll(cx)
+                {
+                    return Poll::Ready(match job {
+                        Ok(job) => {
+                            job_slot = Some(job);
+                            Turn::Job
+                        }
+                        Err(closed) => Turn::Closed(Queue::Jobs, closed),
+                    });
+                }
+                if !tasks.is_empty()
+                    && let Poll::Ready(Some(done)) = tasks.poll_next(cx)
+                {
+                    return Poll::Ready(Turn::Done(done));
+                }
+                Poll::Pending
+            })
+            .await;
+            match turn {
+                Turn::Update => {
+                    let Some(update) = update_slot.take() else {
+                        continue;
+                    };
+                    let result = self.replace(update.expected, update.row).await;
+                    let _ = update.reply.send(result);
+                }
+                Turn::Closed(Queue::Updates, SyncError::Closed(())) => updates = false,
+                Turn::Job => {
+                    let Some(job) = job_slot.take() else {
+                        continue;
+                    };
+                    let identity = job.identity();
+                    match identity.and_then(|identity| same.get_mut(&identity)) {
+                        Some(after) => {
+                            if after.len() < self.concurrency && after.try_reserve(1).is_ok() {
+                                after.push_back(job);
+                            } else {
+                                job.refuse(AccessError::Capacity);
                             }
                         }
-                    } else { receiving = false; }
-                }
-                done = tasks.next(), if !tasks.is_empty() => {
-                    if let Some((identity, done)) = done {
-                        done.send(&self.placements);
-                        if let Some(identity) = identity
-                            && let Some(mut after) = same.remove(&identity)
-                            && let Some(job) = after.pop_front()
-                        {
-                            same.insert(identity, after);
+                        None => {
+                            if let Some(identity) = identity {
+                                same.insert(identity, VecDeque::new());
+                            }
                             let placement = self.snapshot(job.ledger, job.route);
-                            tasks.push(begin(placement, Some(identity), job));
+                            // Room was seen before the job was taken.
+                            tasks
+                                .push(begin(placement, identity, job))
+                                .map_err(|_| AccessError::Capacity)?;
                         }
+                    }
+                }
+                Turn::Closed(Queue::Jobs, SyncError::Closed(())) => receiving = false,
+                // No wait could be kept: the driver is off its shard.
+                Turn::Closed(_, _) => return Err(AccessError::Unavailable),
+                Turn::Done((identity, done)) => {
+                    done.send(&self.placements);
+                    if let Some(identity) = identity
+                        && let Some(mut after) = same.remove(&identity)
+                        && let Some(job) = after.pop_front()
+                    {
+                        same.insert(identity, after);
+                        let placement = self.snapshot(job.ledger, job.route);
+                        // The place of the job that ended.
+                        tasks
+                            .push(begin(placement, Some(identity), job))
+                            .map_err(|_| AccessError::Capacity)?;
                     }
                 }
             }
@@ -1164,11 +1226,12 @@ async fn repair(
         // copy outside the residency boundary is neither asked nor given.
         // They are asked at once: a copy that answers late or not at all
         // delays no other.
-        let mut copies = FuturesUnordered::new();
+        let mut copies =
+            Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
         for peer in placement.copies.iter().copied() {
             if peer != node && placement.fence.admits(peer) {
                 let reference = &reference;
-                copies.push(async move {
+                let asked = copies.push(async move {
                     if holds(pool, peer, scope, transfer, reference).await {
                         content
                             .record_receipt(scope, receipt_for(scope, peer, reference))
@@ -1181,10 +1244,12 @@ async fn repair(
                             .is_ok(),
                     )
                 });
+                // One for each copy: within the set's bound.
+                asked.map_err(|_| AccessError::Capacity)?;
             }
         }
         let mut failed = None;
-        while let Some(given) = copies.next().await {
+        while let Some(given) = copies.join_next().await {
             match given {
                 Ok(true) => {
                     report.pushed = report.pushed.checked_add(1).ok_or(AccessError::Capacity)?;
@@ -1230,8 +1295,10 @@ async fn holds(
 /// megabyte at most and goes by a stream of its own, which carries a
 /// megabyte in a round trip, so a transfer carries as many as it has
 /// streams. `width` is asked whenever a chunk is begun, since it is what
-/// the path holds now (`PeerConnectionPool::bulk_width`); `moved` moves
-/// one chunk. A copy takes the chunks of a manifest in any order.
+/// the path holds now (`PeerConnectionPool::bulk_width`), and never more
+/// than `lane`, the streams a transfer may take at all
+/// (`PeerConnectionPool::bulk_lane`); `moved` moves one chunk. A copy
+/// takes the chunks of a manifest in any order.
 ///
 /// What the copy has room for is found as a sender finds what a path
 /// carries (RFC 5681 §3.1): a chunk refused the room while another is in
@@ -1246,6 +1313,7 @@ async fn holds(
 /// that was lacked, once.
 async fn striped<F>(
     width: impl Fn() -> usize,
+    lane: usize,
     lacked: std::ops::Range<u32>,
     held: impl Fn(u32) -> bool,
     moved: impl Fn(u32) -> F,
@@ -1269,16 +1337,21 @@ where
     let mut refused = 0_usize;
     // How many were begun and are not answered.
     let mut open = 0_usize;
-    let mut flying = FuturesUnordered::new();
+    // Never more than the path's streams carry at once (`lane`, the pool's
+    // bulk lane): the set's bound.
+    let lane = lane.max(1);
+    let mut flying = Concurrent::new(lane).map_err(|_| AccessError::Capacity)?;
     loop {
         let keep = if ordered {
             1
         } else {
-            width().min(most.unwrap_or(usize::MAX)).max(1)
+            width().min(most.unwrap_or(usize::MAX)).clamp(1, lane)
         };
         while flying.len() < keep {
             if let Some(index) = again.pop_first() {
-                flying.push(attempt(index));
+                flying
+                    .push(attempt(index))
+                    .map_err(|_| AccessError::Capacity)?;
             } else if next < lacked.end {
                 let index = next;
                 next = next.checked_add(1).ok_or(AccessError::Capacity)?;
@@ -1287,12 +1360,14 @@ where
                     continue;
                 }
                 open = open.saturating_add(1);
-                flying.push(attempt(index));
+                flying
+                    .push(attempt(index))
+                    .map_err(|_| AccessError::Capacity)?;
             } else {
                 break;
             }
         }
-        match flying.next().await {
+        match flying.join_next().await {
             None => return Ok(()),
             Some((_, Ok(()))) => {
                 open = open.saturating_sub(1);
@@ -1319,7 +1394,7 @@ where
                 );
             }
             Some((_, Err(AccessError::InvalidRequest))) if !ordered => {
-                flying = FuturesUnordered::new();
+                flying.clear();
                 again.clear();
                 open = 0;
                 refused = 0;
@@ -1342,6 +1417,7 @@ async fn send_chunks(
 ) -> Result<(), AccessError> {
     striped(
         || pool.bulk_width(peer),
+        pool.bulk_lane(),
         lacked.range.clone(),
         |index| lacked.held.holds(index),
         async |index: u32| {
@@ -1569,12 +1645,12 @@ async fn obligation(
     );
     // The copies without a receipt are asked at once: one that answers
     // late or not at all delays no other.
-    let mut copies = FuturesUnordered::new();
+    let mut copies = Concurrent::new(required.len()).map_err(|_| AccessError::Capacity)?;
     for peer in required.iter().copied() {
         if !placement.fence.admits(peer) {
             continue;
         }
-        copies.push(async move {
+        let asked = copies.push(async move {
             if content
                 .receipt(scope, reference.root, peer)
                 .await?
@@ -1601,9 +1677,11 @@ async fn obligation(
             }
             Ok::<_, AccessError>(durable.then_some(peer))
         });
+        // One for each copy: within the set's bound.
+        asked.map_err(|_| AccessError::Capacity)?;
     }
     let mut failed = None;
-    while let Some(answered) = copies.next().await {
+    while let Some(answered) = copies.join_next().await {
         match answered {
             Ok(Some(peer)) => {
                 held.insert(peer);
@@ -1986,7 +2064,8 @@ async fn replicate(
     // copy that fails or answers late delays no other, and what the others
     // took they hold whatever became of it. The first failure is what the
     // replication failed with.
-    let mut copies = FuturesUnordered::new();
+    let mut copies =
+        Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
     for peer in placement
         .copies
         .iter()
@@ -1994,12 +2073,15 @@ async fn replicate(
         .filter(|peer| *peer != node)
     {
         placement.admits(peer)?;
-        copies.push(replicate_to(
-            content, pool, scope, transfer, peer, reference,
-        ));
+        // One for each copy: within the set's bound.
+        copies
+            .push(replicate_to(
+                content, pool, scope, transfer, peer, reference,
+            ))
+            .map_err(|_| AccessError::Capacity)?;
     }
     let mut failed = None;
-    while let Some(replicated) = copies.next().await {
+    while let Some(replicated) = copies.join_next().await {
         if let Err(error) = replicated {
             failed.get_or_insert(error);
         }
@@ -2124,6 +2206,7 @@ async fn pull(
         .map_err(|_| AccessError::Capacity)?;
     striped(
         || pool.bulk_width(peer),
+        pool.bulk_lane(),
         0..chunks,
         |index| held.holds(index),
         async |index: u32| {

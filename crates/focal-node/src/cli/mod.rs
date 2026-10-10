@@ -36,7 +36,7 @@ pub(super) use args::{Commands, RequestArgs, RequestCommand};
 pub(super) fn check_request_file(path: &std::path::Path) -> Result<()> {
     request_files::check(path)
 }
-use focal_client::{Client, ClientError, RetryPolicy, UnixTransport, input::*, pending::*};
+use focal_client::{Client, ClientError, RetryPolicy, LocalTransport, input::*, pending::*};
 use focal_model::*;
 use focal_node::{config::Settings, embedded::decode_identity};
 use focal_wire::*;
@@ -153,7 +153,7 @@ impl Context {
                     CliError::Input(format!("invalid local node client context: {error}"))
                 })?;
         let limits = WireLimits::default();
-        let transport = UnixTransport::connect(root.join("focal.sock"), limits.clone())
+        let transport = LocalTransport::connect(root.join("focal.sock"), limits.clone())
             .map_err(|e| CliError::Other(Box::new(e)))?;
         let client = Client::new(
             context::Transport::Unix(transport),
@@ -209,6 +209,30 @@ impl Context {
         })
     }
 }
+/// Ctrl-C, awaited beside a command's own waits: a follow or a list it ends
+/// stops at a page boundary with what was flushed intact.
+pub(super) struct Interrupt(hyper_rt::signal::SignalStream);
+impl Interrupt {
+    pub(super) fn subscribe() -> std::io::Result<Self> {
+        hyper_rt::signal::subscribe(&[hyper_rt::signal::Signal::Interrupt])
+            .map(Self)
+            .map_err(std::io::Error::other)
+    }
+    /// Waits for Ctrl-C; an error when no wait could be kept.
+    pub(super) async fn wait(&self) -> std::io::Result<()> {
+        self.0.recv().await.map(|_| ()).map_err(std::io::Error::other)
+    }
+}
+/// Buffers of the streaming commands' standard output, and their size: a
+/// page is written a chunk at a time, at most this much in flight.
+const STDOUT_BUFFERS: usize = 4;
+const STDOUT_CHUNK: usize = 64 * 1024;
+/// The process's standard output for a streaming command, written by the
+/// runtime's writer thread: a write waiting on a slow reader is raced
+/// against Ctrl-C like every other wait. Taken once in a process.
+pub(super) fn streaming_stdout() -> std::io::Result<hyper_rt::stdio::Stdout> {
+    hyper_rt::stdio::stdout(STDOUT_BUFFERS, STDOUT_CHUNK).map_err(std::io::Error::other)
+}
 fn random_id() -> std::result::Result<[u8; 16], InputError> {
     let mut bytes = [0; 16];
     getrandom::fill(&mut bytes).map_err(|_| InputError::Identity)?;
@@ -217,38 +241,35 @@ fn random_id() -> std::result::Result<[u8; 16], InputError> {
     }
     Ok(bytes)
 }
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn run(
     settings: &Settings,
     command: Commands,
     selection: Option<&str>,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
-    if let focal_client::operations::Engine::Native(standing) = native::detect(runtime, &context)? {
-        return native::run(runtime, &context, command, &standing);
+    if let focal_client::operations::Engine::Native(standing) = native::detect(&context).await? {
+        return native::run(&context, command, &standing).await;
     }
     let command = match command {
         Commands::Claim {
             command: ClaimCommand::Wait(args),
-        } => return claim_wait::run(runtime, &context, args),
+        } => return claim_wait::run(&context, args).await,
         Commands::Monitor {
             command: monitor::MonitorCommand::Get(args),
-        } => return monitor::get(runtime, &context, args),
+        } => return monitor::get(&context, args).await,
         Commands::Watch { command } => {
-            return watch::run(
-                runtime,
-                &context,
+            return watch::run(&context,
                 command,
                 focal_client::watch::WatchEngine::Legacy,
-            );
+            ).await;
         }
-        Commands::Ledger { command } => return graph::run(runtime, &context, command),
-        Commands::Validator { command } => return validators::run(runtime, &context, command),
+        Commands::Ledger { command } => return graph::run(&context, command).await,
+        Commands::Validator { command } => return validators::run(&context, command).await,
         Commands::Artifact {
             command: ArtifactCommand::Upload { command },
-        } => return upload_control::run(runtime, &context, command),
-        Commands::Get { command } => return reads::get(runtime, &context, command),
-        Commands::List { command } => return reads::list(runtime, &context, command),
+        } => return upload_control::run(&context, command).await,
+        Commands::Get { command } => return reads::get(&context, command).await,
+        Commands::List { command } => return reads::list(&context, command).await,
         Commands::Artifact {
             command: ArtifactCommand::Register(args),
         } if args
@@ -256,7 +277,7 @@ pub(super) fn run(
             .as_ref()
             .is_some_and(|path| path != std::path::Path::new("-")) =>
         {
-            return upload::register(runtime, &context, *args);
+            return upload::register(&context, *args).await;
         }
         Commands::Submit {
             command: SubmitCommand::Artifact(args),
@@ -265,23 +286,22 @@ pub(super) fn run(
             .as_ref()
             .is_some_and(|path| path != std::path::Path::new("-")) =>
         {
-            return upload::artifact(runtime, &context, args);
+            return upload::artifact(&context, args).await;
         }
         command => command,
     };
     let (authored, options) = authored::mutation(command)?;
     if options.operation.is_none() {
-        return managed::submit(runtime, &context, authored, options);
+        return managed::submit(&context, authored, options).await;
     }
     let focal_client::operations::PlannedOperation::Mutation(command) =
         authored.build(&context.build, &mut random_id)?
     else {
         return Err(CliError::Input("mutation builder returned a read".into()));
     };
-    submit(runtime, &context, command, options)
+    submit(&context, command, options).await
 }
-fn submit(
-    runtime: &tokio::runtime::Runtime,
+async fn submit(
     context: &Context,
     command: Command,
     options: MutationOptions,
@@ -307,12 +327,11 @@ fn submit(
             .claim_id()
             .ok_or(InputError::Invalid("claim is required"))?;
         *expected_revision = Some(
-            runtime
-                .block_on(context.client.claim_revision(
+            context.client.claim_revision(
                     context.build.ledger,
                     claim,
                     request.request_id,
-                ))?
+                ).await?
                 .ok_or(InputError::Invalid("claim was not found"))?,
         );
     }
@@ -329,7 +348,7 @@ fn submit(
     };
     let mut journal = OperationJournal::create(&path, context.operation, epoch, request)?;
     writeln!(std::io::stderr().lock(), "operation: {}", path.display())?;
-    drive(runtime, context, &mut journal, options.output.format)
+    drive(context, &mut journal, options.output.format).await
 }
 fn private_parent(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
@@ -368,14 +387,13 @@ fn private_parent(path: &std::path::Path) -> Result<()> {
     }
     Ok(())
 }
-fn drive(
-    runtime: &tokio::runtime::Runtime,
+async fn drive(
     context: &Context,
     journal: &mut OperationJournal,
     format: OutputFormat,
 ) -> Result<()> {
     while let Some(request) = journal.next_request()?.cloned() {
-        let reply = match runtime.block_on(context.client.submit(request)) {
+        let reply = match context.client.submit(request).await {
             Ok(reply) => reply,
             Err(error) => {
                 let condition = if matches!(error, ClientError::OutcomeUnknown { .. }) {
@@ -403,29 +421,27 @@ fn drive(
     }
     output::journal(journal, format)
 }
-pub(super) fn status(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn status(
     settings: &Settings,
     selection: Option<&str>,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
-    if native::detect(runtime, &context)?.standing().is_some() {
-        return native::status(runtime, &context, OutputFormat::Json);
+    if native::detect(&context).await?.standing().is_some() {
+        return native::status(&context, OutputFormat::Json).await;
     }
     let request = context.envelope(Operation::Read(ReadRequest {
         consistency: ReadConsistency::Linearizable,
         query: ReadQuery::Objects(Vec::new()),
         max_items: 1,
     }))?;
-    let reply = runtime.block_on(context.client.request(request))?;
+    let reply = context.client.request(request).await?;
     super::output_response(reply).map_err(CliError::Other)
 }
 
 /// `validate document` under the selected context: the engine is probed the
 /// way every mutation probes it, then the document is checked the way that
 /// engine's mutation path checks it. Nothing is journaled or sent.
-pub(super) fn schema_validate(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn schema_validate(
     settings: &Settings,
     selection: Option<&str>,
     operation: &str,
@@ -433,10 +449,9 @@ pub(super) fn schema_validate(
     native: bool,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
-    discovery::validate_online(runtime, &context, operation, input, native)
+    discovery::validate_online(&context, operation, input, native).await
 }
-pub(super) fn request(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn request(
     settings: &Settings,
     args: RequestArgs,
     selection: Option<&str>,
@@ -447,9 +462,9 @@ pub(super) fn request(
         }
         (None, Some(RequestCommand::Check { file })) => request_files::check(&file),
         (None, Some(RequestCommand::Send { file })) => {
-            request_files::send(runtime, settings, selection, &file)
+            request_files::send(settings, selection, &file).await
         }
-        (Some(file), None) => request_files::send(runtime, settings, selection, &file),
+        (Some(file), None) => request_files::send(settings, selection, &file).await,
         (
             None,
             Some(RequestCommand::Retry {
@@ -459,7 +474,7 @@ pub(super) fn request(
             }),
         ) => {
             let context = Context::open(settings, selection)?;
-            if upload::resume_legacy(runtime, &context, &operation, output.format)? {
+            if upload::resume_legacy(&context, &operation, output.format).await? {
                 return Ok(());
             }
             let mut journal = OperationJournal::open(&operation, &context.operation)?;
@@ -468,7 +483,7 @@ pub(super) fn request(
                 "operation: {}",
                 operation.display()
             )?;
-            drive(runtime, &context, &mut journal, output.format)
+            drive(&context, &mut journal, output.format).await
         }
         (
             None,
@@ -485,7 +500,7 @@ pub(super) fn request(
                 &context.operation,
             )?;
             if remote {
-                reconcile::inspect(runtime, &context, &journal, output.format)
+                reconcile::inspect(&context, &journal, output.format).await
             } else {
                 output::journal(&journal, output.format)
             }
@@ -501,9 +516,9 @@ pub(super) fn request(
             let context = Context::open(settings, selection)?;
             if let Some(native) = id.strip_prefix("n1:") {
                 let id = format!("n1:{native}").parse()?;
-                return native::retry(runtime, &context, id, output.format);
+                return native::retry(&context, id, output.format).await;
             }
-            managed::retry(runtime, &context, &id, output.format)
+            managed::retry(&context, &id, output.format).await
         }
         (
             None,
@@ -516,12 +531,12 @@ pub(super) fn request(
         ) => {
             let context = Context::open(settings, selection)?;
             if id.starts_with("n1:") {
-                return native::inspect(runtime, &context, id.parse()?, remote, output.format);
+                return native::inspect(&context, id.parse()?, remote, output.format).await;
             }
-            managed::inspect(runtime, &context, &id, remote, output.format)
+            managed::inspect(&context, &id, remote, output.format).await
         }
         (None, Some(RequestCommand::Reserve { output })) => {
-            managed::reserve(runtime, &Context::open(settings, selection)?, output.format)
+            managed::reserve(&Context::open(settings, selection)?, output.format).await
         }
         (None, Some(RequestCommand::Pending { output })) => {
             managed::pending(&Context::open(settings, selection)?, output.format)
@@ -532,24 +547,20 @@ pub(super) fn request(
                 operation_id,
                 output,
             }),
-        ) => managed::acknowledge(
-            runtime,
-            &Context::open(settings, selection)?,
+        ) => managed::acknowledge(&Context::open(settings, selection)?,
             &operation_id,
             output.format,
-        ),
+        ).await,
         (
             None,
             Some(RequestCommand::Seal {
                 operation_id,
                 output,
             }),
-        ) => managed::seal(
-            runtime,
-            &Context::open(settings, selection)?,
+        ) => managed::seal(&Context::open(settings, selection)?,
             &operation_id,
             output.format,
-        ),
+        ).await,
         (
             None,
             Some(RequestCommand::Status {
@@ -561,12 +572,12 @@ pub(super) fn request(
             let query =
                 focal_client::operations::RequestStatusDocument { epoch, request_id }.build()?;
             let context = Context::open(settings, selection)?;
-            reconcile::query(runtime, &context, query, output.format)
+            reconcile::query(&context, query, output.format).await
         }
         (None, Some(RequestCommand::Epoch { epoch, output })) => {
             let query = focal_client::operations::RequestEpochDocument { epoch }.build()?;
             let context = Context::open(settings, selection)?;
-            reconcile::query(runtime, &context, query, output.format)
+            reconcile::query(&context, query, output.format).await
         }
         _ => Err(CliError::Input(
             "provide a wire request file or a request subcommand".into(),

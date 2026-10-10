@@ -112,8 +112,7 @@ pub(crate) struct Inputs<'a> {
     pub data_dir_override: Option<PathBuf>,
 }
 
-pub(crate) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(crate) async fn run(
     settings: &Settings,
     inputs: Inputs<'_>,
     command: DeploymentCommand,
@@ -127,15 +126,15 @@ pub(crate) fn run(
             )?;
             Ok(())
         }
-        DeploymentCommand::Explain { inventory } => explain(runtime, settings, &inputs, inventory),
+        DeploymentCommand::Explain { inventory } => explain(settings, &inputs, inventory).await,
         DeploymentCommand::Plan { output, dry_run } => {
             if inputs.config.is_none() {
                 return Err(DeploymentError::NoConfig.into());
             }
-            plan(runtime, settings, output.as_deref(), dry_run)
+            plan(settings, output.as_deref(), dry_run).await
         }
-        DeploymentCommand::Apply { plan_file, wait } => apply(runtime, settings, &plan_file, wait),
-        DeploymentCommand::Status { plan } => status(runtime, settings, plan.as_deref()),
+        DeploymentCommand::Apply { plan_file, wait } => apply(settings, &plan_file, wait).await,
+        DeploymentCommand::Status { plan } => status(settings, plan.as_deref()).await,
         DeploymentCommand::Render { target } => {
             if inputs.config.is_none() {
                 return Err(DeploymentError::NoConfig.into());
@@ -248,8 +247,7 @@ fn observed_view(observation: &deployment::plan::Observation) -> serde_json::Val
     })
 }
 
-fn explain(
-    runtime: &tokio::runtime::Runtime,
+async fn explain(
     settings: &Settings,
     inputs: &Inputs<'_>,
     inventory: Option<PathBuf>,
@@ -260,13 +258,10 @@ fn explain(
     // level. A node that is not running, or runs no directory, is explained
     // against itself alone.
     let observation = match inventory {
-        None if network(settings).unwrap_or(false) => {
-            ClusterAdmin::open(settings).ok().and_then(|admin| {
-                runtime
-                    .block_on(deployment::observe::observe(&admin, true))
-                    .ok()
-            })
-        }
+        None if network(settings).unwrap_or(false) => match ClusterAdmin::open(settings) {
+            Ok(admin) => deployment::observe::observe(&admin, true).await.ok(),
+            Err(_) => None,
+        },
         _ => None,
     };
     let nodes: Vec<NodeFacts> = match (&inventory, &observation) {
@@ -361,8 +356,7 @@ fn network(settings: &Settings) -> crate::Result<bool> {
     ))
 }
 
-fn plan(
-    runtime: &tokio::runtime::Runtime,
+async fn plan(
     settings: &Settings,
     output: Option<&Path>,
     dry_run: bool,
@@ -385,7 +379,7 @@ fn plan(
         )
         .map_err(DeploymentError::Unsatisfiable)?;
     }
-    let plan = runtime.block_on(async {
+    let plan = async {
         use deployment::plan::ControlProposal;
         let observation = deployment::observe::observe(&admin, network).await?;
         let mut proposals = Vec::new();
@@ -485,7 +479,7 @@ fn plan(
             &partitions,
             deployment::now_ms()?,
         )
-    })?;
+    }.await?;
     if let Some(output) = output {
         write_new(output, &plan.encode()?)?;
     }
@@ -513,8 +507,7 @@ fn read_plan(path: &Path) -> crate::Result<DeploymentPlan> {
     Ok(DeploymentPlan::decode(&bytes)?)
 }
 
-fn apply(
-    runtime: &tokio::runtime::Runtime,
+async fn apply(
     settings: &Settings,
     plan_file: &Path,
     wait: u64,
@@ -522,17 +515,16 @@ fn apply(
     let plan = read_plan(plan_file)?;
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
-    let report = runtime.block_on(deployment::apply::apply(
+    let report = deployment::apply::apply(
         &admin,
         network,
         &plan,
         Duration::from_secs(wait),
-    ))?;
+    ).await?;
     crate::print_json(&serde_json::json!({"schema_version": 1, "result": report}))
 }
 
-fn status(
-    runtime: &tokio::runtime::Runtime,
+async fn status(
     settings: &Settings,
     plan: Option<&str>,
 ) -> crate::Result<()> {
@@ -545,7 +537,7 @@ fn status(
     };
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
-    let reports = runtime.block_on(deployment::apply::status(&admin, network, plan_id))?;
+    let reports = deployment::apply::status(&admin, network, plan_id).await?;
     crate::print_json(&serde_json::json!({
         "schema_version": 1,
         "result": {"kind": "deployment_status", "plans": reports}

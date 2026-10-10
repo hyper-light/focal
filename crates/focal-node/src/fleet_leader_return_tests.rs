@@ -57,7 +57,7 @@ impl Fleet {
                     }
                 }
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
     }
     /// Every replica follows `node`, which serves.
@@ -93,7 +93,7 @@ impl Fleet {
                         .collect::<Vec<_>>()
                 );
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
     }
     /// `leader` hands leadership to its successor, once: until its term
@@ -113,7 +113,7 @@ impl Fleet {
             if let Err(spent) = wait.check(&self.periods()) {
                 panic!("leadership never left {leader}: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
     }
     fn returns(&self) -> (u64, u64) {
@@ -136,7 +136,7 @@ impl Fleet {
             if let Err(spent) = wait.check(&now) {
                 panic!("the owners stopped: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::pause(TICK).await;
         }
     }
 }
@@ -291,7 +291,7 @@ async fn a_voter_in_the_preferred_leaders_zone_leads_in_its_place() {
         if let Err(spent) = wait.check(&fleet.periods()) {
             panic!("the ranks never followed: {spent}; {:?}", ranks(&fleet));
         }
-        tokio::time::sleep(TICK).await;
+        focal_rt::time::pause(TICK).await;
     }
     fleet.led_by(preferred).await;
 
@@ -337,7 +337,7 @@ async fn a_voter_in_the_preferred_leaders_zone_leads_in_its_place() {
         if let Err(spent) = wait.check(&fleet.periods()) {
             panic!("the ranks never followed: {spent}; {:?}", ranks(&fleet));
         }
-        tokio::time::sleep(TICK).await;
+        focal_rt::time::pause(TICK).await;
     }
     fleet.stop().await;
 }

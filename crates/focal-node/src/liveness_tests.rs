@@ -110,7 +110,7 @@ async fn a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on
     assert!(view.counters.probe_timeouts >= 1);
     assert!(view.counters.deaths >= 1);
     // A death is never duplicated: the committed fact stays at one verdict.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    focal_rt::time::pause(Duration::from_millis(1500)).await;
     let (still, _, _) = wait_for(&founder, &host, "verdict stable", |_| true)
         .await
         .expect("service ended");
@@ -223,7 +223,7 @@ async fn probes_bind_their_sender_refute_self_suspicion_and_ration_extensions() 
     });
     let reply = answer(handle, node_a, &request).await;
     assert_eq!(reply.extension, Some(ExtensionOutcome::Denied));
-    tokio::time::sleep(config.period + Duration::from_millis(50)).await;
+    focal_rt::time::pause(config.period + Duration::from_millis(50)).await;
     request.sequence = 10;
     request.extension = Some(ExtensionRequest {
         incarnation: member.incarnation,

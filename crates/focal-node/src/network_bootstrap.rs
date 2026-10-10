@@ -92,7 +92,7 @@ impl FoundingNetwork {
         Self::open_inner(settings, false).await
     }
     async fn open_inner(settings: &Settings, local_readiness: bool) -> NetworkResult<Self> {
-        tokio::runtime::Handle::try_current().map_err(|_| NetworkError::RuntimeRequired)?;
+        hyper_rt::futures::shard_id().ok_or(NetworkError::RuntimeRequired)?;
         let directory = NodeDirectory::open(settings)?;
         let identity = directory.identity();
         let saved = NetworkState::load(&directory)?;
@@ -129,7 +129,7 @@ impl FoundingNetwork {
         // blocking thread so it neither stalls the async runtime nor executes on
         // the executor's shallow poll stack (a Windows main thread is 1 MiB).
         let settings = settings.clone();
-        tokio::task::spawn_blocking(move || {
+        focal_rt::on_pool(&focal_rt::FILES, move || {
             Self::bootstrap_blocking(
                 &settings,
                 directory,

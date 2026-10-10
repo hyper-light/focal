@@ -14,7 +14,7 @@ use std::{
     sync::mpsc,
     thread::JoinHandle,
 };
-use tokio::sync::oneshot;
+use hyper_rt::sync::OneshotSender;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
@@ -351,8 +351,8 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 enum Work {
-    Redeem(JoinRequest, oneshot::Sender<JoinResponse>),
-    Stop(oneshot::Sender<Result<(), ClusterError>>),
+    Redeem(JoinRequest, OneshotSender<JoinResponse>),
+    Stop(OneshotSender<Result<(), ClusterError>>),
 }
 /// Only the invitation redemption surface is network-facing. Operator invitation
 /// creation requires direct access to the trusted root owner before spawning.
@@ -402,7 +402,7 @@ impl EnrollmentHost {
     }
     /// A full queue returns Capacity without enqueueing; drain ingress and retry.
     pub async fn stop(&self) -> Result<(), ClusterError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| ClusterError::Enrollment(EnrollmentError::Capacity))?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {
@@ -415,7 +415,9 @@ impl EnrollmentHost {
 impl JoinHandler for EnrollmentHost {
     fn handle(&self, request: JoinRequest) -> JoinFuture<'_> {
         Box::pin(async move {
-            let (send, receive) = oneshot::channel();
+            let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
+                return JoinResponse::Rejected(JoinFailure::Capacity);
+            };
             match self.sender.try_send(Work::Redeem(request, send)) {
                 Ok(()) => receive
                     .await

@@ -139,7 +139,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
     }
 }
 async fn read(fixture: &Fixture, index: u128) {
-    let response = tokio::time::timeout(
+    let response = focal_rt::time::timeout(
         Duration::from_secs(5),
         dispatch(
             &fixture.hosts[&ledger(index)],
@@ -211,7 +211,7 @@ async fn checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_an
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
     let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
-    let committed = tokio::time::timeout(
+    let committed = focal_rt::time::timeout(
         Duration::from_secs(5),
         dispatch(
             &fixture.hosts[&ledger(2)],
@@ -279,7 +279,7 @@ async fn expired_cancelled_and_timed_out_exports_release_interest_without_releas
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
     let export = pending_export(&mut fixture, Duration::from_millis(30)).await;
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    focal_rt::time::pause(Duration::from_millis(60)).await;
     read(&fixture, 2).await;
     pause.resume().unwrap();
     assert!(matches!(
@@ -318,7 +318,7 @@ async fn checkpoint_stop_deadline_leaves_other_sessions_available_until_writer_r
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
     let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
-    let stopped = tokio::time::timeout(
+    let stopped = focal_rt::time::timeout(
         REQUEST_TIMEOUT.saturating_add(Duration::from_millis(800)),
         fixture.hosts[&ledger(1)].stop(),
     )

@@ -179,23 +179,38 @@ pub enum JoinTransportError {
 
 /// A listener's service with the enrollment protocol beside `data`: a joiner's message goes to
 /// the [`JoinHandler`], every other request to `data`. The enrollment protocol carries no data
-/// peer's message, so one from a data peer is refused.
+/// peer's message, so one from a data peer is refused. At most `max_connections` enrollments are
+/// handled at once, a joiner having no identity whose share could bound it; one past them is
+/// refused, and its joiner told the sponsor is unavailable.
 pub struct EnrollmentService<S, H> {
     data: S,
     handler: H,
-    timeout: Duration,
+    limits: TransportLimits,
+    /// The enrollments under way, shared with each one's answer, which gives its place back.
+    handling: Arc<AtomicUsize>,
 }
 impl<S: Serve, H: JoinHandler + Clone> EnrollmentService<S, H> {
-    /// `timeout` is the most an enrollment's handling takes, past which its outcome is unknown.
-    pub fn new(data: S, handler: H, timeout: Duration) -> Result<Self, JoinTransportError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(120) {
-            return Err(EnrollmentError::Invalid.into());
-        }
+    /// `limits.timeout` is the most an enrollment's handling takes, past which its outcome is
+    /// unknown; `limits.max_connections` the enrollments handled at once.
+    pub fn new(data: S, handler: H, limits: TransportLimits) -> Result<Self, JoinTransportError> {
+        limits.validate()?;
         Ok(Self {
             data,
             handler,
-            timeout,
+            limits,
+            handling: Arc::new(AtomicUsize::new(0)),
         })
+    }
+}
+/// One enrollment under way, its place given back as it ends.
+struct Handling(Arc<AtomicUsize>);
+impl Drop for Handling {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(1))
+            });
     }
 }
 impl<S: Serve, H: JoinHandler + Clone> Serve for EnrollmentService<S, H> {
@@ -205,10 +220,22 @@ impl<S: Serve, H: JoinHandler + Clone> Serve for EnrollmentService<S, H> {
     fn serve(&self, request: Served) -> ServeFuture {
         match (request.kind, &request.from) {
             (Kind::Enrollment(tag), Inbound::Joiner) => {
-                let handler = self.handler.clone();
-                let timeout = self.timeout;
                 let body = Zeroizing::new(request.body);
+                let most = self.limits.max_connections;
+                if self
+                    .handling
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                        (held < most).then(|| held.saturating_add(1))
+                    })
+                    .is_err()
+                {
+                    return Box::pin(async { None });
+                }
+                let handling = Handling(self.handling.clone());
+                let handler = self.handler.clone();
+                let timeout = self.limits.timeout;
                 Box::pin(async move {
+                    let _handling = handling;
                     answer(handler, tag, body, timeout)
                         .await
                         .map(Reply::uncharged)
@@ -309,7 +336,7 @@ impl EnrollmentServer {
         handler: H,
     ) -> Result<(), JoinTransportError> {
         require_runtime()?;
-        let service = EnrollmentService::new(NoData, handler, self.limits.timeout)?;
+        let service = EnrollmentService::new(NoData, handler, self.limits.clone())?;
         self.server
             .serve_with(service)
             .await

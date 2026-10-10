@@ -29,17 +29,16 @@ pub(super) const MCP_STORE: &str = "mcp-native";
 /// journal as the proof that an unreachable ledger is native. A node without
 /// the native engine refuses the profile at negotiation before any frame is
 /// seen.
-pub(super) fn detect(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn detect(
     context: &Context,
 ) -> Result<focal_client::operations::Engine> {
-    Ok(runtime.block_on(focal_client::operations::probe(
+    Ok(focal_client::operations::probe(
         &context.client,
         context.build.ledger,
         RequestId(random_id()?),
         initialized_in(&context.root.join("client"), STORE),
         context.build.actor,
-    ))?)
+    ).await?)
 }
 
 /// Whether a native journal named `name` has been created under `parent`.
@@ -54,8 +53,7 @@ fn unavailable(what: &str) -> CliError {
 }
 
 /// Route one manual command on a native ledger.
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn run(
     context: &Context,
     command: Commands,
     standing: &NativeStanding,
@@ -97,13 +95,11 @@ pub(super) fn run(
                     options,
                 )
             }
-            ClaimCommand::Wait(args) => return wait(runtime, context, args),
+            ClaimCommand::Wait(args) => return wait(context, args).await,
             ClaimCommand::Lineage(args) => {
-                let outcome = observe(
-                    runtime,
-                    context,
+                let outcome = observe(context,
                     &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: args.id }),
-                )?;
+                ).await?;
                 let focal_native_client::NativeReadOutcome::Lineage(lineage) = outcome else {
                     return Err(CliError::InvalidResponse);
                 };
@@ -231,8 +227,8 @@ pub(super) fn run(
             }
             ArtifactCommand::Upload { .. } => return Err(unavailable("chunked artifact upload")),
         },
-        Commands::Get { command } => return get(runtime, context, command),
-        Commands::List { command } => return list(runtime, context, command),
+        Commands::Get { command } => return get(context, command).await,
+        Commands::List { command } => return list(context, command).await,
         Commands::Evidence { .. } => {
             return Err(CliError::Input(
                 "evidence sets are a V1 concept; native work artifacts attach directly to the cycle".into(),
@@ -268,17 +264,15 @@ pub(super) fn run(
             }
         },
         Commands::Watch { command } => {
-            return super::watch::run(
-                runtime,
-                context,
+            return super::watch::run(context,
                 command,
                 focal_client::watch::WatchEngine::Native,
-            );
+            ).await;
         }
         Commands::Ledger { .. } => return Err(unavailable("graph traversal")),
         Commands::Validator { .. } => return Err(unavailable("validator contract listing")),
     };
-    submit(runtime, context, standing, operation, options)
+    submit(context, standing, operation, options).await
 }
 
 /// Open the client's native journal, creating it once with a marker outside
@@ -373,33 +367,16 @@ pub(super) fn profile(standing: &NativeStanding) -> NativeContentProfile {
     }
 }
 
-/// One blocking bounded list on this context.
-fn lists<'a>(
-    runtime: &'a tokio::runtime::Runtime,
-    context: &'a Context,
-) -> impl FnMut(NativeListRequest) -> std::result::Result<NativeListPage, DriveError> + 'a {
-    move |request| {
-        let envelope = RequestEnvelope {
-            protocol: NATIVE_PROTOCOL_VERSION,
-            ledger: context.build.ledger,
-            route_epoch: RouteEpoch(1),
-            request_epoch: RequestEpoch(1),
-            request_id: RequestId(random_id()?),
-            operation: Operation::NativeList(request),
-        };
-        Ok(runtime.block_on(context.client.native_list(envelope))?)
-    }
-}
 /// One bounded list from the shared `list` flags. `--all` follows the
 /// continuation until it is absent, printing one page at a time; an empty
 /// page with a cursor is a residual-filtered stretch, not the end.
-fn list(runtime: &tokio::runtime::Runtime, context: &Context, command: ListCommand) -> Result<()> {
+async fn list( context: &Context, command: ListCommand) -> Result<()> {
     let (mut operation, args) = native_documents::list(command)?;
     let format = args.output.format;
     let mut pages = 0u64;
     loop {
         let page =
-            focal_native_client::list(&operation, &context.build, &mut lists(runtime, context))?;
+            focal_native_client::list(&operation, &context.build, &mut Waits(context)).await?;
         let next = page.next.as_ref().map(|cursor| output::hex(&cursor.0));
         render_list_page(page, format)?;
         pages = pages.checked_add(1).ok_or(InputError::Capacity)?;
@@ -455,34 +432,63 @@ fn render_list_page(page: NativeListPage, format: OutputFormat) -> Result<()> {
     }
 }
 
-/// One blocking linearizable read per driver requirement on this context.
-/// One blocking submission of an exact journaled frame over this context's
-/// connection.
-pub(super) fn submits<'a>(
-    runtime: &'a tokio::runtime::Runtime,
-    context: &'a Context,
-) -> impl FnMut(RequestEnvelope) -> std::result::Result<NativeMutationReply, DriveError> + 'a {
-    move |request| Ok(runtime.block_on(context.client.submit_native(request))?)
-}
-pub(super) fn reads<'a>(
-    runtime: &'a tokio::runtime::Runtime,
-    context: &'a Context,
-) -> impl FnMut(NativeReadRequest) -> std::result::Result<NativeReadPage, DriveError> + 'a {
-    move |request| {
-        let envelope = RequestEnvelope {
+/// This context's waits for the native driver: its fixed-prefix reads,
+/// lists and exact-frame submissions over the context's connection, and the
+/// wait observer's pauses between probes, which end on Ctrl-C with the
+/// journal untouched.
+pub(super) struct Waits<'a>(pub(super) &'a Context);
+impl Waits<'_> {
+    fn envelope(&self, operation: Operation) -> std::result::Result<RequestEnvelope, DriveError> {
+        Ok(RequestEnvelope {
             protocol: NATIVE_PROTOCOL_VERSION,
-            ledger: context.build.ledger,
+            ledger: self.0.build.ledger,
             route_epoch: RouteEpoch(1),
             request_epoch: RequestEpoch(1),
             request_id: RequestId(random_id()?),
-            operation: Operation::NativeRead(request),
-        };
-        Ok(runtime.block_on(context.client.native_read(envelope))?)
+            operation,
+        })
+    }
+}
+impl focal_native_client::Reads for Waits<'_> {
+    async fn read(
+        &mut self,
+        request: NativeReadRequest,
+    ) -> std::result::Result<NativeReadPage, DriveError> {
+        let envelope = self.envelope(Operation::NativeRead(request))?;
+        Ok(self.0.client.native_read(envelope).await?)
+    }
+}
+impl focal_native_client::Lists for Waits<'_> {
+    async fn list(
+        &mut self,
+        request: NativeListRequest,
+    ) -> std::result::Result<NativeListPage, DriveError> {
+        let envelope = self.envelope(Operation::NativeList(request))?;
+        Ok(self.0.client.native_list(envelope).await?)
+    }
+}
+impl focal_native_client::Submits for Waits<'_> {
+    async fn submit(
+        &mut self,
+        request: RequestEnvelope,
+    ) -> std::result::Result<NativeMutationReply, DriveError> {
+        Ok(self.0.client.submit_native(request).await?)
+    }
+}
+impl focal_native_client::Pause for Waits<'_> {
+    async fn pause(&mut self, period: std::time::Duration) -> std::result::Result<(), DriveError> {
+        use hyper_rt::combine::{Either, race2};
+        use hyper_rt::signal::{Signal, subscribe};
+        let interrupt = subscribe(&[Signal::Interrupt]).map_err(|_| DriveError::Cancelled)?;
+        match race2(focal_rt::time::sleep(period), interrupt.recv()).await {
+            Either::First(Ok(())) => Ok(()),
+            // Ctrl-C, or no wait could be kept.
+            Either::First(Err(_)) | Either::Second(_) => Err(DriveError::Cancelled),
+        }
     }
 }
 
-pub(super) fn submit(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn submit(
     context: &Context,
     standing: &NativeStanding,
     operation: NativeAuthoredOperation,
@@ -518,17 +524,17 @@ pub(super) fn submit(
     focal_native_client::maintain(
         &preparation,
         &mut random_id,
-        &mut reads(runtime, context),
-        &mut submits(runtime, context),
-    )?;
+        &mut Waits(context),
+        &mut Waits(context),
+    ).await?;
     let prepared = focal_native_client::prepare(
         &preparation,
         &operation,
         requested,
         &mut random_id,
-        &mut reads(runtime, context),
-    )?;
-    drive(runtime, context, &store, prepared, options.output.format)
+        &mut Waits(context),
+    ).await?;
+    drive(context, &store, prepared, options.output.format).await
 }
 
 fn recovery_hint(context: &Context, id: NativeOperationId) {
@@ -539,8 +545,7 @@ fn recovery_hint(context: &Context, id: NativeOperationId) {
         );
     }
 }
-fn drive(
-    runtime: &tokio::runtime::Runtime,
+async fn drive(
     context: &Context,
     store: &NativeOperationStore,
     operation: NativeOperation,
@@ -558,7 +563,7 @@ fn drive(
     if let Some(receipt) = operation.receipt {
         return deliver(&receipt);
     }
-    match runtime.block_on(context.client.submit_native(operation.request.clone())) {
+    match context.client.submit_native(operation.request.clone()).await {
         Ok(reply @ NativeMutationReply::Committed(receipt)) => {
             store.record_reply(operation.id, &context.operation, &reply)?;
             deliver(&receipt)
@@ -583,8 +588,8 @@ fn drive(
                     store,
                     &context.operation,
                     &operation,
-                    &mut reads(runtime, context),
-                )?
+                    &mut Waits(context),
+                ).await?
             {
                 return deliver(&receipt);
             }
@@ -701,18 +706,16 @@ fn render_failure(
 }
 
 /// Retry an exact journaled frame; a recorded receipt is printed without a send.
-pub(super) fn retry(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn retry(
     context: &Context,
     id: NativeOperationId,
     format: OutputFormat,
 ) -> Result<()> {
     let store = store(context, false)?.ok_or(NativeStoreError::MissingOperation)?;
     let operation = store.retry(id, &context.operation)?;
-    drive(runtime, context, &store, operation, format)
+    drive(context, &store, operation, format).await
 }
-pub(super) fn inspect(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn inspect(
     context: &Context,
     id: NativeOperationId,
     remote: bool,
@@ -727,12 +730,12 @@ pub(super) fn inspect(
         let key =
             store(context, false)?.and_then(|store| store.key_of(id, &context.operation).ok());
         let page = match key {
-            Some(key) => focal_native_client::outcome(key, &mut reads(runtime, context))?,
+            Some(key) => focal_native_client::outcome(key, &mut Waits(context)).await?,
             None => focal_native_client::outcome_by_id(
                 context.operation.principal,
                 id.request(),
-                &mut reads(runtime, context),
-            )?,
+                &mut Waits(context),
+            ).await?,
         };
         return render_page_as("Observed", page, format);
     }
@@ -782,36 +785,23 @@ pub(super) fn outstanding(context: &Context) -> Result<Vec<(String, &'static str
 /// One read operation on this context: plain reads, the lineage read (which
 /// also lists) and the wait observer (whose pause between probes ends on
 /// Ctrl-C with the journal untouched).
-fn observe(
-    runtime: &tokio::runtime::Runtime,
+async fn observe(
     context: &Context,
     operation: &NativeReadOperation,
 ) -> Result<focal_native_client::NativeReadOutcome> {
-    let mut pause = |duration: std::time::Duration| {
-        runtime.block_on(async {
-            tokio::select! {
-                () = tokio::time::sleep(duration) => Ok(()),
-                signal = tokio::signal::ctrl_c() => {
-                    signal.map_err(|_| DriveError::Cancelled)?;
-                    Err(DriveError::Cancelled)
-                }
-            }
-        })
-    };
     Ok(focal_native_client::read(
         operation,
         &context.build,
-        &mut reads(runtime, context),
-        &mut lists(runtime, context),
-        &mut pause,
-    )?)
+        &mut Waits(context),
+        &mut Waits(context),
+        &mut Waits(context),
+    ).await?)
 }
-fn read(
-    runtime: &tokio::runtime::Runtime,
+async fn read(
     context: &Context,
     operation: &NativeReadOperation,
 ) -> Result<NativeReadPage> {
-    match observe(runtime, context, operation)? {
+    match observe(context, operation).await? {
         focal_native_client::NativeReadOutcome::Page(page) => Ok(page),
         focal_native_client::NativeReadOutcome::Lineage(_)
         | focal_native_client::NativeReadOutcome::Wait(_) => Err(CliError::InvalidResponse),
@@ -819,8 +809,7 @@ fn read(
 }
 /// `wait claim` on the native engine: the same predicates as the V1
 /// observer plus `testament`, the same bounds, printed the same way.
-fn wait(
-    runtime: &tokio::runtime::Runtime,
+async fn wait(
     context: &Context,
     args: super::claim_wait::WaitArgs,
 ) -> Result<()> {
@@ -838,7 +827,7 @@ fn wait(
             timeout_ms: args.timeout_ms.unwrap_or(30_000),
         },
     };
-    let outcome = observe(runtime, context, &NativeReadOperation::ClaimWait(document))?;
+    let outcome = observe(context, &NativeReadOperation::ClaimWait(document)).await?;
     let focal_native_client::NativeReadOutcome::Wait(result) = outcome else {
         return Err(CliError::InvalidResponse);
     };
@@ -978,19 +967,16 @@ fn render_page_as(condition: &str, page: NativeReadPage, format: OutputFormat) -
     }
 }
 /// The ledger's standing under this principal; the native `focal inspect prefix`.
-pub(super) fn status(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn status(
     context: &Context,
     format: OutputFormat,
 ) -> Result<()> {
-    let page = read(
-        runtime,
-        context,
+    let page = read(context,
         &NativeReadOperation::Standing(NativeEmptyDocument::default()),
-    )?;
+    ).await?;
     render_page(page, format)
 }
-fn get(runtime: &tokio::runtime::Runtime, context: &Context, command: GetCommand) -> Result<()> {
+async fn get( context: &Context, command: GetCommand) -> Result<()> {
     let object = |id: String| NativeObjectDocument { id };
     let (operation, format) = match command {
         GetCommand::Claim(args) => {
@@ -1074,6 +1060,6 @@ fn get(runtime: &tokio::runtime::Runtime, context: &Context, command: GetCommand
             }
         }
     };
-    let page = read(runtime, context, &operation)?;
+    let page = read(context, &operation).await?;
     render_page(page, format)
 }

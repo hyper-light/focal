@@ -6,7 +6,7 @@
 use crate::{network_listener::ListenerIdentity, placement_control::PlacementHandle};
 use focal_enrollment::{EnrollmentReceipt, JoinFailure};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 
 /// A credential is renewed once this fraction of its lifetime remains: a
 /// third, the practice ACME clients follow (Let's Encrypt's integration
@@ -90,21 +90,25 @@ pub enum RenewalError {
 }
 
 pub enum CredentialRequest {
-    Renew(oneshot::Sender<Result<CredentialSummary, RenewalError>>),
+    Renew(OneshotSender<Result<CredentialSummary, RenewalError>>),
     /// Rotate to a fresh key under the same identity (24 §11).
-    Rotate(oneshot::Sender<Result<CredentialSummary, RenewalError>>),
-    Current(oneshot::Sender<CredentialSummary>),
+    Rotate(OneshotSender<Result<CredentialSummary, RenewalError>>),
+    Current(OneshotSender<CredentialSummary>),
 }
 /// A bounded handle to the controller's credential state; every clone
 /// shares one queue.
 #[derive(Clone)]
 pub struct CredentialHandle {
-    sender: mpsc::Sender<CredentialRequest>,
+    sender: hyper_rt::sync::Sender<CredentialRequest>,
 }
 impl CredentialHandle {
-    pub fn channel(depth: usize) -> (Self, mpsc::Receiver<CredentialRequest>) {
-        let (sender, receiver) = mpsc::channel(depth.max(1));
-        (Self { sender }, receiver)
+    /// A handle and the controller's queue of `depth` requests; refused at the runtime's cell
+    /// bound.
+    pub fn channel(
+        depth: usize,
+    ) -> Result<(Self, ChannelReceiver<CredentialRequest>), focal_rt::RtError> {
+        let (sender, receiver) = hyper_rt::sync::channel(depth.max(1))?;
+        Ok((Self { sender }, receiver))
     }
     fn send(&self, request: CredentialRequest) -> Result<(), RenewalError> {
         self.sender
@@ -114,17 +118,17 @@ impl CredentialHandle {
     /// Renew now, whatever the expiry; answers once the renewed credential
     /// is installed and presented.
     pub async fn renew(&self) -> Result<CredentialSummary, RenewalError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| RenewalError::Stopped)?;
         self.send(CredentialRequest::Renew(reply))?;
         receive.await.map_err(|_| RenewalError::Stopped)?
     }
     pub async fn rotate(&self) -> Result<CredentialSummary, RenewalError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| RenewalError::Stopped)?;
         self.send(CredentialRequest::Rotate(reply))?;
         receive.await.map_err(|_| RenewalError::Stopped)?
     }
     pub async fn current(&self) -> Result<CredentialSummary, RenewalError> {
-        let (reply, receive) = oneshot::channel();
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| RenewalError::Stopped)?;
         self.send(CredentialRequest::Current(reply))?;
         receive.await.map_err(|_| RenewalError::Stopped)
     }
@@ -202,18 +206,18 @@ mod tests;
 pub struct CredentialSwap {
     pub listener: Option<ListenerIdentity>,
     pub placement: PlacementHandle,
-    pub requests: mpsc::Receiver<CredentialRequest>,
+    pub requests: ChannelReceiver<CredentialRequest>,
 }
 impl CredentialSwap {
     /// A controller run without an endpoint of its own: nothing to present,
     /// nobody to ask; renewals are refused.
-    pub fn detached() -> Self {
-        let (placement, _jobs) = PlacementHandle::channel(1);
-        let (_handle, requests) = CredentialHandle::channel(1);
-        Self {
+    pub fn detached() -> Result<Self, focal_rt::RtError> {
+        let (placement, _jobs) = PlacementHandle::channel(1)?;
+        let (_handle, requests) = CredentialHandle::channel(1)?;
+        Ok(Self {
             listener: None,
             placement,
             requests,
-        }
+        })
     }
 }

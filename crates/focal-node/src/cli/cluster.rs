@@ -521,13 +521,12 @@ pub(crate) enum RangesCommand {
     },
 }
 
-pub(crate) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(crate) async fn run(
     settings: &focal_node::config::Settings,
     command: ClusterCommand,
 ) -> crate::Result<()> {
     if let ClusterCommand::Invite { node, output } = command {
-        return runtime.block_on(crate::invite(settings, &node, &output));
+        return crate::invite(settings, &node, &output).await;
     }
     // Verification reads only the backup: it runs anywhere the binary does.
     if let ClusterCommand::Backup {
@@ -565,19 +564,19 @@ pub(crate) fn run(
     }
     let admin = ClusterAdmin::open(settings)?;
     let result = match command {
-        ClusterCommand::Replicas { command } => replicas(runtime, &admin, command),
+        ClusterCommand::Replicas { command } => replicas(&admin, command).await,
         ClusterCommand::Archive {
             command: ArchiveCommand::Show { session, claim },
-        } => runtime.block_on(admin.archive(
+        } => admin.archive(
             session_of(&admin, session)?,
             focal_model::ClaimId(focal_client::input::parse_id(&claim)?),
-        )),
+        ).await,
         ClusterCommand::Gc {
             command: GcCommand::Restore { domain, root },
-        } => runtime.block_on(admin.gc_restore(
+        } => admin.gc_restore(
             focal_model::ContentDomainId(focal_client::input::parse_id(&domain)?),
             focal_client::input::parse_hash(&root)?,
-        )),
+        ).await,
         ClusterCommand::Backup {
             command:
                 BackupCommand::Create {
@@ -592,7 +591,7 @@ pub(crate) fn run(
                 })?,
                 session: session_of(&admin, session)?,
             };
-            runtime.block_on(admin.backup_create(ledger, &output))
+            admin.backup_create(ledger, &output).await
         }
         ClusterCommand::Backup {
             command: BackupCommand::Verify { .. },
@@ -600,7 +599,7 @@ pub(crate) fn run(
         ClusterCommand::Restore {
             input,
             new_incarnation,
-        } => runtime.block_on(admin.restore(&input, new_incarnation)),
+        } => admin.restore(&input, new_incarnation).await,
         ClusterCommand::Repair {
             tenant,
             session,
@@ -616,122 +615,116 @@ pub(crate) fn run(
             let after = after
                 .map(|after| focal_client::input::parse_id(&after))
                 .transpose()?;
-            runtime.block_on(admin.repair(ledger, after, limit))
+            admin.repair(ledger, after, limit).await
         }
         ClusterCommand::Upgrade {
             command: UpgradeCommand::Status,
-        } => runtime.block_on(admin.upgrade_status()),
+        } => admin.upgrade_status().await,
         ClusterCommand::Upgrade {
             command: UpgradeCommand::Activate { fence },
-        } => runtime.block_on(admin.activate_fence(fence)),
-        ClusterCommand::Status => runtime.block_on(admin.read(AdminRead::Membership)),
-        ClusterCommand::Placement => runtime.block_on(admin.placement()),
-        ClusterCommand::Plan => runtime.block_on(admin.plan()),
+        } => admin.activate_fence(fence).await,
+        ClusterCommand::Status => admin.read(AdminRead::Membership).await,
+        ClusterCommand::Placement => admin.placement().await,
+        ClusterCommand::Plan => admin.plan().await,
         ClusterCommand::Tenants { command } => match command {
             TenantCommand::Admit { tenant } => {
-                runtime.block_on(admin.admit_tenant(focal_client::input::parse_id(&tenant)?))
+                admin.admit_tenant(focal_client::input::parse_id(&tenant)?).await
             }
-            TenantCommand::List => runtime.block_on(admin.tenants()),
+            TenantCommand::List => admin.tenants().await,
         },
         ClusterCommand::Sessions { command } => match command {
-            SessionCommand::Create { tenant, name } => runtime
-                .block_on(admin.create_session(focal_client::input::parse_id(&tenant)?, &name)),
+            SessionCommand::Create { tenant, name } => admin.create_session(focal_client::input::parse_id(&tenant)?, &name).await,
             SessionCommand::Plan {
                 tenant,
                 session,
                 survive,
                 max_failures,
                 dry_run,
-            } => runtime.block_on(admin.plan_session(
+            } => admin.plan_session(
                 focal_client::input::parse_id(&tenant)?,
                 focal_client::input::parse_id(&session)?,
                 &survive,
                 max_failures,
                 dry_run,
-            )),
+            ).await,
         },
         ClusterCommand::Nodes { command } => match command {
-            NodesCommand::List => runtime.block_on(admin.read(AdminRead::Contacts)),
-            NodesCommand::Drain { node } => runtime.block_on(admin.node_eligibility(node, false)),
-            NodesCommand::Undrain { node } => runtime.block_on(admin.node_eligibility(node, true)),
-            NodesCommand::Remove { node } => runtime.block_on(admin.remove_node(node)),
+            NodesCommand::List => admin.read(AdminRead::Contacts).await,
+            NodesCommand::Drain { node } => admin.node_eligibility(node, false).await,
+            NodesCommand::Undrain { node } => admin.node_eligibility(node, true).await,
+            NodesCommand::Remove { node } => admin.remove_node(node).await,
             NodesCommand::Replace { node, replacement } => {
-                runtime.block_on(admin.replace_node(node, replacement))
+                admin.replace_node(node, replacement).await
             }
         },
         ClusterCommand::Client {
             command: ClientCommand::Invite { name, output },
-        } => runtime.block_on(admin.invite_client(&name, &output)),
+        } => admin.invite_client(&name, &output).await,
         ClusterCommand::Invitations { command } => match command {
             InvitationCommand::List {
                 after,
                 limit,
                 expected_revision,
-            } => runtime.block_on(
-                admin.read(AdminRead::Invitations {
+            } => admin.read(AdminRead::Invitations {
                     after: after
                         .as_deref()
                         .map(focal_client::input::parse_id)
                         .transpose()?,
                     limit,
                     expected_revision,
-                }),
-            ),
-            InvitationCommand::Get { id } => runtime.block_on(admin.read(AdminRead::Invitation {
+                }).await,
+            InvitationCommand::Get { id } => admin.read(AdminRead::Invitation {
                 id: focal_client::input::parse_id(&id)?,
-            })),
+            }).await,
             InvitationCommand::Revoke {
                 id,
                 expected_revision,
-            } => runtime
-                .block_on(admin.revoke(focal_client::input::parse_id(&id)?, expected_revision)),
+            } => admin.revoke(focal_client::input::parse_id(&id)?, expected_revision).await,
         },
         ClusterCommand::Credentials { command } => match command {
             CredentialCommand::Get { invitation } => {
-                runtime.block_on(admin.read(AdminRead::Invitation {
+                admin.read(AdminRead::Invitation {
                     id: focal_client::input::parse_id(&invitation)?,
-                }))
+                }).await
             }
             CredentialCommand::Revoke {
                 invitation,
                 expected_revision,
-            } => runtime.block_on(admin.revoke(
+            } => admin.revoke(
                 focal_client::input::parse_id(&invitation)?,
                 expected_revision,
-            )),
-            CredentialCommand::Renew => runtime.block_on(admin.renew_credential()),
-            CredentialCommand::Rotate => runtime.block_on(admin.rotate_credential()),
-            CredentialCommand::Issuers => runtime.block_on(admin.issuers()),
-            CredentialCommand::RotateIssuer => runtime.block_on(admin.rotate_issuer()),
+            ).await,
+            CredentialCommand::Renew => admin.renew_credential().await,
+            CredentialCommand::Rotate => admin.rotate_credential().await,
+            CredentialCommand::Issuers => admin.issuers().await,
+            CredentialCommand::RotateIssuer => admin.rotate_issuer().await,
         },
         ClusterCommand::Membership { command } => match command {
-            MembershipCommand::Show => runtime.block_on(admin.read(AdminRead::Configuration)),
+            MembershipCommand::Show => admin.read(AdminRead::Configuration).await,
             MembershipCommand::AddLearner {
                 node,
                 expected_configuration_index,
-            } => runtime.block_on(admin.membership(
+            } => admin.membership(
                 MembershipChange::AddLearner { node },
                 expected_configuration_index,
-            )),
+            ).await,
             MembershipCommand::Promote {
                 node,
                 expected_configuration_index,
-            } => runtime.block_on(admin.membership(
+            } => admin.membership(
                 MembershipChange::Promote { node },
                 expected_configuration_index,
-            )),
+            ).await,
             MembershipCommand::Remove {
                 node,
                 expected_configuration_index,
-            } => runtime.block_on(admin.membership(
+            } => admin.membership(
                 MembershipChange::Remove { node },
                 expected_configuration_index,
-            )),
+            ).await,
             MembershipCommand::LeaveJoint {
                 expected_configuration_index,
-            } => runtime.block_on(
-                admin.membership(MembershipChange::LeaveJoint, expected_configuration_index),
-            ),
+            } => admin.membership(MembershipChange::LeaveJoint, expected_configuration_index).await,
         },
         ClusterCommand::Leader {
             command:
@@ -739,11 +732,11 @@ pub(crate) fn run(
                     node,
                     expected_configuration_index,
                 },
-        } => runtime.block_on(admin.transfer(node, expected_configuration_index)),
+        } => admin.transfer(node, expected_configuration_index).await,
         ClusterCommand::Partitions { command } => match command {
             PartitionsCommand::Show { partition } => {
                 let partition = focal_client::input::parse_id(&partition)?;
-                runtime.block_on(admin.partition_show(partition))
+                admin.partition_show(partition).await
             }
             PartitionsCommand::AddLearner {
                 partition,
@@ -751,11 +744,11 @@ pub(crate) fn run(
                 expected_configuration_index,
             } => {
                 let partition = focal_client::input::parse_id(&partition)?;
-                runtime.block_on(admin.partition_change(
+                admin.partition_change(
                     partition,
                     MembershipChange::AddLearner { node },
                     expected_configuration_index,
-                ))
+                ).await
             }
             PartitionsCommand::Promote {
                 partition,
@@ -763,11 +756,11 @@ pub(crate) fn run(
                 expected_configuration_index,
             } => {
                 let partition = focal_client::input::parse_id(&partition)?;
-                runtime.block_on(admin.partition_change(
+                admin.partition_change(
                     partition,
                     MembershipChange::Promote { node },
                     expected_configuration_index,
-                ))
+                ).await
             }
             PartitionsCommand::Remove {
                 partition,
@@ -775,11 +768,11 @@ pub(crate) fn run(
                 expected_configuration_index,
             } => {
                 let partition = focal_client::input::parse_id(&partition)?;
-                runtime.block_on(admin.partition_change(
+                admin.partition_change(
                     partition,
                     MembershipChange::Remove { node },
                     expected_configuration_index,
-                ))
+                ).await
             }
             PartitionsCommand::Transfer {
                 partition,
@@ -787,11 +780,11 @@ pub(crate) fn run(
                 expected_configuration_index,
             } => {
                 let partition = focal_client::input::parse_id(&partition)?;
-                runtime.block_on(admin.partition_transfer(
+                admin.partition_transfer(
                     partition,
                     node,
                     expected_configuration_index,
-                ))
+                ).await
             }
         },
         ClusterCommand::Request {
@@ -799,10 +792,10 @@ pub(crate) fn run(
         } => admin.inspect(),
         ClusterCommand::Request {
             command: RequestCommand::Retry { operation_id },
-        } => runtime.block_on(admin.retry(&operation_id)),
+        } => admin.retry(&operation_id).await,
         ClusterCommand::Request {
             command: RequestCommand::Reconcile { operation_id },
-        } => runtime.block_on(admin.reconcile(&operation_id)),
+        } => admin.reconcile(&operation_id).await,
         ClusterCommand::Invite { .. } => return Err("invalid invitation dispatch".into()),
     }?;
     crate::print_json(&serde_json::json!({"schema_version":1,"result":result}))
@@ -811,8 +804,7 @@ pub(crate) fn run(
 /// The session an operator named, else the node identity's original one.
 /// `focal diagnose`: what the selected node and its replicas report about
 /// themselves, one read a command, read through the node's admin socket.
-pub(crate) fn diagnose(
-    runtime: &tokio::runtime::Runtime,
+pub(crate) async fn diagnose(
     settings: &focal_node::config::Settings,
     command: DiagnoseCommand,
 ) -> crate::Result<()> {
@@ -823,26 +815,26 @@ pub(crate) fn diagnose(
             if reads.metrics {
                 // Exposition text goes out as it is: a scraper reads it, not
                 // a JSON consumer.
-                let result = runtime.block_on(admin.operator(OperatorRead::Metrics))?;
+                let result = admin.operator(OperatorRead::Metrics).await?;
                 let focal_client::admin::AdminResult::Metrics { text } = result else {
                     return Err(ClusterAdminError::Invalid.into());
                 };
                 return crate::print_text(&text);
             }
             if let Some(check) = reads.probe {
-                runtime.block_on(admin.probe(&check))
+                admin.probe(&check).await
             } else if reads.identity {
-                runtime.block_on(admin.operator(OperatorRead::Identity))
+                admin.operator(OperatorRead::Identity).await
             } else if reads.health {
-                runtime.block_on(admin.operator(OperatorRead::Health))
+                admin.operator(OperatorRead::Health).await
             } else if reads.listener {
-                runtime.block_on(admin.operator(OperatorRead::Configuration))
+                admin.operator(OperatorRead::Configuration).await
             } else if reads.readiness {
-                runtime.block_on(admin.operator(OperatorRead::Readiness))
+                admin.operator(OperatorRead::Readiness).await
             } else if reads.storage {
-                runtime.block_on(admin.storage())
+                admin.storage().await
             } else if reads.gc {
-                runtime.block_on(admin.gc())
+                admin.gc().await
             } else {
                 return Err(ClusterAdminError::Invalid.into());
             }
@@ -850,9 +842,9 @@ pub(crate) fn diagnose(
         DiagnoseCommand::Cluster(reads) => {
             let session = session_of(&admin, reads.session)?;
             if reads.replicas {
-                runtime.block_on(admin.operator(OperatorRead::Replica { session }))
+                admin.operator(OperatorRead::Replica { session }).await
             } else if reads.retention {
-                runtime.block_on(admin.retention(session))
+                admin.retention(session).await
             } else {
                 return Err(ClusterAdminError::Invalid.into());
             }
@@ -873,8 +865,7 @@ fn session_of(
         .transpose()
         .map(|session| session.unwrap_or(admin.identity().ledger.session))
 }
-fn replicas(
-    runtime: &tokio::runtime::Runtime,
+async fn replicas(
     admin: &ClusterAdmin,
     command: ReplicaCommand,
 ) -> Result<focal_client::admin::AdminResult, focal_node::cluster_admin::ClusterAdminError> {
@@ -894,19 +885,18 @@ fn replicas(
             session: value,
             node,
             expected_configuration_index,
-        } => runtime.block_on(admin.replica_transfer(
+        } => admin.replica_transfer(
             session(value)?,
             node,
             expected_configuration_index,
-        )),
+        ).await,
         ReplicaCommand::ActivateNative { session: value } => {
-            runtime.block_on(admin.replica_activate_native(session(value)?))
+            admin.replica_activate_native(session(value)?).await
         }
         ReplicaCommand::Checkpoint { session: value } => {
-            runtime.block_on(admin.replica_checkpoint(session(value)?))
+            admin.replica_checkpoint(session(value)?).await
         }
-        ReplicaCommand::List { after, limit } => runtime.block_on(
-            admin.replica_list(
+        ReplicaCommand::List { after, limit } => admin.replica_list(
                 after
                     .map(|value| {
                         focal_client::input::parse_id(&value)
@@ -915,10 +905,9 @@ fn replicas(
                     })
                     .transpose()?,
                 limit,
-            ),
-        ),
+            ).await,
         ReplicaCommand::Show { session: value } => {
-            runtime.block_on(admin.replica_show(session(value)?))
+            admin.replica_show(session(value)?).await
         }
         ReplicaCommand::Membership {
             session: value,
@@ -926,7 +915,7 @@ fn replicas(
         } => {
             let session = session(value)?;
             let (change, index) = match command {
-                MembershipCommand::Show => return runtime.block_on(admin.replica_show(session)),
+                MembershipCommand::Show => return admin.replica_show(session).await,
                 MembershipCommand::AddLearner {
                     node,
                     expected_configuration_index,
@@ -952,7 +941,7 @@ fn replicas(
                     expected_configuration_index,
                 } => (MembershipChange::LeaveJoint, expected_configuration_index),
             };
-            runtime.block_on(admin.replica_change(session, change, index))
+            admin.replica_change(session, change, index).await
         }
         ReplicaCommand::Ranges {
             session: value,
@@ -960,25 +949,23 @@ fn replicas(
         } => {
             let session = session(value)?;
             match command {
-                RangesCommand::List => runtime.block_on(admin.replica_ranges(session)),
-                RangesCommand::Move { member, node } => runtime.block_on(
-                    admin.move_range(
+                RangesCommand::List => admin.replica_ranges(session).await,
+                RangesCommand::Move { member, node } => admin.move_range(
                         admin.tenant().0,
                         session.0,
                         focal_client::input::parse_id(&member)
                             .map_err(|_| ClusterAdminError::Invalid)?,
                         node,
-                    ),
-                ),
+                    ).await,
             }
         }
         ReplicaCommand::Request { command } => match command {
             RequestCommand::Inspect => admin.replica_inspect(),
             RequestCommand::Retry { operation_id } => {
-                runtime.block_on(admin.replica_retry(&operation_id))
+                admin.replica_retry(&operation_id).await
             }
             RequestCommand::Reconcile { operation_id } => {
-                runtime.block_on(admin.replica_reconcile(&operation_id))
+                admin.replica_reconcile(&operation_id).await
             }
         },
     }

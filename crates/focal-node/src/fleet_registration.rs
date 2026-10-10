@@ -32,7 +32,7 @@ impl ReplicaHost {
                 REGISTRATION_BYTES,
             )?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Registration(send, charge))
             .map_err(|error| match error {

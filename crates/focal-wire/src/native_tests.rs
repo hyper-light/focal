@@ -898,7 +898,7 @@ fn the_native_profile_negotiates_over_the_local_socket_only_where_the_handler_ad
         for native in [true, false] {
             let socket = root.path().join(format!("native-{native}.sock"));
             let server = std::sync::Arc::new(
-                UnixServer::bind(&socket, grant.clone(), limits.clone()).unwrap(),
+                LocalServer::bind(&socket, grant.clone(), limits.clone()).unwrap(),
             );
             let serving = server.clone();
             let handler: std::sync::Arc<dyn RequestHandler> =
@@ -907,7 +907,7 @@ fn the_native_profile_negotiates_over_the_local_socket_only_where_the_handler_ad
                 serving.serve(handler).await.unwrap();
             })
             .unwrap();
-            let remote = UnixRemote::new(&socket, limits.clone()).unwrap();
+            let remote = LocalRemote::new(&socket, limits.clone()).unwrap();
             let submit = envelope(
                 NATIVE_PROTOCOL_VERSION,
                 Operation::Native {

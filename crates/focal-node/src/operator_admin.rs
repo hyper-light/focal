@@ -409,11 +409,11 @@ impl LocalNetworkAdmin {
         // with them. What the budget does not cover is reported as absent
         // (`truncated`, no directory view), which never satisfies the policy
         // — honest, and bounded.
-        let deadline = tokio::time::Instant::now()
+        let deadline = focal_rt::time::Instant::now()
             .checked_add(READINESS_BUDGET)
             .ok_or(AccessError::Capacity)?;
         let placement = match &self.placement {
-            Some(handle) => match tokio::time::timeout_at(deadline, handle.directory()).await {
+            Some(handle) => match focal_rt::time::timeout_at(deadline, handle.directory()).await {
                 Ok(Ok(report)) => {
                     let (now, holds) = self.session_holds(&report);
                     Some(placement_reply(
@@ -447,7 +447,7 @@ impl LocalNetworkAdmin {
                 break;
             }
             let progress = host.progress();
-            let Ok(Ok(reply)) = tokio::time::timeout_at(deadline, host.diagnostics()).await else {
+            let Ok(Ok(reply)) = focal_rt::time::timeout_at(deadline, host.diagnostics()).await else {
                 truncated = true;
                 break;
             };

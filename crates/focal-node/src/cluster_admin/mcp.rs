@@ -1,11 +1,16 @@
 use super::*;
-use focal_mcp::{AdminAction, AdminBackend, AdminChange, AdminError};
+use focal_mcp::{AdminAction, AdminBackend, AdminChange, AdminError, AdminFuture, Cancel};
+use hyper_rt::combine::{Either, race2};
 impl AdminBackend for ClusterAdmin {
-    fn execute(
+    fn execute<'a>(&'a mut self, action: AdminAction, cancel: &'a mut Cancel) -> AdminFuture<'a> {
+        Box::pin(self.execute_inner(action, cancel))
+    }
+}
+impl ClusterAdmin {
+    async fn execute_inner(
         &mut self,
-        runtime: &tokio::runtime::Runtime,
         action: AdminAction,
-        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> std::result::Result<AdminResult, AdminError> {
         let work = async {
             match action {
@@ -273,12 +278,16 @@ impl AdminBackend for ClusterAdmin {
                 AdminAction::Reconcile { operation_id } => self.reconcile(&operation_id).await,
             }
         };
-        runtime.block_on(async {
-            tokio::select! {
-                result=work=>result.map_err(error),
-                _=cancel=>Err(AdminError { code:"cancelled",condition:"Cancelled",detail:"Admin wait cancelled; inspect the latest journal before issuing a new mutation.".into() }),
-            }
-        })
+        // The cancel's end — sent or its sender gone — ends the wait.
+        match race2(work, cancel).await {
+            Either::First(result) => result.map_err(error),
+            Either::Second(_) => Err(AdminError {
+                code: "cancelled",
+                condition: "Cancelled",
+                detail: "Admin wait cancelled; inspect the latest journal before issuing a new mutation."
+                    .into(),
+            }),
+        }
     }
 }
 fn error(error: ClusterAdminError) -> AdminError {

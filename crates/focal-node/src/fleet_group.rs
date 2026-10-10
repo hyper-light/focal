@@ -36,18 +36,26 @@ pub type ReplicaFleetParts = (
 /// Keeps outbound channel storage charged even after the worker has stopped.
 /// The receiver cannot be detached from its accounting lifetime.
 pub struct FleetReplication {
-    receiver: async_mpsc::Receiver<ReplicationFrame>,
+    receiver: ChannelReceiver<ReplicationFrame>,
     _backing: std::sync::Arc<Allocation>,
 }
 impl FleetReplication {
+    /// The next frame; `None` once the owner's egress has ended (or no
+    /// wait could be kept: off a shard).
     pub async fn recv(&mut self) -> Option<ReplicationFrame> {
-        self.receiver.recv().await
+        self.receiver.recv().await.ok()
     }
-    pub fn try_recv(&mut self) -> Result<ReplicationFrame, async_mpsc::error::TryRecvError> {
-        self.receiver.try_recv()
+    /// A frame already queued, without waiting.
+    pub fn try_recv(&mut self) -> Option<ReplicationFrame> {
+        self.receiver.try_recv().ok().flatten()
     }
-    pub fn close(&mut self) {
-        self.receiver.close();
+    /// Polls for the next frame as the replication driver does: `Closed`
+    /// once the owner's egress has ended and nothing is queued.
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ReplicationFrame, hyper_rt::sync::SyncError<()>>> {
+        std::future::Future::poll(std::pin::pin!(self.receiver.recv()), cx)
     }
 }
 pub(super) struct Routed {
@@ -296,7 +304,8 @@ impl ReplicaFleet {
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
         let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
-        let (outbound, outgoing) = async_mpsc::channel(QUEUED);
+        let (outbound, outgoing) =
+            hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
         let mut sessions = BTreeMap::new();
         let mut wal_owners = Vec::new();
         wal_owners

@@ -15,7 +15,7 @@ use focal_model::LedgerId;
 use focal_wire::AccessError;
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tokio::sync::watch;
+use focal_rt::watch;
 
 /// Milliseconds between the agent's ticks; the default is five seconds.
 pub const INTERVAL_ENV: &str = "FOCAL_RETIRE_INTERVAL_MS";
@@ -60,7 +60,11 @@ fn now_ms() -> u64 {
 }
 
 impl ArchiveAgent {
-    pub fn new(interval: Duration, grace_ms: u64) -> (Self, ArchiveHandle) {
+    /// Refused at the runtime's cell bound (its status is a watched value).
+    pub fn new(
+        interval: Duration,
+        grace_ms: u64,
+    ) -> Result<(Self, ArchiveHandle), focal_rt::RtError> {
         let interval = interval.max(Duration::from_millis(10));
         let (status, receiver) = watch::channel(AdminArchiveAgent {
             interval_ms: u64::try_from(interval.as_millis()).unwrap_or(u64::MAX),
@@ -71,8 +75,8 @@ impl ArchiveAgent {
             seals_proposed: 0,
             seals_waiting: 0,
             last_tick_ms: 0,
-        });
-        (
+        })?;
+        Ok((
             Self {
                 interval,
                 grace_ms,
@@ -85,7 +89,7 @@ impl ArchiveAgent {
                 status,
             },
             ArchiveHandle(receiver),
-        )
+        ))
     }
     fn publish(&self) {
         let status = AdminArchiveAgent {
@@ -98,19 +102,19 @@ impl ArchiveAgent {
             seals_waiting: self.seals_waiting,
             last_tick_ms: now_ms(),
         };
-        let _ = self.status.send(status);
+        self.status.send(status);
     }
     /// The interval and grace from the environment, else the defaults.
-    pub fn from_env() -> (Self, ArchiveHandle) {
+    pub fn from_env() -> Result<(Self, ArchiveHandle), focal_rt::RtError> {
         let (interval, grace_ms) = settings_from_env();
         Self::new(interval, grace_ms)
     }
     pub async fn run(mut self, handles: &NetworkHandles) -> Result<(), AccessError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(AccessError::Unavailable);
         }
         loop {
-            tokio::time::sleep(self.interval).await;
+            focal_rt::time::pause(self.interval).await;
             self.tick(handles).await;
         }
     }

@@ -19,7 +19,7 @@ use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef, Ledger
 use focal_wire::AccessError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use focal_rt::watch;
 
 /// Milliseconds between passes; one minute by default.
 pub const INTERVAL_ENV: &str = "FOCAL_GC_INTERVAL_MS";
@@ -106,7 +106,12 @@ fn admin_report(report: focal_evidence::CollectorReport) -> AdminCollectorReport
 }
 
 impl GcAgent {
-    pub fn new(node: u64, interval: Duration, config: CollectorConfig) -> (Self, GcHandle) {
+    /// Refused at the runtime's cell bound (its status is a watched value).
+    pub fn new(
+        node: u64,
+        interval: Duration,
+        config: CollectorConfig,
+    ) -> Result<(Self, GcHandle), focal_rt::RtError> {
         let interval = interval.max(Duration::from_millis(10));
         let (status, receiver) = watch::channel(AdminGc {
             node,
@@ -114,8 +119,8 @@ impl GcAgent {
             passes: 0,
             collecting: false,
             last: None,
-        });
-        (
+        })?;
+        Ok((
             Self {
                 node,
                 interval,
@@ -127,11 +132,11 @@ impl GcAgent {
                 status,
             },
             GcHandle(receiver),
-        )
+        ))
     }
     /// The interval and the collector's settings from the environment, else
     /// the defaults.
-    pub fn from_env(node: u64) -> (Self, GcHandle) {
+    pub fn from_env(node: u64) -> Result<(Self, GcHandle), focal_rt::RtError> {
         let millis = |name: &str| {
             std::env::var_os(name).and_then(|value| {
                 value
@@ -155,18 +160,18 @@ impl GcAgent {
         Self::new(node, interval, config)
     }
     pub async fn run(mut self, handles: &NetworkHandles) -> Result<(), AccessError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(AccessError::Unavailable);
         }
         loop {
-            tokio::time::sleep(self.interval).await;
+            focal_rt::time::pause(self.interval).await;
             // A pass that cannot run now (a store that refuses, a replica
             // that is stopping) waits for the next tick; nothing is inferred.
             let _ = self.pass(handles).await;
         }
     }
     fn publish(&self) {
-        let _ = self.status.send(AdminGc {
+        self.status.send(AdminGc {
             node: self.node,
             config: admin_config(self.interval, self.config),
             passes: self.passes,
@@ -204,7 +209,7 @@ impl GcAgent {
             if report.complete {
                 break;
             }
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
         }
         pass.content = admin_report(report);
         if !report.complete {
@@ -281,7 +286,7 @@ impl GcAgent {
                     complete = true;
                     break;
                 }
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
             }
             if !complete {
                 // A replica without a native core, or one that stopped mid-walk:
@@ -320,7 +325,7 @@ impl GcAgent {
                         break;
                     }
                 }
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
             }
         }
         protection.finish();
@@ -386,7 +391,7 @@ impl GcAgent {
                 if sweep.complete {
                     break;
                 }
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
             }
         }
         Ok(report)

@@ -101,7 +101,7 @@ async fn completion_and_receipt_probe_use_reserved_bytes_and_queue_slots() {
                 if matches!(reply.result, Response::Read(_)) {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                focal_rt::time::pause(Duration::from_millis(20)).await;
             }
         },
     )

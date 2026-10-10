@@ -68,3 +68,40 @@ pub async fn within_until<F: Future>(
 ) -> Result<Option<F::Output>, RtError> {
     within(deadline.remaining(), work).await
 }
+
+/// Why a bounded wait gave no output: its period passed, or no wait could be kept (off a shard).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TimedOut {
+    #[error("the wait's period passed")]
+    Elapsed,
+    #[error("no wait could be kept: {0}")]
+    Refused(RtError),
+}
+
+/// What `work` yields within `period`, or why it did not: [`within`] in the shape of a result.
+pub async fn timeout<F: Future>(period: Duration, work: F) -> Result<F::Output, TimedOut> {
+    match within(period, work).await {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => Err(TimedOut::Elapsed),
+        Err(refused) => Err(TimedOut::Refused(refused)),
+    }
+}
+
+/// What `work` yields by `deadline`, or why it did not.
+pub async fn timeout_at<F: Future>(deadline: Instant, work: F) -> Result<F::Output, TimedOut> {
+    timeout(deadline.remaining(), work).await
+}
+
+/// Waits `period`: on the shard's wheel, or — off any shard, where a plain thread's own loop drives
+/// the future — by blocking that thread, the only wait it has. A loop that pauses between its tries
+/// never spins on a refused wait.
+pub async fn pause(period: Duration) {
+    if sleep(period).await.is_err() {
+        std::thread::sleep(period);
+    }
+}
+
+/// Waits until `deadline`, as [`pause`] does.
+pub async fn pause_until(deadline: Instant) {
+    pause(deadline.remaining()).await;
+}

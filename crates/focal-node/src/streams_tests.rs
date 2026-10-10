@@ -395,7 +395,7 @@ async fn disconnected_projection_expires_without_another_client_request() {
     };
     node.session.submit_cursor_local(&input).unwrap();
     let (host, owner) = crate::host::LocalHost::spawn(node, WireLimits::default()).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    focal_rt::time::pause(std::time::Duration::from_millis(1200)).await;
     host.stop().await.unwrap();
     owner.join().unwrap();
     let node = open(root.path());

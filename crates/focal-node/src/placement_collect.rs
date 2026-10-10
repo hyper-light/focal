@@ -110,7 +110,7 @@ pub async fn remote_signature(
             request: body.to_vec(),
         },
     };
-    let bytes = tokio::time::timeout(REMOTE_TIMEOUT, pool.send_placement(voter, &envelope))
+    let bytes = focal_rt::time::timeout(REMOTE_TIMEOUT, pool.send_placement(voter, &envelope))
         .await
         .ok()?
         .ok()?;

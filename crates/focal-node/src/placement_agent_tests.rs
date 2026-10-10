@@ -342,7 +342,7 @@ async fn founder_agent_registers_its_session_reports_load_and_restarts_without_r
         after.nodes[&node].enrollment,
         checkpoint.nodes[&node].enrollment
     );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    focal_rt::time::pause(Duration::from_millis(1500)).await;
     let (settled, _, _) = observe(&founder, &host, 7).await.unwrap();
     assert_eq!(
         settled.revision,
@@ -488,7 +488,7 @@ async fn operators_admit_tenants_and_create_sessions_that_register_serve_and_sur
         route_cache_tests::{ask, envelope},
     };
     use focal_client::admin::AdminResult;
-    use focal_wire::{AccessError, Response, UnixRemote, WireLimits};
+    use focal_wire::{AccessError, Response, LocalRemote, WireLimits};
     let directory = tempfile::tempdir().unwrap();
     let settings = settings(directory.path());
     let founder = Running::start(&settings).await;
@@ -519,7 +519,7 @@ async fn operators_admit_tenants_and_create_sessions_that_register_serve_and_sur
     // socket's grant does not name it.
     assert!(admin.create_session(tenant.0, name).await.is_err());
     let local =
-        UnixRemote::new(directory.path().join("focal.sock"), WireLimits::default()).unwrap();
+        LocalRemote::new(directory.path().join("focal.sock"), WireLimits::default()).unwrap();
     assert!(matches!(
         local
             .request(&envelope(ledger, 1, 601))
@@ -804,7 +804,7 @@ async fn the_controller_completes_a_plan_on_one_host_with_signed_readiness_and_f
     );
     assert_eq!(after.revision, revision + 1);
     assert_eq!(after.sessions[&ledger].authority, active.authority);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    focal_rt::time::pause(Duration::from_millis(1000)).await;
     let (settled, _, _) = observe(&founder, &host, 11).await.unwrap();
     assert_eq!(settled.revision, revision + 1);
     founder.stop().await;
@@ -827,7 +827,7 @@ async fn join_peer_inner(
     peer_settings: &crate::network_service::tests::TestSettings,
 ) -> (Running, u64) {
     let identity = crate::embedded::decode_identity(&founder_dir.join("IDENTITY")).unwrap();
-    let admin = focal_wire::UnixRemote::new(
+    let admin = focal_wire::LocalRemote::new(
         founder.status.admin_socket.as_ref().unwrap(),
         crate::network_admin::admin_wire_limits(),
     )

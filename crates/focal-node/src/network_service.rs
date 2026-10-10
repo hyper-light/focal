@@ -44,9 +44,11 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::mpsc,
+    task::Poll,
     time::Duration,
 };
-use tokio::sync::{mpsc as async_mpsc, oneshot};
+use focal_rt::time::Instant;
+use hyper_rt::sync::{ChannelReceiver, OneshotReceiver};
 
 #[path = "network_directory.rs"]
 mod network_directory;
@@ -95,6 +97,10 @@ pub enum ServiceError {
     Wal(#[from] focal_log::LogError),
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
+    #[error("runtime: {0}")]
+    Rt(#[from] focal_rt::RtError),
+    #[error("blocking work: {0}")]
+    Pool(#[from] focal_rt::PoolError),
     #[error("network owner stopped: {0}")]
     Owner(&'static str),
     #[error("network controller: {0}")]
@@ -346,7 +352,7 @@ impl PhysicalOwner {
 const OWNER_SLOTS: usize = 4 + network_directory::MAX_HOSTED_PARTITIONS;
 struct OwnerGate {
     sender: Option<mpsc::SyncSender<OwnerRegistration>>,
-    finished: oneshot::Receiver<Result<(), ServiceError>>,
+    finished: OneshotReceiver<Result<(), ServiceError>>,
 }
 struct OwnerRegistration {
     storage: Option<(NodeDirectory, focal_consensus::storage_open::OpenedStorage)>,
@@ -366,7 +372,7 @@ impl OwnerGate {
             .try_reserve_exact(OWNER_SLOTS)
             .map_err(|_| ServiceError::Owner("owner registry capacity"))?;
         let (sender, receiver) = mpsc::sync_channel::<OwnerRegistration>(5);
-        let (done, finished) = oneshot::channel();
+        let (done, finished) = hyper_rt::sync::oneshot()?;
         std::thread::Builder::new()
             .name("focal-node-owners".into())
             .stack_size(2 * 1024 * 1024)
@@ -458,12 +464,12 @@ pub struct NetworkService {
     handles: NetworkHandles,
     data: DataService,
     listener: NetworkListener,
-    local: UnixServer,
-    admin: Option<(UnixServer, LocalNetworkAdmin)>,
+    local: LocalServer,
+    admin: Option<(LocalServer, LocalNetworkAdmin)>,
     pool: PeerConnectionPool,
     registry: PeerRegistry,
     controller: Option<NetworkController>,
-    credential_requests: Option<async_mpsc::Receiver<crate::credential_renewal::CredentialRequest>>,
+    credential_requests: Option<ChannelReceiver<crate::credential_renewal::CredentialRequest>>,
     agent: Option<crate::placement_agent::PlacementAgent>,
     /// The collector agent (26 §5), taken by `run`.
     gc_agent: Option<crate::gc::GcAgent>,
@@ -471,7 +477,7 @@ pub struct NetworkService {
     liveness: Option<crate::liveness::LivenessDriver>,
     routes: Option<crate::route_cache_host::RouteCacheDriver>,
     directory_startup: Option<DirectoryStartup>,
-    control_output: Option<async_mpsc::Receiver<ControlReplicationFrame>>,
+    control_output: Option<ChannelReceiver<ControlReplicationFrame>>,
     ledger_output: Option<FleetReplication>,
     evidence: Option<EvidenceDriver>,
     signer: Option<QuorumEnrollmentDriver>,
@@ -479,7 +485,7 @@ pub struct NetworkService {
     authority: FounderControlAuthority,
     /// The fingerprint of the certificate the founder presents now, as its
     /// controller publishes it (24 §11).
-    presented: tokio::sync::watch::Receiver<[u8; 32]>,
+    presented: focal_rt::watch::Receiver<[u8; 32]>,
     budget: MemoryBudget,
     _configuration: Allocation,
     /// The cluster this node belongs to, for restoring the enrollment
@@ -490,9 +496,9 @@ pub struct NetworkService {
     /// The fixed labels of this node's metrics and the latest snapshot the
     /// sampler published (24 §23).
     metrics_labels: crate::metrics::MetricLabels,
-    metrics: tokio::sync::watch::Sender<Option<crate::metrics::MetricsPage>>,
+    metrics: focal_rt::watch::Sender<Option<crate::metrics::MetricsPage>>,
     /// The loopback endpoint bound at open when `node.metrics_listen` names one.
-    metrics_listener: Option<tokio::net::TcpListener>,
+    metrics_listener: Option<hyper_rt::tcp::TcpListener>,
     // All service handles and futures drop before registration closes. The
     // reaper retains LOCK even if a caller cancels run_until or keeps a handle.
     owners: Option<OwnerGate>,
@@ -718,7 +724,7 @@ impl NetworkService {
         )?;
         // The founder's own credential as it presents it now (24 §11).
         let (presented_sender, presented) =
-            tokio::sync::watch::channel(certificate_fingerprint(&receipt.certificate));
+            focal_rt::watch::channel(certificate_fingerprint(&receipt.certificate))?;
         // A sponsor named rather than addressed resolves at each start
         // (24 §24); an unresolvable name is not fatal here.
         let sponsor_address = crate::network_state::resolve_endpoint(&state.sponsor.endpoint)
@@ -756,13 +762,13 @@ impl NetworkService {
             controller = controller.with_enrollment_identity(identity.clone());
         }
         let (credential_handle, credential_requests) =
-            crate::credential_renewal::CredentialHandle::channel(4);
+            crate::credential_renewal::CredentialHandle::channel(4)?;
         let limits = ControlHost::wire_limits();
         let socket = match socket {
             Some(socket) => socket,
             None => std::net::UdpSocket::bind(state.listen).map_err(WireError::from)?,
         };
-        let listener = NetworkListener::from_socket(
+        let listener = NetworkListener::bind(
             socket,
             &credentials,
             signing_identity.as_ref(),
@@ -778,6 +784,7 @@ impl NetworkService {
         }
         .parse()
         .map_err(|_| ServiceError::Owner("invalid internal bind"))?;
+        // The peer pool's endpoint is charged to the node's budget.
         let connector = QuicConnector::bind(
             bind,
             client_tls(
@@ -789,6 +796,7 @@ impl NetworkService {
                 &limits,
             )?,
             limits.clone(),
+            focal_wire::endpoint_budget(&limits, Some(&budget))?,
         )?;
         let pool = PeerConnectionPool::new(
             connector,
@@ -798,7 +806,7 @@ impl NetworkService {
         clean_socket(&socket, &root)?;
         // The local grant follows the committed registry: the controller
         // adds every admitted tenant on each refresh (doc 24 §16).
-        let (local_grant, local_grant_watch) = tokio::sync::watch::channel(PeerGrant {
+        let local_grant = LocalGrant::new(PeerGrant {
             principal: if founder {
                 identity.issuer
             } else {
@@ -815,13 +823,13 @@ impl NetworkService {
                 PeerRole::Actor
             },
         });
-        let local = UnixServer::bind_watched(&socket, local_grant_watch, WireLimits::default())?;
+        let local = LocalServer::bind_watched(&socket, local_grant.clone(), WireLimits::default())?;
         controller.follow_local_grant(local_grant);
         let mut admin = if let Some(handler) = admin_handler {
             let path = root.join(ADMIN_SOCKET);
             clean_socket(&path, &root)?;
             Some((
-                UnixServer::bind(
+                LocalServer::bind(
                     path,
                     PeerGrant {
                         principal: identity.issuer,
@@ -853,7 +861,7 @@ impl NetworkService {
             let identity = identity.clone();
             let tenant = tenant.clone();
             let settings = settings.clone();
-            tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
+            focal_rt::on_pool(&focal_rt::FILES, move || -> Result<_, ServiceError> {
                 let content = ContentStore::open_with_disk(
                     root.join("content"),
                     StoreLimits {
@@ -891,8 +899,7 @@ impl NetworkService {
                 };
                 Ok((content, session))
             })
-            .await
-            .map_err(|_| ServiceError::Owner("store recovery task failed to join"))??
+            .await??
         };
         // The founder's custody and serving scope follow the placement its
         // session has committed; a fresh session starts at the single-node
@@ -923,7 +930,8 @@ impl NetworkService {
             }),
             (None, false) => None,
         };
-        let (placement_handle, agent_jobs) = crate::placement_control::PlacementHandle::channel(16);
+        let (placement_handle, agent_jobs) =
+            crate::placement_control::PlacementHandle::channel(16)?;
         let (liveness_handle, liveness_driver) = crate::liveness::LivenessHandle::channel(
             &budget,
             crate::liveness::LivenessConfig::default(),
@@ -1120,10 +1128,10 @@ impl NetworkService {
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
             4,
         )?;
-        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node);
-        let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env();
+        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node)?;
+        let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env()?;
         let (metrics, metrics_view) =
-            tokio::sync::watch::channel::<Option<crate::metrics::MetricsPage>>(None);
+            focal_rt::watch::channel::<Option<crate::metrics::MetricsPage>>(None)?;
         let metrics_labels = crate::metrics::MetricLabels {
             node: identity.node,
             cluster: crate::cluster_admin::hex(&identity.cluster),
@@ -1136,7 +1144,10 @@ impl NetworkService {
             role: if founder { "founder" } else { "host" },
         };
         let metrics_listener = match settings.node.metrics_listen {
-            Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+            Some(address) => Some(hyper_rt::tcp::TcpListener::bind(
+                address,
+                crate::metrics::loopback_backlog(),
+            )?),
             None => None,
         };
         if let Some((server, handler)) = admin.take() {
@@ -1224,7 +1235,7 @@ impl NetworkService {
     /// by one within one page (the audit's F26, `metrics::rounds`).
     async fn sample_metrics(
         &self,
-        started: tokio::time::Instant,
+        started: Instant,
         rounds: &mut crate::metrics::rounds::Rounds,
     ) -> Result<crate::metrics::MetricsSnapshot, MemoryError> {
         fn count(value: usize) -> u64 {
@@ -1613,7 +1624,7 @@ impl NetworkService {
                 peer_reports_dropped: root.peer_reports_dropped,
             },
             peers: self.pool.stats(),
-            listener: self.listener.admission(),
+            listener: self.listener.admission().await,
             peer_rtts,
             liveness,
             credential,
@@ -1702,9 +1713,9 @@ impl NetworkService {
         // A future may be moved to another runtime between polls. Contain the
         // timer dependency here too, after the earlier run boundary has ended.
         let cleaned = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(SHUTDOWN_DEADLINE, cleanup)
-                .await
-                .map_err(|_| ServiceError::ShutdownTimeout)?
+            focal_rt::time::within(SHUTDOWN_DEADLINE, cleanup)
+                .await?
+                .ok_or(ServiceError::ShutdownTimeout)?
         })
         .catch_unwind()
         .await
@@ -1867,7 +1878,7 @@ impl NetworkService {
                 // (the audit's F65). The text is rendered here, once. A
                 // round refused its room keeps the last page, whose sample
                 // time says its age, and the next page counts it.
-                let started = tokio::time::Instant::now();
+                let started = Instant::now();
                 if let Some(rounds) = rounds.as_mut() {
                     let page = match self.sample_metrics(started, rounds).await {
                         Ok(snapshot) => {
@@ -1882,12 +1893,17 @@ impl NetworkService {
                         None => rounds.refused(),
                     }
                 }
-                tokio::time::sleep_until(
+                // A sleep refused (no wheel to keep it) ends the sampler, never spins it.
+                if focal_rt::time::sleep_until(
                     started
                         .checked_add(crate::metrics::SAMPLE_INTERVAL)
                         .unwrap_or(started),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    return;
+                }
             }
         };
         // The root group's tick period follows the round trips this node
@@ -1971,9 +1987,11 @@ impl NetworkService {
                 while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
                     pace_session(&host);
                     after = Some(ledger);
-                    tokio::task::yield_now().await;
+                    hyper_rt::futures::yield_now().await;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if focal_rt::time::sleep(Duration::from_secs(1)).await.is_err() {
+                    return;
+                }
             }
         };
         let metrics_view = self.metrics.subscribe();
@@ -2013,7 +2031,7 @@ impl NetworkService {
                     }) {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    focal_rt::time::sleep(Duration::from_millis(25)).await?;
                 }
                 let mut status = self.status.clone();
                 status.condition = "Ready";
@@ -2024,76 +2042,158 @@ impl NetworkService {
             std::future::pending::<Result<(), ServiceError>>().await
         };
         let handles = &self.handles;
-        tokio::pin!(
-            network,
-            local,
-            admin,
-            controller,
-            placement_agent,
-            archive_agent,
-            gc_agent,
-            liveness,
-            routes,
-            directory_driver,
-            managed_support,
-            control_driver,
-            ledger_driver,
-            evidence_driver,
-            signer_driver,
-            ready,
-            shutdown,
-            metrics_sampler,
-            metrics_endpoint,
-            pacer
-        );
-        let signalled = tokio::select! {
-            result=&mut shutdown=>result.map_err(ServiceError::Io).map(|()| true),
-            result=&mut ready=>result.map(|()| false),
-            result=&mut network=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("network listener ended"))),
-            result=&mut local=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("local listener ended"))),
-            result=&mut admin=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("admin listener ended"))),
-            result=&mut controller=>result.map_err(ServiceError::Controller).and(Err(ServiceError::Owner("controller ended"))),
-            result=&mut placement_agent=>result.map_err(ServiceError::Agent).and(Err(ServiceError::Owner("placement agent ended"))),
-            result=&mut archive_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("archive agent ended"))),
-            result=&mut gc_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("collector agent ended"))),
-            result=&mut directory_driver=>result.map(|()| false),
-            ()=&mut liveness=>Err(ServiceError::Owner("liveness driver ended")),
-            ()=&mut routes=>Err(ServiceError::Owner("route cache driver ended")),
-            _=&mut managed_support=>Err(ServiceError::Owner("managed capability driver ended")),
-            result=&mut control_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("control egress ended"))),
-            result=&mut ledger_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("ledger egress ended"))),
-            _=&mut evidence_driver=>Err(ServiceError::Owner("evidence driver ended")),
-            _=&mut signer_driver=>Err(ServiceError::Owner("enrollment driver ended")),
-            ()=&mut metrics_sampler=>Err(ServiceError::Owner("metrics sampler ended")),
-            ()=&mut pacer=>Err(ServiceError::Owner("pace driver ended")),
-            result=&mut metrics_endpoint=>result.map_err(ServiceError::Io).and(Err(ServiceError::Owner("metrics endpoint ended"))),
-            _=self.handles.control.closed()=>Err(match self.handles.control.progress().failure {
-                Some(failure) => ServiceError::ControlOwner(failure),
-                None => ServiceError::Owner("control owner ended"),
+        // The listener and the two egress drivers outlive the race: the stop phase polls them
+        // again while the owners stop.
+        let mut network = std::pin::pin!(network);
+        let mut control_driver = std::pin::pin!(control_driver);
+        let mut ledger_driver = std::pin::pin!(ledger_driver);
+        // Every other driver, each mapped to how its end ends the run: a shutdown signalled
+        // (`true`), the run over with nothing to stop (`false`), or why it failed.
+        let mut drivers: [Ending<'_>; 18] = [
+            Box::pin(async { shutdown.await.map_err(ServiceError::Io).map(|()| true) }),
+            Box::pin(async { ready.await.map(|()| false) }),
+            Box::pin(async {
+                local
+                    .await
+                    .map_err(ServiceError::Wire)
+                    .and(Err(ServiceError::Owner("local listener ended")))
             }),
-        };
+            Box::pin(async {
+                admin
+                    .await
+                    .map_err(ServiceError::Wire)
+                    .and(Err(ServiceError::Owner("admin listener ended")))
+            }),
+            Box::pin(async {
+                controller
+                    .await
+                    .map_err(ServiceError::Controller)
+                    .and(Err(ServiceError::Owner("controller ended")))
+            }),
+            Box::pin(async {
+                placement_agent
+                    .await
+                    .map_err(ServiceError::Agent)
+                    .and(Err(ServiceError::Owner("placement agent ended")))
+            }),
+            Box::pin(async {
+                archive_agent
+                    .await
+                    .map_err(ServiceError::Access)
+                    .and(Err(ServiceError::Owner("archive agent ended")))
+            }),
+            Box::pin(async {
+                gc_agent
+                    .await
+                    .map_err(ServiceError::Access)
+                    .and(Err(ServiceError::Owner("collector agent ended")))
+            }),
+            Box::pin(async { directory_driver.await.map(|()| false) }),
+            Box::pin(async {
+                liveness.await;
+                Err(ServiceError::Owner("liveness driver ended"))
+            }),
+            Box::pin(async {
+                routes.await;
+                Err(ServiceError::Owner("route cache driver ended"))
+            }),
+            Box::pin(async {
+                let _ = managed_support.await;
+                Err(ServiceError::Owner("managed capability driver ended"))
+            }),
+            Box::pin(async {
+                let _ = evidence_driver.await;
+                Err(ServiceError::Owner("evidence driver ended"))
+            }),
+            Box::pin(async {
+                let _ = signer_driver.await;
+                Err(ServiceError::Owner("enrollment driver ended"))
+            }),
+            Box::pin(async {
+                metrics_sampler.await;
+                Err(ServiceError::Owner("metrics sampler ended"))
+            }),
+            Box::pin(async {
+                pacer.await;
+                Err(ServiceError::Owner("pace driver ended"))
+            }),
+            Box::pin(async {
+                metrics_endpoint
+                    .await
+                    .map_err(ServiceError::Rt)
+                    .and(Err(ServiceError::Owner("metrics endpoint ended")))
+            }),
+            Box::pin(async {
+                handles.control.closed().await;
+                Err(match handles.control.progress().failure {
+                    Some(failure) => ServiceError::ControlOwner(failure),
+                    None => ServiceError::Owner("control owner ended"),
+                })
+            }),
+        ];
+        // The first of them to end ends the race; each registers its own wakes as it is polled.
+        let signalled = std::future::poll_fn(|context| {
+            if let Poll::Ready(result) = network.as_mut().poll(context) {
+                return Poll::Ready(
+                    result
+                        .map_err(ServiceError::Wire)
+                        .and(Err(ServiceError::Owner("network listener ended"))),
+                );
+            }
+            if let Poll::Ready(result) = control_driver.as_mut().poll(context) {
+                return Poll::Ready(
+                    result
+                        .map_err(ServiceError::from)
+                        .and(Err(ServiceError::Owner("control egress ended"))),
+                );
+            }
+            if let Poll::Ready(result) = ledger_driver.as_mut().poll(context) {
+                return Poll::Ready(
+                    result
+                        .map_err(ServiceError::from)
+                        .and(Err(ServiceError::Owner("ledger egress ended"))),
+                );
+            }
+            for driver in &mut drivers {
+                if let Poll::Ready(ended) = driver.as_mut().poll(context) {
+                    return Poll::Ready(ended);
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        drop(drivers);
         if !signalled? {
             return Ok(None);
         }
-        // The stop phase: the owners stop while the listener that receives
-        // their peers' messages and the drivers that carry theirs are still
-        // polled — a leader among them hands its log off first (27 §5),
-        // which is messages both ways. A driver that ends here was closed
-        // by an owner that stopped; it is not what ends the service.
-        let stops = stop_owners(handles);
-        tokio::pin!(stops);
+        // The stop phase: the owners stop while the listener that receives their peers' messages
+        // and the drivers that carry theirs are still polled — a leader among them hands its log
+        // off first (27 §5), which is messages both ways. A driver that ends here was closed by an
+        // owner that stopped; it is not what ends the service.
+        let mut stops = std::pin::pin!(stop_owners(handles));
         let (mut network_ended, mut control_ended, mut ledger_ended) = (false, false, false);
-        let stopped = loop {
-            tokio::select! {
-                stopped = &mut stops => break stopped,
-                _ = &mut network, if !network_ended => network_ended = true,
-                _ = &mut control_driver, if !control_ended => control_ended = true,
-                _ = &mut ledger_driver, if !ledger_ended => ledger_ended = true,
+        let stopped = std::future::poll_fn(|context| {
+            if let Poll::Ready(stopped) = stops.as_mut().poll(context) {
+                return Poll::Ready(stopped);
             }
-        };
+            if !network_ended && network.as_mut().poll(context).is_ready() {
+                network_ended = true;
+            }
+            if !control_ended && control_driver.as_mut().poll(context).is_ready() {
+                control_ended = true;
+            }
+            if !ledger_ended && ledger_driver.as_mut().poll(context).is_ready() {
+                ledger_ended = true;
+            }
+            Poll::Pending
+        })
+        .await;
         Ok(Some(stopped))
     }
 }
+/// A driver of the service's run, boxed beside the others it races, mapped to how its end ends
+/// the run.
+type Ending<'a> = std::pin::Pin<Box<dyn Future<Output = Result<bool, ServiceError>> + 'a>>;
 fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
     #[cfg(unix)]
     {
@@ -2135,10 +2235,9 @@ fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
 #[path = "network_service_tests.rs"]
 pub(crate) mod tests;
 
+/// The service's tasks are a hyper-rt shard's: off one, nothing it serves could wait.
 fn require_runtime() -> Result<(), ServiceError> {
-    tokio::runtime::Handle::try_current().map_err(|_| NetworkError::RuntimeRequired)?;
-    std::panic::catch_unwind(|| drop(tokio::time::sleep(Duration::ZERO)))
-        .map_err(|_| ServiceError::Runtime)?;
+    hyper_rt::futures::shard_id().ok_or(NetworkError::RuntimeRequired)?;
     Ok(())
 }
 

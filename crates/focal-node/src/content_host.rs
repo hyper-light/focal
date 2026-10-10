@@ -17,7 +17,7 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use hyper_rt::sync::OneshotSender;
 
 /// The slices a pass over a whole object takes at most (the audit's F51): a
 /// chunk each of as many as a manifest names — thirty-three bytes a chunk at
@@ -127,7 +127,7 @@ enum Output {
 }
 struct Work {
     command: Command,
-    result: oneshot::Sender<Result<Output, AccessError>>,
+    result: OneshotSender<Result<Output, AccessError>>,
     _allocation: Allocation,
 }
 impl ContentHost {
@@ -268,9 +268,7 @@ impl ContentHost {
         bytes: usize,
         control: bool,
     ) -> Result<Output, AccessError> {
-        tokio::runtime::Handle::try_current().map_err(|_| AccessError::Unavailable)?;
-        std::panic::catch_unwind(|| drop(tokio::time::sleep(Duration::ZERO)))
-            .map_err(|_| AccessError::Unavailable)?;
+        hyper_rt::futures::shard_id().ok_or(AccessError::Unavailable)?;
         let allocation = self
             .budget
             .reserve(
@@ -284,7 +282,7 @@ impl ContentHost {
             )
             .map_err(|_| AccessError::Capacity)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
         self.sender
             .try_send(Work {
                 command,
@@ -295,7 +293,7 @@ impl ContentHost {
                 mpsc::TrySendError::Full(_) => AccessError::Capacity,
                 mpsc::TrySendError::Disconnected(_) => AccessError::Unavailable,
             })?;
-        std::panic::AssertUnwindSafe(async { tokio::time::timeout(self.timeout, receive).await })
+        std::panic::AssertUnwindSafe(async { focal_rt::time::timeout(self.timeout, receive).await })
             .catch_unwind()
             .await
             .map_err(|_| AccessError::OutcomeUnknown)?

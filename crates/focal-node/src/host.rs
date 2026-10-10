@@ -13,15 +13,16 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{oneshot, watch};
+use focal_rt::watch;
+use hyper_rt::sync::OneshotSender;
 
 enum Work {
     Request(
         Box<VerifiedRequest>,
-        oneshot::Sender<OwnedResponse>,
+        OneshotSender<OwnedResponse>,
         Allocation,
     ),
-    Stop(oneshot::Sender<Result<(), NodeError>>),
+    Stop(OneshotSender<Result<(), NodeError>>),
 }
 /// Requests the ingress queue holds, and native proposals the owner holds
 /// unanswered: holding that many, it waits for the log before it takes
@@ -51,7 +52,7 @@ pub(crate) struct Waiting {
     /// Owner polls since the proposal; at `COMMIT_POLLS` it is answered
     /// with its ticket.
     pub(crate) polls: usize,
-    pub(crate) response: oneshot::Sender<OwnedResponse>,
+    pub(crate) response: OneshotSender<OwnedResponse>,
     pub(crate) charge: Allocation,
 }
 impl Waiting {
@@ -141,7 +142,7 @@ impl LocalHost {
         waiting
             .try_reserve_exact(INGRESS)
             .map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
-        let (liveness, ended) = watch::channel(());
+        let (liveness, ended) = watch::channel(()).map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
         let mut views = crate::reads::ReadViews::new();
         let mut streams =
             crate::streams::Streams::new().map_err(|error| NodeError::Domain(error.to_string()))?;
@@ -248,7 +249,7 @@ impl LocalHost {
     /// Returns Capacity without enqueueing when ingress is full; callers can
     /// retry after draining ingress. No blocking task or extra thread is needed.
     pub async fn stop(&self) -> Result<(), NodeError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {
@@ -268,7 +269,7 @@ impl HostOwner {
     /// Joins without blocking the async executor. Unlike Tokio's blocking-pool
     /// spawn, OS thread exhaustion is returned by Builder as an I/O error.
     pub async fn join_async(self) -> Result<(), NodeError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
         let _bridge = std::thread::Builder::new()
             .name("focal-owner-join".into())
             .spawn(move || {
@@ -429,7 +430,9 @@ impl RequestHandler for LocalHost {
             let Ok(charge) = self.budget.reserve(BudgetKind::Pending, lane, bytes) else {
                 return OwnedResponse::new(full);
             };
-            let (send, receive) = oneshot::channel();
+            let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
+                return OwnedResponse::new(full);
+            };
             match self
                 .sender
                 .try_send(Work::Request(Box::new(request), send, charge.commit()))
@@ -1020,7 +1023,7 @@ mod tests {
     #[test]
     fn shutdown_backpressure_and_closed_owner_need_no_runtime_or_worker() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let (_liveness, ended) = watch::channel(());
+        let (_liveness, ended) = watch::channel(()).unwrap();
         let host = LocalHost {
             sender,
             ended,
@@ -1028,7 +1031,7 @@ mod tests {
             limits: WireLimits::default(),
             native: false,
         };
-        let (send, _receive) = oneshot::channel();
+        let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
         host.sender.try_send(Work::Stop(send)).unwrap();
         assert!(matches!(
             host.stop().now_or_never(),

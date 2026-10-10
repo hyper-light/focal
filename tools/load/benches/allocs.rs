@@ -53,7 +53,7 @@ const CRATES: [&str; 13] = [
     "focal-core",
     "focal-memory",
     "focal-model",
-    "tokio",
+    "hyper-rt",
     "std/alloc",
     "other",
 ];
@@ -68,7 +68,7 @@ const NEEDLES: [&[&str]; 12] = [
     &["crates/focal-core/", "focal_core::"],
     &["crates/focal-memory/", "focal_memory::"],
     &["crates/focal-model/", "focal_model::"],
-    &["tokio-", "tokio::"],
+    &["vendor/hyper-rt/", "hyper_rt::"],
     &[
         "library/std/",
         "library/alloc/",
@@ -86,6 +86,12 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn main() {
+    // One root on one shard for the whole measurement: the client's waits are
+    // its tasks', as `focal-load`'s driver runs them.
+    focal_rt::block_on(measure()).unwrap();
+}
+
+async fn measure() {
     alloc_count::configure(101, 1, 200_000);
     let claims = env_u64("FOCAL_LOAD_CLAIMS", 1000);
     let reads = env_u64("FOCAL_LOAD_READS", claims);
@@ -97,10 +103,6 @@ fn main() {
     let mut phases = Vec::new();
 
     let root = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.path().into());
 
@@ -160,7 +162,7 @@ fn main() {
         )
         .unwrap();
         let before = meter.open();
-        let result = runtime.block_on(client.request(envelope));
+        let result = client.request(envelope).await;
         meter.close(before);
         match result {
             Ok(env) => {
@@ -205,7 +207,7 @@ fn main() {
             }),
         };
         let before = meter.open();
-        let result = runtime.block_on(client.request(envelope));
+        let result = client.request(envelope).await;
         meter.close(before);
         if let Ok(env) = result
             && let Response::NativeRead(page) = env.result
@@ -231,7 +233,6 @@ fn main() {
     owner.join().unwrap();
     meter.close(before);
     phases.push(meter.finish());
-    drop(runtime);
 
     println!();
     println!("{}", alloc_count::header());

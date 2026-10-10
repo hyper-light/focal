@@ -1,20 +1,19 @@
 //! OS-main-thread file ownership, with bounded network pages between writes.
 use super::{CliError, Context, Result};
 use focal_client::{Client, ClientError, ClientTransport};
-use focal_model::{Artifact, ArtifactPayload, ContentRef};
-use focal_wire::{ContentChunk, Operation, RequestEnvelope, Response};
+use focal_model::{Artifact, ArtifactPayload};
+use focal_wire::{Operation, RequestEnvelope, Response};
+use futures_util::FutureExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
 };
-use tokio::runtime::Runtime;
 
 const PAGE_BYTES: u32 = 64 * 1024;
 
-pub(super) fn artifact(
-    runtime: &Runtime,
+pub(super) async fn artifact(
     context: &Context,
     artifact: &Artifact,
     output: &Path,
@@ -22,74 +21,61 @@ pub(super) fn artifact(
     if artifact.content().ledger != context.build.ledger {
         return Err(CliError::InvalidResponse);
     }
-    payload(
-        runtime,
-        &context.client,
+    payload(&context.client,
         |operation| context.envelope(operation),
         &artifact.content().payload,
         output,
-    )
+    ).await
 }
 
-fn payload<T: ClientTransport>(
-    runtime: &Runtime,
+async fn payload<T: ClientTransport>(
     client: &Client<T>,
     mut envelope: impl FnMut(Operation) -> Result<RequestEnvelope>,
     payload: &ArtifactPayload,
     output: &Path,
 ) -> Result<()> {
-    // A caller inside a runtime must not perform synchronous writes or nest
-    // block_on. The CLI invokes this owner from its OS main thread.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(CliError::Input(
-            "artifact download requires the CLI main thread outside an async runtime".into(),
-        ));
+    // The pages are asked over the context's connection, a task on this
+    // shard; the file is the command's own, written between pages.
+    if hyper_rt::futures::shard_id().is_none() {
+        return Err(CliError::Client(ClientError::Transport));
     }
     let mut temporary = Temporary::create(output)?;
     match payload {
         ArtifactPayload::Inline(bytes) => temporary.file.write_all(bytes)?,
         ArtifactPayload::Content(content) => {
-            stream(content, &mut temporary.file, |offset, max_bytes| {
+            let mut download = focal_client::artifact_transfer::PayloadDownload::new(
+                content.clone(),
+                content.length,
+                PAGE_BYTES,
+            )
+            .map_err(|_| CliError::InvalidResponse)?;
+            while !download.complete() {
                 let request = envelope(Operation::Download {
                     content: content.clone(),
-                    offset,
-                    max_bytes,
+                    offset: download.offset(),
+                    max_bytes: PAGE_BYTES,
                 })?;
-                // Tokio/transport dependencies can panic on a supplied runtime
-                // without drivers. The owner still removes the temporary file.
-                let response = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    runtime.block_on(client.request(request))
-                }))
-                .map_err(|_| CliError::Client(ClientError::Transport))??;
-                match response.result {
-                    Response::Content(chunk) => Ok(chunk),
-                    _ => Err(CliError::InvalidResponse),
-                }
-            })?;
+                // A dependency that unwinds ends the download as a transport
+                // failure; the owner still removes the temporary file.
+                let response = AssertUnwindSafe(client.request(request))
+                    .catch_unwind()
+                    .await
+                    .map_err(|_| CliError::Client(ClientError::Transport))??;
+                let Response::Content(chunk) = response.result else {
+                    return Err(CliError::InvalidResponse);
+                };
+                download
+                    .accept(&chunk, &mut temporary.file)
+                    .map_err(|error| match error {
+                        focal_client::artifact_transfer::TransferError::Io(error) => {
+                            CliError::Io(error)
+                        }
+                        _ => CliError::InvalidResponse,
+                    })?;
+            }
         }
     }
     temporary.install(output)
-}
-
-fn stream(
-    content: &ContentRef,
-    file: &mut File,
-    mut read: impl FnMut(u64, u32) -> Result<ContentChunk>,
-) -> Result<()> {
-    let mut download = focal_client::artifact_transfer::PayloadDownload::new(
-        content.clone(),
-        content.length,
-        PAGE_BYTES,
-    )
-    .map_err(|_| CliError::InvalidResponse)?;
-    while !download.complete() {
-        let chunk = read(download.offset(), PAGE_BYTES)?;
-        download.accept(&chunk, file).map_err(|error| match error {
-            focal_client::artifact_transfer::TransferError::Io(error) => CliError::Io(error),
-            _ => CliError::InvalidResponse,
-        })?;
-    }
-    Ok(())
 }
 
 pub(super) struct Temporary {

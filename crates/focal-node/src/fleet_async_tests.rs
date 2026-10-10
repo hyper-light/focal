@@ -260,7 +260,7 @@ async fn shared_owner_queues_covering_flush_and_serves_another_group_while_disk_
             if matches!(answer, Response::Submitted(MutationReply::Committed(_))) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            focal_rt::time::pause(Duration::from_millis(50)).await;
             answer = dispatch(
                 &fixture.hosts[&ledger(index)],
                 peer(),
@@ -503,7 +503,7 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
             while host.periods() == *before {
                 waited += 1;
                 assert!(waited < 1_000, "an owner did not tick in ten seconds");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                focal_rt::time::pause(Duration::from_millis(10)).await;
             }
         }
         let asked_before: u64 = fixture
@@ -545,7 +545,7 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
             .sum();
         // The log stays held for many times the millisecond at which every
         // session was asked before.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        focal_rt::time::pause(Duration::from_millis(250)).await;
         let held: u64 = fixture
             .hosts
             .values()
@@ -596,7 +596,7 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
                 if let Err(spent) = wait.check(&[committed]) {
                     panic!("session {index} was not committed: {spent}: {answer:?}");
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                focal_rt::time::pause(Duration::from_millis(50)).await;
                 answer = dispatch(
                     &fixture.hosts[&ledger(index)],
                     peer(),
@@ -796,7 +796,7 @@ async fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_c
     }
     let refused = crate::test_waits::within(&[&host], steps, TICK, async {
         while host.input_refusals().requests_refused == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            focal_rt::time::pause(Duration::from_millis(1)).await;
         }
     })
     .await;
@@ -870,7 +870,7 @@ async fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_ful
     }
     crate::test_waits::within(&[&host], steps, TICK, async {
         while host.input_refusals().requests_refused == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            focal_rt::time::pause(Duration::from_millis(1)).await;
         }
     })
     .await
@@ -905,7 +905,7 @@ async fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_ful
     }
     crate::test_waits::within(&[&host], steps, TICK, async {
         while host.input_refusals().frames_refused == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            focal_rt::time::pause(Duration::from_millis(1)).await;
         }
     })
     .await

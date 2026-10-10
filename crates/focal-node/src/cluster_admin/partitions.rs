@@ -292,7 +292,7 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
         }
         Err(ClusterAdminError::PartitionPending {
             node,
@@ -329,7 +329,7 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
         }
         let current = self.partition_configuration(partition).await?;
         Err(ControlFailure::NotLeader {
@@ -369,7 +369,7 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
         }
         Err(ClusterAdminError::LeaderLeaving(leaving))
     }

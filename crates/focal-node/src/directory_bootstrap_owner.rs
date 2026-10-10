@@ -11,18 +11,26 @@ const DIRECTORY_STACK_BYTES: usize = 2 * 1024 * 1024;
 /// owner, host clones and egress. This receiver cannot be detached from its
 /// allowance; frames additionally retain their individual transport permits.
 pub struct DirectoryReplication {
-    receiver: async_mpsc::Receiver<ControlReplicationFrame>,
+    receiver: ChannelReceiver<ControlReplicationFrame>,
     _progress: watch::Receiver<ControlProgressState>,
 }
 impl DirectoryReplication {
+    /// The next frame; `None` once the owner's egress has ended (or no
+    /// wait could be kept: off a shard).
     pub async fn recv(&mut self) -> Option<ControlReplicationFrame> {
-        self.receiver.recv().await
+        self.receiver.recv().await.ok()
     }
-    pub fn try_recv(&mut self) -> Result<ControlReplicationFrame, async_mpsc::error::TryRecvError> {
-        self.receiver.try_recv()
+    /// A frame already queued, without waiting.
+    pub fn try_recv(&mut self) -> Option<ControlReplicationFrame> {
+        self.receiver.try_recv().ok().flatten()
     }
-    pub fn close(&mut self) {
-        self.receiver.close();
+    /// Polls for the next frame as the replication driver does: `Closed`
+    /// once the owner's egress has ended and nothing is queued.
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ControlReplicationFrame, hyper_rt::sync::SyncError<()>>> {
+        std::future::Future::poll(std::pin::pin!(self.receiver.recv()), cx)
     }
 }
 impl ControlHost {
@@ -65,7 +73,7 @@ impl ControlHost {
             .commit();
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
-        let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
+        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue).map_err(|_| DirectoryBootstrapError::Capacity)?;
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity,
@@ -88,7 +96,7 @@ impl ControlHost {
                 failure: None,
             },
             _allocation: Some(allocation),
-        });
+        }).map_err(|_| DirectoryBootstrapError::Capacity)?;
         let pace = crate::control_host::TickPeriod::default();
         let owner_pace = pace.clone();
         let host = Self {

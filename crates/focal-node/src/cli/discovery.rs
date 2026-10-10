@@ -567,8 +567,7 @@ pub(super) fn validate_offline(
 /// native engine reads the committed bindings the verb needs at a fixed
 /// prefix, compiles the exact frame with throwaway identities, encodes and
 /// fingerprints it. No request, journal identity or mutation is created.
-pub(super) fn validate_online(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn validate_online(
     context: &super::Context,
     operation: &str,
     input: super::args::DocumentInput,
@@ -576,7 +575,7 @@ pub(super) fn validate_online(
 ) -> Result<()> {
     use focal_client::operations::ThrowawayIds;
     use focal_model::RequestId;
-    let engine = super::native::detect(runtime, context)?;
+    let engine = super::native::detect(context).await?;
     let wire = operations::select_online(&engine, native)?;
     let bytes = super::request_files::document_bytes(input)?;
     let document = operations::decode_application(wire, operation, &bytes)?;
@@ -592,8 +591,8 @@ pub(super) fn validate_online(
             let resolved = focal_native_client::resolve(
                 context.build.ledger,
                 &authored,
-                &mut super::native::reads(runtime, context),
-            )?;
+                &mut super::native::Waits(context),
+            ).await?;
             let limits = focal_native_client::CompileLimits::default();
             let mut ids = ThrowawayIds::excluding(&authored.canonical_intent()?)?;
             let compiled = focal_native_client::compile(
