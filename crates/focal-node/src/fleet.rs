@@ -321,6 +321,10 @@ pub struct ReplicaProgress {
     /// answer's signal found its owner's signals full — which answer was not
     /// known (`GroupOwner::sweep`).
     pub waits_swept: u64,
+    /// The times this replica, waiting on a write the log had no room to
+    /// tell it of, was made due by another replica's answered write — the
+    /// room that write gave back (`GroupOwner::signalled`).
+    pub waits_handed: u64,
     pub stopped: bool,
     /// The group's voters as this replica's committed configuration names
     /// them; the paths a pace is derived from (27 §3.1 P2).
@@ -946,6 +950,8 @@ struct Owner {
     waits_answered: u64,
     /// `ReplicaProgress::waits_swept`.
     waits_swept: u64,
+    /// `ReplicaProgress::waits_handed`.
+    waits_handed: u64,
     progress: watch::Sender<ProgressState>,
     /// Drawn when this owner started: with the node id it scopes every read
     /// context the owner mints, so a nonce that restarts from zero, or one
@@ -1131,6 +1137,7 @@ impl ReplicaHost {
                 waits_asked: 0,
                 waits_answered: 0,
                 waits_swept: 0,
+                waits_handed: 0,
                 stopped: false,
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
@@ -1192,6 +1199,7 @@ impl ReplicaHost {
             waits_asked: 0,
             waits_answered: 0,
             waits_swept: 0,
+            waits_handed: 0,
             progress,
             incarnation,
             nonce: 0,
@@ -2886,6 +2894,7 @@ impl Owner {
                 waits_asked: self.waits_asked,
                 waits_answered: self.waits_answered,
                 waits_swept: self.waits_swept,
+                waits_handed: self.waits_handed,
                 stopped,
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),

@@ -557,10 +557,17 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
         assert_eq!(unanswered as u128, sessions);
         // What each session had heard from the log before it answers, and
         // how often a sweep had looked at it.
-        let answered_before: Vec<(u64, u64)> = (1..=sessions)
+        // A session's count of the log's answers, of sweeps that looked at it, and of wakes
+        // handed to it.
+        type Woken = (u64, u64, u64);
+        let answered_before: Vec<Woken> = (1..=sessions)
             .map(|index| {
                 let progress = fixture.hosts[&ledger(index)].progress();
-                (progress.waits_answered, progress.waits_swept)
+                (
+                    progress.waits_answered,
+                    progress.waits_swept,
+                    progress.waits_handed,
+                )
             })
             .collect();
         resume.send(()).unwrap();
@@ -612,27 +619,42 @@ async fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_wai
                 .result;
             }
         }
-        // The log's answer woke every session that waited on it: its signal,
+        // The log's answer woke every session that waited on it: its signal;
         // or — where a write answered more sessions than the owner's signals
         // hold and an answer's signal found them full — the sweep that
-        // signal's loss asked for. Before the sweep, such a session waited for
-        // its tick (PR #4's macOS run: one of a thousand).
+        // signal's loss asked for (before the sweep, such a session waited for
+        // its tick: PR #4's macOS run, one of a thousand); or — where the log
+        // had no room to tell the session of its write — another session's
+        // answered write, which gave the room back (`waits_handed`; uncounted,
+        // it read as a session never woken: CI run 38079021596, macOS, one of
+        // a hundred).
         let mut swept = 0;
-        let unwoken: Vec<u128> = (1..=sessions)
-            .filter(|index| {
-                let progress = fixture.hosts[&ledger(*index)].progress();
-                let (answered, looked) = answered_before[usize::try_from(*index - 1).unwrap()];
-                if progress.waits_swept > looked {
+        let mut handed = 0;
+        let unwoken: Vec<(u128, Woken, Woken)> = (1..=sessions)
+            .filter_map(|index| {
+                let progress = fixture.hosts[&ledger(index)].progress();
+                let before = answered_before[usize::try_from(index - 1).unwrap()];
+                let after = (
+                    progress.waits_answered,
+                    progress.waits_swept,
+                    progress.waits_handed,
+                );
+                if after.1 > before.1 {
                     swept += 1;
                 }
-                progress.waits_answered <= answered && progress.waits_swept <= looked
+                if after.2 > before.2 {
+                    handed += 1;
+                }
+                (after.0 <= before.0 && after.1 <= before.1 && after.2 <= before.2)
+                    .then_some((index, before, after))
             })
             .collect();
-        println!("{sessions} sessions: {swept} looked at by a sweep");
+        println!("{sessions} sessions: {swept} looked at by a sweep, {handed} handed a wake");
         shutdown(fixture).await;
         assert!(
             unwoken.is_empty(),
-            "{} of {sessions} sessions were not woken by the log's answer: {unwoken:?}",
+            "{} of {sessions} sessions were not woken by the log's answer \
+             (session, before and after: answered, swept, handed): {unwoken:?}",
             unwoken.len()
         );
         // While the log was held nothing was asked: a session asks once as

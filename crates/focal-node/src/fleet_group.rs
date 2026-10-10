@@ -837,6 +837,9 @@ impl GroupOwner {
         }
         self.due(ledger);
         if let Some(waiting) = self.unwoken.pop_first() {
+            if let Some(owner) = self.sessions.get_mut(&waiting) {
+                owner.waits_handed = owner.waits_handed.saturating_add(1);
+            }
             self.due(waiting);
         }
     }

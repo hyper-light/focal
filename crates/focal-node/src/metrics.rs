@@ -198,6 +198,7 @@ pub struct SessionCounters {
     pub waits_asked: u64,
     pub waits_answered: u64,
     pub waits_swept: u64,
+    pub waits_handed: u64,
     pub refused_periods: u64,
 }
 impl SessionCounters {
@@ -226,10 +227,11 @@ impl SessionCounters {
             waits_asked: progress.waits_asked,
             waits_answered: progress.waits_answered,
             waits_swept: progress.waits_swept,
+            waits_handed: progress.waits_handed,
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 18] {
+    fn fields(&self) -> [u64; 19] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -248,6 +250,7 @@ impl SessionCounters {
             self.waits_asked,
             self.waits_answered,
             self.waits_swept,
+            self.waits_handed,
             self.refused_periods,
         ]
     }
@@ -283,6 +286,7 @@ impl SessionCounters {
         self.waits_asked = sum(self.waits_asked, other.waits_asked);
         self.waits_answered = sum(self.waits_answered, other.waits_answered);
         self.waits_swept = sum(self.waits_swept, other.waits_swept);
+        self.waits_handed = sum(self.waits_handed, other.waits_handed);
         self.refused_periods = sum(self.refused_periods, other.refused_periods);
     }
 }
@@ -1473,6 +1477,11 @@ impl MetricsSnapshot {
                 "focal_sessions_waits_swept_total",
                 "Times a replica with a write out was looked at because an answer found its owner's signals full.",
                 totals.waits_swept,
+            ),
+            (
+                "focal_sessions_waits_handed_total",
+                "Times a replica waiting on a write the log could not tell it of was made due by another's answered write.",
+                totals.waits_handed,
             ),
             (
                 "focal_sessions_periods_refused_total",
