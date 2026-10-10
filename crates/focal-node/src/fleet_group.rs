@@ -667,7 +667,10 @@ impl GroupOwner {
                     continue;
                 }
                 dispatched = dispatched.saturating_add(1);
+                let what = work.kind();
+                let started = Instant::now();
                 outcome = owner.accept(work);
+                owner.slow.note(what, started);
                 if !matches!(outcome, Ok(false)) {
                     break;
                 }
@@ -766,7 +769,14 @@ impl GroupOwner {
                             if owner.incarnation != routed.incarnation {
                                 continue;
                             }
-                            match owner.accept(routed.work) {
+                            // What the owner does for a dispatch is timed as
+                            // its period's steps are: the slow ones are what
+                            // held every request behind them.
+                            let what = routed.work.kind();
+                            let started = Instant::now();
+                            let accepted = owner.accept(routed.work);
+                            owner.slow.note(what, started);
+                            match accepted {
                                 Ok(false) => self.reschedule(routed.ledger)?,
                                 Ok(true) => self.stop_session(routed.ledger),
                                 Err(error) => {

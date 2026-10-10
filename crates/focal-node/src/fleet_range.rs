@@ -182,6 +182,28 @@ pub(super) enum RangeCall {
         reply: oneshot::Sender<Result<focal_evidence::SeedReport, LedgerError>>,
     },
 }
+impl RangeCall {
+    /// What the owner was doing, for its slow steps (`SlowSteps`).
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::View { .. } => "range: view",
+            Self::Propose { .. } => "range: propose",
+            Self::Move { .. } => "range: move",
+            Self::Fact { .. } => "range: fact",
+            Self::Activate { .. } => "range: activate",
+            Self::Layout { .. } => "range: layout",
+            Self::SplitPoint { .. } => "range: split point",
+            Self::Candidates { .. } => "range: retirement candidates",
+            Self::Archive { .. } => "range: archive family",
+            Self::Retire { .. } => "range: retire",
+            Self::Retired { .. } => "range: retired claim",
+            Self::SealBundle { .. } => "range: seal bundle",
+            Self::Seal { .. } => "range: seal",
+            Self::ContentRoots { .. } => "range: content roots",
+            Self::CollectSeeds { .. } => "range: collect seeds",
+        }
+    }
+}
 /// One seal of closed outcomes as the committed core wrote it (F12): the
 /// plan it was derived from, its bundle, and a fold of older seal rows with
 /// its directory bundle when the index reached its bound. The bytes stay

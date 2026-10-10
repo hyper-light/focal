@@ -112,7 +112,8 @@ impl Owner {
                 .collect(),
             slow_steps: self
                 .slow
-                .recent()
+                .kept()
+                .into_iter()
                 .map(|step| focal_client::admin::AdminSlowStep {
                     what: step.what.to_owned(),
                     micros: step.micros,

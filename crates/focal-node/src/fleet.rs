@@ -394,7 +394,7 @@ impl Work {
             Self::Windows(..) => "windows",
             Self::Refence(..) => "refence",
             Self::Placement(..) => "placement",
-            Self::Range(..) => "range",
+            Self::Range(call, ..) => call.kind(),
             Self::Evidence(..) => "evidence",
             Self::Stop(..) => "stop",
         }
@@ -2365,24 +2365,38 @@ impl Owner {
         // The room its peers' frames have, as its configuration is now: at
         // least once a period, and so within one of a change.
         self.pace.set_frame_room(self.peer_reserve());
+        // Each step is timed as the replica's own owner times its steps: the
+        // slow ones are what held every request behind them.
+        let started = Instant::now();
         self.report_lost()?;
         self.views
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
         self.expire_pending();
         self.progress_evidence()?;
+        self.slow.note("progress: views and evidence", started);
+        let started = Instant::now();
         if self.step_waiting() {
             self.drain_owed = true;
         }
+        self.slow.note("progress: waiting frames", started);
         if self.drain_owed || self.session.has_ready() {
+            let started = Instant::now();
             self.drain_with_runtime(self.stopping.is_none())?;
+            self.slow.note("progress: drain", started);
         }
+        let started = Instant::now();
         self.progress_evidence()?;
         if !self.session.persistence_pending() {
             self.poll_snapshot_feedback()?;
         }
+        self.slow.note("progress: evidence and snapshots", started);
+        let started = Instant::now();
         self.progress_managed()?;
+        self.slow.note("managed progress", started);
+        let started = Instant::now();
         self.checkpoint_for_members()?;
+        self.slow.note("member checkpoint", started);
         let handing_off = self.handing_off();
         if let Some((_, deadline)) = self.stopping.as_ref()
             && !handing_off
@@ -2430,14 +2444,18 @@ impl Owner {
                 self.pace.refuse();
                 self.expire_held();
             } else {
+                let started = Instant::now();
                 self.tick()?;
+                self.slow.note("tick", started);
             }
             self.next_tick = Instant::now()
                 .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(LedgerError::Failed)?;
         }
         if !self.session.persistence_pending() {
+            let started = Instant::now();
             self.beat_if_due()?;
+            self.slow.note("beat", started);
         }
         Ok(false)
     }
