@@ -4,6 +4,11 @@ name: Competitive tail latency
 # on equal terms, every acknowledged write on disk at a quorum, on a Linux
 # runner whose fsync reaches its disk (Docker Desktop's VM does not). Run by
 # hand: each system is three containers at one CPU each beside the generator.
+# Every system is measured on the same runner, one after another: the hosted
+# runners come with different disks (a network-attached virtual disk, or a
+# local NVMe), and a matrix gave each system a runner of its own — focal and
+# Redis on the virtual disk while Kafka and NATS had NVMe in one run, which
+# measured the disks and not the systems.
 on:
   # A branch named compare/<anything> runs it with the defaults below, which
   # starts a run without the workflow on the default branch.
@@ -23,6 +28,9 @@ on:
       payload:
         description: "Bytes of each competitor record"
         default: "128"
+      systems:
+        description: "Systems measured, space-separated, on one runner in turn"
+        default: "focal kafka nats redis"
 
 permissions:
   contents: read
@@ -54,11 +62,7 @@ jobs:
   measure:
     needs: image
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        system: [focal, kafka, nats, redis]
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/download-artifact@v4
@@ -67,44 +71,46 @@ jobs:
       - run: zstd -dc focal-bench.tar.zst | docker load
       - name: The disk the runs write to
         run: |
-          df -h /var/lib/docker || df -h /
-          lsblk -o NAME,ROTA,SIZE,MODEL || true
-          # 500 synchronous 4 KiB writes: whether fsync reaches the device here.
-          dd if=/dev/zero of=/tmp/dsync bs=4k count=500 oflag=dsync 2>&1 | tail -1
-          rm -f /tmp/dsync
+          mkdir -p tools/compare/compose/reports
+          {
+            df -h /var/lib/docker || df -h /
+            lsblk -o NAME,ROTA,SIZE,MODEL || true
+            # 500 synchronous 4 KiB writes: whether fsync reaches the device
+            # here; then three writers at once, as a system's three nodes are.
+            echo "one writer:"
+            dd if=/dev/zero of=/tmp/dsync bs=4k count=500 oflag=dsync 2>&1 | tail -1
+            echo "three writers at once:"
+            for i in 1 2 3; do
+              dd if=/dev/zero of=/tmp/dsync$i bs=4k count=500 oflag=dsync 2>&1 | tail -1 &
+            done
+            wait
+            rm -f /tmp/dsync /tmp/dsync1 /tmp/dsync2 /tmp/dsync3
+          } | tee tools/compare/compose/reports/disk.txt
       - name: Runs
         env:
           NODE_CPUS: "1"
         run: |
-          for rate in ${{ github.event.inputs.rates || '100 200 1000 4000' }}; do
-            bash tools/compare/compose/run.sh "${{ matrix.system }}" "$rate" \
-              "${{ github.event.inputs.seconds || '60' }}" \
-              "${{ github.event.inputs.warmup || '15' }}" \
-              "${{ github.event.inputs.payload || '128' }}" reports
+          for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
+            for rate in ${{ github.event.inputs.rates || '100 200 1000 4000' }}; do
+              bash tools/compare/compose/run.sh "$system" "$rate" \
+                "${{ github.event.inputs.seconds || '60' }}" \
+                "${{ github.event.inputs.warmup || '15' }}" \
+                "${{ github.event.inputs.payload || '128' }}" reports
+            done
           done
-      - uses: actions/upload-artifact@v4
+      - name: One table, every system, one runner
         if: always()
-        with:
-          name: reports-${{ matrix.system }}
-          path: tools/compare/compose/reports
-
-  table:
-    needs: measure
-    if: always()
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: reports-*
-          path: reports
-          merge-multiple: true
-      - name: One table, every system
         run: |
+          {
+            echo '```'
+            cat tools/compare/compose/reports/disk.txt
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, glob, os
           rows = []
           legacy_focal = False
-          for path in sorted(glob.glob("reports/*.json")):
+          for path in sorted(glob.glob("tools/compare/compose/reports/*.json")):
               r = json.load(open(path))
               name = os.path.basename(path)[:-5]
               if "latency_ns" in r:  # focal-load
@@ -116,7 +122,7 @@ jobs:
                   us = lambda v: v / 1000
                   rows.append((name, r["shape"].get("rate"), counts["committed"], counts["refused"] + counts["unknown"] + counts.get("expired", 0),
                                us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])))
-              else:  # focal-compare
+              elif "offered_per_second" in r:  # focal-compare
                   rows.append((name, r["offered_per_second"], r["acknowledged"], r["failed"] + r["refused_by_generator"],
                                r["p50_us"], r["p99_us"], r["p999_us"], r["max_us"]))
           print("| run | offered/s | acknowledged | failed or refused | p50 µs | p99 µs | p99.9 µs | max µs |")
@@ -126,3 +132,8 @@ jobs:
           if legacy_focal:
               print("\nOlder focal reports contain all-attempt latency and whole-phase counts; refusals and warm-up can skew those rows.")
           PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports
+          path: tools/compare/compose/reports

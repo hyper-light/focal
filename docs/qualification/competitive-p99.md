@@ -188,6 +188,21 @@ cycle of about 50 ms is about 640 writes a second, and focal achieved 545. The b
 count beside an exact memory charge, and each prepare re-validates the whole pending chain; both
 are next.
 
+## One runner for every system (2026-10-10)
+
+The hosted `ubuntu-24.04` runners come with one of two disks: a network-attached virtual disk
+(`sda`, "Virtual Disk", reported rotational) or a local NVMe (`nvme0n1`, "MSFT NVMe Accelerator
+v1.0"). One writer's 500 synchronous 4 KiB writes take about the same on both (10–17 MB/s);
+three nodes syncing at once do not. On the same code, focal's leader made 7,390 group commits
+in the 1,000/s run on the virtual disk and 21,208 on NVMe (runs 38014599497 and 38014716408), and
+its p50 was 65 ms against 16 ms. Each system had been measured on a runner of its own, a matrix:
+in run 38009156328 focal and Redis had the virtual disk while Kafka and NATS had NVMe, which
+measured the disks as much as the systems.
+
+The workflow now measures every system on one runner in turn. It records the runner's disk, and
+what one writer and three writers at once sync on it (`disk.txt`), above the table. A table
+compares systems on one machine; tables from runners with different disks are not compared.
+
 **A session's open claims are bounded** (about 11,800 authored claims before admission refuses,
 `native owner memory`). The competitors append to a log without state. focal's write is a
 claim's state transition, which stays open until it is closed, so a long run at a high rate
