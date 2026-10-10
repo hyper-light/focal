@@ -1,0 +1,14 @@
+[package]
+name = "focal-rt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "focal on hyper-rt: the runtime a node, a command and a test run on"
+
+[lints]
+workspace = true
+
+[dependencies]
+hyper-rt.workspace = true

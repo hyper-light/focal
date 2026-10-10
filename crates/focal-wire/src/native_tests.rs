@@ -885,64 +885,70 @@ impl RequestHandler for NativeEcho {
     }
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn the_native_profile_negotiates_over_the_local_socket_only_where_the_handler_admits_it() {
-    let root = tempfile::tempdir().unwrap();
-    let limits = WireLimits::default();
-    let grant = PeerGrant {
-        principal: key().principal,
-        tenants: BTreeSet::from([ledger().tenant]),
-        role: PeerRole::Actor,
-    };
-    for native in [true, false] {
-        let socket = root.path().join(format!("native-{native}.sock"));
-        let server =
-            std::sync::Arc::new(UnixServer::bind(&socket, grant.clone(), limits.clone()).unwrap());
-        let serving = server.clone();
-        let handler: std::sync::Arc<dyn RequestHandler> =
-            std::sync::Arc::new(NativeEcho { native });
-        let task = tokio::spawn(async move { serving.serve(handler).await });
-        let remote = UnixRemote::new(&socket, limits.clone()).unwrap();
-        let submit = envelope(
-            NATIVE_PROTOCOL_VERSION,
-            Operation::Native {
-                frame: frame(0, 0, ledger(), key(), 5),
-            },
-        );
-        let read = envelope(
-            NATIVE_PROTOCOL_VERSION,
-            Operation::NativeRead(read_request()),
-        );
-        let legacy = envelope(PROTOCOL_VERSION, Operation::Summary);
-        if native {
-            let reply = remote.request(&submit).await.unwrap();
+#[test]
+fn the_native_profile_negotiates_over_the_local_socket_only_where_the_handler_admits_it() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let limits = WireLimits::default();
+        let grant = PeerGrant {
+            principal: key().principal,
+            tenants: BTreeSet::from([ledger().tenant]),
+            role: PeerRole::Actor,
+        };
+        for native in [true, false] {
+            let socket = root.path().join(format!("native-{native}.sock"));
+            let server = std::sync::Arc::new(
+                UnixServer::bind(&socket, grant.clone(), limits.clone()).unwrap(),
+            );
+            let serving = server.clone();
+            let handler: std::sync::Arc<dyn RequestHandler> =
+                std::sync::Arc::new(NativeEcho { native });
+            let task = hyper_rt::futures::spawn(async move {
+                serving.serve(handler).await.unwrap();
+            })
+            .unwrap();
+            let remote = UnixRemote::new(&socket, limits.clone()).unwrap();
+            let submit = envelope(
+                NATIVE_PROTOCOL_VERSION,
+                Operation::Native {
+                    frame: frame(0, 0, ledger(), key(), 5),
+                },
+            );
+            let read = envelope(
+                NATIVE_PROTOCOL_VERSION,
+                Operation::NativeRead(read_request()),
+            );
+            let legacy = envelope(PROTOCOL_VERSION, Operation::Summary);
+            if native {
+                let reply = remote.request(&submit).await.unwrap();
+                assert!(matches!(
+                    reply.result,
+                    Response::Native(NativeMutationReply::Refused(NativeRefusal {
+                        kind: NativeRefusalKind::Refused(NativeErrorCode::InvalidTransition),
+                        ref detail,
+                    })) if detail == "command 5"
+                ));
+                let page = remote.request(&read).await.unwrap();
+                assert!(matches!(page.result, Response::NativeRead(ref page) if page.visited == 1));
+            } else {
+                // Without native support the profile is rejected at negotiation;
+                // the request never reaches the handler.
+                assert!(matches!(
+                    remote.request(&submit).await,
+                    Err(WireError::Access(AccessError::UnsupportedProtocol))
+                ));
+            }
+            // Earlier profiles keep working on the same socket either way.
             assert!(matches!(
-                reply.result,
-                Response::Native(NativeMutationReply::Refused(NativeRefusal {
-                    kind: NativeRefusalKind::Refused(NativeErrorCode::InvalidTransition),
-                    ref detail,
-                })) if detail == "command 5"
+                remote.request(&legacy).await.unwrap().result,
+                Response::Error(AccessError::UnsupportedOperation)
             ));
-            let page = remote.request(&read).await.unwrap();
-            assert!(matches!(page.result, Response::NativeRead(ref page) if page.visited == 1));
-        } else {
-            // Without native support the profile is rejected at negotiation;
-            // the request never reaches the handler.
-            assert!(matches!(
-                remote.request(&submit).await,
-                Err(WireError::Access(AccessError::UnsupportedProtocol))
-            ));
+            server.close();
+            hyper_rt::futures::join(task).await.unwrap();
+            drop(server);
         }
-        // Earlier profiles keep working on the same socket either way.
-        assert!(matches!(
-            remote.request(&legacy).await.unwrap().result,
-            Response::Error(AccessError::UnsupportedOperation)
-        ));
-        task.abort();
-        let _ = task.await;
-        drop(server);
-    }
+    })
+    .unwrap()
 }
 
 #[test]

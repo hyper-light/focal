@@ -22,6 +22,13 @@ thiserror = "2.0.3"
 tinyvec = { version = "1.1", features = ["alloc"] }
 tracing = { version = "0.1.10", default-features = false, features = ["std"] }
 
+# hyper-raft's workspace declares the configurations its model checks and fuzzers build under
+# (its Cargo.toml [workspace.lints.rust]); this root declares the same, and the `arbitrary`
+# feature upstream's fuzzing derives sit behind, which focal never enables (its dependency is left
+# out of this manifest, so it never enters focal's lockfile).
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)", 'cfg(feature, values("arbitrary"))'] }
+
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
 # suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
 [workspace]

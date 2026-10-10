@@ -29,6 +29,10 @@ pub trait Budget<K> {
 pub struct Reservation {
     granted: u64,
     buffer: Vec<u8>,
+    /// The accountant's own mark, given back with the reservation: what it needs to release the
+    /// bytes where it took them (focal funds the most urgent class from a reserve apart from the
+    /// rest). The endpoint never reads it.
+    tag: u8,
 }
 
 impl Reservation {
@@ -37,7 +41,22 @@ impl Reservation {
     /// nothing.
     pub fn new(granted: u64, mut buffer: Vec<u8>) -> Self {
         buffer.clear();
-        Self { granted, buffer }
+        Self {
+            granted,
+            buffer,
+            tag: 0,
+        }
+    }
+    /// [`Reservation::new`], marked with the accountant's `tag` ([`Reservation::tag`]).
+    pub fn tagged(granted: u64, buffer: Vec<u8>, tag: u8) -> Self {
+        Self {
+            tag,
+            ..Self::new(granted, buffer)
+        }
+    }
+    /// The accountant's mark: zero unless it was made [`Reservation::tagged`].
+    pub fn tag(&self) -> u8 {
+        self.tag
     }
     /// The bytes granted.
     pub fn granted(&self) -> u64 {
@@ -166,5 +185,18 @@ mod tests {
         assert_eq!(second.bytes().as_ptr(), pointer, "the buffer was reused");
         let window = Budget::<()>::reserve(&mut budget, 60, Lane::Window).unwrap();
         assert_eq!((window.granted(), window.room()), (60, 60));
+    }
+
+    #[test]
+    fn a_tag_comes_back_with_its_reservation_and_survives_the_fill() {
+        let mut tagged = Reservation::tagged(8, vec![9; 4], 3);
+        assert_eq!(
+            (tagged.tag(), tagged.granted(), tagged.bytes()),
+            (3, 8, &[][..])
+        );
+        tagged.fill(&[1, 2]);
+        tagged.clear();
+        assert_eq!((tagged.tag(), tagged.room()), (3, 8));
+        assert_eq!(Reservation::new(8, Vec::new()).tag(), 0);
     }
 }

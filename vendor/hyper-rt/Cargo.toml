@@ -28,6 +28,11 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_WindowsProgramming",
 ] }
 
+# hyper-raft's workspace declares the configurations its model checks and fuzzers build under
+# (its Cargo.toml [workspace.lints.rust]); this root declares the same.
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
 # suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
 [workspace]

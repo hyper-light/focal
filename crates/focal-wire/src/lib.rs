@@ -11,13 +11,12 @@
     )
 )]
 //! Bounded authenticated protocol shared by embedded and QUIC adapters.
-//! Async transport entry points require a Tokio runtime with IO and time drivers.
-//! Missing runtime context returns a typed transport error before dispatch.
+//! Async transport entry points run on a hyper-rt shard (27 §15); off one,
+//! they return a typed transport error before dispatch.
 mod admission;
 mod auth;
 mod crypto;
-pub use crypto::{crypto_provider, quic_client, quic_server};
-pub mod congestion;
+pub use crypto::crypto_provider;
 mod frame;
 mod handler;
 mod list;
@@ -38,7 +37,7 @@ pub use auth::*;
 pub use frame::*;
 pub use handler::*;
 pub use list::*;
-pub use local::{LocalRemote, LocalServer};
+pub use local::{LocalGrant, LocalRemote, LocalServer};
 pub use managed::*;
 pub use message::*;
 pub use native::*;
@@ -53,31 +52,20 @@ pub use traversal::*;
 pub use trust::*;
 pub use validators::*;
 #[cfg(test)]
-mod tests;
+#[path = "net_tests.rs"]
+mod net_tests;
 
+/// Whether this thread is a hyper-rt shard's: what every async entry point
+/// needs, its timers and sockets the shard's.
 pub(crate) fn require_runtime() -> Result<(), WireError> {
-    tokio::runtime::Handle::try_current()
+    hyper_rt::futures::shard_id()
         .map(|_| ())
-        .map_err(|_| WireError::Connection)
+        .ok_or(WireError::Connection)
 }
 
-/// Check the time driver once before setup can spawn endpoint tasks. IO driver
-/// registration happens inside the same containment boundary. This is used by
-/// bind constructors, never on the per-message path.
-pub(crate) fn transport_setup<T>(
-    build: impl FnOnce() -> Result<T, WireError>,
-) -> Result<T, WireError> {
-    require_runtime()?;
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(tokio::time::sleep(std::time::Duration::ZERO));
-        build()
-    }))
-    .map_err(|_| WireError::Connection)?
-}
-
-/// A handle may be used from a different runtime than the one that bound it.
-/// Contain the exchange itself, including timer construction, without adding a
-/// timer probe per request. An unwound exchange is dropped and never repolled.
+/// An exchange contained by an unwind boundary: a dependency that unwinds
+/// ends the exchange, typed, and it is dropped and never polled again
+/// (CLAUDE.md §1: the boundary is the last fence, never the fix).
 pub(crate) async fn transport_exchange<T>(
     exchange: impl std::future::Future<Output = Result<T, WireError>>,
 ) -> Result<T, WireError> {
@@ -93,6 +81,7 @@ pub(crate) async fn transport_exchange<T>(
 }
 
 mod monitor;
+pub mod net;
 mod summary;
 pub use monitor::{MAX_MONITOR_ROOTS, MonitorPage};
 pub use summary::LedgerSummary;

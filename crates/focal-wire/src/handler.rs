@@ -186,12 +186,12 @@ pub async fn dispatch_accounted_by(
                 .reply(Response::Error(AccessError::UnsupportedProtocol)),
         );
     }
+    let period = u64::try_from(limits.request_timeout.as_nanos()).unwrap_or(u64::MAX);
     let response =
-        match tokio::time::timeout(limits.request_timeout, handler.handle_accounted(&verified))
-            .await
-        {
-            Ok(response) => response,
-            Err(_) => {
+        match hyper_rt::futures::within(period, handler.handle_accounted(&verified)).await {
+            Ok(Some(response)) => response,
+            // Its time spent, or no timer to keep it by: the outcome is not known.
+            Ok(None) | Err(_) => {
                 return OwnedResponse::new(verified.request().reply(Response::Error(
                     if verified.request().operation.is_mutation() {
                         AccessError::OutcomeUnknown

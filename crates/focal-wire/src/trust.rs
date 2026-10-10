@@ -29,7 +29,7 @@ use rustls::{
     crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 /// The most roots a verifier holds: a current issuer, its staged
@@ -165,18 +165,17 @@ pub struct Adopted {
     pub anchor: Vec<u8>,
     pub issuer: Option<Vec<u8>>,
 }
-/// The latest issuer a client's verifier found endorsed and not held (24
-/// §11): read once a request succeeded, recorded by the client that holds
-/// the trust.
+/// An issuer a client's verifier found endorsed and not held (24 §11): read
+/// once a request succeeded, recorded by the client that holds the trust.
+/// One waits at most: a verifier that finds another while one waits leaves
+/// the waiting one, an issuer as endorsed as the other, and tells its own
+/// on a later handshake once that one is taken.
 #[derive(Debug)]
-pub struct AdoptedRoots(tokio::sync::watch::Receiver<Option<Adopted>>);
+pub struct AdoptedRoots(Receiver<Adopted>);
 impl AdoptedRoots {
     /// The adoption not yet taken, if any.
     pub fn take(&mut self) -> Option<Adopted> {
-        if !self.0.has_changed().unwrap_or(false) {
-            return None;
-        }
-        self.0.borrow_and_update().clone()
+        self.0.try_recv().ok()
     }
 }
 
@@ -186,20 +185,20 @@ impl AdoptedRoots {
 #[derive(Debug)]
 pub struct AdoptingServerVerifier {
     roots: TrustRoots,
-    known: Arc<WebPkiServerVerifier>,
-    adoption: tokio::sync::watch::Sender<Option<Adopted>>,
+    known: Box<WebPkiServerVerifier>,
+    adoption: SyncSender<Adopted>,
 }
 impl AdoptingServerVerifier {
     pub fn new(
         roots: TrustRoots,
-        provider: Arc<CryptoProvider>,
-    ) -> Result<(Arc<Self>, AdoptedRoots), WireError> {
-        let known = WebPkiServerVerifier::builder_with_provider(Arc::new(roots.store()?), provider)
+        provider: &'static CryptoProvider,
+    ) -> Result<(Box<Self>, AdoptedRoots), WireError> {
+        let known = WebPkiServerVerifier::builder_with_provider(roots.store()?, provider)
             .build()
             .map_err(|_| WireError::Authentication)?;
-        let (adoption, receive) = tokio::sync::watch::channel(None);
+        let (adoption, receive) = sync_channel(1);
         Ok((
-            Arc::new(Self {
+            Box::new(Self {
                 roots,
                 known,
                 adoption,
@@ -230,10 +229,11 @@ impl ServerCertVerifier for AdoptingServerVerifier {
         if let Ok(Some(endorsement)) = self.roots.endorsed_issuer(intermediates, now) {
             let issuer = TrustRoots::self_signed_of(intermediates, &endorsement)
                 .map(|certificate| certificate.to_vec());
-            self.adoption.send_replace(Some(Adopted {
+            // One waiting is as good as another; a full slot leaves it.
+            let _ = self.adoption.try_send(Adopted {
                 anchor: endorsement.to_vec(),
                 issuer,
-            }));
+            });
         }
         Ok(verified)
     }

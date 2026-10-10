@@ -285,6 +285,25 @@ impl TrafficClass {
     }
     /// How many ranks there are.
     pub const RANKS: usize = 3;
+    /// The class of the operation registered as `tag` ([`Operation::registered_tag`]), or `None`
+    /// for a tag no operation has: what the transport classes a message by before any of its body
+    /// is read (the kind crosses the wire as the tag; hyper-transport's `Classes::class_of`). It agrees
+    /// with [`Operation::class`], which the compiler holds to every variant: the network owner refuses
+    /// a request whose decoded operation's tag or class is not the one it was carried as.
+    pub const fn of_tag(tag: u16) -> Option<Self> {
+        match tag {
+            // Raft, Control, PeerControl, NodeContact, EnrollmentControl, ManagedSupport,
+            // PlacementControl, SessionSign, Probe, RangeControl, SessionControl, RaftOrdered.
+            4 | 9 | 11 | 12 | 13 | 19 | 28 | 29 | 30 | 31 | 32 | 33 => Some(Self::Control),
+            // Upload, Download, Custody.
+            7 | 8 | 10 => Some(Self::Bulk),
+            // Submit, Read, Subscribe, OpenEpoch, Stream, List, Reconcile, Managed,
+            // RequestStreamControl, RequestStreamRead, Traverse, Validators, Summary, Monitor,
+            // Select, Native, NativeRead, NativeList.
+            1 | 2 | 3 | 5 | 6 | 14..=18 | 20..=27 => Some(Self::Exchange),
+            _ => None,
+        }
+    }
 }
 /// One movement fact request: an operation, a member and a kind.
 pub const MAX_RANGE_CONTROL_REQUEST_BYTES: usize = 4 * 1024;

@@ -92,9 +92,9 @@ impl AuthenticatedPeer {
     }
 }
 
-/// What the registry holds: the grants by certificate, and the connections
-/// each certificate has open on this node's listeners, so that a revocation
-/// closes them (the audit's F35: a grant withdrawn releases what waits on
+/// What the registry holds: the grants by certificate, and the listeners
+/// serving under them, so that a revocation closes the connections it no
+/// longer grants (the audit's F35: a grant withdrawn releases what waits on
 /// it) instead of leaving them to their idle timeout.
 #[derive(Default)]
 struct Grants {
@@ -105,8 +105,17 @@ struct Grants {
     /// fingerprint: each holds its key's grant until the projection names
     /// it or drops the key. Bounded by `max_peers`.
     provisional: BTreeMap<[u8; 32], [u8; 32]>,
-    live: BTreeMap<[u8; 32], Vec<(usize, quinn::Connection)>>,
+    /// Counted at every withdrawal of a grant: a listener's owner that sees
+    /// it move closes the connections of certificates no longer granted.
+    revision: u64,
+    /// The owners of the listeners serving under these grants, woken at a
+    /// withdrawal; at most [`MAX_WATCHERS`], an ended one dropped as it is
+    /// found.
+    watchers: Vec<crate::net::Network>,
 }
+/// The listeners one registry wakes at a withdrawal: a node's listener, its
+/// control and evidence servers, with room for a test's several.
+const MAX_WATCHERS: usize = 64;
 /// A key an enrollment holds. A certificate of it that the grant projection
 /// does not name — issued by the cluster's CA (the listener verified the
 /// chain) after the certificate the projection names — is a renewal
@@ -144,10 +153,18 @@ pub struct PeerRegistry {
     grants: Arc<RwLock<Grants>>,
     max_peers: usize,
 }
-fn close_revoked(connections: Vec<(usize, quinn::Connection)>) {
-    for (_, connection) in connections {
-        connection.close(1u8.into(), b"revoked");
-    }
+/// Wakes the listeners' owners to close what is no longer granted: each
+/// checks the registry's revision when it next moves, so a wake refused by a
+/// full queue — an owner already moving — loses nothing; an owner that ended
+/// is dropped.
+fn wake_watchers(grants: &mut Grants) {
+    grants.revision = grants.revision.wrapping_add(1);
+    grants.watchers.retain(|watcher| {
+        !matches!(
+            watcher.try_send(crate::net::Command::Revoked),
+            Err(WireError::Connection)
+        )
+    });
 }
 impl PeerRegistry {
     /// Replace a complete server-owned grant projection atomically. Validate
@@ -180,7 +197,7 @@ impl PeerRegistry {
             }
             validate_grant(&enrolled.grant)?;
         }
-        let (previous, revoked) = {
+        let previous = {
             let mut guard = self.grants.write().map_err(|_| AccessError::Unavailable)?;
             let grants = &mut *guard;
             let previous = (
@@ -196,22 +213,16 @@ impl PeerRegistry {
                     grants.provisional.insert(fingerprint, key);
                 }
             }
-            let gone: Vec<[u8; 32]> = grants
-                .live
+            let withdrawn = previous
+                .0
                 .keys()
-                .filter(|fingerprint| !grants.grants.contains_key(*fingerprint))
-                .copied()
-                .collect();
-            let revoked: Vec<_> = gone
-                .iter()
-                .filter_map(|fingerprint| grants.live.remove(fingerprint))
-                .collect();
-            (previous, revoked)
+                .any(|fingerprint| !grants.grants.contains_key(fingerprint));
+            if withdrawn {
+                wake_watchers(grants);
+            }
+            previous
         };
         drop(previous);
-        for connections in revoked {
-            close_revoked(connections);
-        }
         Ok(())
     }
     pub fn new(max_peers: usize) -> Result<Self, AccessError> {
@@ -241,16 +252,39 @@ impl PeerRegistry {
     /// nothing more is received on them, and what was waiting for a body on
     /// one ends with it.
     pub fn revoke(&self, fingerprint: [u8; 32]) -> Result<(), AccessError> {
-        let revoked = {
-            let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-            grants.grants.remove(&fingerprint);
-            grants.provisional.remove(&fingerprint);
-            grants.live.remove(&fingerprint)
-        };
-        if let Some(connections) = revoked {
-            close_revoked(connections);
-        }
+        let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+        grants.grants.remove(&fingerprint);
+        grants.provisional.remove(&fingerprint);
+        wake_watchers(&mut grants);
         Ok(())
+    }
+    /// Counted at every withdrawal of a grant ([`Self::revoke`], a
+    /// projection that drops a certificate).
+    pub fn revision(&self) -> u64 {
+        self.grants
+            .read()
+            .map_or(u64::MAX, |grants| grants.revision)
+    }
+    /// Wake `network`'s owner at every withdrawal, so it closes the
+    /// connections it no longer grants; past [`MAX_WATCHERS`] the owner
+    /// still closes them at its revision check, when it next moves.
+    pub(crate) fn watch(&self, network: crate::net::Network) {
+        let Ok(mut grants) = self.grants.write() else {
+            return;
+        };
+        if grants.watchers.len() >= MAX_WATCHERS {
+            // Ended owners are found by a wake, which a live one reads as a revision check that
+            // changes nothing.
+            grants.watchers.retain(|watcher| {
+                !matches!(
+                    watcher.try_send(crate::net::Command::Revoked),
+                    Err(WireError::Connection)
+                )
+            });
+        }
+        if grants.watchers.len() < MAX_WATCHERS {
+            grants.watchers.push(network);
+        }
     }
     /// Whether the certificate is granted now, without copying its grant:
     /// asked before anything is read for a stream.
@@ -312,59 +346,6 @@ impl PeerRegistry {
             fingerprint: Some(fingerprint),
             renewal_of: Some(key),
         })
-    }
-    /// A connection authenticated by `fingerprint` is held under it until
-    /// the returned guard is dropped, so that a revocation closes it; at
-    /// most `bound` connections a certificate, the listener's own bound.
-    pub fn attach(
-        &self,
-        fingerprint: [u8; 32],
-        connection: &quinn::Connection,
-        bound: usize,
-    ) -> Result<LiveConnection, AccessError> {
-        let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-        if !grants.grants.contains_key(&fingerprint) {
-            return Err(AccessError::Unauthorized);
-        }
-        let live = grants.live.entry(fingerprint).or_default();
-        if live.len() >= bound {
-            return Err(AccessError::Capacity);
-        }
-        live.try_reserve(1).map_err(|_| AccessError::Capacity)?;
-        let id = connection.stable_id();
-        live.push((id, connection.clone()));
-        Ok(LiveConnection {
-            registry: self.clone(),
-            fingerprint,
-            id,
-        })
-    }
-    /// The connections held under `fingerprint` now.
-    pub fn live_connections(&self, fingerprint: [u8; 32]) -> usize {
-        self.grants
-            .read()
-            .ok()
-            .and_then(|grants| grants.live.get(&fingerprint).map(Vec::len))
-            .unwrap_or(0)
-    }
-}
-/// A connection held under its certificate in the registry until dropped.
-pub struct LiveConnection {
-    registry: PeerRegistry,
-    fingerprint: [u8; 32],
-    id: usize,
-}
-impl Drop for LiveConnection {
-    fn drop(&mut self) {
-        let Ok(mut grants) = self.registry.grants.write() else {
-            return;
-        };
-        if let Some(live) = grants.live.get_mut(&self.fingerprint) {
-            live.retain(|(id, _)| *id != self.id);
-            if live.is_empty() {
-                grants.live.remove(&self.fingerprint);
-            }
-        }
     }
 }
 pub fn certificate_fingerprint(der: &[u8]) -> [u8; 32] {
