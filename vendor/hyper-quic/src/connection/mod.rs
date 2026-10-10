@@ -1889,6 +1889,14 @@ impl Connection {
         self.path.rtt.get()
     }
 
+    /// The probe timeout of the application data space (RFC 9002 §6.2.1), before backoff: the
+    /// smoothed RTT, four times its variation, and the peer's acknowledgement delay. No loss is
+    /// declared sooner, and a wait an application judges on what the peer acknowledges or answers
+    /// is not judged sooner either (patch Q7).
+    pub fn probe_timeout(&self) -> Duration {
+        self.pto(SpaceId::Data)
+    }
+
     /// Minimum RTT seen on this path, ignoring ack delay
     pub fn min_rtt(&self) -> Duration {
         self.path.rtt.min()
@@ -2172,6 +2180,13 @@ impl Connection {
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
         self.remove_in_flight(&info);
+        // What reached the peer (patch Q6): a request's bytes in a bottleneck's queue are sent and
+        // not yet had, and an application that asks whether the peer has them reads this.
+        self.stats.path.acked_bytes = self
+            .stats
+            .path
+            .acked_bytes
+            .saturating_add(u64::from(info.size));
         // Careful Resume holds the window in its Unvalidated Phase and Safe Retreat (RFC 9959
         // §3.3, §3.5)
         if info.ack_eliciting && self.path.challenge.is_none() && !self.resume.holds_window() {

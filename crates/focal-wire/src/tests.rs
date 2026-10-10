@@ -4196,16 +4196,20 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
         packet
     }
     let answered = Arc::new(AtomicU64::new(0));
+    // The first of the others that was not answered, and how.
+    let refused = Arc::new(std::sync::Mutex::new(None::<WireError>));
     let others = {
-        let (remote, answered) = (remote.clone(), answered.clone());
+        let (remote, answered, refused) = (remote.clone(), answered.clone(), refused.clone());
         spawn(async move {
             // Until the test aborts it: a bound the test never reaches.
             for id in 1_000..=u128::MAX {
-                remote
-                    .request_within(&other(id), UNREAD_PERIOD)
-                    .await
-                    .unwrap();
-                answered.fetch_add(1, Ordering::Relaxed);
+                match remote.request_within(&other(id), UNREAD_PERIOD).await {
+                    Ok(_) => answered.fetch_add(1, Ordering::Relaxed),
+                    Err(error) => {
+                        *refused.lock().unwrap() = Some(error);
+                        return;
+                    }
+                };
                 pause(UNREAD_EVERY).await;
             }
         })
@@ -4220,7 +4224,13 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
         .await
         .unwrap();
     others.abort();
-    assert!(others.await.is_err(), "the others ended on their own");
+    let _ = others.await;
+    // None of the others was refused, while it waited or after.
+    assert!(
+        refused.lock().unwrap().is_none(),
+        "{:?}",
+        refused.lock().unwrap()
+    );
     remote.close();
     peer.abort();
     for relay in relays {
@@ -4237,9 +4247,14 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
 /// else the connection carries meanwhile (the audit's F38): charged with what
 /// the connection sent, it was kept for as long as the other exchanges moved a
 /// datagram a period, until they had sent as much as it had to — two megabytes
-/// at twenty kilobytes a period here, a hundred periods. The endpoint judges an
-/// exchange by what it sends itself (hyper-transport's `progress.rs`): the
-/// period after flow control stops it, sending less than a datagram, ends it.
+/// at twenty kilobytes a period here, a hundred periods. The endpoint ends an
+/// exchange out of the peer's credit with all it sent acknowledged a window
+/// after it finds it so (hyper-transport's `progress.rs`, hyper-quic patch Q8).
+/// The others are never refused for it: here the unread stream holds the whole
+/// of the connection's credit — the budget's window, a dozen kilobytes to
+/// start, where the old transport's was 144 MiB (excluded by note 32, T46–T48)
+/// — and the others wait for it, held and not judged, and are answered once its
+/// reset gives the credit back.
 #[test]
 fn a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries() {
     focal_rt::block_on(async move {
@@ -4265,10 +4280,9 @@ fn a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries() {
         // that moved nothing.
         assert!(unread.after < kept / 10, "{:?} of {kept:?}", unread.after);
         println!(
-            "a stalled stream of {STALLED} bytes ended after {:?}; the old wait kept it {kept:?}",
-            unread.after
+            "a stalled stream of {STALLED} bytes ended after {:?}, {} others answered meanwhile; the old wait kept it {kept:?}",
+            unread.after, unread.answered
         );
-        assert!(unread.answered >= 1, "{}", unread.answered);
     })
     .unwrap()
 }

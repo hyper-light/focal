@@ -55,6 +55,32 @@ source: its credit law (`flow.rs`, `connection.rs`) is taken here. Neither repos
 
 ## Departures found while porting
 
+- **The peer's time to answer begins when it has the request** (2026-10-10). The asking phase ended
+  a period after everything owed had been *sent*. On a slow path a bottleneck's queue holds the last
+  window for seconds after it leaves, so the peer's period ran out before it had the request: focal's
+  `a_peers_time_to_answer_begins_when_it_has_what_was_asked`, 32 KiB over 64 kbit/s answered 400 ms
+  after arrival, was refused at 4.5 s, as it was in focal before its audit's F38. Once sent whole, a
+  request is now charged with what the peer acknowledges (hyper-quic patch Q6), and the answer period
+  begins when QUIC reports the stream acknowledged whole (`StreamEvent::Finished`;
+  `a_peers_time_to_answer_begins_when_it_has_the_request`,
+  `a_request_in_the_network_is_waited_on_while_the_peer_acknowledges_it`). Over focal's own shape —
+  64 kbit/s each way, 32-datagram queues — that was not enough: the sender, held by the peer's credit,
+  sent nothing for a period while the peer drained the queue, and under that load the round trip was
+  longer than the 500 ms period, so no period could carry the peer's acknowledgements. A period is
+  now charged what the peer acknowledged where that is more than what was sent
+  (`a_request_held_by_the_peers_credit_moves_by_what_the_peer_acknowledges`), and a window is not
+  judged sooner than the path's probe timeout (hyper-quic patch Q7;
+  `a_window_is_judged_no_sooner_than_the_probe_timeout`).
+- **A stream its peer does not read** (2026-10-10, F38's other half). One the peer accepted and
+  never read took the peer's connection credit, and every exchange of its class on the connection
+  waited for credit behind it and was refused (focal's
+  `a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries`); since the answer
+  period began from the acknowledgement, the unread one itself lived as long as the others moved
+  (over a lossy path, longer than the twenty minutes a run was given). Out of credit, a datagram of
+  it and more sent and all of that acknowledged (hyper-quic patch Q8), it is now unread and ends a
+  window later; an exchange waiting only for credit an unread one holds, or held in its window, is
+  held, and goes on as the credit comes back
+  (`a_stream_its_peer_never_reads_ends_by_its_own_bytes_and_the_others_go_on`).
 - **What is sent into silence is not progress.** focal's `carried` charged a period with the bytes
   the connection sent and did not find lost. After a peer dies the sender still sends: the flight in
   the air, then the probe timeout's probes, a datagram or two each at a doubling backoff, so every

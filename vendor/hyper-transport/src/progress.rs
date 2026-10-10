@@ -4,14 +4,32 @@
 //! An exchange is not given a fixed wall time. It is judged once a period, and given up only when
 //! a period moved less than a datagram ([`LEAST_PROGRESS`]), so "a megabyte crosses a path of
 //! 4 Mbit/s ... between endpoints that give a request one second" (focal 27 §7), and an exchange
-//! whose peer stopped taking it ends within a period or two on any path. Two phases:
+//! whose peer stopped taking it ends within a period or two on any path. A window is never judged
+//! sooner than the path's probe timeout (hyper-quic's `probe_timeout`, patch Q7; RFC 9002 §6.2.1):
+//! what the peer acknowledges and answers takes a round trip to say, and where the round trip is
+//! longer than the period — a bottleneck's queue under load, 64 kbit/s and a 500 ms period in
+//! focal's run — a period judged the path's clock rather than the peer. Two phases:
 //!
-//! - **Asking**: the request is being carried and the reply's prefix has not arrived. A period is
-//!   charged what the connection sent and did not lose in it. The exchange ends at the end of a
-//!   period that sent less than a datagram, or in which the peer sent nothing at all, and at the
-//!   end of one that began when all the
-//!   exchanges on the connection had to send beside it, and its own bytes, had been sent: the peer
-//!   had the request and a period to answer it. What was sent is progress only while the peer is
+//! - **Asking**: the request is being carried and the reply's prefix has not arrived. While the
+//!   exchanges on the connection have bytes to send beside it, its own among them, a period is
+//!   charged what the connection sent and did not lose in it, or what the peer acknowledged if that
+//!   is more (a sender held by the peer's flow control on a slow path sends nothing while the peer
+//!   drains the bottleneck), and ends the exchange if that is less than a datagram. Once all of it
+//!   is sent it is in the network, which may hold it longer than a
+//!   period — a bottleneck's queue on a slow path holds a window for seconds — and a period is
+//!   charged what the peer acknowledged of what was sent (hyper-quic's `acked_bytes`, patch Q6), and
+//!   ends the exchange if that is less than a datagram. The peer's time to answer begins when it has
+//!   the request: when QUIC reports the exchange's stream acknowledged whole (`StreamEvent::Finished`),
+//!   and the exchange ends at the end of a period that began with it so (focal's audit F38: counted
+//!   from the send, the period began while the last of a request was still on its way, and ended
+//!   before the peer had it). A period in which the peer sent nothing at all ends it whatever was
+//!   charged. A stream its peer does not read ends by its own bytes, whatever else the connection
+//!   carries (focal's audit F38): out of the peer's credit (its own, or the connection's with bytes
+//!   to send), at least a datagram of it sent and all of that acknowledged, it is unread, and a
+//!   window more ends it, its reset giving back the credit it holds (hyper-quic patch Q8,
+//!   `SendStream::sent_acknowledged`, `written`). An exchange waiting only for credit that an unread
+//!   one holds, or held in its window, is not judged: the credit comes back as the unread one
+//!   ends. What was sent is progress only while the peer is
 //!   heard: a live peer acknowledges what it receives within its `max_ack_delay` (RFC 9000 §13.2.1,
 //!   25 ms by default, §18.2), so a period that heard nothing is silence, and what the sender put
 //!   into it (the flight in the air, then the probe timeout's probes, which RFC 9002 §6.2.4 sends
@@ -93,6 +111,8 @@ impl Progress {
 pub(crate) struct Moved {
     /// Bytes the connection sent and did not find lost.
     pub(crate) sent: u64,
+    /// Bytes of what the connection sent that the peer acknowledged.
+    pub(crate) acked: u64,
     /// Bytes the connection received.
     pub(crate) received: u64,
     /// Stream bytes the connection delivered of the exchange's class and the less urgent ones.
@@ -104,9 +124,10 @@ enum Phase {
     Asking {
         /// What the exchanges on the connection, this one included, had to send.
         owed: u64,
-        /// What the periods so far were charged.
+        /// What the periods so far sent of it.
         charged: u64,
-        /// Whether the period now running began with every owed byte charged.
+        /// Whether the period now running began with the peer holding the whole request: its
+        /// stream acknowledged whole.
         had: bool,
     },
     Answering {
@@ -161,6 +182,8 @@ impl Delivered {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Carry {
     period: Duration,
+    /// When the window being judged began: the wait's start, or its last judgement.
+    since: Instant,
     next: Instant,
     before: Moved,
     phase: Phase,
@@ -171,6 +194,7 @@ impl Carry {
     pub(crate) fn idle(progress: Progress, now: Instant, moved: Moved) -> Self {
         Self {
             period: progress.period,
+            since: now,
             next: now.checked_add(progress.period).unwrap_or(now),
             before: moved,
             phase: Phase::Idle,
@@ -231,7 +255,16 @@ impl Carry {
 
     fn restart(&mut self, now: Instant, moved: Moved) {
         self.before = moved;
+        self.since = now;
         self.next = now.checked_add(self.period).unwrap_or(now);
+    }
+    /// When the window being judged began.
+    pub(crate) fn started(&self) -> Instant {
+        self.since
+    }
+    /// The window a judgement covers on a path whose probe timeout is `floor`.
+    pub(crate) fn window(&self, floor: Duration) -> Duration {
+        self.period.max(floor)
     }
     /// When the wait is next judged, if anything is waited on.
     pub(crate) fn due(&self) -> Option<Instant> {
@@ -239,29 +272,53 @@ impl Carry {
     }
     /// Judge the wait at `now`, if a judgement is due: `moved` is what the connection has moved,
     /// `held` what its exchanges have to send now, `backlog` what the peer has declared and not
-    /// yet delivered of the exchange's class and the less urgent ones.
+    /// yet delivered of the exchange's class and the less urgent ones, `acknowledged` whether
+    /// the peer has acknowledged the exchange's own message whole, and `floor` the path's probe
+    /// timeout. A window shorter than the floor is not judged: what the peer acknowledges and
+    /// answers takes a round trip to say, and on a path whose round trip is longer than the
+    /// period — a bottleneck's queue under load — a period would judge the path's clock, not the
+    /// peer. The judgement waits for the floor, the window kept whole (RFC 9002 §6.2.1 declares no
+    /// loss sooner either).
     pub(crate) fn judge(
         &mut self,
         now: Instant,
         moved: Moved,
         held: u64,
         backlog: u64,
+        acknowledged: bool,
+        floor: Duration,
     ) -> Result<(), Refusal> {
         if now < self.next || matches!(self.phase, Phase::Idle) {
             return Ok(());
         }
+        let ready = self.since.checked_add(floor).unwrap_or(now);
+        if now < ready {
+            self.next = ready;
+            return Ok(());
+        }
         let before = std::mem::replace(&mut self.before, moved);
+        self.since = now;
         self.next = now.checked_add(self.period).unwrap_or(now);
         match &mut self.phase {
             Phase::Asking { owed, charged, had } => {
                 let sent = moved.sent.saturating_sub(before.sent);
+                let acked = moved.acked.saturating_sub(before.acked);
                 let heard = moved.received.saturating_sub(before.received);
-                if *had || sent < LEAST_PROGRESS || heard == 0 {
+                // What reached the peer moves the request as what left this side does: a sender
+                // held by the peer's flow control on a slow path sends nothing while the peer drains
+                // the bottleneck, and acknowledges; once all of it is sent, only what the peer
+                // acknowledges moves it.
+                let carried = if *charged < *owed {
+                    sent.max(acked)
+                } else {
+                    acked
+                };
+                if *had || carried < LEAST_PROGRESS || heard == 0 {
                     return Err(Refusal::Stalled);
                 }
                 *charged = charged.saturating_add(sent);
                 *owed = (*owed).max(held);
-                *had = *charged >= *owed;
+                *had = acknowledged;
                 Ok(())
             }
             Phase::Answering {
@@ -289,9 +346,11 @@ mod tests {
     use super::*;
 
     const PERIOD: Duration = Duration::from_millis(100);
+    /// What the connection moved, everything it sent acknowledged as it went.
     fn moved(sent: u64, received: u64) -> Moved {
         Moved {
             sent,
+            acked: sent,
             received,
             delivered: received,
         }
@@ -314,13 +373,23 @@ mod tests {
                     moved(sent, period * 100),
                     1_000_000 - sent.min(1_000_000),
                     0,
+                    sent >= 1_000_000,
+                    Duration::ZERO,
                 )
                 .unwrap();
         }
-        // Everything was sent by the 80th period: the peer had the request and the 81st to answer.
+        // Everything was sent, and acknowledged, by the 80th period: the peer had the request and
+        // the 81st to answer.
         let now = start + PERIOD * 81;
         assert_eq!(
-            carry.judge(now, moved(1_000_000 + 1_200, 8_200), 0, 0),
+            carry.judge(
+                now,
+                moved(1_000_000 + 1_200, 8_200),
+                0,
+                0,
+                false,
+                Duration::ZERO
+            ),
             Err(Refusal::Stalled)
         );
     }
@@ -336,7 +405,184 @@ mod tests {
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         carry.asking(start, moved(0, 0), 1_000_000);
         assert_eq!(
-            carry.judge(start + PERIOD, moved(13_776, 0), 1_000_000, 0),
+            carry.judge(
+                start + PERIOD,
+                moved(13_776, 0),
+                1_000_000,
+                0,
+                false,
+                Duration::ZERO
+            ),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A request sent whole is in the network until the peer acknowledges it, which a bottleneck's
+    /// queue may hold for many periods: each period that brings the peer's acknowledgement of a
+    /// datagram's worth keeps it, the peer's time to answer begins when it has acknowledged it all,
+    /// and a period that brings less ends it (focal's audit F38).
+    #[test]
+    fn a_request_in_the_network_is_waited_on_while_the_peer_acknowledges_it() {
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
+        let carried = |sent: u64, acked: u64, received: u64| Moved {
+            sent,
+            acked,
+            received,
+            delivered: 0,
+        };
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, carried(0, 0, 0));
+        carry.asking(start, carried(0, 0, 0), 10_000);
+        // Sent whole in the first period, 2,000 of it acknowledged.
+        carry
+            .judge(
+                start + PERIOD,
+                carried(10_000, 2_000, 200),
+                0,
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .unwrap();
+        // Nothing more to send: the periods that bring acknowledgements keep it.
+        carry
+            .judge(
+                start + PERIOD * 2,
+                carried(10_000, 5_000, 400),
+                0,
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .unwrap();
+        carry
+            .judge(
+                start + PERIOD * 3,
+                carried(10_000, 10_000, 600),
+                0,
+                0,
+                true,
+                Duration::ZERO,
+            )
+            .unwrap();
+        // The peer had it whole for a period: its time to answer is over.
+        assert_eq!(
+            carry.judge(
+                start + PERIOD * 4,
+                carried(10_000, 10_000, 800),
+                0,
+                0,
+                true,
+                Duration::ZERO
+            ),
+            Err(Refusal::Stalled)
+        );
+        // A request in the network that the peer acknowledges less than a datagram of in a period
+        // ends there, heard or not.
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, carried(0, 0, 0));
+        carry.asking(start, carried(0, 0, 0), 10_000);
+        carry
+            .judge(
+                start + PERIOD,
+                carried(10_000, 2_000, 200),
+                0,
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(
+            carry.judge(
+                start + PERIOD * 2,
+                carried(10_000, 2_500, 400),
+                0,
+                0,
+                false,
+                Duration::ZERO
+            ),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A sender held by the peer's flow control sends nothing while the peer drains a slow path's
+    /// bottleneck and acknowledges: what the peer acknowledged moves the request as what was sent
+    /// does. Neither, and the period ends it.
+    #[test]
+    fn a_request_held_by_the_peers_credit_moves_by_what_the_peer_acknowledges() {
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
+        let carried = |sent: u64, acked: u64, received: u64| Moved {
+            sent,
+            acked,
+            received,
+            delivered: 0,
+        };
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, carried(0, 0, 0));
+        carry.asking(start, carried(0, 0, 0), 30_000);
+        let none = Duration::ZERO;
+        carry
+            .judge(
+                start + PERIOD,
+                carried(12_000, 0, 200),
+                18_000,
+                0,
+                false,
+                none,
+            )
+            .unwrap();
+        // Nothing sent: the peer's credit is spent; 4,800 of it acknowledged.
+        carry
+            .judge(
+                start + PERIOD * 2,
+                carried(12_000, 4_800, 400),
+                18_000,
+                0,
+                false,
+                none,
+            )
+            .unwrap();
+        assert_eq!(
+            carry.judge(
+                start + PERIOD * 3,
+                carried(12_000, 4_900, 600),
+                18_000,
+                0,
+                false,
+                none
+            ),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A window shorter than the path's probe timeout is not judged: on a path whose round trip is
+    /// longer than the period, what the peer acknowledges and answers cannot come within one. The
+    /// judgement waits for the floor with the window kept whole, and judges all of it.
+    #[test]
+    fn a_window_is_judged_no_sooner_than_the_probe_timeout() {
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
+        let floor = PERIOD * 3;
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
+        carry.asking(start, moved(0, 0), 10_000);
+        // Due by the period, and nothing moved yet: not judged, but put off to the floor.
+        carry
+            .judge(start + PERIOD, moved(0, 0), 10_000, 0, false, floor)
+            .unwrap();
+        assert_eq!(carry.due(), Some(start + floor));
+        // Judged at the floor on everything since the start: it moved.
+        carry
+            .judge(start + floor, moved(10_000, 300), 0, 0, false, floor)
+            .unwrap();
+        // The next window is the floor's too: nothing in it ends the exchange at its end.
+        carry
+            .judge(
+                start + floor + PERIOD,
+                moved(10_000, 300),
+                0,
+                0,
+                false,
+                floor,
+            )
+            .unwrap();
+        assert_eq!(
+            carry.judge(start + floor * 2, moved(10_000, 300), 0, 0, false, floor),
             Err(Refusal::Stalled)
         );
     }
@@ -348,10 +594,24 @@ mod tests {
         carry.asking(start, moved(500, 0), 10_000);
         // Not yet due: no judgement.
         carry
-            .judge(start + PERIOD / 2, moved(500, 0), 10_000, 0)
+            .judge(
+                start + PERIOD / 2,
+                moved(500, 0),
+                10_000,
+                0,
+                false,
+                Duration::ZERO,
+            )
             .unwrap();
         assert_eq!(
-            carry.judge(start + PERIOD, moved(500 + 1_199, 300), 10_000, 0),
+            carry.judge(
+                start + PERIOD,
+                moved(500 + 1_199, 300),
+                10_000,
+                0,
+                false,
+                Duration::ZERO
+            ),
             Err(Refusal::Stalled)
         );
     }
@@ -374,6 +634,8 @@ mod tests {
                     moved(0, arrived),
                     0,
                     1_000_000 - arrived,
+                    false,
+                    Duration::ZERO,
                 )
                 .unwrap();
             carry.arrived(12_000);
@@ -382,7 +644,14 @@ mod tests {
         let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
         carry.answering(start, moved(0, 0), 24_000, 24_000);
         assert_eq!(
-            carry.judge(start + PERIOD, moved(0, 100), 0, 24_000),
+            carry.judge(
+                start + PERIOD,
+                moved(0, 100),
+                0,
+                24_000,
+                false,
+                Duration::ZERO
+            ),
             Err(Refusal::Stalled)
         );
     }
@@ -398,24 +667,53 @@ mod tests {
         carry.answering(start, moved(0, 0), 10_000, 60_000);
         let busy = |received: u64, delivered: u64| Moved {
             sent: 0,
+            acked: 0,
             received,
             delivered,
         };
         // A more urgent class delivers a megabyte: none of it charged.
         carry
-            .judge(start + PERIOD, busy(1_000_000, 0), 0, 60_000)
+            .judge(
+                start + PERIOD,
+                busy(1_000_000, 0),
+                0,
+                60_000,
+                false,
+                Duration::ZERO,
+            )
             .unwrap();
         // The other body's 50,000 arrive, and 10,000 of a third declared meanwhile.
         carry
-            .judge(start + PERIOD * 2, busy(1_050_000, 50_000), 0, 20_000)
+            .judge(
+                start + PERIOD * 2,
+                busy(1_050_000, 50_000),
+                0,
+                20_000,
+                false,
+                Duration::ZERO,
+            )
             .unwrap();
         // The third's 10,000: everything owed delivered by this period's end.
         carry
-            .judge(start + PERIOD * 3, busy(1_060_000, 60_000), 0, 10_000)
+            .judge(
+                start + PERIOD * 3,
+                busy(1_060_000, 60_000),
+                0,
+                10_000,
+                false,
+                Duration::ZERO,
+            )
             .unwrap();
         // A period more, still busy, and still not this body.
         assert_eq!(
-            carry.judge(start + PERIOD * 4, busy(2_000_000, 60_000), 0, 10_000),
+            carry.judge(
+                start + PERIOD * 4,
+                busy(2_000_000, 60_000),
+                0,
+                10_000,
+                false,
+                Duration::ZERO
+            ),
             Err(Refusal::Stalled)
         );
     }

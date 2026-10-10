@@ -314,6 +314,27 @@ impl<'a> SendStream<'a> {
         Ok(written)
     }
 
+    /// Whether the peer has acknowledged every byte sent on the stream, none waiting to be sent
+    /// again: what the stream still holds is unsent (patch Q8). Out of the peer's credit for the
+    /// stream as well, the stream's bytes are all in the peer's buffer, and the peer is not reading
+    /// them.
+    pub fn sent_acknowledged(&self) -> Result<bool, ClosedStream> {
+        match self.state.send.get(&self.id).as_ref() {
+            Some(Some(s)) => Ok(s.pending.sent_acked()),
+            Some(None) => Ok(true),
+            None => Err(ClosedStream { _private: () }),
+        }
+    }
+
+    /// The bytes the application has written to the stream so far (patch Q8).
+    pub fn written(&self) -> Result<u64, ClosedStream> {
+        match self.state.send.get(&self.id).as_ref() {
+            Some(Some(s)) => Ok(s.pending.offset()),
+            Some(None) => Ok(0),
+            None => Err(ClosedStream { _private: () }),
+        }
+    }
+
     /// Check if this stream was stopped, get the reason if it was
     pub fn stopped(&self) -> Result<Option<VarInt>, ClosedStream> {
         match self.state.send.get(&self.id).as_ref() {

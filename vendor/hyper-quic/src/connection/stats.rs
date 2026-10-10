@@ -180,6 +180,9 @@ pub struct PathStats {
     pub lost_packets: u64,
     /// The amount of bytes lost on this path
     pub lost_bytes: u64,
+    /// The amount of bytes of this path's packets the peer acknowledged: what has reached it, as
+    /// the progress of what it was sent (patch Q6)
+    pub acked_bytes: u64,
     /// The amount of packets sent on this path
     pub sent_packets: u64,
     /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)

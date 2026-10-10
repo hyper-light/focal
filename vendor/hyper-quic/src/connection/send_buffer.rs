@@ -219,6 +219,14 @@ impl SendBuffer {
         self.offset
     }
 
+    /// Whether every byte sent so far has been acknowledged and none waits to be sent again: what
+    /// the buffer still holds is unsent (patch Q8)
+    pub(super) fn sent_acked(&self) -> bool {
+        self.retransmits.is_empty()
+            && u64::try_from(self.unacked_len)
+                .is_ok_and(|unacked| unacked == self.offset.saturating_sub(self.unsent))
+    }
+
     /// Whether all sent data has been acknowledged
     pub(super) fn is_fully_acked(&self) -> bool {
         self.unacked_len == 0

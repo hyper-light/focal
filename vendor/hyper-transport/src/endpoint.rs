@@ -45,7 +45,7 @@ use crate::credit::{
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
-use crate::progress::{Carry, Delivered, Moved, Progress};
+use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
@@ -246,6 +246,13 @@ struct Conn<R> {
     /// When this connection's credit queue last advanced (policy C): an exchange was given a stream or finished, or
     /// the peer raised the streams it lets this side open. An exchange waiting for a stream is judged on this.
     credit_moved: Option<Instant>,
+    /// Its exchanges a judgement found unread (`Exchange::unread_since`): while any is, the
+    /// connection's credit it holds is the peer's to give back, and an exchange waiting only for
+    /// that credit is not judged.
+    unread: u32,
+    /// When the last unread exchange ended: the credit it held comes back from then, and an
+    /// exchange that waited for it through a window that saw it end is given a window afresh.
+    unread_ended: Option<Instant>,
     lanes_out: Vec<LaneOut>,
     lanes_in: Vec<LaneIn>,
     window: Window,
@@ -404,6 +411,7 @@ fn moved<R>(conn: &Conn<R>, rank: u8) -> Moved {
     let stats = conn.quic.stats();
     Moved {
         sent: stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes),
+        acked: stats.path.acked_bytes,
         received: stats.udp_rx.bytes,
         delivered: conn.delivered.from(rank),
     }
@@ -1089,6 +1097,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 usize::try_from(limits.streams_per_connection).unwrap_or(0),
             ),
             credit_moved: None,
+            unread: 0,
+            unread_ended: None,
             lanes_out: Vec::new(),
             lanes_in: Vec::new(),
             window: Window::new(initial, limits.window_ceiling),
@@ -1397,7 +1407,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 }
             }
             StreamEvent::Available { dir: Dir::Bi } => conn.credit_moved = Some(now),
-            StreamEvent::Finished { .. } | StreamEvent::Available { .. } => {}
+            // Every byte of the message on the stream acknowledged: the peer has it.
+            StreamEvent::Finished { id } => {
+                if let Some(exchange) = self
+                    .exchange_on(conn, id)
+                    .and_then(|exchange| self.exchanges.get_mut(exchange))
+                {
+                    exchange.out.acked = true;
+                }
+            }
+            StreamEvent::Available { .. } => {}
         }
     }
 
@@ -1621,6 +1640,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             writable_sent: false,
             writable_waiting: false,
             stream_blocked: false,
+            unread_since: None,
             starved: false,
             ended: false,
         };
@@ -1990,6 +2010,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             writable_sent: false,
             writable_waiting: false,
             stream_blocked: false,
+            unread_since: None,
             starved: false,
             ended: false,
         };
@@ -2405,6 +2426,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let Some(exchange) = self.exchanges.remove(id) else {
             return;
         };
+        if exchange.unread_since.is_some() {
+            conn.unread = conn.unread.saturating_sub(1);
+            conn.unread_ended = Some(self.now);
+        }
         self.admission
             .ended(exchange.peer, exchange.connection, self.now);
         self.unlist(conn, id, exchange.at);
@@ -2541,6 +2566,26 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         // classes are served: none means the peer is not taking what the exchange has to send.
         let peer_takes = credit(&mut conn.quic, rank);
         let credit_moved = conn.credit_moved;
+        let floor = conn.quic.probe_timeout();
+        // Out of the peer's credit — its stream's own, or the connection's with this side's bytes
+        // to send — with at least a datagram of its own sent and all of that acknowledged: the
+        // peer holds its bytes and gives back no credit for them. An exchange that wrote less is
+        // one waiting behind such a one, not one.
+        let unread_now = self.exchanges.get(id).is_some_and(|exchange| {
+            let blocked =
+                exchange.stream_blocked || (peer_takes == 0 && exchange.out.pending() > 0);
+            blocked
+                && exchange.stream.is_some_and(|stream| {
+                    let stream = conn.quic.send_stream(stream);
+                    stream
+                        .written()
+                        .is_ok_and(|written| written >= LEAST_PROGRESS)
+                        && stream.sent_acknowledged().unwrap_or(false)
+                })
+        });
+        let held_unread = conn.unread;
+        let unread_ended = conn.unread_ended;
+        let mut unread_change = 0i8;
         let judged = self.exchanges.get_mut(id).map_or(Ok(()), |exchange| {
             if exchange.stream.is_none() {
                 // Queued for a stream (policy C): judged on whether the connection's credit queue moves, not on its
@@ -2554,12 +2599,52 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     _ => Err(Refusal::Stalled),
                 };
             }
+            // A stream its peer does not read ends by its own bytes, whatever else the connection
+            // carries (focal's audit F38): found unread, it is given a window more to be read, and
+            // its reset gives back the connection's credit it holds.
+            match (unread_now, exchange.unread_since) {
+                (true, None) => {
+                    exchange.unread_since = Some(now);
+                    unread_change = 1;
+                }
+                (true, Some(since))
+                    if now.saturating_duration_since(since) >= exchange.carry.window(floor) =>
+                {
+                    return Err(Refusal::Stalled);
+                }
+                (false, Some(_)) => {
+                    exchange.unread_since = None;
+                    unread_change = -1;
+                }
+                _ => {}
+            }
             if Self::ours_to_move(exchange, peer_takes) {
                 exchange.carry.hold(now, at, backlog);
                 return Ok(());
             }
-            exchange.carry.judge(now, at, held, backlog)
+            // Waiting only for the connection's credit, which an unread exchange of this side
+            // holds or held in this window: no evidence against the peer's taking this one, and
+            // the unread one ends within its window and its credit comes back.
+            let starved_by_unread = held_unread > 0
+                || unread_ended.is_some_and(|ended| ended >= exchange.carry.started());
+            if peer_takes == 0
+                && starved_by_unread
+                && exchange.unread_since.is_none()
+                && exchange.out.pending() > 0
+            {
+                exchange.carry.hold(now, at, backlog);
+                return Ok(());
+            }
+            let acknowledged = exchange.out.acked;
+            exchange
+                .carry
+                .judge(now, at, held, backlog, acknowledged, floor)
         });
+        match unread_change {
+            1 => conn.unread = conn.unread.saturating_add(1),
+            -1 => conn.unread = conn.unread.saturating_sub(1),
+            _ => {}
+        }
         if let Err(refusal) = judged {
             self.finish_exchange(conn, id, Some((refusal, false)));
         }

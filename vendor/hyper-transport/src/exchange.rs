@@ -134,6 +134,9 @@ pub(crate) struct Outgoing {
     pub(crate) has_body: bool,
     pub(crate) sum: BodySum,
     pub(crate) trailer_written: usize,
+    /// The peer acknowledged the message whole: its stream finished, QUIC reported every byte of
+    /// it acknowledged (`StreamEvent::Finished`). The peer has the request from then.
+    pub(crate) acked: bool,
 }
 
 impl Outgoing {
@@ -146,6 +149,7 @@ impl Outgoing {
             has_body: false,
             sum: BodySum::default(),
             trailer_written: 0,
+            acked: false,
         }
     }
     /// The bytes still to be written: what the progress deadline charges the connection with.
@@ -283,6 +287,9 @@ pub(crate) struct Exchange<K> {
     /// QUIC refused a write the connection's credit allowed: the stream's own window is spent,
     /// and only QUIC's `Writable` for the stream says it can take more.
     pub(crate) stream_blocked: bool,
+    /// Since when a judgement found it unread: its stream out of the peer's credit, everything it
+    /// sent acknowledged — the peer holds its bytes and reads none of them (focal's audit F38).
+    pub(crate) unread_since: Option<Instant>,
     /// The owner's last read of the body wanted more than had arrived: only then is a period that
     /// brought nothing evidence against the sender.
     pub(crate) starved: bool,
