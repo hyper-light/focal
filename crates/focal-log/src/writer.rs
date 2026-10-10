@@ -781,6 +781,45 @@ impl SharedWal {
         budget: MemoryBudget,
         disk: DiskBudget,
     ) -> Result<Self, LogError> {
+        Self::open_as(directory, options, limits, budget, disk, false)
+    }
+    /// [`Self::open`] for a test that holds the base still from the
+    /// writer's first instant: no step of idle cleaning runs between the
+    /// open and the test's first command, however fast the machine is. A
+    /// test that held it with a command after the open (`Command::Idle`)
+    /// raced the writer, which cleans as soon as nothing waits: a reopen of
+    /// a log with garbage behind its base moved the base by as many steps
+    /// as the writer took before the command came (a reopen loop's base
+    /// stood inside the checkpoint's frames no time in 400 rounds on a
+    /// loaded Linux runner, CI run 38063080415).
+    #[cfg(test)]
+    pub(crate) fn open_still(
+        directory: impl AsRef<Path>,
+        options: WalOptions,
+    ) -> Result<Self, LogError> {
+        let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024)
+            .map_err(|_| LogError::Capacity)?;
+        let disk = DiskBudget::new(DiskBudgetConfig::default()).map_err(|_| LogError::Capacity)?;
+        Self::open_as(
+            directory,
+            options,
+            WalWriterLimits::default(),
+            budget,
+            disk,
+            true,
+        )
+    }
+    /// The writer of `directory`; `still` starts it holding the base still (tests alone).
+    fn open_as(
+        directory: impl AsRef<Path>,
+        options: WalOptions,
+        limits: WalWriterLimits,
+        budget: MemoryBudget,
+        disk: DiskBudget,
+        still: bool,
+    ) -> Result<Self, LogError> {
+        #[cfg(not(test))]
+        let _ = still;
         reject_replay_reentry()?;
         let directory_path = directory.as_ref().to_path_buf();
         if !(1..=MAX_QUEUE_ITEMS).contains(&limits.queue_items)
@@ -861,7 +900,7 @@ impl SharedWal {
             fenced,
             credit: 0,
             #[cfg(test)]
-            still: false,
+            still,
         };
         let (sender, receiver) = mpsc::sync_channel(capacity);
         let thread = std::thread::Builder::new()

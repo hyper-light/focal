@@ -1108,9 +1108,8 @@ fn a_crash_at_every_cut_of_a_cleaning_commit_recovers_every_group() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let cold_records: Vec<Record> = (1..=40).map(|index| record(1, index)).collect();
-        let shared = SharedWal::open(dir.path(), options()).unwrap();
         // The base moves inside commits alone, so the cut is a commit's.
-        idle(&shared, false);
+        let shared = SharedWal::open_still(dir.path(), options()).unwrap();
         let mut cold = shared.lease(LogicalLogId([1; 16])).unwrap();
         let mut hot = shared.lease(LogicalLogId([2; 16])).unwrap();
         cold.append(&cold_records).unwrap();
@@ -1213,8 +1212,7 @@ fn a_base_inside_the_frames_a_checkpoint_kept_recovers_the_group_whole() {
     // The group's frames are the forty a checkpoint kept, from sequence one.
     while inside < 3 {
         assert!(round < 400, "the base never stood inside the checkpoint");
-        let shared = SharedWal::open(dir.path(), options()).unwrap();
-        idle(&shared, false);
+        let shared = SharedWal::open_still(dir.path(), options()).unwrap();
         let cold = shared.lease(LogicalLogId([1; 16])).unwrap();
         let mut hot = shared.lease(LogicalLogId([2; 16])).unwrap();
         assert_eq!(records(&cold), cold_records, "round {round}");
@@ -1240,8 +1238,7 @@ fn a_base_inside_the_frames_a_checkpoint_kept_recovers_the_group_whole() {
 #[test]
 fn garbage_is_worked_off_while_no_command_waits() {
     let dir = tempfile::tempdir().unwrap();
-    let shared = SharedWal::open(dir.path(), options()).unwrap();
-    idle(&shared, false);
+    let shared = SharedWal::open_still(dir.path(), options()).unwrap();
     let mut stays = shared.lease(LogicalLogId([1; 16])).unwrap();
     let mut leaves = shared.lease(LogicalLogId([2; 16])).unwrap();
     let mut held = Vec::new();
