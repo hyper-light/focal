@@ -1,4 +1,14 @@
 use super::*;
+
+/// What `future` answers when polled once: the driver over synchronous reads never waits.
+fn now<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("a driver over synchronous reads waited"),
+    }
+}
 use focal_client::input::{BuildContext, InputError};
 use focal_client::native_store::{NativeIdentity, NativeIdentityKind};
 use focal_client::operations::{NativeAuthoredOperation, parse_native_json};
@@ -2033,7 +2043,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         pauses.push(duration);
         Ok(())
     };
-    let outcome = crate::read(
+    let outcome = now(crate::read(
         &NativeReadOperation::ClaimWait(NativeWaitDocument {
             claim: hex_of(claim.0),
             until: NativeWaitUntil::Testament,
@@ -2043,7 +2053,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         &mut reads,
         &mut lists,
         &mut pause,
-    )
+    ))
     .unwrap();
     let NativeReadOutcome::Wait(result) = outcome else {
         panic!()
@@ -2071,7 +2081,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         ))
     };
     let mut pause = |_: std::time::Duration| panic!("no pause after a settled predicate");
-    let NativeReadOutcome::Wait(result) = crate::read(
+    let NativeReadOutcome::Wait(result) = now(crate::read(
         &NativeReadOperation::ClaimWait(NativeWaitDocument {
             claim: hex_of(claim.0),
             until: NativeWaitUntil::Testament,
@@ -2081,7 +2091,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         &mut reads,
         &mut lists,
         &mut pause,
-    )
+    ))
     .unwrap() else {
         panic!()
     };
@@ -2100,7 +2110,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         })
     };
     let mut pause = |_: std::time::Duration| Ok(());
-    let error = crate::read(
+    let error = now(crate::read(
         &NativeReadOperation::ClaimWait(NativeWaitDocument {
             claim: hex_of(claim.0),
             until: NativeWaitUntil::Satisfied,
@@ -2110,7 +2120,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         &mut reads,
         &mut lists,
         &mut pause,
-    )
+    ))
     .unwrap_err();
     assert!(
         matches!(
@@ -2183,7 +2193,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         })
     };
     let mut pause = |_: std::time::Duration| panic!("a lineage read never pauses");
-    let NativeReadOutcome::Lineage(lineage) = crate::read(
+    let NativeReadOutcome::Lineage(lineage) = now(crate::read(
         &NativeReadOperation::ClaimLineage(NativeObjectDocument {
             id: hex_of(claim.0),
         }),
@@ -2191,7 +2201,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         &mut reads,
         &mut lists,
         &mut pause,
-    )
+    ))
     .unwrap() else {
         panic!()
     };
@@ -2308,14 +2318,20 @@ fn a_lineage_names_what_its_bounds_left_beyond_it() {
         })
     };
     let mut pause = |_: std::time::Duration| panic!("a lineage read never pauses");
-    let mut observe = |id: ClaimId, reads: &mut Reads<'_>, lists: &mut Lists<'_>| {
-        let NativeReadOutcome::Lineage(lineage) = crate::read(
+    let mut observe = |id: ClaimId,
+                       mut reads: &mut dyn FnMut(
+        NativeReadRequest,
+    ) -> Result<NativeReadPage, DriveError>,
+                       mut lists: &mut dyn FnMut(
+        NativeListRequest,
+    ) -> Result<NativeListPage, DriveError>| {
+        let NativeReadOutcome::Lineage(lineage) = now(crate::read(
             &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: hex_of(id.0) }),
             &context(ISSUER),
-            reads,
-            lists,
+            &mut reads,
+            &mut lists,
             &mut pause,
-        )
+        ))
         .unwrap() else {
             panic!()
         };
@@ -2479,13 +2495,13 @@ fn validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_boun
         panic!("a validation read lists nothing")
     };
     let mut pause = |_: std::time::Duration| Ok(());
-    let page = match read(
+    let page = match now(read(
         &operation,
         &context(ISSUER),
         &mut reads,
         &mut lists,
         &mut pause,
-    )
+    ))
     .unwrap()
     {
         NativeReadOutcome::Page(page) => page,
@@ -2536,13 +2552,13 @@ fn validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_boun
             visited: 1,
         })
     };
-    let result = read(
+    let result = now(read(
         &operation,
         &context(ISSUER),
         &mut endless,
         &mut lists,
         &mut pause,
-    );
+    ));
     assert!(
         matches!(result, Err(DriveError::Input(InputError::Capacity))),
         "{result:?}"
@@ -2568,13 +2584,92 @@ fn validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_boun
         })
     };
     assert!(matches!(
-        read(
+        now(read(
             &operation,
             &context(ISSUER),
             &mut wrong,
             &mut lists,
             &mut pause
-        ),
+        )),
         Err(DriveError::Input(InputError::Invalid(_)))
     ));
+}
+
+/// The driver reads only for an identity it has not journaled. Do: prepare `claim.post` under one
+/// identity, then the same document under it again, then another document under it. Expect: one
+/// read for the first; none for the second, which returns the journaled frame; none for the
+/// third, an intent conflict.
+#[test]
+fn an_identity_already_journaled_is_prepared_again_without_a_read() {
+    use focal_client::native_store::{
+        NativeOperationId, NativeOperationStore, NativeStoreError, NativeStoreLimits,
+    };
+    use focal_client::pending::OperationContext;
+    let root = tempfile::tempdir().unwrap();
+    let store =
+        NativeOperationStore::create(root.path().join("native"), NativeStoreLimits::default())
+            .unwrap();
+    let build = context(ISSUER);
+    let limits = CompileLimits::default();
+    let preparation = Preparation {
+        store: &store,
+        context: OperationContext {
+            cluster: [1; 16],
+            principal: ISSUER,
+            ledger: ledger(),
+        },
+        build: &build,
+        profile: NativeContentProfile::AuthoredV1,
+        limits: &limits,
+    };
+    let claim = ClaimId::from_u128(10);
+    let identity: NativeOperationId = format!("n1:{}", hex(7)).parse().unwrap();
+    let served = std::cell::Cell::new(0usize);
+    let mut reads =
+        |_: focal_wire::NativeReadRequest| -> Result<focal_wire::NativeReadPage, DriveError> {
+            served.set(served.get() + 1);
+            Ok(synthetic_claim(
+                claim,
+                ClaimStatus::Generated,
+                1,
+                false,
+                Cause::Root(RootCommandId::from_u128(1)),
+                2,
+            ))
+        };
+    let post = parse("claim.post", json!({"claim": hex_of(claim.0)}));
+    let first = now(prepare(
+        &preparation,
+        &post,
+        Some(identity),
+        &mut ids(1),
+        &mut reads,
+    ))
+    .unwrap();
+    assert_eq!(served.get(), 1);
+    let again = now(prepare(
+        &preparation,
+        &post,
+        Some(identity),
+        &mut ids(2),
+        &mut reads,
+    ))
+    .unwrap();
+    assert_eq!(served.get(), 1, "a journaled identity was read for again");
+    assert_eq!((again.id, &again.request), (first.id, &first.request));
+    let other = parse(
+        "claim.post",
+        json!({"claim": hex_of(ClaimId::from_u128(11).0)}),
+    );
+    assert!(matches!(
+        now(prepare(
+            &preparation,
+            &other,
+            Some(identity),
+            &mut ids(3),
+            &mut reads,
+        )),
+        Err(DriveError::Store(NativeStoreError::IntentConflict))
+    ));
+    assert_eq!(served.get(), 1);
 }

@@ -897,6 +897,52 @@ impl NativeOperationStore {
         }
         self.operation(&directory, id, prepared)
     }
+    /// The operation `operation` names when it is journaled ready for this
+    /// context and intent: what [`Self::prepare`] returns for it without
+    /// expanding anything, so a host that reads before it prepares (the
+    /// native driver's resolution) spends no read on an identity already
+    /// prepared. `None` for an identity absent, or claimed and not yet ready;
+    /// the store's own refusal for one retired, of another context, or of
+    /// another intent.
+    pub fn existing(
+        &self,
+        context: OperationContext,
+        intent: OperationIntent<'_>,
+        operation: NativeOperationId,
+    ) -> Result<Option<NativeOperation>, NativeStoreError> {
+        crate::operation_store::validate_context(context)?;
+        let digest = intent.digest()?;
+        let directory = files::Directory::open_native(&self.root)?;
+        let catalogue = self.catalogue(&directory)?;
+        let id = operation.0.0;
+        if catalogue.retired.contains_key(&id) {
+            return Err(NativeStoreError::Retired);
+        }
+        let Some(entry) = catalogue.entries.get(&id) else {
+            return Ok(None);
+        };
+        if entry.context != context {
+            return Err(NativeStoreError::ContextMismatch);
+        }
+        if entry.intent != digest {
+            return Err(NativeStoreError::IntentConflict);
+        }
+        if !entry.ready {
+            return Ok(None);
+        }
+        let epoch = RequestEpoch(entry.epoch);
+        let prepared = self.prepared(&directory, id, true)?;
+        if prepared.context != context || prepared.request.request_epoch != epoch {
+            return Err(NativeStoreError::ContextMismatch);
+        }
+        if prepared.name != intent.name
+            || prepared.version != intent.version
+            || prepared.canonical != intent.canonical
+        {
+            return Err(NativeStoreError::IntentConflict);
+        }
+        self.operation(&directory, id, prepared).map(Some)
+    }
     /// Reopen a claimed identity for an exact retry. Recovery never expands
     /// authored input or generates identities.
     pub fn retry(

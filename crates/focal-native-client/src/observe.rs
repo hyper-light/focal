@@ -13,6 +13,7 @@ use focal_client::operations::{
 };
 use focal_model::*;
 use focal_wire::*;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 /// How many `caused_by` ancestors a lineage page follows.
@@ -22,8 +23,16 @@ pub const LINEAGE_DEPTH: usize = 16;
 const LINEAGE_RELATED: usize = 64;
 /// The wait observer's probe bound, one second apart under one deadline.
 pub const WAIT_PROBES: u32 = 31;
-/// The host's bounded, cancellable sleep between wait probes.
-pub type Pause<'a> = dyn FnMut(Duration) -> Result<(), DriveError> + 'a;
+/// The host's bounded, cancellable sleep between wait probes. A synchronous
+/// closure is one, ended as it returns.
+pub trait Pause {
+    fn pause(&mut self, period: Duration) -> impl Future<Output = Result<(), DriveError>>;
+}
+impl<F: FnMut(Duration) -> Result<(), DriveError>> Pause for F {
+    fn pause(&mut self, period: Duration) -> impl Future<Output = Result<(), DriveError>> {
+        std::future::ready(self(period))
+    }
+}
 
 const CONTENT_ONLY: NativeClaimExpand = NativeClaimExpand {
     content: true,
@@ -70,22 +79,24 @@ fn add(a: u32, b: u32) -> Result<u32, DriveError> {
 /// listed past the bound, a relation list that did not reach its end — is
 /// named beside what they took (`NativeLineage`), never mistaken for a
 /// complete lineage.
-pub fn lineage(
+pub async fn lineage(
     document: &NativeObjectDocument,
     build: &BuildContext,
-    reads: &mut Reads<'_>,
-    lists: &mut Lists<'_>,
+    reads: &mut impl Reads,
+    lists: &mut impl Lists,
 ) -> Result<NativeLineage, DriveError> {
     let id = ClaimId(parse_id(&document.id)?);
-    let first = reads(NativeReadRequest {
-        consistency: ReadConsistency::Linearizable,
-        query: NativeReadQuery::Claim {
-            id,
-            expand: CLAIM_EXPAND,
-            after: None,
-        },
-        max_items: READ_ITEMS,
-    })?;
+    let first = reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Claim {
+                id,
+                expand: CLAIM_EXPAND,
+                after: None,
+            },
+            max_items: READ_ITEMS,
+        })
+        .await?;
     let token = first.token;
     let native_sequence = first.native_sequence;
     let logical_time = first.logical_time;
@@ -95,13 +106,6 @@ pub fn lineage(
         .cause
         .clone();
     let claim = take_claim(first).ok_or(CompileError::Missing("claim"))?;
-    let mut exact = |query: NativeReadQuery| {
-        reads(NativeReadRequest {
-            consistency: ReadConsistency::Exact(token),
-            query,
-            max_items: READ_ITEMS,
-        })
-    };
     // Ancestors, nearest first.
     let mut ancestors = Vec::new();
     let mut ancestors_beyond = None;
@@ -111,11 +115,16 @@ pub fn lineage(
             ancestors_beyond = Some(parent);
             break;
         }
-        let page = exact(NativeReadQuery::Claim {
-            id: parent,
-            expand: CONTENT_ONLY,
-            after: None,
-        })?;
+        let page = exact(
+            reads,
+            token,
+            NativeReadQuery::Claim {
+                id: parent,
+                expand: CONTENT_ONLY,
+                after: None,
+            },
+        )
+        .await?;
         visited = add(visited, page.visited)?;
         let Some(ancestor) = claim_of(&page) else {
             ancestors_missing = Some(parent);
@@ -135,23 +144,25 @@ pub fn lineage(
         RelationKind::Refines,
         RelationKind::CausedBy,
     ] {
-        let page = lists(NativeListRequest {
-            filter: NativeListFilter::Claims {
-                issuer: None,
-                subject: None,
-                status: None,
-                action: None,
-                scope: None,
-                relation: Some(Relation {
-                    kind,
-                    target: RelationTarget::Object(ObjectRef::claim(build.ledger, id)),
-                }),
-                created_after: None,
-            },
-            cursor: None,
-            max_items: READ_ITEMS,
-            max_visits: 1024,
-        })?;
+        let page = lists
+            .list(NativeListRequest {
+                filter: NativeListFilter::Claims {
+                    issuer: None,
+                    subject: None,
+                    status: None,
+                    action: None,
+                    scope: None,
+                    relation: Some(Relation {
+                        kind,
+                        target: RelationTarget::Object(ObjectRef::claim(build.ledger, id)),
+                    }),
+                    created_after: None,
+                },
+                cursor: None,
+                max_items: READ_ITEMS,
+                max_visits: 1024,
+            })
+            .await?;
         visited = add(visited, page.visited)?;
         let mut listed_not_read = 0u32;
         for object in &page.objects {
@@ -182,11 +193,16 @@ pub fn lineage(
     }
     let mut followers = Vec::new();
     for follower in related {
-        let page = exact(NativeReadQuery::Claim {
-            id: follower,
-            expand: CONTENT_ONLY,
-            after: None,
-        })?;
+        let page = exact(
+            reads,
+            token,
+            NativeReadQuery::Claim {
+                id: follower,
+                expand: CONTENT_ONLY,
+                after: None,
+            },
+        )
+        .await?;
         visited = add(visited, page.visited)?;
         if let Some(object) = take_claim(page) {
             push(&mut followers, object)?;
@@ -206,15 +222,30 @@ pub fn lineage(
     })
 }
 
+/// One page of `query` at exactly `token`'s prefix.
+async fn exact(
+    reads: &mut impl Reads,
+    token: ReadToken,
+    query: NativeReadQuery,
+) -> Result<NativeReadPage, DriveError> {
+    reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Exact(token),
+            query,
+            max_items: READ_ITEMS,
+        })
+        .await
+}
+
 /// Observe one claim until the predicate holds: at most `WAIT_PROBES` fresh
 /// linearizable reads one second apart under one deadline of at most 30
 /// seconds, keeping only the latest observation. An observation that moves
 /// backwards (an older prefix, a lower revision, a terminal status that
 /// changes) is an invalid response, never a met predicate.
-pub fn wait(
+pub async fn wait(
     document: &NativeWaitDocument,
-    reads: &mut Reads<'_>,
-    pause: &mut Pause<'_>,
+    reads: &mut impl Reads,
+    pause: &mut impl Pause,
 ) -> Result<NativeWaitResult, DriveError> {
     if !(1..=30_000).contains(&document.timeout_ms) {
         return Err(InputError::Invalid("timeout_ms must be in 1..=30000").into());
@@ -228,15 +259,17 @@ pub fn wait(
         if Instant::now() >= deadline {
             break;
         }
-        let page = reads(NativeReadRequest {
-            consistency: ReadConsistency::Linearizable,
-            query: NativeReadQuery::Claim {
-                id,
-                expand: STATE_ONLY,
-                after: None,
-            },
-            max_items: 1,
-        })?;
+        let page = reads
+            .read(NativeReadRequest {
+                consistency: ReadConsistency::Linearizable,
+                query: NativeReadQuery::Claim {
+                    id,
+                    expand: STATE_ONLY,
+                    after: None,
+                },
+                max_items: 1,
+            })
+            .await?;
         let claim = claim_of(&page).ok_or(CompileError::Missing("claim"))?;
         let observation = ClaimObservation {
             token: page.token,
@@ -283,7 +316,7 @@ pub fn wait(
         if remaining.is_zero() {
             break;
         }
-        pause(Duration::from_secs(1).min(remaining))?;
+        pause.pause(Duration::from_secs(1).min(remaining)).await?;
     }
     latest.ok_or_else(|| ClientError::Transport.into())
 }
