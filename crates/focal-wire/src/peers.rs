@@ -1655,7 +1655,13 @@ async fn dial_candidates(
                 fresh.push(dialed).map_err(|_| PeerSendError::Busy)?;
             }
             let (winner, rest) = first_connection(fresh).await;
-            drain_candidates(rest, timeout).await;
+            // The winner is the dial's now; the fresh addresses still dialing are closed as they
+            // connect on a task of their own, within the dial's deadline. With no task to give
+            // them, they are abandoned: a connection one of them makes later is its endpoint's to
+            // reuse or idle out.
+            if !rest.is_empty() {
+                let _ = hyper_rt::futures::spawn_detached(drain_candidates(rest, timeout));
+            }
             winner
         });
         if candidates.push(resolving).is_err() {

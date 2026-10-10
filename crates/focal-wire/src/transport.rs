@@ -375,7 +375,14 @@ impl QuicServer {
         budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         limits.validate()?;
-        let directory = NetDirectory::serving(registry.clone(), enrollment, admission.identities);
+        // The directory names every identity the admission holds and every handshake in flight,
+        // so the admission is what refuses an identity past its bound — typed, retryable — and
+        // never the directory, which would tell a granted certificate it is refused.
+        let directory = NetDirectory::serving(
+            registry.clone(),
+            enrollment,
+            admission.identities.saturating_add(admission.pending),
+        );
         let tls = Tls {
             server: Some(tls.0),
             client: listener_client()?,

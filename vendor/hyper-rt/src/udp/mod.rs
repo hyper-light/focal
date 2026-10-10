@@ -19,7 +19,11 @@
 //! unreachable, Windows' reset for a send to a closed port) on a later call; the report says nothing about
 //! the socket and the call that returns it moves no data. Such a call is counted
 //! ([`UdpSocket::astray_reports`]) and returns "nothing now", so the caller awaits the edge again: the
-//! report is consumed, and the driver reports the socket ready at once when data waits behind it.
+//! report is consumed, and the driver reports the socket ready at once when data waits behind it. A send
+//! whose own destination has no route is reported the same way (macOS: an IPv6 destination on an IPv4
+//! socket is `EHOSTUNREACH`), every time: a send that meets a report twice for one datagram takes it as
+//! the datagram's own and refuses it ([`Batched::send`], [`UdpSocket::send_to_writable`]), so one
+//! unroutable destination never holds the datagrams queued behind it.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -250,9 +254,25 @@ impl UdpSocket {
         addr: impl Into<SocketAddr>,
     ) -> Result<usize, RtError> {
         let addr = addr.into();
+        // An astray report is an earlier datagram's once — the call consumed it, and the datagram is
+        // sent again at once — and this one's own the second time: its destination has no route,
+        // which waiting for room never gives it (macOS reports an IPv6 destination on an IPv4 socket
+        // so), and it is refused.
+        let mut reported = false;
         loop {
+            let astray = self.astray_reports();
             if let Some(sent) = self.try_send_to(buf, addr)? {
                 return Ok(sent);
+            }
+            if self.astray_reports() != astray {
+                if reported {
+                    return Err(RtError::DriverRefused {
+                        call: "sendto",
+                        code: None,
+                    });
+                }
+                reported = true;
+                continue;
             }
             self.writable().await?;
         }

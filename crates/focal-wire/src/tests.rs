@@ -606,9 +606,12 @@ fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connec
         );
         assert!(raw.try_write(exchange, &body[body.len() / 2..]).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let stats =
-            admission_settles(&server, |stats| stats.bytes == 0 && stats.connections == 0).await;
-        assert_eq!(stats.bytes, 0);
+        // What it held is given back: the listener holds its receive pool alone.
+        let stats = admission_settles(&server, |stats| {
+            stats.bytes == stats.pooled && stats.connections == 0
+        })
+        .await;
+        assert_eq!(stats.bytes, stats.pooled);
         server.close();
         task.join().await.unwrap();
     })
@@ -3614,7 +3617,7 @@ mod admission {
             // The first ends without its body: its reservation goes back.
             raw.disconnect();
             let _ = first;
-            let stats = admission_settles(&server, |stats| stats.bytes == 0).await;
+            let stats = admission_settles(&server, |stats| stats.bytes == stats.pooled).await;
             assert_eq!(stats.refused_bytes, 1);
             drop(raw);
             server.close();

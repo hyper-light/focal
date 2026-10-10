@@ -81,7 +81,8 @@ impl RawPeer {
         decode_payload::<HelloReply>(&reply).unwrap()
     }
 
-    /// Opens an exchange of `kind` declaring a body of `length` bytes, none of it written yet.
+    /// Opens an exchange of `kind` declaring a body of `length` bytes, none of it written yet,
+    /// and sends what that puts on the wire: its prefix, the peer's `Request`.
     pub(super) fn open(&mut self, kind: Kind, class: TrafficClass, length: u64) -> ExchangeId {
         let now = self.driver.clock().unwrap();
         let progress = Progress::new(limits().request_timeout).unwrap();
@@ -91,6 +92,7 @@ impl RawPeer {
             .open(now, self.peer, kind, &[], Some(length), progress)
             .unwrap();
         self.classes.push((exchange, class));
+        self.driver.flush().unwrap();
         exchange
     }
 

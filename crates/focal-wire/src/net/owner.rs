@@ -573,6 +573,16 @@ impl Owner {
             let _ = reply.send(Err(WireError::Connection));
             return;
         }
+        // A socket is of one family (hyper-rt's IPv6 sockets are IPv6-only): an address of the other
+        // is never reached from it, and is refused now rather than dialed to its idle timeout.
+        let family = self
+            .driver
+            .local_addr()
+            .map(|local| local.is_ipv4() == address.is_ipv4());
+        if family != Ok(true) {
+            let _ = reply.send(Err(WireError::Connection));
+            return;
+        }
         let route = (address, name);
         if let Some(peer) = self.routes.get(&route).copied() {
             if self.peers.contains_key(&peer) {

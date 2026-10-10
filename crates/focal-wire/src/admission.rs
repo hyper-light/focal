@@ -71,9 +71,13 @@ pub struct AdmissionStats {
     pub pending: usize,
     pub identities: usize,
     pub connections: usize,
-    /// Bytes the listener holds of its budget: request bodies being read and its connections'
-    /// receive windows.
+    /// Bytes the listener holds of its budget: request bodies being read, its connections'
+    /// receive windows, and the pool its datagrams are received into.
     pub bytes: usize,
+    /// Of those, the receive pool: chunks the endpoint keeps for the datagrams it reads, held
+    /// whether or not a connection is up (hyper-transport's `receive`, bounded by its
+    /// `receive_chunks`).
+    pub pooled: usize,
     /// Exchanges under way on the connections held: what keeps a connection from being replaced.
     pub serving: usize,
     pub admitted: u64,
@@ -112,6 +116,10 @@ impl AdmissionStats {
             identities: admission.identities,
             connections: admission.connections,
             bytes,
+            pooled: stats
+                .endpoint
+                .receive_chunks
+                .saturating_mul(hyper_transport::RECEIVE_CHUNK),
             serving: admission.serving,
             admitted: admission.admitted,
             replaced: admission.replaced,
