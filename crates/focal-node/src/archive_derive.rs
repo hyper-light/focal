@@ -113,16 +113,24 @@ pub(crate) fn sealed_outcomes(
             Err(SealRefusal::Capacity) => return Err(LedgerError::Capacity),
             Err(_) => return Err(LedgerError::Corrupt),
         };
+        // Short of half a bundle and pressed by no floor, nothing is
+        // proposed, and that is known from the plan: its bundle is not
+        // encoded to be dropped. The quote of a plan short of it was
+        // encoded at every round of the archive agent and dropped, on the
+        // owner's thread, for as long as the outcomes awaiting a seal were
+        // fewer than half a bundle (a stall every five seconds that grew
+        // with them, 70 to 153 ms at 200 writes a second). The same rule
+        // as when the quote came first: a plan short of half a bundle
+        // fits the bundle, so its quote never halved the bound.
+        if floors.is_empty() && plan.rows() < (bound.rows / 2).max(1) {
+            return Ok(None);
+        }
         match core.seal_quote(&plan, limits) {
             Ok(quote) => break (plan, quote),
             Err(_) if bound.rows > 1 => bound.rows /= 2,
             Err(error) => return Err(LedgerError::Native(error.into())),
         }
     };
-    let full = bound.rows / 2;
-    if floors.is_empty() && plan.rows() < full.max(1) {
-        return Ok(None);
-    }
     // A fold when the seal rows would reach the bound: the oldest half
     // into the row keyed by the last of them.
     let seal_rows = core
