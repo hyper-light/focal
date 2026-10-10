@@ -81,7 +81,7 @@ Or take the raw binary from the [latest release](https://github.com/hyper-light/
 download the file for your platform, check its digest against `SHA256SUMS`, `chmod +x` it
 (on Windows, unblock the `.exe`) and put it on your `PATH`; nothing else is needed.
 
-To build from source you need Rust 1.94.1 (pinned in the toolchain file, so `rustup`
+To build from source you need Rust 1.98.1 (pinned in the toolchain file, so `rustup`
 picks it up) and a protobuf compiler (`brew install protobuf` or
 `apt-get install protobuf-compiler`):
 
