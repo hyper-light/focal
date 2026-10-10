@@ -607,9 +607,43 @@ impl HostSender {
                         ledger: *ledger,
                         incarnation: *incarnation,
                         work,
-                        _slot: slot.commit(),
+                        _slot: grouped::Slot::Item {
+                            _allocation: slot.commit(),
+                        },
                     }))
                     .map_err(|error| host_queue_error(*error))
+            }
+        }
+    }
+    /// A peer's frame. A fleet's owner has it queued in the room its
+    /// session's peer reserve gives (`TickPeriod::queue_frame`), apart from
+    /// the participants' queue (F56): refused only when that room is full,
+    /// whatever the participants have queued. A replica's own owner takes it
+    /// with the rest of its queue, which it drains as work comes.
+    fn try_send_frame(
+        &self,
+        work: Work,
+        pace: &crate::pace::TickPeriod,
+    ) -> Result<(), HostQueueError> {
+        match self {
+            Self::Direct(sender) => sender.try_send(work).map_err(host_queue_error),
+            Self::Group {
+                ledger,
+                incarnation,
+                sender,
+                ..
+            } => {
+                let Some(ticket) = pace.queue_frame() else {
+                    return Err(HostQueueError::Full);
+                };
+                sender
+                    .send_frame(grouped::Routed {
+                        ledger: *ledger,
+                        incarnation: *incarnation,
+                        work,
+                        _slot: grouped::Slot::Frame { _ticket: ticket },
+                    })
+                    .map_err(|_| HostQueueError::Disconnected)
             }
         }
     }
@@ -1189,6 +1223,8 @@ impl ReplicaHost {
             next_beat: Instant::now(),
             wake_at: Instant::now(),
         };
+        // The room its peers' frames have before its first period.
+        owner.pace.set_frame_room(owner.peer_reserve());
         Ok((
             Self {
                 sender,
@@ -1773,7 +1809,16 @@ impl ReplicaHost {
                     .checked_mul(32)
                     .and_then(|reply| n.checked_add(reply))
             })
-            .and_then(|n| n.checked_add(4096));
+            .and_then(|n| n.checked_add(4096))
+            // A frame's place on its way to a fleet's owner, apart from the
+            // participants' queue, which that queue's backing does not hold.
+            .and_then(|n| {
+                n.checked_add(if replication {
+                    grouped::FRAME_QUEUE_BYTES
+                } else {
+                    0
+                })
+            });
         let Some(amount) = amount else {
             return OwnedResponse::new(full);
         };
@@ -1790,7 +1835,7 @@ impl ReplicaHost {
             return OwnedResponse::new(full);
         };
         let (send, receive) = oneshot::channel();
-        match self.sender.try_send(Work::Request(
+        let work = Work::Request(
             Box::new(AdmittedRequest {
                 verified: request,
                 witness,
@@ -1798,7 +1843,13 @@ impl ReplicaHost {
             }),
             send,
             charge.commit(),
-        )) {
+        );
+        let sent = if replication {
+            self.sender.try_send_frame(work, &self.pace)
+        } else {
+            self.sender.try_send(work)
+        };
+        match sent {
             Ok(()) => receive
                 .await
                 .unwrap_or_else(|_| OwnedResponse::new(unknown)),
@@ -2311,6 +2362,9 @@ impl Owner {
         Ok(())
     }
     fn progress_group(&mut self) -> Result<bool, LedgerError> {
+        // The room its peers' frames have, as its configuration is now: at
+        // least once a period, and so within one of a change.
+        self.pace.set_frame_room(self.peer_reserve());
         self.report_lost()?;
         self.views
             .advance(&mut self.session)
@@ -2514,6 +2568,7 @@ impl Owner {
             Work::Admit(members, near, response, charge) => {
                 self.admitted = members;
                 self.near = near;
+                self.pace.set_frame_room(self.peer_reserve());
                 self.publish_progress(false);
                 drop(charge);
                 let _ = response.send(Ok(()));

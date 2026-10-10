@@ -965,6 +965,7 @@ impl ReplicaFleet {
             .and_then(|size| size.checked_add(128))
             .and_then(|size| QUEUED.checked_mul(size))
             .and_then(|bytes| bytes.checked_add(policy_bytes))
+            .and_then(|bytes| bytes.checked_add(FRAME_CHANNEL_BYTES))
             .ok_or(LedgerError::Capacity)?;
         let backing = std::sync::Arc::new(
             budget
@@ -998,7 +999,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, (receiver, signals, overflows)) = OwnerQueue::new();
+        let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
@@ -1036,6 +1037,8 @@ impl ReplicaFleet {
             sessions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             scheduler,
+            frames,
+            framed: BTreeMap::new(),
             signals,
             overflows,
             unwoken: std::collections::BTreeSet::new(),

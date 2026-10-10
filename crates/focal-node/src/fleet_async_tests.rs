@@ -820,3 +820,135 @@ async fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_c
     assert_eq!(counted.frames_refused, 0);
     assert_eq!(counted.requests_dropped, 0);
 }
+
+/// A peer's frame is queued in the room its session's peer reserve gives,
+/// apart from the participants' queue (F56): with the session's write out
+/// and the participants' share of its queue full, a frame is not refused —
+/// it waits, and is answered once the write is durable — and only one past
+/// the room is refused, and counted (27 §12). Before, a frame took one of
+/// the participants' places, and with them full every frame was refused
+/// and its peer counted it lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = fixture(path.path(), 1);
+    settle(&fixture).await;
+    let host = fixture.hosts[&ledger(1)].clone();
+    let write = |id: u128| RequestEnvelope {
+        request_id: RequestId::from_u128(id),
+        ..envelope(
+            1,
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        )
+    };
+    let lease = blocker(&fixture.wal);
+    let (resume, disk) = pause(lease);
+    // One write takes the session's write out; the paused writer holds it.
+    let mut observation = host.progress.clone();
+    observation.borrow_and_update();
+    let mut writes = Vec::new();
+    let first = host.clone();
+    writes.push(tokio::spawn(async move {
+        dispatch(&first, peer(), write(100), &ReplicaHost::wire_limits()).await
+    }));
+    let steps = TICK * (2 * crate::test_waits::STEP);
+    crate::test_waits::within(&[&host], steps, TICK, observation.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    // The participants' share of the session's queue, and one more.
+    let queue = ReplicaConfig::new(RootCommandId::from_u128(119)).queue_items;
+    let share = queue - queue / 4;
+    for id in 0..=share {
+        let host = host.clone();
+        let request = write(200 + id as u128);
+        writes.push(tokio::spawn(async move {
+            dispatch(&host, peer(), request, &ReplicaHost::wire_limits()).await
+        }));
+    }
+    crate::test_waits::within(&[&host], steps, TICK, async {
+        while host.input_refusals().requests_refused == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The peers' room: this lone voter's reserve, one in-flight window.
+    let (room, queued) = host.pace.frame_room();
+    assert_eq!(room, focal_consensus::DEFAULT_INFLIGHT_WINDOW);
+    assert_eq!(queued, 0);
+    let node = AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId::from_u128(2),
+        tenants: [ledger(1).tenant].into_iter().collect(),
+        role: PeerRole::Node { node_id: 2 },
+    })
+    .unwrap();
+    let mut frames = Vec::new();
+    for id in 0..=room {
+        let host = host.clone();
+        let node = node.clone();
+        let request = RequestEnvelope {
+            request_id: RequestId::from_u128(1000 + id as u128),
+            ..envelope(
+                1,
+                Operation::Raft {
+                    group: ledger(1).session.0,
+                    message: vec![7, 8, 9],
+                },
+            )
+        };
+        frames.push(tokio::spawn(async move {
+            dispatch(&host, node, request, &ReplicaHost::wire_limits()).await
+        }));
+    }
+    crate::test_waits::within(&[&host], steps, TICK, async {
+        while host.input_refusals().frames_refused == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        host.pace.frame_room(),
+        (room, room),
+        "every place in the room is held while the write is out"
+    );
+    resume.send(()).unwrap();
+    drop(disk.join().unwrap());
+    let mut refused = 0;
+    for frame in frames {
+        match frame.await.unwrap().result {
+            Response::Error(AccessError::Capacity) => refused += 1,
+            // This node is no member of the lone voter's group: the owner
+            // answers the frame once the write is durable, and it is not
+            // refused for room.
+            Response::Error(AccessError::Unauthorized) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let mut capacity = 0;
+    for answer in writes {
+        if matches!(
+            answer.await.unwrap().result,
+            Response::Error(AccessError::Capacity)
+        ) {
+            capacity += 1;
+        }
+    }
+    let counted = host.input_refusals();
+    assert_eq!(
+        host.pace.frame_room().1,
+        0,
+        "every place was given back as its frame was taken"
+    );
+    drop(host);
+    shutdown(fixture).await;
+    assert_eq!(refused, 1, "only the frame past the room is refused");
+    assert_eq!(capacity, 1, "one write found no room");
+    assert_eq!(counted.frames_refused, 1, "and was counted");
+    assert_eq!(counted.requests_refused, 1);
+    assert_eq!(counted.frames_dropped, 0);
+    assert_eq!(counted.requests_dropped, 0);
+}

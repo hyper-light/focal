@@ -54,8 +54,22 @@ pub(super) struct Routed {
     pub ledger: LedgerId,
     pub incarnation: u64,
     pub work: Work,
-    pub _slot: Allocation,
+    pub _slot: Slot,
 }
+/// The place queued work holds until its owner takes it: a participant's
+/// one of its session's queue items, a peer's frame one of the places its
+/// session's peer reserve gives (F56) — never one of the participants'.
+pub(super) enum Slot {
+    Item { _allocation: Allocation },
+    Frame { _ticket: crate::pace::FrameTicket },
+}
+/// What a peer's frame queued for a fleet's owner holds beside its bytes:
+/// its place in the frames' channel and in its session's queue there,
+/// which grows by doubling and is shrunk once a quarter full.
+pub(super) const FRAME_QUEUE_BYTES: usize = size_of::<Routed>().saturating_mul(6);
+/// The frames' channel's own blocks: the one being taken from and the one
+/// being added to, of 31 frames each, whatever the frames queued.
+const FRAME_CHANNEL_BYTES: usize = size_of::<Routed>().saturating_add(16).saturating_mul(64);
 pub(super) enum FleetInput {
     Routed(Routed),
     Management(management::ManagementWork),
@@ -79,33 +93,48 @@ pub(super) enum Signal {
 #[derive(Clone)]
 pub(super) struct OwnerQueue {
     input: mpsc::SyncSender<FleetInput>,
+    /// The peers' frames, apart from the participants' work: unbounded as
+    /// a channel, and bounded by the room each session's peer reserve
+    /// gives (`TickPeriod::queue_frame`), each frame holding its place.
+    frames: mpsc::Sender<Routed>,
     signal: mpsc::SyncSender<Signal>,
     /// That an answer's signal found the queue full: one token at most,
     /// pending until the owner takes it — a second drop while one is pending
     /// is covered by it.
     overflow: mpsc::SyncSender<()>,
 }
-/// The owner's ends of its queue: its input, its signals, and the token
-/// that says an answer's signal was not queued.
+/// The owner's ends of its queue: its input, the peers' frames, its
+/// signals, and the token that says an answer's signal was not queued.
 type OwnerEnds = (
     mpsc::Receiver<FleetInput>,
+    mpsc::Receiver<Routed>,
     mpsc::Receiver<Signal>,
     mpsc::Receiver<()>,
 );
 impl OwnerQueue {
-    /// The owner's input and signal queues, and this handle on them.
+    /// The owner's input, frame and signal queues, and this handle on them.
     fn new() -> (Self, OwnerEnds) {
         let (input, inputs) = mpsc::sync_channel(QUEUED);
+        let (frames, framed) = mpsc::channel();
         let (signal, signals) = mpsc::sync_channel(QUEUED);
         let (overflow, overflows) = mpsc::sync_channel(1);
         (
             Self {
                 input,
+                frames,
                 signal,
                 overflow,
             },
-            (inputs, signals, overflows),
+            (inputs, framed, signals, overflows),
         )
+    }
+    /// A peer's frame, queued apart from the participants' work in the
+    /// place it holds in its session's room, and taken before that work
+    /// (`GroupOwner::take_frames`). Refused only once the owner is gone.
+    pub(super) fn send_frame(&self, routed: Routed) -> Result<(), Box<mpsc::SendError<Routed>>> {
+        self.frames.send(routed).map_err(Box::new)?;
+        let _ = self.signal.try_send(Signal::Input);
+        Ok(())
     }
     /// The refusal carries the work back, as the queue's own does; it is
     /// boxed, the work being large and a refusal rare.
@@ -218,6 +247,7 @@ impl ReplicaFleet {
                     .and_then(|handles| bytes.checked_add(handles))
             })
             .and_then(|bytes| bytes.checked_add(size_of::<Allocation>()))
+            .and_then(|bytes| bytes.checked_add(FRAME_CHANNEL_BYTES))
             .and_then(|bytes| bytes.checked_add(64))
             .ok_or(LedgerError::Capacity)?;
         // Host clones, the owner, and the outbound receiver can outlive one
@@ -265,7 +295,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, (receiver, signals, overflows)) = OwnerQueue::new();
+        let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let mut sessions = BTreeMap::new();
         let mut wal_owners = Vec::new();
@@ -340,6 +370,8 @@ impl ReplicaFleet {
             sessions,
             deadlines,
             scheduler,
+            frames,
+            framed: BTreeMap::new(),
             signals,
             overflows,
             unwoken: std::collections::BTreeSet::new(),
@@ -368,6 +400,13 @@ struct GroupOwner {
     sessions: BTreeMap<LedgerId, Owner>,
     deadlines: BTreeMap<(Instant, LedgerId), ()>,
     scheduler: FairScheduler<Option<Routed>>,
+    /// The peers' frames queued for this owner (`OwnerQueue::send_frame`).
+    frames: mpsc::Receiver<Routed>,
+    /// Each session's frames taken from them and not yet dispatched, in the
+    /// order they came: no more than its peer reserve gives room to, the
+    /// places they hold (`FrameTicket`). A session's queue goes once it is
+    /// empty, or the session stops.
+    framed: BTreeMap<LedgerId, VecDeque<Routed>>,
     /// What wakes this owner when it has nothing due (`Signal`).
     signals: mpsc::Receiver<Signal>,
     /// That an answer's signal found the signals full (`OwnerQueue::persisted`).
@@ -397,6 +436,24 @@ fn report_stop(ledger: LedgerId, error: &LedgerError) {
         ledger.session
     );
 }
+/// Whether a session takes input now: its write is not out, and it is not
+/// stopping — or it is, and its leader hands the log off, which is messages
+/// both ways: the heir's append responses say when it is caught up, and its
+/// vote request ends this replica's term.
+fn takes_input(owner: &Owner) -> bool {
+    !owner.session.persistence_pending()
+        && (owner.stopping.is_none() || owner.handing_off.is_some())
+}
+/// A peer's frame into its session's own queue, behind those that came
+/// before it; dropped, and counted, where the queue cannot grow.
+fn queue_frame(framed: &mut BTreeMap<LedgerId, VecDeque<Routed>>, owner: &Owner, routed: Routed) {
+    let queue = framed.entry(routed.ledger).or_default();
+    if queue.try_reserve(1).is_err() {
+        owner.pace.drop_input(true);
+        return;
+    }
+    queue.push_back(routed);
+}
 impl GroupOwner {
     fn run(mut self, receiver: mpsc::Receiver<FleetInput>) {
         let result = self.run_inner(receiver);
@@ -415,6 +472,7 @@ impl GroupOwner {
         }
     }
     fn stop_session(&mut self, ledger: LedgerId) {
+        self.framed.remove(&ledger);
         if let Some(mut owner) = self.sessions.remove(&ledger) {
             self.deadlines.remove(&(owner.wake_at, ledger));
             self.unwoken.remove(&ledger);
@@ -504,6 +562,12 @@ impl GroupOwner {
         if owner.stopping.is_some() && owner.handing_off.is_none() {
             return Ok(());
         }
+        // A peer's frame is never the scheduler's: it waits in its session's
+        // own queue (`take_frames`).
+        if matches!(class(&routed.work), WorkClass::Apply) {
+            queue_frame(&mut self.framed, owner, routed);
+            return Ok(());
+        }
         self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
         let cost = match &routed.work {
             Work::Request(_, _, charge)
@@ -527,11 +591,105 @@ impl GroupOwner {
         // These scheduler byte quotas cover metadata only. Routed requests
         // already retain their payload reservation in the actual tenant/node
         // ingress hierarchy; charging their heap again would double-count it.
-        let frame = matches!(metadata.class, WorkClass::Apply);
         if self.scheduler.enqueue(metadata, Some(routed), 0).is_err() {
-            owner.pace.drop_input(frame);
+            owner.pace.drop_input(false);
         }
         Ok(())
+    }
+    /// Takes the peers' frames queued for this owner, each into its
+    /// session's own queue in the order it came, at most as many at a pass
+    /// as the participants' input holds: each was queued in its session's
+    /// room, so no more wait than the sessions' peer reserves. One for a
+    /// session stopped or replaced, or stopping and not handing its log
+    /// off, is dropped, as `enqueue` drops one: its peer is told the outcome
+    /// is unknown.
+    fn take_frames(&mut self) {
+        for _ in 0..QUEUED {
+            let Ok(routed) = self.frames.try_recv() else {
+                break;
+            };
+            let Some(owner) = self.sessions.get(&routed.ledger) else {
+                continue;
+            };
+            if owner.incarnation != routed.incarnation
+                || (owner.stopping.is_some() && owner.handing_off.is_none())
+            {
+                continue;
+            }
+            queue_frame(&mut self.framed, owner, routed);
+        }
+    }
+    /// Dispatches the queued frames of every session that takes input now,
+    /// in the order they came and before the participants' work (27 §12).
+    /// A session with its write out takes none, as the scheduler hands it
+    /// nothing: its frames wait in their room for the write to be durable,
+    /// not refused. At most as many at a pass as the input holds. Whether
+    /// any was dispatched.
+    fn dispatch_frames(&mut self) -> Result<bool, LedgerError> {
+        let mut dispatched = 0usize;
+        let mut next = self.framed.keys().next().copied();
+        while let Some(ledger) = next {
+            if dispatched >= QUEUED {
+                break;
+            }
+            next = self
+                .framed
+                .range((
+                    std::ops::Bound::Excluded(ledger),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(after, _)| *after);
+            let Some(owner) = self.sessions.get_mut(&ledger) else {
+                self.framed.remove(&ledger);
+                continue;
+            };
+            if !takes_input(owner) {
+                continue;
+            }
+            let Some(mut queue) = self.framed.remove(&ledger) else {
+                continue;
+            };
+            let mut outcome = Ok(false);
+            while dispatched < QUEUED && takes_input(owner) {
+                let Some(routed) = queue.pop_front() else {
+                    break;
+                };
+                let Routed {
+                    incarnation,
+                    work,
+                    _slot: place,
+                    ..
+                } = routed;
+                // The frame's place is given back as the owner takes it.
+                drop(place);
+                if owner.incarnation != incarnation {
+                    continue;
+                }
+                dispatched = dispatched.saturating_add(1);
+                outcome = owner.accept(work);
+                if !matches!(outcome, Ok(false)) {
+                    break;
+                }
+            }
+            match outcome {
+                Ok(false) => {
+                    if !queue.is_empty() {
+                        if queue.capacity() > queue.len().saturating_mul(4) {
+                            queue.shrink_to(queue.len().saturating_mul(2));
+                        }
+                        self.framed.insert(ledger, queue);
+                    }
+                    self.reschedule(ledger)?;
+                }
+                Ok(true) => self.stop_session(ledger),
+                Err(error) => {
+                    report_stop(ledger, &error);
+                    self.stop_session(ledger);
+                }
+            }
+        }
+        Ok(dispatched != 0)
     }
     fn input(&mut self, input: FleetInput) -> Result<bool, LedgerError> {
         match input {
@@ -579,6 +737,7 @@ impl GroupOwner {
                     }
                 }
             }
+            self.take_frames();
             for _ in 0..SLICE {
                 match receiver.try_recv() {
                     Ok(input) => {
@@ -590,22 +749,15 @@ impl GroupOwner {
                     Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 }
             }
+            // The peers' frames go first: what a session's participants wait
+            // on is its peers' answers.
+            let framed = self.dispatch_frames()?;
             let mut runnable = false;
             for _ in 0..SLICE {
                 let sessions = &self.sessions;
                 match self
                     .scheduler
-                    .schedule_when(|ledger| {
-                        // A stopping session takes no more work — except
-                        // while its leader hands the log off, which is
-                        // messages both ways: the heir's append responses
-                        // say when it is caught up, and its vote request
-                        // ends this replica's term.
-                        sessions.get(&ledger).is_none_or(|owner| {
-                            !owner.session.persistence_pending()
-                                && (owner.stopping.is_none() || owner.handing_off.is_some())
-                        })
-                    })
+                    .schedule_when(|ledger| sessions.get(&ledger).is_none_or(takes_input))
                     .map_err(|_| LedgerError::Failed)?
                 {
                     ScheduleOutcome::Work(mut dispatch) => {
@@ -641,7 +793,7 @@ impl GroupOwner {
                     }
                 }
             }
-            if runnable {
+            if runnable || framed {
                 continue;
             }
             let wait = self
@@ -691,7 +843,7 @@ mod tests {
     /// macOS run: one of a thousand sessions answered by one write).
     #[test]
     fn an_answer_that_finds_the_signals_full_arms_the_sweep() {
-        let (queue, (_inputs, signals, overflows)) = OwnerQueue::new();
+        let (queue, (_inputs, _frames, signals, overflows)) = OwnerQueue::new();
         let ledger = LedgerId {
             tenant: focal_model::TenantId::from_u128(1),
             session: focal_model::SessionId::from_u128(1),

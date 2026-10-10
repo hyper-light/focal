@@ -58,11 +58,35 @@ struct TickShared {
     requests_refused: AtomicU64,
     frames_dropped: AtomicU64,
     requests_dropped: AtomicU64,
+    /// The room the peers' frames have on their way to the owner: how many
+    /// may be queued for it at once, which the owner states — its peer
+    /// reserve (`Owner::peer_reserve`) — and how many are, each holding its
+    /// place (`FrameTicket`). A peer's frame is queued in this room, beside
+    /// the participants' queue and never in it (F56).
+    frame_room: AtomicUsize,
+    frames_queued: AtomicUsize,
+}
+/// One of the places the owner's peer reserve gives the peers' frames
+/// queued for it (`TickPeriod::queue_frame`), held by the frame until the
+/// owner takes it, or it is dropped, and given back then.
+pub(crate) struct FrameTicket(TickPeriod);
+impl Drop for FrameTicket {
+    fn drop(&mut self) {
+        let _ =
+            (self.0)
+                .0
+                .frames_queued
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    queued.checked_sub(1)
+                });
+    }
 }
 /// What a session turned away for room, of peers' frames and participants'
-/// requests apart: refused by its host before it was queued — its queue or
-/// its memory full — and dropped by its fleet's scheduler at its quota once
-/// queued. A peer counts a refused frame lost; a dropped one it asks again
+/// requests apart: refused by its host before it was queued — the room the
+/// peers' frames have, the participants' queue or its memory full — and
+/// dropped by its fleet's owner once queued: a participant's request at the
+/// scheduler's quota, a peer's frame where its session's queue could not
+/// grow. A peer counts a refused frame lost; a dropped one it asks again
 /// once, then counts lost.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InputRefusals {
@@ -200,8 +224,38 @@ impl TickPeriod {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    /// The fleet's scheduler dropped a peer's frame (`frame`) or a
-    /// participant's request at its quota once queued.
+    /// The owner states the room its peers' frames have on their way to it:
+    /// its peer reserve (`Owner::peer_reserve`). A room made smaller takes
+    /// no frame until as many as are over it have been taken.
+    pub(crate) fn set_frame_room(&self, room: usize) {
+        self.0.frame_room.store(room, Ordering::Relaxed);
+    }
+    /// A place for one more of the peers' frames queued for the owner,
+    /// while the room the owner states has one; none before it states it.
+    pub(crate) fn queue_frame(&self) -> Option<FrameTicket> {
+        let room = self.0.frame_room.load(Ordering::Relaxed);
+        self.0
+            .frames_queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                if queued < room {
+                    queued.checked_add(1)
+                } else {
+                    None
+                }
+            })
+            .ok()?;
+        Some(FrameTicket(self.clone()))
+    }
+    /// The room the owner last stated, and the frames queued in it now.
+    #[cfg(test)]
+    pub(crate) fn frame_room(&self) -> (usize, usize) {
+        (
+            self.0.frame_room.load(Ordering::Relaxed),
+            self.0.frames_queued.load(Ordering::Relaxed),
+        )
+    }
+    /// The fleet's owner dropped a peer's frame (`frame`) or a
+    /// participant's request once queued.
     pub(crate) fn drop_input(&self, frame: bool) {
         let counter = if frame {
             &self.0.frames_dropped
@@ -321,5 +375,45 @@ mod quorum_tests {
         );
         pace.publish_quorum_tail(None);
         assert_eq!(pace.quorum_ticks(tick, ceiling), 0);
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+mod frame_room_tests {
+    use super::*;
+
+    /// The peers' frames are queued in the room the owner states and no
+    /// more; a frame taken or dropped gives its place back, and a room made
+    /// smaller takes none until as many as are over it are gone.
+    #[test]
+    fn a_peers_frame_is_queued_in_the_room_the_owner_states() {
+        let pace = TickPeriod::default();
+        assert!(pace.queue_frame().is_none(), "no room before it is stated");
+        pace.set_frame_room(2);
+        let first = pace.queue_frame().unwrap();
+        let second = pace.queue_frame().unwrap();
+        assert!(pace.queue_frame().is_none(), "the room is full");
+        assert_eq!(pace.frame_room(), (2, 2));
+        drop(first);
+        let third = pace.queue_frame().unwrap();
+        pace.set_frame_room(1);
+        drop(second);
+        assert!(pace.queue_frame().is_none(), "one is over the smaller room");
+        drop(third);
+        assert_eq!(pace.frame_room(), (1, 0));
+        let fourth = pace.queue_frame().unwrap();
+        assert!(pace.queue_frame().is_none());
+        drop(fourth);
+        assert_eq!(pace.frame_room(), (1, 0));
     }
 }
