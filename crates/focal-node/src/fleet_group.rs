@@ -504,26 +504,6 @@ impl GroupOwner {
         if owner.stopping.is_some() && owner.handing_off.is_none() {
             return Ok(());
         }
-        // A peer's frame is its owner's as it comes, whatever the session is
-        // doing: the owner steps it, or keeps it in its order for the write
-        // in flight (`fleet::WaitingFrame`), within the peers' reserve.
-        // Queued here behind participants' work, a frame held a place of the
-        // session's queue until the session's write was durable, and the
-        // queue, full, refused the frames that would complete that very work
-        // (the Linux comparison at 1,000 writes a second: the leader refused
-        // 26,252 of its followers' frames, each lost to its peer).
-        if matches!(class(&routed.work), WorkClass::Apply) {
-            let ledger = routed.ledger;
-            match owner.accept(routed.work) {
-                Ok(false) => self.reschedule(ledger)?,
-                Ok(true) => self.stop_session(ledger),
-                Err(error) => {
-                    report_stop(ledger, &error);
-                    self.stop_session(ledger);
-                }
-            }
-            return Ok(());
-        }
         self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
         let cost = match &routed.work {
             Work::Request(_, _, charge)
@@ -547,8 +527,9 @@ impl GroupOwner {
         // These scheduler byte quotas cover metadata only. Routed requests
         // already retain their payload reservation in the actual tenant/node
         // ingress hierarchy; charging their heap again would double-count it.
+        let frame = matches!(metadata.class, WorkClass::Apply);
         if self.scheduler.enqueue(metadata, Some(routed), 0).is_err() {
-            owner.pace.drop_input(false);
+            owner.pace.drop_input(frame);
         }
         Ok(())
     }
