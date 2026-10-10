@@ -471,13 +471,25 @@ impl QuicServer {
     }
     /// Present `tls` to every handshake from now on: a renewed identity, roots that changed.
     pub async fn replace_tls(&self, tls: ServerTls) -> Result<(), WireError> {
-        let tls = Box::new(Tls {
-            server: Some(tls.0),
-            client: listener_client()?,
-        });
-        self.network
-            .call(|reply| Command::SetTls { tls, reply })
-            .await?
+        self.identity().replace(tls).await
+    }
+    /// A handle that presents another identity to this server's next handshakes, held apart from
+    /// the server (a credential's renewal swaps it while the server serves).
+    pub fn identity(&self) -> ServerIdentity {
+        ServerIdentity {
+            network: self.network.clone(),
+        }
+    }
+    /// Waits until the server has ended — closed, its endpoint and socket gone, so an address it
+    /// held is free again.
+    pub async fn ended(&self) {
+        let Ok((done, ended)) = hyper_rt::sync::oneshot() else {
+            return;
+        };
+        if self.network.send(Command::Ended { done }).await.is_ok() {
+            // Told as the owner ends, or dropped by an owner that ended first.
+            let _ = ended.await;
+        }
     }
     /// Closes the server: its connections close and `serve` returns. Refused only when the shard
     /// has no task left to queue it (`Limit`); a server already closed is closed.
@@ -499,13 +511,21 @@ impl QuicServer {
     /// Serves with `serve`, which answers the data protocol and whatever else the listener
     /// carries, until the server is closed.
     pub async fn serve_with<S: Serve>(&self, serve: S) -> Result<(), WireError> {
+        // Off a shard nothing could be served: refused, before an ended owner is told apart.
+        crate::require_runtime()?;
         let (done, ended) = hyper_rt::sync::oneshot().map_err(|_| WireError::Connection)?;
-        self.network
+        match self
+            .network
             .send(Command::Serve {
                 serve: Box::new(serve),
                 done,
             })
-            .await?;
+            .await
+        {
+            // A server closed before it served has ended all the same.
+            Err(WireError::Connection) => return Ok(()),
+            sent => sent?,
+        }
         // The owner ending without a word is an end all the same.
         let _ = ended.await;
         Ok(())
@@ -785,6 +805,23 @@ impl Drop for EnrollmentLink {
         let _ = self
             .network
             .send_now(Command::Disconnect { peer: self.peer });
+    }
+}
+/// A handle that presents another TLS identity to a server's next handshakes; clones share it.
+#[derive(Clone)]
+pub struct ServerIdentity {
+    network: Network,
+}
+impl ServerIdentity {
+    /// Present `tls` to every handshake from now on: a renewed identity, roots that changed.
+    pub async fn replace(&self, tls: ServerTls) -> Result<(), WireError> {
+        let tls = Box::new(Tls {
+            server: Some(tls.0),
+            client: listener_client()?,
+        });
+        self.network
+            .call(|reply| Command::SetTls { tls, reply })
+            .await?
     }
 }
 /// The connector's endpoint, as a handle: connections it opens are the connector's own (same

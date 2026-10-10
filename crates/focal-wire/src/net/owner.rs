@@ -41,6 +41,9 @@ use crate::{
 /// The driver an owner holds.
 pub(crate) type Driver = hyper_rt_transport::Driver<FocalClasses, NetBudget, NetDirectory>;
 
+/// The waits for an owner's end it keeps: a server's serve, and a shutdown that awaits the end.
+const ENDED_WAITERS: usize = 4;
+
 /// The most a greeting and its answer carry, bytes: focal-wire's greeting frame bound (sixteen
 /// profiles of two bytes and two bounds, encoded, far within it).
 pub const HELLO_BYTES: u32 = 4096;
@@ -175,6 +178,8 @@ pub(crate) enum Command {
         serve: Box<dyn Serve>,
         done: OneshotSender<()>,
     },
+    /// Tell `done` when the owner has ended, its endpoint and socket gone.
+    Ended { done: OneshotSender<()> },
     /// What the path to `peer` measures now.
     Path {
         peer: PeerId,
@@ -513,11 +518,18 @@ impl Owner {
                 break;
             }
         }
-        self.shut();
+        let done = self.shut();
+        // The endpoint and its socket go before anyone waiting for the end hears of it: an address
+        // the endpoint held is free again by then.
+        drop(self);
+        for done in done {
+            let _ = done.send(());
+        }
     }
 
-    /// Ends every exchange and connection, telling everyone who waits.
-    fn shut(&mut self) {
+    /// Ends every exchange and connection, telling everyone who waits for one; who waits for the
+    /// owner's own end is handed back, to be told once it has gone.
+    fn shut(&mut self) -> Vec<OneshotSender<()>> {
         let now = self.now();
         for (_, asking) in std::mem::take(&mut self.asking) {
             if let Some(reply) = asking.reply {
@@ -544,12 +556,18 @@ impl Owner {
             self.driver.endpoint().disconnect(now, peer);
         }
         let _ = self.driver.flush();
-        for done in self.done.drain(..) {
-            let _ = done.send(());
-        }
+        std::mem::take(&mut self.done)
     }
 
     // ------------------------------------------------------------------------------- commands
+
+    /// `done` is told when the owner ends; past [`ENDED_WAITERS`] it is dropped now, which its
+    /// waiter reads as the end it waits for.
+    fn wait_for_end(&mut self, done: OneshotSender<()>) {
+        if self.done.len() < ENDED_WAITERS {
+            self.done.push(done);
+        }
+    }
 
     fn on_command(&mut self, command: Command) {
         match command {
@@ -586,12 +604,11 @@ impl Owner {
                 let stats = self.stats();
                 let _ = reply.send(stats);
             }
+            Command::Ended { done } => self.wait_for_end(done),
             Command::Serve { serve, done } => {
                 self.serve = Some(serve);
                 // One serve a listener; a second waits for the same end.
-                if self.done.len() < 2 {
-                    self.done.push(done);
-                }
+                self.wait_for_end(done);
                 // What arrived before it was waiting for it.
                 let parked: Vec<ExchangeId> = self
                     .serving

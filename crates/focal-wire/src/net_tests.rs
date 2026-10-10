@@ -281,3 +281,25 @@ fn an_enrollment_kind_is_refused_where_the_protocol_is_not_served() {
     })
     .unwrap();
 }
+
+/// A server's end is told once its endpoint and socket are gone: the address it held binds again.
+#[test]
+fn a_server_that_ended_has_freed_its_address() {
+    focal_rt::block_on(async {
+        let pki = Pki::new();
+        let registry = PeerRegistry::new(4).unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let (server, task) = server(&pki, registry.clone(), handler.clone()).await;
+        let address = server.local_addr().unwrap();
+        server.close().unwrap();
+        server.ended().await;
+        task.join().await.unwrap();
+        let (again, task) = server_at(&pki, registry, handler, address).await;
+        assert_eq!(again.local_addr().unwrap(), address);
+        again.close().unwrap();
+        again.ended().await;
+        task.join().await.unwrap();
+    })
+    .unwrap();
+}
