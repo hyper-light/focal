@@ -27,10 +27,10 @@ const FRAME: Duration = Duration::from_millis(33);
 const MOST_MOTION: Duration = Duration::from_secs(600);
 /// The narrowest terminal the mark is drawn on, beside the card.
 const WITH_LENSES: usize = 64;
-/// The mark beside the card, as shards draws its own: eight cells by four, its
-/// strokes in Braille dots (16 × 16), the site's geometry.
-const MARK_COLS: usize = 8;
-const MARK_ROWS: usize = 4;
+/// The mark beside the card, in Braille dots as shards draws its own, the site's
+/// geometry: six cells by three, a prism twelve dots a side.
+const MARK_COLS: usize = 6;
+const MARK_ROWS: usize = 3;
 
 /// What the node said about itself last.
 #[derive(Debug, Clone, Default)]

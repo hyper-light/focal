@@ -81,10 +81,11 @@ impl Page {
     }
 }
 
-/// The mark in the head, as shards draws its own: eight cells by four, its strokes
-/// in Braille dots, the site's geometry (`components/project-mark.tsx`).
-const MARK_COLS: usize = 8;
-const MARK_ROWS: usize = 4;
+/// The mark in the head, in Braille dots as shards draws its own, the site's geometry
+/// (`components/project-mark.tsx`): six cells by three, a prism twelve dots a side,
+/// beside the brand's two lines.
+const MARK_COLS: usize = 6;
+const MARK_ROWS: usize = 3;
 
 /// The head: the mark (where there is room) beside the brand `F O C A L` in the prism,
 /// `name` in tracked capitals after it, then `lines` under them.

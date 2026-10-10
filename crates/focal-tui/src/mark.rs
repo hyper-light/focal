@@ -1,15 +1,18 @@
 //! The focal mark (hyperlight-site components/project-mark.tsx): a prism, light entering
 //! at its left face, refracting through it to a focal point, and leaving at its right.
-//! Drawn as shards draws its crystals, in Braille dots (two by four a cell), and as a solid
-//! of glass rather than an outline: at sixteen dots a side an outline's slanted strokes
-//! step unevenly and its inside is empty, which reads as broken. Here the prism climbs
-//! two rows for every dot, so its sides step evenly; its sides are two dots thick and its
-//! base one, so its weight does not sink; its body is a half-tone of glass, lit toward the
-//! focal point; the site's rays run through it brighter than the glass; and the focal
-//! point is a bright core whose cells carry nothing else, so it reads as a point of light,
-//! never a bar. The light disperses across it as the site's prism gradient does, cool
-//! where it enters and warm where it leaves; a glint travels the rim as the study's
-//! beams carry theirs, the apex holds a highlight, and the focal point breathes.
+//! Drawn as shards draws its crystals, in Braille dots (two by four a cell), as a solid of
+//! glass: the prism climbs two rows for every dot, so its sides step evenly; its sides are
+//! two dots thick and its base one; its body is a half-tone of glass, the site's rays and
+//! the focal point lit through it.
+//!
+//! A cell shows one colour, so colour is drawn a cell at a time. A cell on the rim takes
+//! the light where its rim dots are, cool where the light enters and warm where it leaves,
+//! as the site's prism gradient runs; a cell of glass takes the same light, fainter. The
+//! focal point clears no cell (cleared cells read as a hole in the glass): every cell is
+//! drawn toward white by how near its lit dots lie to it, on average, so the light gathers
+//! there and balances on the axis, though the axis runs down a column of dots and a cell
+//! pairs two columns. The apex holds a highlight over the cells of its first rows alike, a
+//! glint travels the rim from the face the light enters, and the focal point breathes.
 
 use crate::canvas::{Canvas, Ink};
 use crate::motion;
@@ -17,32 +20,64 @@ use crate::tokens::{self, Rgb};
 
 type Pt = (f64, f64);
 
-/// Ranks: the focal point over the glint over the rim over the rays over the glass. A cell
-/// takes the colour of its weightiest dot.
+/// A cell's dots, as (x, y) within it, in dots.
+const CELL: [Pt; 8] = [
+    (0.0, 0.0),
+    (1.0, 0.0),
+    (0.0, 1.0),
+    (1.0, 1.0),
+    (0.0, 2.0),
+    (1.0, 2.0),
+    (0.0, 3.0),
+    (1.0, 3.0),
+];
+
+/// Ranks: a cell on the rim over a cell the rays light over a cell of glass. The dots of a
+/// cell share one ink, so ranks order nothing within a cell.
 const GLASS: u8 = 1;
 const RAY: u8 = 2;
 const RIM: u8 = 3;
-const GLINT: u8 = 4;
-const CORE: u8 = 5;
 
 /// Where round the rim the glint is at time zero: high on the left side, where the light
 /// enters (the rim runs down the left side, along the base, up the right).
 const GLINT_START: f64 = 0.12;
+/// The glint's spread, as a share of the way round the rim, and how far toward white it
+/// draws the rim where it is: a sheen, since a cell is the least it can light, and a cell
+/// of a prism twelve dots a side is an eighth of it.
+const GLINT_SPREAD: f64 = 0.05;
+const GLINT_LIGHT: f64 = 0.45;
 /// The glass's and the rays' opacity over the page, of 255.
 const GLASS_ALPHA: u8 = 140;
 const RAY_ALPHA: u8 = 225;
 /// How near a dot is to a ray, in dots, to be drawn as the ray.
 const RAY_REACH: f64 = 0.55;
-/// The focal point's radius, in dots, and how far its glow carries into the glass.
+/// The focal point's radius, in dots: its dots are always lit.
 const CORE_RADIUS: f64 = 1.2;
-const GLOW_REACH: f64 = 3.5;
+/// How far the focal point's light carries, in dots, and how far toward white it draws a
+/// cell on the rim and a cell of glass where it is brightest.
+const GLOW_REACH: f64 = 2.2;
+const RIM_GLOW: f64 = 0.35;
+const GLASS_GLOW: f64 = 0.6;
+/// The apex's highlight, over the cells of its first four rows.
+const APEX_ROWS: f64 = 4.0;
+const APEX_HIGHLIGHT: f64 = 0.55;
+
+/// What a lit dot of the prism is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    Rim,
+    Core,
+    Ray,
+    Glass,
+}
 
 /// The prism on a canvas: its apex, height and the rays through its focal point, all in
 /// dots, mapped from the site's 32-unit box (`m16 4 13 24H3L16 4Z`, the rays
 /// `m4 12 12 5 12-5M4 21l12-4 12 4M16 4v13`, the focal point at 16, 17).
 struct Prism {
     apex: Pt,
-    height: usize,
+    /// Its rows, a whole number.
+    height: f64,
     focus: Pt,
     rays: [(Pt, Pt); 5],
 }
@@ -69,26 +104,48 @@ impl Prism {
         ];
         Prism {
             apex,
-            height: height as usize,
+            height,
             focus,
             rays,
         }
     }
 
-    /// Row `i` from the apex: its row in dots and its first and last dot.
-    fn row(&self, i: usize) -> (f64, f64, f64) {
-        let half = (i / 2) as f64;
-        (
-            self.apex.1 + i as f64,
-            self.apex.0 - half,
-            self.apex.0 + half,
-        )
+    /// What the dot at (`x`, `y`) is, or `None` where it is dark: outside the prism, or
+    /// glass the half-tone leaves out.
+    fn part(&self, x: f64, y: f64) -> Option<Part> {
+        let i = y - self.apex.1;
+        if i < 0.0 || i >= self.height {
+            return None;
+        }
+        // Row `i` reaches `half` dots each side of the apex: a dot for every two rows.
+        let half = (i / 2.0).floor();
+        let k = x - (self.apex.0 - half);
+        let width = 2.0 * half;
+        if k < 0.0 || k > width {
+            return None;
+        }
+        // The sides two dots thick, the base one.
+        if i + 1.0 >= self.height || k < 2.0 || width - k < 2.0 {
+            return Some(Part::Rim);
+        }
+        if dist((x, y), self.focus) <= CORE_RADIUS {
+            return Some(Part::Core);
+        }
+        if self
+            .rays
+            .iter()
+            .any(|(a, b)| to_segment((x, y), *a, *b) <= RAY_REACH)
+        {
+            return Some(Part::Ray);
+        }
+        // Glass: half the dots, a half-tone.
+        ((x + y).rem_euclid(2.0) < 0.5).then_some(Part::Glass)
     }
 
     /// Where light is across the prism, in [0, 1]: 0 where it enters (the left), 1 where
     /// it leaves.
     fn across(&self, x: f64) -> f64 {
-        let half = self.height as f64 / 2.0;
+        let half = self.height / 2.0;
         if half > 0.0 {
             ((x - (self.apex.0 - half)) / (2.0 * half)).clamp(0.0, 1.0)
         } else {
@@ -99,8 +156,8 @@ impl Prism {
     /// How far round the rim a dot on it is, in [0, 1]: down the left side, along the
     /// base, up the right.
     fn round(&self, x: f64, y: f64) -> f64 {
-        let depth = ((y - self.apex.1) / self.height.max(1) as f64).clamp(0.0, 1.0);
-        let last = self.height.saturating_sub(1) as f64;
+        let depth = ((y - self.apex.1) / self.height.max(1.0)).clamp(0.0, 1.0);
+        let last = (self.height - 1.0).max(0.0);
         if (y - self.apex.1) >= last && last > 0.0 {
             1.0 / 3.0 + self.across(x) / 3.0
         } else if x <= self.apex.0 {
@@ -111,107 +168,100 @@ impl Prism {
     }
 }
 
+/// The light at one time: where round the rim the glint is, the dispersion's shimmer, the
+/// focal point's strength, and its white.
+struct Light {
+    glint_at: f64,
+    shimmer: f64,
+    glow: f64,
+    white: Rgb,
+}
+
+impl Light {
+    fn at(t: f64) -> Light {
+        Light {
+            // The glint starts on the face the light enters, high on the left side.
+            glint_at: (GLINT_START + t * 0.21).rem_euclid(1.0),
+            // The dispersion shimmers a little as the light moves.
+            shimmer: 0.08 * (t * 0.5).sin(),
+            // The focal point breathes about its still strength.
+            glow: 0.8 + 0.4 * motion::breath(t, 3.2, 0.0),
+            white: tokens::mix(tokens::FOCUS, tokens::BRIGHT, 0.35),
+        }
+    }
+
+    /// The whole spectrum across the prism at `x`: cool where the light enters, warm where
+    /// it leaves.
+    fn spectrum(&self, prism: &Prism, x: f64) -> Rgb {
+        tokens::prism((0.05 + 0.85 * prism.across(x) + self.shimmer).clamp(0.0, 1.0))
+    }
+
+    /// The ink of the cell whose top row is `top`, its lit dots `dots`; `None` for a cell
+    /// with none.
+    fn ink(&self, prism: &Prism, top: f64, dots: &[Option<(f64, f64, Part)>; 8]) -> Option<Ink> {
+        let lit = || dots.iter().flatten();
+        let n = lit().count() as f64;
+        if n < 1.0 {
+            return None;
+        }
+        // How near the cell's dots lie to the focal point, on average.
+        let away = lit()
+            .map(|(x, y, _)| dist((*x, *y), prism.focus))
+            .sum::<f64>()
+            / n;
+        let near = (-(away / GLOW_REACH).powi(2)).exp() * self.glow;
+        let rims = || lit().filter(|(_, _, part)| *part == Part::Rim);
+        let on_rim = rims().count() as f64;
+        if on_rim >= 1.0 {
+            let x = rims().map(|(x, _, _)| *x).sum::<f64>() / on_rim;
+            let mut color = self.spectrum(prism, x);
+            // The apex's highlight, alike over every cell of its first rows.
+            if top + 1.5 - prism.apex.1 < APEX_ROWS {
+                color = tokens::mix(color, tokens::BRIGHT, APEX_HIGHLIGHT);
+            }
+            color = tokens::mix(color, self.white, RIM_GLOW * near);
+            // The glint where the beam is now, by the cell's rim dot nearest it.
+            let glint = rims()
+                .map(|(x, y, _)| {
+                    let d = (prism.round(*x, *y) - self.glint_at).abs();
+                    motion::glint(d.min(1.0 - d), 0.0, GLINT_SPREAD)
+                })
+                .fold(0.0, f64::max);
+            return Some(Ink::solid(
+                RIM,
+                tokens::mix(color, tokens::BRIGHT, GLINT_LIGHT * glint),
+            ));
+        }
+        let x = lit().map(|(x, _, _)| *x).sum::<f64>() / n;
+        let color = tokens::mix(self.spectrum(prism, x), self.white, GLASS_GLOW * near);
+        let rayed = lit().any(|(_, _, part)| matches!(part, Part::Ray | Part::Core));
+        Some(Ink {
+            rank: if rayed { RAY } else { GLASS },
+            color,
+            alpha: if rayed { RAY_ALPHA } else { GLASS_ALPHA },
+        })
+    }
+}
+
 /// Draws the mark at time `t` across the whole of `canvas`, centred.
 pub fn draw(canvas: &mut Canvas, t: f64) {
     canvas.clear();
     let prism = Prism::on(canvas);
-    let core_cells = core_cells(&prism);
-    // The glint starts on the face the light enters, high on the left side.
-    let glint_at = (GLINT_START + t * 0.21).rem_euclid(1.0);
-    // The dispersion shimmers a little as the light moves.
-    let shimmer = 0.08 * (t * 0.5).sin();
-    let breath = motion::breath(t, 3.2, 0.0);
-    for i in 0..prism.height {
-        let (y, first, last) = prism.row(i);
-        let base = i.saturating_add(1) == prism.height;
-        let width = (last - first).round() as usize;
-        for k in 0..=width {
-            let x = first + k as f64;
-            let in_core_cell = core_cells.contains(&cell(x, y));
-            // The sides two dots thick, the base one.
-            let rim = base || k < 2 || width.saturating_sub(k) < 2;
-            // The whole spectrum across the prism: cool where the light enters, warm
-            // where it leaves.
-            let light = tokens::prism((0.05 + 0.85 * prism.across(x) + shimmer).clamp(0.0, 1.0));
-            if in_core_cell && !rim {
-                let d = dist((x, y), prism.focus);
-                if d <= CORE_RADIUS {
-                    let core = tokens::mix(tokens::FOCUS, tokens::BRIGHT, 0.4 + 0.6 * breath);
-                    canvas.dot(x, y, Ink::solid(CORE, core));
+    let light = Light::at(t);
+    for row in 0..canvas.rows() {
+        for col in 0..canvas.cols() {
+            let (left, top) = (col as f64 * 2.0, row as f64 * 4.0);
+            let dots = CELL.map(|(dx, dy)| {
+                let (x, y) = (left + dx, top + dy);
+                prism.part(x, y).map(|part| (x, y, part))
+            });
+            if let Some(ink) = light.ink(&prism, top, &dots) {
+                for (x, y, _) in dots.iter().flatten() {
+                    canvas.dot(*x, *y, ink);
                 }
-                continue;
-            }
-            if rim {
-                // A highlight at the apex, and the glint where the beam is now.
-                let apex = (1.0 - (y - prism.apex.1) / 2.0).clamp(0.0, 1.0);
-                let color = tokens::mix(light, tokens::BRIGHT, 0.5 * apex);
-                let d = (prism.round(x, y) - glint_at).abs();
-                let glint = motion::glint(d.min(1.0 - d), 0.0, 0.05);
-                let ink = if glint > 0.4 {
-                    Ink::solid(GLINT, tokens::mix(color, tokens::BRIGHT, glint))
-                } else {
-                    Ink::solid(RIM, color)
-                };
-                canvas.dot(x, y, ink);
-                continue;
-            }
-            let near = (-(dist((x, y), prism.focus) / GLOW_REACH).powi(2)).exp();
-            let glowing = tokens::mix(light, tokens::FOCUS, 0.45 * near);
-            let on_ray = prism
-                .rays
-                .iter()
-                .any(|(a, b)| to_segment((x, y), *a, *b) <= RAY_REACH);
-            if on_ray {
-                canvas.dot(
-                    x,
-                    y,
-                    Ink {
-                        rank: RAY,
-                        color: glowing,
-                        alpha: RAY_ALPHA,
-                    },
-                );
-            } else if (x + y).rem_euclid(2.0) < 0.5 {
-                // Glass: half the dots, a half-tone, brighter toward the focal point.
-                canvas.dot(
-                    x,
-                    y,
-                    Ink {
-                        rank: GLASS,
-                        color: glowing,
-                        alpha: GLASS_ALPHA,
-                    },
-                );
             }
         }
     }
-}
-
-/// The cells the focal point falls in: they carry the point alone.
-fn core_cells(prism: &Prism) -> Vec<(i64, i64)> {
-    let mut cells = Vec::new();
-    let (fx, fy) = prism.focus;
-    let reach = CORE_RADIUS.ceil();
-    let mut y = (fy - reach).floor();
-    while y <= fy + reach {
-        let mut x = (fx - reach).floor();
-        while x <= fx + reach {
-            if dist((x, y), prism.focus) <= CORE_RADIUS {
-                let at = cell(x, y);
-                if !cells.contains(&at) {
-                    cells.push(at);
-                }
-            }
-            x += 1.0;
-        }
-        y += 1.0;
-    }
-    cells
-}
-
-/// The cell a dot falls in.
-fn cell(x: f64, y: f64) -> (i64, i64) {
-    ((x / 2.0).floor() as i64, (y / 4.0).floor() as i64)
 }
 
 fn dist(a: Pt, b: Pt) -> f64 {
@@ -284,9 +334,16 @@ mod tests {
         g
     }
 
+    /// Whether the dot at (`x`, `y`) lies inside the prism drawn on `cols` by `rows_` cells.
+    fn inside(cols: usize, rows_: usize, x: i64, y: i64) -> bool {
+        let height = (cols * 2).min(rows_ * 4) as i64;
+        let apex = cols as i64;
+        (0..height).contains(&y) && (x - apex).abs() <= y / 2
+    }
+
     #[test]
     fn the_mark_draws_its_prism_at_any_size() {
-        for (cols, rows_) in [(8, 4), (16, 8), (24, 12)] {
+        for (cols, rows_) in [(6, 3), (8, 4), (16, 8), (24, 12)] {
             let mut c = Canvas::new(cols, rows_);
             draw(&mut c, 0.0);
             let drawn = rows(&c);
@@ -307,7 +364,7 @@ mod tests {
     /// crooked; and nothing is drawn outside it.
     #[test]
     fn the_prism_steps_evenly_and_nothing_strays_outside_it() {
-        for (cols, rows_) in [(8, 4), (16, 8)] {
+        for (cols, rows_) in [(6, 3), (8, 4), (16, 8)] {
             let mut c = Canvas::new(cols, rows_);
             draw(&mut c, 0.0);
             let g = grid(&c);
@@ -329,22 +386,88 @@ mod tests {
         }
     }
 
-    /// The focal point is a point of light: the cells it falls in carry it alone, so the
-    /// rays meeting there never draw a bar across the prism.
+    /// The prism's dots are a mirror image about its apex: nothing leans.
     #[test]
-    fn the_focal_point_carries_its_cells_alone() {
-        let mut c = Canvas::new(8, 4);
-        draw(&mut c, 0.0);
-        let g = grid(&c);
-        let prism = Prism::on(&c);
-        for (cx, cy) in core_cells(&prism) {
-            for y in (cy * 4)..(cy * 4 + 4) {
-                for x in (cx * 2)..(cx * 2 + 2) {
-                    let lit = g[y as usize][x as usize];
-                    let near = dist((x as f64, y as f64), prism.focus) <= CORE_RADIUS;
-                    assert_eq!(lit, near, "dot ({x}, {y})");
+    fn the_prism_is_drawn_alike_either_side_of_its_apex() {
+        for (cols, rows_) in [(6, 3), (8, 4), (16, 8)] {
+            for t in [0.0, 1.3, motion::SETTLED] {
+                let mut c = Canvas::new(cols, rows_);
+                draw(&mut c, t);
+                let g = grid(&c);
+                let apex = cols;
+                for (y, row) in g.iter().enumerate() {
+                    for x in 0..=apex.min(row.len().saturating_sub(1)) {
+                        let mirror = 2 * apex - x;
+                        assert_eq!(
+                            row[x],
+                            mirror < row.len() && row[mirror],
+                            "{cols}x{rows_} at {t}: dot ({x}, {y}) against ({mirror}, {y})"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    /// The glass has no hole: a dark dot inside the prism has every neighbour inside it
+    /// lit, so the half-tone never leaves two dark dots side by side, and the focal point
+    /// clears nothing round it.
+    #[test]
+    fn the_glass_has_no_hole() {
+        for (cols, rows_) in [(6, 3), (8, 4), (16, 8)] {
+            let mut c = Canvas::new(cols, rows_);
+            draw(&mut c, 0.0);
+            let g = grid(&c);
+            for (y, row) in g.iter().enumerate() {
+                for (x, &on) in row.iter().enumerate() {
+                    let (x, y) = (x as i64, y as i64);
+                    if on || !inside(cols, rows_, x, y) {
+                        continue;
+                    }
+                    for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                        if inside(cols, rows_, nx, ny) {
+                            assert!(
+                                g[ny as usize][nx as usize],
+                                "{cols}x{rows_}: dark ({x}, {y}) beside dark ({nx}, {ny})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The focal point is where the light gathers: its light draws the cell nearest it
+    /// toward white, and leaves the prism's corners as the spectrum colours them.
+    #[test]
+    fn the_light_gathers_at_the_focal_point() {
+        let c = Canvas::new(6, 3);
+        let prism = Prism::on(&c);
+        let lit = Light::at(0.0);
+        let unlit = Light {
+            glow: 0.0,
+            ..Light::at(0.0)
+        };
+        let cell = |light: &Light, col: usize, row: usize| {
+            let (left, top) = (col as f64 * 2.0, row as f64 * 4.0);
+            let dots = CELL.map(|(dx, dy)| {
+                let (x, y) = (left + dx, top + dy);
+                prism.part(x, y).map(|part| (x, y, part))
+            });
+            light.ink(&prism, top, &dots).unwrap().color
+        };
+        let from_white = |c: Rgb| {
+            let w = lit.white;
+            let d = |a: u8, b: u8| (f64::from(a) - f64::from(b)).powi(2);
+            (d(c.0, w.0) + d(c.1, w.1) + d(c.2, w.2)).sqrt()
+        };
+        let (focal, plain) = (cell(&lit, 3, 1), cell(&unlit, 3, 1));
+        assert!(
+            from_white(focal) + 10.0 < from_white(plain),
+            "{focal:?} against {plain:?}"
+        );
+        for (col, row) in [(0, 2), (5, 2)] {
+            assert_eq!(cell(&lit, col, row), cell(&unlit, col, row));
         }
     }
 
