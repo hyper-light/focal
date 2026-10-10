@@ -300,6 +300,10 @@ pub struct ReplicaProgress {
     /// Frames behind what was already stepped from their source (27 §12):
     /// stepped as they came, the core judging them.
     pub frames_stale: u64,
+    /// Frames that came, or were let go, while the replica's write was in
+    /// flight, and waited for it to be durable before they were stepped
+    /// (`WaitingFrame`): what was refused, and lost to its peer, before.
+    pub frames_waited: u64,
     /// Reports of a peer the owner already held for the core, and reports
     /// beyond the bound on peers held: the feedback is a hint about a
     /// peer, coalesced and never grown.
@@ -794,6 +798,22 @@ struct HeldFrame {
     message: Vec<u8>,
     pending: Pending,
 }
+/// A peer's frame due to be stepped while the replica's write was in flight
+/// (`Owner::waiting_frames`). Consensus takes no input until that write is
+/// durable, and refusing the frame lost it: the peer counted it lost, told
+/// its core this member was unreachable, and what it acknowledged waited for
+/// its next exchange — under load a follower lost two of five of its frames
+/// to its leader this way. It waits here, in the order frames came, and is
+/// stepped once the write is durable; answered then at the Ready fence as
+/// every peer frame is.
+struct WaitingFrame {
+    frame: HeldFrame,
+    /// An ordered frame: one not stepped is lost to its source's stream.
+    ordered: bool,
+    /// A frame let go past its patience or found stale: a loss, noted once
+    /// it is stepped (`Owner::lost_to`).
+    lost: bool,
+}
 /// One leader's appends as this replica took them (`Owner::append_streams`).
 /// An answer is judged when the log is durable, after frames stepped since;
 /// so a loss is kept as the place it left in the log, not as a moment.
@@ -820,6 +840,14 @@ enum Replication {
         source: u64,
         sequence: u64,
         until: u64,
+        deadline: u64,
+    },
+    /// Due to be stepped while the replica's write is in flight: waits for
+    /// it to be durable (`WaitingFrame`), answered at the Ready fence after.
+    Waiting {
+        source: u64,
+        ordered: bool,
+        lost: bool,
         deadline: u64,
     },
 }
@@ -901,6 +929,13 @@ struct Owner {
     /// A peer's bulk frames held for the ones they overtook, stepped in
     /// their order (`crate::resequence`).
     resequencer: crate::resequence::Resequencer<HeldFrame>,
+    /// Peers' frames due to be stepped while the replica's write was in
+    /// flight, in the order they came (`WaitingFrame`): stepped once it is
+    /// durable. Within the peers' reserve with those held and pending
+    /// (`Owner::pending_peers`).
+    waiting_frames: VecDeque<WaitingFrame>,
+    /// `ReplicaProgress::frames_waited`.
+    frames_waited: u64,
     /// `ReplicaProgress::appends_rejected`.
     appends_rejected: u64,
     /// `ReplicaProgress::appends_rejected_in_order`.
@@ -1054,6 +1089,7 @@ impl ReplicaHost {
                 frames_held: 0,
                 frames_let_go: 0,
                 frames_stale: 0,
+                frames_waited: 0,
                 appends_rejected: 0,
                 appends_rejected_in_order: 0,
                 peer_reports_coalesced: 0,
@@ -1127,6 +1163,8 @@ impl ReplicaHost {
             nonce: 0,
             ordered: std::collections::BTreeMap::new(),
             resequencer: crate::resequence::Resequencer::new(lane, LOST_PEERS),
+            waiting_frames: VecDeque::new(),
+            frames_waited: 0,
             appends_rejected: 0,
             appends_rejected_in_order: 0,
             append_streams: std::collections::BTreeMap::new(),
@@ -2271,6 +2309,9 @@ impl Owner {
             .map_err(|_| LedgerError::Failed)?;
         self.expire_pending();
         self.progress_evidence()?;
+        if self.step_waiting() {
+            self.drain_owed = true;
+        }
         if self.drain_owed || self.session.has_ready() {
             self.drain_with_runtime(self.stopping.is_none())?;
         }
@@ -2719,6 +2760,12 @@ impl Owner {
         if let Some((response, _)) = self.stopping.take() {
             let _ = response.send(Err(LedgerError::OutcomeUnknown));
         }
+        while let Some(waiting) = self.waiting_frames.pop_front() {
+            waiting
+                .frame
+                .pending
+                .finish(Response::Error(AccessError::OutcomeUnknown));
+        }
         while let Some(pending) = self.pending.pop_front() {
             let error = if matches!(
                 pending.waiting,
@@ -2750,6 +2797,7 @@ impl Owner {
                 frames_held: self.frames_held,
                 frames_let_go: self.frames_let_go,
                 frames_stale: self.frames_stale,
+                frames_waited: self.frames_waited,
                 appends_rejected: self.appends_rejected,
                 appends_rejected_in_order: self.appends_rejected_in_order,
                 peer_reports_coalesced: self.lost_coalesced,
@@ -2788,6 +2836,7 @@ impl Owner {
             .filter(|pending| matches!(pending.waiting, WaitingFor::PeerPersistence))
             .count()
             .saturating_add(self.resequencer.held())
+            .saturating_add(self.waiting_frames.len())
     }
     /// Pending participant requests: the queue less the peers'.
     fn pending_participants(&self) -> usize {
@@ -2846,6 +2895,20 @@ impl Owner {
                     .finish(Response::Error(AccessError::Unauthorized));
             }
         }
+        let count = self.waiting_frames.len();
+        for _ in 0..count {
+            let Some(waiting) = self.waiting_frames.pop_front() else {
+                break;
+            };
+            if member(waiting.frame.source) {
+                self.waiting_frames.push_back(waiting);
+            } else {
+                waiting
+                    .frame
+                    .pending
+                    .finish(Response::Error(AccessError::Unauthorized));
+            }
+        }
         self.ordered.retain(|peer, _| member(*peer));
         self.append_streams.retain(|peer, _| member(*peer));
     }
@@ -2856,16 +2919,52 @@ impl Owner {
     fn step_due(&mut self) {
         while let Some(held) = self.resequencer.take_due() {
             self.frames_let_go = self.frames_let_go.saturating_add(1);
-            let source = held.source;
-            self.step_held(held);
-            self.lost_to(source);
+            self.step_or_wait(WaitingFrame {
+                frame: held,
+                ordered: true,
+                lost: true,
+            });
         }
     }
     /// Step what was held behind the frame from `source` just stepped.
     fn step_ready(&mut self, source: u64) {
         while let Some(held) = self.resequencer.step_ready(source) {
-            self.step_held(held);
+            self.step_or_wait(WaitingFrame {
+                frame: held,
+                ordered: true,
+                lost: false,
+            });
         }
+    }
+    /// Whether a frame due now waits: the replica's write is in flight, or
+    /// frames that came before it wait already and it may not pass them.
+    fn must_wait(&self) -> bool {
+        self.session.persistence_pending() || !self.waiting_frames.is_empty()
+    }
+    /// Step a frame now, or keep it, in its order, for the replica's write
+    /// in flight to be durable (`WaitingFrame`).
+    fn step_or_wait(&mut self, frame: WaitingFrame) {
+        if self.must_wait() {
+            self.frames_waited = self.frames_waited.saturating_add(1);
+            self.waiting_frames.push_back(frame);
+        } else {
+            self.step_frame(frame);
+        }
+    }
+    /// Step the frames that waited for the replica's write, in the order
+    /// they came, now that consensus takes input again; answered at the
+    /// Ready fence of the drain that follows, as every peer frame is.
+    /// Whether any was stepped.
+    fn step_waiting(&mut self) -> bool {
+        let mut stepped = false;
+        while !self.session.persistence_pending() {
+            let Some(frame) = self.waiting_frames.pop_front() else {
+                break;
+            };
+            self.step_frame(frame);
+            stepped = true;
+        }
+        stepped
     }
     /// Admit a peer's frame: authorized, within the peers' reserve, and
     /// stepped — now, with what was held behind it, or held itself for
@@ -2926,6 +3025,17 @@ impl Owner {
             self.sent_ordered(node_id);
             self.step_due();
         }
+        // Consensus takes no input while the replica's write is in flight,
+        // and a frame stepped then was refused and lost to its peer: it
+        // waits for the write instead, behind any that wait already.
+        if self.must_wait() {
+            return Ok(Replication::Waiting {
+                source: node_id,
+                ordered: order.is_some(),
+                lost: late,
+                deadline,
+            });
+        }
         if let Err(error) = self.session.step_authenticated(node_id, message) {
             // An ordered frame not stepped is lost to this log as much as
             // one that never came: the appends behind it are refused.
@@ -2949,21 +3059,33 @@ impl Owner {
         // behind the exact Ready fence, including async writes.
         Ok(Replication::Stepped(deadline))
     }
-    /// Step a held frame: answered at the Ready fence as every peer frame
-    /// is, or refused as its step was.
-    fn step_held(&mut self, held: HeldFrame) {
-        let HeldFrame {
-            source,
-            message,
-            mut pending,
-        } = held;
+    /// Step a frame that was held or waited: answered at the Ready fence
+    /// as every peer frame is, or refused as its step was. A loss is noted
+    /// once the frame is stepped (`Owner::lost_to`); an ordered frame not
+    /// stepped is one.
+    fn step_frame(&mut self, frame: WaitingFrame) {
+        let WaitingFrame {
+            frame:
+                HeldFrame {
+                    source,
+                    message,
+                    mut pending,
+                },
+            ordered,
+            lost,
+        } = frame;
         match self.session.step_authenticated(source, &message) {
             Ok(()) => {
                 pending.waiting = WaitingFor::PeerPersistence;
                 self.pending.push_back(pending);
+                if lost {
+                    self.lost_to(source);
+                }
             }
             Err(error) => {
-                self.lost_to(source);
+                if ordered {
+                    self.lost_to(source);
+                }
                 pending.finish(Response::Error(access(error)));
             }
         }
@@ -3033,6 +3155,44 @@ impl Owner {
                     // A lane that was full let what it held go, this frame
                     // with it.
                     self.step_due();
+                }
+                Ok(Replication::Waiting {
+                    source,
+                    ordered,
+                    lost,
+                    deadline,
+                }) => {
+                    let (_, request) = verified.into_parts();
+                    let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                        request.operation
+                    else {
+                        let mut header = header;
+                        header.result = Response::Error(AccessError::Unavailable);
+                        let _ = response.send(finish_response(header, charge));
+                        return;
+                    };
+                    self.frames_waited = self.frames_waited.saturating_add(1);
+                    self.waiting_frames.push_back(WaitingFrame {
+                        frame: HeldFrame {
+                            source,
+                            message,
+                            pending: Pending {
+                                header,
+                                response,
+                                waiting: WaitingFor::PeerPersistence,
+                                term: self.session.scalars().term,
+                                deadline,
+                                _charge: charge,
+                            },
+                        },
+                        ordered,
+                        lost,
+                    });
+                    // What the resequencer held behind it follows it, in its
+                    // order.
+                    if ordered {
+                        self.step_ready(source);
+                    }
                 }
                 Err(error) => {
                     let mut header = header;
@@ -3811,6 +3971,9 @@ impl Owner {
         self.drain_with_runtime(true)
     }
     fn drain_with_runtime(&mut self, drive_runtime: bool) -> Result<(), LedgerError> {
+        // Frames that waited for the last write go into the Ready this drain
+        // takes, and are answered at its fence.
+        self.step_waiting();
         // The batch's drain, whatever its poll makes of it: a write still in
         // flight answers its frames when it is (`Owner::drain_owed`).
         self.drain_owed = false;
@@ -3878,6 +4041,11 @@ impl Owner {
         self.resolve(&events)?;
         self.send(&events.messages)?;
         self.poll_snapshot_feedback()?;
+        // The write is durable: what waited for it is stepped now, and owes
+        // the drain that answers it.
+        if self.step_waiting() {
+            self.drain_owed = true;
+        }
         self.publish_progress(false);
         Ok(())
     }
@@ -4557,6 +4725,26 @@ impl Owner {
             } else {
                 self.pending.push_back(pending);
             }
+        }
+        // A frame that waited for a write past its deadline is given up, a
+        // loss to its source's stream as a frame not stepped is; those
+        // behind it keep their order.
+        let count = self.waiting_frames.len();
+        for _ in 0..count {
+            let Some(waiting) = self.waiting_frames.pop_front() else {
+                break;
+            };
+            if now < waiting.frame.pending.deadline && !waiting.frame.pending.response.is_closed() {
+                self.waiting_frames.push_back(waiting);
+                continue;
+            }
+            if waiting.ordered {
+                self.lost_to(waiting.frame.source);
+            }
+            waiting
+                .frame
+                .pending
+                .finish(Response::Error(AccessError::OutcomeUnknown));
         }
     }
 }

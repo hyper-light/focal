@@ -186,6 +186,7 @@ pub struct SessionCounters {
     pub frames_held: u64,
     pub frames_let_go: u64,
     pub frames_stale: u64,
+    pub frames_waited: u64,
     pub replication_dropped: u64,
     pub peer_reports_coalesced: u64,
     pub peer_reports_dropped: u64,
@@ -205,6 +206,7 @@ impl SessionCounters {
             frames_held: progress.frames_held,
             frames_let_go: progress.frames_let_go,
             frames_stale: progress.frames_stale,
+            frames_waited: progress.frames_waited,
             replication_dropped: progress.dropped_replication,
             peer_reports_coalesced: progress.peer_reports_coalesced,
             peer_reports_dropped: progress.peer_reports_dropped,
@@ -214,7 +216,7 @@ impl SessionCounters {
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 13] {
+    fn fields(&self) -> [u64; 14] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -222,6 +224,7 @@ impl SessionCounters {
             self.frames_held,
             self.frames_let_go,
             self.frames_stale,
+            self.frames_waited,
             self.replication_dropped,
             self.peer_reports_coalesced,
             self.peer_reports_dropped,
@@ -251,6 +254,7 @@ impl SessionCounters {
         self.frames_held = sum(self.frames_held, other.frames_held);
         self.frames_let_go = sum(self.frames_let_go, other.frames_let_go);
         self.frames_stale = sum(self.frames_stale, other.frames_stale);
+        self.frames_waited = sum(self.frames_waited, other.frames_waited);
         self.replication_dropped = sum(self.replication_dropped, other.replication_dropped);
         self.peer_reports_coalesced =
             sum(self.peer_reports_coalesced, other.peer_reports_coalesced);
@@ -1331,6 +1335,11 @@ impl MetricsSnapshot {
                 "focal_sessions_frames_stale_total",
                 "Frames behind what was already stepped from their source.",
                 totals.frames_stale,
+            ),
+            (
+                "focal_sessions_frames_waited_total",
+                "Frames that waited for their replica's write in flight to be durable before they were stepped.",
+                totals.frames_waited,
             ),
             (
                 "focal_sessions_replication_dropped_total",

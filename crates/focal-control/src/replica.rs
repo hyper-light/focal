@@ -403,6 +403,12 @@ impl ControlReplica {
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
+    /// Whether the replica's write or checkpoint is in flight: consensus
+    /// takes no input until it is durable (`DurableNode::persistence_pending`),
+    /// and what is due to be stepped then waits for it.
+    pub fn persistence_pending(&self) -> bool {
+        self.node.persistence_pending()
+    }
     /// The request that holds this owner's one proposal, if one does:
     /// another is refused `Busy` until it is decided, and an owner that
     /// serves callers keeps theirs until then instead of handing them the

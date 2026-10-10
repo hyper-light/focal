@@ -327,6 +327,10 @@ struct HeldControlFrame {
     response: oneshot::Sender<Completed>,
     charge: Allocation,
 }
+/// The most frames that wait for a write in flight (`waiting_frames`): what
+/// the resequencer may hold, every source's whole window.
+const WAITING_FRAMES: usize =
+    focal_consensus::DEFAULT_INFLIGHT_WINDOW.saturating_mul(crate::fleet::LOST_PEERS);
 struct Pending {
     header: ResponseEnvelope,
     response: oneshot::Sender<Completed>,
@@ -377,6 +381,12 @@ struct Owner<V> {
     /// A peer's bulk frames held for the ones they overtook, stepped in
     /// their order (`crate::resequence`).
     resequencer: crate::resequence::Resequencer<HeldControlFrame>,
+    /// Peers' frames due to be stepped while the replica's write or
+    /// checkpoint was in flight, in the order they came: consensus takes no
+    /// input until it is durable, and a frame stepped then was refused and
+    /// lost to its peer. Stepped once it is (`step_waiting`), never more
+    /// than the resequencer itself may hold (`WAITING_FRAMES`).
+    waiting_frames: VecDeque<HeldControlFrame>,
     /// Held frames stepped since the last drain, answered once it has run.
     stepped: Vec<(ResponseEnvelope, oneshot::Sender<Completed>, Allocation)>,
     /// `ControlProgress::appends_rejected`, `frames_held`, `frames_let_go`
@@ -712,6 +722,7 @@ impl ControlHost {
                 crate::fleet::LOST_PEERS,
             ),
             stepped: Vec::new(),
+            waiting_frames: VecDeque::new(),
             appends_rejected: 0,
             frames_held: 0,
             frames_let_go: 0,
@@ -1402,9 +1413,43 @@ impl<V: AuthorityVerifier> Owner<V> {
             self.step_held(held);
         }
     }
-    /// Step a held frame; it is answered once the drain that follows has
-    /// run (`answer_stepped`), or refused now as its step was.
+    /// Whether a frame due now waits: the replica's write or checkpoint is
+    /// in flight, or frames that came before it wait already and it may not
+    /// pass them.
+    fn must_wait(&self) -> bool {
+        self.replica.persistence_pending() || !self.waiting_frames.is_empty()
+    }
+    /// Step a held frame now, or keep it, in its order, for the write in
+    /// flight; refused for the room past `WAITING_FRAMES`.
     fn step_held(&mut self, held: HeldControlFrame) {
+        if !self.must_wait() {
+            self.step_frame(held);
+        } else if self.waiting_frames.len() < WAITING_FRAMES {
+            self.waiting_frames.push_back(held);
+        } else {
+            let mut header = held.header;
+            header.result = Response::Error(AccessError::Capacity);
+            let _ = held.response.send(Completed {
+                response: header,
+                _input: held.charge,
+                _output: None,
+            });
+        }
+    }
+    /// Step the frames that waited for the write, in the order they came,
+    /// now that consensus takes input again; answered by the drain under
+    /// way (`answer_stepped`).
+    fn step_waiting(&mut self) {
+        while !self.replica.persistence_pending() {
+            let Some(frame) = self.waiting_frames.pop_front() else {
+                break;
+            };
+            self.step_frame(frame);
+        }
+    }
+    /// Step a frame; it is answered once the drain that follows has run
+    /// (`answer_stepped`), or refused now as its step was.
+    fn step_frame(&mut self, held: HeldControlFrame) {
         let HeldControlFrame {
             source,
             message,
@@ -1460,6 +1505,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         );
         let mut peer_accepted = false;
         let mut held: Option<(u64, u64, u64)> = None;
+        let mut waits: Option<(u64, bool)> = None;
         let peer_rpc = matches!(
             verified.request().operation,
             Operation::Raft { .. } | Operation::RaftOrdered { .. }
@@ -1538,6 +1584,13 @@ impl<V: AuthorityVerifier> Owner<V> {
                         Ok(crate::resequence::Admission::Step) => {}
                     }
                     self.step_due();
+                }
+                // Consensus takes no input while the replica's write or
+                // checkpoint is in flight: the frame waits for it, behind any
+                // that wait already, and is never refused for it.
+                if self.must_wait() {
+                    waits = Some((node_id, order.is_some()));
+                    return Err(ControlFailure::Invalid);
                 }
                 self.replica
                     .step_authenticated(node_id, message)
@@ -1761,6 +1814,36 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
             }
         })();
+        if let Some((source, ordered)) = waits {
+            let (_, request) = verified.into_parts();
+            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                request.operation
+            else {
+                let mut header = header;
+                header.result = Response::Error(AccessError::Unavailable);
+                let _ = response.send(Completed {
+                    response: header,
+                    _input: charge,
+                    _output: None,
+                });
+                return;
+            };
+            self.step_held(HeldControlFrame {
+                source,
+                message,
+                header,
+                response,
+                charge,
+            });
+            // What the resequencer held behind it follows it, in its order.
+            if ordered {
+                self.step_ready(source);
+            }
+            if self.drain().is_err() {
+                self.answer_stepped(false);
+            }
+            return;
+        }
         if let Some((source, sequence, until)) = held {
             // Held for the frame it overtook: answered once it is stepped
             // and the drain that follows has run.
@@ -1878,11 +1961,30 @@ impl<V: AuthorityVerifier> Owner<V> {
             )
     }
     fn drain(&mut self) -> Result<(), ControlError> {
-        // Frames held past their patience go first, in their order; the
+        // Frames that waited for a write in flight go first, in the order
+        // they came; then frames held past their patience, in theirs; the
         // lanes of members the replica no longer accepts are closed and
         // what they held refused (27 §12).
+        self.step_waiting();
         if self.resequencer.expire(self.pace.periods()).is_ok() {
             self.step_due();
+        }
+        let count = self.waiting_frames.len();
+        for _ in 0..count {
+            let Some(frame) = self.waiting_frames.pop_front() else {
+                break;
+            };
+            if self.replica.accepts_peer(frame.source) {
+                self.waiting_frames.push_back(frame);
+                continue;
+            }
+            let mut header = frame.header;
+            header.result = Response::Error(AccessError::Unauthorized);
+            let _ = frame.response.send(Completed {
+                response: header,
+                _input: frame.charge,
+                _output: None,
+            });
         }
         let mut gone = Vec::new();
         if self

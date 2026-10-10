@@ -212,6 +212,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
             crate::fleet::LOST_PEERS,
         ),
         stepped: Vec::new(),
+        waiting_frames: std::collections::VecDeque::new(),
         appends_rejected: 0,
         frames_held: 0,
         frames_let_go: 0,
