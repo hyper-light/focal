@@ -392,6 +392,7 @@ impl Rounds {
             }
             let stretched = host.stretched();
             let refused = host.refused_periods();
+            let input = host.input_refusals();
             let longest = u64::try_from(host.longest_period().as_millis()).unwrap_or(u64::MAX);
             aggregates.longest_period_ms = aggregates.longest_period_ms.max(longest);
             let (counters, flagged) = host.observe(|progress| {
@@ -412,7 +413,7 @@ impl Rounds {
                 up(&mut aggregates.custody_pending, custody);
                 up(&mut aggregates.importing, importing);
                 (
-                    SessionCounters::of(progress, refused),
+                    SessionCounters::of(progress, refused, input),
                     progress.stopped
                         || progress.leader == 0
                         || stretched

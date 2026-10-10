@@ -187,6 +187,11 @@ pub struct SessionCounters {
     pub frames_let_go: u64,
     pub frames_stale: u64,
     pub frames_waited: u64,
+    /// What the session turned away for room (`pace::InputRefusals`).
+    pub frames_refused: u64,
+    pub requests_refused: u64,
+    pub frames_dropped: u64,
+    pub requests_dropped: u64,
     pub replication_dropped: u64,
     pub peer_reports_coalesced: u64,
     pub peer_reports_dropped: u64,
@@ -198,7 +203,11 @@ pub struct SessionCounters {
 impl SessionCounters {
     /// A replica's counts, read in place, and the periods its owner was
     /// refused.
-    pub fn of(progress: &crate::fleet::ReplicaProgress, refused_periods: u64) -> Self {
+    pub(crate) fn of(
+        progress: &crate::fleet::ReplicaProgress,
+        refused_periods: u64,
+        input: crate::pace::InputRefusals,
+    ) -> Self {
         Self {
             peers_unreachable: progress.peers_unreachable,
             appends_rejected: progress.appends_rejected,
@@ -207,6 +216,10 @@ impl SessionCounters {
             frames_let_go: progress.frames_let_go,
             frames_stale: progress.frames_stale,
             frames_waited: progress.frames_waited,
+            frames_refused: input.frames_refused,
+            requests_refused: input.requests_refused,
+            frames_dropped: input.frames_dropped,
+            requests_dropped: input.requests_dropped,
             replication_dropped: progress.dropped_replication,
             peer_reports_coalesced: progress.peer_reports_coalesced,
             peer_reports_dropped: progress.peer_reports_dropped,
@@ -216,7 +229,7 @@ impl SessionCounters {
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 14] {
+    fn fields(&self) -> [u64; 18] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -225,6 +238,10 @@ impl SessionCounters {
             self.frames_let_go,
             self.frames_stale,
             self.frames_waited,
+            self.frames_refused,
+            self.requests_refused,
+            self.frames_dropped,
+            self.requests_dropped,
             self.replication_dropped,
             self.peer_reports_coalesced,
             self.peer_reports_dropped,
@@ -255,6 +272,10 @@ impl SessionCounters {
         self.frames_let_go = sum(self.frames_let_go, other.frames_let_go);
         self.frames_stale = sum(self.frames_stale, other.frames_stale);
         self.frames_waited = sum(self.frames_waited, other.frames_waited);
+        self.frames_refused = sum(self.frames_refused, other.frames_refused);
+        self.requests_refused = sum(self.requests_refused, other.requests_refused);
+        self.frames_dropped = sum(self.frames_dropped, other.frames_dropped);
+        self.requests_dropped = sum(self.requests_dropped, other.requests_dropped);
         self.replication_dropped = sum(self.replication_dropped, other.replication_dropped);
         self.peer_reports_coalesced =
             sum(self.peer_reports_coalesced, other.peer_reports_coalesced);
@@ -1340,6 +1361,26 @@ impl MetricsSnapshot {
                 "focal_sessions_frames_waited_total",
                 "Frames that waited for their replica's write in flight to be durable before they were stepped.",
                 totals.frames_waited,
+            ),
+            (
+                "focal_sessions_frames_refused_total",
+                "Peers' frames a hosted session refused for room before it queued them, its queue or memory full: each lost to its peer.",
+                totals.frames_refused,
+            ),
+            (
+                "focal_sessions_requests_refused_total",
+                "Participants' requests a hosted session refused for room before it queued them, its queue or memory full.",
+                totals.requests_refused,
+            ),
+            (
+                "focal_sessions_frames_dropped_total",
+                "Peers' frames the fleet's scheduler dropped at a session's quota once queued.",
+                totals.frames_dropped,
+            ),
+            (
+                "focal_sessions_requests_dropped_total",
+                "Participants' requests the fleet's scheduler dropped at a session's quota once queued.",
+                totals.requests_dropped,
             ),
             (
                 "focal_sessions_replication_dropped_total",

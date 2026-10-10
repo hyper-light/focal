@@ -527,7 +527,10 @@ impl GroupOwner {
         // These scheduler byte quotas cover metadata only. Routed requests
         // already retain their payload reservation in the actual tenant/node
         // ingress hierarchy; charging their heap again would double-count it.
-        let _ = self.scheduler.enqueue(metadata, Some(routed), 0);
+        let frame = matches!(metadata.class, WorkClass::Apply);
+        if self.scheduler.enqueue(metadata, Some(routed), 0).is_err() {
+            owner.pace.drop_input(frame);
+        }
         Ok(())
     }
     fn input(&mut self, input: FleetInput) -> Result<bool, LedgerError> {

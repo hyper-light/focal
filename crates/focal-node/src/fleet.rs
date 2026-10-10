@@ -1257,6 +1257,10 @@ impl ReplicaHost {
     pub fn refused_periods(&self) -> u64 {
         self.pace.refused()
     }
+    /// What the session turned away for room (`InputRefusals`).
+    pub(crate) fn input_refusals(&self) -> crate::pace::InputRefusals {
+        self.pace.input_refusals()
+    }
     /// Periods in one election timeout of this replica.
     pub fn election_periods(&self) -> u64 {
         u64::try_from(self.pace.election_tick()).unwrap_or(u64::MAX)
@@ -1782,6 +1786,7 @@ impl ReplicaHost {
             },
             amount,
         ) else {
+            self.pace.refuse_input(replication);
             return OwnedResponse::new(full);
         };
         let (send, receive) = oneshot::channel();
@@ -1797,7 +1802,10 @@ impl ReplicaHost {
             Ok(()) => receive
                 .await
                 .unwrap_or_else(|_| OwnedResponse::new(unknown)),
-            Err(HostQueueError::Full) => OwnedResponse::new(full),
+            Err(HostQueueError::Full) => {
+                self.pace.refuse_input(replication);
+                OwnedResponse::new(full)
+            }
             Err(HostQueueError::Disconnected) => OwnedResponse::new(closed),
         }
     }

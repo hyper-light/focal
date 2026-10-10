@@ -50,6 +50,26 @@ struct TickShared {
     quorum_tail_ns: AtomicU64,
     /// The last derivation as one value, for observers.
     derived: Mutex<Option<focal_timing::TickPace>>,
+    /// What the session turned away for room, counted where it was turned
+    /// away (`InputRefusals`): beside its periods because its host and its
+    /// owner, on threads of their own, both turn input away and both hold
+    /// this, and the node's metrics read it in place.
+    frames_refused: AtomicU64,
+    requests_refused: AtomicU64,
+    frames_dropped: AtomicU64,
+    requests_dropped: AtomicU64,
+}
+/// What a session turned away for room, of peers' frames and participants'
+/// requests apart: refused by its host before it was queued — its queue or
+/// its memory full — and dropped by its fleet's scheduler at its quota once
+/// queued. A peer counts a refused frame lost; a dropped one it asks again
+/// once, then counts lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InputRefusals {
+    pub(crate) frames_refused: u64,
+    pub(crate) requests_refused: u64,
+    pub(crate) frames_dropped: u64,
+    pub(crate) requests_dropped: u64,
 }
 /// When this process began, for the owners' periods to be timed against.
 fn began() -> std::time::Instant {
@@ -169,6 +189,34 @@ impl TickPeriod {
     /// The period passed without a tick.
     pub(crate) fn refuse(&self) {
         self.0.refused.fetch_add(1, Ordering::Relaxed);
+    }
+    /// The host refused a peer's frame (`frame`) or a participant's request
+    /// for room before it was queued.
+    pub(crate) fn refuse_input(&self, frame: bool) {
+        let counter = if frame {
+            &self.0.frames_refused
+        } else {
+            &self.0.requests_refused
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    /// The fleet's scheduler dropped a peer's frame (`frame`) or a
+    /// participant's request at its quota once queued.
+    pub(crate) fn drop_input(&self, frame: bool) {
+        let counter = if frame {
+            &self.0.frames_dropped
+        } else {
+            &self.0.requests_dropped
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn input_refusals(&self) -> InputRefusals {
+        InputRefusals {
+            frames_refused: self.0.frames_refused.load(Ordering::Relaxed),
+            requests_refused: self.0.requests_refused.load(Ordering::Relaxed),
+            frames_dropped: self.0.frames_dropped.load(Ordering::Relaxed),
+            requests_dropped: self.0.requests_dropped.load(Ordering::Relaxed),
+        }
     }
     pub(crate) fn refused(&self) -> u64 {
         self.0.refused.load(Ordering::Relaxed)

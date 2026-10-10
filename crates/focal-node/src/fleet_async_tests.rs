@@ -748,3 +748,75 @@ async fn the_only_stopped_session_past_the_first_512_shows_in_the_first_round() 
         rounds.kept().1,
     );
 }
+
+/// A session whose write is in flight is handed no work: what comes for it
+/// waits in its queue, a participant's within the participants' share, and
+/// what finds no room is refused — counted where it was refused, a
+/// participant's request apart from a peer's frame (`InputRefusals`), never
+/// a silent drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_counts_it() {
+    let path = tempfile::tempdir().unwrap();
+    let fixture = fixture(path.path(), 1);
+    settle(&fixture).await;
+    let host = fixture.hosts[&ledger(1)].clone();
+    let write = |id: u128| RequestEnvelope {
+        request_id: RequestId::from_u128(id),
+        ..envelope(
+            1,
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        )
+    };
+    let lease = blocker(&fixture.wal);
+    let (resume, disk) = pause(lease);
+    // One write takes the session's write out; the paused writer holds it.
+    let mut observation = host.progress.clone();
+    observation.borrow_and_update();
+    let mut answers = Vec::new();
+    let first = host.clone();
+    answers.push(tokio::spawn(async move {
+        dispatch(&first, peer(), write(100), &ReplicaHost::wire_limits()).await
+    }));
+    let steps = TICK * (2 * crate::test_waits::STEP);
+    crate::test_waits::within(&[&host], steps, TICK, observation.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    // The participants' share of the session's queue, and one more.
+    let queue = ReplicaConfig::new(RootCommandId::from_u128(119)).queue_items;
+    let share = queue - queue / 4;
+    for id in 0..=share {
+        let host = host.clone();
+        let request = write(200 + id as u128);
+        answers.push(tokio::spawn(async move {
+            dispatch(&host, peer(), request, &ReplicaHost::wire_limits()).await
+        }));
+    }
+    let refused = crate::test_waits::within(&[&host], steps, TICK, async {
+        while host.input_refusals().requests_refused == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    resume.send(()).unwrap();
+    drop(disk.join().unwrap());
+    let mut capacity = 0;
+    for answer in answers {
+        if matches!(
+            answer.await.unwrap().result,
+            Response::Error(AccessError::Capacity)
+        ) {
+            capacity += 1;
+        }
+    }
+    let counted = host.input_refusals();
+    drop(host);
+    shutdown(fixture).await;
+    refused.unwrap();
+    assert_eq!(capacity, 1, "one write found no room");
+    assert_eq!(counted.requests_refused, 1, "and was counted");
+    assert_eq!(counted.frames_refused, 0);
+    assert_eq!(counted.requests_dropped, 0);
+}
