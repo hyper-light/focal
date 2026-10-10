@@ -4407,7 +4407,8 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
     let others = {
         let (remote, answered) = (remote.clone(), answered.clone());
         tokio::spawn(async move {
-            for id in 1_000.. {
+            // Until the test aborts it: a bound the test never reaches.
+            for id in 1_000..=u128::MAX {
                 remote
                     .request_within(&other(id), UNREAD_PERIOD)
                     .await

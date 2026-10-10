@@ -170,10 +170,7 @@ impl<T> Resequencer<T> {
     /// The one before it was lost, and the frames are stepped as they came.
     pub fn expire(&mut self, now: u64) -> Result<(), Capacity> {
         for lane in self.lanes.values_mut() {
-            loop {
-                let Some((&oldest, held)) = lane.held.iter().next() else {
-                    break;
-                };
+            while let Some((&oldest, held)) = lane.held.iter().next() {
                 if held.until > now && oldest != lane.expected {
                     break;
                 }

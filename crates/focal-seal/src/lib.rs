@@ -52,7 +52,7 @@ const SEAL_BYTES: usize = MAGIC.len() + 16 + 4 + KEYS * ENTRY + HASH;
 /// a page's 128 slots at 4 KiB pages hold them several times over.
 pub fn key_slots() -> usize {
     focal_platform::memory_page_bytes()
-        .map_or(4096, |page| page)
+        .unwrap_or(4096)
         .checked_div(32)
         .unwrap_or(128)
 }

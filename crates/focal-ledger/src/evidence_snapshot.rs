@@ -315,7 +315,7 @@ impl Session {
                 break;
             }
         }
-        objects.sort_by(|left, right| left.artifact.id.cmp(&right.artifact.id));
+        objects.sort_by_key(|left| left.artifact.id);
         if objects
             .windows(2)
             .any(|pair| pair.first().map(|e| e.artifact.id) == pair.get(1).map(|e| e.artifact.id))

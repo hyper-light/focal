@@ -2,7 +2,7 @@
 name = "focal-compare"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 description = "Open-loop tail-latency comparison of durable replicated appends (docs/qualification/competitive-p99.md); a measurement tool, never shipped."

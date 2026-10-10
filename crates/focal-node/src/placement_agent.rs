@@ -763,8 +763,10 @@ impl PlacementAgent {
             return Vec::new();
         };
         bytes
-            .chunks_exact(16)
-            .filter_map(|chunk| <[u8; 16]>::try_from(chunk).ok().map(PartitionId))
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|chunk| PartitionId(*chunk))
             .collect()
     }
     fn store_pending_retires(&self, ids: &[PartitionId]) -> Result<(), AgentError> {
@@ -1462,15 +1464,15 @@ impl PlacementAgent {
             match record.liveness {
                 // Alive is the default; the first committed verdict is a death.
                 None if alive => continue,
-                None => {}
-                Some(current) => {
+                Some(current)
                     if member.incarnation < current.incarnation
-                        || (member.incarnation == current.incarnation && current.alive == alive)
-                        || now < current.decided_at
-                    {
-                        continue;
-                    }
+                        || (member.incarnation == current.incarnation
+                            && current.alive == alive)
+                        || now < current.decided_at =>
+                {
+                    continue;
                 }
+                None | Some(_) => {}
             }
             verdict = Some(PartitionOperation::Liveness {
                 node: *node,

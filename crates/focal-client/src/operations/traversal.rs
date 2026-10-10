@@ -99,7 +99,7 @@ impl TraversalDocument {
                 bytes
                     .try_reserve_exact(text.len() / 2)
                     .map_err(|_| InputError::Capacity)?;
-                for pair in text.as_bytes().chunks_exact(2) {
+                for pair in text.as_bytes().as_chunks::<2>().0 {
                     let pair = std::str::from_utf8(pair)
                         .map_err(|_| InputError::Invalid("traversal cursor"))?;
                     bytes.push(

@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust
-        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy
         shell: bash
       - name: Install protoc
         shell: bash

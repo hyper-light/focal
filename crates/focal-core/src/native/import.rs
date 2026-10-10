@@ -408,7 +408,7 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     let meta = out.meta;
     out.push(Key::Meta, Row::Meta(Box::new(meta)))?;
     let Rows { mut rows, .. } = out;
-    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    rows.sort_unstable_by_key(|a| a.0);
     if rows
         .windows(2)
         .any(|pair| matches!(pair, [a, b] if a.0 == b.0))

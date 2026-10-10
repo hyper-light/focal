@@ -651,7 +651,7 @@ fn hex_bytes(text: &str) -> Result<Vec<u8>, DriveError> {
     decoded
         .try_reserve_exact(bytes.len() / 2)
         .map_err(|_| InputError::Capacity)?;
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let (Some(high), Some(low)) = (pair.first(), pair.get(1)) else {
             return Err(InputError::Invalid("list cursor").into());
         };

@@ -104,7 +104,9 @@ fn native_identity_matches_fixed_vector_excludes_own_id_and_distinguishes_occurr
     let original = build(spec(&relations));
     let preimage: Vec<_> = PREIMAGE
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     let expected = ContentHash(blake3::derive_key(

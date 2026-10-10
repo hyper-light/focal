@@ -285,10 +285,10 @@ pub(super) fn claim(
                     return Err(invalid());
                 }
             }
-            NativeEventKind::Imported(legacy) => {
-                if event.invocation != NativeInvocation::Import || legacy.0 == 0 {
-                    return Err(invalid());
-                }
+            NativeEventKind::Imported(legacy)
+                if (event.invocation != NativeInvocation::Import || legacy.0 == 0) =>
+            {
+                return Err(invalid());
             }
             _ => (),
         }

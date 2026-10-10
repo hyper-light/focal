@@ -9,7 +9,7 @@
 # Base images from Docker's official images' ECR Public mirror, by the same
 # digests as Docker Hub's: its anonymous pull limit, shared by the runners,
 # refused pulls mid-comparison.
-FROM public.ecr.aws/docker/library/rust:1.94.1-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS build
+FROM public.ecr.aws/docker/library/rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
 RUN apk add --no-cache build-base protoc bash perl linux-headers
 WORKDIR /src
 COPY . .

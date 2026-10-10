@@ -345,7 +345,7 @@ fn all_29_original_commands_keep_their_revision_target() {
         None,                           // ExpireMonitor
         None,                           // RecordFencedValidationVerdict
     ];
-    for (round, rows) in commands.chunks_exact(29).enumerate() {
+    for (round, rows) in commands.as_chunks::<29>().0.iter().enumerate() {
         if round == 1 {
             expected[2] = Some(ClaimId::from_u128(1000));
         }
@@ -446,7 +446,9 @@ fn hex_bytes(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0);
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }

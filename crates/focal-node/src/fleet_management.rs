@@ -66,7 +66,9 @@ pub enum FleetError {
 /// reconcile with inspect/retry_install before opening another logical WAL lease.
 pub struct FleetInstallFailure {
     pub error: FleetError,
-    pub replica: Option<FleetReplica>,
+    /// The candidate handed back, as it went to the owner: boxed, a
+    /// session being large.
+    pub replica: Option<Box<FleetReplica>>,
 }
 impl std::fmt::Debug for FleetInstallFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -374,7 +376,7 @@ impl FleetManager {
             Err(error) => {
                 return Err(FleetInstallFailure {
                     error,
-                    replica: Some(replica),
+                    replica: Some(Box::new(replica)),
                 });
             }
         };
@@ -391,7 +393,7 @@ impl FleetManager {
                 mpsc::TrySendError::Disconnected(input) => (FleetError::Unavailable, input),
             };
             let replica = match input {
-                FleetInput::Management(ManagementWork::Install { replica, .. }) => Some(*replica),
+                FleetInput::Management(ManagementWork::Install { replica, .. }) => Some(replica),
                 _ => None,
             };
             return Err(FleetInstallFailure { error, replica });

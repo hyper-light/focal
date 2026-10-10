@@ -1,5 +1,5 @@
 {
-  "musl_image": "rust:1.94.1-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08",
+  "musl_image": "rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f",
   "include": [
     {"target": "aarch64-apple-darwin", "runner": "macos-15", "asset": "focal-macos-arm64", "musl": false, "runtime": "macOS 15 or later"},
     {"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "asset": "focal-macos-x64", "musl": false, "runtime": "macOS 15 or later"},

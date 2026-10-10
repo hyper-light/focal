@@ -106,10 +106,7 @@ pub fn lineage(
     let mut ancestors = Vec::new();
     let mut ancestors_beyond = None;
     let mut ancestors_missing = None;
-    loop {
-        let Cause::Claim(parent) = cause else {
-            break;
-        };
+    while let Cause::Claim(parent) = cause {
         if ancestors.len() >= LINEAGE_DEPTH {
             ancestors_beyond = Some(parent);
             break;

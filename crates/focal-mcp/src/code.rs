@@ -410,9 +410,11 @@ impl<T: ClientTransport> Driver<'_, T> {
             Mode::Run { run, input, now_ms } => {
                 let seed = blake3::derive_key(REFERENCE_CONTEXT, run.as_bytes());
                 let words: Vec<u32> = seed
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .take(4)
-                    .filter_map(|w| <[u8; 4]>::try_from(w).ok().map(u32::from_le_bytes))
+                    .map(|word| u32::from_le_bytes(*word))
                     .collect();
                 let input = serde_json::to_string(input).map_err(|e| e.to_string())?;
                 format!(

@@ -152,7 +152,9 @@ fn weighted_deficit_charges_work_cost_and_rotates_classes_without_starvation() {
     assert_eq!(served.iter().filter(|id| **id == tenant(2)).count(), 30);
     assert!(
         served
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|chunk| chunk[0] == tenant(1) && chunk[1..].iter().all(|id| *id == tenant(2)))
     );
 

@@ -671,7 +671,9 @@ fn fixed_delivery_vector_uses_independently_encoded_full_content_bytes() {
     );
     let preimage: Vec<_> = fixed
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     let expected = ContentHash(*blake3::hash(&preimage).as_bytes());

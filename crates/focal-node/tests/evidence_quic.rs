@@ -987,7 +987,7 @@ async fn evidence_scenario(managed: bool) {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+        b" \n\t\r"[(state >> 62) as usize]
     });
     let seal = upload(&fleet.replicas[leader].actor, 1, &bytes).await;
     let sealed = eventual(&fleet.replicas[leader].actor, &seal).await;
@@ -1303,7 +1303,7 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+        b" \n\t\r"[(state >> 62) as usize]
     });
     // The upload comes to the leader over the loopback; the seal waits for
     // the required copy on node 2, across its relay. The seal is asked
@@ -1433,7 +1433,7 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+        b" \n\t\r"[(state >> 62) as usize]
     });
     let mut second = first.clone();
     for byte in &mut second[SHARED_CHUNK..2 * SHARED_CHUNK] {

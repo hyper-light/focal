@@ -263,17 +263,9 @@ fn hex_bytes(value: &str) -> Result<Vec<u8>, BackendError> {
     bytes
         .try_reserve_exact(value.len() / 2)
         .map_err(|_| InputError::Capacity)?;
-    for pair in value.as_bytes().chunks_exact(2) {
-        let high = pair
-            .first()
-            .copied()
-            .and_then(digit)
-            .ok_or(InputError::Invalid("payload hexadecimal"))?;
-        let low = pair
-            .get(1)
-            .copied()
-            .and_then(digit)
-            .ok_or(InputError::Invalid("payload hexadecimal"))?;
+    for &[high, low] in value.as_bytes().as_chunks::<2>().0 {
+        let high = digit(high).ok_or(InputError::Invalid("payload hexadecimal"))?;
+        let low = digit(low).ok_or(InputError::Invalid("payload hexadecimal"))?;
         bytes.push(
             high.checked_mul(16)
                 .and_then(|n| n.checked_add(low))

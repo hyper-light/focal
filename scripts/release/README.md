@@ -72,7 +72,7 @@ Users without Python can verify the conventional checksum file with
 The native runner labels follow [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 The Alpine compiler image comes from the [official Rust image](https://hub.docker.com/_/rust).
 The exact multi-platform index reference is
-`rust:1.94.1-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08`,
+`rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f`,
 also recorded in `platforms.json`; update that digest with the pinned Rust version.
 Artifact
 actions use the published [upload v4.6.2](https://github.com/actions/upload-artifact/releases/tag/v4.6.2)

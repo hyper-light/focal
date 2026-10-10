@@ -272,7 +272,7 @@ async fn candidate_validation_and_retained_reply_capacity_bound_admission() {
     invalid.config.queue_items = 1;
     let failure = fleet.manager.install(1, invalid).await.err().unwrap();
     assert_eq!(failure.error, FleetError::InvalidSession);
-    let mut valid = failure.replica.unwrap();
+    let mut valid = *failure.replica.unwrap();
     valid.config.queue_items = 8;
     let delivered = fleet.manager.install(1, valid).await.unwrap();
     assert!(
@@ -478,7 +478,7 @@ async fn committed_placement_witness_waits_for_apply_and_route_changes_close_sta
         .err()
         .unwrap();
     assert_eq!(stale.error, FleetError::InvalidSession);
-    let mut candidate = stale.replica.unwrap();
+    let mut candidate = *stale.replica.unwrap();
     candidate.config.route_epoch = RouteEpoch(2);
     let replacement = {
         let installed = fleet.manager.install(3, candidate).await.unwrap();

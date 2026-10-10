@@ -421,15 +421,13 @@ impl Invitation {
             return Err(EnrollmentError::Capacity);
         }
         let mut bytes = Zeroizing::new(Vec::with_capacity(text.len() / 2));
-        for pair in text.as_bytes().chunks_exact(2) {
+        for pair in text.as_bytes().as_chunks::<2>().0 {
             let digit = |v: u8| match v {
                 b'0'..=b'9' => Ok(v.saturating_sub(b'0')),
                 b'a'..=b'f' => Ok(v.saturating_sub(b'a').saturating_add(10)),
                 _ => Err(EnrollmentError::Invalid),
             };
-            let [high, low] = pair else {
-                return Err(EnrollmentError::Invalid);
-            };
+            let [high, low] = pair;
             bytes.push((digit(*high)? << 4) | digit(*low)?);
         }
         let data = InvitationData::decode_any(&bytes)?;

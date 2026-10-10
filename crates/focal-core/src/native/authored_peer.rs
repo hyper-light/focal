@@ -30,11 +30,11 @@ fn citation(content: &ClaimDescriptor, visits: &mut VisitBudget) -> Result<Citat
                 cited.challenge = Some(ClaimId(target.id.0));
             }
             (RelationKind::Invalidates, _) => return Err(ContractError::InvalidTarget.into()),
-            (RelationKind::Reviews, RelationTarget::Evidence(evidence)) => {
-                if cited.evidence.replace(*evidence).is_some() {
-                    // One correction rests on exactly one cited verdict.
-                    return Err(ContractError::InvalidTarget.into());
-                }
+            (RelationKind::Reviews, RelationTarget::Evidence(evidence))
+                if cited.evidence.replace(*evidence).is_some() =>
+            {
+                // One correction rests on exactly one cited verdict.
+                return Err(ContractError::InvalidTarget.into());
             }
             _ => {}
         }
