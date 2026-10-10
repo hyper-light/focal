@@ -557,6 +557,35 @@ impl Text {
         let _ = writeln!(self.out, " {value}");
     }
 }
+/// How long the WAL's group commits took to be durable, as a histogram in
+/// seconds: each bucket counts the commits within its bound and every bound
+/// below it, as Prometheus histograms do, and the last every commit.
+fn render_syncs(text: &mut Text, syncs: &focal_log::SyncLatency) {
+    const NAME: &str = "focal_wal_sync_seconds";
+    text.header(
+        NAME,
+        "histogram",
+        "Each group commit, from its data's sync to its commit frame's and a fence installed with it.",
+    );
+    let bucket = format!("{NAME}_bucket");
+    let mut within = 0u64;
+    for (bound, count) in focal_log::SYNC_BOUNDS_MICROS.iter().zip(syncs.buckets) {
+        within = within.saturating_add(count);
+        text.labeled(&bucket, &[("le", &seconds(*bound))], within);
+    }
+    let count = syncs.count();
+    text.labeled(&bucket, &[("le", "+Inf")], count);
+    let _ = writeln!(text.out, "{NAME}_sum {}", seconds(syncs.sum_micros));
+    let _ = writeln!(text.out, "{NAME}_count {count}");
+}
+/// Microseconds as seconds, exactly: whole seconds, a point and six places.
+fn seconds(micros: u64) -> String {
+    format!(
+        "{}.{:06}",
+        micros.checked_div(1_000_000).unwrap_or(0),
+        micros.checked_rem(1_000_000).unwrap_or(0)
+    )
+}
 /// The node log's counts under the shell (doc 27 §15.10).
 fn render_log(text: &mut Text, log: &LogMetrics) {
     text.counter(
@@ -822,6 +851,7 @@ impl MetricsSnapshot {
                 "Bytes of the frames written again at the tail.",
                 wal.relocated_bytes,
             );
+            render_syncs(&mut text, &wal.syncs);
         }
         text.gauge(
             "focal_fleet_installed",
@@ -1008,6 +1038,28 @@ impl MetricsSnapshot {
             "Peer requests lost or of unknown outcome.",
             self.peers.lost,
         );
+        text.header(
+            "focal_peer_messages_lost_by_cause_total",
+            "counter",
+            "Peer requests lost, by what the peer answered: refused for room, an outcome it could not say on any attempt, refused otherwise; or no answer, lost on the way.",
+        );
+        let answered = self
+            .peers
+            .lost_refused
+            .saturating_add(self.peers.lost_unknown)
+            .saturating_add(self.peers.lost_rejected);
+        for (cause, lost) in [
+            ("refused", self.peers.lost_refused),
+            ("unknown", self.peers.lost_unknown),
+            ("rejected", self.peers.lost_rejected),
+            ("unanswered", self.peers.lost.saturating_sub(answered)),
+        ] {
+            text.labeled(
+                "focal_peer_messages_lost_by_cause_total",
+                &[("cause", cause)],
+                lost,
+            );
+        }
         text.counter(
             "focal_peer_messages_busy_total",
             "Peer requests refused at the pool's bound.",
@@ -1782,6 +1834,9 @@ mod tests {
             peers: PeerPoolStats {
                 delivered: 4,
                 lost: 0,
+                lost_refused: 0,
+                lost_unknown: 0,
+                lost_rejected: 0,
                 busy: 0,
                 dials: 1,
                 refused_unreachable: 0,
@@ -1861,6 +1916,46 @@ mod tests {
         }
         assert!(!text.contains("focal_log_commit_wait_nanoseconds{"));
         assert!(!text.contains("focal_wal_"));
+    }
+    /// A node on focal-log exports how long its group commits took to be
+    /// durable as a histogram — each bucket counts the commits within its
+    /// bound and every bound below it, the last every commit — and every
+    /// node why its peer requests were lost, the unanswered being the rest.
+    #[test]
+    fn a_node_on_focal_log_exports_its_commits_syncs_and_its_losses_by_cause() {
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let mut sample = snapshot(budget.stats());
+        let mut syncs = focal_log::SyncLatency::default();
+        syncs.buckets[0] = 3;
+        syncs.buckets[2] = 2;
+        syncs.buckets[focal_log::SYNC_BUCKETS - 1] = 1;
+        syncs.sum_micros = 1_250_300;
+        sample.storage = Some(StorageMetrics::Wal(focal_log::WalWriterStats {
+            group_commits: 6,
+            syncs,
+            ..Default::default()
+        }));
+        sample.peers.lost = 7;
+        sample.peers.lost_refused = 1;
+        sample.peers.lost_unknown = 2;
+        sample.peers.lost_rejected = 1;
+        let text = sample.render();
+        for line in [
+            "# TYPE focal_wal_sync_seconds histogram\n",
+            "focal_wal_sync_seconds_bucket{le=\"0.000250\"} 3\n",
+            "focal_wal_sync_seconds_bucket{le=\"0.000500\"} 3\n",
+            "focal_wal_sync_seconds_bucket{le=\"0.001000\"} 5\n",
+            "focal_wal_sync_seconds_bucket{le=\"0.256000\"} 5\n",
+            "focal_wal_sync_seconds_bucket{le=\"+Inf\"} 6\n",
+            "focal_wal_sync_seconds_sum 1.250300\n",
+            "focal_wal_sync_seconds_count 6\n",
+            "focal_peer_messages_lost_by_cause_total{cause=\"refused\"} 1\n",
+            "focal_peer_messages_lost_by_cause_total{cause=\"unknown\"} 2\n",
+            "focal_peer_messages_lost_by_cause_total{cause=\"rejected\"} 1\n",
+            "focal_peer_messages_lost_by_cause_total{cause=\"unanswered\"} 3\n",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
     }
     /// The audit's F65: a session whose owner did not answer says so and
     /// carries no owner-side number — never a zero read as health.

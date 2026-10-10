@@ -84,6 +84,8 @@ pub struct WalWriterStats {
     /// at the tail.
     pub relocated_records: u64,
     pub relocated_bytes: u64,
+    /// How long its group commits took to be durable.
+    pub syncs: crate::SyncLatency,
 }
 
 /// The sole Arc owns channel shutdown and the thread join across independent
@@ -1445,6 +1447,7 @@ impl Writer {
                         indexed_records: self.index.records,
                         physical_bytes: self.index.physical_bytes,
                         live_bytes: self.index.live_bytes,
+                        syncs: self.wal.syncs,
                         ..self.stats
                     }));
                 }

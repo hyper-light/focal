@@ -252,6 +252,44 @@ pub struct Wal {
     committed_base: DurableBase,
     failed: bool,
     fault: Option<FaultPoint>,
+    /// How long each group commit took to be durable (`SyncLatency`).
+    syncs: SyncLatency,
+}
+
+/// The bounds of the buckets a group commit's durability is counted in, in microseconds: doubling from a
+/// quarter of a millisecond, which a local flash device's flush takes, to a quarter of a second, past which
+/// a commit is a stall whatever it took.
+pub const SYNC_BOUNDS_MICROS: [u64; 11] = [
+    250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000,
+];
+/// One bucket for each bound, and one for the rest.
+pub const SYNC_BUCKETS: usize = SYNC_BOUNDS_MICROS.len().saturating_add(1);
+/// How long group commits took to be durable — the batch's data synced, its commit frame written and synced,
+/// and a fence installed with it — each counted in the first bucket whose bound (`SYNC_BOUNDS_MICROS`) it is
+/// within, the last bucket taking the rest, with their sum. Fixed: it never grows with the commits counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncLatency {
+    pub buckets: [u64; SYNC_BUCKETS],
+    pub sum_micros: u64,
+}
+impl SyncLatency {
+    fn note(&mut self, took: std::time::Duration) {
+        let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        let bucket = SYNC_BOUNDS_MICROS
+            .iter()
+            .position(|bound| micros <= *bound)
+            .unwrap_or(SYNC_BOUNDS_MICROS.len());
+        if let Some(count) = self.buckets.get_mut(bucket) {
+            *count = count.saturating_add(1);
+        }
+        self.sum_micros = self.sum_micros.saturating_add(micros);
+    }
+    /// The group commits counted.
+    pub fn count(&self) -> u64 {
+        self.buckets
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    }
 }
 
 pub mod conversion;
@@ -429,6 +467,7 @@ impl Wal {
             committed_base: base,
             failed: false,
             fault: None,
+            syncs: SyncLatency::default(),
         })
     }
 
@@ -752,6 +791,7 @@ impl Wal {
     /// segments may then be removed).
     fn finish_append(&mut self) -> Result<DurablePosition, LogError> {
         self.fail_at(FaultPoint::AfterAppend)?;
+        let started = std::time::Instant::now();
         self.active.sync_data()?;
         self.fail_at(FaultPoint::AfterDataSync)?;
         let commit = self.write_commit()?;
@@ -760,6 +800,7 @@ impl Wal {
         if self.fence_due() {
             self.install_fence_here()?;
         }
+        self.syncs.note(started.elapsed());
         self.fail_at(FaultPoint::AfterFenceInstall)?;
         Ok(self.position)
     }
