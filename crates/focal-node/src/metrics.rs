@@ -501,17 +501,20 @@ fn escape(value: &str, out: &mut String) {
         }
     }
 }
+/// The page's text. The node's identity — its id, cluster, role, region,
+/// zone and capability — is one series, `focal_node_info`; every other
+/// series carries its own labels alone. Labels every series of a target
+/// shares are the target's, which the scraper attaches (Prometheus,
+/// "Instrumentation: things to watch out for", target labels): repeated on
+/// each line they were 73 bytes of every series, a quarter of a page whose
+/// size is one operator read, and a page at its widest fitted the series of
+/// two sessions of a three-node cluster.
 struct Text {
     out: String,
-    base: String,
 }
 impl Text {
-    fn new(labels: &MetricLabels, out: String) -> Self {
-        let mut base = String::new();
-        let _ = write!(base, "node=\"{}\",cluster=\"", labels.node);
-        escape(&labels.cluster, &mut base);
-        base.push('"');
-        Self { out, base }
+    fn new(out: String) -> Self {
+        Self { out }
     }
     fn header(&mut self, name: &str, kind: &str, help: &str) {
         let _ = writeln!(self.out, "# HELP {name} {help}");
@@ -519,11 +522,11 @@ impl Text {
     }
     fn gauge(&mut self, name: &str, help: &str, value: impl std::fmt::Display) {
         self.header(name, "gauge", help);
-        let _ = writeln!(self.out, "{name}{{{}}} {value}", self.base);
+        let _ = writeln!(self.out, "{name} {value}");
     }
     fn counter(&mut self, name: &str, help: &str, value: impl std::fmt::Display) {
         self.header(name, "counter", help);
-        let _ = writeln!(self.out, "{name}{{{}}} {value}", self.base);
+        let _ = writeln!(self.out, "{name} {value}");
     }
     /// A latency as a summary: its quantiles where any was timed, then its sum and count.
     fn summary(&mut self, name: &str, help: &str, latency: &LogLatency) {
@@ -537,17 +540,21 @@ impl Text {
                 self.labeled(name, &[("quantile", quantile)], value);
             }
         }
-        let _ = writeln!(self.out, "{name}_sum{{{}}} {}", self.base, latency.sum_ns);
-        let _ = writeln!(self.out, "{name}_count{{{}}} {}", self.base, latency.count);
+        let _ = writeln!(self.out, "{name}_sum {}", latency.sum_ns);
+        let _ = writeln!(self.out, "{name}_count {}", latency.count);
     }
-    fn labeled(&mut self, name: &str, extra: &[(&str, &str)], value: impl std::fmt::Display) {
-        let _ = write!(self.out, "{name}{{{}", self.base);
-        for (key, label) in extra {
-            let _ = write!(self.out, ",{key}=\"");
+    fn labeled(&mut self, name: &str, labels: &[(&str, &str)], value: impl std::fmt::Display) {
+        let _ = write!(self.out, "{name}");
+        for (position, (key, label)) in labels.iter().enumerate() {
+            let open = if position == 0 { '{' } else { ',' };
+            let _ = write!(self.out, "{open}{key}=\"");
             escape(label, &mut self.out);
             self.out.push('"');
         }
-        let _ = writeln!(self.out, "}} {value}");
+        if !labels.is_empty() {
+            self.out.push('}');
+        }
+        let _ = writeln!(self.out, " {value}");
     }
 }
 /// The node log's counts under the shell (doc 27 §15.10).
@@ -621,18 +628,21 @@ impl MetricsSnapshot {
     }
     /// The snapshot as Prometheus text, written into `out`.
     pub fn render_into(&self, out: String) -> String {
-        let mut text = Text::new(&self.labels, out);
+        let mut text = Text::new(out);
         text.header(
             "focal_node_info",
             "gauge",
-            "This node's identity and declared topology.",
+            "This node's identity and declared topology; the page's other series carry their own labels alone.",
         );
+        let node = self.labels.node.to_string();
         let region = self.labels.region.clone().unwrap_or_default();
         let zone = self.labels.zone.clone().unwrap_or_default();
         let capability = crate::upgrade::CAPABILITY_LEVEL.to_string();
         text.labeled(
             "focal_node_info",
             &[
+                ("node", node.as_str()),
+                ("cluster", self.labels.cluster.as_str()),
                 ("role", self.labels.role),
                 ("region", region.as_str()),
                 ("zone", zone.as_str()),
@@ -1836,19 +1846,18 @@ mod tests {
             flushing_ns: Some(250),
         }));
         let text = sample.render();
-        let base = "node=\"7\",cluster=\"ab\\\"cd\"";
         for line in [
-            format!("focal_log_frames_total{{{base}}} 3\n"),
-            format!("focal_log_updates_total{{{base}}} 4\n"),
-            format!("focal_log_flushes_total{{{base}}} 3\n"),
-            "# TYPE focal_log_flush_nanoseconds summary\n".to_string(),
-            format!("focal_log_flush_nanoseconds{{{base},quantile=\"0.99\"}} 1200\n"),
-            format!("focal_log_flush_nanoseconds_sum{{{base}}} 4000\n"),
-            format!("focal_log_flush_nanoseconds_count{{{base}}} 4\n"),
-            format!("focal_log_commit_wait_nanoseconds_count{{{base}}} 0\n"),
-            format!("focal_log_flushing_nanoseconds{{{base}}} 250\n"),
+            "focal_log_frames_total 3\n",
+            "focal_log_updates_total 4\n",
+            "focal_log_flushes_total 3\n",
+            "# TYPE focal_log_flush_nanoseconds summary\n",
+            "focal_log_flush_nanoseconds{quantile=\"0.99\"} 1200\n",
+            "focal_log_flush_nanoseconds_sum 4000\n",
+            "focal_log_flush_nanoseconds_count 4\n",
+            "focal_log_commit_wait_nanoseconds_count 0\n",
+            "focal_log_flushing_nanoseconds 250\n",
         ] {
-            assert!(text.contains(&line), "missing {line}");
+            assert!(text.contains(line), "missing {line}");
         }
         assert!(!text.contains("focal_log_commit_wait_nanoseconds{"));
         assert!(!text.contains("focal_wal_"));
@@ -1866,29 +1875,14 @@ mod tests {
         sample.sessions.push(silent);
         sample.sessions_unobserved = 1;
         let text = sample.render();
-        let base = "node=\"7\",cluster=\"ab\\\"cd\"";
-        assert!(text.contains(&format!(
-            "focal_metrics_collection_milliseconds{{{base}}} 3\n"
-        )));
-        assert!(text.contains(&format!("focal_metrics_sessions_unobserved{{{base}}} 1\n")));
-        assert!(text.contains(&format!(
-            "focal_session_observed{{{base},tenant=\"t\",session=\"s\"}} 1\n"
-        )));
-        assert!(text.contains(&format!(
-            "focal_session_observed{{{base},tenant=\"t\",session=\"u\"}} 0\n"
-        )));
-        assert!(text.contains(&format!(
-            "focal_session_leader{{{base},tenant=\"t\",session=\"u\"}} 3\n"
-        )));
-        assert!(text.contains(&format!(
-            "focal_session_applied_index{{{base},tenant=\"t\",session=\"s\"}} 7\n"
-        )));
-        assert!(!text.contains(&format!(
-            "focal_session_applied_index{{{base},tenant=\"t\",session=\"u\"}}"
-        )));
-        assert!(!text.contains(&format!(
-            "focal_session_apply_lag{{{base},tenant=\"t\",session=\"u\"}}"
-        )));
+        assert!(text.contains("focal_metrics_collection_milliseconds 3\n"));
+        assert!(text.contains("focal_metrics_sessions_unobserved 1\n"));
+        assert!(text.contains("focal_session_observed{tenant=\"t\",session=\"s\"} 1\n"));
+        assert!(text.contains("focal_session_observed{tenant=\"t\",session=\"u\"} 0\n"));
+        assert!(text.contains("focal_session_leader{tenant=\"t\",session=\"u\"} 3\n"));
+        assert!(text.contains("focal_session_applied_index{tenant=\"t\",session=\"s\"} 7\n"));
+        assert!(!text.contains("focal_session_applied_index{tenant=\"t\",session=\"u\"}"));
+        assert!(!text.contains("focal_session_apply_lag{tenant=\"t\",session=\"u\"}"));
         assert_eq!(
             MetricsPage::new(sample.clone(), &budget).unwrap().text,
             text
@@ -1959,8 +1953,11 @@ mod tests {
         drop(silent);
         server.abort();
     }
+    /// The node's identity is one series, its labels escaped; every other
+    /// series carries its own labels alone, the target's being the scraper's
+    /// to attach (`Text`).
     #[test]
-    fn the_text_carries_fixed_labels_escapes_them_and_derives_lags() {
+    fn the_node_info_carries_the_identity_once_and_every_series_its_own_labels() {
         let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
         let _held = budget
             .reserve(
@@ -1979,17 +1976,18 @@ mod tests {
             "focal_node_info{{node=\"7\",cluster=\"ab\\\"cd\",role=\"founder\",region=\"eu-a\",zone=\"\",capability=\"{}\"}} 1",
             crate::upgrade::CAPABILITY_LEVEL
         )));
-        assert!(text.contains(&format!(
-            "focal_memory_used_bytes{{node=\"7\",cluster=\"ab\\\"cd\"}} {used}"
-        )));
-        assert!(
-            text.contains("focal_peer_messages_delivered_total{node=\"7\",cluster=\"ab\\\"cd\"} 4")
+        assert_eq!(
+            text.lines()
+                .filter(|line| !line.starts_with('#') && line.contains("node=\""))
+                .count(),
+            1,
+            "the identity is on one series"
         );
-        assert!(text.contains(
-            "focal_session_apply_lag{node=\"7\",cluster=\"ab\\\"cd\",tenant=\"t\",session=\"s\"} 2"
-        ));
+        assert!(text.contains(&format!("\nfocal_memory_used_bytes {used}\n")));
+        assert!(text.contains("\nfocal_peer_messages_delivered_total 4\n"));
+        assert!(text.contains("\nfocal_session_apply_lag{tenant=\"t\",session=\"s\"} 2\n"));
         assert!(!text.contains("focal_session_retention_floor{"));
-        assert!(text.contains("focal_upgrade_announced_level{node=\"7\",cluster=\"ab\\\"cd\"} 1"));
+        assert!(text.contains("\nfocal_upgrade_announced_level 1\n"));
         assert!(text.ends_with('\n'));
     }
 }

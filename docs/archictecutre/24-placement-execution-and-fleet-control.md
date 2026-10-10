@@ -1790,9 +1790,14 @@ upgrade fence (§21) — and publishes through a `watch` the admin socket
 reads (`OperatorRead::Metrics` → `AdminResult::Metrics { text }`, CLI
 `inspect node --metrics` printing the text as it is, MCP
 `diagnose.node.metrics`). Rendering is Prometheus text exposition (version
-0.0.4) with `# HELP`/`# TYPE` per series and fixed labels on every sample
-(`node`, `cluster`; `focal_node_info` carries `role`, `region`, `zone` and
-`capability`); label values are escaped. Nothing is sampled on a caller's
+0.0.4) with `# HELP`/`# TYPE` per series. The node's identity is one series,
+`focal_node_info{node, cluster, role, region, zone, capability}`; every other
+series carries its own labels alone (a session's `tenant` and `session`, a
+peer's `peer`), and a scraper attaches its target's labels to them, as
+Prometheus asks of labels every series of a target shares (2026-10-10:
+repeated on each sample, `node` and `cluster` were a quarter of a page one
+operator read carries, and a page at its widest fitted the series of two
+sessions of a three-node cluster; now seven). Label values are escaped. Nothing is sampled on a caller's
 behalf: a read serves the latest page, so a scraper's cadence never drives
 owner work. Every listed replica is asked at once and the round closes at
 the cadence (2026-09-29, the audit's F65): an owner that is refused at its

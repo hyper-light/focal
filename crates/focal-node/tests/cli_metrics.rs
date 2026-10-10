@@ -142,25 +142,42 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
         )),
         "{text}"
     );
+    // The node's identity is on `focal_node_info` alone; a series carries its
+    // own labels, or none.
+    assert_eq!(
+        text.lines()
+            .filter(|line| !line.starts_with('#') && line.contains("node=\""))
+            .count(),
+        1,
+        "{text}"
+    );
+    let has = |text: &str, name: &str| {
+        text.lines().any(|line| {
+            line.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+        })
+    };
     for series in [
-        "focal_memory_used_bytes{",
-        "focal_memory_limit_bytes{",
-        "focal_disk_outstanding_bytes{",
-        "focal_wal_appended_records_total{",
-        "focal_fleet_installed{",
-        "focal_root_applied_index{",
-        "focal_peer_messages_delivered_total{",
-        "focal_liveness_members{",
-        "focal_upgrade_fence_level{",
-        "focal_upgrade_announced_level{",
-        "focal_placement_installed{",
-        "focal_admission_tenants{",
-        "# TYPE focal_session_apply_lag gauge",
+        "focal_memory_used_bytes",
+        "focal_memory_limit_bytes",
+        "focal_disk_outstanding_bytes",
+        "focal_wal_appended_records_total",
+        "focal_fleet_installed",
+        "focal_root_applied_index",
+        "focal_peer_messages_delivered_total",
+        "focal_liveness_members",
+        "focal_upgrade_fence_level",
+        "focal_upgrade_announced_level",
+        "focal_placement_installed",
+        "focal_admission_tenants",
     ] {
-        assert!(text.contains(series), "missing {series}: {text}");
+        assert!(has(&text, series), "missing {series}: {text}");
     }
+    assert!(
+        text.contains("# TYPE focal_session_apply_lag gauge"),
+        "{text}"
+    );
     assert!(text.contains(&format!("session=\"{session}\"")), "{text}");
-    assert!(text.contains("focal_upgrade_fence_level{") && text.contains("} 0\n"));
     assert!(text.ends_with('\n'));
     // The loopback endpoint serves the same exposition to GET /metrics, and
     // nothing else.
@@ -188,5 +205,5 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // A second scrape still answers after the refused ones.
     let (head, body) = http(&listen, "GET /metrics HTTP/1.0\r\n\r\n");
     assert!(head.starts_with("HTTP/1.0 200 OK"), "{head}");
-    assert!(body.contains("focal_metrics_sampled_milliseconds{"));
+    assert!(has(&body, "focal_metrics_sampled_milliseconds"), "{body}");
 }
