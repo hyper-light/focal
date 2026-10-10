@@ -920,15 +920,16 @@ dependencies = [
  "focal-memory",
  "focal-model",
  "focal-native-client",
+ "focal-rt",
  "focal-wire",
  "getrandom 0.3.4",
+ "hyper-rt",
  "rquickjs",
  "serde",
  "serde-saphyr",
  "serde_json",
  "tempfile",
  "thiserror",
- "tokio",
 ]
 
 [[package]]

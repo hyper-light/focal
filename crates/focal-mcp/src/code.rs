@@ -16,8 +16,8 @@ use focal_client::operations::{ApplicationResult, CodeCall, CodeOutcome, Operati
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use rquickjs::{Context, Function, Runtime};
 use serde_json::{Map, Value};
+use std::future::Future;
 use std::sync::mpsc;
-use tokio::sync::oneshot;
 
 pub(crate) const RUN: &str = "code.run";
 pub(crate) const SEARCH: &str = "code.search";
@@ -212,11 +212,10 @@ pub(crate) fn is_code(name: &str) -> bool {
     name == RUN || name == SEARCH
 }
 
-/// What a run executes against: the adapter's backend and runtime, the
-/// budget its sandbox and calls are charged to, and what it may call.
+/// What a run executes against: the adapter's backend, the budget its
+/// sandbox and calls are charged to, and what it may call.
 pub(crate) struct Host<'a, T: ClientTransport> {
     pub backend: &'a mut Backend<T>,
-    pub runtime: &'a tokio::runtime::Runtime,
     pub budget: &'a MemoryBudget,
     pub registry: &'a Registry,
     pub limits: CodeLimits,
@@ -226,15 +225,17 @@ pub(crate) struct Host<'a, T: ClientTransport> {
 /// moved into the interrupt hook, and the calls the program makes run with a
 /// signal of their own that never fires (cancellation stops the program at
 /// its next hook call, after the call in flight ends at its own bound).
-pub(crate) fn execute<T: ClientTransport>(
+pub(crate) async fn execute<T: ClientTransport>(
     host: Host<'_, T>,
     call: &mut ToolCall,
-    cancel: &mut oneshot::Receiver<()>,
+    cancel: &mut crate::Cancel,
 ) -> ApplicationResult {
     let limits = host.limits;
-    let (_quiet, quiet) = oneshot::channel();
-    let signal = std::mem::replace(cancel, quiet);
     let mut calls = Vec::new();
+    let Ok((_quiet, quiet)) = hyper_rt::sync::oneshot() else {
+        return result(failed("capacity", "no cell for the run's signal"), calls);
+    };
+    let signal = std::mem::replace(cancel, quiet);
     let outcome = match Request::parse(&call.tool, &mut call.arguments, limits) {
         Err(detail) => failed("argument", detail),
         Ok(request) => match host.budget.reserve(
@@ -248,15 +249,24 @@ pub(crate) fn execute<T: ClientTransport>(
             Err(_) => failed("capacity", "no memory for a sandbox"),
             Ok(reservation) => {
                 let _reservation = reservation.commit();
-                let driven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut driver = Driver {
-                        host,
-                        request: &request,
-                        calls: &mut calls,
-                    };
-                    driver.run(signal)
-                }));
-                driven.unwrap_or_else(|_| failed("dependency", "the engine unwound"))
+                let mut driver = Driver {
+                    host,
+                    request: &request,
+                    calls: &mut calls,
+                };
+                // An unwind out of the engine, at any of its steps, ends the run typed.
+                let mut run = std::pin::pin!(driver.run(signal));
+                std::future::poll_fn(|context| {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run.as_mut().poll(context)
+                    })) {
+                        Ok(poll) => poll,
+                        Err(_) => {
+                            std::task::Poll::Ready(failed("dependency", "the engine unwound"))
+                        }
+                    }
+                })
+                .await
             }
         },
     };
@@ -348,7 +358,7 @@ struct Driver<'a, T: ClientTransport> {
     calls: &'a mut Vec<CodeCall>,
 }
 impl<T: ClientTransport> Driver<'_, T> {
-    fn run(&mut self, mut signal: oneshot::Receiver<()>) -> CodeOutcome {
+    async fn run(&mut self, mut signal: crate::Cancel) -> CodeOutcome {
         let Ok(engine) = Runtime::new() else {
             return failed("dependency", "no engine");
         };
@@ -357,7 +367,7 @@ impl<T: ClientTransport> Driver<'_, T> {
         let (stops, stopped) = mpsc::sync_channel::<Stop>(1);
         let mut left = self.host.limits.work;
         engine.set_interrupt_handler(Some(Box::new(move || {
-            if !matches!(signal.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+            if !matches!(signal.try_recv(), Ok(None)) {
                 let _ = stops.try_send(Stop::Cancelled);
                 return true;
             }
@@ -398,7 +408,7 @@ impl<T: ClientTransport> Driver<'_, T> {
                 Err(_) => return stop(&stopped, failed("heap", "the call queue failed")),
             };
             let Some(next) = next else { break };
-            if let Err(outcome) = self.call(&context, &next) {
+            if let Err(outcome) = self.call(&context, &next).await {
                 return stop(&stopped, outcome);
             }
         }
@@ -450,7 +460,7 @@ impl<T: ClientTransport> Driver<'_, T> {
     }
 
     /// One queued call: `[id, name, input]` as JSON text.
-    fn call(&mut self, context: &Context, next: &str) -> Result<(), CodeOutcome> {
+    async fn call(&mut self, context: &Context, next: &str) -> Result<(), CodeOutcome> {
         let parsed = crate::json::parse(next.as_bytes(), self.host.limits.tree)
             .map_err(|_| failed("argument", "a call's input passes the tree bound"))?;
         let Value::Array(parts) = parsed else {
@@ -510,11 +520,9 @@ impl<T: ClientTransport> Driver<'_, T> {
                 .map_err(|_| failed("capacity", "no memory for a call"))?
                 .commit();
             let mut inner = ToolCall::nested(name.clone(), arguments, allocation);
-            let (_quiet, mut quiet) = oneshot::channel();
-            let result = self
-                .host
-                .backend
-                .execute(self.host.runtime, &mut inner, &mut quiet);
+            let (_quiet, mut quiet) = hyper_rt::sync::oneshot()
+                .map_err(|_| failed("capacity", "no cell for a call's signal"))?;
+            let result = self.host.backend.execute(&mut inner, &mut quiet).await;
             self.calls.push(CodeCall {
                 tool: name,
                 condition: result.condition.clone(),

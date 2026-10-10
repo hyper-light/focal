@@ -16,7 +16,7 @@ mod catalog_admin;
 mod catalog_native;
 mod catalog_transfer;
 mod catalog_watch;
-pub use admin::{AdminAction, AdminBackend, AdminChange, AdminError};
+pub use admin::{AdminAction, AdminBackend, AdminChange, AdminError, AdminFuture};
 mod catalog;
 mod code;
 mod codec;
@@ -31,7 +31,7 @@ mod stdio_tests;
 #[cfg(test)]
 mod tests;
 
-pub use backend::{Backend, JournalError, NativeJournal};
+pub use backend::{Backend, Cancel, JournalError, NativeJournal};
 pub use codec::{EncodedFrame, FrameDecoder, InputFrame};
 pub use protocol::{Action, CallToken, Protocol, ServerInfo, Tool, ToolCall};
 pub use stdio::{ServeError, run_code, serve};

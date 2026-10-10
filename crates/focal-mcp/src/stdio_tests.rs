@@ -20,7 +20,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
 
 const OPERATION_ID: &str = "000000000000000000000000000000ab";
 /// How long a wait may see no progress before it is over: a wedge, not
@@ -28,7 +27,19 @@ const OPERATION_ID: &str = "000000000000000000000000000000ab";
 const FROZEN: Duration = Duration::from_secs(60);
 struct Observed {
     request: RequestEnvelope,
-    response: oneshot::Sender<Result<ResponseEnvelope, WireError>>,
+    response: hyper_rt::sync::OneshotSender<Result<ResponseEnvelope, WireError>>,
+    /// Disconnected once the backend's wait for the response is gone: answered, or dropped as its
+    /// call was cancelled.
+    waiting: mpsc::Receiver<()>,
+}
+impl Observed {
+    /// Whether the backend no longer waits for this response.
+    fn abandoned(&self) -> bool {
+        matches!(
+            self.waiting.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        )
+    }
 }
 struct Controlled {
     requests: mpsc::SyncSender<Observed>,
@@ -40,13 +51,18 @@ impl ClientTransport for Controlled {
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            let (response, receive) = oneshot::channel();
+            let (response, receive) =
+                hyper_rt::sync::oneshot().map_err(|_| WireError::Connection)?;
+            let (alive, waiting) = mpsc::sync_channel::<()>(1);
             self.requests
                 .send(Observed {
                     request: request.clone(),
                     response,
+                    waiting,
                 })
                 .map_err(|_| WireError::Connection)?;
+            // Held for the wait's life: its drop tells the test the wait is gone.
+            let _alive = alive;
             receive.await.map_err(|_| WireError::Connection)?
         })
     }
@@ -277,7 +293,7 @@ fn pending_mutation_keeps_control_responsive_cancel_suppressed_and_restart_retri
         .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}));
     // The server's threads report no period: the wedge window bounds it.
     let deadline = Instant::now() + FROZEN;
-    while !pending.response.is_closed() {
+    while !pending.abandoned() {
         assert!(Instant::now() < deadline, "backend request did not cancel");
         thread::sleep(Duration::from_millis(2));
     }
@@ -398,7 +414,7 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     // EOF cancels the pending backend call: the shutdown is clean (`stop`
     // refuses the bounded one, which would have waited for it).
     reopened.stop();
-    assert!(pending.response.is_closed());
+    assert!(pending.abandoned());
     let store = OperationStore::open(&path, StoreLimits::default()).unwrap();
     let journal = store.open_existing(OPERATION_ID, &context()).unwrap();
     assert_eq!(journal.next_request().unwrap(), Some(&saved));

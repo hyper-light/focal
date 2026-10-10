@@ -2,7 +2,7 @@
 //! authenticated local backend; this hook cannot carry arbitrary wire commands.
 use focal_client::{admin::AdminResult, input::InputError};
 use serde::Deserialize;
-use tokio::{runtime::Runtime, sync::oneshot};
+use std::{future::Future, pin::Pin};
 
 #[derive(Debug, Clone, Copy)]
 pub enum AdminChange {
@@ -202,13 +202,15 @@ pub struct AdminError {
     pub condition: &'static str,
     pub detail: String,
 }
+/// What one administration action answers, awaited on the adapter's worker shard.
+pub type AdminFuture<'a> = Pin<Box<dyn Future<Output = Result<AdminResult, AdminError>> + 'a>>;
 pub trait AdminBackend: Send {
-    fn execute(
-        &mut self,
-        runtime: &Runtime,
+    /// `action`, its waits raced against `cancel`.
+    fn execute<'a>(
+        &'a mut self,
         action: AdminAction,
-        cancel: &mut oneshot::Receiver<()>,
-    ) -> Result<AdminResult, AdminError>;
+        cancel: &'a mut crate::Cancel,
+    ) -> AdminFuture<'a>;
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

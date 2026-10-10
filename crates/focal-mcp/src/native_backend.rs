@@ -1,12 +1,12 @@
 //! The native engine path of the MCP adapter. The engine probe runs once on
-//! the worker's runtime before the catalogue is built; on a native ledger
+//! the worker's shard before the catalogue is built; on a native ledger
 //! every application tool compiles its document through the shared driver,
 //! journals the exact frame under an `n1:` reference in this adapter's own
 //! journal and drives it to a committed receipt, a closed refusal or a
 //! pending outcome the recovery tools resolve. Results are acknowledged
 //! explicitly, as managed results are, so a reply lost between the adapter
 //! and the agent stays listed by `request.pending`.
-use super::{BackendError, bounded_json, cancelled, envelope, random_id};
+use super::{BackendError, Cancel, bounded_json, cancellable, cancelled, envelope, random_id};
 use crate::{Backend, ToolCall};
 use focal_client::input::InputError;
 use focal_client::native_store::{NativeOperation, NativeOperationId, NativeOperationStore};
@@ -17,8 +17,10 @@ use focal_client::{ClientError, ClientTransport};
 use focal_model::RequestId;
 use focal_native_client::{CompileLimits, DriveError, NativeContentProfile, Preparation};
 use focal_wire::*;
+use hyper_rt::combine::{Either, race2};
 use serde_json::Value;
-use tokio::{runtime::Runtime, sync::oneshot};
+use std::cell::Cell;
+use std::future::Future;
 
 /// How the host opens this adapter's native journal once the probe finds a
 /// native ledger. The host owns the directory layout and its markers.
@@ -36,6 +38,78 @@ pub(crate) struct Native {
     limits: CompileLimits,
 }
 
+/// The native driver's waits on this adapter's connection — reads, lists, submissions and the wait
+/// observer's pauses — each raced against the call's cancellation, which they share: a wait takes
+/// it from the cell for its time and gives it back however it ends. The driver makes them one at a
+/// time; a second wait at once would find the cell empty and be refused, typed.
+struct Waits<'a, 'b, T: ClientTransport> {
+    backend: &'a Backend<T>,
+    cancel: &'a Cell<Option<&'b mut Cancel>>,
+}
+/// The call's cancellation, taken from its cell for one wait and put back as the wait ends.
+struct Held<'a, 'b> {
+    cell: &'a Cell<Option<&'b mut Cancel>>,
+    cancel: Option<&'b mut Cancel>,
+}
+impl Drop for Held<'_, '_> {
+    fn drop(&mut self) {
+        self.cell.set(self.cancel.take());
+    }
+}
+impl<T: ClientTransport> Waits<'_, '_, T> {
+    async fn race<R>(
+        &self,
+        work: impl Future<Output = Result<R, DriveError>>,
+    ) -> Result<R, DriveError> {
+        let mut held = Held {
+            cell: self.cancel,
+            cancel: self.cancel.take(),
+        };
+        let cancel = held
+            .cancel
+            .as_deref_mut()
+            .ok_or(DriveError::Client(ClientError::Transport))?;
+        match race2(work, cancel).await {
+            Either::First(done) => done,
+            Either::Second(_) => Err(DriveError::Cancelled),
+        }
+    }
+}
+impl<T: ClientTransport> focal_native_client::Reads for Waits<'_, '_, T> {
+    async fn read(&mut self, read: NativeReadRequest) -> Result<NativeReadPage, DriveError> {
+        let request = envelope(self.backend.build.ledger, Operation::NativeRead(read))?;
+        self.race(async { Ok(self.backend.client.native_read(request).await?) })
+            .await
+    }
+}
+impl<T: ClientTransport> focal_native_client::Lists for Waits<'_, '_, T> {
+    async fn list(&mut self, list: NativeListRequest) -> Result<NativeListPage, DriveError> {
+        let request = envelope(self.backend.build.ledger, Operation::NativeList(list))?;
+        self.race(async { Ok(self.backend.client.native_list(request).await?) })
+            .await
+    }
+}
+impl<T: ClientTransport> focal_native_client::Submits for Waits<'_, '_, T> {
+    async fn submit(
+        &mut self,
+        request: RequestEnvelope,
+    ) -> Result<NativeMutationReply, DriveError> {
+        self.race(async { Ok(self.backend.client.submit_native(request).await?) })
+            .await
+    }
+}
+impl<T: ClientTransport> focal_native_client::Pause for Waits<'_, '_, T> {
+    async fn pause(&mut self, period: std::time::Duration) -> Result<(), DriveError> {
+        let nanos = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
+        self.race(async {
+            hyper_rt::futures::sleep(nanos)
+                .await
+                .map_err(|_| DriveError::Client(ClientError::Transport))
+        })
+        .await
+    }
+}
+
 impl<T: ClientTransport> Backend<T> {
     /// Register the native journal; the engine probe at startup decides
     /// whether it is opened. Without a registration the adapter never probes
@@ -44,13 +118,12 @@ impl<T: ClientTransport> Backend<T> {
         self.native_journal = Some(journal);
         self
     }
-    /// The engine probe. Runs on the worker's runtime because a remote
-    /// transport binds its endpoint to the first runtime that drives it.
-    pub(crate) fn detect(&mut self, runtime: &Runtime) -> Result<(), String> {
-        self.detect_inner(runtime)
-            .map_err(|error| error.to_string())
+    /// The engine probe. Runs on the worker's shard because a remote
+    /// transport binds its endpoint to the shard that first drives it.
+    pub(crate) async fn detect(&mut self) -> Result<(), String> {
+        self.detect_inner().await.map_err(|error| error.to_string())
     }
-    fn detect_inner(&mut self, runtime: &Runtime) -> Result<(), BackendError> {
+    async fn detect_inner(&mut self) -> Result<(), BackendError> {
         let Some(journal) = self.native_journal.take() else {
             return Ok(());
         };
@@ -61,18 +134,18 @@ impl<T: ClientTransport> Backend<T> {
         // identities in the wrong namespace, a fresh context keeps the V1
         // behaviour, whose startup never needed the network. A standing for
         // another principal is a misconfigured context.
-        let engine = runtime
-            .block_on(focal_client::operations::probe(
-                &self.client,
-                self.build.ledger,
-                RequestId(random_id()?),
-                journal.initialized(),
-                self.context.principal,
-            ))
-            .map_err(|error| match error {
-                ClientError::Configuration => BackendError::Configuration,
-                error => error.into(),
-            })?;
+        let engine = focal_client::operations::probe(
+            &self.client,
+            self.build.ledger,
+            RequestId(random_id()?),
+            journal.initialized(),
+            self.context.principal,
+        )
+        .await
+        .map_err(|error| match error {
+            ClientError::Configuration => BackendError::Configuration,
+            error => error.into(),
+        })?;
         if let Engine::Native(standing) = engine {
             let store = journal.open().map_err(BackendError::NativeJournal)?;
             self.native = Some(Native {
@@ -89,44 +162,25 @@ impl<T: ClientTransport> Backend<T> {
     fn native_ref(&self) -> Result<&Native, BackendError> {
         self.native.as_ref().ok_or(BackendError::Configuration)
     }
-    /// One blocking linearizable read on this adapter's connection; the
-    /// client's cancellation drops only the wait.
-    fn native_reads<'a>(
-        &'a self,
-        runtime: &'a Runtime,
-        cancel: &'a mut oneshot::Receiver<()>,
-    ) -> impl FnMut(NativeReadRequest) -> Result<NativeReadPage, DriveError> + 'a {
-        move |read| {
-            let request = envelope(self.build.ledger, Operation::NativeRead(read))?;
-            runtime.block_on(async {
-                tokio::select! {
-                    result = self.client.native_read(request) => Ok(result?),
-                    _ = &mut *cancel => Err(DriveError::Cancelled),
-                }
-            })
+    /// This adapter's waits for the native driver, raced against the shared cancellation.
+    fn waits<'a, 'b>(&'a self, cancel: &'a Cell<Option<&'b mut Cancel>>) -> Waits<'a, 'b, T> {
+        Waits {
+            backend: self,
+            cancel,
         }
     }
-    /// One blocking bounded list on this adapter's connection.
-    fn native_lists<'a>(
+    pub(super) fn native_call<'a>(
         &'a self,
-        runtime: &'a Runtime,
-        cancel: &'a mut oneshot::Receiver<()>,
-    ) -> impl FnMut(NativeListRequest) -> Result<NativeListPage, DriveError> + 'a {
-        move |list| {
-            let request = envelope(self.build.ledger, Operation::NativeList(list))?;
-            runtime.block_on(async {
-                tokio::select! {
-                    result = self.client.native_list(request) => Ok(result?),
-                    _ = &mut *cancel => Err(DriveError::Cancelled),
-                }
-            })
-        }
+        call: &'a mut ToolCall,
+        cancel: &'a mut Cancel,
+        operation_id: &'a mut Option<String>,
+    ) -> super::Branch<'a> {
+        Box::pin(self.native_call_inner(call, cancel, operation_id))
     }
-    pub(super) fn native_call(
+    async fn native_call_inner(
         &self,
-        runtime: &Runtime,
         call: &mut ToolCall,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
         operation_id: &mut Option<String>,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let native = self.native_ref()?;
@@ -179,16 +233,19 @@ impl<T: ClientTransport> Backend<T> {
                     return Err(InputError::Invalid("unsupported recovery argument").into());
                 }
                 if remote {
+                    let shared = Cell::new(Some(&mut *cancel));
                     let page = match native.store.key_of(id, &self.context) {
-                        Ok(key) => focal_native_client::outcome(
-                            key,
-                            &mut self.native_reads(runtime, cancel),
-                        )?,
-                        Err(_) => focal_native_client::outcome_by_id(
-                            self.context.principal,
-                            id.request(),
-                            &mut self.native_reads(runtime, cancel),
-                        )?,
+                        Ok(key) => {
+                            focal_native_client::outcome(key, &mut self.waits(&shared)).await?
+                        }
+                        Err(_) => {
+                            focal_native_client::outcome_by_id(
+                                self.context.principal,
+                                id.request(),
+                                &mut self.waits(&shared),
+                            )
+                            .await?
+                        }
                     };
                     // The wire layer validates the read reply's own envelope
                     // identity, but not that the outcome it carries is for the
@@ -219,7 +276,7 @@ impl<T: ClientTransport> Backend<T> {
                 }
                 let operation = native.store.retry(id, &self.context)?;
                 if call.tool == "request.retry" {
-                    return self.native_drive(runtime, native, operation, cancel);
+                    return self.native_drive(native, operation, cancel).await;
                 }
                 match (operation.receipt, operation.refusal) {
                     (Some(receipt), _) => Ok(committed(receipt, operation.created)),
@@ -251,11 +308,10 @@ impl<T: ClientTransport> Backend<T> {
                 let authored = match decode_application(WireProfile::Native, name, &bytes)? {
                     ApplicationDocument::V1(_) => return Err(BackendError::Configuration),
                     ApplicationDocument::NativeList(list) => {
-                        let page = focal_native_client::list(
-                            &list,
-                            &self.build,
-                            &mut self.native_lists(runtime, cancel),
-                        )?;
+                        let shared = Cell::new(Some(&mut *cancel));
+                        let page =
+                            focal_native_client::list(&list, &self.build, &mut self.waits(&shared))
+                                .await?;
                         return Ok((
                             "Listed",
                             OperationOutput::NativeList {
@@ -264,7 +320,7 @@ impl<T: ClientTransport> Backend<T> {
                         ));
                     }
                     ApplicationDocument::NativeRead(read) => {
-                        return self.native_read_call(runtime, &read, cancel);
+                        return self.native_read_call(&read, cancel).await;
                     }
                     ApplicationDocument::Native(authored) => authored,
                 };
@@ -280,89 +336,52 @@ impl<T: ClientTransport> Backend<T> {
                 };
                 // The journal's own upkeep first (F12).
                 {
-                    let cell = std::cell::RefCell::new(&mut *cancel);
-                    let mut reads = |read: NativeReadRequest| {
-                        let request = envelope(self.build.ledger, Operation::NativeRead(read))?;
-                        let mut cancel = cell.borrow_mut();
-                        runtime.block_on(async {
-                            tokio::select! {
-                                result = self.client.native_read(request) => Ok(result?),
-                                _ = &mut **cancel => Err(DriveError::Cancelled),
-                            }
-                        })
-                    };
-                    let mut submits = |request: RequestEnvelope| {
-                        let mut cancel = cell.borrow_mut();
-                        runtime.block_on(async {
-                            tokio::select! {
-                                result = self.client.submit_native(request) => Ok(result?),
-                                _ = &mut **cancel => Err(DriveError::Cancelled),
-                            }
-                        })
-                    };
+                    let shared = Cell::new(Some(&mut *cancel));
                     focal_native_client::maintain(
                         &preparation,
                         &mut random_id,
-                        &mut reads,
-                        &mut submits,
-                    )?;
+                        &mut self.waits(&shared),
+                        &mut self.waits(&shared),
+                    )
+                    .await?;
                 }
                 if cancelled(cancel) {
                     return Err(BackendError::Cancelled);
                 }
-                let prepared = focal_native_client::prepare(
-                    &preparation,
-                    &authored,
-                    requested,
-                    &mut random_id,
-                    &mut self.native_reads(runtime, cancel),
-                )?;
+                let prepared = {
+                    let shared = Cell::new(Some(&mut *cancel));
+                    focal_native_client::prepare(
+                        &preparation,
+                        &authored,
+                        requested,
+                        &mut random_id,
+                        &mut self.waits(&shared),
+                    )
+                    .await?
+                };
                 *operation_id = Some(prepared.id.to_string());
-                self.native_drive(runtime, native, prepared, cancel)
+                self.native_drive(native, prepared, cancel).await
             }
         }
     }
     /// One read, the lineage read (which also lists) or the wait observer.
     /// All share this adapter's connection; the pause between wait probes is
     /// cancellable like every other wait of this adapter.
-    fn native_read_call(
+    async fn native_read_call(
         &self,
-        runtime: &Runtime,
         read: &focal_client::operations::NativeReadOperation,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let outcome = {
-            let cell = std::cell::RefCell::new(&mut *cancel);
-            let mut reads = |request: NativeReadRequest| {
-                let request = envelope(self.build.ledger, Operation::NativeRead(request))?;
-                let mut cancel = cell.borrow_mut();
-                runtime.block_on(async {
-                    tokio::select! {
-                        result = self.client.native_read(request) => Ok(result?),
-                        _ = &mut **cancel => Err(DriveError::Cancelled),
-                    }
-                })
-            };
-            let mut lists = |request: NativeListRequest| {
-                let request = envelope(self.build.ledger, Operation::NativeList(request))?;
-                let mut cancel = cell.borrow_mut();
-                runtime.block_on(async {
-                    tokio::select! {
-                        result = self.client.native_list(request) => Ok(result?),
-                        _ = &mut **cancel => Err(DriveError::Cancelled),
-                    }
-                })
-            };
-            let mut pause = |duration: std::time::Duration| {
-                let mut cancel = cell.borrow_mut();
-                runtime.block_on(async {
-                    tokio::select! {
-                        () = tokio::time::sleep(duration) => Ok(()),
-                        _ = &mut **cancel => Err(DriveError::Cancelled),
-                    }
-                })
-            };
-            focal_native_client::read(read, &self.build, &mut reads, &mut lists, &mut pause)?
+            let shared = Cell::new(Some(&mut *cancel));
+            focal_native_client::read(
+                read,
+                &self.build,
+                &mut self.waits(&shared),
+                &mut self.waits(&shared),
+                &mut self.waits(&shared),
+            )
+            .await?
         };
         Ok(match outcome {
             focal_native_client::NativeReadOutcome::Page(page) => (
@@ -383,22 +402,22 @@ impl<T: ClientTransport> Backend<T> {
     /// Send the exact journaled frame until the owner commits it. Only a
     /// committed receipt bound to the frame advances the journal; a refusal
     /// is recorded as reported and a pending ticket leaves the frame listed.
-    fn native_drive(
+    async fn native_drive(
         &self,
-        runtime: &Runtime,
         native: &Native,
         operation: NativeOperation,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         if let Some(receipt) = operation.receipt {
             return Ok(committed(receipt, operation.created));
         }
-        let reply = runtime.block_on(async {
-            tokio::select! {
-                result = self.client.submit_native(operation.request.clone()) => result.map_err(BackendError::Client),
-                _ = &mut *cancel => Err(BackendError::Cancelled),
-            }
-        })?;
+        let reply = cancellable(cancel, async {
+            self.client
+                .submit_native(operation.request.clone())
+                .await
+                .map_err(BackendError::Client)
+        })
+        .await?;
         match reply {
             NativeMutationReply::Committed(receipt) => {
                 native
@@ -410,15 +429,21 @@ impl<T: ClientTransport> Backend<T> {
             NativeMutationReply::Refused(refusal) => {
                 // A generation the owner closed before this frame reached it
                 // (F12): a committed outcome is read from the seal.
-                if refusal.kind
+                let expired = if refusal.kind
                     == NativeRefusalKind::Refused(NativeErrorCode::RequestHistoryExpired)
-                    && let Some(receipt) = focal_native_client::expired(
+                {
+                    let shared = Cell::new(Some(&mut *cancel));
+                    focal_native_client::expired(
                         &native.store,
                         &self.context,
                         &operation,
-                        &mut self.native_reads(runtime, cancel),
-                    )?
-                {
+                        &mut self.waits(&shared),
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if let Some(receipt) = expired {
                     return Ok(committed(receipt, operation.created));
                 }
                 native

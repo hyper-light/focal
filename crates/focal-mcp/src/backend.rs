@@ -8,9 +8,64 @@ use focal_client::{
 };
 use focal_model::*;
 use focal_wire::*;
+use hyper_rt::combine::{Either, race2};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{runtime::Runtime, sync::oneshot};
+use std::future::Future;
+
+/// A call's cancellation, which the coordinator fires: each wait the call makes races it, and a
+/// sender gone without firing (its coordinator ended) cancels as well.
+pub type Cancel = hyper_rt::sync::OneshotReceiver<()>;
+
+/// A wait of a call's on the heap: a large branch of the call's execution kept out of its parent's
+/// future, and built in a frame of its own that ends as the box is made (a debug build's frame keeps
+/// every temporary of its function), so the worker's stack holds the branches in flight and none
+/// besides.
+type Boxed<'a, T> = std::pin::Pin<Box<dyn Future<Output = Result<T, BackendError>> + 'a>>;
+/// A branch that answers the call.
+type Branch<'a> = Boxed<'a, (&'static str, OperationOutput)>;
+
+/// `work`, with an unwind out of a dependency it polls contained: refused `Transport`, its
+/// in-flight wait and what it held dropped as it is.
+async fn contained<T>(
+    work: impl Future<Output = Result<T, BackendError>>,
+) -> Result<T, BackendError> {
+    let mut work = std::pin::pin!(work);
+    std::future::poll_fn(|context| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(context)))
+        {
+            Ok(poll) => poll,
+            Err(_) => std::task::Poll::Ready(Err(BackendError::Client(ClientError::Transport))),
+        }
+    })
+    .await
+}
+
+/// `work` within `period` on the shard's clock: `elapsed` once the period is over, `Transport` off
+/// a shard, where no deadline can be kept.
+async fn within<T>(
+    period: std::time::Duration,
+    work: impl Future<Output = Result<T, BackendError>>,
+    elapsed: impl FnOnce() -> BackendError,
+) -> Result<T, BackendError> {
+    let nanos = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
+    match hyper_rt::futures::within(nanos, work).await {
+        Ok(Some(done)) => done,
+        Ok(None) => Err(elapsed()),
+        Err(_) => Err(BackendError::Client(ClientError::Transport)),
+    }
+}
+
+/// `work`, or `Cancelled` once `cancel` fires.
+async fn cancellable<T, E: From<BackendError>>(
+    cancel: &mut Cancel,
+    work: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    match race2(work, cancel).await {
+        Either::First(done) => done,
+        Either::Second(_) => Err(BackendError::Cancelled.into()),
+    }
+}
 
 // OperationStore owns the bounded catalogue and exact prepared requests. It is
 // intentionally synchronous and lives only on this backend's OS thread.
@@ -105,14 +160,13 @@ impl<T: ClientTransport> Backend<T> {
         self.managed = Some(requests);
         Ok(self)
     }
-    pub(crate) fn execute(
+    pub(crate) async fn execute(
         &mut self,
-        runtime: &Runtime,
         call: &mut ToolCall,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> ApplicationResult {
         let mut operation_id = None;
-        let result = self.execute_inner(runtime, call, cancel, &mut operation_id);
+        let result = self.execute_inner(call, cancel, &mut operation_id).await;
         // Native results share the application result shape at version 2.
         let schema_version = if self.has_native() { 2 } else { 1 };
         match result {
@@ -153,14 +207,14 @@ impl<T: ClientTransport> Backend<T> {
             },
         }
     }
-    fn execute_inner(
+    async fn execute_inner(
         &mut self,
-        runtime: &Runtime,
         call: &mut ToolCall,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
         operation_id: &mut Option<String>,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
-        if tokio::runtime::Handle::try_current().is_ok() {
+        // A call's waits are kept by a hyper-rt shard's timers and sockets.
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(BackendError::Configuration);
         }
         if cancelled(cancel) {
@@ -173,7 +227,7 @@ impl<T: ClientTransport> Backend<T> {
             Some(focal_client::operations::Surface::Administration) => {
                 let action = crate::admin::parse(&call.tool, std::mem::take(&mut call.arguments))?;
                 let backend = self.admin.as_mut().ok_or(BackendError::Configuration)?;
-                return match backend.execute(runtime, action, cancel) {
+                return match backend.execute(action, cancel).await {
                     Ok(result) => {
                         Ok(("Administration", OperationOutput::Administration { result }))
                     }
@@ -183,26 +237,26 @@ impl<T: ClientTransport> Backend<T> {
             // Durable watches speak both engines: the journal saves the engine
             // it was created for and streams schema-2 deltas on a native ledger.
             Some(focal_client::operations::Surface::Watch) => {
-                return self.watch(runtime, call, cancel);
+                return self.watch(call, cancel).await;
             }
             Some(focal_client::operations::Surface::Transfer) => {
                 if self.has_native() {
                     return Err(BackendError::Configuration);
                 }
-                return self.transfer(runtime, call, cancel);
+                return self.transfer(call, cancel).await;
             }
             Some(focal_client::operations::Surface::Application) | None => {}
         }
         if self.has_native() {
             // The native catalogue replaces the V1 application and transfer
             // tools; the owner refuses their wire profile anyway.
-            return self.native_call(runtime, call, cancel, operation_id);
+            return self.native_call(call, cancel, operation_id).await;
         }
         if matches!(
             call.tool.as_str(),
             "request.reserve" | "request.pending" | "request.acknowledge" | "request.seal"
         ) {
-            return self.managed_control(runtime, call, cancel, operation_id);
+            return self.managed_control(call, cancel, operation_id).await;
         }
         if matches!(call.tool.as_str(), "request.inspect" | "request.retry") {
             let id = take_id(&mut call.arguments)?;
@@ -226,25 +280,22 @@ impl<T: ClientTransport> Backend<T> {
                 )));
             }
             if id.starts_with("m1:") {
-                return self.managed_recovery(
-                    runtime,
-                    &id,
-                    call.tool == "request.retry",
-                    remote,
-                    cancel,
-                );
+                return self
+                    .managed_recovery(&id, call.tool == "request.retry", remote, cancel)
+                    .await;
             }
             let mut journal = self.store.open_existing(&id, &self.context)?;
             if remote {
                 let business = journal.business_request()?;
-                let reply = self.reconcile(
-                    runtime,
-                    ReconcileQuery::Receipt {
-                        epoch: business.request_epoch,
-                        request: business.request_id,
-                    },
-                    cancel,
-                )?;
+                let reply = self
+                    .reconcile(
+                        ReconcileQuery::Receipt {
+                            epoch: business.request_epoch,
+                            request: business.request_id,
+                        },
+                        cancel,
+                    )
+                    .await?;
                 if let ReconcileResult::Receipt { resolution, .. } = &reply.page.result {
                     match resolution {
                         ReceiptResolution::Committed(receipt) => {
@@ -259,7 +310,7 @@ impl<T: ClientTransport> Backend<T> {
                 return Ok(("Reconciled", OperationOutput::Reconcile { reply }));
             }
             if call.tool == "request.retry" {
-                self.drive(runtime, &mut journal, cancel)?;
+                self.drive(&mut journal, cancel).await?;
             }
             return journal_result(&journal);
         }
@@ -287,14 +338,9 @@ impl<T: ClientTransport> Backend<T> {
             let id = operation_id.as_deref().ok_or(BackendError::Configuration)?;
             if id.starts_with("m1:") {
                 authored.preflight(&self.build)?;
-                return self.managed_mutation(
-                    runtime,
-                    id,
-                    authored,
-                    expected_revision,
-                    &canonical,
-                    cancel,
-                );
+                return self
+                    .managed_mutation(id, authored, expected_revision, &canonical, cancel)
+                    .await;
             }
             let build = self.build;
             let expected_revision = if expected_revision.is_none() {
@@ -306,12 +352,10 @@ impl<T: ClientTransport> Backend<T> {
                             } => *expected_revision,
                             _ => return Err(StoreError::IntentConflict.into()),
                         },
-                        Err(StoreError::MissingOperation) => Some(self.participant_revision(
-                            runtime,
-                            claim,
-                            RequestId(random_id()?),
-                            cancel,
-                        )?),
+                        Err(StoreError::MissingOperation) => Some(
+                            self.participant_revision(claim, RequestId(random_id()?), cancel)
+                                .await?,
+                        ),
                         Err(error) => return Err(error.into()),
                     }
                 } else {
@@ -347,138 +391,177 @@ impl<T: ClientTransport> Backend<T> {
                     Ok((epoch, request))
                 },
             )?;
-            self.drive(runtime, &mut journal, cancel)?;
+            self.drive(&mut journal, cancel).await?;
             journal_result(&journal)
         } else {
             let planned = authored.build(&self.build, &mut random_id)?;
-            if let PlannedOperation::Reconcile(query) = planned {
-                let reply = self.reconcile(runtime, query, cancel)?;
-                return Ok(("Reconciled", OperationOutput::Reconcile { reply }));
-            }
-            if let PlannedOperation::ClaimWait {
-                read,
-                until,
-                timeout_ms,
-            } = planned
-            {
-                let request = envelope(self.build.ledger, Operation::Read(read))?;
-                let result=runtime.block_on(async { tokio::select! {
-                    result=self.client.claim_wait(request,until,std::time::Duration::from_millis(u64::from(timeout_ms)))=>result.map_err(claim_wait_error),
-                    _=cancel=>Err(BackendError::Cancelled),
-                }})?;
-                return Ok((
-                    result.condition.as_str(),
-                    OperationOutput::ClaimWait { result },
-                ));
-            }
-            if let PlannedOperation::ClaimGet(selector) = planned {
-                let request = envelope(self.build.ledger, selector.into_operation())?;
-                let page=runtime.block_on(async {tokio::select! {
-                    result=self.client.claim_get(request)=>result.map_err(BackendError::ClaimGet),
-                    _=cancel=>Err(BackendError::Cancelled),
-                }})?;
-                return Ok(("Read", OperationOutput::Read { page }));
-            }
-            if let PlannedOperation::ValidationContext(read) = planned {
-                let request = envelope(self.build.ledger, Operation::Read(read))?;
-                let context = runtime.block_on(async {
-                    tokio::select! {
-                        result=self.client.validation_context(request)=>result.map_err(validation_context_error),
-                        _=cancel=>Err(BackendError::Cancelled),
-                    }
-                })?;
-                return Ok((
-                    "Read",
-                    OperationOutput::ValidationContext {
-                        context: Box::new(context),
-                    },
-                ));
-            }
-            let request = envelope(self.build.ledger, planned.into_wire(None)?)?;
-            let reply = runtime.block_on(async {
-                tokio::select! {
-                    result=self.client.request(request)=>result.map_err(BackendError::Client),
-                    _=cancel=>Err(BackendError::Cancelled),
-                }
-            })?;
-            match reply.result {
-                Response::Monitor(page) => {
-                    let Some(monitor) = &page.monitor else {
-                        return Err(BackendError::NotFound);
-                    };
-                    Ok((
-                        if monitor.released.is_some() {
-                            "Released"
-                        } else {
-                            "Pending"
-                        },
-                        OperationOutput::Monitor { page },
-                    ))
-                }
-                Response::Summary(summary) => {
-                    Ok(("Observed", OperationOutput::Summary { summary }))
-                }
-                Response::Read(page) => {
-                    if page.objects.is_empty() {
-                        return Err(BackendError::NotFound);
-                    }
-                    Ok(("Read", OperationOutput::Read { page }))
-                }
-                Response::Listed(page) => Ok(("Listed", OperationOutput::List { page })),
-                Response::Validators(page) => {
-                    Ok(("RecordedContracts", OperationOutput::List { page }))
-                }
-                Response::Traversed(page) => Ok(("Traversed", OperationOutput::Traversal { page })),
-                _ => Err(BackendError::Configuration),
-            }
+            self.read_operation(planned, cancel).await
         }
     }
-    fn participant_revision(
+    /// A read the application tools name, boxed ([`Boxed`]).
+    fn read_operation<'a>(
+        &'a self,
+        planned: PlannedOperation,
+        cancel: &'a mut Cancel,
+    ) -> Branch<'a> {
+        Box::pin(self.read_operation_inner(planned, cancel))
+    }
+    async fn read_operation_inner(
         &self,
-        runtime: &Runtime,
+        planned: PlannedOperation,
+        cancel: &mut Cancel,
+    ) -> Result<(&'static str, OperationOutput), BackendError> {
+        if let PlannedOperation::Reconcile(query) = planned {
+            let reply = self.reconcile(query, cancel).await?;
+            return Ok(("Reconciled", OperationOutput::Reconcile { reply }));
+        }
+        if let PlannedOperation::ClaimWait {
+            read,
+            until,
+            timeout_ms,
+        } = planned
+        {
+            let request = envelope(self.build.ledger, Operation::Read(read))?;
+            let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+            let result = cancellable(cancel, self.claim_wait_call(request, until, timeout)).await?;
+            return Ok((
+                result.condition.as_str(),
+                OperationOutput::ClaimWait { result },
+            ));
+        }
+        if let PlannedOperation::ClaimGet(selector) = planned {
+            let request = envelope(self.build.ledger, selector.into_operation())?;
+            let page = cancellable(cancel, self.claim_get_call(request)).await?;
+            return Ok(("Read", OperationOutput::Read { page }));
+        }
+        if let PlannedOperation::ValidationContext(read) = planned {
+            let request = envelope(self.build.ledger, Operation::Read(read))?;
+            let context = cancellable(cancel, self.validation_context_call(request)).await?;
+            return Ok((
+                "Read",
+                OperationOutput::ValidationContext {
+                    context: Box::new(context),
+                },
+            ));
+        }
+        let request = envelope(self.build.ledger, planned.into_wire(None)?)?;
+        let reply = cancellable(cancel, async {
+            self.client
+                .request(request)
+                .await
+                .map_err(BackendError::Client)
+        })
+        .await?;
+        match reply.result {
+            Response::Monitor(page) => {
+                let Some(monitor) = &page.monitor else {
+                    return Err(BackendError::NotFound);
+                };
+                Ok((
+                    if monitor.released.is_some() {
+                        "Released"
+                    } else {
+                        "Pending"
+                    },
+                    OperationOutput::Monitor { page },
+                ))
+            }
+            Response::Summary(summary) => Ok(("Observed", OperationOutput::Summary { summary })),
+            Response::Read(page) => {
+                if page.objects.is_empty() {
+                    return Err(BackendError::NotFound);
+                }
+                Ok(("Read", OperationOutput::Read { page }))
+            }
+            Response::Listed(page) => Ok(("Listed", OperationOutput::List { page })),
+            Response::Validators(page) => Ok(("RecordedContracts", OperationOutput::List { page })),
+            Response::Traversed(page) => Ok(("Traversed", OperationOutput::Traversal { page })),
+            _ => Err(BackendError::Configuration),
+        }
+    }
+    fn claim_wait_call<'a>(
+        &'a self,
+        request: RequestEnvelope,
+        until: focal_client::claim_wait::ClaimWaitUntil,
+        timeout: std::time::Duration,
+    ) -> Boxed<'a, focal_client::claim_wait::ClaimWaitResult> {
+        Box::pin(async move {
+            self.client
+                .claim_wait(request, until, timeout)
+                .await
+                .map_err(claim_wait_error)
+        })
+    }
+    fn claim_get_call(&self, request: RequestEnvelope) -> Boxed<'_, ReadPage> {
+        Box::pin(async move {
+            self.client
+                .claim_get(request)
+                .await
+                .map_err(BackendError::ClaimGet)
+        })
+    }
+    fn validation_context_call(
+        &self,
+        request: RequestEnvelope,
+    ) -> Boxed<'_, focal_client::validation_context::ValidationContext> {
+        Box::pin(async move {
+            self.client
+                .validation_context(request)
+                .await
+                .map_err(validation_context_error)
+        })
+    }
+    async fn participant_revision(
+        &self,
         claim: ClaimId,
         nonce: RequestId,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<ObjectRevision, BackendError> {
-        runtime.block_on(async {
-            tokio::select! {
-                result = self.client.claim_revision(self.context.ledger, claim, nonce) => {
-                    result?.ok_or_else(|| InputError::Invalid("claim was not found").into())
-                },
-                _ = cancel => Err(BackendError::Cancelled),
-            }
+        cancellable(cancel, async {
+            self.client
+                .claim_revision(self.context.ledger, claim, nonce)
+                .await?
+                .ok_or_else(|| InputError::Invalid("claim was not found").into())
         })
+        .await
     }
-    fn reconcile(
-        &self,
-        runtime: &Runtime,
+    fn reconcile<'a>(
+        &'a self,
         query: ReconcileQuery,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &'a mut Cancel,
+    ) -> Boxed<'a, ReconcileReply> {
+        Box::pin(self.reconcile_inner(query, cancel))
+    }
+    async fn reconcile_inner(
+        &self,
+        query: ReconcileQuery,
+        cancel: &mut Cancel,
     ) -> Result<ReconcileReply, BackendError> {
         let request = envelope(self.build.ledger, Operation::Reconcile(query))?;
-        runtime.block_on(async {
-            tokio::select! {
-                result=self.client.reconcile(request, self.context.principal)=>result.map_err(BackendError::Client),
-                _=cancel=>Err(BackendError::Cancelled),
-            }
+        cancellable(cancel, async {
+            self.client
+                .reconcile(request, self.context.principal)
+                .await
+                .map_err(BackendError::Client)
         })
+        .await
     }
-    fn drive(
+    async fn drive(
         &self,
-        runtime: &Runtime,
         journal: &mut OperationJournal,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(), BackendError> {
         while let Some(request) = journal.next_request()?.cloned() {
             if cancelled(cancel) {
                 return Err(BackendError::Cancelled);
             }
-            let reply = runtime.block_on(async {
-                tokio::select! {
-                    result=self.client.submit(request)=>result.map_err(BackendError::Client),
-                    _=&mut *cancel=>Err(BackendError::Cancelled),
-                }
-            })?;
+            let reply = cancellable(cancel, async {
+                self.client
+                    .submit(request)
+                    .await
+                    .map_err(BackendError::Client)
+            })
+            .await?;
             match &reply {
                 MutationReply::Committed(_)
                 | MutationReply::Domain(DomainOutcome::Duplicate(_)) => {
@@ -571,8 +654,9 @@ fn journal_result(
         }
     }
 }
-fn cancelled(cancel: &mut oneshot::Receiver<()>) -> bool {
-    !matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+/// Whether `cancel` fired, or its sender went without firing.
+fn cancelled(cancel: &mut Cancel) -> bool {
+    !matches!(cancel.try_recv(), Ok(None))
 }
 fn random_id() -> Result<[u8; 16], InputError> {
     let mut bytes = [0; 16];

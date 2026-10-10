@@ -8,16 +8,24 @@ use focal_client::{
     operations::{ApplicationResult, OperationOutput},
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender};
 use std::{
     io::{Read, Write},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
 
 const MIB: usize = 1024 * 1024;
+/// The input and output owners' stack: one blocking read or write and the frame codec.
 const THREAD_STACK: usize = MIB;
+/// The ledger worker's stack. It runs a hyper-rt shard whose root task makes each call: the call's
+/// poll chain, the backend's waits and the synchronous work between them (a journal, the native
+/// compiler beneath the driver's waits), and code mode's engine, bounded at half of it
+/// ([`crate::code::CodeLimits::for_adapter`]). The deepest call of the adapter's suite measured
+/// under 1.5 MiB in a debug build (the native example's compile, 2026-10-10), whose frames keep
+/// every temporary; a release build's are a fraction of that.
+pub(crate) const WORKER_STACK: usize = 2 * MIB;
 const JOB_BYTES: usize = 32 * MIB;
 const SHUTDOWN: Duration = Duration::from_secs(3);
 
@@ -37,12 +45,22 @@ pub enum ServeError {
     Shutdown,
     #[error("MCP engine probe failed before any tool was served: {0}")]
     Probe(String),
+    #[error("MCP foreground startup requires a blocking process owner, not a runtime's task")]
+    Nested,
 }
 
 struct Job {
     call: ToolCall,
-    cancel: oneshot::Receiver<()>,
+    cancel: crate::Cancel,
     allocation: Allocation,
+}
+/// What the worker hands the coordinator once its shard probed the engine and built the
+/// catalogue: what the protocol serves, and the construction admission it releases once the
+/// protocol holds its own charge.
+struct Started {
+    tools: Vec<crate::Tool>,
+    skills: crate::skills::Skills,
+    admission: Allocation,
 }
 struct Completion {
     call: ToolCall,
@@ -61,25 +79,51 @@ enum Event {
 /// Serve one stdio MCP connection. This is a foreground-process boundary:
 /// return means the host must exit, releasing any OS I/O still blocked at the
 /// bounded shutdown deadline. It is not a reusable embedded thread pool.
-pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + Send + 'static>(
-    mut backend: Backend<T>,
+pub fn serve<
+    T: ClientTransport + Send + 'static,
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+>(
+    backend: Backend<T>,
     reader: R,
     writer: W,
 ) -> Result<(), ServeError> {
+    // The worker owns a shard of its own; this thread waits on its owners and must not be one.
+    if hyper_rt::futures::shard_id().is_some() {
+        return Err(ServeError::Nested);
+    }
     let Adapter {
         limits,
         code_limits,
         budget,
-        runtime,
     } = Adapter::new()?;
-    backend.detect(&runtime).map_err(ServeError::Probe)?;
-    let Catalogue {
+    let (events, receive) = mpsc::sync_channel(8);
+    let (jobs, work) = hyper_rt::sync::channel(1).map_err(|_| ServeError::Owner)?;
+    let (ready, started) = mpsc::sync_channel(1);
+    let worker_budget = budget.clone();
+    // The worker's shard probes the engine and builds the catalogue before anything is served: a
+    // remote transport binds its endpoint to the shard that first drives it, and every later call
+    // is driven there.
+    let worker = owner(
+        "focal-mcp-ledger",
+        WORKER_STACK,
+        &budget,
+        events.clone(),
+        move |events| worker(backend, worker_budget, code_limits, work, events, ready),
+    )?;
+    let Started {
         tools,
-        registry,
         skills,
         admission: catalog_admission,
-        _registry: _registry_charge,
-    } = Catalogue::new(&backend, &budget, code_limits)?;
+    } = match started.recv() {
+        Ok(Ok(started)) => started,
+        Ok(Err(error)) => {
+            // The worker ends as it reports: nothing else was started.
+            let _ = worker.join();
+            return Err(error);
+        }
+        Err(_) => return Err(ServeError::Owner),
+    };
     let protocol = Protocol::new(
         limits,
         budget.clone(),
@@ -97,27 +141,25 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     let _queues = budget
         .reserve(BudgetKind::Control, BudgetLane::Ordinary, 64 * 1024)?
         .commit();
-    let (events, receive) = mpsc::sync_channel(8);
-    let (jobs, work) = mpsc::sync_channel(1);
     let (frames, output) = mpsc::sync_channel(2);
-    let code = Code {
-        budget: budget.clone(),
-        registry,
-        limits: code_limits,
-    };
-    let worker = owner("focal-mcp-ledger", &budget, events.clone(), move |events| {
-        worker(backend, runtime, code, work, events)
-    })?;
-    let writer = owner("focal-mcp-output", &budget, events.clone(), move |events| {
-        write_output(writer, output, events)
-    })?;
-    let input = owner("focal-mcp-input", &budget, events.clone(), move |events| {
-        read_input(reader, decoder, events)
-    })?;
+    let writer = owner(
+        "focal-mcp-output",
+        THREAD_STACK,
+        &budget,
+        events.clone(),
+        move |events| write_output(writer, output, events),
+    )?;
+    let input = owner(
+        "focal-mcp-input",
+        THREAD_STACK,
+        &budget,
+        events.clone(),
+        move |events| read_input(reader, decoder, events),
+    )?;
     drop(events);
     let mut jobs = Some(jobs);
     let mut frames = Some(frames);
-    let mut active: Option<(CallToken, oneshot::Sender<()>)> = None;
+    let mut active: Option<(CallToken, OneshotSender<()>)> = None;
     let result = coordinate(
         &mut protocol,
         &budget,
@@ -145,9 +187,9 @@ fn coordinate(
     protocol: &mut Protocol,
     budget: &MemoryBudget,
     events: &Receiver<Event>,
-    jobs: &mut Option<SyncSender<Job>>,
+    jobs: &mut Option<Sender<Job>>,
     frames: &mut Option<SyncSender<EncodedFrame>>,
-    active: &mut Option<(CallToken, oneshot::Sender<()>)>,
+    active: &mut Option<(CallToken, OneshotSender<()>)>,
 ) -> Result<(), ServeError> {
     let mut ended = None;
     let mut worker_ended = false;
@@ -186,7 +228,8 @@ fn coordinate(
                             continue;
                         }
                     };
-                    let (cancel, cancelled) = oneshot::channel();
+                    let (cancel, cancelled) =
+                        hyper_rt::sync::oneshot().map_err(|_| ServeError::Owner)?;
                     let token = call.token;
                     jobs.as_ref()
                         .ok_or(ServeError::Owner)?
@@ -264,13 +307,12 @@ fn coordinate(
         }
     }
 }
-/// The adapter's bounds, budget and worker runtime, the same for a served
-/// connection and for one program run from the CLI.
+/// The adapter's bounds and budget, the same for a served connection and for
+/// one program run from the CLI.
 struct Adapter {
     limits: Limits,
     code_limits: crate::code::CodeLimits,
     budget: MemoryBudget,
-    runtime: tokio::runtime::Runtime,
 }
 impl Adapter {
     fn new() -> Result<Self, ServeError> {
@@ -286,23 +328,17 @@ impl Adapter {
         // (half a mebibyte per tool) and its measured resident tree (about
         // 7.5 MiB for the 47-tool native catalogue) are held together before
         // the admission is released, beside the frame decoder and journals.
-        let code_limits = crate::code::CodeLimits::for_adapter(limits, THREAD_STACK)?;
+        let code_limits = crate::code::CodeLimits::for_adapter(limits, WORKER_STACK)?;
         let budget = MemoryBudget::new(
             (160 * MIB)
                 .checked_add(code_limits.reservation()?)
                 .ok_or(ProtocolError::Capacity)?,
             80 * MIB,
         )?;
-        // The worker's runtime is created here so the engine probe, which may
-        // bind a remote endpoint to it, and every later call share one runtime.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         Ok(Self {
             limits,
             code_limits,
             budget,
-            runtime,
         })
     }
 }
@@ -413,7 +449,7 @@ impl Catalogue {
 /// backend outside a served connection: the CLI's `focal code`. The program
 /// sees and calls exactly what `serve` would offer the same backend, through
 /// the same journal, so a run begun over MCP resumes here and the reverse.
-pub fn run_code<T: ClientTransport>(
+pub fn run_code<T: ClientTransport + 'static>(
     mut backend: Backend<T>,
     tool: &str,
     arguments: serde_json::Map<String, serde_json::Value>,
@@ -421,43 +457,48 @@ pub fn run_code<T: ClientTransport>(
     if !crate::code::is_code(tool) {
         return Err(ServeError::Protocol(ProtocolError::Limits));
     }
+    // The run owns a shard on this thread for its life; a thread that already runs one cannot.
+    if hyper_rt::futures::shard_id().is_some() {
+        return Err(ServeError::Nested);
+    }
     let Adapter {
         limits,
         code_limits,
         budget,
-        runtime,
     } = Adapter::new()?;
-    backend.detect(&runtime).map_err(ServeError::Probe)?;
-    let Catalogue {
-        tools: _,
-        registry,
-        skills: _,
-        admission,
-        _registry,
-    } = Catalogue::new(&backend, &budget, code_limits)?;
-    drop(admission);
-    let allocation = budget
-        .reserve(
-            BudgetKind::Pending,
-            BudgetLane::Ordinary,
-            limits.workspace()?,
-        )?
-        .commit();
-    let mut call = crate::ToolCall::nested(tool.into(), arguments, allocation);
-    let (_signal, mut cancel) = oneshot::channel();
-    let result = crate::code::execute(
-        crate::code::Host {
-            backend: &mut backend,
-            runtime: &runtime,
-            budget: &budget,
-            registry: &registry,
-            limits: code_limits,
-        },
-        &mut call,
-        &mut cancel,
-    );
-    runtime.shutdown_background();
-    Ok(result)
+    let tool = tool.to_owned();
+    focal_rt::block_on(async move {
+        backend.detect().await.map_err(ServeError::Probe)?;
+        let Catalogue {
+            tools: _,
+            registry,
+            skills: _,
+            admission,
+            _registry,
+        } = Catalogue::new(&backend, &budget, code_limits)?;
+        drop(admission);
+        let allocation = budget
+            .reserve(
+                BudgetKind::Pending,
+                BudgetLane::Ordinary,
+                limits.workspace()?,
+            )?
+            .commit();
+        let mut call = crate::ToolCall::nested(tool, arguments, allocation);
+        let (_signal, mut cancel) = hyper_rt::sync::oneshot().map_err(|_| ServeError::Owner)?;
+        Ok(crate::code::execute(
+            crate::code::Host {
+                backend: &mut backend,
+                budget: &budget,
+                registry: &registry,
+                limits: code_limits,
+            },
+            &mut call,
+            &mut cancel,
+        )
+        .await)
+    })
+    .map_err(|_| ServeError::Owner)?
 }
 
 fn send_frame(
@@ -470,22 +511,23 @@ fn send_frame(
         Err(TrySendError::Disconnected(_)) => Err(ServeError::Owner),
     }
 }
+/// A thread of the adapter's, its `stack` and bookkeeping charged to the budget for its life.
 fn owner(
     name: &str,
+    stack: usize,
     budget: &MemoryBudget,
     events: SyncSender<Event>,
     run: impl FnOnce(&SyncSender<Event>) -> Result<(), ServeError> + Send + 'static,
 ) -> Result<JoinHandle<()>, ServeError> {
+    let charged = stack
+        .checked_add(64 * 1024)
+        .ok_or(ProtocolError::Capacity)?;
     let allocation = budget
-        .reserve(
-            BudgetKind::Control,
-            BudgetLane::Ordinary,
-            THREAD_STACK + 64 * 1024,
-        )?
+        .reserve(BudgetKind::Control, BudgetLane::Ordinary, charged)?
         .commit();
     Ok(thread::Builder::new()
         .name(name.into())
-        .stack_size(THREAD_STACK)
+        .stack_size(stack)
         .spawn(move || {
             let _allocation = allocation;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&events)))
@@ -495,45 +537,72 @@ fn owner(
             }
         })?)
 }
-/// What the worker needs to run code mode.
-struct Code {
+/// The ledger worker: one shard on its thread, whose root task probes the engine, builds the
+/// catalogue and hands it to the coordinator, then serves the jobs it is given one at a time
+/// until their queue closes. The shard runs between jobs, so a connection the backend holds keeps
+/// its keepalives and acknowledgements while the adapter waits for a call.
+fn worker<T: ClientTransport + 'static>(
+    backend: Backend<T>,
     budget: MemoryBudget,
-    registry: crate::code::Registry,
-    limits: crate::code::CodeLimits,
-}
-fn worker<T: ClientTransport>(
-    mut backend: Backend<T>,
-    runtime: tokio::runtime::Runtime,
-    code: Code,
-    jobs: Receiver<Job>,
+    code_limits: crate::code::CodeLimits,
+    mut jobs: ChannelReceiver<Job>,
     events: &SyncSender<Event>,
+    ready: SyncSender<Result<Started, ServeError>>,
 ) -> Result<(), ServeError> {
-    while let Ok(mut job) = jobs.recv() {
-        let result = if crate::code::is_code(&job.call.tool) {
-            crate::code::execute(
-                crate::code::Host {
-                    backend: &mut backend,
-                    runtime: &runtime,
-                    budget: &code.budget,
-                    registry: &code.registry,
-                    limits: code.limits,
-                },
-                &mut job.call,
-                &mut job.cancel,
-            )
-        } else {
-            backend.execute(&runtime, &mut job.call, &mut job.cancel)
+    let events = events.clone();
+    focal_rt::block_on(async move {
+        let mut backend = backend;
+        if let Err(detail) = backend.detect().await {
+            let _ = ready.send(Err(ServeError::Probe(detail)));
+            return Ok(());
+        }
+        let Catalogue {
+            tools,
+            registry,
+            skills,
+            admission,
+            _registry: _registry_charge,
+        } = match Catalogue::new(&backend, &budget, code_limits) {
+            Ok(catalogue) => catalogue,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return Ok(());
+            }
         };
-        events
-            .send(Event::Complete(Box::new(Completion {
-                call: job.call,
-                result,
-                _allocation: job.allocation,
-            })))
+        ready
+            .send(Ok(Started {
+                tools,
+                skills,
+                admission,
+            }))
             .map_err(|_| ServeError::Owner)?;
-    }
-    runtime.shutdown_background();
-    events.send(Event::WorkerEnd).map_err(|_| ServeError::Owner)
+        while let Ok(mut job) = jobs.recv().await {
+            let result = if crate::code::is_code(&job.call.tool) {
+                crate::code::execute(
+                    crate::code::Host {
+                        backend: &mut backend,
+                        budget: &budget,
+                        registry: &registry,
+                        limits: code_limits,
+                    },
+                    &mut job.call,
+                    &mut job.cancel,
+                )
+                .await
+            } else {
+                backend.execute(&mut job.call, &mut job.cancel).await
+            };
+            events
+                .send(Event::Complete(Box::new(Completion {
+                    call: job.call,
+                    result,
+                    _allocation: job.allocation,
+                })))
+                .map_err(|_| ServeError::Owner)?;
+        }
+        events.send(Event::WorkerEnd).map_err(|_| ServeError::Owner)
+    })
+    .map_err(|_| ServeError::Owner)?
 }
 fn read_input(
     mut reader: impl Read,
