@@ -5,7 +5,7 @@
 //! order of the classes' urgency.
 use crate::net::{
     Answer, Command, Driver, Failed, FocalClasses, Inbound, Kind, Linked, NetBudget, NetDirectory,
-    Network, Sender, Serve, ServeFuture, Served,
+    Network, Reply, Sender, Serve, ServeFuture, Served,
 };
 use crate::*;
 use focal_memory::MemoryBudget;
@@ -168,11 +168,21 @@ impl ServerTls {
     pub fn from_config(config: rustls::ServerConfig) -> Self {
         Self(config)
     }
+    /// The configuration, for an endpoint a test drives itself.
+    #[cfg(test)]
+    pub(crate) fn into_config(self) -> rustls::ServerConfig {
+        self.0
+    }
 }
 impl ClientTls {
     /// A configuration the caller built (an enrollment's pinned verifier, without client auth).
     pub fn from_config(config: rustls::ClientConfig) -> Self {
         Self(config)
+    }
+    /// The configuration, for an endpoint a test drives itself.
+    #[cfg(test)]
+    pub(crate) fn into_config(self) -> rustls::ClientConfig {
+        self.0
     }
 }
 
@@ -252,7 +262,7 @@ fn client_tls_with(
 }
 /// The client side of a listener, which never dials: no root, so no server verifies, and the
 /// data protocol named so the endpoint takes it.
-fn listener_client() -> Result<rustls::ClientConfig, WireError> {
+pub(crate) fn listener_client() -> Result<rustls::ClientConfig, WireError> {
     let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?
@@ -273,7 +283,8 @@ fn congestion() -> Congestion {
 /// segments of a Linux GSO/GRO send or receive.
 const IO_BATCH: usize = 32;
 
-/// An endpoint on `address`, its owner started on the current shard.
+/// An endpoint on `address`, its owner started on the current shard, woken at every withdrawal of
+/// a grant by `revocations` when it serves under a registry.
 fn start(
     address: SocketAddr,
     tls: Tls,
@@ -281,7 +292,24 @@ fn start(
     limits: &WireLimits,
     admission: &AdmissionLimits,
     budget: MemoryBudget,
+    revocations: Option<hyper_rt::sync::WatchReceiver>,
 ) -> Result<(Network, SocketAddr), WireError> {
+    let driver = endpoint_driver(address, tls, directory, limits, admission, budget)?;
+    let local = driver.local_addr().map_err(|_| WireError::Connection)?;
+    let network = Network::start(driver, limits.clone(), command_queue(limits), revocations)?;
+    Ok((network, local))
+}
+
+/// An endpoint carrying focal's traffic on `address`, bound to the current shard's socket and not
+/// yet driven: what [`start`] gives an owner.
+pub(crate) fn endpoint_driver(
+    address: SocketAddr,
+    tls: Tls,
+    directory: NetDirectory,
+    limits: &WireLimits,
+    admission: &AdmissionLimits,
+    budget: MemoryBudget,
+) -> Result<Driver, WireError> {
     let config = Config {
         tls,
         role: Sender::Node,
@@ -299,11 +327,8 @@ fn start(
         std::time::Instant::now(),
     )
     .map_err(|_| WireError::Authentication)?;
-    let driver = Driver::bind(endpoint, address, hyper_rt::udp::Io { batch: IO_BATCH })
-        .map_err(|_| WireError::Connection)?;
-    let local = driver.local_addr().map_err(|_| WireError::Connection)?;
-    let network = Network::start(driver, limits.clone(), command_queue(limits))?;
-    Ok((network, local))
+    Driver::bind(endpoint, address, hyper_rt::udp::Io { batch: IO_BATCH })
+        .map_err(|_| WireError::Connection)
 }
 
 pub struct QuicServer {
@@ -355,8 +380,15 @@ impl QuicServer {
             server: Some(tls.0),
             client: listener_client()?,
         };
-        let (network, address) = start(address, tls, directory, &limits, &admission, budget)?;
-        registry.watch(network.clone());
+        let (network, address) = start(
+            address,
+            tls,
+            directory,
+            &limits,
+            &admission,
+            budget,
+            registry.watch(),
+        )?;
         Ok(Self {
             network,
             address,
@@ -437,7 +469,7 @@ impl<H: RequestHandler + Clone> DataService<H> {
         let this = self.clone();
         Box::pin(async move { this.answer_now(served).await })
     }
-    async fn answer_now(self, served: Served) -> Option<Vec<u8>> {
+    async fn answer_now(self, served: Served) -> Option<Reply> {
         let Inbound::Data { fingerprint, .. } = served.from else {
             return None;
         };
@@ -461,7 +493,13 @@ impl<H: RequestHandler + Clone> DataService<H> {
         } else {
             OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
         };
-        encode_payload(response.envelope(), negotiated.max_frame_bytes).ok()
+        let body = encode_payload(response.envelope(), negotiated.max_frame_bytes).ok()?;
+        // The envelope goes; what its handler charged for it stays with the encoding until the
+        // endpoint has taken its last byte.
+        Some(Reply {
+            body,
+            charge: Some(response.into_charge()),
+        })
     }
 }
 impl<H: RequestHandler + Clone> Serve for DataService<H> {
@@ -513,7 +551,7 @@ impl QuicConnector {
             server: None,
             client: tls.0,
         };
-        let (network, _) = start(address, tls, directory, &limits, &admission, budget)?;
+        let (network, _) = start(address, tls, directory, &limits, &admission, budget, None)?;
         Ok(Self {
             network,
             limits,
@@ -754,10 +792,15 @@ impl QuicRemote {
 /// The connections a participant keeps to the routes it reaches — its initial endpoint and the
 /// hints its requests are redirected to — one per route, dialed once (the audit's F60): its
 /// connector's endpoint keeps them, and concurrent cold calls to one route wait on the one dial
-/// in flight. A route's name is resolved afresh on each dial.
+/// in flight. A route's name is resolved afresh on each dial. The connection last handed out for
+/// each route is remembered, so a failure its caller reports closes that connection and no later
+/// one.
 pub struct RouteConnections {
     connector: QuicConnector,
     max_routes: usize,
+    /// The connection each route was last handed, by its endpoint and server name; at most
+    /// `max_routes`, the one handed longest ago going first.
+    handed: std::sync::Mutex<std::collections::VecDeque<((String, String), QuicRemote)>>,
 }
 /// A connection the cache handed out.
 pub struct Connected {
@@ -774,10 +817,16 @@ impl RouteConnections {
         Ok(Self {
             connector,
             max_routes,
+            handed: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
     pub fn limits(&self) -> &WireLimits {
         self.connector.limits()
+    }
+    /// The dials the routes' endpoint started: a route's first, and each after its connection
+    /// went.
+    pub async fn dials(&self) -> u64 {
+        self.connector.stats().await.dials
     }
     /// The routes this cache may hold.
     pub fn max_routes(&self) -> usize {
@@ -790,6 +839,14 @@ impl RouteConnections {
         }
         let address = resolve(endpoint, self.limits().request_timeout).await?;
         let remote = self.connector.connect(address, server_name).await?;
+        let route = (endpoint.to_owned(), server_name.to_owned());
+        if let Ok(mut handed) = self.handed.lock() {
+            handed.retain(|(held, _)| *held != route);
+            if handed.len() >= self.max_routes {
+                handed.pop_front();
+            }
+            handed.push_back((route, remote.clone()));
+        }
         Ok(Connected {
             generation: remote.epoch,
             remote,
@@ -820,8 +877,19 @@ impl RouteConnections {
             }
         }
     }
-    /// Close the route's connection a request found failed.
-    pub fn forget(&self, _endpoint: &str, _server_name: &str, _generation: u64) {}
+    /// Close the route's connection of `generation`, which its caller found failed: the next call
+    /// dials anew. A failure of a connection no longer the route's forgets nothing.
+    pub fn forget(&self, endpoint: &str, server_name: &str, generation: u64) {
+        let Ok(mut handed) = self.handed.lock() else {
+            return;
+        };
+        let at = handed.iter().position(|((held, name), remote)| {
+            held == endpoint && name == server_name && remote.epoch == generation
+        });
+        if let Some((_, remote)) = at.and_then(|at| handed.remove(at)) {
+            remote.close();
+        }
+    }
 }
 
 /// `endpoint` as an address: itself when it is one, else its host resolved, waited for no longer
@@ -846,6 +914,9 @@ pub(crate) async fn resolve_all(
     let (host, port) = endpoint.rsplit_once(':').ok_or(WireError::Connection)?;
     let port: u16 = port.parse().map_err(|_| WireError::Connection)?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    // Resolution runs on the process's blocking pool, under its share: started here once, so no
+    // caller of a name depends on another having started it.
+    focal_rt::blocking().map_err(|_| WireError::Connection)?;
     let nanos = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
     hyper_rt::futures::within(nanos, hyper_rt::dns::resolve(host, port, most))
         .await

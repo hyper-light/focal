@@ -92,11 +92,10 @@ impl AuthenticatedPeer {
     }
 }
 
-/// What the registry holds: the grants by certificate, and the listeners
-/// serving under them, so that a revocation closes the connections it no
-/// longer grants (the audit's F35: a grant withdrawn releases what waits on
-/// it) instead of leaving them to their idle timeout.
-#[derive(Default)]
+/// What the registry holds: the grants by certificate, and the word the
+/// listeners serving under them watch, so that a revocation closes the
+/// connections it no longer grants (the audit's F35: a grant withdrawn
+/// releases what waits on it) instead of leaving them to their idle timeout.
 struct Grants {
     grants: BTreeMap<[u8; 32], PeerGrant>,
     /// The enrolled keys, by their identity: what a renewal is admitted by.
@@ -108,13 +107,18 @@ struct Grants {
     /// Counted at every withdrawal of a grant: a listener's owner that sees
     /// it move closes the connections of certificates no longer granted.
     revision: u64,
-    /// The owners of the listeners serving under these grants, woken at a
-    /// withdrawal; at most [`MAX_WATCHERS`], an ended one dropped as it is
-    /// found.
-    watchers: Vec<crate::net::Network>,
+    /// The revision, as the listeners' owners watch it: each holds a
+    /// receiver, woken as it moves. A receiver is no hold on its owner, which
+    /// ends when its own handles are gone; the receivers are bounded by
+    /// [`MAX_WATCHERS`], and one past them still sees the revision as it
+    /// moves.
+    watch: hyper_rt::sync::WatchSender,
+    /// The receiver every listener's is cloned from.
+    watched: hyper_rt::sync::WatchReceiver,
 }
 /// The listeners one registry wakes at a withdrawal: a node's listener, its
-/// control and evidence servers, with room for a test's several.
+/// control and evidence servers, with room for a test's several (the
+/// receiver the others are cloned from among them).
 const MAX_WATCHERS: usize = 64;
 /// A key an enrollment holds. A certificate of it that the grant projection
 /// does not name — issued by the cluster's CA (the listener verified the
@@ -153,18 +157,12 @@ pub struct PeerRegistry {
     grants: Arc<RwLock<Grants>>,
     max_peers: usize,
 }
-/// Wakes the listeners' owners to close what is no longer granted: each
-/// checks the registry's revision when it next moves, so a wake refused by a
-/// full queue — an owner already moving — loses nothing; an owner that ended
-/// is dropped.
+/// Wakes the listeners' owners to close what is no longer granted: the
+/// revision moves, and every owner watching it is woken.
 fn wake_watchers(grants: &mut Grants) {
     grants.revision = grants.revision.wrapping_add(1);
-    grants.watchers.retain(|watcher| {
-        !matches!(
-            watcher.try_send(crate::net::Command::Revoked),
-            Err(WireError::Connection)
-        )
-    });
+    let revision = grants.revision;
+    grants.watch.send(revision);
 }
 impl PeerRegistry {
     /// Replace a complete server-owned grant projection atomically. Validate
@@ -229,8 +227,17 @@ impl PeerRegistry {
         if max_peers == 0 || max_peers > 1_000_000 {
             return Err(AccessError::Capacity);
         }
+        let (watch, watched) =
+            hyper_rt::sync::watch(0, MAX_WATCHERS).map_err(|_| AccessError::Unavailable)?;
         Ok(Self {
-            grants: Arc::new(RwLock::new(Grants::default())),
+            grants: Arc::new(RwLock::new(Grants {
+                grants: BTreeMap::new(),
+                keys: BTreeMap::new(),
+                provisional: BTreeMap::new(),
+                revision: 0,
+                watch,
+                watched,
+            })),
             max_peers,
         })
     }
@@ -265,26 +272,13 @@ impl PeerRegistry {
             .read()
             .map_or(u64::MAX, |grants| grants.revision)
     }
-    /// Wake `network`'s owner at every withdrawal, so it closes the
-    /// connections it no longer grants; past [`MAX_WATCHERS`] the owner
-    /// still closes them at its revision check, when it next moves.
-    pub(crate) fn watch(&self, network: crate::net::Network) {
-        let Ok(mut grants) = self.grants.write() else {
-            return;
-        };
-        if grants.watchers.len() >= MAX_WATCHERS {
-            // Ended owners are found by a wake, which a live one reads as a revision check that
-            // changes nothing.
-            grants.watchers.retain(|watcher| {
-                !matches!(
-                    watcher.try_send(crate::net::Command::Revoked),
-                    Err(WireError::Connection)
-                )
-            });
-        }
-        if grants.watchers.len() < MAX_WATCHERS {
-            grants.watchers.push(network);
-        }
+    /// The revision, watched: a listener's owner is woken by it at every
+    /// withdrawal, so it closes the connections it no longer grants. `None`
+    /// past [`MAX_WATCHERS`] listeners: such an owner still closes them at its
+    /// revision check, when it next moves.
+    pub(crate) fn watch(&self) -> Option<hyper_rt::sync::WatchReceiver> {
+        let grants = self.grants.read().ok()?;
+        grants.watched.try_clone().ok()
     }
     /// Whether the certificate is granted now, without copying its grant:
     /// asked before anything is read for a stream.

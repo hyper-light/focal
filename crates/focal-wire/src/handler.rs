@@ -48,6 +48,22 @@ impl OwnedResponse {
     pub fn into_envelope(self) -> ResponseEnvelope {
         self.envelope
     }
+    /// The allowance alone, once the envelope is encoded: a network adapter keeps it until the
+    /// transport has taken the encoding's last byte, and the envelope goes now.
+    pub fn into_charge(self) -> ResponseCharge {
+        ResponseCharge {
+            _allocation: self._allocation,
+            _additional: self._additional,
+        }
+    }
+}
+
+/// What a response's allowance holds while its encoding is on its way out, given back when
+/// dropped: a reply its peer reads slowly stays charged, so the replies held for slow readers are
+/// bounded by the budget that funded them.
+pub struct ResponseCharge {
+    _allocation: Option<Allocation>,
+    _additional: Option<Allocation>,
 }
 pub trait RequestHandler: Send + Sync + 'static {
     /// Local implementation capability only. Group activation remains a

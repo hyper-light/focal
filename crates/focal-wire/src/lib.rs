@@ -52,8 +52,7 @@ pub use traversal::*;
 pub use trust::*;
 pub use validators::*;
 #[cfg(test)]
-#[path = "net_tests.rs"]
-mod net_tests;
+mod tests;
 
 /// Whether this thread is a hyper-rt shard's: what every async entry point
 /// needs, its timers and sockets the shard's.

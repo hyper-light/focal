@@ -15,4 +15,4 @@ pub use classes::{ENROLLMENT_CODES, FocalClasses, HELLO_CODE, Kind, MAX_MESSAGE_
 pub use directory::Inbound;
 pub(crate) use directory::NetDirectory;
 pub(crate) use owner::{Answer, Command, Driver, Failed, Linked, Network};
-pub use owner::{HELLO_BYTES, NetStats, Serve, ServeFuture, Served};
+pub use owner::{HELLO_BYTES, NetStats, Reply, Serve, ServeFuture, Served};

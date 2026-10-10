@@ -191,6 +191,21 @@ fn corrupt_header_and_both_length_caps_refuse_before_body_reads() {
     .unwrap()
 }
 
+/// A typed read of a header announcing more than its bound is refused from the header, before it
+/// waits for the payload or allocates for it: the stream holds the header alone.
+#[test]
+fn oversized_header_is_rejected_before_waiting_for_or_allocating_payload() {
+    focal_rt::block_on(async move {
+        let bytes = header(FrameKind::Request, u32::MAX);
+        let mut reader = Fragmented::new(&bytes, 64);
+        let result =
+            read_frame::<_, crate::RequestEnvelope>(&mut reader, FrameKind::Request, 1024).await;
+        assert!(matches!(result, Err(WireError::Limit)), "{result:?}");
+        assert_eq!(reader.consumed, HEADER_BYTES);
+    })
+    .unwrap()
+}
+
 #[test]
 fn zero_length_raw_frame_is_valid_and_typed_trailing_payload_remains_invalid() {
     focal_rt::block_on(async move {

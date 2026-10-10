@@ -680,6 +680,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Close every connection to `peer` (T43: a retired route closes its connection); its
     /// exchanges are refused as the connections close.
     pub fn disconnect(&mut self, now: Instant, peer: PeerId) {
+        self.close_peer(now, peer, CLOSE_NORMAL);
+    }
+
+    /// Close every connection to `peer`, telling it why: a peer whose identity no longer
+    /// authenticates here (its grant withdrawn) is refused [`Refusal::Identity`], which its side
+    /// reports as it reports a dial whose certificate was refused at its handshake. Its exchanges
+    /// are refused as the connections close.
+    pub fn refuse(&mut self, now: Instant, peer: PeerId, refusal: Refusal) {
+        self.close_peer(now, peer, refusal.code());
+    }
+
+    fn close_peer(&mut self, now: Instant, peer: PeerId, code: u32) {
         self.core.now = now;
         for key in 0..self.conns.len() {
             let of = self
@@ -690,7 +702,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                     conn.dialed == Some(peer) || conn.peer.is_some_and(|(id, _)| id == peer)
                 });
             if of {
-                self.close(now, key, CLOSE_NORMAL);
+                self.close(now, key, code);
             }
         }
     }
@@ -812,6 +824,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     pub fn end(&mut self, exchange: ExchangeId) {
         let _ = self.with_exchange(exchange, |core, conn, id| {
             core.end(conn, id);
+            Ok(())
+        });
+    }
+
+    /// End `exchange`, refusing it for `refusal`: a half not yet complete is reset with the
+    /// refusal's code, so its peer hears why — an owner holding a sender to its share of what it
+    /// reads refuses past it `Budget`, which the asker reads as the peer's refusal and not as its
+    /// connection failing. The owner, which refused it, hears nothing more of it.
+    pub fn refuse_exchange(&mut self, exchange: ExchangeId, refusal: Refusal) {
+        let _ = self.with_exchange(exchange, |core, conn, id| {
+            core.refuse(conn, id, refusal);
             Ok(())
         });
     }
@@ -2352,6 +2375,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         } else {
             self.finish_exchange(conn, id, None);
         }
+    }
+
+    /// End exchange `id` refused for `refusal`, by its owner: the halves not yet complete are reset
+    /// with the refusal's code, and the owner, which decided it, is told nothing (an exchange its
+    /// owner ended raises no event).
+    fn refuse(&mut self, conn: &mut Conn<C::Role>, id: u64, refusal: Refusal) {
+        if let Some(exchange) = self.exchanges.get_mut(id) {
+            exchange.ended = true;
+        }
+        self.finish_exchange(conn, id, Some((refusal, false)));
     }
 
     /// End exchange `id`: with `failure`, the owner hears it was refused. A half not yet complete

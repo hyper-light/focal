@@ -286,7 +286,8 @@ pub(crate) struct Exchange<K> {
     /// The owner's last read of the body wanted more than had arrived: only then is a period that
     /// brought nothing evidence against the sender.
     pub(crate) starved: bool,
-    /// The owner ended it while only this side's trailer was left to send: it stays, unseen by
-    /// the owner, until the trailer is sent, and then goes.
+    /// The owner ended it: while only this side's trailer was left to send it stays, unseen by
+    /// the owner, until the trailer is sent, and then goes; refused by its owner it goes at once.
+    /// Either way the owner hears nothing more of it.
     pub(crate) ended: bool,
 }

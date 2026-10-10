@@ -7,7 +7,10 @@
 //!
 //! A request a peer sends is read whole into a reservation of the node's budget and handed, with
 //! what its sender authenticated as, to a task of its own on the owner's shard ([`Serve`]); the
-//! task's answer comes back as a command and is written as the exchange's reply. A request is
+//! task's answer comes back on the owner's own queue and is written as the exchange's reply. The
+//! owner ends, closing its connections, once every handle to it is gone: nothing else holds its
+//! queue of commands open (a registry wakes it through a watched word, its tasks answer on a queue
+//! of its own). A request is
 //! admitted against its sender's share of the ingress before any of its body is reserved (the
 //! audit's F03): the lane's bytes among the peers with a connection up, one frame at least.
 
@@ -17,8 +20,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use hyper_rt::combine::{Either, race2};
-use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender as CommandSender, channel, oneshot};
+use hyper_rt::combine::{Either3, race3};
+use hyper_rt::sync::{
+    ChannelReceiver, OneshotSender, Sender as CommandSender, WatchReceiver, channel, oneshot,
+};
 use hyper_rt::{RtError, TaskId};
 use hyper_transport::tls::Tls;
 use hyper_transport::{
@@ -56,9 +61,23 @@ pub struct Served {
     pub path: Duration,
 }
 
-/// A served request's answer: the reply's body, or `None` to refuse the exchange (its stream is
-/// reset, which its asker reads as the exchange refused by the peer).
-pub type ServeFuture = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + 'static>>;
+/// A served request's answer: the reply, or `None` to refuse the exchange (its stream is reset,
+/// which its asker reads as the exchange refused by the peer).
+pub type ServeFuture = Pin<Box<dyn Future<Output = Option<Reply>> + 'static>>;
+
+/// A served request's reply: its body, and the charge its handler made for it, kept until the
+/// endpoint has taken the body's last byte or the exchange ends. A reply whose peer reads it
+/// slowly stays charged while the owner holds it.
+pub struct Reply {
+    pub body: Vec<u8>,
+    pub charge: Option<crate::ResponseCharge>,
+}
+impl Reply {
+    /// A reply whose body is all it holds.
+    pub fn uncharged(body: Vec<u8>) -> Self {
+        Self { body, charge: None }
+    }
+}
 
 /// What an endpoint serves: its peers' greetings and requests. Installed on a listening endpoint's
 /// owner once ([`Command::Serve`]); until then every request is refused.
@@ -107,6 +126,9 @@ pub struct NetStats {
     pub refused_unnegotiated: u64,
     /// Exchanges asked and answered.
     pub answered: u64,
+    /// Dials started: a route's first, and each after its connection went. A caller that joins a
+    /// dial in flight, or finds the route's connection up, starts none.
+    pub dials: u64,
 }
 
 /// What a handle asks of the owner.
@@ -132,11 +154,6 @@ pub(crate) enum Command {
         period: Duration,
         reply: OneshotSender<Result<Answer, Failed>>,
     },
-    /// A served request's answer, from its task.
-    Answer {
-        exchange: ExchangeId,
-        body: Option<Vec<u8>>,
-    },
     /// Close every connection to `peer`.
     Disconnect { peer: PeerId },
     /// Run the connections made from now on under `tls`.
@@ -144,8 +161,6 @@ pub(crate) enum Command {
         tls: Box<Tls>,
         reply: OneshotSender<Result<(), WireError>>,
     },
-    /// The registry's grants changed: close what they no longer grant.
-    Revoked,
     /// What the owner holds.
     Stats { reply: OneshotSender<NetStats> },
     /// Serve the endpoint's peers with `serve`, and tell `done` when the owner ends.
@@ -170,22 +185,28 @@ pub(crate) struct Network {
 
 impl Network {
     /// Starts the owner of `driver` on the current shard, negotiating under `limits`; commands wait
-    /// in a queue of `queue`, past which a handle's send waits its turn. The owner serves nothing
-    /// until it is given what to serve ([`Command::Serve`]).
+    /// in a queue of `queue`, past which a handle's send waits its turn, and the answers of the
+    /// requests it serves in one of their own as long. `revocations` is the registry's revision,
+    /// watched, for a listener: the owner closes the connections a withdrawal no longer grants as
+    /// it moves. The owner serves nothing until it is given what to serve ([`Command::Serve`]).
     pub(crate) fn start(
         driver: Driver,
         limits: WireLimits,
         queue: usize,
+        revocations: Option<WatchReceiver>,
     ) -> Result<Self, WireError> {
         let (commands, receiver) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
-        let owner = Owner::new(driver, limits, commands.clone());
-        hyper_rt::futures::spawn_detached(owner.run(receiver))
+        let (answers, answered) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
+        let owner = Owner::new(driver, limits, answers);
+        hyper_rt::futures::spawn_detached(owner.run(receiver, answered, revocations))
             .map_err(|_| WireError::Connection)?;
         Ok(Self { commands })
     }
 
-    /// Sends `command`, waiting its turn on the queue: `Connection` when the owner has ended.
+    /// Sends `command`, waiting its turn on the queue: `Connection` when the owner has ended, or
+    /// when this is not a shard's task (a wait it cannot keep: refused before anything is queued).
     pub(crate) async fn send(&self, command: Command) -> Result<(), WireError> {
+        crate::require_runtime()?;
         self.commands
             .send(command)
             .await
@@ -229,6 +250,8 @@ struct PeerState {
 struct DialState {
     route: (SocketAddr, String),
     offers: Vec<u16>,
+    /// The endpoint is dialing it: from the dial's start to its connection up or its failure.
+    dialing: bool,
     hello: Option<ExchangeId>,
     waiting: Vec<OneshotSender<Result<Linked, WireError>>>,
 }
@@ -255,8 +278,8 @@ struct Serving {
     share: u64,
     /// The task answering it.
     task: Option<TaskId>,
-    /// The answer, as it is written.
-    answer: Option<(Vec<u8>, usize)>,
+    /// The answer, as it is written: its charge held until its last byte is taken.
+    answer: Option<(Reply, usize)>,
     /// The request read whole before the endpoint was given what to serve: it waits for it.
     parked: Option<Vec<u8>>,
 }
@@ -270,7 +293,8 @@ struct Owner {
     serve: Option<Box<dyn Serve>>,
     /// Who waits for the owner to end.
     done: Vec<OneshotSender<()>>,
-    commands: CommandSender<Command>,
+    /// Where the tasks serving requests send their answers.
+    answers: CommandSender<(ExchangeId, Option<Reply>)>,
     peers: BTreeMap<PeerId, PeerState>,
     routes: BTreeMap<(SocketAddr, String), PeerId>,
     asking: BTreeMap<ExchangeId, Asking>,
@@ -329,7 +353,11 @@ fn unreachable(refusal: Option<Refusal>) -> WireError {
 }
 
 impl Owner {
-    fn new(driver: Driver, limits: WireLimits, commands: CommandSender<Command>) -> Self {
+    fn new(
+        driver: Driver,
+        limits: WireLimits,
+        answers: CommandSender<(ExchangeId, Option<Reply>)>,
+    ) -> Self {
         let last = driver.clock().unwrap_or_else(|_| Instant::now());
         Self {
             driver,
@@ -337,7 +365,7 @@ impl Owner {
             limits,
             serve: None,
             done: Vec::new(),
-            commands,
+            answers,
             peers: BTreeMap::new(),
             routes: BTreeMap::new(),
             asking: BTreeMap::new(),
@@ -357,15 +385,51 @@ impl Owner {
         self.last
     }
 
-    async fn run(mut self, mut commands: ChannelReceiver<Command>) {
+    async fn run(
+        mut self,
+        mut commands: ChannelReceiver<Command>,
+        mut answers: ChannelReceiver<(ExchangeId, Option<Reply>)>,
+        mut revocations: Option<WatchReceiver>,
+    ) {
+        // Whether a handle may still send: once every one is gone the queue is read no more.
+        let mut asked = true;
         loop {
-            let next = race2(self.driver.event(), commands.recv()).await;
+            // What the endpoint has first, then the answers of this owner's own tasks, then what
+            // it is asked, then the registry's word.
+            let others = async {
+                let commands = async {
+                    if asked {
+                        Some(commands.recv().await)
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                let revoked = async {
+                    match revocations.as_mut() {
+                        Some(watched) => watched.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                };
+                hyper_rt::combine::race2(commands, revoked).await
+            };
+            let next = race3(self.driver.event(), answers.recv(), others).await;
             match next {
-                Either::First(Ok(event)) => self.on_event(event),
-                Either::First(Err(_)) => break,
-                Either::Second(Ok(command)) => self.on_command(command),
+                Either3::First(Ok(event)) => self.on_event(event),
+                Either3::First(Err(_)) => break,
+                Either3::Second(Ok((exchange, reply))) => self.answer(exchange, reply),
+                // The owner holds a sender of its own: never closed while it runs.
+                Either3::Second(Err(_)) => break,
+                Either3::Third(hyper_rt::combine::Either::First(Some(Ok(command)))) => {
+                    self.on_command(command)
+                }
                 // Every handle is gone: nothing more will be asked.
-                Either::Second(Err(_)) => self.closing = true,
+                Either3::Third(hyper_rt::combine::Either::First(_)) => {
+                    asked = false;
+                    self.closing = true;
+                }
+                Either3::Third(hyper_rt::combine::Either::Second(true)) => self.revoked(),
+                // The registry is gone: its revision is read as the owner moves, as before.
+                Either3::Third(hyper_rt::combine::Either::Second(false)) => revocations = None,
             }
             // The rest of what is ready, a bounded turn of it, before the next wait.
             for _ in 0..hyper_rt_transport::TURNS {
@@ -440,7 +504,6 @@ impl Owner {
                 period,
                 reply,
             } => self.ask(peer, epoch, kind, body, period, reply),
-            Command::Answer { exchange, body } => self.answer(exchange, body),
             Command::Disconnect { peer } => {
                 let now = self.now();
                 self.driver.endpoint().disconnect(now, peer);
@@ -453,7 +516,6 @@ impl Owner {
                     .map_err(|_| WireError::Authentication);
                 let _ = reply.send(set);
             }
-            Command::Revoked => self.revoked(),
             Command::Stats { reply } => {
                 let stats = self.stats();
                 let _ = reply.send(stats);
@@ -539,14 +601,41 @@ impl Owner {
                 dialed: Some(DialState {
                     route,
                     offers,
+                    dialing: false,
                     hello: None,
                     waiting: vec![reply],
                 }),
             },
         );
+        self.dial(peer, address);
+    }
+
+    /// Starts a dial of `peer` at `address`; a refused one fails who waits for it.
+    fn dial(&mut self, peer: PeerId, address: SocketAddr) {
         let now = self.now();
-        if let Err(refusal) = self.driver.endpoint().connect(now, peer, address) {
-            self.fail_waiting(peer, refused(refusal));
+        match self.driver.endpoint().connect(now, peer, address) {
+            Ok(()) => {
+                if let Some(dial) = self
+                    .peers
+                    .get_mut(&peer)
+                    .and_then(|state| state.dialed.as_mut())
+                {
+                    dial.dialing = true;
+                }
+                self.stats.dials = self.stats.dials.saturating_add(1);
+            }
+            Err(refusal) => self.fail_waiting(peer, refused(refusal)),
+        }
+    }
+
+    /// The dial of `peer` is over, its connection up or failed.
+    fn dialed(&mut self, peer: PeerId) {
+        if let Some(dial) = self
+            .peers
+            .get_mut(&peer)
+            .and_then(|state| state.dialed.as_mut())
+        {
+            dial.dialing = false;
         }
     }
 
@@ -583,10 +672,11 @@ impl Owner {
         }
         dial.offers = offers;
         dial.waiting.push(reply);
-        // A dial in progress or a connection being greeted is joined; the endpoint dials once.
-        let now = self.now();
-        if let Err(refusal) = self.driver.endpoint().connect(now, peer, address) {
-            self.fail_waiting(peer, refused(refusal));
+        // A dial in progress or a connection being greeted is joined; a route whose connection
+        // went is dialed again, once.
+        let idle = !dial.dialing && state.epoch.is_none();
+        if idle {
+            self.dial(peer, address);
         }
     }
 
@@ -725,17 +815,17 @@ impl Owner {
         }
     }
 
-    fn answer(&mut self, exchange: ExchangeId, body: Option<Vec<u8>>) {
+    fn answer(&mut self, exchange: ExchangeId, reply: Option<Reply>) {
         let Some(serving) = self.serving.get_mut(&exchange) else {
             // Refused while its task ran: nothing waits for the answer.
             return;
         };
         serving.task = None;
-        let Some(body) = body else {
+        let Some(reply) = reply else {
             self.end_serving(exchange);
             return;
         };
-        let length = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        let length = u64::try_from(reply.body.len()).unwrap_or(u64::MAX);
         if self
             .driver
             .endpoint()
@@ -746,7 +836,7 @@ impl Owner {
             return;
         }
         if let Some(serving) = self.serving.get_mut(&exchange) {
-            serving.answer = Some((body, 0));
+            serving.answer = Some((reply, 0));
         }
         self.write_answer(exchange);
     }
@@ -755,14 +845,14 @@ impl Owner {
         let Some(serving) = self.serving.get_mut(&exchange) else {
             return;
         };
-        let Some((body, written)) = serving.answer.as_mut() else {
+        let Some((reply, written)) = serving.answer.as_mut() else {
             return;
         };
-        let rest = body.get(*written..).unwrap_or(&[]);
+        let rest = reply.body.get(*written..).unwrap_or(&[]);
         let done = match self.driver.endpoint().write_body(exchange, rest) {
             Ok(taken) => {
                 *written = written.saturating_add(taken);
-                *written >= body.len()
+                *written >= reply.body.len()
             }
             Err(_) => true,
         };
@@ -803,11 +893,13 @@ impl Owner {
         }
     }
 
+    /// Closes the connections of every peer whose grant was withdrawn, telling each it was refused
+    /// for its identity: what the peer's dial reports as its certificate refused.
     fn revoked(&mut self) {
         let now = self.now();
         let revoked = self.driver.endpoint().directory().revoked();
         for peer in revoked {
-            self.driver.endpoint().disconnect(now, peer);
+            self.driver.endpoint().refuse(now, peer, Refusal::Identity);
         }
     }
 
@@ -900,6 +992,7 @@ impl Owner {
     }
 
     fn connected(&mut self, peer: PeerId, _role: Sender, epoch: Epoch) {
+        self.dialed(peer);
         self.driver.endpoint().directory_mut().set_live(peer, true);
         let state = self.peers.entry(peer).or_insert(PeerState {
             epoch: None,
@@ -961,6 +1054,7 @@ impl Owner {
     }
 
     fn unreached(&mut self, peer: PeerId, refusal: Option<Refusal>) {
+        self.dialed(peer);
         let unpinned = self.driver.endpoint().directory_mut().take_unpinned(peer);
         let error = if unpinned {
             WireError::Authentication
@@ -1017,14 +1111,18 @@ impl Owner {
                 None => {
                     self.stats.refused_unnegotiated =
                         self.stats.refused_unnegotiated.saturating_add(1);
-                    self.driver.endpoint().end(exchange);
+                    self.driver
+                        .endpoint()
+                        .refuse_exchange(exchange, Refusal::Kind);
                     return;
                 }
             },
         };
         let Some(length) = body.filter(|length| *length <= bound) else {
             self.stats.refused_unnegotiated = self.stats.refused_unnegotiated.saturating_add(1);
-            self.driver.endpoint().end(exchange);
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::FrameBound);
             return;
         };
         // The sender's share of the ingress, before any of the body is reserved (F03).
@@ -1035,15 +1133,19 @@ impl Owner {
             .and_then(|lanes| lanes.get(lane_of(class)))
             .copied()
             .unwrap_or(0);
+        // Refused past it typed, as the budget's own refusal is: the sender reads the peer's
+        // capacity, never its connection failing.
         if held.saturating_add(length) > share {
             self.stats.refused_ingress = self.stats.refused_ingress.saturating_add(1);
-            self.driver.endpoint().end(exchange);
+            self.driver
+                .endpoint()
+                .refuse_exchange(exchange, Refusal::Budget);
             return;
         }
         let reading = match self.driver.endpoint().reserve(class, length) {
             Ok(reading) => reading,
-            Err(_) => {
-                self.driver.endpoint().end(exchange);
+            Err(refusal) => {
+                self.driver.endpoint().refuse_exchange(exchange, refusal);
                 return;
             }
         };
@@ -1151,7 +1253,7 @@ impl Owner {
             Err(_) => HelloReply::Rejected(AccessError::InvalidRequest),
         };
         let body = encode_payload(&reply, HELLO_BYTES).ok();
-        self.answer(exchange, body);
+        self.answer(exchange, body.map(Reply::uncharged));
     }
 
     /// Hands a request to a task of its own; its answer comes back as a command.
@@ -1186,11 +1288,11 @@ impl Owner {
             return;
         };
         let work = serve.serve(served);
-        let commands = self.commands.clone();
+        let answers = self.answers.clone();
         let task = hyper_rt::futures::spawn_detached(async move {
-            let body = work.await;
+            let reply = work.await;
             // The owner reads its queue until it ends; one that ended has nothing to write to.
-            let _ = commands.send(Command::Answer { exchange, body }).await;
+            let _ = answers.send((exchange, reply)).await;
         });
         match task {
             Ok(task) => {
