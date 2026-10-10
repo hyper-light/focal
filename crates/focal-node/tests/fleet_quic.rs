@@ -1654,7 +1654,14 @@ async fn a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader() {
     assert_eq!(added.view().configuration.learners, vec![fresh_node]);
     let other = (leader + 1) % 3;
     hand_off(&fleet, other).await;
-    applied_at_least(&fleet, fresh, compacted_applied, true).await;
+    // The copy states its promise at the configuration it has applied, so
+    // it is asked once it has applied the one that admitted it: asked
+    // before, it promised at the configuration before its admission, which
+    // every voter that applied the admission refuses as stale (4 runs in 32
+    // with four of this test at once; the service's discovery asks again
+    // each round, where this asks once).
+    let admitted = added.view().configuration_index;
+    applied_at_least(&fleet, fresh, admitted.max(compacted_applied), true).await;
     // The promises the new leader holds were taken at the configuration
     // before the admission; promotion wants the candidate's at the current
     // one, which the service's discovery asks again for.
