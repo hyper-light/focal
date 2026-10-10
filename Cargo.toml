@@ -3,12 +3,18 @@ members = ["crates/*", "tools/*"]
 # The shared crates vendored from hyper-raft are roots of their own (SNAPSHOT in each).
 exclude = [
     "vendor/hyper-block",
+    "vendor/hyper-datagram",
     "vendor/hyper-durable",
     "vendor/hyper-liveness",
     "vendor/hyper-log",
+    "vendor/hyper-quic",
     "vendor/hyper-raft",
+    "vendor/hyper-rt",
+    "vendor/hyper-rt-transport",
     "vendor/hyper-seal",
     "vendor/hyper-timing",
+    "vendor/hyper-tls",
+    "vendor/hyper-transport",
 ]
 resolver = "3"
 
@@ -37,6 +43,17 @@ hyper-seal = { version = "0.1.0", path = "vendor/hyper-seal" }
 # The consensus core, vendored from hyper-raft (vendor/hyper-raft/SNAPSHOT;
 # 27 §4.2): focal's core moved there and is shared with mantle and slates.
 hyper-raft = { version = "0.1.0", path = "vendor/hyper-raft" }
+# The runtime and the transport, vendored from hyper-raft (vendor/*/SNAPSHOT): the
+# thread-per-core runtime every async task runs on (hyper-rt), the sans-io
+# application layer over QUIC (hyper-transport over hyper-quic and hyper-tls),
+# the sealed datagram plane (hyper-datagram), and the driver that runs the
+# endpoint and the plane on a hyper-rt shard (hyper-rt-transport).
+hyper-datagram = { version = "0.1.0", path = "vendor/hyper-datagram" }
+hyper-quic = { version = "0.1.0", path = "vendor/hyper-quic" }
+hyper-rt = { version = "0.1.0", path = "vendor/hyper-rt" }
+hyper-rt-transport = { version = "0.1.0", path = "vendor/hyper-rt-transport" }
+hyper-tls = { version = "0.1.0", path = "vendor/hyper-tls" }
+hyper-transport = { version = "0.1.0", path = "vendor/hyper-transport" }
 # raft-rs 0.7's message and log types, for focal-consensus's tests alone: the
 # oracle its envelope codec is held to byte for byte, since focal's WAL and
 # wire keep raft-rs's protobuf encoding (focal-consensus/src/envelope.rs).

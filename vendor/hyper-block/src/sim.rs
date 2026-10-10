@@ -17,6 +17,9 @@ use crate::DiskError;
 use crate::block::BlockFile;
 use crate::buf::Alignment;
 
+mod shared;
+pub use shared::{SimDevice, SimHandle};
+
 /// The largest simulated file: tests hold two copies of it in memory.
 pub const MAX_SIM_LEN: u64 = 1 << 30;
 
@@ -97,13 +100,12 @@ pub struct SimStats {
 }
 
 /// A simulated file with power-loss semantics. It has one owner, as every [`BlockFile`] does: a
-/// log's device thread while the log runs, the test once the log has given it back.
+/// log's device thread while the log runs, the test once the log has given it back. Several threads
+/// that each need a handle onto one simulated device use [`SimDevice`] instead.
 #[derive(Debug)]
 pub struct SimFile {
-    state: RefCell<State>,
+    disk: RefCell<Disk>,
     align: Alignment,
-    sector: u64,
-    name: std::path::PathBuf,
 }
 
 impl SimFile {
@@ -111,40 +113,90 @@ impl SimFile {
     /// `sector` granularity (a power of two no larger than the alignment; 512 models a
     /// 512e drive under 4 KiB I/O).
     pub fn new(align: Alignment, sector: Alignment, seed: u64) -> Result<Self, DiskError> {
-        if sector > align {
-            return Err(sim_error("sector larger than the alignment"));
-        }
         Ok(Self {
-            state: RefCell::new(State {
-                visible: Vec::new(),
-                durable: Vec::new(),
-                dirty: BTreeSet::new(),
-                faults: Vec::new(),
-                rng: SplitMix64::new(seed),
-                stats: SimStats::default(),
-            }),
+            disk: RefCell::new(Disk::new(align, sector, seed)?),
             align,
-            sector: u64::try_from(sector.get()).unwrap_or(u64::MAX),
-            name: std::path::PathBuf::from(format!("sim-{seed:016x}")),
         })
     }
 
     /// Arms a fault. Read faults persist until cleared; the others fire once.
     pub fn inject(&self, fault: Fault) -> Result<(), DiskError> {
-        self.lock()?.faults.push(fault);
+        self.lock()?.inject(fault);
         Ok(())
     }
 
     /// Disarms every fault.
     pub fn clear_faults(&self) -> Result<(), DiskError> {
-        self.lock()?.faults.clear();
+        self.lock()?.clear_faults();
         Ok(())
     }
 
     /// Loses power: unflushed sectors survive per `crash`, and what reads return becomes
     /// what survived.
     pub fn crash(&self, crash: Crash) -> Result<(), DiskError> {
-        let mut state = self.lock()?;
+        self.lock()?.crash(crash);
+        Ok(())
+    }
+
+    /// The operations counted so far.
+    pub fn stats(&self) -> Result<SimStats, DiskError> {
+        Ok(self.lock()?.state.stats)
+    }
+
+    /// A copy of what would survive a crash that kept nothing unflushed.
+    pub fn durable_image(&self) -> Result<Vec<u8>, DiskError> {
+        Ok(self.lock()?.state.durable.clone())
+    }
+
+    /// The file's state, for one operation: no operation runs inside another, so it is never
+    /// borrowed already, and a borrow that fails is refused rather than unwound.
+    fn lock(&self) -> Result<RefMut<'_, Disk>, DiskError> {
+        self.disk
+            .try_borrow_mut()
+            .map_err(|_| sim_error("simulated file reentered"))
+    }
+}
+
+/// The simulated device itself: its images, faults, generator and counts, and the operations on
+/// them, each taking a transfer [`check`] has already accepted. [`SimFile`] holds one in a cell for
+/// its single owner; [`SimDevice`]'s device thread owns one and serves every handle from it, so the
+/// two behave alike by construction.
+#[derive(Debug)]
+pub(crate) struct Disk {
+    state: State,
+    sector: u64,
+    name: std::path::PathBuf,
+}
+
+impl Disk {
+    pub(crate) fn new(align: Alignment, sector: Alignment, seed: u64) -> Result<Self, DiskError> {
+        if sector > align {
+            return Err(sim_error("sector larger than the alignment"));
+        }
+        Ok(Self {
+            state: State {
+                visible: Vec::new(),
+                durable: Vec::new(),
+                dirty: BTreeSet::new(),
+                faults: Vec::new(),
+                rng: SplitMix64::new(seed),
+                stats: SimStats::default(),
+            },
+            sector: u64::try_from(sector.get()).unwrap_or(u64::MAX),
+            name: std::path::PathBuf::from(format!("sim-{seed:016x}")),
+        })
+    }
+
+    pub(crate) fn inject(&mut self, fault: Fault) {
+        self.state.faults.push(fault);
+    }
+
+    pub(crate) fn clear_faults(&mut self) {
+        self.state.faults.clear();
+    }
+
+    pub(crate) fn crash(&mut self, crash: Crash) {
+        let state = &mut self.state;
         let dirty: Vec<u64> = std::mem::take(&mut state.dirty).into_iter().collect();
         for sector in dirty {
             let keep = match crash {
@@ -153,52 +205,23 @@ impl SimFile {
                 Crash::KeepAll => true,
             };
             if keep {
-                persist_sector(&mut state, sector, self.sector);
+                persist_sector(state, sector, self.sector);
             }
         }
         state.visible = state.durable.clone();
         state.stats.crashes = state.stats.crashes.saturating_add(1);
-        Ok(())
     }
 
-    /// The operations counted so far.
-    pub fn stats(&self) -> Result<SimStats, DiskError> {
-        Ok(self.lock()?.stats)
+    pub(crate) fn stats(&self) -> SimStats {
+        self.state.stats
     }
 
-    /// A copy of what would survive a crash that kept nothing unflushed.
-    pub fn durable_image(&self) -> Result<Vec<u8>, DiskError> {
-        Ok(self.lock()?.durable.clone())
+    pub(crate) fn durable_image(&self) -> Vec<u8> {
+        self.state.durable.clone()
     }
 
-    /// The file's state, for one operation: no operation runs inside another, so it is never
-    /// borrowed already, and a borrow that fails is refused rather than unwound.
-    fn lock(&self) -> Result<RefMut<'_, State>, DiskError> {
-        self.state
-            .try_borrow_mut()
-            .map_err(|_| sim_error("simulated file reentered"))
-    }
-
-    /// Refuses what a direct-I/O file would refuse: misaligned offsets, lengths and buffer
-    /// addresses, so tests catch an engine that would fail on a real `O_DIRECT` file.
-    fn check(&self, addr: usize, offset: u64, len: usize) -> Result<u64, DiskError> {
-        // A transfer of no bytes has no first byte to align (`DeviceFile::check_address`).
-        if !self.align.is_aligned_u64(offset)
-            || !self.align.is_aligned(len)
-            || (len != 0 && !self.align.is_aligned(addr))
-        {
-            return Err(DiskError::Misaligned {
-                offset,
-                len,
-                align: self.align.get(),
-            });
-        }
-        let len = u64::try_from(len).map_err(|_| sim_error("length"))?;
-        let end = offset.checked_add(len).ok_or_else(|| sim_error("offset"))?;
-        if end > MAX_SIM_LEN {
-            return Err(sim_error("simulated file larger than MAX_SIM_LEN"));
-        }
-        Ok(end)
+    pub(crate) fn len(&self) -> Result<u64, DiskError> {
+        u64::try_from(self.state.visible.len()).map_err(|_| sim_error("length"))
     }
 
     fn io(&self, op: &'static str, kind: std::io::ErrorKind) -> DiskError {
@@ -208,6 +231,168 @@ impl SimFile {
             source: std::io::Error::from(kind),
         }
     }
+
+    /// Fills `buf`, which [`check`] found ends at `end`, from `offset`.
+    pub(crate) fn read(&mut self, buf: &mut [u8], offset: u64, end: u64) -> Result<(), DiskError> {
+        let state = &mut self.state;
+        state.stats.reads = state.stats.reads.saturating_add(1);
+        let len = u64::try_from(buf.len()).map_err(|_| sim_error("length"))?;
+        let failed = state.faults.iter().any(|f| {
+            matches!(f, Fault::ReadError { offset: o, len: l } if overlaps(offset, len, *o, *l))
+        });
+        if failed {
+            return Err(self.io("read", std::io::ErrorKind::Other));
+        }
+        let (start, stop) = (
+            usize::try_from(offset).map_err(|_| sim_error("offset"))?,
+            usize::try_from(end).map_err(|_| sim_error("offset"))?,
+        );
+        let Some(src) = self.state.visible.get(start..stop) else {
+            return Err(DiskError::ShortRead {
+                path: self.name.clone(),
+                offset,
+                missing: stop.saturating_sub(self.state.visible.len().max(start)),
+            });
+        };
+        buf.copy_from_slice(src);
+        for fault in &self.state.faults {
+            if let Fault::BitFlip {
+                offset: at, bit, ..
+            } = fault
+                && (offset..end).contains(at)
+            {
+                let index = usize::try_from(at.saturating_sub(offset)).unwrap_or(usize::MAX);
+                if let Some(byte) = buf.get_mut(index) {
+                    *byte ^= 1u8.checked_shl(u32::from(*bit % 8)).unwrap_or(0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `buf`, which [`check`] found ends at `end`, at `offset`, into the volatile cache.
+    pub(crate) fn write(&mut self, buf: &[u8], offset: u64, end: u64) -> Result<(), DiskError> {
+        let state = &mut self.state;
+        state.stats.writes = state.stats.writes.saturating_add(1);
+        if power_cut(state) {
+            return Err(self.io("write", std::io::ErrorKind::Other));
+        }
+        if let Some(i) = state.faults.iter().position(|f| *f == Fault::WriteError) {
+            state.faults.remove(i);
+            return Err(self.io("write", std::io::ErrorKind::Other));
+        }
+        let capacity = state.faults.iter().find_map(|f| match f {
+            Fault::Capacity { len } => Some(*len),
+            _ => None,
+        });
+        if capacity.is_some_and(|cap| end > cap) {
+            return Err(self.io("write", std::io::ErrorKind::StorageFull));
+        }
+        let (start, stop) = (
+            usize::try_from(offset).map_err(|_| sim_error("offset"))?,
+            usize::try_from(end).map_err(|_| sim_error("offset"))?,
+        );
+        if state.visible.len() < stop {
+            state.visible.resize(stop, 0);
+        }
+        if let Some(dst) = state.visible.get_mut(start..stop) {
+            dst.copy_from_slice(buf);
+        }
+        let first = offset.checked_div(self.sector).unwrap_or(0);
+        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
+        if !buf.is_empty() {
+            state.dirty.extend(first..=last);
+        }
+        // A stored bit flip is re-applied on every read of its byte; a write over it heals it.
+        state.faults.retain(|f| {
+            !matches!(f, Fault::BitFlip { offset: at, stored: true, .. } if (offset..end).contains(at))
+        });
+        Ok(())
+    }
+
+    /// The write, durable on its own as a FUA write is: its sectors reach the medium before it
+    /// returns, and every other sector not yet flushed stays as it was, durable at the next flush
+    /// or not at a crash. One operation, as a power cut counts it.
+    pub(crate) fn write_durable(
+        &mut self,
+        buf: &[u8],
+        offset: u64,
+        end: u64,
+    ) -> Result<crate::block::Durable, DiskError> {
+        self.write(buf, offset, end)?;
+        let state = &mut self.state;
+        state.stats.durable_writes = state.stats.durable_writes.saturating_add(1);
+        if buf.is_empty() {
+            return Ok(crate::block::Durable::Written);
+        }
+        let first = offset.checked_div(self.sector).unwrap_or(0);
+        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
+        for sector in first..=last {
+            state.dirty.remove(&sector);
+            persist_sector(state, sector, self.sector);
+        }
+        Ok(crate::block::Durable::Written)
+    }
+
+    /// Makes every sector the device holds unflushed durable, whichever handle wrote it: a flush
+    /// is the file's and the device's, not the descriptor's (fdatasync(2): "all modified in-core
+    /// data of the file referred to by fd"; fcntl(2) on macOS, F_FULLFSYNC: the drive flushes all
+    /// buffered data to permanent storage).
+    pub(crate) fn sync(&mut self) -> Result<(), DiskError> {
+        let state = &mut self.state;
+        state.stats.syncs = state.stats.syncs.saturating_add(1);
+        if power_cut(state) {
+            return Err(self.io("sync_data", std::io::ErrorKind::Other));
+        }
+        let dirty: Vec<u64> = std::mem::take(&mut state.dirty).into_iter().collect();
+        if let Some(i) = state.faults.iter().position(|f| *f == Fault::SyncError) {
+            state.faults.remove(i);
+            // The kernel has marked these pages clean; whether they reached the medium is
+            // unknown, and a later flush will not write them again.
+            for sector in dirty {
+                if state.rng.next_u64() & 1 == 1 {
+                    persist_sector(state, sector, self.sector);
+                }
+            }
+            return Err(self.io("sync_data", std::io::ErrorKind::Other));
+        }
+        for sector in dirty {
+            persist_sector(state, sector, self.sector);
+        }
+        if state.durable.len() < state.visible.len() {
+            let len = state.visible.len();
+            state.durable.resize(len, 0);
+        }
+        Ok(())
+    }
+}
+
+/// Refuses what a direct-I/O file would refuse: misaligned offsets, lengths and buffer
+/// addresses, so tests catch an engine that would fail on a real `O_DIRECT` file. The transfer's
+/// end on success.
+pub(crate) fn check(
+    align: Alignment,
+    addr: usize,
+    offset: u64,
+    len: usize,
+) -> Result<u64, DiskError> {
+    // A transfer of no bytes has no first byte to align (`DeviceFile::check_address`).
+    if !align.is_aligned_u64(offset)
+        || !align.is_aligned(len)
+        || (len != 0 && !align.is_aligned(addr))
+    {
+        return Err(DiskError::Misaligned {
+            offset,
+            len,
+            align: align.get(),
+        });
+    }
+    let len = u64::try_from(len).map_err(|_| sim_error("length"))?;
+    let end = offset.checked_add(len).ok_or_else(|| sim_error("offset"))?;
+    if end > MAX_SIM_LEN {
+        return Err(sim_error("simulated file larger than MAX_SIM_LEN"));
+    }
+    Ok(end)
 }
 
 /// Copies one sector from the visible image to the durable one, growing it as needed.
@@ -253,7 +438,7 @@ fn overlaps(offset: u64, len: u64, start: u64, span: u64) -> bool {
     offset < fault_end && start < end
 }
 
-fn sim_error(what: &str) -> DiskError {
+pub(crate) fn sim_error(what: &str) -> DiskError {
     DiskError::Io {
         op: "sim",
         path: std::path::PathBuf::from("sim"),
@@ -286,86 +471,17 @@ impl BlockFile for SimFile {
     }
 
     fn len(&self) -> Result<u64, DiskError> {
-        let state = self.lock()?;
-        u64::try_from(state.visible.len()).map_err(|_| sim_error("length"))
+        self.lock()?.len()
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-        let end = self.check(buf.as_ptr().addr(), offset, buf.len())?;
-        let mut state = self.lock()?;
-        state.stats.reads = state.stats.reads.saturating_add(1);
-        let len = u64::try_from(buf.len()).map_err(|_| sim_error("length"))?;
-        let failed = state.faults.iter().any(|f| {
-            matches!(f, Fault::ReadError { offset: o, len: l } if overlaps(offset, len, *o, *l))
-        });
-        if failed {
-            return Err(self.io("read", std::io::ErrorKind::Other));
-        }
-        let (start, stop) = (
-            usize::try_from(offset).map_err(|_| sim_error("offset"))?,
-            usize::try_from(end).map_err(|_| sim_error("offset"))?,
-        );
-        let Some(src) = state.visible.get(start..stop) else {
-            return Err(DiskError::ShortRead {
-                path: self.name.clone(),
-                offset,
-                missing: stop.saturating_sub(state.visible.len().max(start)),
-            });
-        };
-        buf.copy_from_slice(src);
-        for fault in &state.faults {
-            if let Fault::BitFlip {
-                offset: at, bit, ..
-            } = fault
-                && (offset..end).contains(at)
-            {
-                let index = usize::try_from(at.saturating_sub(offset)).unwrap_or(usize::MAX);
-                if let Some(byte) = buf.get_mut(index) {
-                    *byte ^= 1u8.checked_shl(u32::from(*bit % 8)).unwrap_or(0);
-                }
-            }
-        }
-        Ok(())
+        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        self.lock()?.read(buf, offset, end)
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-        let end = self.check(buf.as_ptr().addr(), offset, buf.len())?;
-        let mut state = self.lock()?;
-        state.stats.writes = state.stats.writes.saturating_add(1);
-        if power_cut(&mut state) {
-            return Err(self.io("write", std::io::ErrorKind::Other));
-        }
-        if let Some(i) = state.faults.iter().position(|f| *f == Fault::WriteError) {
-            state.faults.remove(i);
-            return Err(self.io("write", std::io::ErrorKind::Other));
-        }
-        let capacity = state.faults.iter().find_map(|f| match f {
-            Fault::Capacity { len } => Some(*len),
-            _ => None,
-        });
-        if capacity.is_some_and(|cap| end > cap) {
-            return Err(self.io("write", std::io::ErrorKind::StorageFull));
-        }
-        let (start, stop) = (
-            usize::try_from(offset).map_err(|_| sim_error("offset"))?,
-            usize::try_from(end).map_err(|_| sim_error("offset"))?,
-        );
-        if state.visible.len() < stop {
-            state.visible.resize(stop, 0);
-        }
-        if let Some(dst) = state.visible.get_mut(start..stop) {
-            dst.copy_from_slice(buf);
-        }
-        let first = offset.checked_div(self.sector).unwrap_or(0);
-        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
-        if !buf.is_empty() {
-            state.dirty.extend(first..=last);
-        }
-        // A stored bit flip is re-applied on every read of its byte; a write over it heals it.
-        state.faults.retain(|f| {
-            !matches!(f, Fault::BitFlip { offset: at, stored: true, .. } if (offset..end).contains(at))
-        });
-        Ok(())
+        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        self.lock()?.write(buf, offset, end)
     }
 
     /// The sim stands for a direct file on Linux, so that one run's bytes are every platform's.
@@ -373,56 +489,18 @@ impl BlockFile for SimFile {
         true
     }
 
-    /// The write, durable on its own as a FUA write is: its sectors reach the medium before it
-    /// returns, and every other sector not yet flushed stays as it was, durable at the next flush
-    /// or not at a crash. One operation, as a power cut counts it.
+    /// The write, durable on its own as a FUA write is (`Disk::write_durable`).
     fn write_durable_at(
         &self,
         buf: &[u8],
         offset: u64,
     ) -> Result<crate::block::Durable, DiskError> {
-        self.write_all_at(buf, offset)?;
-        let mut state = self.lock()?;
-        state.stats.durable_writes = state.stats.durable_writes.saturating_add(1);
-        if buf.is_empty() {
-            return Ok(crate::block::Durable::Written);
-        }
-        let end = offset.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
-        let first = offset.checked_div(self.sector).unwrap_or(0);
-        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
-        for sector in first..=last {
-            state.dirty.remove(&sector);
-            persist_sector(&mut state, sector, self.sector);
-        }
-        Ok(crate::block::Durable::Written)
+        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        self.lock()?.write_durable(buf, offset, end)
     }
 
     fn sync_data(&self) -> Result<(), DiskError> {
-        let mut state = self.lock()?;
-        state.stats.syncs = state.stats.syncs.saturating_add(1);
-        if power_cut(&mut state) {
-            return Err(self.io("sync_data", std::io::ErrorKind::Other));
-        }
-        let dirty: Vec<u64> = std::mem::take(&mut state.dirty).into_iter().collect();
-        if let Some(i) = state.faults.iter().position(|f| *f == Fault::SyncError) {
-            state.faults.remove(i);
-            // The kernel has marked these pages clean; whether they reached the medium is
-            // unknown, and a later flush will not write them again.
-            for sector in dirty {
-                if state.rng.next_u64() & 1 == 1 {
-                    persist_sector(&mut state, sector, self.sector);
-                }
-            }
-            return Err(self.io("sync_data", std::io::ErrorKind::Other));
-        }
-        for sector in dirty {
-            persist_sector(&mut state, sector, self.sector);
-        }
-        if state.durable.len() < state.visible.len() {
-            let len = state.visible.len();
-            state.durable.resize(len, 0);
-        }
-        Ok(())
+        self.lock()?.sync()
     }
 }
 
