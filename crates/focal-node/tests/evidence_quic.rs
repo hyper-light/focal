@@ -1472,14 +1472,35 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
     }
     sealed(&fleet, leader, &slow, 1, &first).await;
     let before = fleet.relays[1].carried_toward_back();
+    let warmed_before = warm_up_bytes_toward(&fleet, 2).await;
     let reference = sealed(&fleet, leader, &slow, 2, &second).await;
-    let crossed = fleet.relays[1].carried_toward_back() - before;
+    // What crossed toward the copy, less the path warm-ups' padding: each connection to the copy
+    // that has not measured its path warms it up when idle (hyper-quic's Careful Resume), and an
+    // idle gap of the seal's exchanges is when it may (Linux CI: a warm-up's 160 datagrams in this
+    // count, 2 runs of 3)
+    let warmed = warm_up_bytes_toward(&fleet, 2).await - warmed_before;
+    let crossed = fleet.relays[1].carried_toward_back() - before - warmed;
     assert_bytes(
         download(&fleet.replicas[1].actor, &reference).await,
         &second,
     );
     fleet.stop().await;
     crossed
+}
+/// The bytes the other nodes' connections to node `target` have sent it as their paths' warm-up
+/// (`PathFacts::warm_up_bytes`): datagrams of padding the relay in front of the node counts with
+/// everything else that crosses toward it.
+async fn warm_up_bytes_toward(fleet: &Fleet, target: u64) -> u64 {
+    let mut bytes = 0;
+    for (index, replica) in fleet.replicas.iter().enumerate() {
+        if index as u64 + 1 == target {
+            continue;
+        }
+        if let Some(path) = replica.pool.path_now(target).await {
+            bytes += path.warm_up_bytes;
+        }
+    }
+    bytes
 }
 /// Upload `bytes` to the leader and seal, asking the seal again, exactly,
 /// while the copy is being made: for as long as four exchanges across the
