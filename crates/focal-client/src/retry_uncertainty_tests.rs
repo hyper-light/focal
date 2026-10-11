@@ -302,3 +302,58 @@ async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_
         Err(ClientError::OutcomeUnknown { .. })
     ));
 }
+
+/// Capacity resends are throttled by the client's budget (gRFC A6): under a
+/// lasting overload the resends thin to none, every refusal reported, and
+/// answers refill the budget.
+#[test]
+fn capacity_resends_are_throttled_by_the_clients_budget() {
+    focal_rt::block_on(capacity_resends_are_throttled_by_the_clients_budget_on_a_shard()).unwrap();
+}
+async fn capacity_resends_are_throttled_by_the_clients_budget_on_a_shard() {
+    let quick = RetryPolicy {
+        max_attempts: 4,
+        max_elapsed: Duration::from_secs(5),
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    };
+    // Four refused requests, then forty answered, then a refused one.
+    let mut steps = vec![Step::Capacity; 4 + 2 + 1 + 1];
+    steps.extend([Step::Committed; 40]);
+    steps.extend([Step::Capacity; 2]);
+    let seen = Mutex::new(Vec::new());
+    let client = Client::new(
+        Script { seen: &seen, steps },
+        quick.clone(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    let mut sends = Vec::new();
+    for _ in 0..4 {
+        let before = seen.lock().unwrap().len();
+        assert!(matches!(
+            client.request(request()).await,
+            Err(ClientError::Access(AccessError::Capacity))
+        ));
+        sends.push(seen.lock().unwrap().len() - before);
+    }
+    // Ten tokens, a refusal spending one, a resend while more than half
+    // remain: three resends, then one, then none.
+    assert_eq!(sends, vec![4, 2, 1, 1]);
+    assert_eq!(client.retry_tokens(), 2_000);
+    for _ in 0..40 {
+        assert!(matches!(
+            client.request(request()).await.unwrap().result,
+            Response::Submitted(MutationReply::Committed(_))
+        ));
+    }
+    // A tenth of a token an answer: six tokens, one resend again.
+    assert_eq!(client.retry_tokens(), 6_000);
+    let before = seen.lock().unwrap().len();
+    assert!(matches!(
+        client.request(request()).await,
+        Err(ClientError::Access(AccessError::Capacity))
+    ));
+    assert_eq!(seen.lock().unwrap().len() - before, 2);
+}
