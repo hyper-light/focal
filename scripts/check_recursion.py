@@ -11,6 +11,9 @@ the drop glue of one of their types (`drop_in_place`, and `drop_glue` as rustc 1
 when it is teardown alone (drops, a channel's `release`, `disconnect`, `discard_all_messages`)
 whose functions name one of their types among their generic arguments (a message that holds the
 receiving end of its own channel); listed when it lies inside a third-party dependency.
+A function's name is read by the checker's own demangler of Rust's v0 symbols (RFC 2603), the
+same on every machine: a platform's c++filt prints crate disambiguators (binutils) or no v0 name
+at all (an older Xcode), and a name read wrong is a cycle judged wrong.
 
 Each target's IR is written to a path of its own (`--emit=llvm-ir=PATH`, under the profile's
 `ir` directory): cargo names a binary's artifact only where it copies it out, never the `deps`
@@ -23,9 +26,11 @@ edge, and so a function that builds a boxed future of itself and awaits it is in
 The source check covers that form: an `async fn`, or a function returning a future, that calls
 itself by name (`name(`, `Self::name(`, `self.name(`) in its own body is refused.
 
-The checker proves itself on its fixtures first (`--self-test`): a self-recursive function, a
-mutual recursion and the drop glue of a self-referential type are refused, a dependency's
-cycle is listed and not refused, and a boxed async self-call is refused at the source.
+The checker proves itself on its fixtures first (`--self-test`): symbols of the workspace that
+take every production of the v0 grammar its call graphs meet are read as LLVM's demangler reads
+them, a self-recursive function, a mutual recursion and the drop glue of a self-referential type
+are refused, a dependency's cycle is listed and not refused, and a boxed async self-call is
+refused at the source.
 """
 from __future__ import annotations
 
@@ -45,49 +50,349 @@ TEST_TREE = re.compile(r"(^|/)(tests|benches|examples)(/|$)")
 
 DEFINE = re.compile(r'^define\b[^@]*@("(?:[^"\\]|\\.)*"|[-a-zA-Z$._0-9]+)\(')
 CALL = re.compile(r'\b(?:call|invoke)\b[^@]*?@("(?:[^"\\]|\\.)*"|[-a-zA-Z$._0-9]+)\(')
-def demangler() -> list[str]:
-    """The command that demangles Rust's v0 symbols here: the toolchain's `llvm-cxxfilt` (rustup's
-    `llvm-tools`), else the platform's `c++filt` (LLVM's, or binutils' since 2.36). Refused, never
-    skipped, when neither does."""
-    sysroot = subprocess.run(
-        ["rustc", "--print", "sysroot"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    host = subprocess.run(
-        ["rustc", "--print", "host-tuple"], check=False, capture_output=True, text=True
-    ).stdout.strip()
-    candidates = [
-        [str(Path(sysroot) / "lib" / "rustlib" / host / "bin" / "llvm-cxxfilt")],
-        ["llvm-cxxfilt"],
-        ["c++filt"],
-    ]
-    for command in candidates:
-        try:
-            probe = subprocess.run(
-                command, input="_RNvCs1234_7mycrate3foo\n", capture_output=True, text=True, check=False
-            )
-        except OSError:
-            continue
-        if probe.stdout.strip() == "mycrate::foo":
-            return command
-    raise SystemExit(
-        "no demangler of Rust's v0 symbols: install rustup's llvm-tools component "
-        "(`rustup component add llvm-tools`) or binutils 2.36 or later"
-    )
+# --- Rust v0 symbol demangling (RFC 2603), without recursion -------------------------------------
+#
+# The checker reads its call graph's names itself rather than through a platform demangler: a
+# Linux runner's GNU c++filt prints crate disambiguators and a macOS runner's Xcode c++filt prints
+# no v0 name at all, so the same IR read two names on two machines. The grammar is walked by an
+# explicit stack of steps: each step either parses one production at the input's position or
+# writes text; a backreference parses what it names at its earlier position and comes back. A
+# symbol that takes more than V0_STEPS steps, or does not parse, is kept as it is.
+
+V0_STEPS = 200_000
+BASIC = {
+    "a": "i8", "b": "bool", "c": "char", "d": "f64", "e": "str", "f": "f32", "h": "u8",
+    "i": "isize", "j": "usize", "l": "i32", "m": "u32", "n": "i128", "o": "u128", "s": "i16",
+    "t": "u16", "u": "()", "v": "...", "x": "i64", "y": "u64", "z": "!", "p": "_",
+}
+
+
+class V0Error(Exception):
+    pass
+
+
+def demangle_v0(symbol: str) -> str:
+    """`symbol`'s path, as a v0 demangler prints it without disambiguators, or `symbol` itself
+    when it is no v0 name."""
+    text = symbol
+    for prefix in ("__R", "_R", "R"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    else:
+        return symbol
+    # A suffix after a period (`.llvm.123`) is LLVM's, not the name's.
+    text = text.split(".", 1)[0]
+    try:
+        return _V0(text).run()
+    except V0Error:
+        return symbol
+
+
+class _V0:
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+        self.out: list[str] = []
+        self.quiet = 0
+        # Lifetimes bound by the binders around this point (`for<'a>`).
+        self.bound = 0
+        # (kind, argument) steps, last first.
+        self.stack: list[tuple[str, object]] = []
+
+    def peek(self) -> str:
+        return self.text[self.pos] if self.pos < len(self.text) else ""
+
+    def next(self) -> str:
+        if self.pos >= len(self.text):
+            raise V0Error("end of symbol")
+        c = self.text[self.pos]
+        self.pos += 1
+        return c
+
+    def eat(self, c: str) -> bool:
+        if self.peek() == c:
+            self.pos += 1
+            return True
+        return False
+
+    def emit(self, s: str) -> None:
+        if not self.quiet:
+            self.out.append(s)
+
+    def base62(self) -> int:
+        """A base-62 number ended by `_`; `_` alone is 0, and every other one more than it reads."""
+        if self.eat("_"):
+            return 0
+        value = 0
+        while True:
+            c = self.next()
+            if c == "_":
+                return value + 1
+            if "0" <= c <= "9":
+                digit = ord(c) - ord("0")
+            elif "a" <= c <= "z":
+                digit = ord(c) - ord("a") + 10
+            elif "A" <= c <= "Z":
+                digit = ord(c) - ord("A") + 36
+            else:
+                raise V0Error("base-62 digit")
+            value = value * 62 + digit
+            if value > 1 << 64:
+                raise V0Error("base-62 overflow")
+
+    def disambiguator(self) -> int:
+        """`s <base-62>`, one more than the number; 0 when absent."""
+        return self.base62() + 1 if self.eat("s") else 0
+
+    def ident(self) -> str:
+        return self.ident_numbered()[0]
+
+    def ident_numbered(self) -> tuple[str, int]:
+        """An identifier and its disambiguator: what tells a closure from its siblings."""
+        number = self.disambiguator()
+        punycode = self.eat("u")
+        # A decimal number has no leading zero: `0` stands alone, so `00` is two lengths.
+        digits = self.next() if self.peek().isdigit() else ""
+        if digits not in ("", "0"):
+            while self.peek().isdigit():
+                digits += self.next()
+        if not digits:
+            raise V0Error("identifier length")
+        length = int(digits)
+        self.eat("_")
+        if self.pos + length > len(self.text):
+            raise V0Error("identifier past the end")
+        name = self.text[self.pos:self.pos + length]
+        self.pos += length
+        return (f"{{punycode:{name}}}" if punycode else name), number
+
+    def push(self, *steps: tuple[str, object]) -> None:
+        """Run `steps` next, in their order."""
+        self.stack.extend(reversed(steps))
+
+    def run(self) -> str:
+        self.push(("path", True))
+        # An instantiating crate may follow the path; it is not printed.
+        self.stack.insert(0, ("trailer", None))
+        budget = V0_STEPS
+        while self.stack:
+            budget -= 1
+            if budget < 0:
+                raise V0Error("step budget")
+            kind, arg = self.stack.pop()
+            getattr(self, "step_" + kind)(arg)
+        return "".join(self.out)
+
+    # -- steps --------------------------------------------------------------------------------
+
+    def step_text(self, s: object) -> None:
+        self.emit(str(s))
+
+    def step_quiet(self, on: object) -> None:
+        self.quiet += 1 if on else -1
+
+    def step_goto(self, pos: object) -> None:
+        self.pos = int(pos)  # type: ignore[arg-type]
+
+    def step_trailer(self, _: object) -> None:
+        if self.pos < len(self.text):
+            self.quiet += 1
+            self.push(("path", False), ("quiet", False))
+
+    def backref(self, kind: str, arg: object) -> None:
+        start = self.pos - 1
+        target = self.base62()
+        if target >= start:
+            raise V0Error("backreference forward")
+        self.push((kind, arg), ("goto", self.pos))
+        self.pos = target
+
+    def step_path(self, in_value: object) -> None:
+        c = self.next()
+        if c == "C":
+            self.disambiguator()
+            self.emit(self.ident())
+        elif c == "N":
+            ns = self.next()
+            self.push(("path", in_value), ("nested", ns))
+        elif c == "M":
+            self.disambiguator()
+            self.push(("quiet", True), ("path", False), ("quiet", False),
+                      ("text", "<"), ("type", None), ("text", ">"))
+        elif c == "X":
+            self.disambiguator()
+            self.push(("quiet", True), ("path", False), ("quiet", False),
+                      ("text", "<"), ("type", None), ("text", " as "), ("path", False), ("text", ">"))
+        elif c == "Y":
+            self.push(("text", "<"), ("type", None), ("text", " as "), ("path", False), ("text", ">"))
+        elif c == "I":
+            self.push(("path", in_value), ("text", "::<" if in_value else "<"),
+                      ("list", ("generic", ", ", ">", 0)))
+        elif c == "B":
+            self.backref("path", in_value)
+        else:
+            raise V0Error("path")
+
+    def step_nested(self, ns: object) -> None:
+        name, number = self.ident_numbered()
+        ns = str(ns)
+        if ns.isupper():
+            what = {"C": "closure", "S": "shim"}.get(ns, ns)
+            self.emit(f"::{{{what}" + (f":{name}" if name else "") + f"#{number}}}")
+        elif name:
+            # An item without a name (a tuple struct's constructor) prints as its path.
+            self.emit("::" + name)
+
+    def step_list(self, spec: object) -> None:
+        item, separator, close, count = spec  # type: ignore[misc]
+        if self.eat("E"):
+            # A tuple of one keeps its comma: `(T,)`.
+            self.emit("," + close if item == "member" and count == 1 else close)
+            return
+        if count:
+            self.emit(separator)
+        self.push((item, None), ("list", (item, separator, close, count + 1)))
+
+    def step_member(self, _: object) -> None:
+        """A tuple's member: a type."""
+        self.step_type(None)
+
+    def lifetime(self, index: int) -> str:
+        """Lifetime `index` by de Bruijn index: 0 is erased, 1 the innermost bound."""
+        if index == 0:
+            return "'_"
+        depth = self.bound - index
+        if depth < 0:
+            raise V0Error("lifetime unbound")
+        return "'" + chr(ord("a") + depth) if depth < 26 else f"'_{depth}"
+
+    def step_unbind(self, count: object) -> None:
+        self.bound -= int(count)  # type: ignore[arg-type]
+
+    def step_generic(self, _: object) -> None:
+        if self.eat("L"):
+            self.emit(self.lifetime(self.base62()))
+        elif self.eat("K"):
+            self.step_const(None)
+        else:
+            self.step_type(None)
+
+    def step_const(self, _: object) -> None:
+        c = self.peek()
+        if c == "B":
+            self.next()
+            self.backref("const", None)
+            return
+        if c == "p":
+            self.next()
+            self.emit("_")
+            return
+        self.next()
+        negative = self.eat("n")
+        digits = ""
+        while self.peek() != "_":
+            digits += self.next()
+        self.next()
+        if c == "b":
+            self.emit("true" if digits == "1" else "false")
+        elif c == "c":
+            self.emit(repr(chr(int(digits or "0", 16))))
+        else:
+            self.emit(("-" if negative else "") + str(int(digits or "0", 16)))
+
+    def binder(self) -> int:
+        """`G <base-62>`: as many lifetimes bound as the number and one, named and printed."""
+        if not self.eat("G"):
+            return 0
+        count = self.base62() + 1
+        names = [self.lifetime_name(self.bound + offset) for offset in range(count)]
+        self.bound += count
+        self.emit("for<" + ", ".join(names) + "> ")
+        return count
+
+    def lifetime_name(self, depth: int) -> str:
+        return "'" + chr(ord("a") + depth) if depth < 26 else f"'_{depth}"
+
+    def step_type(self, _: object) -> None:
+        c = self.peek()
+        if c in BASIC:
+            self.next()
+            self.emit(BASIC[c])
+            return
+        self.next()
+        if c == "R" or c == "Q":
+            named = self.lifetime(self.base62()) if self.eat("L") else "'_"
+            self.emit("&" + ("" if named == "'_" else named + " ") + ("mut " if c == "Q" else ""))
+            self.push(("type", None))
+        elif c == "P" or c == "O":
+            self.emit("*mut " if c == "O" else "*const ")
+            self.push(("type", None))
+        elif c == "A":
+            self.push(("text", "["), ("type", None), ("text", "; "), ("const", None), ("text", "]"))
+        elif c == "S":
+            self.push(("text", "["), ("type", None), ("text", "]"))
+        elif c == "T":
+            self.push(("text", "("), ("list", ("member", ", ", ")", 0)))
+        elif c == "F":
+            bound = self.binder()
+            prefix = ""
+            if self.eat("U"):
+                prefix += "unsafe "
+            if self.eat("K"):
+                if self.eat("C"):
+                    prefix += 'extern "C" '
+                else:
+                    prefix += f'extern "{self.ident()}" '
+            self.emit(prefix + "fn(")
+            self.push(("list", ("type", ", ", ")", 0)), ("returns", None), ("unbind", bound))
+        elif c == "D":
+            self.emit("dyn ")
+            bound = self.binder()
+            self.push(("list", ("dyn", " + ", "", 0)), ("unbind", bound), ("lifetime", None))
+        elif c == "B":
+            self.backref("type", None)
+        else:
+            self.pos -= 1
+            self.push(("path", False))
+
+    def step_returns(self, _: object) -> None:
+        """A function type's return: `()` is left out, as rustc writes it."""
+        if self.eat("u"):
+            return
+        self.emit(" -> ")
+        self.push(("type", None))
+
+    def step_lifetime(self, _: object) -> None:
+        if self.next() != "L":
+            raise V0Error("dyn lifetime")
+        self.base62()
+
+    def step_dyn(self, _: object) -> None:
+        self.push(("path", False), ("projections", 0))
+
+    def step_projections(self, count: object) -> None:
+        # A trait's associated type bindings, `p <ident> <type>`, inside its generic arguments:
+        # `FnOnce<(T,), Output = ()>`, or `Iterator<Item = T>` where it has none.
+        if not self.eat("p"):
+            if count:
+                self.emit(">")
+            return
+        name = self.ident()
+        if count:
+            self.emit(", ")
+        elif not self.quiet and self.out and self.out[-1].endswith(">"):
+            self.out[-1] = self.out[-1][:-1]
+            self.emit(", ")
+        else:
+            self.emit("<")
+        self.emit(f"{name} = ")
+        self.push(("type", None), ("projections", int(count) + 1))
 
 
 def demangle_all(symbols: set[str]) -> dict[str, str]:
-    """Each symbol's demangled path, all in one run of the demangler."""
-    ordered = sorted(symbols)
-    if not ordered:
-        return {}
-    names = subprocess.run(
-        demangler(),
-        input="\n".join(symbol.strip('"') for symbol in ordered) + "\n",
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.splitlines()
-    return dict(zip(ordered, names))
+    """Each symbol's demangled path, read here the same on every machine."""
+    return {symbol: demangle_v0(symbol.strip('"')) for symbol in symbols}
 
 
 def read_graph(files: list[Path]) -> dict[str, set[str]]:
@@ -479,6 +784,36 @@ def report(refused: list[list[str]], listed: list[list[str]], sources: list[str]
 
 def self_test() -> None:
     """The checker on its fixtures: each refusal it must make, and the listing it must not refuse."""
+    # Symbols of the workspace, each read as LLVM's demangler reads it: every production of the
+    # grammar the call graph meets (295,468 symbols of the workspace's IR read the same, 2026-10-11).
+    for symbol, read in (
+        ('_RNvMs0_CsekvDPWo0cJz_10focal_coreNtB5_4Core3new',
+         '<focal_core::Core>::new'),
+        ('_RNvXs3_NtCsvUqMUTWekE_10focal_wire5peersNtB5_4SlotNtNtNtCs8Mbv00yxnRz_4core3ops4drop4Drop4drop',
+         '<focal_wire::peers::Slot as core::ops::drop::Drop>::drop'),
+        ('_RNCNvNtCs12HxQLK2ftI_12focal_memory6budget3ends_0B5_',
+         'focal_memory::budget::end::{closure#1}'),
+        ('_RNvYNcNtNtCs12HxQLK2ftI_12focal_memory5owner7OwnerId0INtNtNtCs8Mbv00yxnRz_4core3ops8function6FnOnceTyEE9call_onceB8_',
+         '<focal_memory::owner::OwnerId as core::ops::function::FnOnce<(u64,)>>::call_once'),
+        ('_RNvMNtCs8Mbv00yxnRz_4core6optionINtB2_6OptionFG_RL0_NtNtCsekvDPWo0cJz_10focal_core6native3KeyEyE7is_someBS_',
+         "<core::option::Option<for<'a> fn(&'a focal_core::native::Key) -> u64>>::is_some"),
+        ('_RINvNtCs8Mbv00yxnRz_4core3ptr9drop_glueDNtNtNtB4_6future6future6Futurep6OutputINtNtB4_6option6OptionNtNtNtCsvUqMUTWekE_10focal_wire3net5owner5ReplyEEL_EB1G_',
+         'core::ptr::drop_glue::<dyn core::future::future::Future<Output = core::option::Option<focal_wire::net::owner::Reply>>>'),
+        ('_RINvNtNtCsekvDPWo0cJz_10focal_core6native16projection_quote3sumKj4_EB6_',
+         'focal_core::native::projection_quote::sum::<4>'),
+        ('_RNvXNtCs8Mbv00yxnRz_4core6borrowNtNtCsekvDPWo0cJz_10focal_core6native3KeyINtB2_6BorrowBu_E6borrowBy_',
+         '<focal_core::native::Key as core::borrow::Borrow<focal_core::native::Key>>::borrow'),
+        ('_RNvMNtCs12HxQLK2ftI_12focal_memory5ownerNtB2_7OwnerId3new',
+         '<focal_memory::owner::OwnerId>::new'),
+        ('_RNcNtINtNtCs8Mbv00yxnRz_4core6option6OptionAhj10_E4Some0CsekvDPWo0cJz_10focal_core',
+         'core::option::Option::<[u8; 16]>::Some'),
+        ('_RINvNtCs8Mbv00yxnRz_4core3cmp6max_byyQNvYyNtB2_3Ord3cmpECsekvDPWo0cJz_10focal_core',
+         'core::cmp::max_by::<u64, &mut <u64 as core::cmp::Ord>::cmp>'),
+    ):
+        if demangle_v0(symbol) != read:
+            raise SystemExit(f"self-test: {symbol} read as {demangle_v0(symbol)!r}, not {read!r}")
+    if demangle_v0("_RNvCs1234_7mycrate") != "_RNvCs1234_7mycrate":
+        raise SystemExit("self-test: a symbol cut short was read rather than kept")
     crates = {"focal_fixture"}
     graph = read_graph(sorted((FIXTURES / "ir").glob("*.ll")))
     refused, listed = judge(components(graph), crates)

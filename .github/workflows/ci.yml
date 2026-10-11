@@ -50,8 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Install pinned Rust
-        # llvm-tools: the v0 demangler the recursion check reads the call graph with.
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --component llvm-tools
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - name: Install native protobuf compiler (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
