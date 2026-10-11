@@ -4,7 +4,7 @@
 use super::*;
 use crate::native::artifact_intent::{ArtifactCommand, ReportKind};
 use crate::native::input_codec::{
-    DecodeError, DecodedPlan, DecodedRequest, InputHeader, NativeDecodeLimits,
+    DecodeError, DecodedPlan, DecodedRequest, InputHeader, NativeDecodeLimits, StructuralInput,
 };
 use focal_memory::Reservation;
 
@@ -33,6 +33,45 @@ fn check_frame_header(
 }
 
 impl NativeOwner {
+    /// Refuses, from its header alone, a request its frame's decoding would
+    /// end in refusing: a fresh request (its key has no outcome, committed or
+    /// pending) while as many candidates are pending as this owner holds. The
+    /// owner refused it only after planning its frame (every validation body
+    /// in it inspected), so at its bound each refusal cost a decode. A header
+    /// that does not read, that names another ledger, profile or actor, a
+    /// faulted owner and a retry of a request with an outcome are decoded as
+    /// before, which says why they are refused or answers them.
+    fn refuse_when_full(
+        &self,
+        context: NativeContext,
+        bytes: &[u8],
+    ) -> Result<(), NativeOwnerError> {
+        if self.faulted
+            || (self.pending.len() < self.core.limits.pending
+                && self.pending.len() < self.pending.capacity())
+        {
+            return Ok(());
+        }
+        let Ok(header) = StructuralInput::peek_header(bytes) else {
+            return Ok(());
+        };
+        let state = &self.core.state;
+        if check_frame_header(context, state.ledger, state.profile, header).is_err() {
+            return Ok(());
+        }
+        let Some(request) = header.request else {
+            return Ok(());
+        };
+        let view = View {
+            state,
+            tail: self.pending.back().map(|row| &row.prepared),
+        };
+        if view.outcome(request.into()).is_some() {
+            return Ok(());
+        }
+        Err(NativeError::Capacity("pending candidates").into())
+    }
+
     /// Decode a complete borrowed actor frame with cumulative input work limits.
     /// The caller retains its charged receive buffer until this method returns;
     /// this synchronous API neither receives bytes nor acknowledges durability.
@@ -43,6 +82,7 @@ impl NativeOwner {
         limits: NativeDecodeLimits,
         evidence: Option<&VerifiedNativeArtifact>,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        self.refuse_when_full(context, bytes)?;
         let ledger = self.core.state.ledger;
         let profile = self.core.state.profile;
         limits.with_header_check(
@@ -65,6 +105,7 @@ impl NativeOwner {
         inline_domain: ContentDomainId,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        self.refuse_when_full(context, bytes)?;
         let ledger = self.core.state.ledger;
         let profile = self.core.state.profile;
         limits.with_header_check(
@@ -92,6 +133,7 @@ impl NativeOwner {
         evidence: Option<&VerifiedNativeArtifact>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        self.refuse_when_full(context, bytes)?;
         let ledger = self.core.state.ledger;
         let profile = self.core.state.profile;
         limits.with_header_check(

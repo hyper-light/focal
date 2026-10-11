@@ -447,3 +447,71 @@ fn raw_actor_header_is_checked_before_scanning_an_untrusted_body() {
     ));
     assert_eq!(owner.pending_len(), 0);
 }
+
+/// An owner holding as many candidates as it may refuses a fresh request from
+/// its frame's header alone, before reading the rest: a header with nothing
+/// after it is refused for the full queue where an owner with room reads on
+/// and refuses it as truncated. Its exact retry of a pending request is still
+/// answered, and a header naming another actor is still refused as such.
+#[test]
+fn a_full_owner_refuses_a_fresh_request_from_its_header() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let limits = NativeDecodeLimits::for_native(
+        owner.core.limits,
+        1 << 20,
+        DecodeWork {
+            parse: 1 << 24,
+            source: 1 << 24,
+            model: 1 << 24,
+            acceptance: 1 << 24,
+            native: 1 << 24,
+        },
+    )
+    .unwrap();
+    let full = owner.core.limits.pending;
+    let mut first = None;
+    for n in 0..full {
+        let id = 800 + u128::try_from(n).unwrap();
+        let bytes = encoded(
+            &creation(id, id, &[], None),
+            NativeContentProfile::ProjectionOnly,
+        );
+        let staged = owner
+            .prepare_frame(context(ISSUER, 10), &bytes, limits, None)
+            .unwrap();
+        if first.is_none() {
+            first = Some((bytes, ticket(staged)));
+        }
+    }
+    assert_eq!(owner.pending_len(), full);
+    let fresh = encoded(
+        &creation(900, 900, &[], None),
+        NativeContentProfile::ProjectionOnly,
+    );
+    let header = &fresh[..85];
+    for frame in [header, &fresh[..]] {
+        assert!(matches!(
+            owner.prepare_frame(context(ISSUER, 10), frame, limits, None),
+            Err(NativeOwnerError::Native(NativeError::Capacity(
+                "pending candidates"
+            )))
+        ));
+    }
+    let (bytes, candidate) = first.unwrap();
+    assert!(matches!(
+        owner.prepare_frame(context(ISSUER, 10), &bytes, limits, None),
+        Ok(NativeStaging::Existing { candidate: Some(retried), .. }) if retried == candidate
+    ));
+    assert!(matches!(
+        owner.prepare_frame(context(EVALUATOR, 10), header, limits, None),
+        Err(NativeOwnerError::Native(NativeError::Contract(
+            ContractError::WrongActor
+        )))
+    ));
+    owner.publish_after_durable(candidate).unwrap();
+    assert!(matches!(
+        owner.prepare_frame(context(ISSUER, 10), header, limits, None),
+        Err(NativeOwnerError::Input(CodecError::Truncated))
+    ));
+    assert_eq!(owner.pending_len(), full - 1);
+}

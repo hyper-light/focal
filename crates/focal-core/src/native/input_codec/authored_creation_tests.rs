@@ -634,6 +634,9 @@ fn measure_time_to_decode_an_authored_frame() {
     let bytes: Vec<Vec<u8>> = (1..=frames)
         .map(|id| encoded(&input(vec![proposal(id, Change::None)])))
         .collect();
+    // The plan alone (FOCAL_MEASURE_PLAN_ONLY): what an owner spent on a
+    // request before it could refuse it for a full queue.
+    let plan_only = std::env::var("FOCAL_MEASURE_PLAN_ONLY").is_ok();
     for round in 0..rounds {
         let started = std::time::Instant::now();
         for frame in &bytes {
@@ -641,6 +644,10 @@ fn measure_time_to_decode_an_authored_frame() {
                 .prepare_authored_creation(native(), limits())
                 .unwrap()
                 .unwrap();
+            if plan_only {
+                std::hint::black_box(plan.intent_fingerprint());
+                continue;
+            }
             let quote = plan.quote();
             std::hint::black_box(plan.build(quote.bytes, quote.construction).unwrap());
         }

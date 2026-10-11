@@ -48,6 +48,17 @@ impl<'a> StructuralInput<'a> {
     pub fn inspect(bytes: &'a [u8], limits: InspectionLimits) -> Result<Self, Error> {
         Self::inspect_with_header(bytes, limits, |_| Ok(()))
     }
+    /// The frame's header alone, read as [`Self::inspect`] reads it first: what
+    /// an owner needs to refuse a request before reading the rest.
+    pub(in crate::native) fn peek_header(bytes: &[u8]) -> Result<InputHeader, Error> {
+        let mut scan = Scan {
+            cursor: Cursor::new(bytes, bytes.len(), HEADER_VISITS)?,
+            items: 0,
+            text: 0,
+            blobs: 0,
+        };
+        scan.header()
+    }
     pub(super) fn inspect_with_header<E: From<Error>>(
         bytes: &'a [u8],
         limits: InspectionLimits,
@@ -59,47 +70,8 @@ impl<'a> StructuralInput<'a> {
             text: limits.text_bytes,
             blobs: limits.blob_bytes,
         };
-        if scan.cursor.fixed::<8>()? != MAGIC || scan.cursor.u16()? != VERSION {
-            return Err(Error::InvalidTag("input format").into());
-        }
-        let profile = match scan.cursor.u8()? {
-            0 => NativeContentProfile::ProjectionOnly,
-            1 => NativeContentProfile::AuthoredV1,
-            _ => return Err(Error::InvalidTag("content profile").into()),
-        };
-        let namespace = scan.closed8(3, "input namespace")?;
-        let ledger = LedgerId {
-            tenant: TenantId(scan.cursor.fixed()?),
-            session: SessionId(scan.cursor.fixed()?),
-        };
-        let (kind, request) = match namespace {
-            0 => {
-                let request = RequestKey {
-                    principal: ParticipantId(scan.cursor.fixed()?),
-                    epoch: RequestEpoch(scan.cursor.u64()?),
-                    id: RequestId(scan.cursor.fixed()?),
-                };
-                let command = scan.closed8(28, "command")?;
-                if matches!(
-                    (profile, command),
-                    (NativeContentProfile::ProjectionOnly, 27)
-                        | (NativeContentProfile::AuthoredV1, 0)
-                ) {
-                    return Err(Error::InvalidTag("creation profile").into());
-                }
-                (FrameKind::Request { command }, Some(request))
-            }
-            1 => (FrameKind::EvaluationDeadline, None),
-            2 => (FrameKind::ClaimDeadline, None),
-            3 => (FrameKind::MonitorDeadline, None),
-            _ => return Err(Error::InvalidTag("input namespace").into()),
-        };
-        let header = InputHeader {
-            ledger,
-            profile,
-            kind,
-            request,
-        };
+        let header = scan.header()?;
+        let kind = header.kind;
         check_header(header)?;
         match kind {
             FrameKind::Request { command } => scan.command(command)?,
@@ -154,6 +126,9 @@ impl<'a> StructuralInput<'a> {
     }
 }
 
+/// What reading a frame's header alone may take: its fixed fields, read once.
+const HEADER_VISITS: usize = 1024;
+
 struct Scan<'a> {
     cursor: Cursor<'a>,
     items: usize,
@@ -161,6 +136,50 @@ struct Scan<'a> {
     blobs: usize,
 }
 impl Scan<'_> {
+    /// The fixed header every frame begins with.
+    fn header(&mut self) -> Result<InputHeader, Error> {
+        if self.cursor.fixed::<8>()? != MAGIC || self.cursor.u16()? != VERSION {
+            return Err(Error::InvalidTag("input format"));
+        }
+        let profile = match self.cursor.u8()? {
+            0 => NativeContentProfile::ProjectionOnly,
+            1 => NativeContentProfile::AuthoredV1,
+            _ => return Err(Error::InvalidTag("content profile")),
+        };
+        let namespace = self.closed8(3, "input namespace")?;
+        let ledger = LedgerId {
+            tenant: TenantId(self.cursor.fixed()?),
+            session: SessionId(self.cursor.fixed()?),
+        };
+        let (kind, request) = match namespace {
+            0 => {
+                let request = RequestKey {
+                    principal: ParticipantId(self.cursor.fixed()?),
+                    epoch: RequestEpoch(self.cursor.u64()?),
+                    id: RequestId(self.cursor.fixed()?),
+                };
+                let command = self.closed8(28, "command")?;
+                if matches!(
+                    (profile, command),
+                    (NativeContentProfile::ProjectionOnly, 27)
+                        | (NativeContentProfile::AuthoredV1, 0)
+                ) {
+                    return Err(Error::InvalidTag("creation profile"));
+                }
+                (FrameKind::Request { command }, Some(request))
+            }
+            1 => (FrameKind::EvaluationDeadline, None),
+            2 => (FrameKind::ClaimDeadline, None),
+            3 => (FrameKind::MonitorDeadline, None),
+            _ => return Err(Error::InvalidTag("input namespace")),
+        };
+        Ok(InputHeader {
+            ledger,
+            profile,
+            kind,
+            request,
+        })
+    }
     fn closed8(&mut self, max: u8, field: &'static str) -> Result<u8, Error> {
         let value = self.cursor.u8()?;
         if value > max {
