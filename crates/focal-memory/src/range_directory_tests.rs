@@ -660,3 +660,84 @@ fn a_search_by_cached_prefix_finds_exactly_what_the_whole_key_order_holds() {
     let ordered: Vec<u32> = store.entries().map(|entry| entry.key.0).collect();
     assert_eq!(ordered, held.iter().copied().collect::<Vec<_>>());
 }
+
+/// A plan finds each changed key in the page whose span holds it, its group's
+/// page: a deletion of a key the store does not hold is refused wherever the
+/// key falls (before the first page, between two entries of a page, between
+/// two pages, past the last), alone or among changes in other groups, and a
+/// batch's new length counts the keys it adds and not those it replaces.
+#[test]
+fn a_plan_finds_each_changed_key_in_its_groups_page() {
+    let budget = budget();
+    // Keys 4, 8, 12 and on, two to a page: [4, 8], [12, 16] and on.
+    let store = seed(&budget, 2049, 2);
+    assert!(store.root.pages.height() >= 3);
+    let before = budget.stats();
+    for absent in [
+        0,
+        1,
+        key(0) + 1,
+        key(1) + 2,
+        key(700) + 1,
+        key(2048) + 4,
+        u64::MAX,
+    ] {
+        let alone = store.plan_batch(
+            store.prefix() + 1,
+            vec![Change::Delete(absent)],
+            ORDINARY,
+            usize::MAX,
+        );
+        assert!(
+            matches!(alone, Err(MemoryError::MissingKey)),
+            "key {absent}"
+        );
+        let among = store.plan_batch(
+            store.prefix() + 1,
+            vec![
+                Change::Delete(key(5)),
+                Change::Delete(absent),
+                Change::Put(Entry::new(key(9) + 1, 1, 0)),
+                Change::Put(Entry::new(key(1200), 2, 0)),
+            ],
+            ORDINARY,
+            usize::MAX,
+        );
+        assert!(
+            matches!(among, Err(MemoryError::MissingKey)),
+            "key {absent} among others"
+        );
+    }
+    assert_eq!(budget.stats(), before);
+    let mut expected = entries(&store.root);
+    let changes = vec![
+        // Three keys added: before the first page, inside a page, past the last.
+        Change::Put(Entry::new(1, 11, 0)),
+        Change::Put(Entry::new(key(700) + 1, 12, 0)),
+        Change::Put(Entry::new(key(2048) + 1, 13, 0)),
+        // Two replaced and two deleted.
+        Change::Put(Entry::new(key(3), 14, 0)),
+        Change::Put(Entry::new(key(1500), 15, 0)),
+        Change::Delete(key(10)),
+        Change::Delete(key(2000)),
+    ];
+    for change in &changes {
+        match change {
+            Change::Put(entry) => {
+                expected.insert(entry.key, entry.value);
+            }
+            Change::Delete(key) => {
+                expected.remove(key);
+            }
+        }
+    }
+    let candidate = store
+        .prepare_batch(store.prefix() + 1, changes, ORDINARY)
+        .unwrap();
+    assert_eq!(candidate.root.len, store.len() + 1);
+    assert_eq!(entries(&candidate.root), expected);
+    assert!(candidate.root.pages.check_shape());
+    drop(candidate);
+    drop(store);
+    assert_eq!(budget.stats().used, 0);
+}

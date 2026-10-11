@@ -195,6 +195,22 @@ pub(crate) struct Page<K, V> {
 }
 
 impl<K: crate::RangeKey, V> Page<K, V> {
+    /// The entry of `key` in this page. The sought key's prefix once; an
+    /// entry's against it, and past it only where they tie.
+    pub(crate) fn find(&self, key: &K) -> Option<&Entry<K, V>> {
+        let probe = key.order_prefix();
+        self.entries
+            .binary_search_by(|entry| {
+                entry
+                    .key
+                    .order_prefix()
+                    .cmp(&probe)
+                    .then_with(|| entry.key.cmp_past_prefix(key))
+            })
+            .ok()
+            .and_then(|index| self.entries.get(index))
+    }
+
     pub(crate) fn new(entries: Vec<Entry<K, V>>, allocation: Allocation) -> Self {
         let first = entries.first().map_or(0, |entry| entry.key.order_prefix());
         Self {
@@ -245,20 +261,7 @@ pub(crate) struct Root<K, V> {
 
 impl<K: crate::RangeKey, V> Root<K, V> {
     pub fn get(&self, key: &K) -> Option<&Entry<K, V>> {
-        let page = self.pages.page_of(key)?;
-        // The sought key's prefix once; an entry's against it, and past it
-        // only where they tie.
-        let probe = key.order_prefix();
-        page.entries
-            .binary_search_by(|entry| {
-                entry
-                    .key
-                    .order_prefix()
-                    .cmp(&probe)
-                    .then_with(|| entry.key.cmp_past_prefix(key))
-            })
-            .ok()
-            .and_then(|index| page.entries.get(index))
+        self.pages.page_of(key)?.find(key)
     }
 
     pub fn page_index(&self, key: &K) -> usize {

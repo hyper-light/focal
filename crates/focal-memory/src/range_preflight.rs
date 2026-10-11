@@ -258,21 +258,9 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             )?
         };
         for change in &changes {
-            match change {
-                Change::Put(entry) => {
-                    layout::check_entry::<K, V>(entry.heap_bytes, self.config)?;
-                    input_pending_bytes = checked_add(input_pending_bytes, entry.heap_bytes)?;
-                    if base.get(&entry.key).is_none() {
-                        new_len = checked_add(new_len, 1)?;
-                    }
-                }
-                Change::Delete(key) => {
-                    let existing = base.get(key).ok_or(MemoryError::MissingKey)?;
-                    // Conservatively bound the caller's cloned deletion key by
-                    // the retained entry's combined key/value heap charge.
-                    input_pending_bytes = checked_add(input_pending_bytes, existing.heap_bytes)?;
-                    new_len = new_len.checked_sub(1).ok_or(MemoryError::MissingKey)?;
-                }
+            if let Change::Put(entry) = change {
+                layout::check_entry::<K, V>(entry.heap_bytes, self.config)?;
+                input_pending_bytes = checked_add(input_pending_bytes, entry.heap_bytes)?;
             }
         }
         let mut count = Counts {
@@ -284,6 +272,23 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             let selected = remaining
                 .get(..group.count)
                 .ok_or(MemoryError::MissingKey)?;
+            // A key the base holds is in the page whose span holds it, the
+            // group's: each change is found there, not by a descent of its own.
+            for change in selected {
+                let existing = group.page.and_then(|page| page.find(change.key()));
+                match (change, existing) {
+                    (Change::Put(_), Some(_)) => {}
+                    (Change::Put(_), None) => new_len = checked_add(new_len, 1)?,
+                    (Change::Delete(_), Some(existing)) => {
+                        // Conservatively bound the caller's cloned deletion key by
+                        // the retained entry's combined key/value heap charge.
+                        input_pending_bytes =
+                            checked_add(input_pending_bytes, existing.heap_bytes)?;
+                        new_len = new_len.checked_sub(1).ok_or(MemoryError::MissingKey)?;
+                    }
+                    (Change::Delete(_), None) => return Err(MemoryError::MissingKey),
+                }
+            }
             match group.page {
                 None if base.pages.is_empty() => {
                     let produced =
