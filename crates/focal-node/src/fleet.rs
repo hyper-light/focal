@@ -2102,11 +2102,8 @@ impl Owner {
         // owner the log as well as the state: a longer log between images
         // makes each rewrite, on the owner's thread, longer (265 ms at 22k
         // entries on the Linux comparison). It keeps the floor alone.
-        let expansion = if self.session.checkpoint_rewrites_log() {
-            0
-        } else {
-            self.config.checkpoint_expansion
-        };
+        // diag: the size rule on focal-log too, measured against the floor.
+        let expansion = self.config.checkpoint_expansion;
         Ok(checkpoint_due(
             CheckpointLog {
                 entries,
