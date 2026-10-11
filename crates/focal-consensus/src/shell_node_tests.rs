@@ -359,6 +359,56 @@ fn three_members_on_the_shell_elect_replicate_and_read() {
     );
 }
 
+/// On the shell too, a batch proposed at once goes to each member as one append of it all, and
+/// every entry commits on every member in the order proposed; one entry no proposal holds
+/// refuses the batch whole.
+#[test]
+fn three_members_on_the_shell_take_a_batch_as_one_append() {
+    let mut cluster = Cluster::new();
+    cluster.members[0].node().campaign().unwrap();
+    cluster.pump();
+    let entries: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 64]).collect();
+    let too_big = vec![0u8; config(1).max_entry_bytes + 1];
+    assert!(matches!(
+        cluster.members[0].node().propose_batch_borrowed_in(
+            [entries[0].as_slice(), too_big.as_slice()].into_iter(),
+            BudgetLane::Completion
+        ),
+        Err(ConsensusError::Capacity)
+    ));
+    cluster.members[0]
+        .node()
+        .propose_batch_borrowed_in(entries.iter().map(Vec::as_slice), BudgetLane::Completion)
+        .unwrap();
+    // The leader's first drain sends each follower one append of all five,
+    // delivered as the cluster delivers.
+    let mut messages = Vec::new();
+    for events in cluster.members[0].settle() {
+        cluster.applied[0].extend(
+            events
+                .committed
+                .iter()
+                .map(|entry| (entry.index, entry.data.clone())),
+        );
+        messages.extend(events.messages);
+    }
+    let appends: Vec<usize> = messages
+        .iter()
+        .filter(|message| message.msg_type == MessageType::MsgAppend)
+        .map(|message| message.entries.len())
+        .collect();
+    assert_eq!(appends, vec![5, 5]);
+    for message in messages {
+        let to = usize::try_from(message.to).unwrap() - 1;
+        cluster.members[to].node().step(message).unwrap();
+    }
+    cluster.pump();
+    let expected: Vec<(u64, Vec<u8>)> = (2..).zip(entries.iter().cloned()).collect();
+    for applied in &cluster.applied[1..] {
+        assert_eq!(applied, &expected);
+    }
+}
+
 /// Contract (f): a write holding an entry that needs a decoder the group's records do not state
 /// waits, whole, and the member refuses input as focal-log refuses while its floor write is
 /// pending; once the record is durable the write goes out, and a restart requires the decoder.

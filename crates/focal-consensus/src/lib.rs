@@ -978,6 +978,29 @@ impl LogNode {
             replica.propose_inner(owned)
         })
     }
+    /// As [`Self::propose_borrowed_in`], every entry of `entries` in one
+    /// proposal (`core_state::proposal`): the leader sends each member one
+    /// append of them all. Refused whole, as one entry is; none of them is
+    /// proposed then.
+    pub fn propose_batch_borrowed_in<'a>(
+        &mut self,
+        entries: impl Iterator<Item = &'a [u8]> + Clone,
+        lane: BudgetLane,
+    ) -> Result<(), ConsensusError> {
+        self.check_leader()?;
+        let (count, bytes) = core_state::check_batch(&self.config, entries.clone())?;
+        if count == 0 {
+            return Ok(());
+        }
+        self.guarded_in(bytes, 0, lane, |replica| {
+            replica.check_leader()?;
+            let message = core_state::proposal(replica.raw.raft.id(), entries, count)?;
+            replica
+                .raw
+                .step(message)
+                .map_err(|error| core_state::proposal_refused(&replica.raw, error))
+        })
+    }
     /// The authenticated envelope must bind cluster/group identity. Peer input is
     /// validated before Raft; unexpected dependency failures stop this replica.
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {

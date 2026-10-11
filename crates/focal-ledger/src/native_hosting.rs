@@ -906,6 +906,32 @@ impl Session {
             }),
         }
     }
+    /// Whether native candidates admitted from now on wait to be proposed
+    /// together: a host taking requests in batches sets it, and its candidates
+    /// are encoded as they are admitted (a refusal is the request's own) and
+    /// proposed as one when it drains ([`Self::flush_deferred_native_proposals`]);
+    /// [`Self::has_ready`] says a drain is owed them.
+    pub fn set_native_proposals_deferred(&mut self, deferred: bool) {
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.set_proposals_deferred(deferred);
+        }
+    }
+    /// Every candidate admitted since the last flush is proposed now, in one
+    /// proposal (one append to each member). Proposal pressure or authority
+    /// moving keeps them for the next flush, as a refusal at admission would;
+    /// a failure that stops the session is returned.
+    pub fn flush_deferred_native_proposals(&mut self) -> Result<(), LedgerError> {
+        let Some(engine) = self.native.as_deref_mut() else {
+            return Ok(());
+        };
+        match engine.flush_deferred(&mut self.consensus) {
+            None => Ok(()),
+            Some(error) => {
+                self.failed = true;
+                Err(error.into())
+            }
+        }
+    }
     /// Admit one borrowed native input frame from an authenticated participant.
     pub fn propose_native_frame(
         &mut self,

@@ -1061,7 +1061,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         consensus: &mut DurableNode,
     ) -> Option<NativeSessionError> {
-        if !self.is_authoritative(&consensus.scalars()) {
+        // A host taking a batch proposes its candidates when the batch ends
+        // (`flush_deferred`), not at a poll inside it.
+        if self.defer_proposals || !self.is_authoritative(&consensus.scalars()) {
             return None;
         }
         match self.flush_proposals(consensus) {

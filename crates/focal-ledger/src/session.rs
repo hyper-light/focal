@@ -890,7 +890,12 @@ impl Session {
     /// Includes unstarted Ready work, such as the internal leadership ReadIndex
     /// queued by the last publication. Idle owners need not poll their sessions.
     pub fn has_ready(&self) -> bool {
-        self.consensus.has_ready() || self.retained.is_some()
+        self.consensus.has_ready()
+            || self.retained.is_some()
+            || self
+                .native
+                .as_deref()
+                .is_some_and(|engine| engine.has_deferred())
     }
     /// The bytes of entries `peer` is sent ahead of its answers while this
     /// replica leads (`DurableNode::set_inflight_bytes`).

@@ -1339,3 +1339,139 @@ fn a_dropped_proposal_is_refused_by_its_cause() {
         Err(ConsensusError::NotLeader { leader: 1 })
     ));
 }
+
+/// The messages one round of proposals sends among three voters, by sender,
+/// receiver and kind (an append that carries no entry apart): how many, and
+/// the entries they carry.
+fn round_messages(
+    cluster: &mut Cluster,
+) -> std::collections::BTreeMap<(u64, u64, &'static str), (usize, usize)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for _ in 0..100 {
+        let mut messages = Vec::new();
+        for (i, node) in cluster.nodes.iter_mut().enumerate() {
+            let events = node.drain().unwrap();
+            cluster.applied[i].extend(events.committed.into_iter().map(|entry| entry.data));
+            messages.extend(events.messages);
+        }
+        if messages.is_empty() {
+            return counts;
+        }
+        for message in messages {
+            let kind = match message.msg_type {
+                MessageType::MsgAppend if message.entries.is_empty() => "commit",
+                MessageType::MsgAppend => "append",
+                MessageType::MsgAppendResponse => "answer",
+                _ => "other",
+            };
+            let entry: &mut (usize, usize) =
+                counts.entry((message.from, message.to, kind)).or_default();
+            entry.0 += 1;
+            entry.1 += message.entries.len();
+            let to = message.to;
+            cluster.nodes[(to - 1) as usize].step(message).unwrap();
+        }
+    }
+    panic!("message delivery failed to quiesce");
+}
+
+/// A round's proposals made at once go to each member as one append of them
+/// all, which it answers once, and its commit as one more: eight messages
+/// among three voters for seven entries. Proposed one at a time, each sent
+/// each member an append of its own, drew an answer of its own and a commit's
+/// broadcast of its own: fifty-six (the Linux comparison's leader sent 4.2
+/// messages a write and each follower 2.1, 2026-10-11). Every entry commits
+/// on every member either way, in the order proposed.
+#[test]
+fn a_round_proposed_at_once_sends_each_member_one_append_of_it() {
+    let entries: Vec<Vec<u8>> = (0..7u8).map(|i| vec![i; 2_800]).collect();
+    let mut batched = Cluster::new();
+    batched.nodes[0].campaign().unwrap();
+    batched.pump(None);
+    let committed = batched.applied[0].len();
+    batched.nodes[0]
+        .propose_batch_borrowed_in(entries.iter().map(Vec::as_slice), BudgetLane::Completion)
+        .unwrap();
+    let counts = round_messages(&mut batched);
+    for follower in [2, 3] {
+        assert_eq!(
+            counts.get(&(1, follower, "append")),
+            Some(&(1, 7)),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get(&(1, follower, "commit")),
+            Some(&(1, 0)),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get(&(follower, 1, "answer")),
+            Some(&(2, 0)),
+            "{counts:?}"
+        );
+    }
+    assert_eq!(
+        counts.values().map(|(messages, _)| messages).sum::<usize>(),
+        8
+    );
+    for applied in &batched.applied {
+        assert_eq!(&applied[applied.len() - 7..], &entries[..]);
+    }
+    assert_eq!(batched.applied[0].len(), committed + 7);
+
+    let mut each = Cluster::new();
+    each.nodes[0].campaign().unwrap();
+    each.pump(None);
+    for entry in &entries {
+        each.nodes[0]
+            .propose_borrowed_in(entry, BudgetLane::Completion)
+            .unwrap();
+    }
+    let counts = round_messages(&mut each);
+    for follower in [2, 3] {
+        assert_eq!(
+            counts.get(&(1, follower, "append")),
+            Some(&(7, 7)),
+            "{counts:?}"
+        );
+    }
+    assert_eq!(
+        counts.values().map(|(messages, _)| messages).sum::<usize>(),
+        56
+    );
+    for applied in &each.applied {
+        assert_eq!(&applied[applied.len() - 7..], &entries[..]);
+    }
+}
+
+/// A batch is checked and refused whole: an entry past what one entry holds,
+/// or an empty one, refuses it, and none of its entries is proposed; an empty
+/// batch proposes nothing.
+#[test]
+fn a_batch_with_an_entry_no_proposal_holds_is_refused_whole() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    let last = cluster.nodes[0].last_index().unwrap();
+    let too_big = vec![0u8; config(1).max_entry_bytes + 1];
+    let small = vec![1u8; 16];
+    for batch in [
+        vec![small.as_slice(), too_big.as_slice()],
+        vec![small.as_slice(), &[][..]],
+    ] {
+        assert!(matches!(
+            cluster.nodes[0].propose_batch_borrowed_in(batch.into_iter(), BudgetLane::Completion),
+            Err(ConsensusError::Capacity)
+        ));
+    }
+    cluster.nodes[0]
+        .propose_batch_borrowed_in(std::iter::empty(), BudgetLane::Completion)
+        .unwrap();
+    assert_eq!(cluster.nodes[0].last_index().unwrap(), last);
+    // A follower is refused as one proposal is.
+    let batch = [small.as_slice()];
+    assert!(matches!(
+        cluster.nodes[1].propose_batch_borrowed_in(batch.into_iter(), BudgetLane::Completion),
+        Err(ConsensusError::NotLeader { .. })
+    ));
+}
