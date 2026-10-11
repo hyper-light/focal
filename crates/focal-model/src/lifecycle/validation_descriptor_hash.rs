@@ -138,6 +138,13 @@ impl Stream {
     }
 }
 
+/// Whether two bindings have one [`intent`]: equal in every field it hashes
+/// (the ledger, the object and the content; not the revision). Comparing the
+/// fields decides what comparing two intents decided, without hashing either.
+pub(super) fn same_intent(left: Binding, right: Binding) -> bool {
+    left.ledger == right.ledger && left.object == right.object && left.content == right.content
+}
+
 pub(super) fn intent(binding: Binding) -> ContentHash {
     let mut hash = blake3::Hasher::new();
     hash.update(b"focal/native/validation-descriptor-intent/1");
