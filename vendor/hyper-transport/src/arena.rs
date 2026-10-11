@@ -156,6 +156,7 @@ impl<T> Arena<T> {
             }
         }
     }
+    #[cfg(any(test, feature = "oracle"))]
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(|slot| slot.value.as_ref())
     }

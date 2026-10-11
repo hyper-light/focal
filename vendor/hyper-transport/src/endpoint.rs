@@ -43,6 +43,7 @@ use crate::budget::{Budget, Lane, Reservation};
 use crate::credit::{
     K_GRANULARITY, MIN_DATAGRAM, Window, class_reserve, initial_window, stream_window_ceiling,
 };
+use crate::deadlines;
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
@@ -372,11 +373,41 @@ pub struct Endpoint<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role
     scratch: Vec<u8>,
     responses: VecDeque<(Transmit, Vec<u8>)>,
     spare: Vec<Vec<u8>>,
-    next: usize,
+    /// By connection key: whether it waits in `touched`, in `rearm` or in `sending`.
+    marks: Vec<Marks>,
+    /// The connections an event or a call changed since the endpoint last read them
+    /// (`read_touched`): each is given its turn to transmit and its deadline is placed again. A
+    /// connection that nothing touched has nothing new to send and no deadline but the one placed,
+    /// so the endpoint visits what its events reach, never every connection it holds (`benches/
+    /// connections.rs` in hyper-rt-transport).
+    touched: Vec<usize>,
+    /// The connections whose deadline is to be placed again though nothing changed what they
+    /// would send: one given its turn that had nothing to send, its timers moved all the same.
+    rearm: Vec<usize>,
+    /// The connections that may have a datagram to send, each given its turn in order: one that
+    /// sends goes to the back, as it may have more; one with nothing leaves until touched again.
+    sending: VecDeque<usize>,
+    /// The connections by their next deadline, the earliest first (src/deadlines.rs, by key): the
+    /// connection's QUIC timer or its exchanges' earliest wait, whichever comes first.
+    deadlines: Vec<(Instant, u64)>,
+    /// Each connection's index in `deadlines`, by key.
+    positions: Vec<Option<usize>>,
+    /// The connections a timeout found due, gathered before they are driven.
+    due: Vec<u64>,
+    /// The frontier of a walk of `deadlines` for the due ones.
+    walk: Vec<usize>,
     /// The connections held so far: the next one's serial.
     serials: u64,
     /// A peer's connections, gathered to read its paused lanes again.
     keys: Vec<usize>,
+}
+
+/// Where a connection waits to be read again (`Endpoint::touched`, `rearm`, `sending`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Marks {
+    touched: bool,
+    rearm: bool,
+    sending: bool,
 }
 
 /// What the code driving one connection reaches besides it.
@@ -535,7 +566,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             scratch: Vec::new(),
             responses: VecDeque::with_capacity(limits.max_responses),
             spare: Vec::with_capacity(limits.max_responses),
-            next: 0,
+            marks: Vec::with_capacity(peers),
+            touched: Vec::with_capacity(peers),
+            rearm: Vec::with_capacity(peers),
+            sending: VecDeque::with_capacity(peers),
+            deadlines: Vec::with_capacity(peers),
+            positions: Vec::with_capacity(peers),
+            due: Vec::with_capacity(peers),
+            walk: Vec::with_capacity(peers),
             serials: 0,
             keys: Vec::with_capacity(limits.admission.per_identity),
         })
@@ -581,15 +619,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
             return Some(transmit);
         }
-        let count = self.conns.len();
-        for step in 0..count {
-            let key = self.next.wrapping_add(step).checked_rem(count).unwrap_or(0);
+        self.read_touched();
+        while let Some(key) = self.sending.pop_front() {
+            if let Some(marks) = self.marks.get_mut(key) {
+                marks.sending = false;
+            }
             let Some(Some(conn)) = self.conns.get_mut(key) else {
                 continue;
             };
-            if let Some(transmit) = conn.quic.poll_transmit(now, 1, out, self.quic.configs()) {
-                self.next = key.wrapping_add(1);
+            let sent = conn.quic.poll_transmit(now, 1, out, self.quic.configs());
+            // Sending, or finding nothing to send, moves the connection's timers.
+            self.rearm_later(key);
+            if let Some(transmit) = sent {
                 self.endpoint_events(key);
+                self.queue_sending(key);
                 return Some(transmit);
             }
         }
@@ -598,6 +641,135 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 
     /// When [`Endpoint::handle_timeout`] is next due.
     pub fn poll_timeout(&mut self) -> Option<Instant> {
+        self.read_touched();
+        let first = self.deadlines.first().map(|(due, _)| *due);
+        #[cfg(feature = "oracle")]
+        self.check_deadlines(first);
+        first
+    }
+
+    /// Time has reached `now`: fire every timer due.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        self.core.now = now;
+        self.read_touched();
+        let mut due = std::mem::take(&mut self.due);
+        due.clear();
+        deadlines::due(&self.deadlines, now, &mut self.walk, &mut due);
+        for &id in &due {
+            let Ok(key) = usize::try_from(id) else {
+                continue;
+            };
+            if let Some(Some(conn)) = self.conns.get_mut(key)
+                && conn.quic.poll_timeout().is_some_and(|at| at <= now)
+            {
+                conn.quic.handle_timeout(now);
+            }
+            self.pump(now, key);
+            // Driven or gone, its deadline is placed again at the next poll.
+            self.touch(key);
+        }
+        due.clear();
+        self.due = due;
+    }
+
+    /// Connection `key` changed: it is given its turn to transmit, and its deadline is placed
+    /// again, at the endpoint's next poll.
+    fn touch(&mut self, key: usize) {
+        self.reserve_marks(key);
+        if let Some(marks) = self.marks.get_mut(key)
+            && !marks.touched
+        {
+            marks.touched = true;
+            self.touched.push(key);
+        }
+    }
+
+    /// Connection `key`'s deadline is placed again at the endpoint's next poll.
+    fn rearm_later(&mut self, key: usize) {
+        self.reserve_marks(key);
+        if let Some(marks) = self.marks.get_mut(key)
+            && !marks.rearm
+        {
+            marks.rearm = true;
+            self.rearm.push(key);
+        }
+    }
+
+    /// Connection `key` waits for its turn to transmit, once.
+    fn queue_sending(&mut self, key: usize) {
+        if let Some(marks) = self.marks.get_mut(key)
+            && !marks.sending
+        {
+            marks.sending = true;
+            self.sending.push_back(key);
+        }
+    }
+
+    /// Room for key `key`'s marks and heap index: the keys are the QUIC endpoint's connection
+    /// handles, bounded by the connections it holds at once.
+    fn reserve_marks(&mut self, key: usize) {
+        if self.marks.len() <= key {
+            self.marks.resize(key.saturating_add(1), Marks::default());
+        }
+        if self.positions.len() <= key {
+            self.positions.resize(key.saturating_add(1), None);
+        }
+    }
+
+    /// Reads again the connections touched since the last poll: each is queued for its turn to
+    /// transmit and placed again by its deadline, and those only to be re-armed are placed again.
+    fn read_touched(&mut self) {
+        let mut touched = std::mem::take(&mut self.touched);
+        for &key in &touched {
+            if let Some(marks) = self.marks.get_mut(key) {
+                marks.touched = false;
+            }
+            if self.conns.get(key).is_some_and(Option::is_some) {
+                self.queue_sending(key);
+            }
+            self.place(key);
+        }
+        touched.clear();
+        self.touched = touched;
+        let mut rearm = std::mem::take(&mut self.rearm);
+        for &key in &rearm {
+            if let Some(marks) = self.marks.get_mut(key) {
+                marks.rearm = false;
+            }
+            self.place(key);
+        }
+        rearm.clear();
+        self.rearm = rearm;
+    }
+
+    /// Places connection `key` in `deadlines` by its QUIC timer or its exchanges' earliest wait,
+    /// whichever comes first; a connection gone, or with neither, leaves them.
+    fn place(&mut self, key: usize) {
+        let due = match self.conns.get_mut(key) {
+            Some(Some(conn)) => {
+                let quic = conn.quic.poll_timeout();
+                let waits = self.core.exchanges.first_due(key);
+                match (quic, waits) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+            _ => None,
+        };
+        let Ok(id) = u64::try_from(key) else {
+            return;
+        };
+        deadlines::set(&mut self.deadlines, &mut self.positions, id, due);
+    }
+
+    /// With the oracle on, the earliest deadline placed equals the one a visit of every connection
+    /// and every exchange finds (what `poll_timeout` was): a connection changed and not touched
+    /// would differ.
+    #[cfg(feature = "oracle")]
+    fn check_deadlines(&mut self, first: Option<Instant>) {
+        if !self.core.oracle {
+            return;
+        }
         let connections = self
             .conns
             .iter_mut()
@@ -610,22 +782,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .values()
             .filter_map(|exchange| exchange.carry.due())
             .min();
-        match (connections, exchanges) {
+        let visited = match (connections, exchanges) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
-        }
-    }
-
-    /// Time has reached `now`: fire every timer due.
-    pub fn handle_timeout(&mut self, now: Instant) {
-        self.core.now = now;
-        for key in 0..self.conns.len() {
-            if let Some(Some(conn)) = self.conns.get_mut(key)
-                && conn.quic.poll_timeout().is_some_and(|due| due <= now)
-            {
-                conn.quic.handle_timeout(now);
-            }
-            self.pump(now, key);
+        };
+        if visited != first {
+            self.core.mismatches = self.core.mismatches.saturating_add(1);
         }
     }
 
@@ -1056,6 +1218,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         if let Some(slot) = self.conns.get_mut(key) {
             *slot = Some(conn);
         }
+        self.touch(key);
     }
 
     /// The owner polled a frame of `peer`'s lane on the connection `key` held under `serial`:
@@ -1239,6 +1402,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .is_some_and(|conn| conn.quic.is_drained());
         if drained && let Some(conn) = self.take(key) {
             self.core.gone(key, conn);
+            // Gone: its deadline leaves at the next poll.
+            self.touch(key);
         }
     }
 
