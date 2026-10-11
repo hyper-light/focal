@@ -13,7 +13,7 @@
 #
 # The data volume must belong to uid 65532: `docker run --user 0 ... prepare volume
 # --owner 65532:65532` once, or the Kubernetes init step the renderer emits.
-FROM rust:1.94.1-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08 AS build
+FROM rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
 # The same packages, flags and target the release workflow's musl lane uses.
 RUN apk add --no-cache build-base protoc
 WORKDIR /src
