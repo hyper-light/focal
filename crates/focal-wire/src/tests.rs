@@ -2395,8 +2395,15 @@ fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
                     max_bytes: 1024 * 1024,
                 },
             ))
-            .await
-            .unwrap();
+            .await;
+        eprintln!(
+            "DIAG narrow read: {:?} after {} ms, tick {} ns, overrun {} ns",
+            read.as_ref().err(),
+            (hyper_rt::futures::now_ns() - began) / 1_000_000,
+            hyper_rt::futures::timer_tick_ns(),
+            hyper_rt::futures::scheduler_overrun_ns()
+        );
+        let read = read.unwrap();
         assert_eq!(
             read.result,
             Response::Custody(CustodyReply::Chunk {
@@ -6002,7 +6009,16 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
         let remote = connector.connect(address, "localhost").await.unwrap();
         assert!(remote.request(&request(0)).await.is_ok());
         // The stalled request ends at its deadline, not with its connection.
-        assert!(remote.request(&request(1)).await.is_err());
+        let began = hyper_rt::futures::now_ns();
+        let stalled = remote.request(&request(1)).await;
+        eprintln!(
+            "DIAG stall: {:?} after {} ms, tick {} ns, overrun {} ns",
+            stalled.as_ref().map(|_| "answered"),
+            (hyper_rt::futures::now_ns() - began) / 1_000_000,
+            hyper_rt::futures::timer_tick_ns(),
+            hyper_rt::futures::scheduler_overrun_ns()
+        );
+        assert!(stalled.is_err());
         pause(DEADLINE * 3).await;
         // A remote is its connection: one that went is not asked again.
         assert!(

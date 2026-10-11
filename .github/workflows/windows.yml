@@ -21,6 +21,13 @@ jobs:
           curl -sSL "$url" -o protoc.zip
           7z x protoc.zip -oprotoc-dist >/dev/null
           echo "PROTOC=$(pwd)/protoc-dist/bin/protoc.exe" >> "$GITHUB_ENV"
+      - name: DIAG the two timing tests, five runs with their output
+        shell: bash
+        run: |
+          for run in 1 2 3 4 5; do
+            echo "== run $run"
+            cargo test -p focal-wire --lib --locked -- --nocapture a_stall_past_the_request_deadline narrow_path_carries 2>&1 | grep -E 'DIAG|test result|FAILED|panicked' || true
+          done
       - name: Build the workspace
         shell: bash
         run: cargo build --workspace --locked
