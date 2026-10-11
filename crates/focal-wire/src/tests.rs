@@ -624,6 +624,51 @@ fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connec
 /// at dispatch by the grant current then. The registry is asked again
 /// once the whole request has arrived; the early check alone would have
 /// dispatched it.
+/// A handler slower than the asker's period is answered for, "not yet"
+/// (`Unavailable` for a read, `OutcomeUnknown` for a mutation), and the
+/// answer arrives within the period the asker gives (its request time, which
+/// a node and its askers share), never after the asker has refused the
+/// exchange as stalled. Answered at the server's full request time, it came
+/// after the asker's period every time: that period began when the asker
+/// sent, before the server had the request, and the server's timer fires no
+/// earlier than due (evidence_quic's seal across 128 kbit/s, 2026-10-10).
+#[test]
+fn a_handler_slower_than_the_askers_period_is_answered_within_it() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> = Arc::new(|_: VerifiedRequest| async {
+            std::future::pending::<ResponseEnvelope>().await
+        });
+        let (server, task) = server(&pki, registry.clone(), handler).await;
+        let connector = connector(&pki, certificate, key);
+        let remote = connector
+            .connect(server.local_addr().unwrap(), "localhost")
+            .await
+            .unwrap();
+        for id in 1..=2 {
+            let answered = remote.request(&request(id)).await;
+            assert!(
+                matches!(
+                    &answered,
+                    Ok(ResponseEnvelope {
+                        result: Response::Error(AccessError::Unavailable),
+                        ..
+                    })
+                ),
+                "ask {id}: {answered:?}"
+            );
+        }
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 #[test]
 fn a_complete_request_is_authorized_by_the_grant_current_at_dispatch() {
     focal_rt::block_on(async move {

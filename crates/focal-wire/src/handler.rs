@@ -202,7 +202,7 @@ pub async fn dispatch_accounted_by(
                 .reply(Response::Error(AccessError::UnsupportedProtocol)),
         );
     }
-    let period = u64::try_from(limits.request_timeout.as_nanos()).unwrap_or(u64::MAX);
+    let period = answer_within(limits.request_timeout, path);
     let response =
         match hyper_rt::futures::within(period, handler.handle_accounted(&verified)).await {
             Ok(Some(response)) => response,
@@ -270,6 +270,22 @@ pub async fn dispatch_accounted_by(
         )));
     }
     response
+}
+
+/// How long a handler is given before its request is answered "not yet", nanoseconds: the asker's
+/// period (the request time, which a node and its askers share) less what this answer's arrival
+/// within it takes. The asker's period began when it sent, before this side had the request, and is
+/// judged by progress (hyper-transport's `Progress`): an answer begun at the period's end came
+/// after the asker had refused the exchange as stalled, every time. So the answer sets aside the
+/// path's round trip, as this connection measures it (the request's way here and the answer's way
+/// back), and how late this shard's timer ends it: a tick by design, and the shard's measured
+/// scheduler overrun. A shard so starved that nothing is left answers at once.
+pub(crate) fn answer_within(period: std::time::Duration, path: std::time::Duration) -> u64 {
+    let nanos = |span: std::time::Duration| u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
+    nanos(period)
+        .saturating_sub(nanos(path))
+        .saturating_sub(hyper_rt::futures::timer_tick_ns())
+        .saturating_sub(hyper_rt::futures::scheduler_overrun_ns())
 }
 
 pub fn validate_response(
