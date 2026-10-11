@@ -38,6 +38,17 @@ impl Instant {
     }
 }
 
+/// Whether `deadline` is still ahead: a call bounded by it begins each step of its own only
+/// while it is. `within` polls its work before its timer, so a wake that comes late, past the
+/// deadline, finds the work ready to go on; without this the work would begin its next step (a
+/// read sent) after the time it was given was up.
+pub(crate) fn ahead(deadline: Instant) -> Result<(), ClientError> {
+    if deadline.remaining().is_zero() {
+        return Err(ClientError::Transport);
+    }
+    Ok(())
+}
+
 /// What `future` yields within `period`, or `None` once the period is over. Off a shard no
 /// deadline can be kept: refused `Transport` before the work begins. Named waits around the
 /// work, which they hold once (`focal_rt::adapt`).

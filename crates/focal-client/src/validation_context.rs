@@ -71,10 +71,13 @@ impl<T: ClientTransport> Client<T> {
             request.route_epoch = token.route_epoch;
         }
         let duration = self.retry_timeout().min(Duration::from_secs(30));
+        let deadline = crate::time::Instant::now()
+            .checked_add(duration)
+            .ok_or(ClientError::Transport)?;
         // A dependency's unwind stays inside this read-only interface: the
         // in-flight wait and all retained response ownership drop on failure.
         let future = async {
-            crate::time::within(duration, self.context_inner(request, id, exact))
+            crate::time::within(duration, self.context_inner(request, id, exact, deadline))
                 .await?
                 .ok_or(ClientError::Transport)?
         };
@@ -93,6 +96,7 @@ impl<T: ClientTransport> Client<T> {
         request: RequestEnvelope,
         id: ValidationId,
         exact: Option<ReadToken>,
+        deadline: crate::time::Instant,
     ) -> Result<ValidationContext> {
         let mut allowance = JsonAllowance::new(self.wire_limits().max_frame_bytes as usize);
         let page = self.read(request.clone()).await?;
@@ -132,6 +136,7 @@ impl<T: ClientTransport> Client<T> {
             return Err(invalid());
         }
         let claim_id = validation.content().claim;
+        crate::time::ahead(deadline)?;
         let parent = self
             .read(followup(
                 &request,
@@ -194,6 +199,7 @@ impl<T: ClientTransport> Client<T> {
                 kind: ObjectKind::Testament,
                 id: ObjectId(testament_id.0),
             };
+            crate::time::ahead(deadline)?;
             let page = self.read(followup(&request, token, reference)?).await?;
             allowance.add(&page)?;
             if page.token != token || page.next.is_some() || page.objects.len() != 1 {

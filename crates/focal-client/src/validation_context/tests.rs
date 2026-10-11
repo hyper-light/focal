@@ -233,6 +233,10 @@ impl Fixture {
 struct Mock {
     replies: Mutex<VecDeque<(Response, Duration)>>,
     calls: Mutex<Vec<RequestEnvelope>>,
+    /// A reply that holds the shard's thread before it is ready: which call's, and for how
+    /// long. The shard is then busy elsewhere, as a loaded machine keeps it, and its next
+    /// poll finds the reply ready and the call's deadline passed at once.
+    stall: Mutex<Option<(usize, Duration)>>,
 }
 impl Mock {
     fn pages(pages: Vec<ReadPage>) -> Self {
@@ -242,6 +246,7 @@ impl Mock {
         Self {
             replies: Mutex::new(replies.into_iter().map(|r| (r, Duration::ZERO)).collect()),
             calls: Mutex::new(vec![]),
+            stall: Mutex::new(None),
         }
     }
     fn calls(&self) -> Vec<RequestEnvelope> {
@@ -255,7 +260,16 @@ impl ClientTransport for &Mock {
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            self.calls.lock().unwrap().push(request.clone());
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(request.clone());
+                calls.len() - 1
+            };
+            if let Some((stalled, period)) = *self.stall.lock().unwrap()
+                && stalled == call
+            {
+                std::thread::sleep(period);
+            }
             let (response, delay) = self
                 .replies
                 .lock()
@@ -718,6 +732,27 @@ async fn whole_call_deadline_bounds_three_individually_valid_waits_on_a_shard() 
         Err(ValidationContextError::Client(ClientError::Transport))
     ));
     assert!(mock.calls().len() <= 2);
+}
+
+/// A wake past the whole call's deadline finds the second reply ready and the deadline passed at
+/// once (`within` polls its work first): the call ends there, and no read is sent past its
+/// deadline. Before, the third read was sent and the call answered after its time was up (macOS
+/// CI flagged the timed version of this, run 38086325072).
+#[test]
+fn a_late_wake_past_the_whole_call_deadline_sends_no_further_read() {
+    focal_rt::block_on(async {
+        let mock = Mock::pages(Fixture::new().pages());
+        *mock.stall.lock().unwrap() = Some((1, Duration::from_millis(60)));
+        let result = client(&mock, WireLimits::default(), Duration::from_millis(40))
+            .validation_context(request())
+            .await;
+        assert!(matches!(
+            result,
+            Err(ValidationContextError::Client(ClientError::Transport))
+        ));
+        assert_eq!(mock.calls().len(), 2);
+    })
+    .unwrap();
 }
 
 /// Off a shard, where no deadline could be kept, a read is a typed failure and nothing is sent.
