@@ -14511,3 +14511,101 @@ The gate on the landing tree (head `bf87b03`, macOS 26.4.1 arm64, under other wo
 recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3282
 passed, 0 failed, 22 ignored. Windows CI built and tested the same code (run 38159367923).
+
+### 2026-10-11 — A record and a refusal each take one pass; a frame's validations are inspected where they are planned
+
+**A log record is measured and written in one pass each.** Measuring a candidate's record (to fund its
+buffer) and writing it each encoded every changed row twice, once to learn the length written before
+it, and fed every field to the record's BLAKE3 as it went; the measure hashed only to compare its
+hash with the write's. Now:
+- The measure finds each row's length once and counts its bytes (`CountingSink::count`).
+- The write writes each row once behind a length it patches in (`SliceSink::patch_u32`), then hashes
+  the record's bytes in one update and appends the digest.
+- Both charge the same visits, and their equality is still checked.
+
+The record's bytes and digest are unchanged; every record codec, replay and recovery test reads them.
+Its hash is now the write's, carried by the encoded record. The test encoder checks that the written
+hash is the digest of the bytes before it and the record's trailer. Over 5,000 authored claims,
+interleaved A/B, measuring and writing a claim's record went from 13.2–13.4 to 6.5–6.6 µs.
+
+**An owner at its bound refuses a fresh request from its frame's header.** Before, a request was
+refused for the full queue only after its frame was planned, which inspects every validation body in
+it: 16.5–17.4 µs for an authored claim of two validations. So at the bound every refusal cost a decode.
+The comparison's leader refused 14,141 writes so at 1,000/s and 32,721 at 4,000/s (run 38148578690).
+
+The owner now reads the header alone (`StructuralInput::peek_header`, the parse `inspect` begins
+with). It refuses a request whose key has no outcome, committed or pending, while as many candidates
+are pending as it holds. These are decoded as before, which says why they are refused or answers
+them:
+- a header that does not read;
+- a header naming another ledger, profile or actor;
+- a faulted owner;
+- an exact retry.
+
+**A validation descriptor built from a frame's view is not inspected again.** A build re-inspected
+its source before copying it (a whole pass of its content's and specification's BLAKE3), to refuse a
+source that changed after its plan. A frame's view reads borrowed bytes through one decoder, so every
+read it makes is its plan's.
+
+`ValidationSource::replays` is false unless a source says so; a frame's view does. It lets a build
+take its plan's fields. The descriptor the build makes is still inspected and held to the plan's
+content and specification. The view's quoted build work drops the re-inspection: two passes of its
+handlers and one of its contributors, which the codec's exact check confirms.
+
+**An authored claim's cohort takes each validation's checked declaration from the planning loop.**
+Where the cohort's hold fits the claim (eight or fewer validations), the loop checks each body from
+its own plan and hands the cohort what it checked (`Held::push`). The checking's work is kept out of
+the build's quote, which does not check; the quote stays exact, and every work domain is still
+refused one below it. A claim of more validations is read at the cohort, as before.
+
+An authored claim's frame (two validations), inspected, planned and built, interleaved A/B:
+- 32.7–35.6 to 30.3–30.6 µs for the view's replay;
+- then 32.2–33.1 to 29.0–29.4 µs for the hand-over.
+
+Tests:
+- A replaying source's build reads its handlers twice and its contributors once; another source reads
+  them three times and twice.
+- A source that claims to replay and changes a handler or a contributor during its copy is refused.
+- A claim of 8, 9 and 16 validations covers the hand-over (8) and the cohort's own read (9, 16).
+- A full owner refuses a fresh request's bare header for the full queue; an owner with room reads on
+  and refuses it as truncated. The full owner refuses the whole frame too, answers an exact retry of a
+  pending request, and refuses another actor's header as such.
+
+**What bounds the comparison at 1,000/s, measured.** The land-9 entry named 32 pending candidates
+over a commit's latency without having measured it. On 1-CPU nodes (land-9 A/B, run 38159367941; 75 s
+runs of 75,000 writes offered, about 44,000 committed), the generator's report counts each refusal
+by its cause:
+- 13,300–14,400 at the owner's `pending candidates`;
+- 16,700–17,800 as `access: Capacity` at the session's ingress.
+
+A frame-pointer profile of the leader at 1,000/s (run 38161000738) put its process at 0.88 of its one
+CPU, 1.33 ms of CPU a committed write: the network 43%, the session owner 41% and checkpoints 12%,
+while the owner's own thread was busy only about 36% of the time. Both bounds fill because the
+leader's CPU per write is the ceiling, not because 32 is.
+
+Checkpoints are a large share of that CPU on every node. One is taken every ~4,200 entries and
+re-encodes the whole root:
+- its off-owner encode grew from 0.46 s to 2.3 s on the leader, and from 0.58 s to 1.9 s on the
+  followers, as the state grew over the run;
+- its commit held the owner 22–159 ms.
+
+On one runner, against land-9 (A/B run 38163702691: two rounds, A then B and then B then A; measured
+writes, medians):
+
+| offered/s | land-9 committed | land-10 committed | land-9 p99 | land-10 p99 |
+|---|---|---|---|---|
+| 100 | 6,059 | 6,059 | 5.55 ms | 5.49 ms |
+| 1,000 | 35,346 | 35,808 | 199.3 ms | 194.4 ms |
+| 4,000 | 28,898 | 29,032 | 420.2 ms | 411.7 ms |
+
+The owner's work this batch removed is a share of the leader's CPU, not the whole of it: 1.3% more
+writes committed at 1,000/s, and 0.5% more at 4,000/s.
+
+The gate on the landing tree (head `c25fe14`, the code of `11adddb` on the history before land-9's
+record; macOS 26.4.1 arm64, under other work's load), exit 0: `cargo fmt --all --check`,
+`python3 scripts/check-contracts.py` (1561 links, 37 source hashes, 15 vocabularies),
+`bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1153 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3284
+passed, 0 failed, 22 ignored. Windows CI built and tested the same code (run 38163702765).
