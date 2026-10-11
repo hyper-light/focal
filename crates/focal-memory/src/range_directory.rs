@@ -6,12 +6,18 @@
 //! handles into 16 and 17; deletion borrows or merges before publishing. Each
 //! node owns one charged vector and one charged Arc allocation. Small splice
 //! descriptions stay on the stack, so there is no unaccounted merge buffer.
+//!
+//! A node is let go through [`release`], a level at a time: a branch's own
+//! drop leaves its children ([`Links::Branches`]), since dropping them there
+//! would make a node's drop call itself (CLAUDE.md §1a). Every handle on a
+//! node outside a branch is [`Held`] or [`Gathered`], which let go so.
 
 use super::{Page, bounded_push, bounded_vec};
 use crate::{
     ALLOCATOR_OVERHEAD, Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, checked_add,
     checked_mul,
 };
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 const MIN: usize = 16;
@@ -22,7 +28,7 @@ const MAX: usize = 32;
 const MAX_LEVELS: usize = usize::BITS.div_ceil(MIN.trailing_zeros()).saturating_add(2) as usize;
 
 pub(crate) struct PageDirectory<K, V> {
-    root: Option<Arc<Node<K, V>>>,
+    root: Held<K, V>,
 }
 
 struct Node<K, V> {
@@ -37,7 +43,154 @@ struct Node<K, V> {
 
 enum Links<K, V> {
     Leaves(Vec<Arc<Page<K, V>>>),
-    Branches(Vec<Arc<Node<K, V>>>),
+    /// Kept from the node's own drop and let go by [`release`].
+    Branches(ManuallyDrop<Vec<Arc<Node<K, V>>>>),
+}
+
+/// A handle on a node, or on none (an empty directory, a split that did not
+/// happen), let go through [`release`] when dropped.
+struct Held<K, V>(Option<Arc<Node<K, V>>>);
+
+impl<K, V> Held<K, V> {
+    const fn none() -> Self {
+        Self(None)
+    }
+
+    fn new(node: Node<K, V>) -> Self {
+        Self(Some(Arc::new(node)))
+    }
+
+    /// Another handle on `node`.
+    fn share(node: &Arc<Node<K, V>>) -> Self {
+        Self(Some(Arc::clone(node)))
+    }
+
+    fn handle(&self) -> Option<&Arc<Node<K, V>>> {
+        self.0.as_ref()
+    }
+
+    fn node(&self) -> Option<&Node<K, V>> {
+        self.0.as_deref()
+    }
+
+    /// The node, to be a branch's child, which [`release`] lets go.
+    fn into_child(mut self) -> Option<Arc<Node<K, V>>> {
+        self.0.take()
+    }
+}
+
+impl<K, V> Clone for Held<K, V> {
+    fn clone(&self) -> Self {
+        Self(self.0.as_ref().map(Arc::clone))
+    }
+}
+
+impl<K, V> Drop for Held<K, V> {
+    fn drop(&mut self) {
+        if let Some(node) = self.0.take() {
+            release(node);
+        }
+    }
+}
+
+/// Handles gathered to be a branch's children, or a level of a directory
+/// being built: each let go through [`release`] unless they become children.
+struct Gathered<K, V>(Vec<Arc<Node<K, V>>>);
+
+impl<K, V> Gathered<K, V> {
+    fn with_capacity(capacity: usize) -> Result<Self, MemoryError> {
+        Ok(Self(bounded_vec(capacity)?))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn get(&self, index: usize) -> Option<&Arc<Node<K, V>>> {
+        self.0.get(index)
+    }
+
+    /// Takes `held`'s node: refused past `limit` or the capacity, `held`
+    /// then let go as it was.
+    fn push(&mut self, held: Held<K, V>, limit: usize) -> Result<(), MemoryError> {
+        if self.0.len() >= limit || self.0.len() >= self.0.capacity() {
+            return Err(MemoryError::Capacity {
+                requested: checked_add(self.0.len(), 1)?,
+                available: limit,
+            });
+        }
+        if let Some(node) = held.into_child() {
+            self.0.push(node);
+        }
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Held<K, V> {
+        Held(self.0.pop())
+    }
+
+    /// The handles, made a branch's children.
+    fn into_children(mut self) -> ManuallyDrop<Vec<Arc<Node<K, V>>>> {
+        ManuallyDrop::new(std::mem::take(&mut self.0))
+    }
+}
+
+impl<K, V> Drop for Gathered<K, V> {
+    fn drop(&mut self) {
+        for node in std::mem::take(&mut self.0) {
+            release(node);
+        }
+    }
+}
+
+/// What [`release`] holds of a branch it let go: the children it has not yet
+/// let go, and the branch's charge, given back after their handles' buffer.
+type Unwinding<K, V> = (std::vec::IntoIter<Arc<Node<K, V>>>, Allocation);
+
+/// Lets `node` go and, where its handle was the last, its children, theirs
+/// and so on: a loop over the branches being let go, one a level and at most
+/// [`MAX_LEVELS`] (a branch's children are one level below it, and none is
+/// built deeper), each with the children it has left. A node another
+/// directory shares only loses a handle here (`Arc::into_inner`, which gives
+/// the node to exactly one of the handles let go at once).
+fn release<K, V>(node: Arc<Node<K, V>>) {
+    let mut unwinding: [Option<Unwinding<K, V>>; MAX_LEVELS] = std::array::from_fn(|_| None);
+    let mut depth = 0usize;
+    let mut next = Some(node);
+    loop {
+        if let Some(node) = next.take()
+            && let Some(Node {
+                links: Links::Branches(children),
+                _allocation: allocation,
+                ..
+            }) = Arc::into_inner(node)
+        {
+            let children = ManuallyDrop::into_inner(children).into_iter();
+            // A branch's level is below MAX_LEVELS (`branch`) and each frame is
+            // a level below the last, so a frame is always free here.
+            if let Some(frame) = unwinding.get_mut(depth) {
+                *frame = Some((children, allocation));
+                depth = depth.saturating_add(1);
+            }
+        }
+        // The next child of the deepest branch still being let go.
+        loop {
+            let Some(top) = depth.checked_sub(1) else {
+                return;
+            };
+            let Some(Some((children, _))) = unwinding.get_mut(top) else {
+                return;
+            };
+            if let Some(child) = children.next() {
+                next = Some(child);
+                break;
+            }
+            if let Some(frame) = unwinding.get_mut(top) {
+                drop(frame.take());
+            }
+            depth = top;
+        }
+    }
 }
 
 /// One preparation's cumulative issued-allocation bound. Dropped intermediate
@@ -76,25 +229,25 @@ impl<'a> DirectoryBuild<'a> {
 
 impl<K, V> PageDirectory<K, V> {
     pub(super) fn new() -> Self {
-        Self { root: None }
+        Self { root: Held::none() }
     }
 
     pub(super) fn shared(&self) -> Self {
         Self {
-            root: self.root.as_ref().map(Arc::clone),
+            root: self.root.clone(),
         }
     }
 
     pub(super) fn len(&self) -> usize {
-        self.root.as_ref().map_or(0, |node| node.pages)
+        self.root.node().map_or(0, |node| node.pages)
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.root.is_none()
+        self.root.node().is_none()
     }
 
     pub(super) fn get(&self, mut index: usize) -> Option<&Arc<Page<K, V>>> {
-        let mut node = self.root.as_deref()?;
+        let mut node = self.root.node()?;
         if index >= node.pages {
             return None;
         }
@@ -119,7 +272,7 @@ impl<K, V> PageDirectory<K, V> {
     }
 
     pub(super) fn from(&self, index: usize) -> Iter<'_, K, V> {
-        Iter::new(self.root.as_deref(), index)
+        Iter::new(self.root.node(), index)
     }
 
     /// Total additional bytes that may be issued over all directory edits.
@@ -154,7 +307,7 @@ impl<K, V> PageDirectory<K, V> {
     #[cfg(test)]
     pub(super) fn height(&self) -> usize {
         self.root
-            .as_ref()
+            .node()
             .map_or(0, |root| root.level.saturating_add(1))
     }
 }
@@ -164,7 +317,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
     /// nodes decide every comparison where they differ; where they tie, the
     /// keys do. The sought key's prefix is computed once.
     pub(super) fn page_index(&self, key: &K) -> usize {
-        let Some(mut node) = self.root.as_deref() else {
+        let Some(mut node) = self.root.node() else {
             return 0;
         };
         let probe = key.order_prefix();
@@ -211,25 +364,29 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
             return Err(MemoryError::MissingKey);
         }
         self.check_page(index, false, &page)?;
-        let Some(root) = &self.root else {
+        let Some(root) = self.root.node() else {
             let node = leaf(1, |_| Some(Arc::clone(&page)), |_| true, build)?;
-            return Ok(Self { root: Some(node) });
+            return Ok(Self { root: node });
         };
         let (left, right) = insert_node(root, index, page, build)?;
-        let root = match right {
-            None => left,
-            Some(right) => branch(
+        let root = if right.handle().is_none() {
+            left
+        } else {
+            branch(
                 2,
-                |index| match index {
-                    0 => Some(Arc::clone(&left)),
-                    1 => Some(Arc::clone(&right)),
-                    _ => None,
+                |index| {
+                    match index {
+                        0 => left.handle(),
+                        1 => right.handle(),
+                        _ => None,
+                    }
+                    .map(Held::share)
                 },
                 |_| true,
                 build,
-            )?,
+            )?
         };
-        Ok(Self { root: Some(root) })
+        Ok(Self { root })
     }
 
     pub(super) fn replace(
@@ -242,9 +399,9 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
             return Err(MemoryError::MissingKey);
         }
         self.check_page(index, true, &page)?;
-        let root = self.root.as_ref().ok_or(MemoryError::MissingKey)?;
+        let root = self.root.node().ok_or(MemoryError::MissingKey)?;
         Ok(Self {
-            root: Some(replace_node(root, index, page, build)?),
+            root: replace_node(root, index, page, build)?,
         })
     }
 
@@ -253,20 +410,23 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         index: usize,
         build: &mut DirectoryBuild<'_>,
     ) -> Result<Self, MemoryError> {
-        let root = self.root.as_ref().ok_or(MemoryError::MissingKey)?;
+        let root = self.root.node().ok_or(MemoryError::MissingKey)?;
         if index >= root.pages {
             return Err(MemoryError::MissingKey);
         }
         let mut root = remove_node(root, index, build)?;
         // A one-child root carries no information and need not be retained.
-        while let Some(node) = &root {
-            let Links::Branches(children) = &node.links else {
+        loop {
+            let only = match root.node().map(|node| &node.links) {
+                Some(Links::Branches(children)) if children.len() == 1 => {
+                    children.first().map(Held::share)
+                }
+                _ => None,
+            };
+            let Some(only) = only else {
                 break;
             };
-            if children.len() != 1 {
-                break;
-            }
-            root = children.first().map(Arc::clone);
+            root = only;
         }
         Ok(Self { root })
     }
@@ -314,7 +474,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
 
     #[cfg(test)]
     pub(super) fn check_shape(&self) -> bool {
-        self.root.as_ref().is_none_or(|root| audit(root, true))
+        self.root.node().is_none_or(|root| audit(root, true))
     }
 
     /// The bytes [`Self::from_pages`] may issue for `count` pages: one node
@@ -360,7 +520,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         build: &mut DirectoryBuild<'_>,
     ) -> Result<Self, MemoryError> {
         if count == 0 {
-            return Ok(Self { root: None });
+            return Ok(Self::new());
         }
         let groups = count.div_ceil(MAX);
         let _staging = build.source.reserve(
@@ -374,7 +534,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                 )?,
             )?,
         )?;
-        let mut level: Vec<Arc<Node<K, V>>> = bounded_vec(groups)?;
+        let mut level = Gathered::with_capacity(groups)?;
         let mut offset = 0usize;
         for group in 0..groups {
             let width = group_width(count, groups, group);
@@ -384,22 +544,22 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                 |_| true,
                 build,
             )?;
-            bounded_push(&mut level, node, groups)?;
+            level.push(node, groups)?;
             offset = checked_add(offset, width)?;
         }
         while level.len() > 1 {
             let groups = level.len().div_ceil(MAX);
-            let mut next: Vec<Arc<Node<K, V>>> = bounded_vec(groups)?;
+            let mut next = Gathered::with_capacity(groups)?;
             let mut offset = 0usize;
             for group in 0..groups {
                 let width = group_width(level.len(), groups, group);
                 let node = branch(
                     width,
-                    |index| level.get(checked_add(offset, index).ok()?).map(Arc::clone),
+                    |index| level.get(checked_add(offset, index).ok()?).map(Held::share),
                     |_| true,
                     build,
                 )?;
-                bounded_push(&mut next, node, groups)?;
+                next.push(node, groups)?;
                 offset = checked_add(offset, width)?;
             }
             level = next;
@@ -469,7 +629,7 @@ fn leaf<K: crate::RangeKey, V>(
     mut item: impl FnMut(usize) -> Option<Arc<Page<K, V>>>,
     seam: impl Fn(usize) -> bool,
     build: &mut DirectoryBuild<'_>,
-) -> Result<Arc<Node<K, V>>, MemoryError> {
+) -> Result<Held<K, V>, MemoryError> {
     if count == 0 || count > MAX {
         return Err(invalid("invalid directory leaf width"));
     }
@@ -492,7 +652,7 @@ fn leaf<K: crate::RangeKey, V>(
         bounded_push(&mut pages, page, count)?;
     }
     let first = pages.first().map_or(0, |page| page.first);
-    Ok(Arc::new(Node {
+    Ok(Held::new(Node {
         links: Links::Leaves(pages),
         first,
         pages: count,
@@ -505,19 +665,20 @@ fn leaf<K: crate::RangeKey, V>(
 /// order where `seam` says the sequence is new, as for [`leaf`].
 fn branch<K: crate::RangeKey, V>(
     count: usize,
-    mut item: impl FnMut(usize) -> Option<Arc<Node<K, V>>>,
+    mut item: impl FnMut(usize) -> Option<Held<K, V>>,
     seam: impl Fn(usize) -> bool,
     build: &mut DirectoryBuild<'_>,
-) -> Result<Arc<Node<K, V>>, MemoryError> {
+) -> Result<Held<K, V>, MemoryError> {
     if count == 0 || count > MAX {
         return Err(invalid("invalid directory branch width"));
     }
     let allocation = build.allocate(node_charge::<K, V>(count)?)?;
-    let mut children: Vec<Arc<Node<K, V>>> = bounded_vec(count)?;
+    let mut children = Gathered::with_capacity(count)?;
     let mut pages = 0usize;
     let mut level = None;
     for index in 0..count {
-        let child = item(index).ok_or(invalid("missing directory child"))?;
+        let held = item(index).ok_or(invalid("missing directory child"))?;
+        let child = held.node().ok_or(invalid("missing directory child"))?;
         let child_level = checked_add(child.level, 1)?;
         if child.pages == 0
             || child_level >= MAX_LEVELS
@@ -528,6 +689,7 @@ fn branch<K: crate::RangeKey, V>(
         if seam(index) {
             let first = child.first_key().ok_or(invalid("empty directory child"))?;
             if children
+                .0
                 .last()
                 .and_then(|previous| previous.last_key())
                 .is_some_and(|previous| previous >= first)
@@ -537,25 +699,27 @@ fn branch<K: crate::RangeKey, V>(
         }
         pages = checked_add(pages, child.pages)?;
         level = Some(child_level);
-        bounded_push(&mut children, child, count)?;
+        children.push(held, count)?;
     }
-    let first = children.first().map_or(0, |child| child.first);
-    Ok(Arc::new(Node {
-        links: Links::Branches(children),
+    let first = children.0.first().map_or(0, |child| child.first);
+    let level = level.ok_or(invalid("empty directory branch"))?;
+    Ok(Held::new(Node {
+        links: Links::Branches(children.into_children()),
         first,
         pages,
-        level: level.ok_or(invalid("empty directory branch"))?,
+        level,
         _allocation: allocation,
     }))
 }
 
-/// A borrowed sequence with at most two owned replacement handles. Reading it
-/// never copies keys/values or allocates a temporary vector.
+/// A borrowed sequence with at most two replacement handles, borrowed from
+/// their owner. Reading it never copies keys/values or allocates a temporary
+/// vector.
 struct Splice<'a, T> {
     old: &'a [T],
     at: usize,
     removed: usize,
-    inserted: [Option<T>; 2],
+    inserted: [Option<&'a T>; 2],
     count: usize,
 }
 
@@ -564,8 +728,8 @@ impl<'a, T> Splice<'a, T> {
         old: &'a [T],
         at: usize,
         removed: usize,
-        first: Option<T>,
-        second: Option<T>,
+        first: Option<&'a T>,
+        second: Option<&'a T>,
     ) -> Result<Self, MemoryError> {
         if checked_add(at, removed)? > old.len() || (first.is_none() && second.is_some()) {
             return Err(invalid("invalid directory splice"));
@@ -590,20 +754,21 @@ impl<'a, T> Splice<'a, T> {
         index >= self.at && index <= self.at.saturating_add(self.count)
     }
 
-    fn get(&self, index: usize) -> Option<&T> {
+    fn get(&self, index: usize) -> Option<&'a T> {
         if index < self.at {
             return self.old.get(index);
         }
         let relative = index.checked_sub(self.at)?;
         if relative < self.count {
-            return self.inserted.get(relative)?.as_ref();
+            return *self.inserted.get(relative)?;
         }
         self.old
             .get(index.checked_sub(self.count)?.checked_add(self.removed)?)
     }
 }
 
-type Split<K, V> = (Arc<Node<K, V>>, Option<Arc<Node<K, V>>>);
+/// A node and, if it split, its right half.
+type Split<K, V> = (Held<K, V>, Held<K, V>);
 
 fn split_leaves<K: crate::RangeKey, V>(
     items: &Splice<'_, Arc<Page<K, V>>>,
@@ -618,7 +783,7 @@ fn split_leaves<K: crate::RangeKey, V>(
                 |i| items.seam(i),
                 build,
             )?,
-            None,
+            Held::none(),
         ));
     }
     if count != checked_add(MAX, 1)? {
@@ -640,7 +805,7 @@ fn split_leaves<K: crate::RangeKey, V>(
         |i| i.checked_add(MIN).is_some_and(|i| items.seam(i)),
         build,
     )?;
-    Ok((left, Some(right)))
+    Ok((left, right))
 }
 
 fn split_branches<K: crate::RangeKey, V>(
@@ -652,11 +817,11 @@ fn split_branches<K: crate::RangeKey, V>(
         return Ok((
             branch(
                 count,
-                |i| items.get(i).map(Arc::clone),
+                |i| items.get(i).map(Held::share),
                 |i| items.seam(i),
                 build,
             )?,
-            None,
+            Held::none(),
         ));
     }
     if count != checked_add(MAX, 1)? {
@@ -664,7 +829,7 @@ fn split_branches<K: crate::RangeKey, V>(
     }
     let left = branch(
         MIN,
-        |i| items.get(i).map(Arc::clone),
+        |i| items.get(i).map(Held::share),
         |i| items.seam(i),
         build,
     )?;
@@ -673,12 +838,12 @@ fn split_branches<K: crate::RangeKey, V>(
         |i| {
             i.checked_add(MIN)
                 .and_then(|i| items.get(i))
-                .map(Arc::clone)
+                .map(Held::share)
         },
         |i| i.checked_add(MIN).is_some_and(|i| items.seam(i)),
         build,
     )?;
-    Ok((left, Some(right)))
+    Ok((left, right))
 }
 
 fn child_at<K, V>(
@@ -758,10 +923,13 @@ fn insert_node<K: crate::RangeKey, V>(
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Split<K, V>, MemoryError> {
     let (descent, pages, rank) = Descent::to_leaf(node, rank, true)?;
-    let mut split = split_leaves(&Splice::new(pages, rank, 0, Some(page), None)?, build)?;
+    let mut split = split_leaves(&Splice::new(pages, rank, 0, Some(&page), None)?, build)?;
     for &(children, index) in descent.upward() {
         let (left, right) = split;
-        split = split_branches(&Splice::new(children, index, 1, Some(left), right)?, build)?;
+        split = split_branches(
+            &Splice::new(children, index, 1, left.handle(), right.handle())?,
+            build,
+        )?;
     }
     Ok(split)
 }
@@ -771,9 +939,9 @@ fn replace_node<K: crate::RangeKey, V>(
     rank: usize,
     page: Arc<Page<K, V>>,
     build: &mut DirectoryBuild<'_>,
-) -> Result<Arc<Node<K, V>>, MemoryError> {
+) -> Result<Held<K, V>, MemoryError> {
     let (descent, pages, rank) = Descent::to_leaf(node, rank, false)?;
-    let items = Splice::new(pages, rank, 1, Some(page), None)?;
+    let items = Splice::new(pages, rank, 1, Some(&page), None)?;
     let mut node = leaf(
         items.len()?,
         |i| items.get(i).map(Arc::clone),
@@ -781,13 +949,15 @@ fn replace_node<K: crate::RangeKey, V>(
         build,
     )?;
     for &(children, index) in descent.upward() {
-        let items = Splice::new(children, index, 1, Some(node), None)?;
-        node = branch(
-            items.len()?,
-            |i| items.get(i).map(Arc::clone),
-            |i| items.seam(i),
-            build,
-        )?;
+        node = {
+            let items = Splice::new(children, index, 1, node.handle(), None)?;
+            branch(
+                items.len()?,
+                |i| items.get(i).map(Held::share),
+                |i| items.seam(i),
+                build,
+            )?
+        };
     }
     Ok(node)
 }
@@ -796,65 +966,77 @@ fn remove_node<K: crate::RangeKey, V>(
     node: &Node<K, V>,
     rank: usize,
     build: &mut DirectoryBuild<'_>,
-) -> Result<Option<Arc<Node<K, V>>>, MemoryError> {
+) -> Result<Held<K, V>, MemoryError> {
     let (descent, pages, rank) = Descent::to_leaf(node, rank, false)?;
     let items = Splice::new(pages, rank, 1, None, None)?;
     let mut node = if items.len()? == 0 {
-        None
+        Held::none()
     } else {
-        Some(leaf(
+        leaf(
             items.len()?,
             |i| items.get(i).map(Arc::clone),
             |i| items.seam(i),
             build,
-        )?)
+        )?
     };
     for &(children, index) in descent.upward() {
-        let items = match node {
+        let (at, removed, first, second) = match node.node() {
             Some(child) if child.width() < MIN && children.len() > 1 => {
                 repair(children, index, child, build)?
             }
-            child => Splice::new(children, index, 1, child, None)?,
+            _ => (
+                index,
+                1,
+                std::mem::replace(&mut node, Held::none()),
+                Held::none(),
+            ),
         };
-        node = if items.len()? == 0 {
-            None
-        } else {
-            Some(branch(
-                items.len()?,
-                |i| items.get(i).map(Arc::clone),
-                |i| items.seam(i),
-                build,
-            )?)
+        node = {
+            let items = Splice::new(children, at, removed, first.handle(), second.handle())?;
+            if items.len()? == 0 {
+                Held::none()
+            } else {
+                branch(
+                    items.len()?,
+                    |i| items.get(i).map(Held::share),
+                    |i| items.seam(i),
+                    build,
+                )?
+            }
         };
     }
     Ok(node)
 }
 
-fn repair<'a, K: crate::RangeKey, V>(
-    children: &'a [Arc<Node<K, V>>],
+/// What replaces an underfull child and the sibling it is evened with: where
+/// the replaced span starts, its length, and the nodes that take its place.
+type Repaired<K, V> = (usize, usize, Held<K, V>, Held<K, V>);
+
+fn repair<K: crate::RangeKey, V>(
+    children: &[Arc<Node<K, V>>],
     index: usize,
-    child: Arc<Node<K, V>>,
+    child: &Node<K, V>,
     build: &mut DirectoryBuild<'_>,
-) -> Result<Splice<'a, Arc<Node<K, V>>>, MemoryError> {
+) -> Result<Repaired<K, V>, MemoryError> {
     let left = index.checked_sub(1).and_then(|i| children.get(i));
     let right = index.checked_add(1).and_then(|i| children.get(i));
     if let Some(left) = left.filter(|left| left.width() > MIN) {
-        let (first, second) = redistribute(left, &child, left.width().saturating_sub(1), build)?;
-        return Splice::new(children, index.saturating_sub(1), 2, Some(first), second);
+        let (first, second) = redistribute(left, child, left.width().saturating_sub(1), build)?;
+        return Ok((index.saturating_sub(1), 2, first, second));
     }
     if let Some(right) = right.filter(|right| right.width() > MIN) {
-        let (first, second) = redistribute(&child, right, checked_add(child.width(), 1)?, build)?;
-        return Splice::new(children, index, 2, Some(first), second);
+        let (first, second) = redistribute(child, right, checked_add(child.width(), 1)?, build)?;
+        return Ok((index, 2, first, second));
     }
     if let Some(left) = left {
         let width = checked_add(left.width(), child.width())?;
-        let (first, second) = redistribute(left, &child, width, build)?;
-        return Splice::new(children, index.saturating_sub(1), 2, Some(first), second);
+        let (first, second) = redistribute(left, child, width, build)?;
+        return Ok((index.saturating_sub(1), 2, first, second));
     }
     let right = right.ok_or(invalid("missing directory rebalance sibling"))?;
     let width = checked_add(child.width(), right.width())?;
-    let (first, second) = redistribute(&child, right, width, build)?;
-    Splice::new(children, index, 2, Some(first), second)
+    let (first, second) = redistribute(child, right, width, build)?;
+    Ok((index, 2, first, second))
 }
 
 fn joined<'a, T>(left: &'a [T], right: &'a [T], index: usize) -> Option<&'a T> {
@@ -892,9 +1074,9 @@ fn redistribute<K: crate::RangeKey, V>(
                 build,
             )?;
             let second = if second_count == 0 {
-                None
+                Held::none()
             } else {
-                Some(leaf(
+                leaf(
                     second_count,
                     |i| {
                         i.checked_add(first_count)
@@ -903,30 +1085,31 @@ fn redistribute<K: crate::RangeKey, V>(
                     },
                     |_| true,
                     build,
-                )?)
+                )?
             };
             Ok((first, second))
         }
         (Links::Branches(left), Links::Branches(right)) => {
+            let (left, right) = (left.as_slice(), right.as_slice());
             let first = branch(
                 first_count,
-                |i| joined(left, right, i).map(Arc::clone),
+                |i| joined(left, right, i).map(Held::share),
                 |_| true,
                 build,
             )?;
             let second = if second_count == 0 {
-                None
+                Held::none()
             } else {
-                Some(branch(
+                branch(
                     second_count,
                     |i| {
                         i.checked_add(first_count)
                             .and_then(|i| joined(left, right, i))
-                            .map(Arc::clone)
+                            .map(Held::share)
                     },
                     |_| true,
                     build,
-                )?)
+                )?
             };
             Ok((first, second))
         }
@@ -1118,7 +1301,7 @@ mod tests {
 
     fn children(node: &Node<u64, u64>) -> &[Arc<Node<u64, u64>>] {
         match &node.links {
-            Links::Branches(children) => children,
+            Links::Branches(children) => children.as_slice(),
             Links::Leaves(_) => panic!("expected a branch in multilevel fixture"),
         }
     }
@@ -1135,8 +1318,8 @@ mod tests {
                 |_| panic!("singleton replacement cannot copy an old value"),
             )
             .unwrap();
-        let old_root = store.root.pages.root.as_ref().unwrap();
-        let next_root = next.root.pages.root.as_ref().unwrap();
+        let old_root = store.root.pages.root.handle().unwrap();
+        let next_root = next.root.pages.root.handle().unwrap();
         assert!(!Arc::ptr_eq(old_root, next_root));
         let old = children(old_root);
         let new = children(next_root);
@@ -1166,7 +1349,7 @@ mod tests {
         let store = multilevel(&budget);
         let original = &store.root.pages;
         let before = budget.stats();
-        let mut node = original.root.as_deref().unwrap();
+        let mut node = original.root.node().unwrap();
         let mut exact = 0;
         loop {
             exact += node_charge::<u64, u64>(node.width()).unwrap();
@@ -1197,6 +1380,80 @@ mod tests {
         drop(next);
         assert_eq!(budget.stats().used, before.used);
         drop(store);
+        assert_eq!(budget.stats().used, 0);
+    }
+
+    /// A page of one entry, its key `key`, charged to `budget`.
+    fn page(budget: &MemoryBudget, key: u64) -> Arc<Page<u64, u64>> {
+        let allocation = budget
+            .reserve(BudgetKind::Pages, BudgetLane::Completion, 64)
+            .unwrap()
+            .commit();
+        Arc::new(Page::new(vec![Entry::new(key, key, 0)], allocation))
+    }
+
+    /// A directory over `count` pages whose keys are 0, 2, 4 and on.
+    fn built(budget: &MemoryBudget, count: usize) -> PageDirectory<u64, u64> {
+        let bound = PageDirectory::<u64, u64>::build_bound(count).unwrap();
+        let mut build = DirectoryBuild::new(budget, BudgetLane::Completion, bound);
+        PageDirectory::from_pages(
+            count,
+            |index| Some(page(budget, u64::try_from(index).ok()? * 2)),
+            &mut build,
+        )
+        .unwrap()
+    }
+
+    /// An edit of a directory, made within the build it is given.
+    type Edit<'a> =
+        dyn Fn(&mut DirectoryBuild<'_>) -> Result<PageDirectory<u64, u64>, MemoryError> + 'a;
+
+    /// Every point an edit can be refused at gives back all it took, through
+    /// the handles that let go of the nodes it built ([`Held`], [`Gathered`],
+    /// [`release`]): an insert that splits a full leaf and its full parent up
+    /// to a new root, a removal that evens an underfull leaf with its
+    /// sibling, and one that merges two and collapses the root, each refused
+    /// at every byte short of what it needs; admitted, what it built goes
+    /// when it is dropped.
+    #[test]
+    fn an_edit_refused_at_any_point_leaves_no_charge_behind() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
+        let full = built(&budget, MAX * MAX);
+        assert_eq!(full.height(), 2);
+        let evened = built(&budget, MAX + 1);
+        let mut merged = built(&budget, MAX + 1);
+        let mut admitted = DirectoryBuild::new(&budget, BudgetLane::Completion, usize::MAX);
+        // [17, 16] less one of the left's pages: [16, 16].
+        merged = merged.remove(0, &mut admitted).unwrap();
+        let edits: [(&str, &Edit<'_>); 3] = [
+            ("split to a new root", &|build| {
+                full.insert(1, page(&budget, 1), build)
+            }),
+            ("evened with a sibling", &|build| evened.remove(MAX, build)),
+            ("merged and collapsed", &|build| {
+                merged.remove(MAX - 1, build)
+            }),
+        ];
+        let before = budget.stats();
+        for (name, edit) in edits {
+            let mut refused = 0;
+            let next = loop {
+                let mut build = DirectoryBuild::new(&budget, BudgetLane::Completion, refused);
+                match edit(&mut build) {
+                    Ok(next) => break next,
+                    Err(_) => {
+                        assert_eq!(budget.stats(), before, "{name}: refused at {refused} bytes");
+                        refused += 1;
+                    }
+                }
+            };
+            assert!(refused > 0, "{name} needs room to build");
+            assert!(next.check_shape(), "{name}");
+            drop(next);
+            assert_eq!(budget.stats(), before, "{name}: admitted, then dropped");
+        }
+        assert_eq!(full.height(), 2);
+        drop((full, evened, merged));
         assert_eq!(budget.stats().used, 0);
     }
 }
