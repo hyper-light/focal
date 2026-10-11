@@ -70,6 +70,29 @@ jobs:
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # B's build reuses A's compiled crates through the build's cache mount,
+      # and cargo judges a crate fresh by its sources' times: B was checked
+      # out before A was built, so B's sources read as older than A's outputs
+      # and B's image carried A's binaries (every A/B from d08dcff on: B's
+      # build finished in two seconds). Each file B changes or adds is made
+      # newer than A's build, so cargo rebuilds what B changed and what
+      # depends on it; a file B removed leaves its crate's sources incomplete,
+      # which cargo rebuilds as well.
+      - name: B's changes newer than A's build
+        run: |
+          changed=0
+          while IFS= read -r line; do
+            case "$line" in
+              "Files a/"*" and b/"*" differ")
+                path=${line#Files a/}; path=${path%% and b/*}
+                touch "b/$path"; changed=$((changed + 1)) ;;
+              "Only in b"*)
+                dir=${line#Only in }; dir=${dir%%: *}; name=${line#*: }
+                find "$dir/$name" -exec touch {} +; changed=$((changed + 1)) ;;
+            esac
+          done < <(diff -rq --exclude=.git a b || true)
+          echo "B differs from A in $changed paths"
+          test "$changed" -gt 0
       - uses: docker/build-push-action@v6
         with:
           context: b
@@ -78,6 +101,15 @@ jobs:
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # The two sides' nodes are different builds, or the comparison
+      # measures one build against itself.
+      - name: A's and B's nodes differ
+        run: |
+          a=$(docker run --rm focal:bench-a sha256sum /usr/local/bin/focal | cut -d' ' -f1)
+          b=$(docker run --rm focal:bench-b sha256sum /usr/local/bin/focal | cut -d' ' -f1)
+          echo "A's focal: $a"
+          echo "B's focal: $b"
+          test "$a" != "$b"
       - run: docker save focal:bench-a focal:bench-b | zstd -T0 -3 > focal-bench-ab.tar.zst
       - uses: actions/upload-artifact@v4
         with:
