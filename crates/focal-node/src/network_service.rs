@@ -1983,7 +1983,6 @@ impl NetworkService {
             Poll::Pending
         })
         .await;
-        drop(drivers);
         if !signalled? {
             return Ok(None);
         }
@@ -2009,6 +2008,10 @@ impl NetworkService {
             Poll::Pending
         })
         .await;
+        // The other drivers are held, unpolled, until the owners have stopped: what one of them
+        // holds while it runs (its registrations, its sockets) is the stopping owners' as well, and
+        // a hand-off, messages both ways, must find them where they were.
+        drop(drivers);
         Ok(Some(stopped))
     }
     /// Publishes a fresh metrics snapshot on a fixed cadence (24 §23); the
