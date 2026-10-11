@@ -1104,6 +1104,29 @@ impl NativeOwner {
         pending.record.encode(&pending.prepared, limits)
     }
 
+    /// The encoded records of `candidate` and of every candidate after it,
+    /// in chain order: what a flush proposes at once. Refused unless each of
+    /// them was encoded ([`Self::encode_candidate`]).
+    pub fn encoded_from(
+        &self,
+        candidate: NativeCandidate,
+    ) -> Result<impl Iterator<Item = &[u8]> + Clone + '_, NativeOwnerError> {
+        let position = self.position(candidate)?;
+        if self
+            .pending
+            .iter()
+            .skip(position)
+            .any(|row| row.record.encoded().is_none())
+        {
+            return Err(NativeError::Capacity("a candidate's record is not encoded").into());
+        }
+        Ok(self
+            .pending
+            .iter()
+            .skip(position)
+            .filter_map(|row| row.record.encoded().map(record_codec::FundedRecord::bytes)))
+    }
+
     /// Includes all unpublished work. These observations are provisional and
     /// must not be returned as durable participant acknowledgments.
     pub fn effective(&self) -> NativeView<'_> {

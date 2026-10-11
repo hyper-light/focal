@@ -187,6 +187,15 @@ impl DurableNode {
     ) -> Result<(), ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.propose_borrowed_in(data, lane))
     }
+    /// Every entry of `entries` in one proposal, refused whole: the leader
+    /// sends each member one append of them all.
+    pub fn propose_batch_borrowed_in<'a>(
+        &mut self,
+        entries: impl Iterator<Item = &'a [u8]> + Clone,
+        lane: BudgetLane,
+    ) -> Result<(), ConsensusError> {
+        dispatch!(inner = &mut self.backend => inner.propose_batch_borrowed_in(entries, lane))
+    }
     /// The authenticated envelope must bind cluster/group identity. Peer input is
     /// validated before Raft; unexpected dependency failures stop this replica.
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {

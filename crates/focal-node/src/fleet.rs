@@ -2041,8 +2041,17 @@ impl Owner {
     /// Whether the owner is to stop.
     fn take(&mut self, work: Work, receiver: &mpsc::Receiver<Work>) -> Result<bool, LedgerError> {
         self.batching = true;
+        // The batch's native candidates are proposed together when it ends:
+        // each member is sent one append of them all and answers once, where
+        // a proposal a request sent each member an append of its own, drew
+        // an answer and a commit's broadcast of its own (eight messages an
+        // entry among three voters, 2026-10-11).
+        self.session.set_native_proposals_deferred(true);
         let stop = self.take_batch(work, receiver);
         self.batching = false;
+        self.session.set_native_proposals_deferred(false);
+        let flushed = self.session.flush_deferred_native_proposals();
+        flushed?;
         if self.drain_owed || self.session.has_ready() {
             self.drain()?;
         }
@@ -4164,6 +4173,14 @@ impl Owner {
         self.drain_with_runtime(true)
     }
     fn drain_with_runtime(&mut self, drive_runtime: bool) -> Result<(), LedgerError> {
+        // The native candidates admitted since the last drain are proposed as
+        // one, into the Ready this drain takes: each member is sent one append
+        // of them all. An owner that takes requests in batches defers them
+        // again for the next (a session it reopened starts undeferred).
+        self.session.flush_deferred_native_proposals()?;
+        if self.batching {
+            self.session.set_native_proposals_deferred(true);
+        }
         // Frames that waited for the last write go into the Ready this drain
         // takes, and are answered at its fence.
         self.step_waiting();

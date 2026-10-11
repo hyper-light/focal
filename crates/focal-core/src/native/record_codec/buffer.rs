@@ -141,6 +141,14 @@ impl PendingRecord {
         Ok(Self::Reserved { quote, allocation })
     }
 
+    /// The record once encoded ([`Self::encode`]); none before.
+    pub(in crate::native) fn encoded(&self) -> Option<&FundedRecord> {
+        match self {
+            Self::Encoded(record) => Some(record),
+            Self::Disabled | Self::Reserved { .. } => None,
+        }
+    }
+
     pub(in crate::native) fn encode(
         &mut self,
         prepared: &NativePrepared,
