@@ -65,6 +65,39 @@ struct TickShared {
     /// the participants' queue and never in it (F56).
     frame_room: AtomicUsize,
     frames_queued: AtomicUsize,
+    /// The writes the session's leader holds admitted at once, as its owner
+    /// learned it (`write_window::WriteWindow`), zero until it states one;
+    /// and the writes admitted now, each holding its place (`WriteTicket`)
+    /// from the host's ingress until it is answered.
+    write_window: AtomicU64,
+    writes_admitted: AtomicU64,
+}
+/// A write's place in its session's window, taken at the host's ingress
+/// (`TickPeriod::admit_write`) and held until the write is answered, given
+/// back as it drops; with when it was taken, on the pace's clock.
+pub(crate) struct WriteTicket {
+    pace: TickPeriod,
+    admitted_ns: u64,
+}
+impl WriteTicket {
+    /// When the write was admitted, nanoseconds since the process began.
+    pub(crate) fn admitted_ns(&self) -> u64 {
+        self.admitted_ns
+    }
+}
+impl Drop for WriteTicket {
+    fn drop(&mut self) {
+        let _ = self.pace.0.writes_admitted.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |admitted| admitted.checked_sub(1),
+        );
+    }
+}
+/// Nanoseconds since the process began, the clock a write's admission and
+/// its answer are both read on.
+pub(crate) fn now_ns() -> u64 {
+    u64::try_from(began().elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 /// The bound a session's host turned an input away at, before it was
 /// queued ([`TickPeriod::refuse_input`]).
@@ -78,6 +111,8 @@ pub(crate) enum InputBound {
     /// Its queue was full: the participants' queue for a request, the room
     /// the owner's peer reserve gives for a peer's frame.
     Queue,
+    /// Its session's write window was full ([`TickPeriod::admit_write`]).
+    Window,
 }
 /// One kind of input's refusals, a count for each bound.
 #[derive(Default)]
@@ -85,6 +120,7 @@ struct RefusalCounts {
     memory: AtomicU64,
     reply: AtomicU64,
     queue: AtomicU64,
+    window: AtomicU64,
 }
 impl RefusalCounts {
     fn count(&self, bound: InputBound) {
@@ -92,6 +128,7 @@ impl RefusalCounts {
             InputBound::Memory => &self.memory,
             InputBound::Reply => &self.reply,
             InputBound::Queue => &self.queue,
+            InputBound::Window => &self.window,
         }
         .fetch_add(1, Ordering::Relaxed);
     }
@@ -100,6 +137,7 @@ impl RefusalCounts {
             memory: self.memory.load(Ordering::Relaxed),
             reply: self.reply.load(Ordering::Relaxed),
             queue: self.queue.load(Ordering::Relaxed),
+            window: self.window.load(Ordering::Relaxed),
         }
     }
 }
@@ -259,6 +297,38 @@ impl TickPeriod {
         } else {
             self.0.requests_refused.count(bound);
         }
+    }
+    /// A place in the session's write window for one more write, while the
+    /// window its owner states has one, or before it states one (the host's
+    /// queue bounds the writes then); none past it.
+    pub(crate) fn admit_write(&self) -> Option<WriteTicket> {
+        let window = self.0.write_window.load(Ordering::Acquire);
+        self.0
+            .writes_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                if window == 0 || admitted < window {
+                    admitted.checked_add(1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .map(|_| WriteTicket {
+                pace: self.clone(),
+                admitted_ns: now_ns(),
+            })
+    }
+    /// The owner states the window it learned.
+    pub(crate) fn set_write_window(&self, window: u64) {
+        self.0.write_window.store(window, Ordering::Release);
+    }
+    /// The writes admitted now, each holding its place.
+    pub(crate) fn writes_admitted(&self) -> u64 {
+        self.0.writes_admitted.load(Ordering::Acquire)
+    }
+    /// The window its owner states, zero before it states one.
+    pub(crate) fn write_window(&self) -> u64 {
+        self.0.write_window.load(Ordering::Acquire)
     }
     /// The owner states the room its peers' frames have on their way to it:
     /// its peer reserve (`Owner::peer_reserve`). A room made smaller takes

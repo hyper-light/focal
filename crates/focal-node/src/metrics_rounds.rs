@@ -567,6 +567,8 @@ impl SessionMetrics {
             achieved_max_failures: Some(u16::MAX),
             blocked: Some(wide),
             tick_period_ms: wide,
+            write_window: wide,
+            writes_admitted: wide,
             periods: wide,
             refused_periods: wide,
             peers_unreachable: wide,

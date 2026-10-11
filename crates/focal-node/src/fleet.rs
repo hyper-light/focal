@@ -529,6 +529,9 @@ struct AdmittedRequest {
     verified: VerifiedRequest,
     witness: Option<EvidenceWitness>,
     native: Option<focal_evidence::VerifiedNativeArtifact>,
+    /// A write's place in its session's write window, held until it is
+    /// answered (`pace::WriteTicket`); none for what is not a write.
+    write: Option<crate::pace::WriteTicket>,
 }
 struct MembershipCall {
     request: Option<SessionMembershipRequest>,
@@ -922,6 +925,15 @@ struct Pending {
     /// that a loaded machine slows gives up nothing it would have answered.
     deadline: u64,
     _charge: Allocation,
+    /// A write's place in its session's window and its admission, sampled
+    /// when it is answered committed (`write_window`).
+    write: Option<WriteWait>,
+}
+/// A write's place in its session's window and its admission as the window
+/// samples it.
+struct WriteWait {
+    admitted: crate::write_window::Admitted,
+    _ticket: crate::pace::WriteTicket,
 }
 impl Pending {
     fn finish(mut self, result: Response) {
@@ -933,6 +945,9 @@ impl Pending {
     }
 }
 struct Owner {
+    /// The session's write window, learned from its writes' answers and
+    /// stated to its host's ingress (`write_window`).
+    window: crate::write_window::WriteWindow,
     session: Session,
     /// The owner's slowest recent steps, for the replica's diagnostics.
     slow: crate::owner_steps::SlowSteps,
@@ -1203,7 +1218,15 @@ impl ReplicaHost {
         getrandom::fill(&mut incarnation).map_err(|_| LedgerError::Capacity)?;
         let incarnation = u64::from_le_bytes(incarnation);
         let lane = session.inflight_window();
+        // The writes the owner may hold pending bound the window it learns,
+        // until that bound too is derived from the node's memory.
+        let window = crate::write_window::WriteWindow::new(
+            u64::try_from(config.pending_clients).unwrap_or(u64::MAX),
+            crate::pace::now_ns(),
+        );
+        pace.set_write_window(window.window());
         let owner = Owner {
+            window,
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
             pace: pace.clone(),
             session,
@@ -1352,6 +1375,14 @@ impl ReplicaHost {
     }
     pub fn tick_period(&self) -> Duration {
         self.pace.get(self.tick, self.tick_ceiling)
+    }
+    /// The writes the session's leader holds admitted at once, as its owner
+    /// learned its window (`write_window`), and those admitted now.
+    pub fn write_window(&self) -> u64 {
+        self.pace.write_window()
+    }
+    pub fn writes_admitted(&self) -> u64 {
+        self.pace.writes_admitted()
     }
     pub fn memory_stats(&self) -> focal_memory::BudgetStats {
         self.budget.stats()
@@ -1792,6 +1823,19 @@ impl ReplicaHost {
             request.request().operation,
             Operation::Raft { .. } | Operation::RaftOrdered { .. }
         );
+        // A write takes its place in its session's write window before it
+        // holds memory or a place in the queue: past the window its owner
+        // learned, it is refused here (`write_window`).
+        let write = if matches!(request.request().operation, Operation::Native { .. }) {
+            let Some(ticket) = self.pace.admit_write() else {
+                self.pace
+                    .refuse_input(false, crate::pace::InputBound::Window);
+                return OwnedResponse::new(full);
+            };
+            Some(ticket)
+        } else {
+            None
+        };
         let response_bytes = match &request.request().operation {
             Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
             Operation::Summary => {
@@ -1888,6 +1932,7 @@ impl ReplicaHost {
                 verified: request,
                 witness,
                 native,
+                write,
             }),
             send,
             charge.commit(),
@@ -2803,13 +2848,13 @@ impl Owner {
         charge: Allocation,
     ) -> Result<(), LedgerError> {
         let waiting = self.session.reads_waiting();
-        self.request(
-            request.verified,
-            response,
-            charge,
-            request.witness,
-            request.native,
-        );
+        let AdmittedRequest {
+            verified,
+            witness,
+            native,
+            write,
+        } = *request;
+        self.request(verified, response, charge, witness, native, write);
         // A request that only asked a read is not drained for here:
         // the owner's loop takes what else is queued first, and the
         // round that leaves with its drain carries every read asked
@@ -3290,6 +3335,7 @@ impl Owner {
         charge: Allocation,
         witness: Option<EvidenceWitness>,
         native: Option<focal_evidence::VerifiedNativeArtifact>,
+        write: Option<crate::pace::WriteTicket>,
     ) {
         let header = verified
             .request()
@@ -3316,6 +3362,7 @@ impl Owner {
                     term: self.session.scalars().term,
                     deadline,
                     _charge: charge,
+                    write: None,
                 }),
                 Ok(Replication::Held {
                     source,
@@ -3340,6 +3387,7 @@ impl Owner {
                             term: self.session.scalars().term,
                             deadline,
                             _charge: charge,
+                            write: None,
                         },
                     };
                     if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
@@ -3376,6 +3424,7 @@ impl Owner {
                                 term: self.session.scalars().term,
                                 deadline,
                                 _charge: charge,
+                                write: None,
                             },
                         },
                         ordered,
@@ -4103,6 +4152,13 @@ impl Owner {
             }
         })();
         if let Some((waiting, deadline)) = waiting {
+            let write = write.map(|ticket| WriteWait {
+                admitted: crate::write_window::Admitted {
+                    at_ns: ticket.admitted_ns(),
+                    delivered: self.window.delivered(),
+                },
+                _ticket: ticket,
+            });
             self.pending.push_back(Pending {
                 header,
                 response,
@@ -4110,6 +4166,7 @@ impl Owner {
                 term: self.session.scalars().term,
                 deadline,
                 _charge: charge,
+                write,
             });
         } else {
             let mut header = header;
@@ -4456,6 +4513,7 @@ impl Owner {
         self.resolve_placement(events)?;
         let status = self.session.scalars();
         let count = self.pending.len();
+        let mut answered = false;
         for _ in 0..count {
             let mut pending = self.pending.pop_front().ok_or(LedgerError::Corrupt)?;
             if !self.serves_route(pending.header.route_epoch)
@@ -4830,6 +4888,18 @@ impl Owner {
                 _ => None,
             };
             if let Some(result) = result {
+                // A write answered committed is the window's sample: its
+                // time from admission to answer, and one more delivered.
+                if let (Response::Native(NativeMutationReply::Committed(_)), Some(write)) =
+                    (&result, &pending.write)
+                {
+                    self.window.answered(
+                        write.admitted,
+                        crate::pace::now_ns(),
+                        self.pace.writes_admitted().saturating_sub(1),
+                    );
+                    answered = true;
+                }
                 pending.finish(result);
             } else if self.pace.periods() >= pending.deadline
                 || status.term != pending.term
@@ -4840,6 +4910,9 @@ impl Owner {
             } else {
                 self.pending.push_back(pending);
             }
+        }
+        if answered {
+            self.pace.set_write_window(self.window.window());
         }
         Ok(())
     }

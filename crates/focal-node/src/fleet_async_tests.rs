@@ -1051,3 +1051,55 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
     })
     .unwrap()
 }
+
+/// A write past its session's write window is refused at the host's
+/// ingress, before it holds memory or a place in the queue, and counted at
+/// the window; a write's place is given back as it is answered (its ticket
+/// drops), and a request that is not a write takes none (`write_window`).
+#[test]
+fn a_write_past_its_sessions_window_is_refused_at_the_ingress_and_counted() {
+    focal_rt::block_on(async move {
+        let path = tempfile::tempdir().unwrap();
+        let fixture = fixture(path.path(), 1);
+        settle(&fixture).await;
+        let host = fixture.hosts[&ledger(1)].clone();
+        // The owner stated the window it starts with (RFC 6928's ten).
+        assert_eq!(host.write_window(), 10);
+        assert_eq!(host.writes_admitted(), 0);
+        // A window of one, and a write holding its place.
+        host.pace.set_write_window(1);
+        let held = host.pace.admit_write().unwrap();
+        assert_eq!(host.writes_admitted(), 1);
+        assert!(host.pace.admit_write().is_none(), "the window is full");
+        let mut write = envelope(1, Operation::Native { frame: vec![0; 64] });
+        write.protocol = focal_wire::NATIVE_PROTOCOL_VERSION;
+        let reply = dispatch(&host, peer(), write, &ReplicaHost::wire_limits()).await;
+        assert!(
+            matches!(reply.result, Response::Error(AccessError::Capacity)),
+            "{:?}",
+            reply.result
+        );
+        let counted = host.input_refusals();
+        assert_eq!(
+            counted.requests_refused,
+            crate::metrics::RefusedBy {
+                window: 1,
+                ..Default::default()
+            },
+            "counted at the window"
+        );
+        // A read is no write: it takes no place, and is answered.
+        let answered = dispatch(&host, peer(), read(1), &ReplicaHost::wire_limits()).await;
+        assert!(
+            !matches!(answered.result, Response::Error(AccessError::Capacity)),
+            "{:?}",
+            answered.result
+        );
+        assert_eq!(host.writes_admitted(), 1);
+        drop(held);
+        assert_eq!(host.writes_admitted(), 0, "the place is given back");
+        drop(host);
+        shutdown(fixture).await;
+    })
+    .unwrap()
+}

@@ -151,6 +151,10 @@ pub struct SessionMetrics {
     /// measured tail it was derived from, in microseconds, and how many
     /// round trips fed it (27 §3.1 P2).
     pub tick_period_ms: u64,
+    /// The writes the session's leader holds admitted at once, as its owner
+    /// learned its write window, and the writes admitted now.
+    pub write_window: u64,
+    pub writes_admitted: u64,
     /// Periods the session's owner has run: the unit its replica's election
     /// timer counts, and what a wait on it is charged in (27 §3.1 P8).
     pub periods: u64,
@@ -217,23 +221,28 @@ pub struct RefusedBy {
     pub reply: u64,
     /// Its queue was full.
     pub queue: u64,
+    /// Its session's write window was full.
+    pub window: u64,
 }
 impl RefusedBy {
     pub fn total(&self) -> u64 {
         self.memory
             .saturating_add(self.reply)
             .saturating_add(self.queue)
+            .saturating_add(self.window)
     }
     fn add(&mut self, other: &Self) {
         self.memory = self.memory.saturating_add(other.memory);
         self.reply = self.reply.saturating_add(other.reply);
         self.queue = self.queue.saturating_add(other.queue);
+        self.window = self.window.saturating_add(other.window);
     }
-    fn bounds(&self) -> [(&'static str, u64); 3] {
+    fn bounds(&self) -> [(&'static str, u64); 4] {
         [
             ("memory", self.memory),
             ("reply", self.reply),
             ("queue", self.queue),
+            ("window", self.window),
         ]
     }
 }
@@ -267,7 +276,7 @@ impl SessionCounters {
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 23] {
+    fn fields(&self) -> [u64; 25] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -279,9 +288,11 @@ impl SessionCounters {
             self.frames_refused.memory,
             self.frames_refused.reply,
             self.frames_refused.queue,
+            self.frames_refused.window,
             self.requests_refused.memory,
             self.requests_refused.reply,
             self.requests_refused.queue,
+            self.requests_refused.window,
             self.frames_dropped,
             self.requests_dropped,
             self.replication_dropped,
@@ -1549,12 +1560,12 @@ impl MetricsSnapshot {
         for (name, help, refused) in [
             (
                 "focal_sessions_frames_refused_total",
-                "Peers' frames a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue): each lost to its peer.",
+                "Peers' frames a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue, write window): each lost to its peer.",
                 totals.frames_refused,
             ),
             (
                 "focal_sessions_requests_refused_total",
-                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue).",
+                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue, write window).",
                 totals.requests_refused,
             ),
         ] {
@@ -1563,7 +1574,7 @@ impl MetricsSnapshot {
                 text.labeled(name, &[("bound", bound)], count);
             }
         }
-        let series: [(&str, &str, &str); 32] = [
+        let series: [(&str, &str, &str); 34] = [
             (
                 "focal_session_observed",
                 "gauge",
@@ -1624,6 +1635,16 @@ impl MetricsSnapshot {
                 "focal_session_tick_period_milliseconds",
                 "gauge",
                 "The replica owner's tick period in force; stretched for a far or slow group.",
+            ),
+            (
+                "focal_session_write_window",
+                "gauge",
+                "The writes the session's leader holds admitted at once, queued and pending, as it learned them from its writes' answers.",
+            ),
+            (
+                "focal_session_writes_admitted",
+                "gauge",
+                "The session's writes admitted now, from its host's ingress until each is answered.",
             ),
             (
                 "focal_session_broadcast_tail_microseconds",
@@ -1751,6 +1772,8 @@ impl MetricsSnapshot {
                     }
                     "focal_session_term" => Some(session.term),
                     "focal_session_tick_period_milliseconds" => Some(session.tick_period_ms),
+                    "focal_session_write_window" => Some(session.write_window),
+                    "focal_session_writes_admitted" => Some(session.writes_admitted),
                     "focal_session_broadcast_tail_microseconds" => Some(session.broadcast_tail_us),
                     "focal_session_pace_samples" => Some(session.pace_samples),
                     "focal_session_committed_index" => Some(session.committed_index),
@@ -2054,7 +2077,8 @@ mod tests {
         }
     }
     /// What a node's sessions turned away for room is exported by the bound
-    /// that turned it away — the node's memory, a reply cell, the queue —
+    /// that turned it away — the node's memory, a reply cell, the queue, the
+    /// session's write window —
     /// peers' frames and participants' requests apart, every bound named
     /// whether or not it refused.
     #[test]
@@ -2065,11 +2089,13 @@ mod tests {
             memory: 2,
             reply: 0,
             queue: 5,
+            window: 9,
         };
         sample.session_aggregates.totals.frames_refused = RefusedBy {
             memory: 0,
             reply: 1,
             queue: 3,
+            window: 0,
         };
         let text = sample.render();
         for line in [
@@ -2077,6 +2103,7 @@ mod tests {
             "focal_sessions_requests_refused_total{bound=\"memory\"} 2\n",
             "focal_sessions_requests_refused_total{bound=\"reply\"} 0\n",
             "focal_sessions_requests_refused_total{bound=\"queue\"} 5\n",
+            "focal_sessions_requests_refused_total{bound=\"window\"} 9\n",
             "# TYPE focal_sessions_frames_refused_total counter\n",
             "focal_sessions_frames_refused_total{bound=\"memory\"} 0\n",
             "focal_sessions_frames_refused_total{bound=\"reply\"} 1\n",
