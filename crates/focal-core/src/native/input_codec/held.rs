@@ -42,6 +42,15 @@ impl<T: Copy> Held<T> {
         Ok((held, count))
     }
 
+    /// Holds `value` after those held, counted whether or not it fits.
+    pub(super) fn push(&mut self, value: T) {
+        if let Some(slot) = self.values.get_mut(self.len) {
+            *slot = Some(value);
+        }
+        self.len = self.len.saturating_add(1);
+        self.complete = self.len <= HELD;
+    }
+
     /// What is held, where every value fits; none where the claim has more.
     pub(super) fn replay(&self) -> Option<&[Option<T>]> {
         self.values.get(..self.len).filter(|_| self.complete)

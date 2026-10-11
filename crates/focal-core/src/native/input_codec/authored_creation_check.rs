@@ -11,10 +11,27 @@ fn model_error(error: DecodeError) -> ContractError {
         _ => ContractError::Capacity,
     }
 }
+/// A validation body's checked declaration and its specification's hash.
 #[derive(Clone, Copy)]
-struct Metadata {
+pub(super) struct Metadata {
     declaration: validation::CheckedDeclaration,
     specification: ContentHash,
+}
+/// The checked declaration of the body `plan` planned, charged as a cohort's
+/// read charges it: the planning loop hands its cohort what it planned.
+pub(super) fn checked(
+    plan: ValidationBodyPlan<'_, '_>,
+    budget: &Budget,
+) -> Result<Metadata, DecodeError> {
+    let specification = plan.specification_hash();
+    let (declaration, visits, source) =
+        plan.into_checked_declaration(budget.descriptor.remaining())?;
+    budget.descriptor.charge(visits)?;
+    budget.source.charge(source)?;
+    Ok(Metadata {
+        declaration,
+        specification,
+    })
 }
 fn metadata(
     reader: &mut Reader<'_, '_>,
@@ -151,6 +168,7 @@ pub(super) fn cohort(
     principal: Principal,
     limits: AuthoredCreationLimits,
     budget: &Budget,
+    planned: super::held::Held<Metadata>,
 ) -> Result<(), DecodeError> {
     let mut source = Cohort {
         claim: group.claim.source(),
@@ -161,9 +179,12 @@ pub(super) fn cohort(
         limits,
         held: super::held::Held::none(),
     };
-    // Each body is read, checked and stamped once, for every pass after.
-    let (held, _) = super::held::Held::read(source.read())?;
-    source.held = held;
+    // Each body is checked and stamped once, for every pass after: as its
+    // plan read it where the planning loop handed it over, else read here.
+    source.held = match planned.replay() {
+        Some(_) => planned,
+        None => super::held::Held::read(source.read())?.0,
+    };
     let acceptance = aggregation::AcceptancePolicy::prepare_source(
         claim,
         issuer,
