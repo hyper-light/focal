@@ -191,6 +191,14 @@ pub(crate) fn test_key_file(root: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut hasher);
     let key = keys.path().join(format!("{:016x}.key", hasher.finish()));
+    // Tests in parallel open one data directory's keys at once (a suite's one home), and a seal is
+    // installed through one temporary name (`focal_platform::fs::install`): two first opens raced
+    // to it, the second rename finding nothing (CI run 38079021596). A node's data-directory lock
+    // admits one opener; here the opens are serialized.
+    static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _opening = OPENING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     focal_seal::open_or_create(root, &key).unwrap();
     key
 }

@@ -347,3 +347,22 @@ fn writes_behind_a_held_one_are_refused_and_a_third_decoder_is_never_durable() {
     assert_eq!(store.held(), Some(&[b'c'; 32]), "never taken for durable");
     assert_eq!(store.submit(&write_of(&third), waker), Err(Fault::Behind));
 }
+
+/// Tests in parallel open one data directory's keys at once (`seal`'s home is the suite's): every
+/// first open succeeds. The seal is installed through one temporary name, so two first opens at
+/// once raced to it and the second rename found nothing (CI run 38079021596, ubuntu).
+#[test]
+fn concurrent_first_opens_of_one_data_directory_all_succeed() {
+    for _ in 0..32 {
+        let root = tempfile::tempdir().unwrap();
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    start.wait();
+                    crate::node_storage::test_key_file(root.path());
+                });
+            }
+        });
+    }
+}
