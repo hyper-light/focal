@@ -14100,3 +14100,61 @@ The gate on the landing tree (head `11b8fd5`, macOS 26.4.1 arm64, under other wo
 `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3263
 passed, 0 failed, 20 ignored.
+
+
+### 2026-10-11 — Three-voter sessions on 128 MB and 256 MB nodes
+
+A session can now be placed on three voters, and survive the loss of one, on nodes of 128 MB and
+256 MB. Before this landing it could not be on either.
+
+The chaos scenario (`scripts/chaos/chaos.sh IMAGE 120 5 50 kill`) runs three nodes in Docker at
+one CPU each, with no swap. It places one session on three voters, then writes 120 claims through
+the founder under 5% loss and 50 ms ± 25 ms delay on every node, SIGKILLing a voter at claim 40 and
+restarting it at claim 80. Afterwards every acknowledged claim must read back on two nodes. Latency
+is measured end to end, through a CLI submit via `docker exec`.
+
+| Node memory, fault | Acknowledged | Refused or unknown | Missing reads | Duplicates | p50 / p99 |
+|---|---|---|---|---|---|
+| 256 MB, voter killed | 120 of 120 | 0 | 0 | 0 | 411 / 711 ms |
+| 128 MB, voter killed | 120 of 120 | 0 | 0 | 0 | 308 / 548 ms |
+| 128 MB, voter cut off | 120 of 120 | 0 | 0 | 0 | 431 / 952 ms |
+| 128 MB, leader cut off | 80 of 120 | 40 | 0 | 0 | 354 / 10,542 ms |
+
+The cut-off runs (`partition` and `leader` modes) cut a node off both ways, 100% loss, from claim
+40 to claim 80 while it stays up. The leader mode cuts the founder, which is the session's leader
+and the node the CLI writes through. The writes sent while it is cut off are refused or of unknown
+outcome, as that mode requires, and never acknowledged and lost; its p99 is theirs. Once it
+reconnects, writes are acknowledged again.
+
+What stood in the way, each found by measuring:
+- **The session allowance's floor.** A session's committed memory requirement was never below a
+  fixed 256 MiB. That is more than a 256 MB container's whole 192 MiB envelope, so placement, which
+  seats a copy only where the requirement fits, could seat no second copy. `plan session` was
+  refused PolicyUnsatisfied while each node reported 143–148 MB free. A founder now commits half its
+  envelope: 96 MiB at 256 MB, 48 MiB at 128 MB. Measured with focal-load over the local socket, a
+  96 MiB session committed 5,875 claims and a 48 MiB one 2,803, each then refusing `Capacity` from
+  its engine's memory while its node served on.
+- **The placement agent's fixed 32 MiB.** At 128 MB, it and the node's fixed allowances left each
+  node 47.8 MB free against the 50.3 MB a 48 MiB session asks. The agent now charges its tables by
+  their entries. It funds a pass before the pass grows anything, and settles the charge after every
+  pass and job. An idle 128 MB node now charges 19–22 MB in all, with control memory at 9–12 MB,
+  where it charged 52–56 MB with control at 42–45 MB.
+- **A residency fence held every node's region.** Each fence copied the whole node table, on the
+  agent and again on the evidence service: O(sessions × nodes). It now holds its placement's
+  members' regions alone.
+
+Also in this landing:
+- After an MCP cancellation, the next call waits for the cancelled one to end instead of being
+  refused. This is macOS CI's `mcp_stdio` claim-wait cancellation failure.
+- On Windows, a path's identity is the path's own, never what a reparse point leads to, so a local
+  server removes its AF_UNIX socket file when it ends.
+- The slow-response test asserts its held output charge only where the kernel holds less than the
+  response. Windows' AF_UNIX takes the whole 900 KB at once.
+
+The gate on the landing tree (head `b81f945`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1150 production sources, no policy allowance),
+`cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3264
+passed, 0 failed, 20 ignored.
