@@ -7,6 +7,9 @@ use super::*;
 use focal_model::ContentDomainId;
 
 const DISK_SAMPLE_INTERVAL: u32 = 32;
+/// The most of a stopped session's cause it keeps: an error's text runs to a
+/// line, its detail named once.
+const FAILURE_TEXT: usize = 512;
 
 pub(super) struct Pending {
     pub(super) candidate: NativeCandidate,
@@ -106,6 +109,9 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     #[cfg(test)]
     pub(crate) refuse_reconstructions: u32,
     pub(super) failed: bool,
+    /// What the session first failed closed on, at most [`FAILURE_TEXT`]
+    /// bytes of it: named by every refusal after (`check`).
+    pub(super) failure: Option<Box<str>>,
     pub(super) materializer: super::MaterializerStats,
     pub(super) _pending_allocation: Allocation,
 }
@@ -215,16 +221,33 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             #[cfg(test)]
             refuse_reconstructions: 0,
             failed: false,
+            failure: None,
             materializer: super::MaterializerStats::default(),
             _pending_allocation: permit.commit(),
         })
     }
 
     pub(super) fn check(&self) -> Result<(), NativeSessionError> {
-        if self.failed || self.domain.is_none() {
-            Err(NativeSessionError::Failed)
-        } else {
-            Ok(())
+        if self.failed {
+            return Err(match &self.failure {
+                Some(cause) => NativeSessionError::Stopped(cause.clone()),
+                None => NativeSessionError::Failed,
+            });
+        }
+        if self.domain.is_none() {
+            return Err(NativeSessionError::Failed);
+        }
+        Ok(())
+    }
+    /// The session stops on `error`, which is fail-closed: it keeps the first
+    /// such error's text, at most [`FAILURE_TEXT`] bytes, to name when asked
+    /// again. Written once, as the session stops.
+    pub(super) fn fail_closed(&mut self, error: &NativeSessionError) {
+        self.failed = true;
+        if self.failure.is_none() {
+            let mut text = error.to_string();
+            text.truncate(text.floor_char_boundary(FAILURE_TEXT));
+            self.failure = Some(text.into_boxed_str());
         }
     }
     pub(crate) fn activation_index(&self) -> u64 {
@@ -1068,7 +1091,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     }
                 }
                 FailureClass::FailClosed => {
-                    self.failed = true;
+                    self.fail_closed(&error);
                     return Err(error);
                 }
             },

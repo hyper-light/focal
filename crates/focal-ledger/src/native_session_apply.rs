@@ -137,7 +137,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             }
             Err(error) => {
                 if error.class() == FailureClass::FailClosed {
-                    self.failed = true;
+                    self.fail_closed(&error);
                 }
                 self.delivery = Some(delivery);
                 Err(error)
@@ -1068,7 +1068,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Ok(()) => None,
             Err(error) => {
                 if error.class() == FailureClass::FailClosed {
-                    self.failed = true;
+                    self.fail_closed(&error);
                 }
                 Some(error)
             }
