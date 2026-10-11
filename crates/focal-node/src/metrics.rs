@@ -750,6 +750,20 @@ impl MetricsSnapshot {
             "Bytes charged to the node's allowance.",
             self.memory.used,
         );
+        // What the charge holds, kind by kind: what a node at a small envelope spends its memory
+        // on, read where it runs (a container of 256 MB, 2026-10-10).
+        text.header(
+            "focal_memory_used_by_kind_bytes",
+            "gauge",
+            "Bytes charged to the node's allowance, by the kind of what they hold; they sum to focal_memory_used_bytes when nothing is charged between the reads.",
+        );
+        for kind in focal_memory::BudgetKind::ALL {
+            text.labeled(
+                "focal_memory_used_by_kind_bytes",
+                &[("kind", kind.label())],
+                self.memory.used_by(kind),
+            );
+        }
         text.gauge(
             "focal_memory_completion_reserve_bytes",
             "Bytes kept for completion work.",

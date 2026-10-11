@@ -44,6 +44,45 @@ pub enum BudgetKind {
 
 const KIND_COUNT: usize = BudgetKind::Reserved as usize + 1;
 
+impl BudgetKind {
+    /// Every kind, in the order the counters keep them.
+    pub const ALL: [Self; KIND_COUNT] = [
+        Self::Arena,
+        Self::Payload,
+        Self::Index,
+        Self::Pages,
+        Self::Roots,
+        Self::ReadPins,
+        Self::Pending,
+        Self::Query,
+        Self::Monitor,
+        Self::Dedup,
+        Self::Timer,
+        Self::Recovery,
+        Self::Control,
+        Self::Reserved,
+    ];
+    /// The kind's name, as a metric's label gives it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Arena => "arena",
+            Self::Payload => "payload",
+            Self::Index => "index",
+            Self::Pages => "pages",
+            Self::Roots => "roots",
+            Self::ReadPins => "read_pins",
+            Self::Pending => "pending",
+            Self::Query => "query",
+            Self::Monitor => "monitor",
+            Self::Dedup => "dedup",
+            Self::Timer => "timer",
+            Self::Recovery => "recovery",
+            Self::Control => "control",
+            Self::Reserved => "reserved",
+        }
+    }
+}
+
 // Named counters make category access total, including during Drop.
 #[derive(Debug)]
 struct KindCounters {

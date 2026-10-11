@@ -177,6 +177,14 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
         text.contains("# TYPE focal_session_apply_lag gauge"),
         "{text}"
     );
+    // The node's charge, kind by kind.
+    for kind in focal_memory::BudgetKind::ALL {
+        let series = format!(
+            "focal_memory_used_by_kind_bytes{{kind=\"{}\"}} ",
+            kind.label()
+        );
+        assert!(text.contains(&series), "missing {series}: {text}");
+    }
     assert!(text.contains(&format!("session=\"{session}\"")), "{text}");
     assert!(text.ends_with('\n'));
     // The loopback endpoint serves the same exposition to GET /metrics, and
