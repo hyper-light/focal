@@ -10,7 +10,7 @@ use crate::congestion::bbr::min_max::MinMax;
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant, float};
 
-use super::{BASE_DATAGRAM_SIZE, Controller};
+use super::{Controller, initial_window};
 
 mod bw_estimation;
 mod min_max;
@@ -62,7 +62,9 @@ pub struct Bbr {
 impl Bbr {
     /// Construct a state using the given `config` and current time `now`
     pub fn new(config: BbrConfig, current_mtu: u16) -> Self {
-        let initial_window = config.initial_window;
+        let window = config
+            .initial_window
+            .unwrap_or_else(|| initial_window(current_mtu.into()));
         Self {
             config,
             current_mtu: current_mtu as u64,
@@ -80,7 +82,7 @@ impl Bbr {
             high_cwnd_gain: K_DEFAULT_HIGH_GAIN,
             last_cycle_start: None,
             current_cycle_offset: 0,
-            init_cwnd: initial_window,
+            init_cwnd: window,
             min_cwnd: calculate_min_window(current_mtu as u64),
             prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
@@ -91,7 +93,7 @@ impl Bbr {
             max_acked_packet_number: 0,
             max_sent_packet_number: 0,
             end_recovery_at_packet_number: 0,
-            cwnd: initial_window,
+            cwnd: window,
             current_round_trip_end_packet_number: 0,
             round_count: 0,
             bw_at_last_round: 0,
@@ -491,7 +493,7 @@ impl Controller for Bbr {
     fn on_mtu_update(&mut self, new_mtu: u16) {
         self.current_mtu = new_mtu as u64;
         self.min_cwnd = calculate_min_window(self.current_mtu);
-        self.init_cwnd = self.config.initial_window.max(self.min_cwnd);
+        self.init_cwnd = self.initial_window().max(self.min_cwnd);
         self.cwnd = self.cwnd.max(self.min_cwnd);
     }
 
@@ -518,7 +520,9 @@ impl Controller for Bbr {
     }
 
     fn initial_window(&self) -> u64 {
-        self.config.initial_window
+        self.config
+            .initial_window
+            .unwrap_or_else(|| initial_window(self.current_mtu))
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -527,26 +531,23 @@ impl Controller for Bbr {
 }
 
 /// Configuration for the [`Bbr`] congestion controller
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BbrConfig {
-    initial_window: u64,
+    /// `None`: RFC 9002 §7.2's, by the path's datagram size
+    initial_window: Option<u64>,
 }
 
 impl BbrConfig {
-    /// Default limit on the amount of outstanding data in bytes.
+    /// Limit on the amount of outstanding data in bytes before any is acknowledged
     ///
-    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    /// By default RFC 9002 §7.2's, `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`,
+    /// recalculated as the path's datagram size changes, as CUBIC's and NewReno's are; a value set
+    /// here is fixed. Upstream's default was 200 datagrams of 1,200 bytes, 240,000 bytes: Chromium's
+    /// bound on a window resumed from a cached bandwidth (`kMaxInitialCongestionWindow`), not a
+    /// start, and the bound the path's warm-up spends to scales with it (`VENDORED.md` §21).
     pub fn initial_window(&mut self, value: u64) -> &mut Self {
-        self.initial_window = value;
+        self.initial_window = Some(value);
         self
-    }
-}
-
-impl Default for BbrConfig {
-    fn default() -> Self {
-        Self {
-            initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
-        }
     }
 }
 
@@ -682,11 +683,29 @@ const K_STARTUP_GROWTH_TARGET: f32 = 1.25;
 /// Rounds without that growth before STARTUP ends, 3 (BBR draft §4.3.2.2)
 const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
 
-// Do not allow initial congestion window to be greater than 200 packets.
-/// Do not allow initial congestion window to be greater than 200 packets (upstream's value)
-const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
-
 /// ProbeRTT sizes its window from the BDP (upstream's choice)
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 /// Low gain holds until the BDP target is reached (upstream's choice)
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::super::BASE_DATAGRAM_SIZE;
+    use super::*;
+
+    /// RFC 9002 §7.2's initial window by the path's datagram size, as CUBIC's and NewReno's are; a
+    /// window set in the configuration is kept whatever the datagram size
+    #[test]
+    fn the_initial_window_is_rfc_9002s_by_the_datagram_size_unless_set() {
+        let mut bbr = Bbr::new(BbrConfig::default(), BASE_DATAGRAM_SIZE as u16);
+        assert_eq!((bbr.window(), bbr.initial_window()), (12_000, 12_000));
+        bbr.on_mtu_update(1_452);
+        assert_eq!(bbr.initial_window(), 14_520);
+        let mut config = BbrConfig::default();
+        config.initial_window(30_000);
+        let mut set = Bbr::new(config, BASE_DATAGRAM_SIZE as u16);
+        assert_eq!((set.window(), set.initial_window()), (30_000, 30_000));
+        set.on_mtu_update(1_452);
+        assert_eq!(set.initial_window(), 30_000);
+    }
+}

@@ -164,4 +164,5 @@ pub(crate) fn initial_window(max_datagram_size: u64) -> u64 {
 }
 
 /// The smallest maximum datagram size QUIC allows, 1200 bytes (RFC 9000 §14)
+#[cfg(test)]
 const BASE_DATAGRAM_SIZE: u64 = 1200;
