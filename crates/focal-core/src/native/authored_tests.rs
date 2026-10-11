@@ -704,6 +704,14 @@ fn measure_time_per_authored_claim() {
     // encodes it, timed apart (FOCAL_MEASURE_RECORD set).
     let record = std::env::var("FOCAL_MEASURE_RECORD").is_ok();
     let mut record_ns = 0u128;
+    // A follower's apply of that record, timed apart (FOCAL_MEASURE_REPLAY
+    // set): inspected, replayed against a second core at the leader's
+    // prefix, and published there, as a follower applies a committed record.
+    let replay = std::env::var("FOCAL_MEASURE_REPLAY").is_ok();
+    let mut replay_ns = 0u128;
+    let replay_dir = tempfile::tempdir().unwrap();
+    let store = crate::native::record_codec::recovery::tests::store(replay_dir.path());
+    let mut follower = measured_core();
     let limits = record_codec::EncodingLimits {
         bytes: 1 << 24,
         visits: usize::MAX,
@@ -720,6 +728,33 @@ fn measure_time_per_authored_claim() {
             std::hint::black_box(plan.write_into(&mut bytes).unwrap());
             record_ns += prepared_at.elapsed().as_nanos();
         }
+        if replay {
+            let plan = record_codec::EncodingPlan::prepare(&prepared, limits).unwrap();
+            let mut bytes = vec![0; plan.quote().bytes];
+            plan.write_into(&mut bytes).unwrap();
+            let started = std::time::Instant::now();
+            let structural = record_codec::StructuralRecord::inspect(
+                &bytes,
+                record_codec::InspectionLimits {
+                    bytes: bytes.len(),
+                    visits: usize::MAX,
+                    rows: 1 << 16,
+                    row_bytes: 32 << 20,
+                },
+            )
+            .unwrap();
+            let replayed = record_codec::replay::prepare(
+                &follower,
+                &structural,
+                core.state.rows.id(),
+                crate::native::record_codec::recovery::tests::limits(follower.limits),
+                &store,
+                &focal_evidence::BuiltinNativeSchemas,
+            )
+            .unwrap();
+            follower.publish_native(replayed).unwrap();
+            replay_ns += started.elapsed().as_nanos();
+        }
         let publish_at = std::time::Instant::now();
         core.publish_native(prepared).unwrap();
         let p = prepared_at.duration_since(started).as_nanos();
@@ -735,6 +770,12 @@ fn measure_time_per_authored_claim() {
         println!(
             "record {:.1} µs per claim",
             record_ns as f64 / claims as f64 / 1e3
+        );
+    }
+    if replay {
+        println!(
+            "replay {:.1} µs per claim",
+            replay_ns as f64 / claims as f64 / 1e3
         );
     }
     println!(
