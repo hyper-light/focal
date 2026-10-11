@@ -133,6 +133,58 @@ pub(crate) fn proposal_refused<S: Storage>(
     }
 }
 
+/// The entries of `entries`, each checked as one entry an owner proposes, and
+/// their count and bytes: what a batch reserves before it is copied.
+pub(crate) fn check_batch<'a>(
+    config: &NodeConfig,
+    entries: impl Iterator<Item = &'a [u8]>,
+) -> Result<(usize, usize), ConsensusError> {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for data in entries {
+        check_entry(config, data.len())?;
+        count = count.checked_add(1).ok_or(ConsensusError::Capacity)?;
+        bytes = bytes
+            .checked_add(data.len())
+            .ok_or(ConsensusError::Capacity)?;
+    }
+    Ok((count, bytes))
+}
+
+/// One proposal of every entry of `entries` (`count` of them), from `from`:
+/// what the leader's core appends whole and sends each member in one append
+/// (its `propose` takes every entry a proposal carries), where a proposal an
+/// entry sent each member an append of its own, drew an answer of its own and
+/// a commit's broadcast of its own. Each entry is copied into a buffer of
+/// exactly its length.
+pub(crate) fn proposal<'a>(
+    from: u64,
+    entries: impl Iterator<Item = &'a [u8]>,
+    count: usize,
+) -> Result<Message, ConsensusError> {
+    let mut message = proto::message(0, MessageType::MsgPropose);
+    message.from = from;
+    message
+        .entries
+        .try_reserve_exact(count)
+        .map_err(|_| ConsensusError::Capacity)?;
+    for data in entries {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(data.len())
+            .map_err(|_| ConsensusError::Capacity)?;
+        if owned.capacity() > data.len() {
+            return Err(ConsensusError::Capacity);
+        }
+        owned.extend_from_slice(data);
+        message.entries.push(Entry {
+            data: owned,
+            ..Entry::default()
+        });
+    }
+    Ok(message)
+}
+
 /// An entry an owner proposes: something, and no more than one entry holds.
 pub(crate) fn check_entry(config: &NodeConfig, len: usize) -> Result<(), ConsensusError> {
     if len == 0 || len > config.max_entry_bytes {

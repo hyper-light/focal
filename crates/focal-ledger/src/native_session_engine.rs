@@ -27,6 +27,12 @@ pub(super) enum Domain {
 pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) delivery: Option<super::apply::Delivery>,
     pub(super) pending: VecDeque<Pending>,
+    /// While its host takes a batch of requests: each candidate is encoded
+    /// as it is admitted, and every one is proposed together when the batch
+    /// ends (`flush_proposals`), one append to each member, where a proposal
+    /// a candidate sent each member an append, drew an answer and a commit's
+    /// broadcast of its own.
+    pub(super) defer_proposals: bool,
     pub(super) domain: Option<Domain>,
     pub(super) reader: ContentReader,
     /// Where checkpoint seeds are read from on install (25 §5); the writer
@@ -176,6 +182,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok(Self {
             delivery: None,
             pending,
+            defer_proposals: false,
             domain: Some(Domain::Passive(core)),
             reader,
             seeds,
@@ -1076,7 +1083,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         };
         // Temporary encoding or proposal pressure preserves the candidate: the
         // caller polls and resubmits the exact request without a second candidate.
-        match self.flush_proposals(consensus) {
+        // In a batch, the candidate is encoded now (its refusal is its own) and
+        // proposed with the batch's others when the batch ends.
+        let flushed = if self.defer_proposals {
+            self.encode_proposals().map(drop)
+        } else {
+            self.flush_proposals(consensus)
+        };
+        match flushed {
             Ok(()) => {}
             Err(error) => match error.class() {
                 FailureClass::Retryable | FailureClass::Authority => {}
@@ -1098,16 +1112,43 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         Ok(NativeSubmission::Pending { candidate, outcome })
     }
-    /// Encode and propose every unsubmitted candidate in chain order. Encoding
-    /// refusals discard the candidate and its suffix; proposal pressure keeps
-    /// them for the next flush.
-    pub(super) fn flush_proposals(
+    /// Whether candidates admitted from now on wait for [`Self::flush_deferred`].
+    pub(crate) fn set_proposals_deferred(&mut self, deferred: bool) {
+        self.defer_proposals = deferred;
+    }
+    /// Whether deferred candidates wait to be proposed: a drain is owed them.
+    pub(crate) fn has_deferred(&self) -> bool {
+        self.defer_proposals && self.pending.iter().any(|pending| !pending.submitted)
+    }
+    /// Propose every candidate the host deferred, together, on an authority;
+    /// pressure, authority moving and a refused candidate keep or answer them
+    /// as at admission. Only a refusal that stops the session is returned.
+    pub(crate) fn flush_deferred(
         &mut self,
         consensus: &mut DurableNode,
-    ) -> Result<(), NativeSessionError> {
+    ) -> Option<NativeSessionError> {
+        if self.pending.iter().all(|pending| pending.submitted)
+            || !self.is_authoritative(&consensus.scalars())
+        {
+            return None;
+        }
+        match self.flush_proposals(consensus) {
+            Err(error) if error.class() == FailureClass::FailClosed => {
+                self.fail_closed(&error);
+                Some(error)
+            }
+            Ok(()) | Err(_) => None,
+        }
+    }
+    /// Encode every unsubmitted candidate in chain order, and name the first
+    /// of them. Encoding refusals discard the candidate and its suffix.
+    pub(super) fn encode_proposals(
+        &mut self,
+    ) -> Result<Option<NativeCandidate>, NativeSessionError> {
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
         };
+        let mut first = None;
         let mut position = 0usize;
         while let Some(pending) = self.pending.get_mut(position) {
             if !pending.submitted {
@@ -1125,6 +1166,64 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     }
                 };
                 pending.hash = Some(encoded.hash());
+                first.get_or_insert(pending.candidate);
+            }
+            position = add(position, 1)?;
+        }
+        Ok(first)
+    }
+    /// Encode and propose every unsubmitted candidate in chain order, in one
+    /// proposal: the leader sends each member one append of them all.
+    /// Encoding refusals discard the candidate and its suffix; proposal
+    /// pressure keeps them for the next flush, and a batch the log has no
+    /// room for whole is proposed a candidate at a time, as many as it has
+    /// room for.
+    pub(super) fn flush_proposals(
+        &mut self,
+        consensus: &mut DurableNode,
+    ) -> Result<(), NativeSessionError> {
+        let Some(first) = self.encode_proposals()? else {
+            return Ok(());
+        };
+        let Some(Domain::Active(owner, _)) = self.domain.as_ref() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let records = owner
+            .encoded_from(first)
+            .map_err(NativeSessionError::Owner)?;
+        // The unsubmitted candidates are the chain's suffix from the first of
+        // them, in the owner's chain and in this one alike.
+        let unsubmitted = self
+            .pending
+            .iter()
+            .filter(|pending| !pending.submitted)
+            .count();
+        if records.clone().count() != unsubmitted {
+            return Err(NativeSessionError::Failed);
+        }
+        match consensus.propose_batch_borrowed_in(records, BudgetLane::Completion) {
+            Ok(()) => {
+                for pending in self.pending.iter_mut() {
+                    pending.submitted = true;
+                }
+                Ok(())
+            }
+            Err(ConsensusError::Capacity) => self.propose_each(consensus),
+            Err(error) => Err(error.into()),
+        }
+    }
+    /// Propose every unsubmitted candidate, encoded, one at a time: as many
+    /// as the log has room for; the rest wait for the next flush.
+    fn propose_each(&mut self, consensus: &mut DurableNode) -> Result<(), NativeSessionError> {
+        let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let mut position = 0usize;
+        while let Some(pending) = self.pending.get_mut(position) {
+            if !pending.submitted {
+                let encoded = owner
+                    .encode_candidate(pending.candidate, self.limits.encoding)
+                    .map_err(NativeSessionError::Owner)?;
                 consensus.propose_borrowed_in(encoded.bytes(), BudgetLane::Completion)?;
                 pending.submitted = true;
             }
