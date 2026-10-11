@@ -14441,3 +14441,73 @@ The gate on the landing tree (head `075fa63`, macOS 26.4.1 arm64, under other wo
 recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3279
 passed, 0 failed, 20 ignored.
+
+### 2026-10-11 — Decoding a claim checks each declaration once; an A/B runs both builds on one runner
+
+**A claim's declarations are read from its frame once.** A claim's acceptance is checked by passes
+that each read every declaration from the frame, check it and stamp it:
+- A legacy creation of one declaration read its body 17 times and hashed 35 acceptance intents.
+- An authored creation read each validation body at every pass, and each read inspects the body
+  twice, both feeding BLAKE3 its content and specification. BLAKE3 was 78% of decoding a frame.
+
+A claim's cohort now holds what its first read gave (`input_codec::held::Held`, up to eight
+declarations) and replays it to the passes after; a claim of more is read at every pass, as before.
+An acceptance source says whether it replays (`AcceptanceSource::replays`, false unless a source
+says so). A replaying source's later passes still check order, counts and shape, but do not hash
+what they read, and a build from its plan does not inspect it again; the built policy is still
+hashed against the plan's intent.
+
+**A validation descriptor's build compares bindings, not their intents.** It compared `hash::intent`
+of two bindings (a BLAKE3 of the ledger, the object and the content); comparing those fields
+decides the same, and refuses a collision the hashes would have let through, without six hashes a
+claim.
+
+Measured:
+- A session's CPU for 5,000 claims from their frames (legacy Create, decoded, prepared, made
+  durable and published; the process's user time): 0.52–0.55 s before, 0.40–0.45 s after. On the
+  owner's thread, decoding went from 0.9 to 0.4 of the core preparation's time, and BLAKE3 from
+  32% of its CPU to 25%.
+- An authored claim's frame (one claim, two validations), inspected, planned and built,
+  interleaved A/B: 96.2–97.9 to 32.6–33.8 µs.
+
+Tests:
+- A replaying source is inspected once and its build reads only the passes that copy it.
+- One that changes under its copy is refused, its declarations or its slots.
+- A claim of 8, 9 and 16 declarations or validations, held or read at every pass, legacy and
+  authored, plans the typed input's intent and builds its frame.
+
+New measurements: `measure_time_per_claim_from_its_frame` (focal-ledger) times claims from their
+frames through a session; `measure_time_to_decode_an_authored_frame` (focal-core) times an authored
+frame's decoding.
+
+**An A/B of two focal builds runs on one runner (compare-ab.yml).** One build's comparison run
+against another's, each on a runner of its own, measured the runners: Kafka's p99 at 1,000/s was
+10.7 ms in compare run 38147352430 and 26.3 ms in 38154875102. A branch named `ab/<anything>`
+builds its commit (B) and the commit `tools/compare/ab-base` names (A) on one runner, one after the
+other, so the base images are pulled once: two A/Bs' four builds at once met public.ecr.aws's
+`429 Too Many Requests: Data limit exceeded`. Both sides then run on one runner at every rate, A
+then B in the first round and B then A in the next, each driven by B's generator (compose's
+focal-load image is `FOCAL_LOAD_IMAGE`). Its summary puts every round's sides together, with their
+medians.
+
+On one runner, against land-8 (A/B run 38159367941: two rounds, A then B and then B then A;
+measured writes):
+
+| offered/s | land-8 committed | land-9 committed | land-8 p99 | land-9 p99 |
+|---|---|---|---|---|
+| 100 | 6,059 / 6,059 | 6,059 / 6,059 | 5.4 / 5.4 ms | 6.1 / 5.6 ms |
+| 1,000 | 34,282 / 34,264 | 33,734 / 34,256 | 205.0 / 201.2 ms | 203.2 / 196.2 ms |
+| 4,000 | 25,195 / 25,100 | 27,751 / 28,253 | 485.7 / 520.7 ms | 401.1 / 505.3 ms |
+
+At 4,000 a second, where the owner decodes many more requests than it commits, land-9 committed 11%
+more. At 1,000 the commits did not move. There the bound is not the owner's CPU but 32 pending
+candidates over a commit's latency (`NativeLimits::pending`), one of the fixed bounds that are to
+give way to windows each node learns.
+
+The gate on the landing tree (head `bf87b03`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1153 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3282
+passed, 0 failed, 22 ignored. Windows CI built and tested the same code (run 38159367923).
