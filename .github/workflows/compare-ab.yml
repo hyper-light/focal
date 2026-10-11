@@ -1,0 +1,165 @@
+name: Interleaved A/B tail latency
+
+# Two focal builds measured on one runner, their runs interleaved: at every
+# rate, A then B in the first round and B then A in the second (and so on), so
+# the runner's disk, its neighbours and its warmth weigh on both alike. One
+# build's comparison run against another's, each on a runner of its own,
+# measures the runners: Kafka's p99 at 1,000/s was 10.7 ms in compare run
+# 38147352430 and 26.3 ms in 38154875102, the same Kafka on other runners.
+#
+# A branch named ab/<anything> runs it: B is the pushed commit and A the
+# commit named in tools/compare/ab-base (a full SHA). Both sides' nodes are
+# driven by B's generator, so only the nodes differ.
+on:
+  push:
+    branches: ["ab/**"]
+  workflow_dispatch:
+    inputs:
+      rates:
+        description: "Offered records a second, space-separated"
+        default: "100 1000 4000"
+      rounds:
+        description: "Rounds of every rate, each running both sides"
+        default: "2"
+      seconds:
+        description: "Seconds measured per run"
+        default: "60"
+      warmup:
+        description: "Seconds sent and not measured, first"
+        default: "15"
+
+permissions:
+  contents: read
+
+jobs:
+  base:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.read.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - id: read
+        run: |
+          sha=$(tr -d '[:space:]' < tools/compare/ab-base)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "tools/compare/ab-base names no full commit" >&2; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: base
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        side: [a, b]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ matrix.side == 'a' && needs.base.outputs.sha || github.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/compare/compose/focal.Dockerfile
+          tags: focal:bench
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker save focal:bench | zstd -T0 -3 > focal-bench-${{ matrix.side }}.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: focal-bench-${{ matrix.side }}
+          path: focal-bench-${{ matrix.side }}.tar.zst
+          retention-days: 3
+
+  measure:
+    needs: [base, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: focal-bench-a
+      - uses: actions/download-artifact@v4
+        with:
+          name: focal-bench-b
+      - name: Both sides' images
+        run: |
+          for side in a b; do
+            zstd -dc "focal-bench-$side.tar.zst" | docker load
+            docker tag focal:bench "focal:bench-$side"
+          done
+      - name: The disk the runs write to
+        run: |
+          mkdir -p tools/compare/compose/reports
+          {
+            echo "A $(cat tools/compare/ab-base)"
+            echo "B ${{ github.sha }}"
+            df -h /var/lib/docker || df -h /
+            lsblk -o NAME,ROTA,SIZE,MODEL || true
+            echo "one writer:"
+            dd if=/dev/zero of=/tmp/dsync bs=4k count=500 oflag=dsync 2>&1 | tail -1
+          } | tee tools/compare/compose/reports/disk.txt
+      - name: Runs, interleaved
+        env:
+          NODE_CPUS: "1"
+          FOCAL_LOAD_IMAGE: focal:bench-b
+        run: |
+          rounds=${{ github.event.inputs.rounds || '2' }}
+          for round in $(seq 1 "$rounds"); do
+            order="a b"
+            if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
+            for rate in ${{ github.event.inputs.rates || '100 1000 4000' }}; do
+              for side in $order; do
+                docker tag "focal:bench-$side" focal:bench
+                # A failed run is recorded and the rest still run.
+                bash tools/compare/compose/run.sh focal "$rate" \
+                  "${{ github.event.inputs.seconds || '60' }}" \
+                  "${{ github.event.inputs.warmup || '15' }}" \
+                  128 "reports/$side/$round" || echo "$side round $round at $rate/s failed"
+              done
+            done
+          done
+      - name: A beside B, every round
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat tools/compare/compose/reports/disk.txt
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, json, os, statistics
+          rows = {}
+          for path in glob.glob("tools/compare/compose/reports/*/*/focal-*-128.json"):
+              side, round_ = path.split(os.sep)[-3:-1]
+              r = json.load(open(path))
+              m = r["measured_writes"]
+              l = m["committed_latency_ns"]
+              rate = r["shape"]["rate"]
+              rows.setdefault(rate, {}).setdefault(side, []).append(
+                  (int(round_), m["committed"], m["refused"] + m["unknown"] + m.get("expired", 0),
+                   l["p50"] / 1000, l["p99"] / 1000, l["p999"] / 1000))
+          print("| offered/s | side | round | committed | refused | p50 µs | p99 µs | p99.9 µs |")
+          print("|---|---|---|---|---|---|---|---|")
+          for rate in sorted(rows):
+              for side in ("a", "b"):
+                  for row in sorted(rows[rate].get(side, [])):
+                      print(f"| {rate} | {side} | {row[0]} | {row[1]:,} | {row[2]:,} | {row[3]:,.0f} | {row[4]:,.0f} | {row[5]:,.0f} |")
+          print()
+          print("| offered/s | median committed A → B | median p99 µs A → B |")
+          print("|---|---|---|")
+          for rate in sorted(rows):
+              a = rows[rate].get("a", [])
+              b = rows[rate].get("b", [])
+              if a and b:
+                  ca, cb = statistics.median(x[1] for x in a), statistics.median(x[1] for x in b)
+                  pa, pb = statistics.median(x[4] for x in a), statistics.median(x[4] for x in b)
+                  print(f"| {rate} | {ca:,.0f} → {cb:,.0f} | {pa:,.0f} → {pb:,.0f} |")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports
+          path: tools/compare/compose/reports
