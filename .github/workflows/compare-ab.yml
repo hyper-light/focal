@@ -45,31 +45,44 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "tools/compare/ab-base names no full commit" >&2; exit 1; }
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
+  # Both sides on one runner, one after the other: their base images are
+  # pulled once (four builds at once, two A/Bs' two sides, met public.ecr.aws's
+  # `429 Too Many Requests: Data limit exceeded`), and the second build reuses
+  # the first's compiled dependencies in the build's cache mount.
   image:
     needs: base
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    strategy:
-      matrix:
-        side: [a, b]
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ matrix.side == 'a' && needs.base.outputs.sha || github.sha }}
+          ref: ${{ needs.base.outputs.sha }}
+          path: a
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: b
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
-          context: .
-          file: tools/compare/compose/focal.Dockerfile
-          tags: focal:bench
+          context: a
+          file: a/tools/compare/compose/focal.Dockerfile
+          tags: focal:bench-a
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - run: docker save focal:bench | zstd -T0 -3 > focal-bench-${{ matrix.side }}.tar.zst
+      - uses: docker/build-push-action@v6
+        with:
+          context: b
+          file: b/tools/compare/compose/focal.Dockerfile
+          tags: focal:bench-b
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker save focal:bench-a focal:bench-b | zstd -T0 -3 > focal-bench-ab.tar.zst
       - uses: actions/upload-artifact@v4
         with:
-          name: focal-bench-${{ matrix.side }}
-          path: focal-bench-${{ matrix.side }}.tar.zst
+          name: focal-bench-ab
+          path: focal-bench-ab.tar.zst
           retention-days: 3
 
   measure:
@@ -80,16 +93,9 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: actions/download-artifact@v4
         with:
-          name: focal-bench-a
-      - uses: actions/download-artifact@v4
-        with:
-          name: focal-bench-b
+          name: focal-bench-ab
       - name: Both sides' images
-        run: |
-          for side in a b; do
-            zstd -dc "focal-bench-$side.tar.zst" | docker load
-            docker tag focal:bench "focal:bench-$side"
-          done
+        run: zstd -dc focal-bench-ab.tar.zst | docker load
       - name: The disk the runs write to
         run: |
           mkdir -p tools/compare/compose/reports
