@@ -116,6 +116,11 @@ warmup_ms: $(( warmup * 1000 ))
 EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
+    # Every node's processor with call graphs, twenty seconds into the
+    # measured window: where each node's CPU goes per write.
+    for n in focal1 focal2 focal3; do
+      dc exec -d "$n" sh -c "sleep $(( warmup + 20 )); perf record -F 499 --call-graph fp -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
+    done
     cpu_stat before > "$out/$report.cpu.txt"
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
@@ -124,6 +129,15 @@ EOF
       exit 1
     fi
     cpu_stat after >> "$out/$report.cpu.txt"
+    for n in focal1 focal2 focal3; do
+      echo "::group::$n by thread and function (focal at $rate/s)"
+      dc exec -T "$n" sh -c "cat /data/perf.log; perf report -i /data/perf.data --stdio --no-children --sort comm -g none 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -20" || true
+      # Inclusive time by function for the whole process (what each call
+      # costs with all it calls), then each function's own time.
+      dc exec -T "$n" sh -c "perf report -i /data/perf.data --stdio --children --sort comm,symbol -g none --percent-limit 1 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -160" || true
+      dc exec -T "$n" sh -c "perf report -i /data/perf.data --stdio --no-children --sort comm,symbol -g none --percent-limit 0.3 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -90" || true
+      echo "::endgroup::"
+    done
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
