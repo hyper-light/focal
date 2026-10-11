@@ -260,9 +260,10 @@ impl<'s, 'a, S: ValidationSource<'a>> ValidationSourcePlan<'s, 'a, S> {
             self.shape.checked_visits,
             Some(self.shape.content_hash),
         )?;
-        if hash::intent(fields.declaration(actual.content_hash).binding)
-            != self.intent_fingerprint()
-            || actual.specification_hash != self.shape.specification_hash
+        if !hash::same_intent(
+            fields.declaration(actual.content_hash).binding,
+            self.fields.declaration(self.shape.content_hash).binding,
+        ) || actual.specification_hash != self.shape.specification_hash
             || actual.heap != self.shape.heap
             || actual.allocations != self.shape.allocations
             || actual.contributors != self.shape.contributors
@@ -503,9 +504,10 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
     let mut visits = VisitBudget::new(shape.build_visits);
     let (fields, actual) = inspect(principal, source, limits, visits.remaining())?;
     visits.charge(actual.inspection_visits)?;
-    if hash::intent(fields.declaration(actual.content_hash).binding)
-        != hash::intent(expected.declaration(shape.content_hash).binding)
-        || actual.specification_hash != shape.specification_hash
+    if !hash::same_intent(
+        fields.declaration(actual.content_hash).binding,
+        expected.declaration(shape.content_hash).binding,
+    ) || actual.specification_hash != shape.specification_hash
         || actual.heap != shape.heap
         || actual.allocations != shape.allocations
         || actual.contributors != shape.contributors
@@ -573,9 +575,10 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
     };
     let (copied, checked) = inspect(principal, &owned, limits, visits.remaining())?;
     visits.charge(checked.inspection_visits)?;
-    if hash::intent(copied.declaration(checked.content_hash).binding)
-        != hash::intent(expected.declaration(shape.content_hash).binding)
-        || checked.specification_hash != shape.specification_hash
+    if !hash::same_intent(
+        copied.declaration(checked.content_hash).binding,
+        expected.declaration(shape.content_hash).binding,
+    ) || checked.specification_hash != shape.specification_hash
         || checked.attempts != shape.attempts
         || descriptor.binding() != copied.declaration(checked.content_hash).binding
     {
