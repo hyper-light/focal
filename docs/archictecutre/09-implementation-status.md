@@ -14277,7 +14277,7 @@ The gate on the landing tree (head `793136e`, macOS 26.4.1 arm64, under other wo
 `bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
 recursion), `cargo deny check advisories bans licenses sources` (its first run could not fetch the
 advisory database, a network timeout; the second passed), and
-`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3271
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3271
 passed, 0 failed, 20 ignored.
 
 ### 2026-10-11 — A wake is counted where it is seen; a stopped session names its cause; the stall test's stall outlasts the transport's bound
@@ -14323,5 +14323,64 @@ The gate on the landing tree (head `68e2dd1`, macOS 26.4.1 arm64, under other wo
 15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
 `bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
 recursion), `cargo deny check advisories bans licenses sources`, and
-`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3272
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3272
 passed, 0 failed, 20 ignored.
+
+### 2026-10-11 — The endpoint visits only what is touched; a client's capacity resends are budgeted; a run of padding is one frame; a lookup descends once
+
+**The network driver visits only the connections an event or a call touched** (shared crates at
+hyper-raft 33f90a2). Every turn of hyper-transport's endpoint offered each connection its turn to
+transmit, drove each on a timeout, and read every connection's timer and every exchange's wait for
+the next deadline. On the comparison's leader those visits took 8% of its one CPU at 1,000 requests
+a second and 14% at 4,000 (perf, compare run 38142415872). The endpoint now keeps the connections a
+datagram, a call or a timeout touched, those with something to send, and an indexed heap of each
+connection's next deadline. hyper-rt-transport's new bench times one exchange beside n − 1 idle
+connections: with 512 held, an exchange cost 232–243 µs before and 40–43 µs after, what one held
+connection costs. The full visit of every exchange is the `oracle` feature's alone, a cross-check
+that the heap agrees with it.
+
+**A client's capacity resends are throttled as gRPC throttles retries** (gRFC A6: ten tokens, a
+refusal for capacity spends one, an answer earns a tenth, and the client resends only while it holds
+more than half). A node that refuses for capacity is overloaded, and every client resending each
+refusal at once kept it so. A native refusal for capacity spends as a session's refusal does. The
+load generator now counts its refusals by reason, so a comparison says how many the owner refused
+after preparing them and how many were refused at a session's door.
+
+**A run of PADDING frames is decoded as one frame** (hyper-raft ed03c42). Each padding byte was a
+frame of its own, decoded and passed over. A PING padded to 1,452 bytes decoded in 4,019 ns as 1,452
+frames; it decodes in 472 ns as 2.
+
+**A range store's lookup descends its directory once.** `get` found the key's page rank (summing
+the pages left of the path at every level) and then walked down again to the page of that rank;
+`page_of` descends once, by key. Where the cached prefixes tie (a claim's rows share its affinity),
+`RangeKey::cmp_past_prefix` compares past the prefix without reading either key's affinity again.
+Authored claim creation over 11,000 claims, interleaved A/B: prepare 40.0–40.2 to 37.3–37.6 µs and
+publish 5.2 to 4.5 µs a claim.
+
+The comparison (Linux x86_64, three nodes of one CPU each, 128-byte writes; measured writes, the
+p99 of those that succeeded). The two runs sampled by perf on the leader are the before and after
+of the whole landing; the other two measured parts of it without perf:
+
+| run | head | offered/s | committed | refused | p99 |
+|---|---|---|---|---|---|
+| before, perf (run 38142415872) | 793136e | 1,000 / 4,000 | 25,526 / 25,279 | 34,593 / 214,721 | 683.4 ms / 69.9 s |
+| endpoint (run 38147352430) | 1299cd8 | 100 / 200 / 1,000 | 6,059 / 12,119 / 27,533 | 0 / 0 / 32,586 | 6.0 / 23.7 / 495.7 ms |
+| endpoint, budget, counts (run 38148578690) | 938180d | 100 / 1,000 / 4,000 | 6,059 / 31,655 / 25,970 | 0 / 28,464 / 214,030 | 4.9 / 206.9 / 405.4 ms |
+| all of it, perf (run 38151390392) | 81b8b16 | 1,000 / 4,000 | 32,098 / 26,508 | 28,021 / 213,492 | 221.9 / 436.0 ms |
+
+At 1,000 a second the budget took the p99 from 496 to 207 ms. Of that run's 34,080 refused attempts,
+14,141 were refused by the owner after preparing them (`pending candidates`) and 19,939 at a
+session's door (`access: Capacity`, counted after the client's resends). The endpoint run's Kafka,
+NATS and Redis rows hold every write at 1,000 a second, with p99s of 10.7, 5.3 and 5.9 ms. focal's
+leader cannot yet keep 1,000 claims a second on one CPU, and its owner's CPU per claim is the next
+work: perf at 81b8b16 puts preparation at 13.7% of the process, lookups at 8.1%, planning at 3.8%,
+publication at 3.5% and BLAKE3 at about 3.8%.
+
+The gate on the landing tree (head `81b8b16`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3275
+passed, 0 failed, 20 ignored. The land-5 and land-6 entries above counted 167 test binaries; their
+gate logs hold 166, as this one does.
