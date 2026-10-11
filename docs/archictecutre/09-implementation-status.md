@@ -14609,3 +14609,139 @@ record; macOS 26.4.1 arm64, under other work's load), exit 0: `cargo fmt --all -
 recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3284
 passed, 0 failed, 22 ignored. Windows CI built and tested the same code (run 38163702765).
+
+### 2026-10-11 — A member's split point from its middle page; every comparison run says what a write costs each node
+
+**A member's split point is found from its middle page, by one descent and a bounded scan.** The range
+balancer asks for a member's split point at every pass while a split is refused, and a split is
+refused while candidates are pending, so this happens under load.
+
+The search walked the member's rows from the first to the middle one, computing each row's affinity:
+half a member of hundreds of thousands of rows on every pass. The comparison's leader spent 2% of its
+process there at 1,000/s (frame-pointer profile, compare run 38161000738), in owner steps of
+61–94 ms (`range: split point` among its slowest).
+
+It now starts at the page before the middle page (`RangeStore::entries_from_page`, a descent by rank).
+It returns the first affinity that follows a row of a smaller one, within 4,096 rows. Past them it
+returns none: there is no dividing affinity there, a refusal the balancer observes again. Test: a
+member of 300 claims' rows divides at an affinity it holds, with at least a quarter of its rows on
+each side.
+
+**Every comparison run records each container's CPU and network.** `run.sh` reads, on the host and
+before and after the load:
+- each container's cgroup v2 `cpu.stat` into `<report>.cpu.txt`;
+- its namespace's UDP and TCP counters (`/proc/PID/net/snmp`) and its interface's bytes and packets
+  (`/proc/PID/net/dev`) into `<report>.net.txt`.
+
+The comparison's and the A/B's summaries add the busiest node's and all nodes' CPU microseconds per
+write, the busiest node's share of the wall clock, and in the A/B the time its quota held it back.
+
+**A session's host counts what it turns away for room by the bound that turned it away:** the node's
+memory, a reply cell or the queue (`focal_sessions_{requests,frames}_refused_total{bound}`). One
+count could not say which bound refused the 17,000 writes the generator saw refused as
+`access: Capacity` at 1,000/s.
+
+**A path's warm-up is background traffic (hyper-quic patch Q12, the shared crates at hyper-raft
+d7d5165).** Linux CI failed the 128 kbit/s crossing (`evidence_quic`): no leader within ten seconds.
+A diagnostic run of it, six times with the path's warm-up and six without (run 38171360767), failed 4
+of 6 with it and none without. In the failing runs every node's term climbed to 5 while the relays,
+which queue 32 datagrams each way, stayed full.
+
+The warm-up measures a path for Careful Resume while the connection is idle: PING and PADDING to the
+path's MTU, until four initial windows are acknowledged in one round trip, within a budget of
+sixteen. A 128 kbit/s path cannot carry that in a round trip, so its packets queued. A queue that
+holds them drops nothing, and no loss ended the warm-up, so it ran to its budget: some twelve seconds
+of the path, which the election's votes waited behind.
+
+It now runs as LEDBAT++'s slow start (draft-irtf-iccrg-ledbat-plus-plus §4.1, §4.5), the IETF's
+model of background traffic:
+- it begins with two packets, sent once nothing of the connection is in flight;
+- its window grows by what each acknowledgement acknowledges;
+- it ends once its queueing delay passes three quarters of the 60 ms target. That delay is the least
+  of its four most recent RTT samples (none older than a round trip, RFC 6817 §2.5) past the least
+  of all its samples.
+
+Only its own packets judge it: a smaller packet's RTT is shorter by the time the path takes to carry
+the difference, 91 ms of a 1,452-byte datagram at 128 kbit/s.
+
+RFC 9406's delay increase, tried first, compares round trips' least RTTs. A round trip begins with an
+empty queue, so its least sample stays at the base, and the warm-up ended only in its third round
+trip.
+
+On hyper-quic's pair (128 kbit/s each way, 10 ms one way, a queue without bound; its new link rate):
+
+| | warm-up packets (client / server) | how it ended | smoothed RTT after |
+|---|---|---|---|
+| before | 160 / 163 | its budget | 7.3 s |
+| RFC 9406's exit | 41 / 35 | the queue, third round trip | 1.9 s / 1.3 s |
+| now | 6 / 6 | the queue, second sample | 172 / 192 ms |
+
+Without a rate on the path, the warm-up still completes its measurement. The new test fails before
+the patch: the warm-up ended at its budget. `PathStats::warm_up_end` says why a warm-up ended.
+
+On Linux CI the crossing then passed 12 of 12 runs with the warm-up on (run 38175260073). Each seal
+came 71.3–73.9 s after its upload began, against the path's own 65 s: what the runs without the
+warm-up took before (75.3–78.1 s a test, against 79.7 and 85.2 s for the two runs with it that had
+passed).
+
+**Correction: the land-9 and land-10 A/B tables compared one build with itself.** An A/B builds A and
+then B on one runner (`compare-ab.yml`, from d08dcff). B's build reuses A's compiled crates through the
+build's cache mount, and cargo judges a crate fresh by its sources' modification times. B was checked
+out before A was built, so B's sources read as older than A's outputs, cargo rebuilt nothing, and B's
+image carried A's binaries. B's build finished in about two seconds in runs 38159367941 (land-9's) and
+38163702691 (land-10's).
+
+Those tables therefore measured the spread between two runs of one build: up to 11% of committed writes
+at 4,000/s, and about 1.3% at 1,000/s. They did not measure the changes. The changes' own measurements
+in those entries, the local interleaved harnesses, stand. The land-8 A/B (run 38159221354) built its
+sides on separate runners and stands too.
+
+The workflow now makes every file B changes or adds newer than A's build before building B, and fails
+unless the two images' `focal` binaries differ.
+
+**What a write costs each node, measured** (cluster profile 38164600339 and its network counters in
+38165626497, on this code; 1-CPU nodes, 1,000/s offered, about 43,000–47,000 writes committed in
+76 s):
+
+| node | busy | CPU a committed write | UDP datagrams a write (out / in) |
+|---|---|---|---|
+| leader | 99%, its quota holding it 55 s in 730 of 760 periods | 1,745 µs | 12.4 / 13.8 |
+| follower | 65% | 1,140 µs | 5.7 / 4.9 |
+
+The leader's CPU a write by thread:
+- **Network threads, 895 µs.** About 730 µs of that varies with the write rate; about 90 ms a
+  second is spent whatever the rate. The kernel's UDP send path alone is 206 µs, about half of it the
+  receiving containers' softirq work charged to the sender.
+- **Session owner, 679 µs.** Preparing a claim is 309 µs of it.
+- **Checkpoints, 118 µs.**
+- **WAL, 40 µs.**
+
+A follower spends 428 µs a write replaying the leader's records. The leader sent 4.2 peer messages a
+committed write, and each follower 2.1.
+
+On one runner, against land-10 (A/B run 38171214170, the first since the A/B builds its sides
+apart: two rounds, A then B and then B then A; measured writes, medians of the rounds):
+
+| offered/s | committed | p50 | p99 | busiest node's CPU a write |
+|---|---|---|---|---|
+| 100 | 6,059 → 6,059 | 3.09 → 2.87 ms | 5.08 → 4.80 ms | 2,604 → 2,373 µs |
+| 1,000 | 37,128 → 37,997 | 66.0 → 63.1 ms | 191.8 → 193.1 ms | 1,553 → 1,534 µs |
+| 4,000 | 30,558 → 28,893 | 103.4 → 124.0 ms | 427.0 → 423.2 ms | 1,925 → 2,044 µs |
+
+This batch measures and counts; its one change to the write path is the split point's search. At
+100/s and 1,000/s the rows sit within the spread between rounds of one build.
+
+At 4,000/s B's two rounds both sat above A's: a median of 118.8–129.2 ms against 101.8–104.9 ms, and
+28,525–29,261 writes committed against 29,745–31,372. One build's own rounds spread 15% in median
+and 6% in committed writes at that rate (run 38163702691). With two rounds a side, that ordering
+comes by chance one time in six. The split point is measured alone at 1,000/s and 4,000/s, four
+rounds a side: land-11b against itself with the split point reverted (run 38178536730).
+
+The gate on the landing tree (head `5f52c35`, macOS 26.4.1 arm64, under other work's load), exit 0:
+`cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes, 15
+vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1153 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3286
+passed, 0 failed, 22 ignored. Land-10's Linux CI had failed the 128 kbit/s crossing (run
+38168585066); this batch's warm-up is the fix for it.
