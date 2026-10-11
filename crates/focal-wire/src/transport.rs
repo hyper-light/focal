@@ -9,7 +9,7 @@ use crate::net::{
 };
 use crate::*;
 use focal_memory::MemoryBudget;
-use hyper_transport::congestion::{Congestion, CopaConfig};
+use hyper_transport::congestion::{Congestion, CubicConfig};
 use hyper_transport::tls::Tls;
 use hyper_transport::{Classes, Config, Endpoint, Limits, PathFacts, PeerId};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -353,7 +353,7 @@ pub(crate) fn listener_client() -> Result<rustls::ClientConfig, WireError> {
 /// §3.1 P10, F39): it stalled on no path and kept what is asked beside a transfer from waiting for
 /// a full queue (hyper-raft docs/transport.md §4d).
 fn congestion() -> Congestion {
-    Congestion::Copa(CopaConfig::default())
+    Congestion::Cubic(CubicConfig::default())
 }
 
 /// The datagrams one system call carries each way: hyper-rt's batch bound, at most the 64
