@@ -1,0 +1,31 @@
+name: Diag slow path
+# DIAG (not for merge): the 128 kbit/s crossing alone on Linux, the warm-up on, with hyper-quic's
+# patch Q12 (the warm-up as background traffic). Before it: 4 of 6 runs found no leader in time.
+on:
+  push:
+    branches: ["diag/slow-**"]
+permissions:
+  contents: read
+jobs:
+  slow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build the test
+        run: bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked --no-run
+      - name: Warm-up on, twelve runs
+        run: |
+          passed=0
+          for i in $(seq 1 12); do
+            echo "::group::warm-up on, run $i"
+            out=$(bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked -- --exact a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second --nocapture 2>&1 || true)
+            echo "$out" | grep -E "diag t=|panicked|test result|no quorum|left|right|bit/s:" || true
+            if echo "$out" | grep -q "test result: ok. 1 passed"; then passed=$((passed + 1)); fi
+            echo "::endgroup::"
+          done
+          echo "passed $passed of 12"
+          echo "passed $passed of 12" >> "$GITHUB_STEP_SUMMARY"
+          test "$passed" -eq 12
