@@ -69,6 +69,8 @@ jobs:
         with:
           name: focal-bench-image
       - run: zstd -dc focal-bench.tar.zst | docker load
+      - name: Let perf sample a container's process
+        run: sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
       - name: The disk the runs write to
         run: |
           mkdir -p tools/compare/compose/reports
@@ -90,8 +92,8 @@ jobs:
         env:
           NODE_CPUS: "1"
         run: |
-          for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
-            for rate in ${{ github.event.inputs.rates || '100 200 1000 4000' }}; do
+          for system in ${{ github.event.inputs.systems || 'focal' }}; do
+            for rate in ${{ github.event.inputs.rates || '1000 4000' }}; do
               bash tools/compare/compose/run.sh "$system" "$rate" \
                 "${{ github.event.inputs.seconds || '60' }}" \
                 "${{ github.event.inputs.warmup || '15' }}" \
