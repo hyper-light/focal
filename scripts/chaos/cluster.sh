@@ -41,10 +41,14 @@ ready() { # node: wait until its start reported Ready, at most 120 checks
 
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
 
-for contender in $(seq 1 "${CONTEND:-0}"); do
+# A counted loop, not `seq 1 N`: BSD seq counts down from 1 to 0, so a count of
+# none started two.
+contender=1
+while [ "$contender" -le "${CONTEND:-0}" ]; do
   # A busy neighbour on the nodes' CPUs: what a shared machine gives a node.
   docker run -d --name "fc-contend-$contender" --cpus 1 \
     ${NODE_CPUSET:+--cpuset-cpus "$NODE_CPUSET"} alpine:3.20 sh -c 'while :; do :; done' >/dev/null
+  contender=$((contender + 1))
 done
 
 docker run -d --name fc-founder --hostname fc-founder --network "$NET" "${LIMITS[@]}" \
