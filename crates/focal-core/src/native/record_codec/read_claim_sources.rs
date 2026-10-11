@@ -96,6 +96,13 @@ impl<D: Objects + ?Sized> aggregation::AcceptanceSource for Acceptance<'_, '_, D
             meter: self.meter,
         }
     }
+    /// A record's slots and declarations are read from its bytes, which it
+    /// borrows and which cannot change while borrowed, by the same decoder at
+    /// every pass, and each declaration is the object the record's objects
+    /// hold, decoded once: every pass yields what the first did.
+    fn replays(&self) -> bool {
+        true
+    }
 }
 
 pub(in crate::native::record_codec) struct Responses<'m, 'a, D: Objects + ?Sized> {
