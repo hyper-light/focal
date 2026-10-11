@@ -179,6 +179,10 @@ pub enum WarmUpEnd {
     Congestion,
     /// It spent its budget without measuring four initial windows a round trip
     Budget,
+    /// Its round trips stopped growing short of four initial windows a round trip: three round
+    /// trips it sent in, none delivering a quarter more than the last that grew (BBR's full-pipe
+    /// test, draft-ietf-ccwg-bbr §4.3.1.2)
+    Plateau,
     /// The path changed (a migration)
     PathChanged,
 }
@@ -212,6 +216,9 @@ pub struct PathStats {
     /// The packets the path's warm-up sent to measure it for Careful Resume (also counted by
     /// `sent_packets`)
     pub sent_warm_up_packets: u64,
+    /// The bytes of those packets' datagrams, each its own (UDP payloads): what the warm-up put on
+    /// the path, which a count of what crossed it may take out to see the application's own
+    pub sent_warm_up_bytes: u64,
     /// Why the path's warm-up ended; none while it runs, or if the connection did not warm up
     pub warm_up_end: Option<WarmUpEnd>,
     /// The number of times a black hole was detected in the path

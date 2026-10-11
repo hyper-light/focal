@@ -178,6 +178,10 @@ pub struct PathFacts {
     pub pacing_rate: Option<u64>,
     /// The controller's slow-start threshold, bytes, when it keeps one.
     pub ssthresh: Option<u64>,
+    /// The bytes the path's warm-up has put on it, its datagrams' (hyper-quic's
+    /// `PathStats::sent_warm_up_bytes`): what a count of the bytes that crossed the path takes out to
+    /// see the application's own
+    pub warm_up_bytes: u64,
     /// The path's probe timeout before backoff (RFC 9002 §6.2.1): the smoothed round trip, four
     /// times its variation and the peer's acknowledgement delay, how long what is sent now may take
     /// to be known delivered or lost. An asker that gives its peer a time to answer waits this on
@@ -1116,6 +1120,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             // qlog's bits a second, in bytes.
             pacing_rate: metrics.pacing_rate.and_then(|bits| bits.checked_div(8)),
             ssthresh: metrics.ssthresh,
+            warm_up_bytes: stats.path.sent_warm_up_bytes,
             probe_timeout: conn.quic.probe_timeout(),
         })
     }

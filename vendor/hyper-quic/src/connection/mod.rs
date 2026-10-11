@@ -1419,6 +1419,7 @@ impl Connection {
             Some(false) => {
                 self.app_limited = false;
                 self.limited_through = Some(self.spaces.get(SpaceId::Data).next_packet_number);
+                self.resume.on_warm_up_held();
             }
             None => {}
         }
@@ -1466,10 +1467,15 @@ impl Connection {
             warm_up: true,
             ..Default::default()
         };
+        let number = builder.exact_number;
         builder.finish_and_track(now, self, Some(sent_frames), buf);
-        self.resume.on_warm_up_sent(bytes);
+        self.resume.on_warm_up_sent(bytes, number);
         self.stats.path.sent_warm_up_packets =
             self.stats.path.sent_warm_up_packets.saturating_add(1);
+        // The datagram is the warm-up's alone: it is written only into an empty transmit buffer
+        let datagram = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        self.stats.path.sent_warm_up_bytes =
+            self.stats.path.sent_warm_up_bytes.saturating_add(datagram);
         trace!(size, "writing a warm-up packet");
         Some(true)
     }
@@ -1989,7 +1995,8 @@ impl Connection {
             return Ok(());
         }
 
-        let (ack_eliciting_acked, acked_bytes) = self.on_packets_acked(now, space, &newly_acked);
+        let (ack_eliciting_acked, acked_bytes, warm_up_bytes_acked) =
+            self.on_packets_acked(now, space, &newly_acked);
 
         self.path.congestion.on_end_acks(
             now,
@@ -2013,6 +2020,7 @@ impl Connection {
         let data_sent = data
             .time_of_last_ack_eliciting_packet
             .map(|_| data.largest_ack_eliciting_sent);
+        self.resume.on_warm_up_acked(warm_up_bytes_acked);
         self.resume.on_ack(
             now,
             acked_bytes,
@@ -2076,9 +2084,10 @@ impl Connection {
         now: Instant,
         space: SpaceId,
         newly_acked: &ArrayRangeSet,
-    ) -> (bool, u64) {
+    ) -> (bool, u64, u64) {
         let mut ack_eliciting_acked = false;
         let mut acked_bytes = 0u64;
+        let mut warm_up_acked = 0u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces.get_mut(space).take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -2095,6 +2104,9 @@ impl Connection {
                 ack_eliciting_acked |= info.ack_eliciting;
                 if info.ack_eliciting {
                     acked_bytes = acked_bytes.saturating_add(u64::from(info.size));
+                }
+                if info.warm_up {
+                    warm_up_acked = warm_up_acked.saturating_add(u64::from(info.size));
                 }
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
@@ -2113,7 +2125,7 @@ impl Connection {
                 self.on_packet_acked(now, info);
             }
         }
-        (ack_eliciting_acked, acked_bytes)
+        (ack_eliciting_acked, acked_bytes, warm_up_acked)
     }
 
     /// Takes an RTT sample from an ACK of a new largest, ACK-eliciting packet; returns it with the
