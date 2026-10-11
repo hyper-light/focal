@@ -700,20 +700,42 @@ fn measure_time_per_authored_claim() {
     let mut core = measured_core();
     let (mut prepare_ns, mut publish_ns) = (0u128, 0u128);
     let mut window = (0u128, 0u128);
+    // The candidate's log record, measured and written as an owner funds and
+    // encodes it, timed apart (FOCAL_MEASURE_RECORD set).
+    let record = std::env::var("FOCAL_MEASURE_RECORD").is_ok();
+    let mut record_ns = 0u128;
+    let limits = record_codec::EncodingLimits {
+        bytes: 1 << 24,
+        visits: usize::MAX,
+        rows: 1 << 16,
+    };
     for id in 1..=claims {
         let input = create(id, vec![proposal(id, 10_000 + id)]);
         let started = std::time::Instant::now();
         let prepared = prepare(&core, input, &[]);
         let prepared_at = std::time::Instant::now();
+        if record {
+            let plan = record_codec::EncodingPlan::prepare(&prepared, limits).unwrap();
+            let mut bytes = vec![0; plan.quote().bytes];
+            std::hint::black_box(plan.write_into(&mut bytes).unwrap());
+            record_ns += prepared_at.elapsed().as_nanos();
+        }
+        let publish_at = std::time::Instant::now();
         core.publish_native(prepared).unwrap();
         let p = prepared_at.duration_since(started).as_nanos();
-        let q = prepared_at.elapsed().as_nanos();
+        let q = publish_at.elapsed().as_nanos();
         prepare_ns += p;
         publish_ns += q;
         if id > claims - 1000 {
             window.0 += p;
             window.1 += q;
         }
+    }
+    if record {
+        println!(
+            "record {:.1} µs per claim",
+            record_ns as f64 / claims as f64 / 1e3
+        );
     }
     println!(
         "{claims} claims: prepare {:.1} µs, publish {:.1} µs per claim; last 1000: prepare {:.1} µs, publish {:.1} µs",

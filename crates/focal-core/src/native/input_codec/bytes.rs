@@ -174,6 +174,16 @@ impl CountingSink {
     pub(in crate::native) fn visits_used(&self) -> usize {
         self.visits.used
     }
+    /// Counts `bytes` more of output whose write visits were charged as they
+    /// were measured (a row's length is measured before it is written).
+    pub(in crate::native) fn count(&mut self, bytes: usize) -> Result<(), Error> {
+        let len = add(self.len, bytes)?;
+        if len > self.maximum {
+            return Err(Error::Capacity);
+        }
+        self.len = len;
+        Ok(())
+    }
 }
 impl Sink for CountingSink {
     fn visit(&mut self, amount: usize) -> Result<(), Error> {
@@ -209,6 +219,23 @@ impl<'a> SliceSink<'a> {
     }
     pub(in crate::native) fn visits_used(&self) -> usize {
         self.visits.used
+    }
+    /// The bytes written so far.
+    pub(in crate::native) fn written(&self) -> &[u8] {
+        self.bytes.get(..self.written).unwrap_or(&[])
+    }
+    /// Writes `value` over the four bytes written at `at`, a length written
+    /// before what it measures; the write it replaces was charged.
+    pub(in crate::native) fn patch_u32(&mut self, at: usize, value: u32) -> Result<(), Error> {
+        let end = add(at, 4)?;
+        if end > self.written {
+            return Err(Error::Capacity);
+        }
+        self.bytes
+            .get_mut(at..end)
+            .ok_or(Error::Capacity)?
+            .copy_from_slice(&value.to_le_bytes());
+        Ok(())
     }
     /// Exact fill is a metadata check and adds no write visits. Counting and
     /// slice encoders therefore have identical costs for the same write stream.

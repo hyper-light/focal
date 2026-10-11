@@ -119,6 +119,9 @@ pub struct EncodingPlan<'a> {
     quote: EncodingQuote,
 }
 impl<'a> EncodingPlan<'a> {
+    /// Measures the record: its bytes and the visits its write takes. Its
+    /// hash is its write's ([`Self::write_into`]); the quote's is zero until
+    /// then.
     pub fn prepare(
         prepared: &'a NativePrepared,
         limits: EncodingLimits,
@@ -127,14 +130,25 @@ impl<'a> EncodingPlan<'a> {
             return Err(CodecError::Capacity);
         }
         let mut sink = CountingSink::new(limits.bytes, limits.visits);
-        let hash = frame(&mut sink, prepared)?;
+        frame(&mut sink, prepared, |sink, key, value, ledger| {
+            // Each row's length precedes it: measured once here, and its
+            // write's visits charged as it is measured.
+            let mut measure = RowSize { sink, bytes: 0 };
+            rows::value(&mut measure, key, value, ledger)?;
+            let size = measure.bytes;
+            write_count(sink, size)?;
+            sink.count(size)
+        })?;
+        let hashed = sink.len();
+        digest_visits(&mut sink, hashed)?;
+        sink.write(&[0; 32])?;
         Ok(Self {
             prepared,
             quote: EncodingQuote {
                 bytes: sink.len(),
                 visits: sink.visits_used(),
                 rows: prepared.mutation_count(),
-                hash,
+                hash: ContentHash([0; 32]),
             },
         })
     }
@@ -143,21 +157,45 @@ impl<'a> EncodingPlan<'a> {
     }
     /// A wrong-sized destination is refused before any byte is changed. The
     /// destination must already be charged through its eventual WAL ownership.
+    /// Each row is written once, behind a length patched in once it is known,
+    /// and the digest taken of the whole record at once: the stream it had
+    /// been, a field at a time, with each row encoded twice (once to measure
+    /// its length), cost twice the encoding and a hash of every field.
     pub fn write_into(&self, output: &mut [u8]) -> Result<ContentHash, CodecError> {
         if output.len() != self.quote.bytes {
             return Err(CodecError::Capacity);
         }
         let mut sink = SliceSink::new(output, self.quote.visits);
-        let hash = frame(&mut sink, self.prepared)?;
-        if sink.len() != self.quote.bytes
-            || sink.visits_used() != self.quote.visits
-            || hash != self.quote.hash
-        {
+        frame(&mut sink, self.prepared, |sink, key, value, ledger| {
+            let at = sink.len();
+            write_count(sink, 0)?;
+            rows::value(sink, key, value, ledger)?;
+            let size = sink
+                .len()
+                .checked_sub(at)
+                .and_then(|written| written.checked_sub(4))
+                .ok_or(CodecError::Capacity)?;
+            sink.patch_u32(at, u32::try_from(size).map_err(|_| CodecError::Capacity)?)
+        })?;
+        let hashed = sink.len();
+        digest_visits(&mut sink, hashed)?;
+        let mut hash = blake3::Hasher::new_derive_key(HASH_DOMAIN);
+        hash.update(sink.written());
+        let hash = ContentHash(*hash.finalize().as_bytes());
+        sink.write(&hash.0)?;
+        if sink.len() != self.quote.bytes || sink.visits_used() != self.quote.visits {
             return Err(CodecError::InvalidTag("record source"));
         }
         sink.finish()?;
         Ok(hash)
     }
+}
+
+/// The digest's work: its construction and finalization, and the `hashed`
+/// bytes before it.
+fn digest_visits(sink: &mut impl Sink, hashed: usize) -> Result<(), CodecError> {
+    sink.visit(256)?;
+    sink.visit(add(1, hashed)?)
 }
 
 fn add(a: usize, b: usize) -> Result<usize, CodecError> {
@@ -262,7 +300,13 @@ impl<S: Sink> Sink for RowSize<'_, S> {
     }
 }
 
-fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash, CodecError> {
+/// The record's bytes before its digest, each changed row's through `row`
+/// (which writes its length and then its body, or counts them).
+fn frame<S: Sink>(
+    sink: &mut S,
+    prepared: &NativePrepared,
+    mut row: impl FnMut(&mut S, Key, &Row, LedgerId) -> Result<(), CodecError>,
+) -> Result<(), CodecError> {
     let outcome = prepared.outcome;
     if outcome.ledger.tenant.is_zero()
         || outcome.ledger.session.is_zero()
@@ -271,24 +315,20 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
     {
         return Err(CodecError::InvalidTag("record frame"));
     }
-    // Hash construction/finalization have fixed bounded work in addition to the
-    // separately metered byte stream. No user-controlled derive-key context.
-    sink.visit(256)?;
-    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(HASH_DOMAIN));
-    write_raw(&mut hashed, &MAGIC)?;
-    write_u16(&mut hashed, VERSION)?;
+    write_raw(sink, &MAGIC)?;
+    write_u16(sink, VERSION)?;
     write_u8(
-        &mut hashed,
+        sink,
         match prepared.content_profile() {
             NativeContentProfile::ProjectionOnly => 0,
             NativeContentProfile::AuthoredV1 => 1,
         },
     )?;
-    types::ledger(&mut hashed, outcome.ledger)?;
-    write_raw(&mut hashed, &prepared.fragments.id().0.to_le_bytes())?;
-    write_u64(&mut hashed, prepared.fragments.base_prefix())?;
-    fixed::outcome(&mut hashed, outcome)?;
-    write_count(&mut hashed, prepared.mutation_count())?;
+    types::ledger(sink, outcome.ledger)?;
+    write_raw(sink, &prepared.fragments.id().0.to_le_bytes())?;
+    write_u64(sink, prepared.fragments.base_prefix())?;
+    fixed::outcome(sink, outcome)?;
+    write_count(sink, prepared.mutation_count())?;
     let mut previous = None;
     let mut meta = false;
     let mut recorded = false;
@@ -300,17 +340,17 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
             .checked_add(1)
             .and_then(|n| n.checked_mul(64))
             .ok_or(CodecError::Capacity)?;
-        hashed.visit(lookup)?;
+        sink.visit(lookup)?;
         if previous.is_some_and(|last| last >= key) {
             return Err(CodecError::InvalidTag("record key order"));
         }
         previous = Some(key);
-        write_u8(&mut hashed, u8::from(!deleted))?;
-        fixed::key(&mut hashed, key)?;
+        write_u8(sink, u8::from(!deleted))?;
+        fixed::key(sink, key)?;
         let value = prepared.fragments.get(&key);
         match (deleted, value) {
             (true, None) if key != Key::Meta && key != Key::Outcome(outcome.invocation) => {
-                write_count(&mut hashed, 0)?;
+                write_count(sink, 0)?;
             }
             (false, Some(value)) => {
                 rows::family(key, value)?;
@@ -324,14 +364,7 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
                     }
                     recorded = true;
                 }
-                let mut measure = RowSize {
-                    sink: &mut hashed,
-                    bytes: 0,
-                };
-                rows::value(&mut measure, key, value, outcome.ledger)?;
-                let size = measure.bytes;
-                write_count(&mut hashed, size)?;
-                rows::value(&mut hashed, key, value, outcome.ledger)?;
+                row(sink, key, value, outcome.ledger)?;
             }
             _ => return Err(CodecError::InvalidTag("record mutation")),
         }
@@ -339,7 +372,5 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
     if !meta || !recorded {
         return Err(CodecError::InvalidTag("record accounting rows"));
     }
-    let digest = hashed.digest();
-    write_raw(hashed.sink, &digest.0)?;
-    Ok(digest)
+    Ok(())
 }

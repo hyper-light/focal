@@ -169,7 +169,9 @@ impl PendingRecord {
             }
             bytes.resize(quote.bytes, 0);
             let plan = EncodingPlan { prepared, quote };
-            plan.write_into(&mut bytes)
+            // The record's hash is its write's: the measuring pass does not hash.
+            let hash = plan
+                .write_into(&mut bytes)
                 .map_err(NativeOwnerError::Record)?;
             let previous = std::mem::replace(self, Self::Disabled);
             let Self::Reserved { allocation, .. } = previous else {
@@ -177,7 +179,7 @@ impl PendingRecord {
             };
             *self = Self::Encoded(FundedRecord {
                 bytes,
-                quote,
+                quote: EncodingQuote { hash, ..quote },
                 allocation,
             });
         }
