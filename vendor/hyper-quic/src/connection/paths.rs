@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
 
+#[cfg(feature = "qlog")]
 use qlog::events::quic::MetricsUpdated;
 
 /// The RTT variation's weight in the probe timer: 2, Chromium's `kPtoRttvarMultiplier`
@@ -57,6 +58,7 @@ pub(super) struct PathData {
     first_packet: Option<u64>,
 
     /// Snapshot of the qlog recovery metrics
+    #[cfg(feature = "qlog")]
     recovery_metrics: RecoveryMetrics,
 
     /// Tag uniquely identifying a path in a connection
@@ -107,6 +109,7 @@ impl PathData {
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
             first_packet: None,
+            #[cfg(feature = "qlog")]
             recovery_metrics: RecoveryMetrics::default(),
             generation,
         }
@@ -135,6 +138,7 @@ impl PathData {
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
             first_packet: None,
+            #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
             generation,
         }
@@ -208,6 +212,7 @@ impl PathData {
         true
     }
 
+    #[cfg(feature = "qlog")]
     pub(super) fn qlog_recovery_metrics(&mut self, pto_count: u32) -> Option<MetricsUpdated> {
         let controller_metrics = self.congestion.metrics();
 
@@ -235,6 +240,7 @@ impl PathData {
     }
 }
 
+#[cfg(feature = "qlog")]
 /// Congestion metrics as described in [`recovery_metrics_updated`].
 ///
 /// [`recovery_metrics_updated`]: https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-quic-events.html#name-recovery_metrics_updated
@@ -253,6 +259,7 @@ struct RecoveryMetrics {
     pub pacing_rate: Option<u64>,
 }
 
+#[cfg(feature = "qlog")]
 impl RecoveryMetrics {
     /// Retain only values that have been updated since the last snapshot.
     fn retain_updated(&self, previous: &Self) -> Self {
@@ -515,6 +522,7 @@ impl InFlight {
 }
 
 /// A metric when it changed since `previous`
+#[cfg(feature = "qlog")]
 fn keep_if_changed<T: PartialEq>(previous: Option<T>, current: Option<T>) -> Option<T> {
     if previous == current { None } else { current }
 }

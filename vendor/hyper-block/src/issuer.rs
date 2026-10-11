@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{Builder, JoinHandle};
 
+use hyper_rt::sync::{self, ChannelReceiver, Sender, SyncError};
+
 use crate::DiskError;
 pub use crate::aio::Transfers;
 use crate::block::BlockFile;
@@ -97,7 +99,7 @@ enum Event {
         files: Vec<Handle>,
         /// The batches the submitter may have out at once.
         batches: usize,
-        answers: SyncSender<Numbered>,
+        answers: Sender<Numbered>,
         reply: SyncSender<Result<(usize, u64), DiskError>>,
     },
     Detach {
@@ -322,7 +324,11 @@ fn attach<F: BlockFile + 'static>(
         files.push(Box::new(file.try_clone()?));
     }
     // Each batch out is answered once: room for every answer the submitter may be owed.
-    let (answers, answered) = sync_channel(batches);
+    let (answers, answered) = sync::channel(batches).map_err(|error| DiskError::Io {
+        op: "attach completion channel",
+        path: path.to_path_buf(),
+        source: std::io::Error::other(error),
+    })?;
     let (reply, replied) = sync_channel(1);
     let gone = || stopped(path, "the device's issuer has stopped");
     events
@@ -364,7 +370,7 @@ pub struct Attached {
     slot: usize,
     generation: u64,
     events: SyncSender<Event>,
-    answers: Receiver<Numbered>,
+    answers: ChannelReceiver<Numbered>,
     path: PathBuf,
     /// The batches it may have out at once, those out, and the next batch's number.
     batches: usize,
@@ -459,8 +465,24 @@ impl Attached {
         }
         let answered = self
             .answers
-            .recv()
+            .blocking_recv()
             .map_err(|_| stopped(&self.path, "the device's issuer has stopped"))?;
+        self.out = self.out.saturating_sub(1);
+        Ok(answered)
+    }
+
+    /// The next answer, waiting as a hyper-rt task. Dropping this borrowed wait leaves the
+    /// batch out and its buffers owned by the issuer or answer queue; a later wait or sync
+    /// receive takes the same answer. Dropping the attachment still waits for its detach.
+    pub async fn answer_async(&mut self) -> Result<Numbered, DiskError> {
+        if self.out == 0 {
+            return Err(invalid(&self.path, "an answer with no batch out"));
+        }
+        let answered = self
+            .answers
+            .recv()
+            .await
+            .map_err(|error| completion_error(&self.path, error))?;
         self.out = self.out.saturating_sub(1);
         Ok(answered)
     }
@@ -471,14 +493,12 @@ impl Attached {
             return Ok(None);
         }
         match self.answers.try_recv() {
-            Ok(answered) => {
+            Ok(Some(answered)) => {
                 self.out = self.out.saturating_sub(1);
                 Ok(Some(answered))
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(stopped(&self.path, "the device's issuer has stopped"))
-            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(completion_error(&self.path, error)),
         }
     }
 
@@ -665,7 +685,7 @@ fn carry_out(files: &[Option<(u64, Handle)>], transfer: Transfer) -> Finished {
 /// number it attached for.
 struct Client {
     generation: u64,
-    answers: SyncSender<Numbered>,
+    answers: Sender<Numbered>,
     limit: usize,
     batches: VecDeque<Batch>,
 }
@@ -784,7 +804,7 @@ impl<'a> Dispatch<'a> {
         &mut self,
         files: Vec<Handle>,
         limit: usize,
-        answers: SyncSender<Numbered>,
+        answers: Sender<Numbered>,
     ) -> Result<(usize, u64), DiskError> {
         if self.stopping {
             return Err(stopped(self.path, "the device's issuer is stopping"));
@@ -1065,6 +1085,16 @@ fn stopped(path: &Path, why: &str) -> DiskError {
     }
 }
 
+fn completion_error(path: &Path, error: SyncError<()>) -> DiskError {
+    match error {
+        SyncError::Closed(()) => stopped(path, "the device's issuer has stopped"),
+        SyncError::NotOnShardThread(()) => {
+            invalid(path, "an async answer must be polled by a hyper-rt task")
+        }
+        SyncError::Full(()) => invalid(path, "the completion channel refused a receive"),
+    }
+}
+
 fn unwound() -> DiskError {
     stopped(Path::new(""), "a device worker unwound")
 }
@@ -1079,7 +1109,12 @@ fn invalid(path: &Path, why: &str) -> DiskError {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{Future, poll_fn};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    use hyper_rt::combine::{Either, race2};
+    use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 
     use super::*;
     use crate::buf::Alignment;
@@ -1209,6 +1244,287 @@ mod tests {
                 (buf, (i * 4096) as u64)
             })
             .collect()
+    }
+
+    fn runtime() -> LocalRuntime {
+        // Test shape: one shard, room for the waiter and an independent task that opens I/O.
+        LocalRuntime::new(&RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: 64,
+            timers_per_shard: 64,
+            interests_per_shard: 64,
+            ring_entries: 64,
+            step_budget_ns: 1_000_000_000,
+            timer_tick_ns: 100_000,
+            batch: 64,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+        })
+        .unwrap()
+    }
+
+    struct OpenOnDrop(&'static Counts);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Cancelling a borrowed wait spends neither a batch credit nor its buffers. A repeated
+    /// poll and a spurious wake still wait, and another task on the shard can release the I/O.
+    #[test]
+    fn a_cancelled_async_answer_can_be_waited_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(writes(1), true).unwrap();
+        probe.entered(1);
+        let counts = probe.counts;
+        let mut rt = runtime();
+        let attached = rt
+            .block_on(async move {
+                let mut attached = attached;
+                let _open = OpenOnDrop(counts);
+                {
+                    let mut answer = std::pin::pin!(attached.answer_async());
+                    let waker = poll_fn(|cx| {
+                        assert!(answer.as_mut().poll(cx).is_pending());
+                        Poll::Ready(cx.waker().clone())
+                    })
+                    .await;
+                    waker.wake_by_ref();
+                    let cancelled = race2(answer.as_mut(), async {}).await;
+                    assert!(matches!(cancelled, Either::Second(())));
+                }
+                assert_eq!(attached.out(), 1);
+                assert!(attached.try_answer().unwrap().is_none());
+                assert!(attached.submit(writes(1), false).is_err());
+                hyper_rt::futures::spawn_detached(async move {
+                    counts.open.store(true, Ordering::SeqCst);
+                })
+                .unwrap();
+                let (answered, buffers) = attached.answer_async().await.unwrap();
+                assert_eq!(answered, number);
+                assert_eq!(buffers.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                assert_eq!(attached.out(), 0);
+                assert!(attached.try_answer().unwrap().is_none());
+                assert!(attached.answer_async().await.is_err());
+                attached
+            })
+            .unwrap();
+        assert_eq!(attached.out(), 0);
+        assert_eq!(probe.counts.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A cancelled wait's task can end while the attachment remains owned. The next task
+    /// registers its own wake and receives the completion rather than the old task's wake.
+    #[test]
+    fn an_async_answer_can_move_to_another_task_after_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        let counts = probe.counts;
+        let mut rt = runtime();
+        let (attached, open) = rt
+            .block_on(async move {
+                let mut attached = attached;
+                let open = OpenOnDrop(counts);
+                assert!(matches!(
+                    race2(attached.answer_async(), async {}).await,
+                    Either::Second(())
+                ));
+                assert_eq!(attached.out(), 1);
+                (attached, open)
+            })
+            .unwrap();
+        let mut next_rt = runtime();
+        let attached = next_rt
+            .block_on(async move {
+                let mut attached = attached;
+                let _open = open;
+                hyper_rt::futures::spawn_detached(async move {
+                    counts.open.store(true, Ordering::SeqCst);
+                })
+                .unwrap();
+                let (answered, buffers) = attached.answer_async().await.unwrap();
+                assert_eq!(answered, number);
+                assert_eq!(buffers.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+                attached
+            })
+            .unwrap();
+        assert_eq!(attached.out(), 0);
+    }
+
+    /// A foreign executor cannot register a pending wait; refusal retains the batch so the
+    /// existing synchronous answer still receives exactly its original buffers.
+    #[test]
+    fn an_async_answer_off_the_runtime_refuses_without_consuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let _open = OpenOnDrop(probe.counts);
+        let number = attached.submit(writes(1), false).unwrap();
+        probe.entered(1);
+        {
+            let mut answer = std::pin::pin!(attached.answer_async());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                answer.as_mut().poll(&mut cx),
+                Poll::Ready(Err(DiskError::Io { source, .. }))
+                    if source.kind() == std::io::ErrorKind::InvalidInput
+            ));
+        }
+        assert_eq!(attached.out(), 1);
+        probe.open();
+        let (answered, buffers) = attached.answer().unwrap();
+        assert_eq!(answered, number);
+        assert_eq!(buffers.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+        assert_eq!(attached.out(), 0);
+    }
+
+    /// Reads can finish before earlier writes; the async path retains their numbers and the
+    /// read bytes, then the sync path takes the held write and its flush in the same attachment.
+    #[test]
+    fn async_and_sync_answers_keep_out_of_order_batch_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 2).unwrap();
+        let probe = Probe::new(dir.path(), false, None);
+        probe.file.write_all_at(&[7; 4096], 4096).unwrap();
+        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
+        let held = attached.submit(writes(1), true).unwrap();
+        probe.entered(1);
+        let read = attached.submit_reads(reads(1, 1)).unwrap();
+        let counts = probe.counts;
+        let mut rt = runtime();
+        let mut attached = rt
+            .block_on(async move {
+                let mut attached = attached;
+                let _open = OpenOnDrop(counts);
+                let (answered, buffers) = attached.answer_async().await.unwrap();
+                assert_eq!(answered, read);
+                assert_eq!(buffers.unwrap()[0].0.as_slice(), &[7; 4096]);
+                assert_eq!(attached.out(), 1);
+                attached
+            })
+            .unwrap();
+        let (answered, buffers) = attached.answer().unwrap();
+        assert_eq!(answered, held);
+        assert_eq!(buffers.unwrap()[0].0.as_slice(), &[fill(0); 4096]);
+        assert_eq!(attached.out(), 0);
+        assert_eq!(probe.counts.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A failed batch is one answer, not a broken wake or spent queue slot; a later flush on
+    /// the attachment succeeds. Stopping the issuer then refuses submission without a credit.
+    #[test]
+    fn async_failure_and_stopped_issuer_preserve_batch_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, Some(0));
+        let mut attached = issuer.attach(&probe).unwrap();
+        let number = attached.submit(writes(1), true).unwrap();
+        let mut rt = runtime();
+        let mut attached = rt
+            .block_on(async move {
+                let mut attached = attached;
+                let (answered, result) = attached.answer_async().await.unwrap();
+                assert_eq!(answered, number);
+                assert!(matches!(result, Err(DiskError::Io { .. })));
+                assert_eq!(attached.out(), 0);
+                attached
+            })
+            .unwrap();
+        assert_eq!(probe.counts.flushes.load(Ordering::SeqCst), 0);
+        attached.flush().unwrap();
+        drop(issuer);
+        assert!(
+            matches!(attached.submit(Vec::new(), true), Err(DiskError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(attached.out(), 0);
+        assert!(attached.try_answer().unwrap().is_none());
+    }
+
+    /// Issuer shutdown drains its accepted I/O before the completion sender closes. Those
+    /// already-queued answers remain available to an async wait, one credit per answer.
+    #[test]
+    fn async_answers_already_queued_survive_issuer_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        let mut attached = issuer.attach_deep(&probe, 2).unwrap();
+        let write = attached.submit(writes(1), true).unwrap();
+        let read = attached.submit_reads(reads(1, 1)).unwrap();
+        drop(issuer);
+        assert_eq!(attached.out(), 2);
+        let mut rt = runtime();
+        let attached = rt
+            .block_on(async move {
+                let mut attached = attached;
+                let mut answers = [
+                    attached.answer_async().await.unwrap(),
+                    attached.answer_async().await.unwrap(),
+                ];
+                answers.sort_by_key(|(number, _)| *number);
+                let [(written, buffers), (read_back, failed)] = answers;
+                assert_eq!(written, write);
+                // The write may finish or be refused during shutdown; either is its numbered
+                // answer, and only a completed write returns the original buffers.
+                if let Ok(buffers) = buffers {
+                    assert_eq!(buffers[0].0.as_slice(), &[fill(0); 4096]);
+                }
+                assert_eq!(read_back, read);
+                assert!(failed.is_err());
+                assert_eq!(attached.out(), 0);
+                attached
+            })
+            .unwrap();
+        assert_eq!(attached.out(), 0);
+    }
+
+    /// Channel admission is bounded by the runtime's public cell limit. Isolate that global
+    /// limit in a child process; refusal leaves the issuer usable once capacity is restored.
+    #[test]
+    // The test reruns itself as a child process, the environment marking the child: the global
+    // cell limit it sets must not reach the other tests of this binary.
+    #[allow(clippy::disallowed_methods)]
+    fn completion_channel_capacity_refusal_leaves_the_issuer_usable() {
+        const CHILD: &str = "MANTLE_COMPLETION_CELL_REFUSAL";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "issuer::tests::completion_channel_capacity_refusal_leaves_the_issuer_usable",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::start(Path::new("dev"), 1).unwrap();
+        let probe = Probe::new(dir.path(), true, None);
+        hyper_rt::sync::cell::set_limit(0);
+        assert!(
+            matches!(issuer.attach(&probe), Err(DiskError::Io { source, .. })
+            if matches!(source.get_ref().and_then(|cause| cause.downcast_ref::<hyper_rt::RtError>()),
+                Some(hyper_rt::RtError::Capacity { bound: 0, .. })))
+        );
+        hyper_rt::sync::cell::set_limit(hyper_rt::sync::cell::MAX_CELLS);
+        let mut attached = issuer.attach(&probe).unwrap();
+        let buffers = attached.write(writes(1), true).unwrap();
+        assert_eq!(buffers[0].0.as_slice(), &[fill(0); 4096]);
     }
 
     #[test]

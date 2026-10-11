@@ -4,8 +4,8 @@ use focal_client::watch::{
     WatchAction, WatchDelivery, WatchEngine, WatchJournal, WatchOptions, WatchPage, WatchStore,
 };
 use focal_wire::NativeObject;
-use std::{io, time::Duration};
 use hyper_rt::combine::{Either, race2};
+use std::{io, time::Duration};
 #[derive(Subcommand)]
 pub(crate) enum WatchCommand {
     /// Watch claim facts. No --claim filter means all claims.
@@ -212,9 +212,12 @@ async fn follow_pages(
                 if !idle {
                     continue;
                 }
-                let paced = focal_rt::time::pause(Duration::from_millis(250));
+                let paced = focal_rt::time::sleep(Duration::from_millis(250));
                 let stopped = match race2(paced, interrupt.wait()).await {
-                    Either::First(()) => false,
+                    Either::First(slept) => {
+                        slept.map_err(io::Error::other)?;
+                        false
+                    }
                     Either::Second(signal) => {
                         signal?;
                         true

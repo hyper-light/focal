@@ -44,102 +44,107 @@ async fn confirmed(running: &Running, members: &[u64]) -> crate::liveness::Liven
     .await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on_restart() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = [settings(dirs[0].path()), settings(dirs[1].path())];
-    let founder = Running::start(&founder_settings).await;
-    let (peer_a, node_a) =
-        join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
-    let (peer_b, node_b) =
-        join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
-    let founder_node = founder.status.node;
-    let host = partition_host(&founder).await;
+#[test]
+fn a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on_restart() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = [settings(dirs[0].path()), settings(dirs[1].path())];
+        let founder = Running::start(&founder_settings).await;
+        let (peer_a, node_a) =
+            join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
+        let (peer_b, node_b) =
+            join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
+        let founder_node = founder.status.node;
+        let host = partition_host(&founder).await;
 
-    // Every host confirms the others by acknowledgement and learns a
-    // coordinate from the round trips.
-    let view = confirmed(&founder, &[node_a, node_b]).await;
-    assert!(view.incarnation > 0);
-    assert!(view.counters.probes_sent > 0);
-    assert!(view.counters.confirmations >= 2);
-    confirmed(&peer_a, &[founder_node, node_b]).await;
-    // Its own acknowledged probes place it in the coordinate space; the
-    // founder's probes are answered from the driver's state.
-    let peer_view = view_when(&peer_a, "coordinate learned", |view| {
-        view.coordinate.samples > 0 && view.counters.probes_answered > 0
-    })
-    .await;
-    assert!(peer_view.counters.probes_sent > 0);
-    // Alive is the default: no verdict is committed for a healthy host.
-    let (checkpoint, _, _) = wait_for(&founder, &host, "hosts enrolled", |state| {
-        state.nodes.contains_key(&node_a) && state.nodes.contains_key(&node_b)
-    })
-    .await
-    .expect("service ended");
-    assert!(checkpoint.nodes[&node_b].liveness.is_none());
-    assert!(checkpoint.nodes[&node_b].is_alive());
-
-    // Host b leaves without notice.
-    peer_b.stop().await;
-    let (dead, _, _) = wait_for(&founder, &host, "host-b declared dead", |state| {
-        state
-            .nodes
-            .get(&node_b)
-            .and_then(|record| record.liveness)
-            .is_some_and(|liveness| !liveness.alive)
-    })
-    .await
-    .expect("service ended");
-    let verdict = dead.nodes[&node_b].liveness.unwrap();
-    assert!(!dead.nodes[&node_b].is_alive());
-    assert!(verdict.witness >= 1);
-    assert!(verdict.decided_at > 0);
-    assert_eq!(dead.nodes[&node_b].enrollment.generation, 1);
-    // Host a is untouched by b's loss.
-    assert!(dead.nodes[&node_a].is_alive());
-    let view = founder.handles.liveness.view();
-    assert_eq!(view.member(node_b).unwrap().status, MemberStatus::Dead);
-    assert_eq!(
-        view.member(node_b).unwrap().incarnation,
-        verdict.incarnation
-    );
-    // The death came from probes that timed out and a suspicion that
-    // expired here or a peer's gossiped death of the same incarnation.
-    assert!(view.counters.probe_timeouts >= 1);
-    assert!(view.counters.deaths >= 1);
-    // A death is never duplicated: the committed fact stays at one verdict.
-    focal_rt::time::pause(Duration::from_millis(1500)).await;
-    let (still, _, _) = wait_for(&founder, &host, "verdict stable", |_| true)
+        // Every host confirms the others by acknowledgement and learns a
+        // coordinate from the round trips.
+        let view = confirmed(&founder, &[node_a, node_b]).await;
+        assert!(view.incarnation > 0);
+        assert!(view.counters.probes_sent > 0);
+        assert!(view.counters.confirmations >= 2);
+        confirmed(&peer_a, &[founder_node, node_b]).await;
+        // Its own acknowledged probes place it in the coordinate space; the
+        // founder's probes are answered from the driver's state.
+        let peer_view = view_when(&peer_a, "coordinate learned", |view| {
+            view.coordinate.samples > 0 && view.counters.probes_answered > 0
+        })
+        .await;
+        assert!(peer_view.counters.probes_sent > 0);
+        // Alive is the default: no verdict is committed for a healthy host.
+        let (checkpoint, _, _) = wait_for(&founder, &host, "hosts enrolled", |state| {
+            state.nodes.contains_key(&node_a) && state.nodes.contains_key(&node_b)
+        })
         .await
         .expect("service ended");
-    assert_eq!(still.nodes[&node_b].liveness, Some(verdict));
+        assert!(checkpoint.nodes[&node_b].liveness.is_none());
+        assert!(checkpoint.nodes[&node_b].is_alive());
 
-    // Host b returns with a fresh incarnation and is revived, not re-enrolled.
-    let peer_b = Running::start(&peer_settings[1]).await;
-    let (revived, _, _) = wait_for(&founder, &host, "host-b revived", |state| {
-        state
-            .nodes
-            .get(&node_b)
-            .and_then(|record| record.liveness)
-            .is_some_and(|liveness| liveness.alive)
+        // Host b leaves without notice.
+        peer_b.stop().await;
+        let (dead, _, _) = wait_for(&founder, &host, "host-b declared dead", |state| {
+            state
+                .nodes
+                .get(&node_b)
+                .and_then(|record| record.liveness)
+                .is_some_and(|liveness| !liveness.alive)
+        })
+        .await
+        .expect("service ended");
+        let verdict = dead.nodes[&node_b].liveness.unwrap();
+        assert!(!dead.nodes[&node_b].is_alive());
+        assert!(verdict.witness >= 1);
+        assert!(verdict.decided_at > 0);
+        assert_eq!(dead.nodes[&node_b].enrollment.generation, 1);
+        // Host a is untouched by b's loss.
+        assert!(dead.nodes[&node_a].is_alive());
+        let view = founder.handles.liveness.view();
+        assert_eq!(view.member(node_b).unwrap().status, MemberStatus::Dead);
+        assert_eq!(
+            view.member(node_b).unwrap().incarnation,
+            verdict.incarnation
+        );
+        // The death came from probes that timed out and a suspicion that
+        // expired here or a peer's gossiped death of the same incarnation.
+        assert!(view.counters.probe_timeouts >= 1);
+        assert!(view.counters.deaths >= 1);
+        // A death is never duplicated: the committed fact stays at one verdict.
+        focal_rt::time::sleep(Duration::from_millis(1500))
+            .await
+            .unwrap();
+        let (still, _, _) = wait_for(&founder, &host, "verdict stable", |_| true)
+            .await
+            .expect("service ended");
+        assert_eq!(still.nodes[&node_b].liveness, Some(verdict));
+
+        // Host b returns with a fresh incarnation and is revived, not re-enrolled.
+        let peer_b = Running::start(&peer_settings[1]).await;
+        let (revived, _, _) = wait_for(&founder, &host, "host-b revived", |state| {
+            state
+                .nodes
+                .get(&node_b)
+                .and_then(|record| record.liveness)
+                .is_some_and(|liveness| liveness.alive)
+        })
+        .await
+        .expect("service ended");
+        let revival = revived.nodes[&node_b].liveness.unwrap();
+        assert!(revival.incarnation > verdict.incarnation);
+        assert!(revival.decided_at >= verdict.decided_at);
+        assert_eq!(revived.nodes[&node_b].enrollment.generation, 1);
+        assert!(revived.nodes[&node_b].is_alive());
+        let view = founder.handles.liveness.view();
+        assert!(view.counters.revivals >= 1);
+        // Host a sees the same membership through its own probes and gossip.
+        let peer_view = confirmed(&peer_a, &[founder_node, node_b]).await;
+        assert!(peer_view.member(node_b).unwrap().incarnation >= revival.incarnation);
+        peer_b.stop().await;
+        peer_a.stop().await;
+        founder.stop().await;
     })
-    .await
-    .expect("service ended");
-    let revival = revived.nodes[&node_b].liveness.unwrap();
-    assert!(revival.incarnation > verdict.incarnation);
-    assert!(revival.decided_at >= verdict.decided_at);
-    assert_eq!(revived.nodes[&node_b].enrollment.generation, 1);
-    assert!(revived.nodes[&node_b].is_alive());
-    let view = founder.handles.liveness.view();
-    assert!(view.counters.revivals >= 1);
-    // Host a sees the same membership through its own probes and gossip.
-    let peer_view = confirmed(&peer_a, &[founder_node, node_b]).await;
-    assert!(peer_view.member(node_b).unwrap().incarnation >= revival.incarnation);
-    peer_b.stop().await;
-    peer_a.stop().await;
-    founder.stop().await;
+    .unwrap()
 }
 
 fn probe(sender: u64, generation: u64, sequence: u64, config: &LivenessConfig) -> ProbeRequest {
@@ -164,111 +169,117 @@ async fn answer(handle: &LivenessHandle, peer: u64, request: &ProbeRequest) -> P
     ProbeReply::decode(&bytes, &handle.config().vivaldi).unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn probes_bind_their_sender_refute_self_suspicion_and_ration_extensions() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = settings(dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let (peer_a, node_a) = join_peer(&founder, founder_dir.path(), "host-a", &peer_settings).await;
-    let founder_node = founder.status.node;
-    let view = confirmed(&founder, &[node_a]).await;
-    let handle = &founder.handles.liveness;
-    let config = *handle.config();
-    let member = *view.member(node_a).unwrap();
+#[test]
+fn probes_bind_their_sender_refute_self_suspicion_and_ration_extensions() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = settings(dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let (peer_a, node_a) =
+            join_peer(&founder, founder_dir.path(), "host-a", &peer_settings).await;
+        let founder_node = founder.status.node;
+        let view = confirmed(&founder, &[node_a]).await;
+        let handle = &founder.handles.liveness;
+        let config = *handle.config();
+        let member = *view.member(node_a).unwrap();
 
-    // A probe speaks only for the node the certificate authorized.
-    let request = probe(node_a, member.generation, 7, &config);
-    assert_eq!(
-        handle
-            .answer(founder_node, &request.encode().unwrap())
+        // A probe speaks only for the node the certificate authorized.
+        let request = probe(node_a, member.generation, 7, &config);
+        assert_eq!(
+            handle
+                .answer(founder_node, &request.encode().unwrap())
+                .await
+                .unwrap_err(),
+            crate::liveness::ProbeError::Invalid
+        );
+        let reply = answer(handle, node_a, &request).await;
+        assert_eq!(reply.outcome, ProbeOutcome::Ack);
+        assert_eq!(reply.node, founder_node);
+        assert_eq!(reply.sequence, 7);
+        assert_eq!(reply.generation, view.generation);
+        assert_eq!(reply.incarnation, view.incarnation);
+        assert!(reply.extension.is_none());
+
+        // A loaded member asks for time: granted once with witnessed progress,
+        // rate-limited within a period, refused while it reports overload.
+        let mut request = probe(node_a, member.generation, 8, &config);
+        request.extension = Some(ExtensionRequest {
+            incarnation: member.incarnation,
+            witness: 1,
+            overloaded: false,
+        });
+        let reply = answer(handle, node_a, &request).await;
+        let Some(ExtensionOutcome::Granted { millis }) = reply.extension else {
+            panic!("first extension is granted: {:?}", reply.extension);
+        };
+        assert!(millis >= config.extension_min_grant_ms);
+        let after = handle.view();
+        assert_eq!(after.member(node_a).unwrap().extensions, 1);
+        assert_eq!(after.member(node_a).unwrap().extended_ms, millis);
+        assert_eq!(after.counters.extensions_granted, 1);
+        assert!(after.events.iter().any(|event| {
+            matches!(event, LivenessEvent::ExtensionGranted { node, .. } if *node == node_a)
+        }));
+        request.sequence = 9;
+        request.extension = Some(ExtensionRequest {
+            incarnation: member.incarnation,
+            witness: 2,
+            overloaded: false,
+        });
+        let reply = answer(handle, node_a, &request).await;
+        assert_eq!(reply.extension, Some(ExtensionOutcome::Denied));
+        focal_rt::time::sleep(config.period + Duration::from_millis(50))
             .await
-            .unwrap_err(),
-        crate::liveness::ProbeError::Invalid
-    );
-    let reply = answer(handle, node_a, &request).await;
-    assert_eq!(reply.outcome, ProbeOutcome::Ack);
-    assert_eq!(reply.node, founder_node);
-    assert_eq!(reply.sequence, 7);
-    assert_eq!(reply.generation, view.generation);
-    assert_eq!(reply.incarnation, view.incarnation);
-    assert!(reply.extension.is_none());
+            .unwrap();
+        request.sequence = 10;
+        request.extension = Some(ExtensionRequest {
+            incarnation: member.incarnation,
+            witness: 3,
+            overloaded: true,
+        });
+        let reply = answer(handle, node_a, &request).await;
+        assert_eq!(reply.extension, Some(ExtensionOutcome::Denied));
+        assert_eq!(handle.view().member(node_a).unwrap().extensions, 1);
+        assert_eq!(handle.view().counters.extensions_denied, 2);
 
-    // A loaded member asks for time: granted once with witnessed progress,
-    // rate-limited within a period, refused while it reports overload.
-    let mut request = probe(node_a, member.generation, 8, &config);
-    request.extension = Some(ExtensionRequest {
-        incarnation: member.incarnation,
-        witness: 1,
-        overloaded: false,
-    });
-    let reply = answer(handle, node_a, &request).await;
-    let Some(ExtensionOutcome::Granted { millis }) = reply.extension else {
-        panic!("first extension is granted: {:?}", reply.extension);
-    };
-    assert!(millis >= config.extension_min_grant_ms);
-    let after = handle.view();
-    assert_eq!(after.member(node_a).unwrap().extensions, 1);
-    assert_eq!(after.member(node_a).unwrap().extended_ms, millis);
-    assert_eq!(after.counters.extensions_granted, 1);
-    assert!(after.events.iter().any(|event| {
-        matches!(event, LivenessEvent::ExtensionGranted { node, .. } if *node == node_a)
-    }));
-    request.sequence = 9;
-    request.extension = Some(ExtensionRequest {
-        incarnation: member.incarnation,
-        witness: 2,
-        overloaded: false,
-    });
-    let reply = answer(handle, node_a, &request).await;
-    assert_eq!(reply.extension, Some(ExtensionOutcome::Denied));
-    focal_rt::time::pause(config.period + Duration::from_millis(50)).await;
-    request.sequence = 10;
-    request.extension = Some(ExtensionRequest {
-        incarnation: member.incarnation,
-        witness: 3,
-        overloaded: true,
-    });
-    let reply = answer(handle, node_a, &request).await;
-    assert_eq!(reply.extension, Some(ExtensionOutcome::Denied));
-    assert_eq!(handle.view().member(node_a).unwrap().extensions, 1);
-    assert_eq!(handle.view().counters.extensions_denied, 2);
-
-    // Gossip that suspects this node at its incarnation is refuted by moving
-    // past it; the refutation rides the answer.
-    let before = handle.view().incarnation;
-    let mut request = probe(node_a, member.generation, 11, &config);
-    request.updates = vec![LivenessUpdate {
-        node: founder_node,
-        generation: view.generation,
-        incarnation: before,
-        status: MemberStatus::Suspect,
-        origin: node_a,
-    }];
-    let reply = answer(handle, node_a, &request).await;
-    assert_eq!(reply.incarnation, before + 1);
-    assert!(reply.updates.iter().any(|update| {
-        update.node == founder_node
-            && update.status == MemberStatus::Alive
-            && update.incarnation == before + 1
-    }));
-    let after = handle.view();
-    assert_eq!(after.incarnation, before + 1);
-    assert_eq!(after.counters.self_refutations, 1);
-    assert!(after.events.iter().any(|event| {
-        matches!(
-            event,
-            LivenessEvent::SelfRefutation { incarnation, accuser }
-                if *incarnation == before + 1 && *accuser == node_a
-        )
-    }));
-    // Stale gossip about an older incarnation changes nothing.
-    request.sequence = 12;
-    let reply = answer(handle, node_a, &request).await;
-    assert_eq!(reply.incarnation, before + 1);
-    peer_a.stop().await;
-    founder.stop().await;
+        // Gossip that suspects this node at its incarnation is refuted by moving
+        // past it; the refutation rides the answer.
+        let before = handle.view().incarnation;
+        let mut request = probe(node_a, member.generation, 11, &config);
+        request.updates = vec![LivenessUpdate {
+            node: founder_node,
+            generation: view.generation,
+            incarnation: before,
+            status: MemberStatus::Suspect,
+            origin: node_a,
+        }];
+        let reply = answer(handle, node_a, &request).await;
+        assert_eq!(reply.incarnation, before + 1);
+        assert!(reply.updates.iter().any(|update| {
+            update.node == founder_node
+                && update.status == MemberStatus::Alive
+                && update.incarnation == before + 1
+        }));
+        let after = handle.view();
+        assert_eq!(after.incarnation, before + 1);
+        assert_eq!(after.counters.self_refutations, 1);
+        assert!(after.events.iter().any(|event| {
+            matches!(
+                event,
+                LivenessEvent::SelfRefutation { incarnation, accuser }
+                    if *incarnation == before + 1 && *accuser == node_a
+            )
+        }));
+        // Stale gossip about an older incarnation changes nothing.
+        request.sequence = 12;
+        let reply = answer(handle, node_a, &request).await;
+        assert_eq!(reply.incarnation, before + 1);
+        peer_a.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 #[test]

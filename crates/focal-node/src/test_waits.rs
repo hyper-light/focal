@@ -70,9 +70,12 @@ pub(crate) async fn charged<F: Future>(
     );
     let mut what = std::pin::pin!(what);
     loop {
-        match hyper_rt::combine::race2(what.as_mut(), focal_rt::time::pause(tick)).await {
+        match hyper_rt::combine::race2(what.as_mut(), focal_rt::time::sleep(tick)).await {
             hyper_rt::combine::Either::First(output) => return Ok(output),
-            hyper_rt::combine::Either::Second(()) => wait.check(&counters())?,
+            hyper_rt::combine::Either::Second(slept) => {
+                slept.expect("a test waits on its shard");
+                wait.check(&counters())?;
+            }
         }
     }
 }

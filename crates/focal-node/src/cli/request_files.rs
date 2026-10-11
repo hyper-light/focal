@@ -127,11 +127,7 @@ pub(super) fn check(path: &Path) -> Result<()> {
         "locally checked; authentication, authority, epoch admission and server acceptance unchecked",
     )
 }
-pub(super) async fn send(
-    settings: &Settings,
-    selection: Option<&str>,
-    file: &Path,
-) -> Result<()> {
+pub(super) async fn send(settings: &Settings, selection: Option<&str>, file: &Path) -> Result<()> {
     // Preserve the original expert `request FILE` transport path, including its
     // 1 MiB JSON bound and complete wire operation surface. `check` is a separate
     // stricter offline tool; it is not an authority gate on existing raw clients.

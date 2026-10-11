@@ -117,7 +117,7 @@ impl<T: ClientTransport> Client<T> {
         {
             return Err(ClaimWaitError::InvalidRequest);
         }
-        // Contain a missing Tokio time driver without leaking an in-flight read.
+        // Contain a dependency's panic without leaking an in-flight read.
         let future = self.wait_inner(request, until, timeout.min(self.retry_timeout()));
         let mut future = pin!(future);
         poll_fn(

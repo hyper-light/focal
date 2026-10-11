@@ -445,7 +445,9 @@ impl Invitation {
         )?;
         self.request(key, now)
     }
-    pub(crate) fn request(&self, key: &JoinKey, now: i64) -> Result<JoinRequest, EnrollmentError> {
+    /// The join request this invitation makes for `key` at `now`: what a joiner sends once its
+    /// connection's leaf has passed the invitation's pins.
+    pub fn request(&self, key: &JoinKey, now: i64) -> Result<JoinRequest, EnrollmentError> {
         if self.data.cluster != key.cluster() {
             return Err(EnrollmentError::WrongCluster);
         }

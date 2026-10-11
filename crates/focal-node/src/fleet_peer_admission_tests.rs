@@ -11,7 +11,7 @@ fn node_peer(node: u64) -> AuthenticatedPeer {
     })
     .unwrap()
 }
-fn summary(fixture: &mut Fixture, id: u128) -> oneshot::Receiver<OwnedResponse> {
+fn summary(fixture: &mut Fixture, id: u128) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let owner = &mut fixture.owners[0];
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -27,14 +27,14 @@ fn summary(fixture: &mut Fixture, id: u128) -> oneshot::Receiver<OwnedResponse> 
         .reserve(BudgetKind::Query, BudgetLane::Ordinary, 64 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
 /// Every frame owner `from` sent, as (target, request).
 fn sent(fixture: &mut Fixture, from: usize) -> Vec<(u64, RequestEnvelope)> {
     let mut frames = Vec::new();
-    while let Ok(frame) = fixture.outgoing[from].try_recv() {
+    while let Ok(Some(frame)) = fixture.outgoing[from].try_recv() {
         frames.push((frame.target, frame.request));
     }
     frames
@@ -45,7 +45,7 @@ fn ingress(
     fixture: &mut Fixture,
     from: u64,
     request: RequestEnvelope,
-) -> oneshot::Receiver<OwnedResponse> {
+) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let owner = &mut fixture.owners[0];
     let verified = verify_request(node_peer(from), request, &owner.limits).unwrap();
     let charge = owner
@@ -53,7 +53,7 @@ fn ingress(
         .reserve(BudgetKind::Query, BudgetLane::Completion, 64 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
@@ -67,14 +67,11 @@ fn a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on() {
     // the leader's read barrier, a quorum of heartbeat answers.
     let mut waiting = summary(&mut fixture, 1);
     fixture.owners[0].drain().unwrap();
-    assert!(matches!(
-        waiting.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(waiting.try_recv(), Ok(None)));
     // A second participant is refused: the participants' bound holds.
     let mut second = summary(&mut fixture, 2);
     assert!(matches!(
-        second.try_recv().unwrap().envelope().result,
+        second.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Capacity)
     ));
     // The leader's heartbeats, carrying the read's context, reach the
@@ -107,7 +104,7 @@ fn a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on() {
     for receiver in &mut answered {
         assert!(
             matches!(
-                receiver.try_recv().unwrap().envelope().result,
+                receiver.try_recv().unwrap().unwrap().envelope().result,
                 Response::PeerAccepted
             ),
             "a peer's acknowledgment is admitted beside the full participant queue"
@@ -118,7 +115,7 @@ fn a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on() {
         fixture.pump();
     }
     assert!(matches!(
-        waiting.try_recv().unwrap().envelope().result,
+        waiting.try_recv().unwrap().unwrap().envelope().result,
         Response::Summary(_)
     ));
     // The peers' admission is bounded too: the members' in-flight windows.
@@ -158,7 +155,7 @@ fn deliver(
     fixture: &mut Fixture,
     to: u64,
     request: RequestEnvelope,
-) -> oneshot::Receiver<OwnedResponse> {
+) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let owner = &mut fixture.owners[usize::try_from(to - 1).unwrap()];
     let verified = verify_request(node_peer(1), request, &owner.limits).unwrap();
     let charge = owner
@@ -166,7 +163,7 @@ fn deliver(
         .reserve(BudgetKind::Query, BudgetLane::Completion, 64 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
@@ -212,16 +209,10 @@ fn a_frame_that_comes_while_the_write_is_in_flight_waits_for_it() {
     assert_eq!(fixture.owners[1].waiting_frames.len(), 1, "it waits");
     assert_eq!(fixture.owners[1].frames_waited, 1);
     assert!(
-        matches!(
-            second_answer.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ),
+        matches!(second_answer.try_recv(), Ok(None)),
         "a frame that waits is not refused"
     );
-    assert!(matches!(
-        first_answer.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(first_answer.try_recv(), Ok(None)));
     drop(pause);
     let owner = &mut fixture.owners[1];
     let mut wait = focal_timing::ProgressDeadline::begin(
@@ -243,7 +234,7 @@ fn a_frame_that_comes_while_the_write_is_in_flight_waits_for_it() {
     for answer in [&mut first_answer, &mut second_answer] {
         assert!(
             matches!(
-                answer.try_recv().unwrap().envelope().result,
+                answer.try_recv().unwrap().unwrap().envelope().result,
                 Response::PeerAccepted
             ),
             "both appends are taken and answered at the fence"
@@ -301,10 +292,7 @@ fn a_frame_let_go_while_the_write_is_in_flight_waits_for_it() {
     assert!(owner.session.persistence_pending());
     assert_eq!(owner.waiting_frames.len(), 1, "it waits for the write");
     assert!(
-        matches!(
-            third_answer.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ),
+        matches!(third_answer.try_recv(), Ok(None)),
         "a frame let go into a write in flight is not refused"
     );
     drop(pause);
@@ -326,7 +314,7 @@ fn a_frame_let_go_while_the_write_is_in_flight_waits_for_it() {
     }
     for answer in [&mut first_answer, &mut third_answer] {
         assert!(matches!(
-            answer.try_recv().unwrap().envelope().result,
+            answer.try_recv().unwrap().unwrap().envelope().result,
             Response::PeerAccepted
         ));
     }

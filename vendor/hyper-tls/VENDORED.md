@@ -488,3 +488,22 @@ client against `openssl s_server`, and `openssl s_client` against a hyper-tls se
 the group negotiated and the chain verified. Both pass. CI's runners carry OpenSSL 3.0, which has no
 ML-KEM, so the tests are `#[ignore]` and run by hand: `cargo test -p hyper-tls --test
 openssl_interop -- --ignored`. slates ships the same group, checked against OpenSSL 3.5.7 both ways.
+
+## 9. Sending is not recursive (2026-10-10)
+
+- **The exhaustion close.** On TLS 1.2, a connection whose record sequence space ran out sent
+  `close_notify` from inside `send_single_fragment` through `send_close_notify`. That re-entered
+  the path that called it: `send_warning_alert_no_log` → `send_msg` → `send_msg_encrypt` →
+  `send_single_fragment`.
+  - At runtime the alert took the alert branch and the recursion stopped at one level, but the
+    call graph had a cycle. focal's owner banned runtime recursion in its implementation and the
+    crates it vendors (2026-10-10).
+  - `close_on_exhausted_keys` now queues the `close_notify` through the alert branch directly,
+    encrypted. As `send_close_notify` does, it sets the same flags and queues nothing once a
+    `close_notify` or a fatal alert was sent.
+- **Oracle.** `tls12_connection_fails_after_key_reaches_confidentiality_limit` and every
+  close_notify test in `tests/api.rs` pass unchanged. The record after the limit is still never
+  sent, and the peer reads the end of the stream.
+- **Checked.** hyper-tls's own IR at opt-level 0 holds no cycle through hyper-tls code (focal's
+  `scripts/check_recursion.py`). The six cycles left are inside the standard library's own
+  generic code it instantiates.

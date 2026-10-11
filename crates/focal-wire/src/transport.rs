@@ -698,6 +698,16 @@ impl QuicConnector {
             offers: OFFERED_PROTOCOLS.to_vec(),
         })
     }
+    /// A connector that is its own owner — a client's, a join's — its endpoint funded by a budget
+    /// of its own sized to `limits` ([`endpoint_budget`]).
+    pub fn bind_standalone(
+        address: SocketAddr,
+        tls: ClientTls,
+        limits: WireLimits,
+    ) -> Result<Self, WireError> {
+        let budget = endpoint_budget(&limits, None)?;
+        Self::bind(address, tls, limits, budget)
+    }
     /// A connector that offers only `versions` in its Hello: what a
     /// connector of an older binary offers, for a fleet's tests of a mixed
     /// window (27 §12). The base profile is always among them.
@@ -1202,6 +1212,9 @@ pub async fn resolve_all(
     let (host, port) = endpoint.rsplit_once(':').ok_or(WireError::Connection)?;
     let port: u16 = port.parse().map_err(|_| WireError::Connection)?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    // Off a shard the wait for an answer cannot be kept: refused before any lookup is asked of
+    // the pool, which would run it for nobody.
+    crate::require_runtime()?;
     // Resolution runs on the process's blocking pool, under its share: started here once, so no
     // caller of a name depends on another having started it.
     focal_rt::blocking().map_err(|_| WireError::Connection)?;

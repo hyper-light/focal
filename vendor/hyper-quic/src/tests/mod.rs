@@ -112,6 +112,42 @@ fn pending_incoming_can_retry_after_disabling_server() {
     );
 }
 
+/// A server replaces its configuration again and again while every connection it accepted under
+/// an earlier one stays up, as a node's peers hold their connections across its certificate
+/// renewals: each replacement is taken, every connection still carries data, and the endpoint holds
+/// its current configuration alone. A connection is lent the configuration it was accepted under
+/// only through its handshake, so a replaced one lives no longer than the handshakes begun under
+/// it.
+#[test]
+fn server_config_replacements_outlast_the_connections_accepted_under_them() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_config = pair.add_client_config(client_config());
+    let replacements = EndpointConfig::default()
+        .config_slots
+        .get()
+        .saturating_mul(2);
+    let mut connections = Vec::new();
+    for _ in 0..replacements {
+        connections.push(pair.connect_with_shared(client_config));
+        pair.server
+            .set_server_config(Some(server_config()))
+            .expect("a replacement is taken while connections accepted under earlier ones live");
+    }
+    pair.drive();
+    assert_eq!(pair.server.configs().len(), 1);
+    for (client_ch, server_ch) in connections {
+        let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+        pair.client_send(client_ch, s).write(b"hello").unwrap();
+        pair.client_send(client_ch, s).finish().unwrap();
+        pair.drive();
+        assert_matches!(
+            pair.server_conn_mut(server_ch).poll(),
+            Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+        );
+    }
+}
+
 #[test]
 fn version_negotiate_server() {
     let _guard = subscribe();

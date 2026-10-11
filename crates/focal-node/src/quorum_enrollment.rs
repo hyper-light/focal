@@ -7,6 +7,7 @@ use focal_enrollment::*;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ParticipantId, RequestId, TenantId};
 use focal_wire::{AuthenticatedPeer, PeerGrant, PeerRole};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -15,7 +16,6 @@ use std::{
     pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 
 /// A control call's future: awaited by the signer on its shard, never moved
 /// to another thread.
@@ -305,7 +305,8 @@ impl QuorumEnrollmentHost {
         if request.is_zero() || intent.endpoint.len() > 512 {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Invite(request, intent, send), 4096)?;
         receive
             .await
@@ -317,7 +318,8 @@ impl QuorumEnrollmentHost {
         request: JoinRequest,
     ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
         let bytes = request.encode()?.len();
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Redeem(request, send), bytes)?;
         receive
             .await
@@ -331,7 +333,8 @@ impl QuorumEnrollmentHost {
         request: RenewRequest,
     ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
         let bytes = request.encode()?.len();
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Renew(request, send), bytes)?;
         receive
             .await
@@ -339,7 +342,8 @@ impl QuorumEnrollmentHost {
             .result
     }
     pub async fn revoke(&self, invitation: InvitationId) -> Result<(), QuorumEnrollmentError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Revoke(invitation, send), 16)?;
         receive
             .await
@@ -353,7 +357,8 @@ impl QuorumEnrollmentHost {
         if tenant == [0; 16] {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::AdmitTenant(tenant, send), 16)?;
         receive
             .await
@@ -370,7 +375,8 @@ impl QuorumEnrollmentHost {
         if level == 0 {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::ActivateFence(level, send), 16)?;
         receive
             .await
@@ -386,7 +392,8 @@ impl QuorumEnrollmentHost {
         &self,
         now: i64,
     ) -> Result<Option<CredentialMaterial>, QuorumEnrollmentError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::MaintainBootstrapServer(now, send), 4096)?;
         receive
             .await
@@ -401,7 +408,8 @@ impl QuorumEnrollmentHost {
         &self,
         now: i64,
     ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::MaintainIssuer(now, false, send), 8192)?;
         receive
             .await
@@ -416,7 +424,8 @@ impl QuorumEnrollmentHost {
         &self,
         now: i64,
     ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::MaintainIssuer(now, true, send), 8192)?;
         receive
             .await
@@ -431,7 +440,8 @@ impl QuorumEnrollmentHost {
             return Err(EnrollmentError::Capacity.into());
         }
         let bytes = certificate.len();
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Authorize(certificate, send), bytes)?;
         receive
             .await
@@ -439,7 +449,8 @@ impl QuorumEnrollmentHost {
             .result
     }
     pub async fn stop(&self) -> Result<(), QuorumEnrollmentError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Stop(send), 0)?;
         receive.await.map_err(|_| QuorumEnrollmentError::Stopped)
     }

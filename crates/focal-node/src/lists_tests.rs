@@ -376,30 +376,33 @@ fn visit_bytes_and_response_bytes_stop_before_materializing_an_oversized_object(
     }
 }
 
-#[tokio::test]
-async fn local_owner_lists_under_actor_authority_and_preserves_reply_charge() {
-    let root = tempfile::tempdir().unwrap();
-    let node = fixture(root.path());
-    let actor = peer(&node);
-    let ledger = node.identity.ledger;
-    let (host, owner) = crate::host::LocalHost::spawn(node, WireLimits::default()).unwrap();
-    let request = RequestEnvelope {
-        protocol: PROTOCOL_VERSION,
-        ledger,
-        route_epoch: RouteEpoch(1),
-        request_epoch: RequestEpoch(1),
-        request_id: RequestId::from_u128(1),
-        operation: Operation::List(query(ObjectKind::Validation)),
-    };
-    let reply = dispatch_accounted(&host, actor, request.clone(), &WireLimits::default()).await;
-    let Response::Listed(page) = &reply.envelope().result else {
-        panic!("{:?}", reply.envelope())
-    };
-    assert_eq!(page.objects.len(), 2);
-    validate_response(&request, reply.envelope(), None, &WireLimits::default()).unwrap();
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(page.objects.len(), 2); // delivered snapshot materialization outlives owner
+#[test]
+fn local_owner_lists_under_actor_authority_and_preserves_reply_charge() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let node = fixture(root.path());
+        let actor = peer(&node);
+        let ledger = node.identity.ledger;
+        let (host, owner) = crate::host::LocalHost::spawn(node, WireLimits::default()).unwrap();
+        let request = RequestEnvelope {
+            protocol: PROTOCOL_VERSION,
+            ledger,
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(1),
+            operation: Operation::List(query(ObjectKind::Validation)),
+        };
+        let reply = dispatch_accounted(&host, actor, request.clone(), &WireLimits::default()).await;
+        let Response::Listed(page) = &reply.envelope().result else {
+            panic!("{:?}", reply.envelope())
+        };
+        assert_eq!(page.objects.len(), 2);
+        validate_response(&request, reply.envelope(), None, &WireLimits::default()).unwrap();
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(page.objects.len(), 2); // delivered snapshot materialization outlives owner
+    })
+    .unwrap()
 }
 
 #[test]

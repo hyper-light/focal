@@ -27,6 +27,7 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use hyper_quic::congestion::Congestion;
@@ -458,6 +459,22 @@ fn refusal_of(reason: &ConnectionError) -> Option<Refusal> {
     }
 }
 
+/// The configuration slots an endpoint under `admission` needs, so that replacing its TLS
+/// ([`Endpoint::set_tls`]) is never refused for the configurations it still holds: one current
+/// server and one current client configuration, and while they are replaced their replacements,
+/// four; beside them each replaced configuration still held has a holder, a server's an inbound
+/// handshake begun under it (`pending` at most), a client's a dial or a connection made with it
+/// (within `connections`). A connection a server accepted holds its configuration no longer than
+/// its handshake (hyper-quic's `Configs`).
+fn config_slots(admission: &AdmissionLimits) -> Result<NonZeroUsize, Refusal> {
+    admission
+        .connections
+        .checked_add(admission.pending)
+        .and_then(|held| held.checked_add(4))
+        .and_then(NonZeroUsize::new)
+        .ok_or(Refusal::Configuration)
+}
+
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, B, D> {
     /// An endpoint for `config`, holding its bytes against `budget` and naming peers by
     /// `directory`. `now` is the caller's clock.
@@ -470,8 +487,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
-        let mut quic = hyper_quic::Endpoint::new(EndpointConfig::default(), server, true, None)
-            .map_err(|_| Refusal::Quic)?;
+        let mut endpoint = EndpointConfig::default();
+        endpoint.config_slots(config_slots(&config.limits.admission)?);
+        let mut quic =
+            hyper_quic::Endpoint::new(endpoint, server, true, None).map_err(|_| Refusal::Quic)?;
         let client = quic
             .insert_client_config(client)
             .map_err(|_| Refusal::Quic)?;

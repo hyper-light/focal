@@ -331,10 +331,7 @@ fn absolute(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) async fn run(
-    settings: &Settings,
-    command: ContextCommand,
-) -> Result<()> {
+pub(crate) async fn run(settings: &Settings, command: ContextCommand) -> Result<()> {
     if let ContextCommand::Enroll { name, invite_file } = command {
         return enroll(settings, &name, &invite_file).await;
     }
@@ -606,11 +603,7 @@ impl ClientTransport for Transport {
                         }
                         .parse()
                         .map_err(|_| WireError::Connection)?;
-                        let made = remote
-                            .tls
-                            .lock()
-                            .map_err(|_| WireError::Connection)?
-                            .take();
+                        let made = remote.tls.lock().map_err(|_| WireError::Connection)?.take();
                         let (tls, adopted) = match made {
                             Some(made) => made,
                             None => (remote.remake)()?,
@@ -620,12 +613,8 @@ impl ClientTransport for Transport {
                         }
                         // The context's endpoint is its own owner: it dials
                         // the routes it is sent to, and nothing else.
-                        let connector = QuicConnector::bind(
-                            address,
-                            tls,
-                            remote.limits.clone(),
-                            focal_wire::endpoint_budget(&remote.limits, None)?,
-                        )?;
+                        let connector =
+                            QuicConnector::bind_standalone(address, tls, remote.limits.clone())?;
                         let transport = QuicTransport::new(connector, remote.initial.clone(), 16)?;
                         remote
                             .transport
@@ -844,11 +833,7 @@ pub(super) fn now() -> Result<i64> {
     )
     .map_err(|_| InputError::Invalid("system time is out of range").into())
 }
-async fn enroll(
-    settings: &Settings,
-    selected: &str,
-    invitation: &Path,
-) -> Result<()> {
+async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Result<()> {
     use focal_enrollment::{EnrollmentClient, TransportLimits};
     use focal_node::network_join::{ClientInvitation, PendingClientJoin};
     name(selected)?;
@@ -913,7 +898,8 @@ async fn enroll(
         let result = pending.redeem(&client, now()?).await.map_err(other);
         client.close();
         result
-    }.await?;
+    }
+    .await?;
     super::super::print_json(&serde_json::json!({"condition":"Enrolled","name":selected,"principal":ParticipantId(receipt.identity.principal),"request_id":pending.request_id(),"selected":false})).map_err(CliError::Other)
 }
 /// A secret credential (a private key) must be reachable only by its owner:

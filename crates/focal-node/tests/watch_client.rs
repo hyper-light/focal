@@ -75,8 +75,7 @@ impl Fixture {
         self.owner.join().unwrap();
     }
 }
-fn delivery(
-    runtime: &tokio::runtime::Runtime,
+async fn delivery(
     client: &Client<EmbeddedTransport<LocalHost>>,
     journal: &mut WatchJournal,
 ) -> WatchDelivery {
@@ -84,8 +83,9 @@ fn delivery(
         match journal.next_action(&mut random).unwrap() {
             WatchAction::Delivery => return journal.delivery().unwrap().clone(),
             WatchAction::Request(action) => {
-                let reply = runtime
-                    .block_on(client.request(action.request.clone()))
+                let reply = client
+                    .request(action.request.clone())
+                    .await
                     .unwrap_or_else(|error| {
                         panic!("watch request {:?}: {error:?}", action.request.operation)
                     });
@@ -97,280 +97,281 @@ fn delivery(
 }
 #[test]
 fn lost_delivery_and_lost_ack_recover_exactly_without_advancing_unconsumed_data() {
-    let root = tempfile::tempdir().unwrap();
-    let local = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let fixture = Fixture::start(root.path());
-    let store = WatchStore::open(local.path(), fixture.context).unwrap();
-    let mut watch = store
-        .create(
-            "changes",
-            WatchOptions {
-                seed: false,
-                max_items: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let first = delivery(&runtime, &fixture.client, &mut watch);
-    assert_eq!(first.number, 1);
-    assert_eq!(watch.status().acknowledged, 0);
-    assert!(matches!(
-        watch.acknowledge(ContentHash([1; 32])),
-        Err(WatchError::DeliveryMismatch)
-    ));
-    drop(watch);
-    drop(store);
-    let context = fixture.context;
-    fixture.stop();
-    let fixture = Fixture::start(root.path());
-    let store = WatchStore::open(local.path(), context).unwrap();
-    let mut watch = store.resume("changes").unwrap();
-    assert_eq!(watch.delivery(), Some(&first));
-    assert!(matches!(
-        watch.next_action(&mut random).unwrap(),
-        WatchAction::Delivery
-    ));
-    watch.acknowledge(first.id).unwrap();
-    drop(watch);
-    let mut watch = store.resume("changes").unwrap();
-    watch.acknowledge(first.id).unwrap();
-    assert_eq!(watch.status().acknowledged, 1);
-    let next = delivery(&runtime, &fixture.client, &mut watch);
-    assert_eq!(next.number, 2);
-    assert_ne!(next.id, first.id);
-    // More than the four-slot window can pass only after each consumed page's
-    // exact receipt is retired. There is no manual epoch/floor ceremony.
-    for _ in 0..12 {
-        let id = watch.delivery().unwrap().id;
-        watch.acknowledge(id).unwrap();
-        let _ = delivery(&runtime, &fixture.client, &mut watch);
-    }
-    drop(watch);
-    fixture.stop();
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fixture = Fixture::start(root.path());
+        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let mut watch = store
+            .create(
+                "changes",
+                WatchOptions {
+                    seed: false,
+                    max_items: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first = delivery(&fixture.client, &mut watch).await;
+        assert_eq!(first.number, 1);
+        assert_eq!(watch.status().acknowledged, 0);
+        assert!(matches!(
+            watch.acknowledge(ContentHash([1; 32])),
+            Err(WatchError::DeliveryMismatch)
+        ));
+        drop(watch);
+        drop(store);
+        let context = fixture.context;
+        fixture.stop();
+        let fixture = Fixture::start(root.path());
+        let store = WatchStore::open(local.path(), context).unwrap();
+        let mut watch = store.resume("changes").unwrap();
+        assert_eq!(watch.delivery(), Some(&first));
+        assert!(matches!(
+            watch.next_action(&mut random).unwrap(),
+            WatchAction::Delivery
+        ));
+        watch.acknowledge(first.id).unwrap();
+        drop(watch);
+        let mut watch = store.resume("changes").unwrap();
+        watch.acknowledge(first.id).unwrap();
+        assert_eq!(watch.status().acknowledged, 1);
+        let next = delivery(&fixture.client, &mut watch).await;
+        assert_eq!(next.number, 2);
+        assert_ne!(next.id, first.id);
+        // More than the four-slot window can pass only after each consumed page's
+        // exact receipt is retired. There is no manual epoch/floor ceremony.
+        for _ in 0..12 {
+            let id = watch.delivery().unwrap().id;
+            watch.acknowledge(id).unwrap();
+            let _ = delivery(&fixture.client, &mut watch).await;
+        }
+        drop(watch);
+        fixture.stop();
+    })
+    .unwrap()
 }
 #[test]
 fn lost_network_reply_keeps_exact_request_and_missing_journal_cannot_recreate() {
-    let root = tempfile::tempdir().unwrap();
-    let local = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let fixture = Fixture::start(root.path());
-    let store = WatchStore::open(local.path(), fixture.context).unwrap();
-    let mut watch = store
-        .create(
-            "unknown",
-            WatchOptions {
-                seed: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let original = loop {
-        let WatchAction::Request(action) = watch.next_action(&mut random).unwrap() else {
-            panic!("request expected")
-        };
-        let reply = runtime
-            .block_on(fixture.client.request(action.request.clone()))
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fixture = Fixture::start(root.path());
+        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let mut watch = store
+            .create(
+                "unknown",
+                WatchOptions {
+                    seed: false,
+                    ..Default::default()
+                },
+            )
             .unwrap();
-        if matches!(action.request.operation, Operation::Managed { .. }) {
-            break action.request;
-        }
+        let original = loop {
+            let WatchAction::Request(action) = watch.next_action(&mut random).unwrap() else {
+                panic!("request expected")
+            };
+            let reply = fixture
+                .client
+                .request(action.request.clone())
+                .await
+                .unwrap();
+            if matches!(action.request.operation, Operation::Managed { .. }) {
+                break action.request;
+            }
+            watch.accept(action, reply).unwrap();
+        };
+        drop(watch);
+        let mut watch = store.resume("unknown").unwrap();
+        let WatchAction::Request(action) = watch.next_action(&mut random).unwrap() else {
+            panic!("pending expected")
+        };
+        assert_eq!(action.request, original);
+        let reply = fixture
+            .client
+            .request(action.request.clone())
+            .await
+            .unwrap();
         watch.accept(action, reply).unwrap();
-    };
-    drop(watch);
-    let mut watch = store.resume("unknown").unwrap();
-    let WatchAction::Request(action) = watch.next_action(&mut random).unwrap() else {
-        panic!("pending expected")
-    };
-    assert_eq!(action.request, original);
-    let reply = runtime
-        .block_on(fixture.client.request(action.request.clone()))
-        .unwrap();
-    watch.accept(action, reply).unwrap();
-    assert!(watch.delivery().is_some());
-    drop(watch);
-    let body = std::fs::read_dir(local.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("watch-")
-                && p.extension().is_some_and(|e| e == "watch-owner")
-        })
-        .unwrap();
-    std::fs::remove_file(body).unwrap();
-    assert!(store.resume("unknown").is_err());
-    fixture.stop();
+        assert!(watch.delivery().is_some());
+        drop(watch);
+        let body = std::fs::read_dir(local.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("watch-")
+                    && p.extension().is_some_and(|e| e == "watch-owner")
+            })
+            .unwrap();
+        std::fs::remove_file(body).unwrap();
+        assert!(store.resume("unknown").is_err());
+        fixture.stop();
+    })
+    .unwrap()
 }
 
 #[test]
 fn seed_pages_survive_client_restart_and_expired_source_never_skips_to_tail() {
-    let root = tempfile::tempdir().unwrap();
-    let local = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    let mut node = EmbeddedNode::open(&settings).unwrap();
-    let report = focal_node::demo::run(&mut node).unwrap();
-    drop(node);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let fixture = Fixture::start(root.path());
-    let store = WatchStore::open(local.path(), fixture.context).unwrap();
-    let options = WatchOptions {
-        claims: vec![report.claim],
-        max_items: 1,
-        ..Default::default()
-    };
-    let mut watch = store.create("seed", options).unwrap();
-    let first = delivery(&runtime, &fixture.client, &mut watch);
-    let WatchPage::Seed { page } = &first.page else {
-        panic!("seed")
-    };
-    let token = page.token;
-    assert!(page.next.is_some());
-    watch.acknowledge(first.id).unwrap();
-    drop(watch);
-    let mut watch = store.resume("seed").unwrap();
-    let second = delivery(&runtime, &fixture.client, &mut watch);
-    let WatchPage::Seed { page } = &second.page else {
-        panic!("seed")
-    };
-    assert_eq!(page.token, token);
-    assert!(page.next.is_some());
-    drop(watch);
-    fixture.stop();
-    let fixture = Fixture::start(root.path());
-    let mut watch = store.resume("seed").unwrap();
-    assert_eq!(watch.delivery(), Some(&second));
-    watch.acknowledge(second.id).unwrap();
-    let mut expired = false;
-    for _ in 0..32 {
-        let WatchAction::Request(action) = watch.next_action(&mut random).unwrap() else {
-            panic!("expired seed must not invent data")
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        let report = focal_node::demo::run(&mut node).unwrap();
+        drop(node);
+        let fixture = Fixture::start(root.path());
+        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let options = WatchOptions {
+            claims: vec![report.claim],
+            max_items: 1,
+            ..Default::default()
         };
-        let response = runtime.block_on(fixture.client.request(action.request.clone()));
-        match response {
-            Ok(response) => match watch.accept(action, response) {
-                Ok(()) => {}
-                Err(WatchError::Remote(_)) => {
+        let mut watch = store.create("seed", options).unwrap();
+        let first = delivery(&fixture.client, &mut watch).await;
+        let WatchPage::Seed { page } = &first.page else {
+            panic!("seed")
+        };
+        let token = page.token;
+        assert!(page.next.is_some());
+        watch.acknowledge(first.id).unwrap();
+        drop(watch);
+        let mut watch = store.resume("seed").unwrap();
+        let second = delivery(&fixture.client, &mut watch).await;
+        let WatchPage::Seed { page } = &second.page else {
+            panic!("seed")
+        };
+        assert_eq!(page.token, token);
+        assert!(page.next.is_some());
+        drop(watch);
+        fixture.stop();
+        let fixture = Fixture::start(root.path());
+        let mut watch = store.resume("seed").unwrap();
+        assert_eq!(watch.delivery(), Some(&second));
+        watch.acknowledge(second.id).unwrap();
+        let mut expired = false;
+        for _ in 0..32 {
+            let WatchAction::Request(action) = watch.next_action(&mut random).unwrap() else {
+                panic!("expired seed must not invent data")
+            };
+            let response = fixture.client.request(action.request.clone()).await;
+            match response {
+                Ok(response) => match watch.accept(action, response) {
+                    Ok(()) => {}
+                    Err(WatchError::Remote(_)) => {
+                        expired = true;
+                        break;
+                    }
+                    Err(error) => panic!("{error}"),
+                },
+                Err(focal_client::ClientError::Access(_)) => {
+                    assert!(
+                        matches!(action.request.operation,Operation::Read(ReadRequest{consistency:ReadConsistency::Exact(actual),..}) if actual==token)
+                    );
                     expired = true;
                     break;
                 }
                 Err(error) => panic!("{error}"),
-            },
-            Err(focal_client::ClientError::Access(_)) => {
-                assert!(
-                    matches!(action.request.operation,Operation::Read(ReadRequest{consistency:ReadConsistency::Exact(actual),..}) if actual==token)
-                );
-                expired = true;
-                break;
             }
-            Err(error) => panic!("{error}"),
         }
-    }
-    assert!(expired);
-    assert!(watch.status().seeding);
-    assert!(watch.status().pending);
-    assert_eq!(watch.status().acknowledged, 2);
-    drop(watch);
-    fixture.stop();
+        assert!(expired);
+        assert!(watch.status().seeding);
+        assert!(watch.status().pending);
+        assert_eq!(watch.status().acknowledged, 2);
+        drop(watch);
+        fixture.stop();
+    })
+    .unwrap()
 }
 
 #[test]
 fn large_seed_rows_use_server_byte_budget_and_all_continuations_finish() {
-    let root = tempfile::tempdir().unwrap();
-    let local = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    let mut node = EmbeddedNode::open(&settings).unwrap();
-    focal_node::demo::run(&mut node).unwrap();
-    for index in 0..6u128 {
-        let artifact = NewArtifact {
-            id: ArtifactId::from_u128(80000 + index),
-            content: ArtifactContent {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        focal_node::demo::run(&mut node).unwrap();
+        for index in 0..6u128 {
+            let artifact = NewArtifact {
+                id: ArtifactId::from_u128(80000 + index),
+                content: ArtifactContent {
+                    ledger: node.identity.ledger,
+                    schema: SCHEMA_MAJOR,
+                    kind: format!("large-seed-row-{index}"),
+                    schema_hash: ContentHash([94; 32]),
+                    metadata: vec![1; 15000],
+                    payload: ArtifactPayload::Inline(vec![2; 15000]),
+                    producer: node.identity.issuer,
+                    receipt: None,
+                    inputs: BTreeSet::new(),
+                    visibility: BTreeSet::new(),
+                },
+            };
+            let hash = artifact.content.content_hash().unwrap();
+            let input = AuthenticatedInput {
                 ledger: node.identity.ledger,
-                schema: SCHEMA_MAJOR,
-                kind: format!("large-seed-row-{index}"),
-                schema_hash: ContentHash([94; 32]),
-                metadata: vec![1; 15000],
-                payload: ArtifactPayload::Inline(vec![2; 15000]),
-                producer: node.identity.issuer,
-                receipt: None,
-                inputs: BTreeSet::new(),
-                visibility: BTreeSet::new(),
-            },
-        };
-        let hash = artifact.content.content_hash().unwrap();
-        let input = AuthenticatedInput {
-            ledger: node.identity.ledger,
-            principal: node.identity.issuer,
-            request_epoch: RequestEpoch(1),
-            request_id: RequestId::from_u128(90000 + index),
-            expected_revision: None,
-            authority: AuthorityContext {
-                runtime: true,
-                cause: Cause::Root(node.identity.root),
-                policy_revision: 1,
-                logical_time: 0,
-                evidence: vec![EvidenceAttestation {
-                    descriptor_hash: hash,
-                    custody_revision: 1,
-                    durable: true,
-                    schema_valid: true,
-                }],
-            },
-            command: Command::RegisterArtifact { artifact },
-        };
-        let result = node.session.submit_local(&input).unwrap();
-        assert!(
-            matches!(result, focal_ledger::Submission::Committed(_)),
-            "{result:?}"
-        );
-    }
-    drop(node);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let fixture = Fixture::start(root.path());
-    let store = WatchStore::open(local.path(), fixture.context).unwrap();
-    let mut watch = store.create("large", WatchOptions::default()).unwrap();
-    let mut count = 0;
-    let mut pages = 0;
-    loop {
-        let item = delivery(&runtime, &fixture.client, &mut watch);
-        assert!(
-            postcard::experimental::serialized_size(&item.page).unwrap() <= MAX_WATCH_PAGE_BYTES
-        );
-        let WatchPage::Seed { page } = &item.page else {
-            break;
-        };
-        count += page.objects.len();
-        pages += 1;
-        watch.acknowledge(item.id).unwrap();
-        if pages == 1 {
-            drop(watch);
-            watch = store.resume("large").unwrap();
+                principal: node.identity.issuer,
+                request_epoch: RequestEpoch(1),
+                request_id: RequestId::from_u128(90000 + index),
+                expected_revision: None,
+                authority: AuthorityContext {
+                    runtime: true,
+                    cause: Cause::Root(node.identity.root),
+                    policy_revision: 1,
+                    logical_time: 0,
+                    evidence: vec![EvidenceAttestation {
+                        descriptor_hash: hash,
+                        custody_revision: 1,
+                        durable: true,
+                        schema_valid: true,
+                    }],
+                },
+                command: Command::RegisterArtifact { artifact },
+            };
+            let result = node.session.submit_local(&input).unwrap();
+            assert!(
+                matches!(result, focal_ledger::Submission::Committed(_)),
+                "{result:?}"
+            );
         }
-    }
-    assert_eq!(count, 11);
-    assert!(pages >= 3);
-    drop(watch);
-    fixture.stop();
+        drop(node);
+        let fixture = Fixture::start(root.path());
+        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let mut watch = store.create("large", WatchOptions::default()).unwrap();
+        let mut count = 0;
+        let mut pages = 0;
+        loop {
+            let item = delivery(&fixture.client, &mut watch).await;
+            assert!(
+                postcard::experimental::serialized_size(&item.page).unwrap()
+                    <= MAX_WATCH_PAGE_BYTES
+            );
+            let WatchPage::Seed { page } = &item.page else {
+                break;
+            };
+            count += page.objects.len();
+            pages += 1;
+            watch.acknowledge(item.id).unwrap();
+            if pages == 1 {
+                drop(watch);
+                watch = store.resume("large").unwrap();
+            }
+        }
+        assert_eq!(count, 11);
+        assert!(pages >= 3);
+        drop(watch);
+        fixture.stop();
+    })
+    .unwrap()
 }
 
 // Native claim frames, shaped as in the node's own native host tests.
@@ -493,12 +494,7 @@ fn frame(ledger: LedgerId, input: &NativeInput) -> Vec<u8> {
     bytes
 }
 /// One committed native creation through the in-process client.
-fn commit_native(
-    runtime: &tokio::runtime::Runtime,
-    fixture: &Fixture,
-    request: u128,
-    claim: u128,
-) -> NativeReceipt {
+async fn commit_native(fixture: &Fixture, request: u128, claim: u128) -> NativeReceipt {
     let ledger = fixture.context.ledger;
     let input = create(
         ledger,
@@ -517,208 +513,203 @@ fn commit_native(
             frame: frame(ledger, &input),
         },
     };
-    match runtime
-        .block_on(fixture.client.request(envelope))
-        .unwrap()
-        .result
-    {
+    match fixture.client.request(envelope).await.unwrap().result {
         Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
         other => panic!("native creation: {other:?}"),
     }
 }
 #[test]
 fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas_in_process() {
-    let root = tempfile::tempdir().unwrap();
-    let local = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
-        .unwrap();
-    let fixture = Fixture::start(root.path());
-    let first = commit_native(&runtime, &fixture, 1, 100);
-    assert_eq!(first.sequence, SessionSeq(1));
-    let store = WatchStore::open(local.path(), fixture.context).unwrap();
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+            .unwrap();
+        let fixture = Fixture::start(root.path());
+        let first = commit_native(&fixture, 1, 100).await;
+        assert_eq!(first.sequence, SessionSeq(1));
+        let store = WatchStore::open(local.path(), fixture.context).unwrap();
 
-    // A seeded claim watch: the claim is read with its evaluations at a
-    // prefix no older than the snapshot, then the seed completes and the
-    // tail polls.
-    let mut seeded = store
-        .create(
-            "seeded",
-            WatchOptions {
-                engine: WatchEngine::Native,
-                claims: vec![ClaimId::from_u128(100)],
-                seed: true,
-                max_items: 8,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let page = delivery(&runtime, &fixture.client, &mut seeded);
-    let WatchPage::NativeSeed {
-        token,
-        objects,
-        next,
-    } = &page.page
-    else {
-        panic!("native seed page: {page:?}");
-    };
-    assert_eq!(*next, NativeSeedNext::Complete);
-    assert!(token.sequence >= SessionSeq(1));
-    assert!(
-        objects.iter().any(|object| matches!(object, NativeObject::Claim(claim) if claim.binding.object == ObjectId::from_u128(100))),
-        "{objects:?}"
-    );
-    assert!(seeded.status().seeding);
-    seeded.acknowledge(page.id).unwrap();
-    let tail = delivery(&runtime, &fixture.client, &mut seeded);
-    let WatchPage::Events { page: events } = &tail.page else {
-        panic!("tail page: {tail:?}");
-    };
-    assert!(
-        events
-            .events
-            .iter()
-            .all(|event| !matches!(event, StreamEvent::Delta { .. })),
-        "the seed's own facts are not replayed: {events:?}"
-    );
-    assert!(!seeded.status().seeding);
-    seeded.acknowledge(tail.id).unwrap();
-
-    // A second record: the seeded watch receives only its claim's facts and
-    // an unseeded watch of everything replays both records from the origin.
-    let second = commit_native(&runtime, &fixture, 2, 101);
-    assert_eq!(second.sequence, SessionSeq(2));
-    let mut everything = store
-        .create(
-            "everything",
-            WatchOptions {
-                engine: WatchEngine::Native,
-                seed: false,
-                max_items: 64,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let history = delivery(&runtime, &fixture.client, &mut everything);
-    let WatchPage::Events { page: events } = &history.page else {
-        panic!("history page: {history:?}");
-    };
-    let deltas: Vec<&Delta> = events
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            StreamEvent::Delta { delta, .. } => Some(delta),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        deltas
-            .iter()
-            .all(|delta| delta.schema == NATIVE_DELTA_SCHEMA),
-        "{deltas:?}"
-    );
-    assert!(
-        deltas
-            .iter()
-            .all(|delta| delta.actor == fixture.context.principal)
-    );
-    let creations: Vec<ClaimId> = deltas
-        .iter()
-        .filter(|delta| {
-            matches!(
-                &delta.fact,
-                DeltaFact::Native(record) if matches!(
-                    record.fact,
-                    NativeFactRecord::Claim(NativeClaimEventRecord { kind: NativeEventKindRecord::Created, .. })
-                )
+        // A seeded claim watch: the claim is read with its evaluations at a
+        // prefix no older than the snapshot, then the seed completes and the
+        // tail polls.
+        let mut seeded = store
+            .create(
+                "seeded",
+                WatchOptions {
+                    engine: WatchEngine::Native,
+                    claims: vec![ClaimId::from_u128(100)],
+                    seed: true,
+                    max_items: 8,
+                    ..Default::default()
+                },
             )
-        })
-        .filter_map(|delta| delta.claim)
-        .collect();
-    assert_eq!(
-        creations,
-        [ClaimId::from_u128(100), ClaimId::from_u128(101)],
-        "{deltas:?}"
-    );
-    assert!(
-        deltas
-            .iter()
-            .any(|delta| delta.id.sequence == SessionSeq(1))
-    );
-    assert!(
-        deltas
-            .iter()
-            .any(|delta| delta.id.sequence == SessionSeq(2))
-    );
-    for delta in &deltas {
-        let DeltaFact::Native(record) = &delta.fact else {
-            panic!("{delta:?}");
+            .unwrap();
+        let page = delivery(&fixture.client, &mut seeded).await;
+        let WatchPage::NativeSeed {
+            token,
+            objects,
+            next,
+        } = &page.page
+        else {
+            panic!("native seed page: {page:?}");
         };
-        assert_eq!(record.sequence, delta.id.sequence);
-        assert_eq!(record.ordinal, delta.id.ordinal);
-    }
-    everything.acknowledge(history.id).unwrap();
-    let after = delivery(&runtime, &fixture.client, &mut seeded);
-    let WatchPage::Events { page: events } = &after.page else {
-        panic!("{after:?}");
-    };
-    assert!(
-        events
+        assert_eq!(*next, NativeSeedNext::Complete);
+        assert!(token.sequence >= SessionSeq(1));
+        assert!(
+            objects.iter().any(|object| matches!(object, NativeObject::Claim(claim) if claim.binding.object == ObjectId::from_u128(100))),
+            "{objects:?}"
+        );
+        assert!(seeded.status().seeding);
+        seeded.acknowledge(page.id).unwrap();
+        let tail = delivery(&fixture.client, &mut seeded).await;
+        let WatchPage::Events { page: events } = &tail.page else {
+            panic!("tail page: {tail:?}");
+        };
+        assert!(
+            events
+                .events
+                .iter()
+                .all(|event| !matches!(event, StreamEvent::Delta { .. })),
+            "the seed's own facts are not replayed: {events:?}"
+        );
+        assert!(!seeded.status().seeding);
+        seeded.acknowledge(tail.id).unwrap();
+
+        // A second record: the seeded watch receives only its claim's facts and
+        // an unseeded watch of everything replays both records from the origin.
+        let second = commit_native(&fixture, 2, 101).await;
+        assert_eq!(second.sequence, SessionSeq(2));
+        let mut everything = store
+            .create(
+                "everything",
+                WatchOptions {
+                    engine: WatchEngine::Native,
+                    seed: false,
+                    max_items: 64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let history = delivery(&fixture.client, &mut everything).await;
+        let WatchPage::Events { page: events } = &history.page else {
+            panic!("history page: {history:?}");
+        };
+        let deltas: Vec<&Delta> = events
             .events
             .iter()
-            .all(|event| !matches!(event, StreamEvent::Delta { .. })),
-        "the claim filter keeps another claim's creation out: {events:?}"
-    );
-    seeded.acknowledge(after.id).unwrap();
-
-    // A watch of a family seeds through its list and restarts intact.
-    let mut definitions = store
-        .create(
-            "definitions",
-            WatchOptions {
-                engine: WatchEngine::Native,
-                family: Some(ObjectKind::Validation),
-                max_items: 8,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let listed = delivery(&runtime, &fixture.client, &mut definitions);
-    let WatchPage::NativeSeed { objects, next, .. } = &listed.page else {
-        panic!("{listed:?}");
-    };
-    assert_eq!(*next, NativeSeedNext::Complete);
-    assert_eq!(objects.len(), 2, "{objects:?}");
-    assert!(
-        objects
+            .filter_map(|event| match event {
+                StreamEvent::Delta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deltas
+                .iter()
+                .all(|delta| delta.schema == NATIVE_DELTA_SCHEMA),
+            "{deltas:?}"
+        );
+        assert!(
+            deltas
+                .iter()
+                .all(|delta| delta.actor == fixture.context.principal)
+        );
+        let creations: Vec<ClaimId> = deltas
             .iter()
-            .all(|object| matches!(object, NativeObject::Definition(_)))
-    );
-    drop(definitions);
-    drop(seeded);
-    drop(everything);
-    drop(store);
-    let context = fixture.context;
-    fixture.stop();
-    let fixture = Fixture::start(root.path());
-    let store = WatchStore::open(local.path(), context).unwrap();
-    let mut definitions = store.resume("definitions").unwrap();
-    assert_eq!(definitions.delivery(), Some(&listed));
-    definitions.acknowledge(listed.id).unwrap();
-    let tail = delivery(&runtime, &fixture.client, &mut definitions);
-    assert!(matches!(tail.page, WatchPage::Events { .. }), "{tail:?}");
-    let mut everything = store.resume("everything").unwrap();
-    let again = delivery(&runtime, &fixture.client, &mut everything);
-    assert!(matches!(again.page, WatchPage::Events { .. }));
-    drop(definitions);
-    drop(everything);
-    fixture.stop();
+            .filter(|delta| {
+                matches!(
+                    &delta.fact,
+                    DeltaFact::Native(record) if matches!(
+                        record.fact,
+                        NativeFactRecord::Claim(NativeClaimEventRecord { kind: NativeEventKindRecord::Created, .. })
+                    )
+                )
+            })
+            .filter_map(|delta| delta.claim)
+            .collect();
+        assert_eq!(
+            creations,
+            [ClaimId::from_u128(100), ClaimId::from_u128(101)],
+            "{deltas:?}"
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta.id.sequence == SessionSeq(1))
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| delta.id.sequence == SessionSeq(2))
+        );
+        for delta in &deltas {
+            let DeltaFact::Native(record) = &delta.fact else {
+                panic!("{delta:?}");
+            };
+            assert_eq!(record.sequence, delta.id.sequence);
+            assert_eq!(record.ordinal, delta.id.ordinal);
+        }
+        everything.acknowledge(history.id).unwrap();
+        let after = delivery(&fixture.client, &mut seeded).await;
+        let WatchPage::Events { page: events } = &after.page else {
+            panic!("{after:?}");
+        };
+        assert!(
+            events
+                .events
+                .iter()
+                .all(|event| !matches!(event, StreamEvent::Delta { .. })),
+            "the claim filter keeps another claim's creation out: {events:?}"
+        );
+        seeded.acknowledge(after.id).unwrap();
+
+        // A watch of a family seeds through its list and restarts intact.
+        let mut definitions = store
+            .create(
+                "definitions",
+                WatchOptions {
+                    engine: WatchEngine::Native,
+                    family: Some(ObjectKind::Validation),
+                    max_items: 8,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let listed = delivery(&fixture.client, &mut definitions).await;
+        let WatchPage::NativeSeed { objects, next, .. } = &listed.page else {
+            panic!("{listed:?}");
+        };
+        assert_eq!(*next, NativeSeedNext::Complete);
+        assert_eq!(objects.len(), 2, "{objects:?}");
+        assert!(
+            objects
+                .iter()
+                .all(|object| matches!(object, NativeObject::Definition(_)))
+        );
+        drop(definitions);
+        drop(seeded);
+        drop(everything);
+        drop(store);
+        let context = fixture.context;
+        fixture.stop();
+        let fixture = Fixture::start(root.path());
+        let store = WatchStore::open(local.path(), context).unwrap();
+        let mut definitions = store.resume("definitions").unwrap();
+        assert_eq!(definitions.delivery(), Some(&listed));
+        definitions.acknowledge(listed.id).unwrap();
+        let tail = delivery(&fixture.client, &mut definitions).await;
+        assert!(matches!(tail.page, WatchPage::Events { .. }), "{tail:?}");
+        let mut everything = store.resume("everything").unwrap();
+        let again = delivery(&fixture.client, &mut everything).await;
+        assert!(matches!(again.page, WatchPage::Events { .. }));
+        drop(definitions);
+        drop(everything);
+        fixture.stop();
+    })
+    .unwrap()
 }
 
 /// The audit's F61: a tail poll with nothing new to acknowledge is a plain
@@ -726,136 +717,142 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas_in_proc
 /// for it; the acknowledgment of a consumed page stays a durable request.
 #[test]
 fn idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal() {
-    let root = tempfile::tempdir().unwrap();
-    let local = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
-        .unwrap();
-    let fixture = Fixture::start(root.path());
-    commit_native(&runtime, &fixture, 1, 100);
-    let store = WatchStore::open(local.path(), fixture.context).unwrap();
-    let mut watch = store
-        .create(
-            "idle",
-            WatchOptions {
-                engine: WatchEngine::Native,
-                seed: false,
-                max_items: 64,
-                ..Default::default()
-            },
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        focal_node::native_activation::activate_local(
+            &settings,
+            NativeContentProfile::ProjectionOnly,
         )
         .unwrap();
-    // Every request the watch issues, by kind, and the page it ends in.
-    let deliver = |journal: &mut WatchJournal, issued: &mut Vec<&'static str>| -> WatchDelivery {
-        for _ in 0..64 {
-            match journal.next_action(&mut random).unwrap() {
-                WatchAction::Delivery => return journal.delivery().unwrap().clone(),
-                WatchAction::Request(action) => {
-                    issued.push(match &action.request.operation {
-                        Operation::Managed {
-                            operation:
-                                ManagedOperation::Cursor(StreamRequest::Poll {
-                                    acknowledged: Some(_),
-                                    ..
-                                }),
-                            ..
-                        } => "ack",
-                        Operation::Managed {
-                            operation: ManagedOperation::Cursor(_),
-                            ..
-                        } => "managed",
-                        Operation::Stream(StreamRequest::Poll {
-                            acknowledged: None, ..
-                        }) => "read",
-                        Operation::RequestStreamControl { .. }
-                        | Operation::RequestStreamRead { .. } => "maintenance",
-                        other => panic!("{other:?}"),
-                    });
-                    let reply = runtime
-                        .block_on(fixture.client.request(action.request.clone()))
-                        .unwrap();
-                    journal.accept(action, reply).unwrap();
+        let fixture = Fixture::start(root.path());
+        commit_native(&fixture, 1, 100).await;
+        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let mut watch = store
+            .create(
+                "idle",
+                WatchOptions {
+                    engine: WatchEngine::Native,
+                    seed: false,
+                    max_items: 64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Every request the watch issues, by kind, and the page it ends in.
+        let deliver = async |journal: &mut WatchJournal,
+                             issued: &mut Vec<&'static str>|
+               -> WatchDelivery {
+            for _ in 0..64 {
+                match journal.next_action(&mut random).unwrap() {
+                    WatchAction::Delivery => return journal.delivery().unwrap().clone(),
+                    WatchAction::Request(action) => {
+                        issued.push(match &action.request.operation {
+                            Operation::Managed {
+                                operation:
+                                    ManagedOperation::Cursor(StreamRequest::Poll {
+                                        acknowledged: Some(_),
+                                        ..
+                                    }),
+                                ..
+                            } => "ack",
+                            Operation::Managed {
+                                operation: ManagedOperation::Cursor(_),
+                                ..
+                            } => "managed",
+                            Operation::Stream(StreamRequest::Poll {
+                                acknowledged: None, ..
+                            }) => "read",
+                            Operation::RequestStreamControl { .. }
+                            | Operation::RequestStreamRead { .. } => "maintenance",
+                            other => panic!("{other:?}"),
+                        });
+                        let reply = fixture
+                            .client
+                            .request(action.request.clone())
+                            .await
+                            .unwrap();
+                        journal.accept(action, reply).unwrap();
+                    }
                 }
             }
-        }
-        panic!("watch did not reach delivery")
-    };
-    let events_of = |delivery: &WatchDelivery| -> usize {
-        let WatchPage::Events { page } = &delivery.page else {
-            panic!("{delivery:?}");
+            panic!("watch did not reach delivery")
         };
-        page.events.len()
-    };
-    let mut issued = Vec::new();
-    // The registration delivers the record's facts; consuming them makes
-    // the next poll a durable acknowledgment, which finds nothing more.
-    let first = deliver(&mut watch, &mut issued);
-    assert!(events_of(&first) > 0, "{first:?}");
-    watch.acknowledge(first.id).unwrap();
-    let second = deliver(&mut watch, &mut issued);
-    assert_eq!(events_of(&second), 0);
-    assert_eq!(
-        issued.iter().filter(|kind| **kind == "ack").count(),
-        1,
-        "{issued:?}"
-    );
-    watch.acknowledge(second.id).unwrap();
-    // From here every poll is a read: no ordinal, so nothing to retire
-    // beyond the acknowledgment's own, which one control retires first.
-    let before = issued.len();
-    for _ in 0..8 {
-        let page = deliver(&mut watch, &mut issued);
-        assert_eq!(events_of(&page), 0);
+        let events_of = |delivery: &WatchDelivery| -> usize {
+            let WatchPage::Events { page } = &delivery.page else {
+                panic!("{delivery:?}");
+            };
+            page.events.len()
+        };
+        let mut issued = Vec::new();
+        // The registration delivers the record's facts; consuming them makes
+        // the next poll a durable acknowledgment, which finds nothing more.
+        let first = deliver(&mut watch, &mut issued).await;
+        assert!(events_of(&first) > 0, "{first:?}");
+        watch.acknowledge(first.id).unwrap();
+        let second = deliver(&mut watch, &mut issued).await;
+        assert_eq!(events_of(&second), 0);
+        assert_eq!(
+            issued.iter().filter(|kind| **kind == "ack").count(),
+            1,
+            "{issued:?}"
+        );
+        watch.acknowledge(second.id).unwrap();
+        // From here every poll is a read: no ordinal, so nothing to retire
+        // beyond the acknowledgment's own, which one control retires first.
+        let before = issued.len();
+        for _ in 0..8 {
+            let page = deliver(&mut watch, &mut issued).await;
+            assert_eq!(events_of(&page), 0);
+            watch.acknowledge(page.id).unwrap();
+        }
+        let idle = &issued[before..];
+        assert_eq!(
+            idle.iter().filter(|kind| **kind == "read").count(),
+            8,
+            "{issued:?}"
+        );
+        assert!(
+            idle.iter()
+                .filter(|kind| **kind != "read")
+                .all(|kind| *kind == "maintenance")
+                && idle.iter().filter(|kind| **kind == "maintenance").count() <= 1,
+            "{issued:?}"
+        );
+        // A new record arrives through a read; consuming it is acknowledged
+        // durably by the poll after, and the polls after that read again.
+        commit_native(&fixture, 2, 101).await;
+        let page = deliver(&mut watch, &mut issued).await;
+        assert!(events_of(&page) > 0);
+        assert_eq!(issued.last(), Some(&"read"), "{issued:?}");
         watch.acknowledge(page.id).unwrap();
-    }
-    let idle = &issued[before..];
-    assert_eq!(
-        idle.iter().filter(|kind| **kind == "read").count(),
-        8,
-        "{issued:?}"
-    );
-    assert!(
-        idle.iter()
-            .filter(|kind| **kind != "read")
-            .all(|kind| *kind == "maintenance")
-            && idle.iter().filter(|kind| **kind == "maintenance").count() <= 1,
-        "{issued:?}"
-    );
-    // A new record arrives through a read; consuming it is acknowledged
-    // durably by the poll after, and the polls after that read again.
-    commit_native(&runtime, &fixture, 2, 101);
-    let page = deliver(&mut watch, &mut issued);
-    assert!(events_of(&page) > 0);
-    assert_eq!(issued.last(), Some(&"read"), "{issued:?}");
-    watch.acknowledge(page.id).unwrap();
-    let page = deliver(&mut watch, &mut issued);
-    assert_eq!(events_of(&page), 0);
-    assert!(issued.contains(&"ack"), "{issued:?}");
-    assert_eq!(
-        issued.iter().filter(|kind| **kind == "ack").count(),
-        2,
-        "{issued:?}"
-    );
-    watch.acknowledge(page.id).unwrap();
-    // The acknowledgment the source holds is saved with the watch: a resumed
-    // watch reads on.
-    drop(watch);
-    let mut watch = store.resume("idle").unwrap();
-    let page = deliver(&mut watch, &mut issued);
-    assert_eq!(events_of(&page), 0);
-    assert_eq!(issued.last(), Some(&"read"), "{issued:?}");
-    watch.acknowledge(page.id).unwrap();
-    drop(watch);
-    drop(store);
-    fixture.stop();
-    // The node committed nothing for the reads: the registry's revision is
-    // the registration's and the two acknowledgments'.
-    let node = EmbeddedNode::open(&settings).unwrap();
-    assert_eq!(node.session.cursor_revision(), 3);
+        let page = deliver(&mut watch, &mut issued).await;
+        assert_eq!(events_of(&page), 0);
+        assert!(issued.contains(&"ack"), "{issued:?}");
+        assert_eq!(
+            issued.iter().filter(|kind| **kind == "ack").count(),
+            2,
+            "{issued:?}"
+        );
+        watch.acknowledge(page.id).unwrap();
+        // The acknowledgment the source holds is saved with the watch: a resumed
+        // watch reads on.
+        drop(watch);
+        let mut watch = store.resume("idle").unwrap();
+        let page = deliver(&mut watch, &mut issued).await;
+        assert_eq!(events_of(&page), 0);
+        assert_eq!(issued.last(), Some(&"read"), "{issued:?}");
+        watch.acknowledge(page.id).unwrap();
+        drop(watch);
+        drop(store);
+        fixture.stop();
+        // The node committed nothing for the reads: the registry's revision is
+        // the registration's and the two acknowledgments'.
+        let node = EmbeddedNode::open(&settings).unwrap();
+        assert_eq!(node.session.cursor_revision(), 3);
+    })
+    .unwrap()
 }

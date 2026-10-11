@@ -8,17 +8,17 @@ use crate::{
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
-use focal_wire::*;
 use focal_rt::Concurrent;
+use focal_wire::*;
 use futures_util::FutureExt;
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError};
+use std::pin::pin;
+use std::task::Poll;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     pin::Pin,
 };
-use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError};
-use std::pin::pin;
-use std::task::Poll;
 
 const JOB_BYTES: usize = 8 * 1024 * 1024;
 
@@ -2064,8 +2064,7 @@ async fn replicate(
     // copy that fails or answers late delays no other, and what the others
     // took they hold whatever became of it. The first failure is what the
     // replication failed with.
-    let mut copies =
-        Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
+    let mut copies = Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
     for peer in placement
         .copies
         .iter()

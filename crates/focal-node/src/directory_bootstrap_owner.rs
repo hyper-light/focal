@@ -73,7 +73,8 @@ impl ControlHost {
             .commit();
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
-        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue).map_err(|_| DirectoryBootstrapError::Capacity)?;
+        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue)
+            .map_err(|_| DirectoryBootstrapError::Capacity)?;
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity,
@@ -96,7 +97,8 @@ impl ControlHost {
                 failure: None,
             },
             _allocation: Some(allocation),
-        }).map_err(|_| DirectoryBootstrapError::Capacity)?;
+        })
+        .map_err(|_| DirectoryBootstrapError::Capacity)?;
         let pace = crate::control_host::TickPeriod::default();
         let owner_pace = pace.clone();
         let host = Self {

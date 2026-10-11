@@ -45,28 +45,35 @@ impl Instant {
     }
 }
 
+// Each wait below is the runtime's own future, made here and handed back: no wait adds a layer of
+// its own around the work. A layer that made the work's future in its poll would keep a temporary
+// the work's size in its frame, and a debug build keeps every layer's frame on the stack at once.
+
 /// Waits `period` on the shard's wheel.
-pub async fn sleep(period: Duration) -> Result<(), RtError> {
-    hyper_rt::futures::sleep(nanos(period)).await
+pub fn sleep(period: Duration) -> impl Future<Output = Result<(), RtError>> {
+    hyper_rt::futures::sleep(nanos(period))
 }
 
 /// Waits until `deadline` on the shard's wheel; at once for one that has passed.
-pub async fn sleep_until(deadline: Instant) -> Result<(), RtError> {
-    sleep(deadline.remaining()).await
+pub fn sleep_until(deadline: Instant) -> impl Future<Output = Result<(), RtError>> {
+    sleep(deadline.remaining())
 }
 
 /// What `work` yields within `period` on the shard's clock, or `None` once the period is over (the
 /// work dropped with it). The work is polled first, so one that is ready wins even at the deadline.
-pub async fn within<F: Future>(period: Duration, work: F) -> Result<Option<F::Output>, RtError> {
-    hyper_rt::futures::within(nanos(period), work).await
+pub fn within<F: Future>(
+    period: Duration,
+    work: F,
+) -> impl Future<Output = Result<Option<F::Output>, RtError>> {
+    hyper_rt::futures::within(nanos(period), work)
 }
 
 /// What `work` yields by `deadline`, or `None` once it has passed.
-pub async fn within_until<F: Future>(
+pub fn within_until<F: Future>(
     deadline: Instant,
     work: F,
-) -> Result<Option<F::Output>, RtError> {
-    within(deadline.remaining(), work).await
+) -> impl Future<Output = Result<Option<F::Output>, RtError>> {
+    within(deadline.remaining(), work)
 }
 
 /// Why a bounded wait gave no output: its period passed, or no wait could be kept (off a shard).
@@ -79,29 +86,25 @@ pub enum TimedOut {
 }
 
 /// What `work` yields within `period`, or why it did not: [`within`] in the shape of a result.
-pub async fn timeout<F: Future>(period: Duration, work: F) -> Result<F::Output, TimedOut> {
-    match within(period, work).await {
-        Ok(Some(output)) => Ok(output),
-        Ok(None) => Err(TimedOut::Elapsed),
-        Err(refused) => Err(TimedOut::Refused(refused)),
+pub fn timeout<F: Future>(
+    period: Duration,
+    work: F,
+) -> impl Future<Output = Result<F::Output, TimedOut>> {
+    // Made before the block, which only awaits it in place.
+    let waiting = within(period, work);
+    async move {
+        match waiting.await {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => Err(TimedOut::Elapsed),
+            Err(refused) => Err(TimedOut::Refused(refused)),
+        }
     }
 }
 
 /// What `work` yields by `deadline`, or why it did not.
-pub async fn timeout_at<F: Future>(deadline: Instant, work: F) -> Result<F::Output, TimedOut> {
-    timeout(deadline.remaining(), work).await
-}
-
-/// Waits `period`: on the shard's wheel, or — off any shard, where a plain thread's own loop drives
-/// the future — by blocking that thread, the only wait it has. A loop that pauses between its tries
-/// never spins on a refused wait.
-pub async fn pause(period: Duration) {
-    if sleep(period).await.is_err() {
-        std::thread::sleep(period);
-    }
-}
-
-/// Waits until `deadline`, as [`pause`] does.
-pub async fn pause_until(deadline: Instant) {
-    pause(deadline.remaining()).await;
+pub fn timeout_at<F: Future>(
+    deadline: Instant,
+    work: F,
+) -> impl Future<Output = Result<F::Output, TimedOut>> {
+    timeout(deadline.remaining(), work)
 }

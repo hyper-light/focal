@@ -18,9 +18,9 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
 - **Address-validation tokens.** `bloom` is always on. NEW_TOKEN tokens are issued (`sent: 2`) and
   their reuse is detected by `BloomTokenLog`. RFC 9000 §8.1.4 says a server SHOULD protect
   against replay of these tokens; with bloom off, quinn sends none.
-- **qlog.** `qlog` is always compiled. Whether a connection emits it is runtime configuration
-  (`QlogConfig`), not a build mode.
-- **`arbitrary`.** Kept as the one feature: fuzzing derives, never in a shipped build.
+- **qlog.** On by default (the `qlog` feature, §20). Whether a connection emits it is runtime
+  configuration (`QlogConfig`).
+- **`arbitrary`.** Kept as a feature: fuzzing derives, never in a shipped build.
 - **Oracle.** 303 unit tests and 3 doctests pass. That is upstream's suite under this one
   configuration; the ring default ran 296 unit tests because the bloom-gated token tests were
   off.
@@ -70,8 +70,8 @@ Upstream's own tests are the oracle that conformance changed no behaviour.
 
 8. **TLS configuration lives in the endpoint's `Configs` slab** (`config/configs.rs`).
    - The endpoint owns every server and client configuration in a slab of
-     `EndpointConfig::config_slots` slots (default 4, derived: one current and one draining
-     configuration per side; a rotation is days apart, far longer than a connection lives).
+     `EndpointConfig::config_slots` slots (default 4: one current configuration per side and its
+     replacement while it is replaced; §19 states what holds a replaced one).
      `ServerConfig` holds its crypto configuration, handshake-token key and time source as
      `Box`es, and `ClientConfig` its crypto configuration and initial-CID provider; neither is
      `Clone` any more.
@@ -759,3 +759,61 @@ rows.
   to it. Out of the peer's credit as well, the stream's bytes are all in the peer's buffer and the
   peer is not reading them: hyper-transport ends such an exchange (focal's audit F38). No behaviour
   of the connection changes.
+
+## 19. A server connection holds its configuration through its handshake (2026-10-10)
+
+- **Patch Q9: a replaced server configuration lives no longer than its handshakes.** Upstream held
+  an `Arc<ServerConfig>` in every connection for the connection's life. The slab of §2.8 copied
+  that as a count released only by `Drained`.
+  - Every connection a server accepted pinned the configuration it was accepted under for as long
+    as it lived. Peers hold their connections across a node's certificate renewals, so each
+    replacement left one more superseded configuration in a slot.
+  - After two or three replacements `set_server_config` was refused (`ConfigsFull`), and the node
+    never presented its renewed certificate. focal's founder kept presenting a bootstrap server
+    certificate its joiners had already unpinned, and their renewals failed until their
+    credentials expired.
+  - Now a server connection releases its count when its handshake completes, with a new endpoint
+    event `ConfigReleased`. Nothing after that point needs the configuration it was accepted
+    under:
+    - its tickets were made as it read the client's Finished;
+    - a QUIC client sends no TLS message after its Finished (RFC 9001 §4.4, §6), and CRYPTO data
+      arriving after it is refused as TLS would refuse it: crypto error 10, unexpected_message;
+    - NEW_TOKEN is sealed under the endpoint's current server configuration (`Configs` keeps which
+      one is current, `Configs::current_server_config`). That is the configuration that validates
+      the token when the client returns. Upstream sealed it under the connection's own, so a token
+      issued after a replacement was never valid.
+  - A client connection still holds its configuration until it drains: its server may send
+    tickets for that configuration's cache at any time after the handshake (RFC 8446 §4.6.1).
+- **Test harness.** `TestEndpoint::drive_outgoing` handed every queued connection event to the
+  first connection it visited, and kept one timer for all connections: the last visited
+  connection's. With two connections, the map's order decided which connection heard the other's
+  datagrams, and the other's timers were lost (handshakes timed out, or `drive` never idled). Each
+  connection now takes its own events and timer. Upstream's helper has the same loop; its tests
+  hold one connection per pair.
+- **Tests.**
+  - `server_config_replacements_outlast_the_connections_accepted_under_them`: eight replacements
+    while every earlier connection stays up. The original code refused the fourth with
+    `ConfigsFull`.
+  - `a_token_issued_after_a_replacement_validates_under_it`: a replacement mid-handshake. The
+    original code sealed the token under the replaced key, and the returning client was not
+    validated.
+
+## 20. qlog behind a feature again (2026-10-10)
+
+- **The `qlog` feature is restored.** It is on by default, so this workspace and every consumer
+  that leaves default features on build as before.
+  - `qlog` 0.15 turns on serde_json's `preserve_order`. Cargo unifies features, so every
+    serde_json map in a build that holds hyper-quic iterated in insertion order rather than
+    sorted. That includes code that never touches QUIC.
+  - focal's schemas, output and canonical documents were written against sorted maps. Its suite
+    found the change: a native-verb test read an object's first key and got another one. A
+    document carrying free-form JSON would have encoded its keys in input order, so two equal
+    documents could encode differently.
+  - Built without the feature, the qlog pieces change as follows:
+    - `QlogStream` is a type with no values, so no connection is given one;
+    - `QlogSink` emits nothing;
+    - `QlogConfig`, `QlogError` and the paths' recovery-metrics snapshot that only qlog reads are
+      not compiled.
+  - Upstream quinn-proto gates the same pieces behind its own `qlog` feature.
+- **Checked.** Clippy -D warnings and the 392 unit tests pass in both builds, with the feature and
+  without it.

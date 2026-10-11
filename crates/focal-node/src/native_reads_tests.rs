@@ -31,6 +31,7 @@ use focal_native_client::{
     fingerprint, read, resolve,
 };
 use focal_wire::*;
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 
 const ISSUER: ParticipantId = ParticipantId::from_u128(1);
@@ -164,7 +165,10 @@ impl Harness {
             &mut reads,
             &mut lists,
             &mut pause,
-        )? {
+        )
+        .now_or_never()
+        .expect("the owner's pages are answered as they are asked")?
+        {
             NativeReadOutcome::Page(page) => Ok(page),
             NativeReadOutcome::Lineage(lineage) => panic!("a plain read: {lineage:?}"),
             NativeReadOutcome::Wait(wait) => panic!("a plain read: {wait:?}"),
@@ -176,6 +180,8 @@ impl Harness {
     ) -> Result<focal_native_client::Resolved, DriveError> {
         let mut reads = |request: NativeReadRequest| self.page(&request).map_err(access);
         resolve(ledger(), operation, &mut reads)
+            .now_or_never()
+            .expect("the owner's pages are answered as they are asked")
     }
     /// Resolve through the node's page, compile, encode and admit the frame
     /// as the node does.
@@ -799,6 +805,8 @@ fn validation_get_follows_the_evaluation_pages_to_the_end() {
         &mut lists,
         &mut pause,
     )
+    .now_or_never()
+    .expect("the owner's pages are answered as they are asked")
     .unwrap()
     {
         NativeReadOutcome::Page(page) => page,

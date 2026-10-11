@@ -91,111 +91,120 @@ async fn wait_for_contact(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converges_after_a_crash() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
-    let before = peer.handles.credentials.current().await.unwrap();
-    assert_eq!(before.node, node);
-    assert_eq!(before.renewals, 0);
-    let receipt_path = peer_dir
-        .path()
-        .join("JOIN")
-        .join("node-key")
-        .join("enrollment.bin");
-    let held = std::fs::read(&receipt_path).unwrap();
-    // A renewal must extend the credential beyond the second it was issued.
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    // The controller asks the sponsor under the credential it holds, installs
-    // the renewal under the same key and presents it at once.
-    let renewed = peer.handles.credentials.renew().await.unwrap();
-    assert_eq!(renewed.node, node);
-    assert_eq!(renewed.principal, before.principal);
-    assert!(renewed.expires_at > before.expires_at);
-    assert!(renewed.issued_at >= before.issued_at);
-    assert_ne!(
-        renewed.certificate_fingerprint,
-        before.certificate_fingerprint
-    );
-    assert_eq!(renewed.renewals, 1);
-    assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
-    // Give the controller a loop to announce; if it stopped, say why.
-    focal_rt::time::pause(Duration::from_millis(600)).await;
-    match peer.handles.credentials.current().await {
-        Ok(current) => assert_eq!(current, renewed),
-        Err(error) => panic!(
-            "the host's controller stopped after renewing ({error}): {:?}",
-            peer.outcome().await
-        ),
-    }
-    // The peer announces its renewed certificate to the root: the founder
-    // authorizes the new connection and records the fingerprint it presented.
-    wait_for_contact(
-        &founder,
-        founder_dir.path(),
-        node,
-        renewed.certificate_fingerprint,
-    )
-    .await;
-    // The placement agent signs with the renewed credential from now on and
-    // keeps its state.
-    let status = peer.handles.placement.status().await.unwrap();
-    assert_eq!(status.node, node);
-    // Crash window: the sponsor committed the renewal but the holder still
-    // has the previous receipt on disk. A retry is answered with the committed
-    // renewal, never a second issuance, and the holder converges on it.
-    peer.stop().await;
-    std::fs::write(&receipt_path, &held).unwrap();
-    let peer = Running::start(&peer_settings).await;
-    // The controller sees the registry ahead of the receipt it holds and
-    // converges on the committed renewal by itself.
-    let converged = until(
-        "the restarted host converges on the committed renewal",
-        &[&founder, &peer],
-        Duration::from_secs(30),
-        async || {
-            let current = match peer.handles.credentials.current().await {
-                Ok(current) => current,
-                Err(error) => return Some(Err(error)),
-            };
-            if current.renewals == 1 {
-                return Some(Ok(current));
-            }
-            assert_eq!(current.expires_at, before.expires_at);
-            None
-        },
-    )
-    .await;
-    let converged = match converged {
-        Ok(converged) => converged,
-        Err(error) => panic!(
-            "the restarted host's controller stopped ({error}): {:?}",
-            peer.outcome().await
-        ),
-    };
-    assert_eq!(converged.expires_at, renewed.expires_at);
-    assert_eq!(
-        converged.certificate_fingerprint,
-        renewed.certificate_fingerprint
-    );
-    // A later renewal under the renewed credential commits again.
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    let again = peer.handles.credentials.renew().await.unwrap();
-    assert!(again.expires_at > converged.expires_at);
-    assert_eq!(again.renewals, 2);
-    wait_for_contact(
-        &founder,
-        founder_dir.path(),
-        node,
-        again.certificate_fingerprint,
-    )
-    .await;
-    peer.stop().await;
-    founder.stop().await;
+#[test]
+fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converges_after_a_crash() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+        let before = peer.handles.credentials.current().await.unwrap();
+        assert_eq!(before.node, node);
+        assert_eq!(before.renewals, 0);
+        let receipt_path = peer_dir
+            .path()
+            .join("JOIN")
+            .join("node-key")
+            .join("enrollment.bin");
+        let held = std::fs::read(&receipt_path).unwrap();
+        // A renewal must extend the credential beyond the second it was issued.
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        // The controller asks the sponsor under the credential it holds, installs
+        // the renewal under the same key and presents it at once.
+        let renewed = peer.handles.credentials.renew().await.unwrap();
+        assert_eq!(renewed.node, node);
+        assert_eq!(renewed.principal, before.principal);
+        assert!(renewed.expires_at > before.expires_at);
+        assert!(renewed.issued_at >= before.issued_at);
+        assert_ne!(
+            renewed.certificate_fingerprint,
+            before.certificate_fingerprint
+        );
+        assert_eq!(renewed.renewals, 1);
+        assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
+        // Give the controller a loop to announce; if it stopped, say why.
+        focal_rt::time::sleep(Duration::from_millis(600))
+            .await
+            .unwrap();
+        match peer.handles.credentials.current().await {
+            Ok(current) => assert_eq!(current, renewed),
+            Err(error) => panic!(
+                "the host's controller stopped after renewing ({error}): {:?}",
+                peer.outcome().await
+            ),
+        }
+        // The peer announces its renewed certificate to the root: the founder
+        // authorizes the new connection and records the fingerprint it presented.
+        wait_for_contact(
+            &founder,
+            founder_dir.path(),
+            node,
+            renewed.certificate_fingerprint,
+        )
+        .await;
+        // The placement agent signs with the renewed credential from now on and
+        // keeps its state.
+        let status = peer.handles.placement.status().await.unwrap();
+        assert_eq!(status.node, node);
+        // Crash window: the sponsor committed the renewal but the holder still
+        // has the previous receipt on disk. A retry is answered with the committed
+        // renewal, never a second issuance, and the holder converges on it.
+        peer.stop().await;
+        std::fs::write(&receipt_path, &held).unwrap();
+        let peer = Running::start(&peer_settings).await;
+        // The controller sees the registry ahead of the receipt it holds and
+        // converges on the committed renewal by itself.
+        let converged = until(
+            "the restarted host converges on the committed renewal",
+            &[&founder, &peer],
+            Duration::from_secs(30),
+            async || {
+                let current = match peer.handles.credentials.current().await {
+                    Ok(current) => current,
+                    Err(error) => return Some(Err(error)),
+                };
+                if current.renewals == 1 {
+                    return Some(Ok(current));
+                }
+                assert_eq!(current.expires_at, before.expires_at);
+                None
+            },
+        )
+        .await;
+        let converged = match converged {
+            Ok(converged) => converged,
+            Err(error) => panic!(
+                "the restarted host's controller stopped ({error}): {:?}",
+                peer.outcome().await
+            ),
+        };
+        assert_eq!(converged.expires_at, renewed.expires_at);
+        assert_eq!(
+            converged.certificate_fingerprint,
+            renewed.certificate_fingerprint
+        );
+        // A later renewal under the renewed credential commits again.
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        let again = peer.handles.credentials.renew().await.unwrap();
+        assert!(again.expires_at > converged.expires_at);
+        assert_eq!(again.renewals, 2);
+        wait_for_contact(
+            &founder,
+            founder_dir.path(),
+            node,
+            again.certificate_fingerprint,
+        )
+        .await;
+        peer.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 /// The identity the root's grant names for `node`, once it names it.
@@ -208,274 +217,290 @@ async fn granted_identity(founder: &Running, node: u64) -> Option<[u8; 32]> {
         .map(|grant| grant.enrollment.identity.0)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_committed_rotation_after_a_crash()
+#[test]
+fn a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_committed_rotation_after_a_crash()
  {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
-    let before = peer.handles.credentials.current().await.unwrap();
-    assert_eq!(before.rotations, 0);
-    // The root granted the node under the key it enrolled with.
-    let granted = until(
-        "the node is granted",
-        &[&founder, &peer],
-        Duration::from_secs(30),
-        async || granted_identity(&founder, node).await,
-    )
-    .await;
-    assert_eq!(granted, before.key_identity);
-    let key_dir = peer_dir.path().join("JOIN").join("node-key");
-    let held_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
-    let held_receipt = std::fs::read(key_dir.join("enrollment.bin")).unwrap();
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    // The rotation: a new key under the same identity and principal,
-    // presented at once and announced to the root.
-    let rotated = peer.handles.credentials.rotate().await.unwrap();
-    assert_eq!(rotated.node, node);
-    assert_eq!(rotated.principal, before.principal);
-    assert_ne!(rotated.key_identity, before.key_identity);
-    assert_ne!(
-        rotated.certificate_fingerprint,
-        before.certificate_fingerprint
-    );
-    assert_eq!(rotated.rotations, 1);
-    assert_eq!(rotated.renewals, 0);
-    let adopted_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
-    assert_ne!(adopted_key, held_key);
-    assert!(
-        !peer_dir
-            .path()
-            .join("JOIN")
-            .join("node-key.next")
-            .join("join-key.bin")
-            .exists(),
-        "the staged key is cleared once adopted"
-    );
-    wait_for_contact(
-        &founder,
-        founder_dir.path(),
-        node,
-        rotated.certificate_fingerprint,
-    )
-    .await;
-    // The root re-grants the node under its new key.
-    until(
-        "the node is re-granted under its rotated key",
-        &[&founder, &peer],
-        Duration::from_secs(30),
-        async || {
-            (granted_identity(&founder, node).await == Some(rotated.key_identity)).then_some(())
-        },
-    )
-    .await;
-    // Under the rotated key a renewal is an ordinary renewal.
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    let renewed = peer.handles.credentials.renew().await.unwrap();
-    assert_eq!(renewed.key_identity, rotated.key_identity);
-    assert_eq!(renewed.renewals, 1);
-    assert_eq!(renewed.rotations, 1);
-    // Crash window: the sponsor committed a rotation but the holder still
-    // has the previous key and receipt, with the new key staged. The
-    // restarted host adopts the committed rotation by itself.
-    peer.stop().await;
-    let staged = peer_dir.path().join("JOIN").join("node-key.next");
-    std::fs::create_dir_all(&staged).unwrap();
-    crate::set_test_mode(&staged, 0o700);
-    for name in ["join-key.bin", "join-key.bin.initialized"] {
-        let source = key_dir.join(name);
-        if source.exists() {
-            std::fs::copy(&source, staged.join(name)).unwrap();
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+        let before = peer.handles.credentials.current().await.unwrap();
+        assert_eq!(before.rotations, 0);
+        // The root granted the node under the key it enrolled with.
+        let granted = until(
+            "the node is granted",
+            &[&founder, &peer],
+            Duration::from_secs(30),
+            async || granted_identity(&founder, node).await,
+        )
+        .await;
+        assert_eq!(granted, before.key_identity);
+        let key_dir = peer_dir.path().join("JOIN").join("node-key");
+        let held_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
+        let held_receipt = std::fs::read(key_dir.join("enrollment.bin")).unwrap();
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        // The rotation: a new key under the same identity and principal,
+        // presented at once and announced to the root.
+        let rotated = peer.handles.credentials.rotate().await.unwrap();
+        assert_eq!(rotated.node, node);
+        assert_eq!(rotated.principal, before.principal);
+        assert_ne!(rotated.key_identity, before.key_identity);
+        assert_ne!(
+            rotated.certificate_fingerprint,
+            before.certificate_fingerprint
+        );
+        assert_eq!(rotated.rotations, 1);
+        assert_eq!(rotated.renewals, 0);
+        let adopted_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
+        assert_ne!(adopted_key, held_key);
+        assert!(
+            !peer_dir
+                .path()
+                .join("JOIN")
+                .join("node-key.next")
+                .join("join-key.bin")
+                .exists(),
+            "the staged key is cleared once adopted"
+        );
+        wait_for_contact(
+            &founder,
+            founder_dir.path(),
+            node,
+            rotated.certificate_fingerprint,
+        )
+        .await;
+        // The root re-grants the node under its new key.
+        until(
+            "the node is re-granted under its rotated key",
+            &[&founder, &peer],
+            Duration::from_secs(30),
+            async || {
+                (granted_identity(&founder, node).await == Some(rotated.key_identity)).then_some(())
+            },
+        )
+        .await;
+        // Under the rotated key a renewal is an ordinary renewal.
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        let renewed = peer.handles.credentials.renew().await.unwrap();
+        assert_eq!(renewed.key_identity, rotated.key_identity);
+        assert_eq!(renewed.renewals, 1);
+        assert_eq!(renewed.rotations, 1);
+        // Crash window: the sponsor committed a rotation but the holder still
+        // has the previous key and receipt, with the new key staged. The
+        // restarted host adopts the committed rotation by itself.
+        peer.stop().await;
+        let staged = peer_dir.path().join("JOIN").join("node-key.next");
+        std::fs::create_dir_all(&staged).unwrap();
+        crate::set_test_mode(&staged, 0o700);
+        for name in ["join-key.bin", "join-key.bin.initialized"] {
+            let source = key_dir.join(name);
+            if source.exists() {
+                std::fs::copy(&source, staged.join(name)).unwrap();
+            }
         }
-    }
-    std::fs::write(key_dir.join("join-key.bin"), &held_key).unwrap();
-    std::fs::write(key_dir.join("enrollment.bin"), &held_receipt).unwrap();
-    let peer = Running::start(&peer_settings).await;
-    let converged = until(
-        "the restarted host adopts the committed rotation",
-        &[&founder, &peer],
-        Duration::from_secs(30),
-        async || match peer.handles.credentials.current().await {
-            Ok(current) if current.rotations == 1 => Some(Ok(current)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        },
-    )
-    .await;
-    let converged = match converged {
-        Ok(converged) => converged,
-        Err(error) => panic!(
-            "the restarted host's controller stopped ({error}): {:?}",
-            peer.outcome().await
-        ),
-    };
-    assert_eq!(converged.key_identity, rotated.key_identity);
-    assert_eq!(
-        converged.certificate_fingerprint,
-        renewed.certificate_fingerprint
-    );
-    peer.stop().await;
-    founder.stop().await;
+        std::fs::write(key_dir.join("join-key.bin"), &held_key).unwrap();
+        std::fs::write(key_dir.join("enrollment.bin"), &held_receipt).unwrap();
+        let peer = Running::start(&peer_settings).await;
+        let converged = until(
+            "the restarted host adopts the committed rotation",
+            &[&founder, &peer],
+            Duration::from_secs(30),
+            async || match peer.handles.credentials.current().await {
+                Ok(current) if current.rotations == 1 => Some(Ok(current)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .await;
+        let converged = match converged {
+            Ok(converged) => converged,
+            Err(error) => panic!(
+                "the restarted host's controller stopped ({error}): {:?}",
+                peer.outcome().await
+            ),
+        };
+        assert_eq!(converged.key_identity, rotated.key_identity);
+        assert_eq!(
+            converged.certificate_fingerprint,
+            renewed.certificate_fingerprint
+        );
+        peer.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_it_holds() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let founder_id = founder_node(founder_dir.path());
-    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
-    let before = founder.handles.credentials.current().await.unwrap();
-    assert_eq!(before.node, founder_id);
-    assert_eq!(before.renewals, 0);
-    assert_eq!(before.rotations, 0);
-    let receipt_path = founder_receipt_path(founder_dir.path());
-    let held = std::fs::read(&receipt_path).unwrap();
-    let genesis = root_registry(&founder, founder_dir.path())
-        .await
-        .enrollments()
-        .find(|listed| listed.identity.node_id == Some(founder_id))
-        .unwrap()
-        .clone();
-    assert_eq!(genesis.revision, 1);
-    assert_eq!(
-        certificate_fingerprint(&genesis.certificate),
-        before.certificate_fingerprint
-    );
-    // A renewal must extend the credential beyond the second it was issued.
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    // The founder asks the enrollment host it runs, installs the renewal
-    // under its genesis key and presents it at once.
-    let renewed = founder.handles.credentials.renew().await.unwrap();
-    assert_eq!(renewed.node, founder_id);
-    assert_eq!(renewed.principal, before.principal);
-    assert_eq!(renewed.key_identity, before.key_identity);
-    assert!(renewed.expires_at > before.expires_at);
-    assert_ne!(
-        renewed.certificate_fingerprint,
-        before.certificate_fingerprint
-    );
-    assert_eq!(renewed.renewals, 1);
-    assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
-    // The registry lists the renewal under the founder's identity, issued
-    // under the founding subject at its new revision, with the genesis
-    // certificate retiring through the grace.
-    let registry = root_registry(&founder, founder_dir.path()).await;
-    let listed = registry
-        .enrollments()
-        .find(|listed| listed.identity.node_id == Some(founder_id))
-        .unwrap()
-        .clone();
-    assert_eq!(listed.identity, genesis.identity);
-    assert_eq!(listed.public_key, genesis.public_key);
-    assert!(listed.revision > genesis.revision);
-    assert_eq!(
-        certificate_fingerprint(&listed.certificate),
-        renewed.certificate_fingerprint
-    );
-    let now = unix_time().unwrap();
-    assert_eq!(
-        registry
-            .authorize_certificate(&genesis.certificate, now)
-            .unwrap(),
-        genesis.identity
-    );
-    assert!(
-        registry
-            .retired(now)
-            .any(|(retired, _)| retired.certificate == genesis.certificate)
-    );
-    // It announces the renewed certificate to the root and keeps serving:
-    // the joined host renews through it, and a new host enrolls after.
-    wait_for_contact(
-        &founder,
-        founder_dir.path(),
-        founder_id,
-        renewed.certificate_fingerprint,
-    )
-    .await;
-    let peer_renewed = peer.handles.credentials.renew().await.unwrap();
-    assert_eq!(peer_renewed.node, node);
-    assert_eq!(peer_renewed.renewals, 1);
-    let second_dir = tempfile::tempdir().unwrap();
-    let second_settings = settings(second_dir.path());
-    let (second, second_node) =
-        join_peer(&founder, founder_dir.path(), "second", &second_settings).await;
-    assert_ne!(second_node, node);
-    second.stop().await;
-    // Crash window: the registry committed the renewal but the founder
-    // still holds the genesis receipt. It starts on the committed renewal
-    // at once, without another issuance.
-    founder.stop().await;
-    std::fs::write(&receipt_path, &held).unwrap();
-    let founder = Running::start(&founder_settings).await;
-    let restarted = founder.handles.credentials.current().await.unwrap();
-    assert_eq!(
-        restarted.certificate_fingerprint,
-        renewed.certificate_fingerprint
-    );
-    assert_eq!(restarted.expires_at, renewed.expires_at);
-    assert_eq!(restarted.renewals, 0);
-    assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
-    // A rotation moves the founder to a fresh key under its identity; the
-    // root re-grants it under the new key, and a restart finds the rotated
-    // key beside the genesis draft.
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    let rotated = founder.handles.credentials.rotate().await.unwrap();
-    assert_eq!(rotated.principal, before.principal);
-    assert_ne!(rotated.key_identity, before.key_identity);
-    assert_eq!(rotated.rotations, 1);
-    assert!(
-        !founder_dir
-            .path()
-            .join("cluster")
-            .join("network")
-            .join("node-key.next")
-            .join("join-key.bin")
-            .exists(),
-        "the staged key is cleared once adopted"
-    );
-    until(
-        "the founder is re-granted under its rotated key",
-        &[&founder, &peer],
-        Duration::from_secs(30),
-        async || {
-            (granted_identity(&founder, founder_id).await == Some(rotated.key_identity))
-                .then_some(())
-        },
-    )
-    .await;
-    founder.stop().await;
-    let founder = Running::start(&founder_settings).await;
-    let restarted = founder.handles.credentials.current().await.unwrap();
-    assert_eq!(restarted.key_identity, rotated.key_identity);
-    assert_eq!(
-        restarted.certificate_fingerprint,
-        rotated.certificate_fingerprint
-    );
-    // Under the rotated key a renewal is an ordinary renewal, carrying the
-    // founder's principal, and the joined host still renews through it.
-    focal_rt::time::pause(Duration::from_millis(1100)).await;
-    let again = founder.handles.credentials.renew().await.unwrap();
-    assert_eq!(again.key_identity, rotated.key_identity);
-    assert_eq!(again.principal, before.principal);
-    assert!(again.expires_at > rotated.expires_at);
-    wait_for_contact(
-        &founder,
-        founder_dir.path(),
-        founder_id,
-        again.certificate_fingerprint,
-    )
-    .await;
-    let peer_again = peer.handles.credentials.renew().await.unwrap();
-    assert_eq!(peer_again.renewals, 2);
-    peer.stop().await;
-    founder.stop().await;
+#[test]
+fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_it_holds() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let founder_id = founder_node(founder_dir.path());
+        let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+        let before = founder.handles.credentials.current().await.unwrap();
+        assert_eq!(before.node, founder_id);
+        assert_eq!(before.renewals, 0);
+        assert_eq!(before.rotations, 0);
+        let receipt_path = founder_receipt_path(founder_dir.path());
+        let held = std::fs::read(&receipt_path).unwrap();
+        let genesis = root_registry(&founder, founder_dir.path())
+            .await
+            .enrollments()
+            .find(|listed| listed.identity.node_id == Some(founder_id))
+            .unwrap()
+            .clone();
+        assert_eq!(genesis.revision, 1);
+        assert_eq!(
+            certificate_fingerprint(&genesis.certificate),
+            before.certificate_fingerprint
+        );
+        // A renewal must extend the credential beyond the second it was issued.
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        // The founder asks the enrollment host it runs, installs the renewal
+        // under its genesis key and presents it at once.
+        let renewed = founder.handles.credentials.renew().await.unwrap();
+        assert_eq!(renewed.node, founder_id);
+        assert_eq!(renewed.principal, before.principal);
+        assert_eq!(renewed.key_identity, before.key_identity);
+        assert!(renewed.expires_at > before.expires_at);
+        assert_ne!(
+            renewed.certificate_fingerprint,
+            before.certificate_fingerprint
+        );
+        assert_eq!(renewed.renewals, 1);
+        assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
+        // The registry lists the renewal under the founder's identity, issued
+        // under the founding subject at its new revision, with the genesis
+        // certificate retiring through the grace.
+        let registry = root_registry(&founder, founder_dir.path()).await;
+        let listed = registry
+            .enrollments()
+            .find(|listed| listed.identity.node_id == Some(founder_id))
+            .unwrap()
+            .clone();
+        assert_eq!(listed.identity, genesis.identity);
+        assert_eq!(listed.public_key, genesis.public_key);
+        assert!(listed.revision > genesis.revision);
+        assert_eq!(
+            certificate_fingerprint(&listed.certificate),
+            renewed.certificate_fingerprint
+        );
+        let now = unix_time().unwrap();
+        assert_eq!(
+            registry
+                .authorize_certificate(&genesis.certificate, now)
+                .unwrap(),
+            genesis.identity
+        );
+        assert!(
+            registry
+                .retired(now)
+                .any(|(retired, _)| retired.certificate == genesis.certificate)
+        );
+        // It announces the renewed certificate to the root and keeps serving:
+        // the joined host renews through it, and a new host enrolls after.
+        wait_for_contact(
+            &founder,
+            founder_dir.path(),
+            founder_id,
+            renewed.certificate_fingerprint,
+        )
+        .await;
+        let peer_renewed = peer.handles.credentials.renew().await.unwrap();
+        assert_eq!(peer_renewed.node, node);
+        assert_eq!(peer_renewed.renewals, 1);
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_settings = settings(second_dir.path());
+        let (second, second_node) =
+            join_peer(&founder, founder_dir.path(), "second", &second_settings).await;
+        assert_ne!(second_node, node);
+        second.stop().await;
+        // Crash window: the registry committed the renewal but the founder
+        // still holds the genesis receipt. It starts on the committed renewal
+        // at once, without another issuance.
+        founder.stop().await;
+        std::fs::write(&receipt_path, &held).unwrap();
+        let founder = Running::start(&founder_settings).await;
+        let restarted = founder.handles.credentials.current().await.unwrap();
+        assert_eq!(
+            restarted.certificate_fingerprint,
+            renewed.certificate_fingerprint
+        );
+        assert_eq!(restarted.expires_at, renewed.expires_at);
+        assert_eq!(restarted.renewals, 0);
+        assert_ne!(std::fs::read(&receipt_path).unwrap(), held);
+        // A rotation moves the founder to a fresh key under its identity; the
+        // root re-grants it under the new key, and a restart finds the rotated
+        // key beside the genesis draft.
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        let rotated = founder.handles.credentials.rotate().await.unwrap();
+        assert_eq!(rotated.principal, before.principal);
+        assert_ne!(rotated.key_identity, before.key_identity);
+        assert_eq!(rotated.rotations, 1);
+        assert!(
+            !founder_dir
+                .path()
+                .join("cluster")
+                .join("network")
+                .join("node-key.next")
+                .join("join-key.bin")
+                .exists(),
+            "the staged key is cleared once adopted"
+        );
+        until(
+            "the founder is re-granted under its rotated key",
+            &[&founder, &peer],
+            Duration::from_secs(30),
+            async || {
+                (granted_identity(&founder, founder_id).await == Some(rotated.key_identity))
+                    .then_some(())
+            },
+        )
+        .await;
+        founder.stop().await;
+        let founder = Running::start(&founder_settings).await;
+        let restarted = founder.handles.credentials.current().await.unwrap();
+        assert_eq!(restarted.key_identity, rotated.key_identity);
+        assert_eq!(
+            restarted.certificate_fingerprint,
+            rotated.certificate_fingerprint
+        );
+        // Under the rotated key a renewal is an ordinary renewal, carrying the
+        // founder's principal, and the joined host still renews through it.
+        focal_rt::time::sleep(Duration::from_millis(1100))
+            .await
+            .unwrap();
+        let again = founder.handles.credentials.renew().await.unwrap();
+        assert_eq!(again.key_identity, rotated.key_identity);
+        assert_eq!(again.principal, before.principal);
+        assert!(again.expires_at > rotated.expires_at);
+        wait_for_contact(
+            &founder,
+            founder_dir.path(),
+            founder_id,
+            again.certificate_fingerprint,
+        )
+        .await;
+        let peer_again = peer.handles.credentials.renew().await.unwrap();
+        assert_eq!(peer_again.renewals, 2);
+        peer.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 /// A lifetime short enough for the test to watch a credential renew itself
@@ -486,44 +511,47 @@ async fn the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_
 /// to a credential that had expired between its join and its start.
 const SHORT_LIFETIME: u64 = 3 * START_ALLOWANCE;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_late_joiner() {
-    // Told in phases, each an `async fn` of its own: a debug build gives
-    // one generator's poll a frame for every temporary of every phase at
-    // once — as one function this body's frame was 628 KiB on macOS, and
-    // under it, with the open path's 483 KiB beneath, a Windows test
-    // thread of 2 MiB overflowed — and phases take their frames in turn.
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let mut founder_settings = settings(founder_dir.path());
-    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let genesis = a_short_lifetime_at_genesis(&founder, founder_dir.path()).await;
-    let (peer, node, peer_renewed) = the_founder_and_a_joined_host_renew_twice(
-        &founder,
-        founder_dir.path(),
-        &peer_settings,
-        &genesis,
-    )
-    .await;
-    the_bootstrap_certificate_succeeds_itself_and_the_host_renews_through_it(
-        &founder,
-        &peer,
-        founder_dir.path(),
-        &genesis,
-        &peer_renewed,
-    )
-    .await;
-    late_hosts_join_before_and_after_the_founder_restarts(
-        founder,
-        &founder_settings,
-        founder_dir.path(),
-        peer,
-        node,
-        &genesis,
-    )
-    .await;
+#[test]
+fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_late_joiner() {
+    focal_rt::block_on(async move {
+        // Told in phases, each an `async fn` of its own: a debug build gives
+        // one generator's poll a frame for every temporary of every phase at
+        // once — as one function this body's frame was 628 KiB on macOS, and
+        // under it, with the open path's 483 KiB beneath, a Windows test
+        // thread of 2 MiB overflowed — and phases take their frames in turn.
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let mut founder_settings = settings(founder_dir.path());
+        founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let genesis = a_short_lifetime_at_genesis(&founder, founder_dir.path()).await;
+        let (peer, node, peer_renewed) = the_founder_and_a_joined_host_renew_twice(
+            &founder,
+            founder_dir.path(),
+            &peer_settings,
+            &genesis,
+        )
+        .await;
+        the_bootstrap_certificate_succeeds_itself_and_the_host_renews_through_it(
+            &founder,
+            &peer,
+            founder_dir.path(),
+            &genesis,
+            &peer_renewed,
+        )
+        .await;
+        late_hosts_join_before_and_after_the_founder_restarts(
+            founder,
+            &founder_settings,
+            founder_dir.path(),
+            peer,
+            node,
+            &genesis,
+        )
+        .await;
+    })
+    .unwrap()
 }
 /// The genesis of a cluster whose credential lifetime is short: what the
 /// later phases compare against.
@@ -675,7 +703,7 @@ async fn the_bootstrap_certificate_succeeds_itself_and_the_host_renews_through_i
             Err(_) => {
                 // A renewal is decided in whole seconds: the next attempt
                 // is a second on, as the controller's own retries are.
-                focal_rt::time::pause(Duration::from_secs(1)).await;
+                focal_rt::time::sleep(Duration::from_secs(1)).await.unwrap();
                 None
             }
         },
@@ -720,64 +748,67 @@ async fn late_hosts_join_before_and_after_the_founder_restarts(
     after.stop().await;
     founder.stop().await;
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_credential_lifetime_is_committed_at_genesis_and_a_later_change_is_refused() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let mut founder_settings = settings(founder_dir.path());
-    founder_settings.value.node.credential_lifetime_seconds = Some(3600);
-    let founder = Running::start(&founder_settings).await;
-    let genesis = founder.handles.credentials.current().await.unwrap();
-    assert_eq!(genesis.expires_at - genesis.issued_at, 3600);
-    founder.stop().await;
-    // A start that asks for another lifetime is refused by the field's
-    // name, like any committed policy; the committed one starts.
-    let changed = TestSettings {
-        value: {
-            let mut value = founder_settings.value.clone();
-            value.node.credential_lifetime_seconds = Some(7200);
-            value
-        },
-        socket: founder_settings.socket.try_clone().unwrap(),
-    };
-    let error = changed.open().await.err().unwrap();
-    assert!(
-        matches!(
-            error,
-            ServiceError::Bootstrap(NetworkError::Node(NodeError::Config(
-                ConfigError::CommittedPolicyChange {
-                    field: "node.credential_lifetime_seconds"
-                }
-            )))
-        ),
-        "{error}"
-    );
-    // The issuer lifetime is committed with it: derived at genesis (twelve
-    // credential lifetimes), and a start naming another is refused too.
-    let changed_issuer = TestSettings {
-        value: {
-            let mut value = founder_settings.value.clone();
-            value.node.issuer_lifetime_seconds = Some(6 * 3600);
-            value
-        },
-        socket: founder_settings.socket.try_clone().unwrap(),
-    };
-    let error = changed_issuer.open().await.err().unwrap();
-    assert!(
-        matches!(
-            error,
-            ServiceError::Bootstrap(NetworkError::Node(NodeError::Config(
-                ConfigError::CommittedPolicyChange {
-                    field: "node.issuer_lifetime_seconds"
-                }
-            )))
-        ),
-        "{error}"
-    );
-    let founder = Running::start(&founder_settings).await;
-    let restarted = founder.handles.credentials.current().await.unwrap();
-    assert_eq!(restarted.expires_at, genesis.expires_at);
-    assert_eq!(restarted.expires_at - restarted.issued_at, 3600);
-    founder.stop().await;
+#[test]
+fn the_credential_lifetime_is_committed_at_genesis_and_a_later_change_is_refused() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let mut founder_settings = settings(founder_dir.path());
+        founder_settings.value.node.credential_lifetime_seconds = Some(3600);
+        let founder = Running::start(&founder_settings).await;
+        let genesis = founder.handles.credentials.current().await.unwrap();
+        assert_eq!(genesis.expires_at - genesis.issued_at, 3600);
+        founder.stop().await;
+        // A start that asks for another lifetime is refused by the field's
+        // name, like any committed policy; the committed one starts.
+        let changed = TestSettings {
+            value: {
+                let mut value = founder_settings.value.clone();
+                value.node.credential_lifetime_seconds = Some(7200);
+                value
+            },
+            socket: founder_settings.socket.try_clone().unwrap(),
+        };
+        let error = changed.open().await.err().unwrap();
+        assert!(
+            matches!(
+                error,
+                ServiceError::Bootstrap(NetworkError::Node(NodeError::Config(
+                    ConfigError::CommittedPolicyChange {
+                        field: "node.credential_lifetime_seconds"
+                    }
+                )))
+            ),
+            "{error}"
+        );
+        // The issuer lifetime is committed with it: derived at genesis (twelve
+        // credential lifetimes), and a start naming another is refused too.
+        let changed_issuer = TestSettings {
+            value: {
+                let mut value = founder_settings.value.clone();
+                value.node.issuer_lifetime_seconds = Some(6 * 3600);
+                value
+            },
+            socket: founder_settings.socket.try_clone().unwrap(),
+        };
+        let error = changed_issuer.open().await.err().unwrap();
+        assert!(
+            matches!(
+                error,
+                ServiceError::Bootstrap(NetworkError::Node(NodeError::Config(
+                    ConfigError::CommittedPolicyChange {
+                        field: "node.issuer_lifetime_seconds"
+                    }
+                )))
+            ),
+            "{error}"
+        );
+        let founder = Running::start(&founder_settings).await;
+        let restarted = founder.handles.credentials.current().await.unwrap();
+        assert_eq!(restarted.expires_at, genesis.expires_at);
+        assert_eq!(restarted.expires_at - restarted.issued_at, 3600);
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 /// A host that joins a cluster older than a credential lifetime is admitted:
@@ -785,80 +816,81 @@ async fn the_credential_lifetime_is_committed_at_genesis_and_a_later_change_is_r
 /// certificate has expired by then, and the founder is still its route —
 /// known by its enrolled key, presenting a renewal of it. The host
 /// announces itself, the root admits it, and it catches up and renews.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up()
- {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let mut founder_settings = settings(founder_dir.path());
-    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let genesis = founder.handles.credentials.current().await.unwrap();
-    let (peer, _node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
-    // The founder's genesis certificate runs out: the founder serves on its
-    // renewals.
-    until(
-        "the founder's genesis certificate expires",
-        &[&founder, &peer],
-        Duration::from_secs(4 * SHORT_LIFETIME),
-        async || {
-            let held = founder.handles.credentials.current().await.ok()?;
-            (unix_time().ok()? >= genesis.expires_at && held.expires_at > genesis.expires_at)
+#[test]
+fn a_host_that_joins_after_the_founders_genesis_certificate_expired_is_admitted_and_catches_up() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let mut founder_settings = settings(founder_dir.path());
+        founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let genesis = founder.handles.credentials.current().await.unwrap();
+        let (peer, _node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+        // The founder's genesis certificate runs out: the founder serves on its
+        // renewals.
+        until(
+            "the founder's genesis certificate expires",
+            &[&founder, &peer],
+            Duration::from_secs(4 * SHORT_LIFETIME),
+            async || {
+                let held = founder.handles.credentials.current().await.ok()?;
+                (unix_time().ok()? >= genesis.expires_at && held.expires_at > genesis.expires_at)
+                    .then_some(())
+            },
+        )
+        .await;
+        let late_dir = tempfile::tempdir().unwrap();
+        let late_settings = settings(late_dir.path());
+        let (late, late_node) = join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
+        // The root admits it: its contact is committed and it replicates the
+        // root from there.
+        let admitted = try_until(
+            &[&founder, &peer, &late],
+            Duration::from_secs(40),
+            async || {
+                let observation = late.handles.control.observe_root().await.ok()?;
+                (observation.snapshot().applied_index > 0
+                    && observation
+                        .contacts()
+                        .contacts
+                        .records
+                        .iter()
+                        .any(|contact| contact.node == late_node))
                 .then_some(())
-        },
-    )
-    .await;
-    let late_dir = tempfile::tempdir().unwrap();
-    let late_settings = settings(late_dir.path());
-    let (late, late_node) = join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
-    // The root admits it: its contact is committed and it replicates the
-    // root from there.
-    let admitted = try_until(
-        &[&founder, &peer, &late],
-        Duration::from_secs(40),
-        async || {
-            let observation = late.handles.control.observe_root().await.ok()?;
-            (observation.snapshot().applied_index > 0
-                && observation
+            },
+        )
+        .await;
+        if let Err(spent) = admitted {
+            let observation = founder.handles.control.observe_root().await.unwrap();
+            panic!(
+                "the late host {late_node} was never admitted ({spent}): members {:?} contacts {:?}; late {:?}",
+                observation.configuration().configuration,
+                observation
                     .contacts()
                     .contacts
                     .records
                     .iter()
-                    .any(|contact| contact.node == late_node))
-            .then_some(())
-        },
-    )
-    .await;
-    if let Err(spent) = admitted {
-        let observation = founder.handles.control.observe_root().await.unwrap();
-        panic!(
-            "the late host {late_node} was never admitted ({spent}): members {:?} contacts {:?}; late {:?}",
-            observation.configuration().configuration,
-            observation
-                .contacts()
-                .contacts
-                .records
-                .iter()
-                .map(|contact| contact.node)
-                .collect::<Vec<_>>(),
-            late.outcome().await
-        );
-    }
-    // And it renews itself as the others do.
-    until(
-        "the late host renews",
-        &[&founder, &peer, &late],
-        Duration::from_secs(4 * SHORT_LIFETIME),
-        async || {
-            let held = late.handles.credentials.current().await.ok()?;
-            (held.renewals >= 1).then_some(())
-        },
-    )
-    .await;
-    late.stop().await;
-    peer.stop().await;
-    founder.stop().await;
+                    .map(|contact| contact.node)
+                    .collect::<Vec<_>>(),
+                late.outcome().await
+            );
+        }
+        // And it renews itself as the others do.
+        until(
+            "the late host renews",
+            &[&founder, &peer, &late],
+            Duration::from_secs(4 * SHORT_LIFETIME),
+            async || {
+                let held = late.handles.credentials.current().await.ok()?;
+                (held.renewals >= 1).then_some(())
+            },
+        )
+        .await;
+        late.stop().await;
+        peer.stop().await;
+        founder.stop().await;
+    }).unwrap()
 }
 
 /// The issuer succeeds itself in a running cluster (24 §11; the audit's
@@ -871,167 +903,171 @@ async fn a_host_that_joins_after_the_founders_genesis_certificate_expired_is_adm
 /// under it, and the genesis issuer retires once nothing live was issued
 /// under it. A late host joins under the successor alone; the founder
 /// restarts on it and enrolls another.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_genesis_issuer_retires()
-{
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let mut founder_settings = settings(founder_dir.path());
-    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let founder_id = founder_node(founder_dir.path());
-    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
-    let genesis_registry = root_registry(&founder, founder_dir.path()).await;
-    let genesis = genesis_registry.issuers().clone();
-    assert!(genesis.successor.is_none() && genesis.retiring.is_none());
-    assert!(genesis.current.endorsement.is_none());
-    assert_eq!(
-        genesis.current.certificate,
-        genesis_registry.ca_certificate()
-    );
-    assert_eq!(
-        genesis_registry.limits().issuer_lifetime,
-        focal_enrollment::DEFAULT_ISSUER_LIFETIMES * SHORT_LIFETIME
-    );
-    // Founded at this binary's level: the succession is open from genesis.
-    assert_eq!(
-        genesis_registry.fence().level,
-        crate::upgrade::CAPABILITY_LEVEL
-    );
-    assert!(crate::upgrade::opened(
-        genesis_registry.fence(),
-        crate::upgrade::ISSUER_SUCCESSION_LEVEL
-    ));
-    drop(genesis_registry);
-    // The operator stages the successor; asked again, it is the same one,
-    // staged or issuing by then.
-    let enrollment = founder.handles.enrollment.clone().unwrap();
-    let staged = enrollment
-        .rotate_issuer(unix_time().unwrap())
-        .await
-        .unwrap();
-    let successor = staged.successor.clone().unwrap().record;
-    assert!(successor.endorsement.is_some());
-    assert_ne!(successor.fingerprint, genesis.current.fingerprint);
-    assert_eq!(staged.current, genesis.current);
-    assert!(
-        focal_wire::issued_by(
-            successor.endorsement.as_ref().unwrap(),
-            &genesis.current.certificate
+#[test]
+fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_genesis_issuer_retires() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let mut founder_settings = settings(founder_dir.path());
+        founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let founder_id = founder_node(founder_dir.path());
+        let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+        let genesis_registry = root_registry(&founder, founder_dir.path()).await;
+        let genesis = genesis_registry.issuers().clone();
+        assert!(genesis.successor.is_none() && genesis.retiring.is_none());
+        assert!(genesis.current.endorsement.is_none());
+        assert_eq!(
+            genesis.current.certificate,
+            genesis_registry.ca_certificate()
+        );
+        assert_eq!(
+            genesis_registry.limits().issuer_lifetime,
+            focal_enrollment::DEFAULT_ISSUER_LIFETIMES * SHORT_LIFETIME
+        );
+        // Founded at this binary's level: the succession is open from genesis.
+        assert_eq!(
+            genesis_registry.fence().level,
+            crate::upgrade::CAPABILITY_LEVEL
+        );
+        assert!(crate::upgrade::opened(
+            genesis_registry.fence(),
+            crate::upgrade::ISSUER_SUCCESSION_LEVEL
+        ));
+        drop(genesis_registry);
+        // The operator stages the successor; asked again, it is the same one,
+        // staged or issuing by then.
+        let enrollment = founder.handles.enrollment.clone().unwrap();
+        let staged = enrollment
+            .rotate_issuer(unix_time().unwrap())
+            .await
+            .unwrap();
+        let successor = staged.successor.clone().unwrap().record;
+        assert!(successor.endorsement.is_some());
+        assert_ne!(successor.fingerprint, genesis.current.fingerprint);
+        assert_eq!(staged.current, genesis.current);
+        assert!(
+            focal_wire::issued_by(
+                successor.endorsement.as_ref().unwrap(),
+                &genesis.current.certificate
+            )
+            .unwrap()
+        );
+        let again = enrollment
+            .rotate_issuer(unix_time().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            again
+                .successor
+                .as_ref()
+                .is_some_and(|staged| staged.record == successor)
+                || again.current == successor,
+            "{again:?}"
+        );
+        // Activated at the controller's next step: the successor issues and
+        // the genesis issuer retires.
+        let activated = until(
+            "the successor issues",
+            &[&founder, &peer],
+            Duration::from_secs(SHORT_LIFETIME),
+            async || {
+                let registry = root_registry(&founder, founder_dir.path()).await;
+                (registry.issuers().current == successor).then(|| registry.issuers().clone())
+            },
         )
-        .unwrap()
-    );
-    let again = enrollment
-        .rotate_issuer(unix_time().unwrap())
-        .await
-        .unwrap();
-    assert!(
-        again
-            .successor
-            .as_ref()
-            .is_some_and(|staged| staged.record == successor)
-            || again.current == successor,
-        "{again:?}"
-    );
-    // Activated at the controller's next step: the successor issues and
-    // the genesis issuer retires.
-    let activated = until(
-        "the successor issues",
-        &[&founder, &peer],
-        Duration::from_secs(SHORT_LIFETIME),
-        async || {
-            let registry = root_registry(&founder, founder_dir.path()).await;
-            (registry.issuers().current == successor).then(|| registry.issuers().clone())
-        },
-    )
-    .await;
-    assert_eq!(activated.retiring, Some(genesis.current.clone()));
-    assert!(activated.successor.is_none());
-    // Every node renews under it ahead of expiry: the registry lists each
-    // under a certificate the successor issued.
-    let under = |registry: &EnrollmentRegistry, listed: u64| {
-        registry
-            .enrollments()
-            .find(|receipt| receipt.identity.node_id == Some(listed))
-            .is_some_and(|receipt| {
-                focal_wire::issued_by(&receipt.certificate, &successor.certificate).unwrap_or(false)
-            })
-    };
-    until(
-        "every node renews under the successor",
-        &[&founder, &peer],
-        Duration::from_secs(2 * SHORT_LIFETIME),
-        async || {
-            let registry = root_registry(&founder, founder_dir.path()).await;
-            (under(&registry, founder_id) && under(&registry, node)).then_some(())
-        },
-    )
-    .await;
-    // The host renews through the founder under the issuers it adopted —
-    // the enrollment endpoint presenting a chain its trust verifies — when
-    // asked now.
-    let peer_renewed = until(
-        "the host renews under the successor when asked",
-        &[&founder, &peer],
-        Duration::from_secs(SHORT_LIFETIME),
-        async || match peer.handles.credentials.renew().await {
-            Ok(renewed) => Some(renewed),
-            Err(_) => {
-                focal_rt::time::pause(Duration::from_secs(1)).await;
-                None
-            }
-        },
-    )
-    .await;
-    assert_eq!(peer_renewed.node, node);
-    // The genesis issuer retires once nothing live was issued under it —
-    // every credential issued under it expired, the bootstrap server
-    // certificate succeeded itself under the successor — within a lifetime
-    // of the activation and the last credential it issued.
-    let retired = until(
-        "the genesis issuer retires",
-        &[&founder, &peer],
-        Duration::from_secs(3 * SHORT_LIFETIME),
-        async || {
-            let registry = root_registry(&founder, founder_dir.path()).await;
-            (registry.issuers().retiring.is_none() && registry.issuers().current == successor)
-                .then_some(registry)
-        },
-    )
-    .await;
-    assert_eq!(retired.trust_roots().count(), 1);
-    // The genesis issuer stays the cluster's identity.
-    assert_eq!(retired.ca_certificate(), genesis.current.certificate);
-    drop(retired);
-    // A late host joins with an invitation naming the successor alone, and
-    // is issued under it.
-    let late_dir = tempfile::tempdir().unwrap();
-    let late_settings = settings(late_dir.path());
-    let (late, late_node) = join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
-    let listed = root_registry(&founder, founder_dir.path()).await;
-    assert!(under(&listed, late_node), "{:?}", listed.issuers());
-    drop(listed);
-    late.stop().await;
-    peer.stop().await;
-    // The founder restarts on the successor — its authority holds it, the
-    // registry names it — and enrolls another host.
-    founder.stop().await;
-    let founder = Running::start(&founder_settings).await;
-    let restarted = root_registry(&founder, founder_dir.path()).await;
-    assert_eq!(restarted.issuers().current, successor);
-    assert!(restarted.issuers().retiring.is_none());
-    drop(restarted);
-    let after_dir = tempfile::tempdir().unwrap();
-    let after_settings = settings(after_dir.path());
-    let (after, after_node) =
-        join_peer(&founder, founder_dir.path(), "after", &after_settings).await;
-    assert_ne!(after_node, late_node);
-    let listed = root_registry(&founder, founder_dir.path()).await;
-    assert!(under(&listed, after_node));
-    drop(listed);
-    after.stop().await;
-    founder.stop().await;
+        .await;
+        assert_eq!(activated.retiring, Some(genesis.current.clone()));
+        assert!(activated.successor.is_none());
+        // Every node renews under it ahead of expiry: the registry lists each
+        // under a certificate the successor issued.
+        let under = |registry: &EnrollmentRegistry, listed: u64| {
+            registry
+                .enrollments()
+                .find(|receipt| receipt.identity.node_id == Some(listed))
+                .is_some_and(|receipt| {
+                    focal_wire::issued_by(&receipt.certificate, &successor.certificate)
+                        .unwrap_or(false)
+                })
+        };
+        until(
+            "every node renews under the successor",
+            &[&founder, &peer],
+            Duration::from_secs(2 * SHORT_LIFETIME),
+            async || {
+                let registry = root_registry(&founder, founder_dir.path()).await;
+                (under(&registry, founder_id) && under(&registry, node)).then_some(())
+            },
+        )
+        .await;
+        // The host renews through the founder under the issuers it adopted —
+        // the enrollment endpoint presenting a chain its trust verifies — when
+        // asked now.
+        let peer_renewed = until(
+            "the host renews under the successor when asked",
+            &[&founder, &peer],
+            Duration::from_secs(SHORT_LIFETIME),
+            async || match peer.handles.credentials.renew().await {
+                Ok(renewed) => Some(renewed),
+                Err(_) => {
+                    focal_rt::time::sleep(Duration::from_secs(1)).await.unwrap();
+                    None
+                }
+            },
+        )
+        .await;
+        assert_eq!(peer_renewed.node, node);
+        // The genesis issuer retires once nothing live was issued under it —
+        // every credential issued under it expired, the bootstrap server
+        // certificate succeeded itself under the successor — within a lifetime
+        // of the activation and the last credential it issued.
+        let retired = until(
+            "the genesis issuer retires",
+            &[&founder, &peer],
+            Duration::from_secs(3 * SHORT_LIFETIME),
+            async || {
+                let registry = root_registry(&founder, founder_dir.path()).await;
+                (registry.issuers().retiring.is_none() && registry.issuers().current == successor)
+                    .then_some(registry)
+            },
+        )
+        .await;
+        assert_eq!(retired.trust_roots().count(), 1);
+        // The genesis issuer stays the cluster's identity.
+        assert_eq!(retired.ca_certificate(), genesis.current.certificate);
+        drop(retired);
+        // A late host joins with an invitation naming the successor alone, and
+        // is issued under it.
+        let late_dir = tempfile::tempdir().unwrap();
+        let late_settings = settings(late_dir.path());
+        let (late, late_node) =
+            join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
+        let listed = root_registry(&founder, founder_dir.path()).await;
+        assert!(under(&listed, late_node), "{:?}", listed.issuers());
+        drop(listed);
+        late.stop().await;
+        peer.stop().await;
+        // The founder restarts on the successor — its authority holds it, the
+        // registry names it — and enrolls another host.
+        founder.stop().await;
+        let founder = Running::start(&founder_settings).await;
+        let restarted = root_registry(&founder, founder_dir.path()).await;
+        assert_eq!(restarted.issuers().current, successor);
+        assert!(restarted.issuers().retiring.is_none());
+        drop(restarted);
+        let after_dir = tempfile::tempdir().unwrap();
+        let after_settings = settings(after_dir.path());
+        let (after, after_node) =
+            join_peer(&founder, founder_dir.path(), "after", &after_settings).await;
+        assert_ne!(after_node, late_node);
+        let listed = root_registry(&founder, founder_dir.path()).await;
+        assert!(under(&listed, after_node));
+        drop(listed);
+        after.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 /// A renewal asked the moment the successor issues is installed under it:
@@ -1047,73 +1083,77 @@ async fn the_operator_rotates_the_issuer_every_node_renews_under_it_and_the_gene
 /// dials again (24 §11). Before, the refusal was reported as the host's own
 /// credential material being inconsistent — in three of three copies run
 /// together, and on macOS CI at b318e80 (2026-10-03).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let peer_dir = tempfile::tempdir().unwrap();
-    let mut founder_settings = settings(founder_dir.path());
-    founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
-    let peer_settings = settings(peer_dir.path());
-    let founder = Running::start(&founder_settings).await;
-    let founder_id = founder_node(founder_dir.path());
-    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
-    let enrollment = founder.handles.enrollment.clone().unwrap();
-    let staged = enrollment
-        .rotate_issuer(unix_time().unwrap())
-        .await
-        .unwrap();
-    let successor = staged.successor.clone().unwrap().record;
-    enrollment
-        .rotate_issuer(unix_time().unwrap())
-        .await
-        .unwrap();
-    // The root commits the activation; the holders' controllers read it at
-    // their own pace, and are asked before they have.
-    until(
-        "the successor issues",
-        &[&founder, &peer],
-        Duration::from_secs(SHORT_LIFETIME),
-        async || {
-            let registry = root_registry(&founder, founder_dir.path()).await;
-            (registry.issuers().current == successor).then_some(())
-        },
-    )
-    .await;
-    for (who, handles, listed) in [
-        ("founder", &founder.handles, founder_id),
-        ("host", &peer.handles, node),
-    ] {
-        let renewed = until(
-            "the credential renews under the successor when asked",
+#[test]
+fn a_renewal_asked_the_moment_the_successor_issues_is_installed_under_it() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let mut founder_settings = settings(founder_dir.path());
+        founder_settings.value.node.credential_lifetime_seconds = Some(SHORT_LIFETIME);
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let founder_id = founder_node(founder_dir.path());
+        let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+        let enrollment = founder.handles.enrollment.clone().unwrap();
+        let staged = enrollment
+            .rotate_issuer(unix_time().unwrap())
+            .await
+            .unwrap();
+        let successor = staged.successor.clone().unwrap().record;
+        enrollment
+            .rotate_issuer(unix_time().unwrap())
+            .await
+            .unwrap();
+        // The root commits the activation; the holders' controllers read it at
+        // their own pace, and are asked before they have.
+        until(
+            "the successor issues",
             &[&founder, &peer],
             Duration::from_secs(SHORT_LIFETIME),
-            async || match handles.credentials.renew().await {
-                Ok(renewed) => Some(renewed),
-                // The sponsor's endpoint between the two certificates it
-                // presents (24 §11) is asked again; a receipt that could not
-                // be installed is the defect.
-                Err(crate::credential_renewal::RenewalError::Unavailable) => None,
-                Err(error) => panic!("the {who}'s renewal under the successor: {error}"),
+            async || {
+                let registry = root_registry(&founder, founder_dir.path()).await;
+                (registry.issuers().current == successor).then_some(())
             },
         )
         .await;
-        assert_eq!(renewed.node, listed, "{who}");
-        // The holder's own renewal ahead of expiry may have come first on a
-        // slow runner (the lifetime is short here); the ask is answered
-        // with what it holds then, and counts as the renewal it is.
-        assert!(renewed.renewals >= 1, "{who}: {}", renewed.renewals);
-        let registry = root_registry(&founder, founder_dir.path()).await;
-        let under = registry
-            .enrollments()
-            .find(|receipt| receipt.identity.node_id == Some(listed))
-            .is_some_and(|receipt| {
-                focal_wire::issued_by(&receipt.certificate, &successor.certificate).unwrap_or(false)
-            });
-        assert!(
-            under,
-            "the {who}'s renewed credential is issued by the successor"
-        );
-    }
-    peer.stop().await;
-    founder.stop().await;
+        for (who, handles, listed) in [
+            ("founder", &founder.handles, founder_id),
+            ("host", &peer.handles, node),
+        ] {
+            let renewed = until(
+                "the credential renews under the successor when asked",
+                &[&founder, &peer],
+                Duration::from_secs(SHORT_LIFETIME),
+                async || match handles.credentials.renew().await {
+                    Ok(renewed) => Some(renewed),
+                    // The sponsor's endpoint between the two certificates it
+                    // presents (24 §11) is asked again; a receipt that could not
+                    // be installed is the defect.
+                    Err(crate::credential_renewal::RenewalError::Unavailable) => None,
+                    Err(error) => panic!("the {who}'s renewal under the successor: {error}"),
+                },
+            )
+            .await;
+            assert_eq!(renewed.node, listed, "{who}");
+            // The holder's own renewal ahead of expiry may have come first on a
+            // slow runner (the lifetime is short here); the ask is answered
+            // with what it holds then, and counts as the renewal it is.
+            assert!(renewed.renewals >= 1, "{who}: {}", renewed.renewals);
+            let registry = root_registry(&founder, founder_dir.path()).await;
+            let under = registry
+                .enrollments()
+                .find(|receipt| receipt.identity.node_id == Some(listed))
+                .is_some_and(|receipt| {
+                    focal_wire::issued_by(&receipt.certificate, &successor.certificate)
+                        .unwrap_or(false)
+                });
+            assert!(
+                under,
+                "the {who}'s renewed credential is issued by the successor"
+            );
+        }
+        peer.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }

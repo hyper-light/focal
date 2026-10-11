@@ -529,7 +529,9 @@ pub async fn apply(
                     if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    focal_rt::time::pause(POLL).await;
+                    focal_rt::time::sleep(POLL)
+                        .await
+                        .map_err(std::io::Error::other)?;
                 }
             }
             Change::PlanPartition {
@@ -596,7 +598,9 @@ pub async fn apply(
                     if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    focal_rt::time::pause(POLL).await;
+                    focal_rt::time::sleep(POLL)
+                        .await
+                        .map_err(std::io::Error::other)?;
                 }
             }
             Change::PlanSession {
@@ -691,7 +695,9 @@ pub async fn apply(
                     {
                         break;
                     }
-                    focal_rt::time::pause(POLL).await;
+                    focal_rt::time::sleep(POLL)
+                        .await
+                        .map_err(std::io::Error::other)?;
                     current = Current::of(&observe(admin, network).await?);
                 }
             }

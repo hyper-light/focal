@@ -13,8 +13,8 @@ use focal_directory::{
 };
 use focal_ledger::SessionPlacementRequest;
 use focal_wire::{MAX_PLACEMENT_CONTROL_REQUEST_BYTES, PeerRole, VerifiedRequest};
-use serde::{Deserialize, Serialize};
 use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
+use serde::{Deserialize, Serialize};
 
 /// One session fact a voter can witness from its own hosted replica.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,8 +263,7 @@ pub struct MoveRangeJob {
     pub ledger: focal_model::LedgerId,
     pub member: focal_memory::RangeId,
     pub node: u64,
-    pub reply:
-        OneshotSender<Result<focal_ranges::TransferId, crate::placement_agent::AgentError>>,
+    pub reply: OneshotSender<Result<focal_ranges::TransferId, crate::placement_agent::AgentError>>,
 }
 /// One operator request to place a session under a durability: answered by
 /// the agent's next pass over the partition holding the session.
@@ -382,9 +381,7 @@ pub struct PlacementHandle {
 }
 impl PlacementHandle {
     /// A handle and the agent's queue of `depth` jobs; refused at the runtime's cell bound.
-    pub fn channel(
-        depth: usize,
-    ) -> Result<(Self, ChannelReceiver<AgentJob>), focal_rt::RtError> {
+    pub fn channel(depth: usize) -> Result<(Self, ChannelReceiver<AgentJob>), focal_rt::RtError> {
         let (sender, receiver) = hyper_rt::sync::channel(depth.max(1))?;
         Ok((Self { sender }, receiver))
     }
@@ -408,7 +405,8 @@ impl PlacementHandle {
         tenant: focal_model::TenantId,
         name: String,
     ) -> Result<CreatedSession, crate::placement_agent::AgentError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::CreateSession(Box::new(CreateSessionJob {
             tenant,
             name,
@@ -427,7 +425,8 @@ impl PlacementHandle {
         &self,
         request: crate::backup::RestoreRequest,
     ) -> Result<crate::backup::RestoredSession, crate::placement_agent::AgentError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::RestoreSession(Box::new(RestoreSessionJob {
             request,
             reply,
@@ -448,7 +447,8 @@ impl PlacementHandle {
         durability: focal_directory::DurabilityIntent,
         dry_run: bool,
     ) -> Result<PlannedSession, crate::placement_agent::AgentError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::PlanSession(Box::new(PlanSessionJob {
             ledger,
             durability,
@@ -468,7 +468,8 @@ impl PlacementHandle {
         &self,
         durability: focal_directory::DurabilityIntent,
     ) -> Result<PlannedControl, crate::placement_agent::AgentError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::PlanControl(Box::new(PlanControlJob {
             durability,
             reply,
@@ -489,7 +490,8 @@ impl PlacementHandle {
         member: focal_memory::RangeId,
         node: u64,
     ) -> Result<focal_ranges::TransferId, crate::placement_agent::AgentError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| crate::placement_agent::AgentError::Capacity)?;
         self.send(AgentJob::MoveRange(Box::new(MoveRangeJob {
             ledger,
             member,
@@ -506,13 +508,15 @@ impl PlacementHandle {
     }
     /// The partitions as the agent last observed them.
     pub async fn directory(&self) -> Result<DirectoryReport, PlacementProofError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.send(AgentJob::Directory(reply))?;
         receive.await.map_err(|_| PlacementProofError::Unavailable)
     }
     /// The agent's current diagnostic view.
     pub async fn status(&self) -> Result<AgentStatus, PlacementProofError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.send(AgentJob::Status(reply))?;
         receive.await.map_err(|_| PlacementProofError::Unavailable)
     }
@@ -521,7 +525,8 @@ impl PlacementHandle {
         &self,
         permit: crate::placement_proof::SessionProofPermit,
     ) -> Result<AccountedAuthorityProof, PlacementProofError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (reply, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.send(AgentJob::Sign(Box::new(SignJob { permit, reply })))?;
         receive
             .await
@@ -533,7 +538,9 @@ impl PlacementHandle {
         &self,
         request: CollectRequest,
     ) -> Result<AuthorityProof, crate::placement_collect::CollectError> {
-        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| crate::placement_collect::CollectError::Proof(PlacementProofError::Capacity))?;
+        let (reply, receive) = hyper_rt::sync::oneshot().map_err(|_| {
+            crate::placement_collect::CollectError::Proof(PlacementProofError::Capacity)
+        })?;
         self.send(AgentJob::Collect(Box::new(CollectJob { request, reply })))
             .map_err(crate::placement_collect::CollectError::Proof)?;
         receive.await.map_err(|_| {

@@ -49,8 +49,8 @@ mod round;
 pub use round::{DeadlineExtender, ProgressWitness, RoundAnchors, RoundBudget, RoundWait, Verdict};
 mod qos;
 pub use qos::{
-    Arrivals, Costs, Detector, Floors, LinkBehaviour, Span, arrival_detector_at,
-    configure_arrivals, detector_at, election_span, lateness_bound, mistake_bound,
+    Arrivals, Costs, Detector, LinkBehaviour, Span, arrival_detector_at, configure_arrivals,
+    election_span, lateness_bound, mistake_bound,
 };
 mod folds;
 pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};

@@ -51,6 +51,9 @@ impl EndpointEvent {
 pub(crate) enum EndpointEventInner {
     /// The connection has been drained
     Drained,
+    /// The server's handshake is complete: the configuration it was accepted under is lent to it
+    /// no more, so the endpoint stops counting the connection on it
+    ConfigReleased,
     /// The reset token and/or address eligible for generating resets has been updated
     ResetToken(SocketAddr, ResetToken),
     /// The connection needs connection identifiers

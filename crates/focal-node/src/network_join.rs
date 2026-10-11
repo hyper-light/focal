@@ -631,7 +631,8 @@ impl JoinedNode {
             }
             .parse()
             .map_err(|_| JoinError::Invalid)?;
-            let connector = QuicConnector::bind(
+            // One exchange's endpoint, its own owner.
+            let connector = QuicConnector::bind_standalone(
                 bind,
                 focal_wire::client_tls(
                     TlsIdentity::from_pkcs8(
@@ -642,8 +643,6 @@ impl JoinedNode {
                     &limits,
                 )?,
                 limits.clone(),
-                // One exchange's endpoint, its own owner.
-                focal_wire::endpoint_budget(&limits, None)?,
             )?;
             let remote = connector
                 .connect(address, &founder.identity.server_name)

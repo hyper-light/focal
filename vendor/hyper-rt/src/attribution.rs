@@ -192,9 +192,8 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
-    /// Whether the shard is reading at step starts and wait ends.
-    #[cfg(test)]
-    fn armed(&self) -> bool {
+    /// Whether the shard is reading at step starts and wait ends: the loop asks before it reads.
+    pub(crate) fn armed(&self) -> bool {
         self.armed
     }
 

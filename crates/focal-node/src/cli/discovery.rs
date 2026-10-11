@@ -592,7 +592,8 @@ pub(super) async fn validate_online(
                 context.build.ledger,
                 &authored,
                 &mut super::native::Waits(context),
-            ).await?;
+            )
+            .await?;
             let limits = focal_native_client::CompileLimits::default();
             let mut ids = ThrowawayIds::excluding(&authored.canonical_intent()?)?;
             let compiled = focal_native_client::compile(

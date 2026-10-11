@@ -21,7 +21,7 @@ fn a_request_before_the_handler_waits_for_it() {
         .unwrap();
         let server = Arc::new(
             QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 limits(),
@@ -150,7 +150,7 @@ fn an_enrollment_message_is_answered_on_a_connection_of_its_own_and_only_from_a_
         let bound = 4096u32;
         let server = Arc::new(
             QuicServer::bind_serving(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 ServerTls::from_config(server_tls),
                 PeerRegistry::new(4).unwrap(),
                 Some(EnrollmentProtocol {
@@ -254,7 +254,7 @@ fn an_enrollment_kind_is_refused_where_the_protocol_is_not_served() {
         .unwrap();
         let server = Arc::new(
             QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 limits(),

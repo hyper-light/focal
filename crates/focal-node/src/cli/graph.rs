@@ -37,15 +37,13 @@ pub(crate) struct TraverseArgs {
     #[command(flatten)]
     output: OutputOptions,
 }
-pub(super) async fn run(
-    context: &Context,
-    command: LedgerCommand,
-) -> Result<()> {
+pub(super) async fn run(context: &Context, command: LedgerCommand) -> Result<()> {
     match command {
         LedgerCommand::Summary(output) => {
             let summary = context
-                    .client
-                    .ledger_summary(context.envelope(focal_wire::Operation::Summary)?).await?;
+                .client
+                .ledger_summary(context.envelope(focal_wire::Operation::Summary)?)
+                .await?;
             match output.format {
                 super::args::OutputFormat::Json | super::args::OutputFormat::Yaml => {
                     super::output::structured(

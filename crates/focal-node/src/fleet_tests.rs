@@ -55,7 +55,7 @@ fn request(id: u128, operation: Operation) -> RequestEnvelope {
 struct Fleet {
     hosts: Vec<ReplicaHost>,
     owners: Vec<ReplicaOwner>,
-    pumps: Vec<tokio::task::JoinHandle<()>>,
+    pumps: Vec<focal_rt::JoinHandle<()>>,
     isolated: Arc<AtomicU8>,
 }
 impl Fleet {
@@ -94,8 +94,8 @@ impl Fleet {
             .map(|(index, mut channel)| {
                 let targets = hosts.clone();
                 let isolated = isolated.clone();
-                tokio::spawn(async move {
-                    while let Some(frame) = channel.recv().await {
+                focal_rt::spawn(async move {
+                    while let Ok(frame) = channel.recv().await {
                         let source = index as u8 + 1;
                         if isolated.load(Ordering::SeqCst) == source
                             || isolated.load(Ordering::SeqCst) == frame.target as u8
@@ -124,6 +124,7 @@ impl Fleet {
                         );
                     }
                 })
+                .unwrap()
             })
             .collect();
         Self {
@@ -171,7 +172,7 @@ impl Fleet {
             if let Err(spent) = wait.check(&self.periods()) {
                 panic!("leadership never left {from}: {spent}");
             }
-            focal_rt::time::pause(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     async fn leader(&self, excluding: Option<usize>) -> usize {
@@ -207,7 +208,7 @@ impl Fleet {
                         self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
                     );
                 }
-                focal_rt::time::pause(TICK).await;
+                focal_rt::time::sleep(TICK).await.unwrap();
             }
         }
     }
@@ -220,7 +221,7 @@ impl Fleet {
                     self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
                 );
             }
-            focal_rt::time::pause(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     async fn retry_exact(&self, candidate: usize, request: &RequestEnvelope) -> ResponseEnvelope {
@@ -343,115 +344,117 @@ fn a_log_is_checkpointed_once_it_outweighs_its_last_image() {
 /// proposal is pending at nearly every period; the log a replica keeps past
 /// its checkpoint is sampled throughout and held to the cadence plus what
 /// the session may have pending (`SessionLimits::pending`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replica_under_a_steady_load_checkpoints_by_cadence() {
-    const CADENCE: u64 = 32;
-    const CLIENTS: u128 = 16;
-    const EACH: u128 = 40;
-    let root = tempfile::tempdir().unwrap();
-    let fleet = Fleet::open_configured(root.path(), |config| {
-        config.checkpoint_after_entries = CADENCE;
-        // The entry floor alone: the size rule is the next test's.
-        config.checkpoint_expansion = 0;
-    });
-    let leader = fleet.leader(None).await;
-    let done = std::sync::atomic::AtomicBool::new(false);
-    let fleet_ref = &fleet;
-    let done_ref = &done;
-    // Each client asks the replica that leads at the time and, refused,
-    // asks again after the pause the client itself takes; its wait is
-    // charged to the group's commits, so only a stall spends it.
-    let policy = focal_client::RetryPolicy::default();
-    let policy = &policy;
-    let clients = futures_util::future::join_all((0..CLIENTS).map(|client| async move {
-        for each in 0..EACH {
-            let envelope = request(
-                10_000 + client * EACH + each,
-                Operation::OpenEpoch {
-                    epoch: RequestEpoch(1),
-                },
-            );
-            let committed = || {
-                fleet_ref
-                    .hosts
-                    .iter()
-                    .map(|host| host.progress().sequence)
-                    .max()
-                    .unwrap_or_default()
-            };
-            let mut wait = fleet_ref.deadline();
-            let mut seen = committed();
-            let mut backoffs = 0u32;
-            loop {
-                let leading = fleet_ref
-                    .hosts
-                    .iter()
-                    .position(|host| {
-                        let progress = host.progress();
-                        progress.node == progress.leader
-                    })
-                    .unwrap_or(leader);
-                let reply = dispatch(
-                    &fleet_ref.hosts[leading],
-                    actor(),
-                    envelope.clone(),
-                    &ReplicaHost::wire_limits(),
-                )
-                .await;
-                match reply.result {
-                    Response::Submitted(MutationReply::Committed(_)) => break,
-                    Response::Error(
-                        refused @ (AccessError::Unavailable
-                        | AccessError::OutcomeUnknown
-                        | AccessError::Capacity),
-                    ) => {
-                        let now = committed();
-                        if now > seen {
-                            seen = now;
-                            wait = fleet_ref.deadline();
+#[test]
+fn a_replica_under_a_steady_load_checkpoints_by_cadence() {
+    focal_rt::block_on(async move {
+        const CADENCE: u64 = 32;
+        const CLIENTS: u128 = 16;
+        const EACH: u128 = 40;
+        let root = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open_configured(root.path(), |config| {
+            config.checkpoint_after_entries = CADENCE;
+            // The entry floor alone: the size rule is the next test's.
+            config.checkpoint_expansion = 0;
+        });
+        let leader = fleet.leader(None).await;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let fleet_ref = &fleet;
+        let done_ref = &done;
+        // Each client asks the replica that leads at the time and, refused,
+        // asks again after the pause the client itself takes; its wait is
+        // charged to the group's commits, so only a stall spends it.
+        let policy = focal_client::RetryPolicy::default();
+        let policy = &policy;
+        let clients = focal_rt::join_all((0..CLIENTS).map(|client| async move {
+            for each in 0..EACH {
+                let envelope = request(
+                    10_000 + client * EACH + each,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                );
+                let committed = || {
+                    fleet_ref
+                        .hosts
+                        .iter()
+                        .map(|host| host.progress().sequence)
+                        .max()
+                        .unwrap_or_default()
+                };
+                let mut wait = fleet_ref.deadline();
+                let mut seen = committed();
+                let mut backoffs = 0u32;
+                loop {
+                    let leading = fleet_ref
+                        .hosts
+                        .iter()
+                        .position(|host| {
+                            let progress = host.progress();
+                            progress.node == progress.leader
+                        })
+                        .unwrap_or(leader);
+                    let reply = dispatch(
+                        &fleet_ref.hosts[leading],
+                        actor(),
+                        envelope.clone(),
+                        &ReplicaHost::wire_limits(),
+                    )
+                    .await;
+                    match reply.result {
+                        Response::Submitted(MutationReply::Committed(_)) => break,
+                        Response::Error(
+                            refused @ (AccessError::Unavailable
+                            | AccessError::OutcomeUnknown
+                            | AccessError::Capacity),
+                        ) => {
+                            let now = committed();
+                            if now > seen {
+                                seen = now;
+                                wait = fleet_ref.deadline();
+                            }
+                            if let Err(spent) = wait.check(&fleet_ref.periods()) {
+                                panic!("{envelope:?}: {refused:?} after {spent}");
+                            }
+                            if !matches!(refused, AccessError::OutcomeUnknown) {
+                                focal_rt::time::sleep(policy.pause(backoffs)).await.unwrap();
+                                backoffs = backoffs.saturating_add(1);
+                            }
                         }
-                        if let Err(spent) = wait.check(&fleet_ref.periods()) {
-                            panic!("{envelope:?}: {refused:?} after {spent}");
-                        }
-                        if !matches!(refused, AccessError::OutcomeUnknown) {
-                            focal_rt::time::pause(policy.pause(backoffs)).await;
-                            backoffs = backoffs.saturating_add(1);
-                        }
+                        other => panic!("{envelope:?}: {other:?}"),
                     }
-                    other => panic!("{envelope:?}: {other:?}"),
                 }
             }
-        }
-    }));
-    let sampler = async {
-        let mut kept = 0u64;
-        while !done_ref.load(std::sync::atomic::Ordering::Acquire) {
-            for host in &fleet_ref.hosts {
-                if let Ok(reply) = host.diagnostics().await {
-                    kept = kept.max(reply.value().log_entries_since_checkpoint);
+        }));
+        let sampler = async {
+            let mut kept = 0u64;
+            while !done_ref.load(std::sync::atomic::Ordering::Acquire) {
+                for host in &fleet_ref.hosts {
+                    if let Ok(reply) = host.diagnostics().await {
+                        kept = kept.max(reply.value().log_entries_since_checkpoint);
+                    }
                 }
+                focal_rt::time::sleep(TICK).await.unwrap();
             }
-            focal_rt::time::pause(TICK).await;
-        }
-        kept
-    };
-    let ((), kept) = tokio::join!(
-        async {
-            clients.await;
-            done_ref.store(true, std::sync::atomic::Ordering::Release);
-        },
-        sampler
-    );
-    let bound = CADENCE + u64::try_from(SessionLimits::default().pending).unwrap();
-    println!(
-        "steady load: {} entries; the most a replica kept past its checkpoint {kept}, bound {bound}",
-        CLIENTS * EACH
-    );
-    assert!(
-        kept <= bound,
-        "a replica kept {kept} entries past its checkpoint under load, past {bound}"
-    );
-    fleet.stop().await;
+            kept
+        };
+        let ((), kept) = hyper_rt::combine::join2(
+            async {
+                clients.await.unwrap();
+                done_ref.store(true, std::sync::atomic::Ordering::Release);
+            },
+            sampler
+        ).await;
+        let bound = CADENCE + u64::try_from(SessionLimits::default().pending).unwrap();
+        println!(
+            "steady load: {} entries; the most a replica kept past its checkpoint {kept}, bound {bound}",
+            CLIENTS * EACH
+        );
+        assert!(
+            kept <= bound,
+            "a replica kept {kept} entries past its checkpoint under load, past {bound}"
+        );
+        fleet.stop().await;
+    }).unwrap()
 }
 
 #[path = "fleet_leader_return_tests.rs"]
@@ -463,98 +466,104 @@ mod summary_tests;
 #[path = "fleet_reconciliation_tests.rs"]
 mod reconciliation_tests;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quorum_commit_read_barrier_partition_retry_and_restart_use_the_real_owner() {
-    let root = tempfile::tempdir().unwrap();
-    let fleet = Fleet::open(root.path());
-    let leader = fleet.leader(None).await;
-    let epoch = request(
-        1,
-        Operation::OpenEpoch {
-            epoch: RequestEpoch(1),
-        },
-    );
-    let first = fleet.retry_exact(leader, &epoch).await;
-    let Response::Submitted(MutationReply::Committed(receipt)) = &first.result else {
-        panic!("{first:?}");
-    };
-    assert_eq!(receipt.sequence, SessionSeq(1));
-    fleet.all_at(SessionSeq(1)).await;
-    fleet.isolated.store(leader as u8 + 1, Ordering::SeqCst);
-    let next = request(
-        2,
-        Operation::OpenEpoch {
-            epoch: RequestEpoch(1),
-        },
-    );
-    let isolated = dispatch(
-        &fleet.hosts[leader],
-        actor(),
-        next.clone(),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
-    assert!(
-        matches!(
-            isolated.result,
-            Response::Error(AccessError::OutcomeUnknown | AccessError::Unavailable)
-        ),
-        "{isolated:?}"
-    );
-    let replacement = fleet.leader(Some(leader)).await;
-    let committed = fleet.retry_exact(replacement, &next).await;
-    let Response::Submitted(MutationReply::Committed(receipt)) = &committed.result else {
-        panic!("{committed:?}");
-    };
-    assert_eq!(receipt.sequence, SessionSeq(2));
-    fleet.isolated.store(0, Ordering::SeqCst);
-    fleet.all_at(SessionSeq(2)).await;
-    assert_eq!(fleet.retry_exact(replacement, &epoch).await, first);
-    fleet.stop().await;
-    let fleet = Fleet::open(root.path());
-    let leader = fleet.leader(None).await;
-    assert_eq!(fleet.retry_exact(leader, &next).await, committed);
-    assert_eq!(fleet.retry_exact(leader, &epoch).await, first);
-    fleet.all_at(SessionSeq(2)).await;
-    fleet.stop().await;
+#[test]
+fn quorum_commit_read_barrier_partition_retry_and_restart_use_the_real_owner() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open(root.path());
+        let leader = fleet.leader(None).await;
+        let epoch = request(
+            1,
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        let first = fleet.retry_exact(leader, &epoch).await;
+        let Response::Submitted(MutationReply::Committed(receipt)) = &first.result else {
+            panic!("{first:?}");
+        };
+        assert_eq!(receipt.sequence, SessionSeq(1));
+        fleet.all_at(SessionSeq(1)).await;
+        fleet.isolated.store(leader as u8 + 1, Ordering::SeqCst);
+        let next = request(
+            2,
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        let isolated = dispatch(
+            &fleet.hosts[leader],
+            actor(),
+            next.clone(),
+            &ReplicaHost::wire_limits(),
+        )
+        .await;
+        assert!(
+            matches!(
+                isolated.result,
+                Response::Error(AccessError::OutcomeUnknown | AccessError::Unavailable)
+            ),
+            "{isolated:?}"
+        );
+        let replacement = fleet.leader(Some(leader)).await;
+        let committed = fleet.retry_exact(replacement, &next).await;
+        let Response::Submitted(MutationReply::Committed(receipt)) = &committed.result else {
+            panic!("{committed:?}");
+        };
+        assert_eq!(receipt.sequence, SessionSeq(2));
+        fleet.isolated.store(0, Ordering::SeqCst);
+        fleet.all_at(SessionSeq(2)).await;
+        assert_eq!(fleet.retry_exact(replacement, &epoch).await, first);
+        fleet.stop().await;
+        let fleet = Fleet::open(root.path());
+        let leader = fleet.leader(None).await;
+        assert_eq!(fleet.retry_exact(leader, &next).await, committed);
+        assert_eq!(fleet.retry_exact(leader, &epoch).await, first);
+        fleet.all_at(SessionSeq(2)).await;
+        fleet.stop().await;
+    })
+    .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exact_retry_rediscovery_preserves_receipt_after_cached_owner_loses_leadership() {
-    let root = tempfile::tempdir().unwrap();
-    let fleet = Fleet::open(root.path());
-    let previous = fleet.leader(None).await;
-    let request = request(
-        41,
-        Operation::OpenEpoch {
-            epoch: RequestEpoch(1),
-        },
-    );
-    let first = fleet.retry_exact(previous, &request).await;
-    assert!(matches!(
-        first.result,
-        Response::Submitted(MutationReply::Committed(_))
-    ));
-    fleet.all_at(SessionSeq(1)).await;
-    let replacement = fleet.depose(previous).await;
-    assert_ne!(replacement, previous);
-    let stale = dispatch(
-        &fleet.hosts[previous],
-        actor(),
-        request.clone(),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
-    // The deposed owner refuses; one the group has since elected again
-    // answers with the receipt it committed. Never anything else.
-    assert!(
-        matches!(
-            stale.result,
-            Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown)
-        ) || stale == first,
-        "cached owner answered with another outcome: {stale:?}"
-    );
-    assert_eq!(fleet.retry_exact(previous, &request).await, first);
-    assert_eq!(fleet.hosts[replacement].progress().sequence, SessionSeq(1));
-    fleet.stop().await;
+#[test]
+fn exact_retry_rediscovery_preserves_receipt_after_cached_owner_loses_leadership() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open(root.path());
+        let previous = fleet.leader(None).await;
+        let request = request(
+            41,
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        let first = fleet.retry_exact(previous, &request).await;
+        assert!(matches!(
+            first.result,
+            Response::Submitted(MutationReply::Committed(_))
+        ));
+        fleet.all_at(SessionSeq(1)).await;
+        let replacement = fleet.depose(previous).await;
+        assert_ne!(replacement, previous);
+        let stale = dispatch(
+            &fleet.hosts[previous],
+            actor(),
+            request.clone(),
+            &ReplicaHost::wire_limits(),
+        )
+        .await;
+        // The deposed owner refuses; one the group has since elected again
+        // answers with the receipt it committed. Never anything else.
+        assert!(
+            matches!(
+                stale.result,
+                Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown)
+            ) || stale == first,
+            "cached owner answered with another outcome: {stale:?}"
+        );
+        assert_eq!(fleet.retry_exact(previous, &request).await, first);
+        assert_eq!(fleet.hosts[replacement].progress().sequence, SessionSeq(1));
+        fleet.stop().await;
+    })
+    .unwrap()
 }

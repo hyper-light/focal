@@ -5,7 +5,9 @@ use focal_control::*;
 use focal_directory::AuthorityVerifier;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{LedgerId, RequestEpoch, RequestId, RouteEpoch};
+use focal_rt::watch;
 use focal_wire::*;
+use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 use std::{
     collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -13,8 +15,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use focal_rt::watch;
-use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 
 /// Entries a control group applies past its last checkpoint before it checkpoints again
 /// ([`ControlHostConfig::checkpoint_interval`]'s default).
@@ -437,7 +437,8 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareSessionProof {
                 // The witness already owns its full structural export charge.
@@ -472,7 +473,8 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareReplicaReady {
                 ready: Box::new(ready),
@@ -506,7 +508,8 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareMembershipProof {
                 next: Box::new(next),
@@ -542,7 +545,8 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
             .map_err(|_| PlacementProofError::Capacity)?
             .commit();
-        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| PlacementProofError::Capacity)?;
         self.sender
             .try_send(Work::PrepareDelegationProof {
                 group,
@@ -609,14 +613,7 @@ impl ControlHost {
         verifier: V,
         config: ControlHostConfig,
         budget: MemoryBudget,
-    ) -> Result<
-        (
-            Self,
-            ControlOwner,
-            ChannelReceiver<ControlReplicationFrame>,
-        ),
-        ControlError,
-    > {
+    ) -> Result<(Self, ControlOwner, ChannelReceiver<ControlReplicationFrame>), ControlError> {
         Self::spawn_inner(replica, verifier, config, budget, None)
     }
     /// Resume a replica already drained by trusted startup authentication. Its
@@ -628,14 +625,7 @@ impl ControlHost {
         config: ControlHostConfig,
         budget: MemoryBudget,
         initial: ControlEvents,
-    ) -> Result<
-        (
-            Self,
-            ControlOwner,
-            ChannelReceiver<ControlReplicationFrame>,
-        ),
-        ControlError,
-    > {
+    ) -> Result<(Self, ControlOwner, ChannelReceiver<ControlReplicationFrame>), ControlError> {
         if initial.applied_index != replica.applied_index() {
             return Err(ControlError::Invalid);
         }
@@ -647,14 +637,7 @@ impl ControlHost {
         config: ControlHostConfig,
         budget: MemoryBudget,
         initial: Option<ControlEvents>,
-    ) -> Result<
-        (
-            Self,
-            ControlOwner,
-            ChannelReceiver<ControlReplicationFrame>,
-        ),
-        ControlError,
-    > {
+    ) -> Result<(Self, ControlOwner, ChannelReceiver<ControlReplicationFrame>), ControlError> {
         config.validate()?;
         if config
             .enrollment_authority
@@ -669,7 +652,8 @@ impl ControlHost {
         let limits = Self::wire_limits();
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
-        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue).map_err(|_| ControlError::Capacity)?;
+        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue)
+            .map_err(|_| ControlError::Capacity)?;
         let status = replica.status();
         let pace = TickPeriod::default();
         let (progress, changes) = watch::channel(ControlProgressState {
@@ -694,7 +678,8 @@ impl ControlHost {
                 failure: None,
             },
             _allocation: None,
-        }).map_err(|_| ControlError::Capacity)?;
+        })
+        .map_err(|_| ControlError::Capacity)?;
         let (lost_sender, lost) = mpsc::sync_channel(crate::fleet::LOST_PEERS);
         let owner = Owner {
             replica,

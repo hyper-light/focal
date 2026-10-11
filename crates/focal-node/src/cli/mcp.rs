@@ -564,14 +564,14 @@ mod tests {
         }
     }
     #[test]
-    fn entered_async_runtime_is_rejected_before_any_context_or_bootstrap_io() {
+    fn a_serve_on_a_shard_is_rejected_before_any_context_or_bootstrap_io() {
         let temp = private_root();
         let mut settings = Settings::default();
         settings.node.data_dir = Some(temp.path().into());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        assert!(async { serve(&settings, None) }.await.is_err());
+        // The adapter owns its own worker shard: one asked for from inside
+        // another's root is refused before it opens anything.
+        let refused = focal_rt::block_on(async move { serve(&settings, None).is_err() }).unwrap();
+        assert!(refused);
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

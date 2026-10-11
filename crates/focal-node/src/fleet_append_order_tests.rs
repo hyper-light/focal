@@ -30,7 +30,7 @@ fn next_append(fixture: &mut Fixture, id: u128, to: u64) -> RequestEnvelope {
     ));
     fixture.owners[0].drain().unwrap();
     let mut appends = Vec::new();
-    while let Ok(frame) = fixture.outgoing[0].try_recv() {
+    while let Ok(Some(frame)) = fixture.outgoing[0].try_recv() {
         if frame.target == to && matches!(frame.request.operation, Operation::RaftOrdered { .. }) {
             appends.push(frame.request);
         }
@@ -61,7 +61,7 @@ fn deliver(fixture: &mut Fixture, to: u64, request: RequestEnvelope) {
         .reserve(BudgetKind::Query, BudgetLane::Completion, 64 * 1024)
         .unwrap()
         .commit();
-    let (send, _answered) = oneshot::channel();
+    let (send, _answered) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
 }
 /// What follower `to` has refused, and of that what the order should
@@ -210,7 +210,7 @@ fn an_append_given_up_before_it_leaves_keeps_its_place_in_the_order() {
     drop(hog);
     owner.send(&[append(term)]).unwrap();
     let mut sequences = Vec::new();
-    while let Ok(frame) = fixture.outgoing[0].try_recv() {
+    while let Ok(Some(frame)) = fixture.outgoing[0].try_recv() {
         if let Operation::RaftOrdered {
             epoch, sequence, ..
         } = frame.request.operation
@@ -227,7 +227,7 @@ fn an_append_given_up_before_it_leaves_keeps_its_place_in_the_order() {
     // A later term's appends begin an order of their own.
     let owner = &mut fixture.owners[0];
     owner.send(&[append(term + 1)]).unwrap();
-    let frame = fixture.outgoing[0].try_recv().unwrap();
+    let frame = fixture.outgoing[0].try_recv().unwrap().unwrap();
     assert!(matches!(
         frame.request.operation,
         Operation::RaftOrdered { epoch, sequence: 1, .. } if epoch == term + 1

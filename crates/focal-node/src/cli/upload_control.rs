@@ -97,10 +97,7 @@ fn open(context: &Context, origin: Origin, id: [u8; 16]) -> Result<UploadJournal
     .map_err(error)?;
     store.open_upload(id, &context.operation).map_err(error)
 }
-pub(super) async fn run(
-    context: &Context,
-    command: UploadCommand,
-) -> Result<()> {
+pub(super) async fn run(context: &Context, command: UploadCommand) -> Result<()> {
     let (args, cancel) = match command {
         UploadCommand::Inspect(args) => (args, false),
         UploadCommand::Cancel(args) => (args, true),
@@ -165,10 +162,7 @@ pub(super) async fn run(
     // output error. Keep the original failure and exact recovery identity.
     result.and(output)
 }
-async fn cancel_upload(
-    context: &Context,
-    journal: &mut UploadJournal,
-) -> Result<()> {
+async fn cancel_upload(context: &Context, journal: &mut UploadJournal) -> Result<()> {
     journal.cancel().map_err(error)?;
     let request = journal
         .next_request()

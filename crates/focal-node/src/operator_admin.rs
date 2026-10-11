@@ -447,7 +447,8 @@ impl LocalNetworkAdmin {
                 break;
             }
             let progress = host.progress();
-            let Ok(Ok(reply)) = focal_rt::time::timeout_at(deadline, host.diagnostics()).await else {
+            let Ok(Ok(reply)) = focal_rt::time::timeout_at(deadline, host.diagnostics()).await
+            else {
                 truncated = true;
                 break;
             };

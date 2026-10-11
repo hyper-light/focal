@@ -29,16 +29,15 @@ pub(super) const MCP_STORE: &str = "mcp-native";
 /// journal as the proof that an unreachable ledger is native. A node without
 /// the native engine refuses the profile at negotiation before any frame is
 /// seen.
-pub(super) async fn detect(
-    context: &Context,
-) -> Result<focal_client::operations::Engine> {
+pub(super) async fn detect(context: &Context) -> Result<focal_client::operations::Engine> {
     Ok(focal_client::operations::probe(
         &context.client,
         context.build.ledger,
         RequestId(random_id()?),
         initialized_in(&context.root.join("client"), STORE),
         context.build.actor,
-    ).await?)
+    )
+    .await?)
 }
 
 /// Whether a native journal named `name` has been created under `parent`.
@@ -97,9 +96,11 @@ pub(super) async fn run(
             }
             ClaimCommand::Wait(args) => return wait(context, args).await,
             ClaimCommand::Lineage(args) => {
-                let outcome = observe(context,
+                let outcome = observe(
+                    context,
                     &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: args.id }),
-                ).await?;
+                )
+                .await?;
                 let focal_native_client::NativeReadOutcome::Lineage(lineage) = outcome else {
                     return Err(CliError::InvalidResponse);
                 };
@@ -264,10 +265,8 @@ pub(super) async fn run(
             }
         },
         Commands::Watch { command } => {
-            return super::watch::run(context,
-                command,
-                focal_client::watch::WatchEngine::Native,
-            ).await;
+            return super::watch::run(context, command, focal_client::watch::WatchEngine::Native)
+                .await;
         }
         Commands::Ledger { .. } => return Err(unavailable("graph traversal")),
         Commands::Validator { .. } => return Err(unavailable("validator contract listing")),
@@ -370,7 +369,7 @@ pub(super) fn profile(standing: &NativeStanding) -> NativeContentProfile {
 /// One bounded list from the shared `list` flags. `--all` follows the
 /// continuation until it is absent, printing one page at a time; an empty
 /// page with a cursor is a residual-filtered stretch, not the end.
-async fn list( context: &Context, command: ListCommand) -> Result<()> {
+async fn list(context: &Context, command: ListCommand) -> Result<()> {
     let (mut operation, args) = native_documents::list(command)?;
     let format = args.output.format;
     let mut pages = 0u64;
@@ -526,14 +525,16 @@ pub(super) async fn submit(
         &mut random_id,
         &mut Waits(context),
         &mut Waits(context),
-    ).await?;
+    )
+    .await?;
     let prepared = focal_native_client::prepare(
         &preparation,
         &operation,
         requested,
         &mut random_id,
         &mut Waits(context),
-    ).await?;
+    )
+    .await?;
     drive(context, &store, prepared, options.output.format).await
 }
 
@@ -563,7 +564,11 @@ async fn drive(
     if let Some(receipt) = operation.receipt {
         return deliver(&receipt);
     }
-    match context.client.submit_native(operation.request.clone()).await {
+    match context
+        .client
+        .submit_native(operation.request.clone())
+        .await
+    {
         Ok(reply @ NativeMutationReply::Committed(receipt)) => {
             store.record_reply(operation.id, &context.operation, &reply)?;
             deliver(&receipt)
@@ -589,7 +594,8 @@ async fn drive(
                     &context.operation,
                     &operation,
                     &mut Waits(context),
-                ).await?
+                )
+                .await?
             {
                 return deliver(&receipt);
             }
@@ -731,11 +737,14 @@ pub(super) async fn inspect(
             store(context, false)?.and_then(|store| store.key_of(id, &context.operation).ok());
         let page = match key {
             Some(key) => focal_native_client::outcome(key, &mut Waits(context)).await?,
-            None => focal_native_client::outcome_by_id(
-                context.operation.principal,
-                id.request(),
-                &mut Waits(context),
-            ).await?,
+            None => {
+                focal_native_client::outcome_by_id(
+                    context.operation.principal,
+                    id.request(),
+                    &mut Waits(context),
+                )
+                .await?
+            }
         };
         return render_page_as("Observed", page, format);
     }
@@ -795,12 +804,10 @@ async fn observe(
         &mut Waits(context),
         &mut Waits(context),
         &mut Waits(context),
-    ).await?)
+    )
+    .await?)
 }
-async fn read(
-    context: &Context,
-    operation: &NativeReadOperation,
-) -> Result<NativeReadPage> {
+async fn read(context: &Context, operation: &NativeReadOperation) -> Result<NativeReadPage> {
     match observe(context, operation).await? {
         focal_native_client::NativeReadOutcome::Page(page) => Ok(page),
         focal_native_client::NativeReadOutcome::Lineage(_)
@@ -809,10 +816,7 @@ async fn read(
 }
 /// `wait claim` on the native engine: the same predicates as the V1
 /// observer plus `testament`, the same bounds, printed the same way.
-async fn wait(
-    context: &Context,
-    args: super::claim_wait::WaitArgs,
-) -> Result<()> {
+async fn wait(context: &Context, args: super::claim_wait::WaitArgs) -> Result<()> {
     let fields = args.claim.is_some() || args.until.is_some() || args.timeout_ms.is_some();
     let document: NativeWaitDocument = match args.input.load(fields)? {
         Some(document) => document,
@@ -967,16 +971,15 @@ fn render_page_as(condition: &str, page: NativeReadPage, format: OutputFormat) -
     }
 }
 /// The ledger's standing under this principal; the native `focal inspect prefix`.
-pub(super) async fn status(
-    context: &Context,
-    format: OutputFormat,
-) -> Result<()> {
-    let page = read(context,
+pub(super) async fn status(context: &Context, format: OutputFormat) -> Result<()> {
+    let page = read(
+        context,
         &NativeReadOperation::Standing(NativeEmptyDocument::default()),
-    ).await?;
+    )
+    .await?;
     render_page(page, format)
 }
-async fn get( context: &Context, command: GetCommand) -> Result<()> {
+async fn get(context: &Context, command: GetCommand) -> Result<()> {
     let object = |id: String| NativeObjectDocument { id };
     let (operation, format) = match command {
         GetCommand::Claim(args) => {

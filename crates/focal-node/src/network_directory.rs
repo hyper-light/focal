@@ -421,7 +421,7 @@ async fn permit(
                     }
                     *left = left.saturating_sub(1);
                 }
-                focal_rt::time::pause(PERMIT_PAUSE).await;
+                focal_rt::time::sleep(PERMIT_PAUSE).await?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -587,7 +587,7 @@ async fn watch_seat(
                 return Ok(());
             }
         }
-        focal_rt::time::pause(PERMIT_PAUSE).await;
+        focal_rt::time::sleep(PERMIT_PAUSE).await?;
     }
 }
 fn record_path(root: &Path, partition: PartitionId) -> PathBuf {
@@ -786,7 +786,7 @@ async fn refresh_authority(
                 told = now;
             }
         }
-        focal_rt::time::pause(Duration::from_millis(250)).await;
+        focal_rt::time::sleep(Duration::from_millis(250)).await?;
     }
 }
 

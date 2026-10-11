@@ -20,7 +20,9 @@ use focal_ledger::{LegacyImportPayloads, PendingImport};
 pub use focal_ledger::{MembershipView, SessionMembershipReceipt, SessionMembershipRequest};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
+use focal_rt::watch;
 use focal_wire::*;
+use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 pub use registration::RegistrationFactsReply;
 use std::{
     collections::VecDeque,
@@ -30,8 +32,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use focal_rt::watch;
-use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 
 #[path = "fleet_evidence.rs"]
 mod evidence_owner;
@@ -161,11 +161,23 @@ pub struct ReplicaConfig {
 }
 #[cfg(test)]
 #[derive(Clone, Debug)]
-struct CheckpointObserver(hyper_rt::sync::Sender<LedgerId>);
+struct CheckpointObserver(hyper_rt::sync::Sender<LedgerId>, u64);
+#[cfg(test)]
+impl CheckpointObserver {
+    /// An observer named by a number of its own, which its clones share: two
+    /// configurations are equal when they report to the same observer.
+    fn new(sender: hyper_rt::sync::Sender<LedgerId>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(
+            sender,
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
 #[cfg(test)]
 impl PartialEq for CheckpointObserver {
     fn eq(&self, other: &Self) -> bool {
-        self.0.same_channel(&other.0)
+        self.1 == other.1
     }
 }
 #[cfg(test)]
@@ -205,6 +217,15 @@ pub struct ReplicationFrame {
     /// (`replication::drive`).
     pub(crate) urgent: bool,
     _charge: Allocation,
+}
+impl std::fmt::Debug for ReplicationFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationFrame")
+            .field("target", &self.target)
+            .field("request", &self.request.request_id)
+            .field("urgent", &self.urgent)
+            .finish_non_exhaustive()
+    }
 }
 /// Whether a message is what a group cannot do without: anything but an
 /// append on its way to a member and a snapshot. An append names a place
@@ -1055,7 +1076,8 @@ impl ReplicaHost {
         Self::validate(&config, &limits)?;
         let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024)?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
-        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue).map_err(|_| LedgerError::Capacity)?;
+        let (outbound, outgoing) =
+            hyper_rt::sync::channel(config.replication_queue).map_err(|_| LedgerError::Capacity)?;
         let (host, owner) = Self::assemble(
             session,
             config,

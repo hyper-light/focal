@@ -45,8 +45,10 @@ pub enum NetworkError {
     Encoding(#[from] postcard::Error),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("network initialization requires a Tokio runtime")]
+    #[error("network initialization runs on a hyper-rt shard")]
     RuntimeRequired,
+    #[error("blocking pool: {0}")]
+    Pool(#[from] focal_rt::PoolError),
     #[error("an enrolled peer requires the replicated network owner")]
     EnrolledPeer,
     #[error("legacy enrollment bootstrap requires an explicit migration")]
@@ -140,8 +142,7 @@ impl FoundingNetwork {
                 local_readiness,
             )
         })
-        .await
-        .map_err(|_| NetworkError::RuntimeRequired)?
+        .await?
     }
     /// The synchronous founder bootstrap, run off the executor by [open_inner].
     fn bootstrap_blocking(

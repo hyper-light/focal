@@ -12,10 +12,10 @@ use crate::network_service::NetworkHandles;
 use focal_client::admin::AdminArchiveAgent;
 use focal_core::native::retirement::RetirementCursor;
 use focal_model::LedgerId;
+use focal_rt::watch;
 use focal_wire::AccessError;
 use std::collections::BTreeMap;
 use std::time::Duration;
-use focal_rt::watch;
 
 /// Milliseconds between the agent's ticks; the default is five seconds.
 pub const INTERVAL_ENV: &str = "FOCAL_RETIRE_INTERVAL_MS";
@@ -114,7 +114,9 @@ impl ArchiveAgent {
             return Err(AccessError::Unavailable);
         }
         loop {
-            focal_rt::time::pause(self.interval).await;
+            focal_rt::time::sleep(self.interval)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
             self.tick(handles).await;
         }
     }

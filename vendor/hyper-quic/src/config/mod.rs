@@ -23,6 +23,7 @@ pub(crate) use configs::ConfigKey;
 pub use configs::{ClientConfigHandle, Configs, ConfigsFull, ServerConfigHandle};
 mod transport;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+#[cfg(feature = "qlog")]
 pub use transport::{QlogConfig, QlogError};
 
 /// Global configuration for the endpoint, affecting all connections

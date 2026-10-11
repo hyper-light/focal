@@ -191,19 +191,22 @@ async fn wait_registered_grant(
     }
     let fingerprint = certificate_fingerprint(&receipt.certificate);
     std::panic::AssertUnwindSafe(async {
+        // A wait that cannot be kept (off a shard) ends the watch as one
+        // that ran out: the outcome is unknown, never a grant.
         focal_rt::time::timeout(deadline, async {
             loop {
                 if let Ok(peer) = registry.authenticate(fingerprint)
                     && peer.principal() == grant.principal
                     && peer.role() == grant.role
                 {
-                    return;
+                    return Ok(());
                 }
-                focal_rt::time::pause(Duration::from_millis(25)).await;
+                focal_rt::time::sleep(Duration::from_millis(25)).await?;
             }
         })
         .await
-        .map_err(|_| JoinFailure::OutcomeUnknown)
+        .map_err(|_| JoinFailure::OutcomeUnknown)?
+        .map_err(|_: focal_rt::RtError| JoinFailure::OutcomeUnknown)
     })
     .catch_unwind()
     .await
@@ -1147,17 +1150,18 @@ impl NetworkController {
         // Construct before the async body: cancellation before its first poll
         // must also withdraw the startup projection.
         let projection = PeerProjectionGuard(registry);
+        // Made here, boxed, so the run's own frame never holds the loop's state.
+        let inner = Box::pin(
+            std::panic::AssertUnwindSafe(self.run_inner(pool, host, registry, swap)).catch_unwind(),
+        );
         async move {
             let _projection = projection;
-            // A handle can be moved into a runtime without a timer driver. Consume
-            // the failed controller at this dependency boundary; never reuse it.
+            // Off a shard no wait can be kept. Consume the failed controller at
+            // this boundary; never reuse it.
             if hyper_rt::futures::shard_id().is_none() {
                 Err(ControllerError::Runtime)
             } else {
-                std::panic::AssertUnwindSafe(self.run_inner(pool, host, registry, swap))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or(Err(ControllerError::Runtime))
+                inner.await.unwrap_or(Err(ControllerError::Runtime))
             }
         }
     }
@@ -1189,7 +1193,7 @@ impl NetworkController {
                 // export before reserving the next one, otherwise two large
                 // snapshots can permanently prevent a refresh under pressure.
                 observed = None;
-                let next = match observe_projection(host, registry).await? {
+                let next = match focal_rt::boxed(|| observe_projection(host, registry)).await? {
                     Some(value) => value,
                     None => {
                         // The root is unobservable from here — typically a
@@ -1204,14 +1208,18 @@ impl NetworkController {
                             .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
                         {
                             last_bootstrap_announce = Some(std::time::Instant::now());
-                            if let Ok(result) =
-                                focal_rt::time::timeout(ANNOUNCE_ROUND, self.announce_unobserved(pool))
-                                    .await
+                            if let Ok(result) = focal_rt::time::timeout(
+                                ANNOUNCE_ROUND,
+                                focal_rt::boxed(|| self.announce_unobserved(pool)),
+                            )
+                            .await
                             {
                                 result?;
                             }
                         }
-                        focal_rt::time::pause(OBSERVATION_RETRY).await;
+                        focal_rt::time::sleep(OBSERVATION_RETRY)
+                            .await
+                            .map_err(|_| ControllerError::Runtime)?;
                         continue;
                     }
                 };
@@ -1233,23 +1241,24 @@ impl NetworkController {
                 // unknown outcome; the next round uses this exact contact key.
                 if let Ok(result) = focal_rt::time::timeout(
                     ANNOUNCE_ROUND,
-                    self.announce(current, pool, host, registry),
+                    focal_rt::boxed(|| self.announce(current, pool, host, registry)),
                 )
                 .await
                 {
                     result?;
                 }
                 if let Some(admission) = &mut self.admission {
-                    admission
-                        .advance(&self.state, current, &eligible, host, &self.budget)
-                        .await?;
+                    focal_rt::boxed(|| {
+                        admission.advance(&self.state, current, &eligible, host, &self.budget)
+                    })
+                    .await?;
                 }
             }
-            self.maintain_credential(pool, host, registry, &swap, now)
-                .await;
-            self.maintain_bootstrap_server(&swap, now).await;
-            self.maintain_issuer(now).await;
-            self.present_trust(pool, &swap).await?;
+            // Each step boxed where it is made: this loop's frame holds pointers, not the steps.
+            focal_rt::boxed(|| self.maintain_credential(pool, host, registry, &swap, now)).await;
+            focal_rt::boxed(|| self.maintain_bootstrap_server(&swap, now)).await;
+            focal_rt::boxed(|| self.maintain_issuer(now)).await;
+            focal_rt::boxed(|| self.present_trust(pool, &swap)).await?;
             // A credential request is served on the root as it is applied
             // now: one taken below is served at the top of the next pass,
             // after the refresh that reads what the root committed since.
@@ -1260,25 +1269,29 @@ impl NetworkController {
             // ubuntu CI, 2026-10-02).
             if let Some(request) = asked.take() {
                 let now = unix_time()?;
-                self.serve_credential(request, pool, host, registry, &swap, now)
-                    .await;
+                focal_rt::boxed(|| {
+                    self.serve_credential(request, pool, host, registry, &swap, now)
+                })
+                .await;
                 continue;
             }
             // A queue whose every handle went has nothing more to ask: the pause alone paces
             // the loop then, never a closed queue's answer at once.
             if requests_open {
                 match race2(
-                    focal_rt::time::pause(Duration::from_millis(250)),
+                    focal_rt::time::sleep(Duration::from_millis(250)),
                     swap.requests.recv(),
                 )
                 .await
                 {
-                    Either::First(()) => {}
+                    Either::First(slept) => slept.map_err(|_| ControllerError::Runtime)?,
                     Either::Second(Ok(request)) => asked = Some(request),
                     Either::Second(Err(_)) => requests_open = false,
                 }
             } else {
-                focal_rt::time::pause(Duration::from_millis(250)).await;
+                focal_rt::time::sleep(Duration::from_millis(250))
+                    .await
+                    .map_err(|_| ControllerError::Runtime)?;
             }
         }
     }
@@ -1757,7 +1770,9 @@ impl NetworkController {
             if issued_by_held(&self.state.sponsor.issuers) {
                 return Ok(());
             }
-            focal_rt::time::pause(OBSERVATION_RETRY).await;
+            focal_rt::time::sleep(OBSERVATION_RETRY)
+                .await
+                .map_err(|_| RenewalError::Unavailable)?;
         }
     }
     fn refresh(

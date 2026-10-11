@@ -4,8 +4,8 @@ use crate::fleet::FleetManager;
 use focal_ledger::LedgerError;
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{RequestEpoch, RequestId};
-use focal_wire::{MANAGED_PROTOCOL_VERSION, Operation, PeerConnectionPool, RequestEnvelope};
 use focal_rt::Concurrent;
+use focal_wire::{MANAGED_PROTOCOL_VERSION, Operation, PeerConnectionPool, RequestEnvelope};
 use hyper_rt::combine::{Either, join2, race2};
 use std::future::Future;
 use std::pin::pin;
@@ -86,7 +86,10 @@ async fn bring(
                 }
                 // Nothing was serving: the period is waited out.
                 Either::First(None) => {
-                    if focal_rt::time::sleep(Duration::from_millis(100)).await.is_err() {
+                    if focal_rt::time::sleep(Duration::from_millis(100))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }

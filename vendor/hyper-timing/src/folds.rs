@@ -11,8 +11,6 @@
 
 use std::time::Duration;
 
-use crate::qos::Floors;
-
 /// An exact mean of nanosecond samples: their count and their sum. The sum is a `u128`, so it
 /// cannot overflow before the count does, at 2⁶⁴ samples; a sample past that is refused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -211,26 +209,6 @@ impl Flushes {
     }
 }
 
-impl Floors {
-    /// The floors from what was measured: the receiver's granularity `G`, the sender's mean flush
-    /// (its stability floor is `E[flush] + G`, Lindley's condition with the sender's wait in its
-    /// service), and the link's correlation time `T_c`, which the traces measure (§2.6). `None`
-    /// while either fold is empty: no floor is invented.
-    pub fn measured(
-        granularity: &Lateness,
-        sender: &Flushes,
-        correlation: Duration,
-    ) -> Option<Self> {
-        let granularity = granularity.granularity()?;
-        let flush = sender.mean()?;
-        Some(Self {
-            granularity,
-            sender: flush.saturating_add(granularity),
-            correlation,
-        })
-    }
-}
-
 /// The fleet's node failures over its exposure, for the MTBF (`docs/timing.md` §2.6, item 3): the
 /// Jeffreys posterior for a Poisson rate after `k` failures in node exposure `T` is
 /// `Gamma(k + ½, T)`, mean rate `(k + ½)/T` (Jeffreys 1946), so `MTBF = T / (k + ½)`. Before the
@@ -337,25 +315,6 @@ mod tests {
             Some(Duration::from_nanos(1)),
             "stamps are whole nanoseconds"
         );
-    }
-
-    #[test]
-    fn the_floors_need_both_folds() {
-        let mut late = Lateness::new(Duration::from_nanos(1));
-        let mut flush = Flushes::new();
-        let tc = Duration::from_millis(50);
-        assert_eq!(Floors::measured(&late, &flush, tc), None);
-        late.on_wait(0, 0).unwrap();
-        assert_eq!(Floors::measured(&late, &flush, tc), None, "no flush");
-        flush.on_flush(10, 4_010).unwrap();
-        let on_time = Floors::measured(&late, &flush, tc).unwrap();
-        assert_eq!(on_time.granularity, Duration::from_nanos(1), "on time: r");
-        assert_eq!(on_time.sender, Duration::from_nanos(4_001));
-        late.on_wait(0, 2_000).unwrap();
-        let floors = Floors::measured(&late, &flush, tc).unwrap();
-        assert_eq!(floors.granularity, Duration::from_nanos(1_000));
-        assert_eq!(floors.sender, Duration::from_nanos(5_000));
-        assert_eq!(floors.correlation, tc);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Profile, Transport, WorkloadShape};
 use focal_client::{
-    Client, ClientError, EmbeddedTransport, QuicTransport, RetryPolicy, LocalTransport,
+    Client, ClientError, EmbeddedTransport, LocalTransport, QuicTransport, RetryPolicy,
 };
 use focal_ledger::NativeContentProfile;
 use focal_model::{
@@ -128,14 +128,9 @@ impl Conn {
                 }
                 .parse()
                 .map_err(|_| LoadError::Shape("local address".into()))?;
-                // The connection's endpoint is its own owner, funded for its
-                // limits.
-                let connector = QuicConnector::bind(
-                    address,
-                    client.tls,
-                    limits.clone(),
-                    focal_wire::endpoint_budget(limits, None)?,
-                )?;
+                // The connection's endpoint is its own owner.
+                let connector =
+                    QuicConnector::bind_standalone(address, client.tls, limits.clone())?;
                 // One route, one connection: the transport's bound is the
                 // routes a client may hold, as the CLI's enrolled context.
                 let transport = QuicTransport::new(connector, initial, 16)?;
@@ -527,13 +522,16 @@ async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadE
             // A write is due and has room: it is sent at its place, unless
             // one under way ends first.
             Some(at) => {
-                let wait = focal_rt::time::pause(at.saturating_duration_since(Instant::now()));
+                let wait = focal_rt::time::sleep(at.saturating_duration_since(Instant::now()));
                 let ended = if flying.is_empty() {
-                    wait.await;
+                    wait.await.map_err(LoadError::Runtime)?;
                     None
                 } else {
                     match race2(wait, flying.join_next()).await {
-                        Either::First(()) => None,
+                        Either::First(slept) => {
+                            slept.map_err(LoadError::Runtime)?;
+                            None
+                        }
                         Either::Second(written) => Some(written),
                     }
                 };
@@ -677,7 +675,12 @@ async fn run_phase(
             .ok_or(LoadError::Bound("connections"))?;
         let index = job.index;
         callers
-            .push(async move { (index, worker(job, phase, run_start, generations, conn).await) })
+            .push(async move {
+                (
+                    index,
+                    worker(job, phase, run_start, generations, conn).await,
+                )
+            })
             .map_err(|_| LoadError::Bound("callers"))?;
     }
     let mut outcomes = Vec::with_capacity(callers.len());
@@ -1007,7 +1010,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 callers: reader_count,
                 count: share(shape.reads, reader_count, index)?,
                 base: worker_base(shape.seed, u128::from(index))?,
-                    names,
+                names,
                 limits: limits.clone(),
                 created: outcome.created.clone(),
                 // Reads are not paced: they measure the read path closed-loop.

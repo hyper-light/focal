@@ -362,47 +362,52 @@ fn new_seed_generation_fences_old_cursor_and_request_key_cannot_change_intent() 
     assert_eq!(node.session.cursor_revision(), 2);
 }
 
-#[tokio::test]
-async fn disconnected_projection_expires_without_another_client_request() {
-    let root = tempfile::tempdir().unwrap();
-    let mut node = open(root.path());
-    crate::demo::run(&mut node).unwrap();
-    let sequence = node.session.sequence();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    let expiry = now + 100;
-    let input = focal_ledger::CursorInput {
-        ledger: node.identity.ledger,
-        key: RequestKey {
-            principal: node.identity.issuer,
-            epoch: RequestEpoch(1),
-            id: RequestId::from_u128(31),
-        },
-        intent_hash: ContentHash([31; 32]),
-        command: CursorCommand {
-            expected_revision: 0,
-            now,
-            operation: CursorOperation::Register {
-                consumer: ConsumerId::from_u128(31),
-                scope: ContentHash([32; 32]),
-                filter: DeltaFilter::All,
-                start: Position::resolved(node.identity.ledger, sequence),
-                expires_at: expiry,
+#[test]
+fn disconnected_projection_expires_without_another_client_request() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let mut node = open(root.path());
+        crate::demo::run(&mut node).unwrap();
+        let sequence = node.session.sequence();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let expiry = now + 100;
+        let input = focal_ledger::CursorInput {
+            ledger: node.identity.ledger,
+            key: RequestKey {
+                principal: node.identity.issuer,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(31),
             },
-        },
-    };
-    node.session.submit_cursor_local(&input).unwrap();
-    let (host, owner) = crate::host::LocalHost::spawn(node, WireLimits::default()).unwrap();
-    focal_rt::time::pause(std::time::Duration::from_millis(1200)).await;
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    let node = open(root.path());
-    assert!(node.session.cursor_clock() >= expiry);
-    assert_eq!(node.session.cursor_revision(), 2);
-    assert_eq!(node.session.next_cursor_expiry(), None);
-    assert_eq!(node.session.sequence(), sequence);
+            intent_hash: ContentHash([31; 32]),
+            command: CursorCommand {
+                expected_revision: 0,
+                now,
+                operation: CursorOperation::Register {
+                    consumer: ConsumerId::from_u128(31),
+                    scope: ContentHash([32; 32]),
+                    filter: DeltaFilter::All,
+                    start: Position::resolved(node.identity.ledger, sequence),
+                    expires_at: expiry,
+                },
+            },
+        };
+        node.session.submit_cursor_local(&input).unwrap();
+        let (host, owner) = crate::host::LocalHost::spawn(node, WireLimits::default()).unwrap();
+        focal_rt::time::sleep(std::time::Duration::from_millis(1200))
+            .await
+            .unwrap();
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        let node = open(root.path());
+        assert!(node.session.cursor_clock() >= expiry);
+        assert_eq!(node.session.cursor_revision(), 2);
+        assert_eq!(node.session.next_cursor_expiry(), None);
+        assert_eq!(node.session.sequence(), sequence);
+    })
+    .unwrap()
 }
 
 struct StreamCluster {

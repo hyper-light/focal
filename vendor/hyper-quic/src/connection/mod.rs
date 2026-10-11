@@ -19,7 +19,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
-    config::{ConfigKey, Configs, ServerConfigHandle, TransportConfig},
+    config::{ConfigKey, Configs, TransportConfig},
     crypto::{self, KeyPair, Keys, PacketKey},
     float,
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
@@ -151,6 +151,9 @@ pub struct Connection {
     /// The endpoint's slot holding the configuration this connection was started from, which the
     /// endpoint lends to each call that needs it
     shared_config: ConfigKey,
+    /// Whether the endpoint still counts this connection on `shared_config`: a server's handshake
+    /// completing releases it
+    holds_config: bool,
     /// The CID we initially chose, for use during the handshake
     handshake_cid: ConnectionId,
     /// The CID the peer initially chose, for use during the handshake
@@ -333,6 +336,7 @@ impl Connection {
             qlog,
             crypto,
             shared_config,
+            holds_config: true,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
             local_cid_state: CidState::new(
@@ -2901,6 +2905,16 @@ impl Connection {
 
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
+            if !self.holds_config {
+                // Only a server whose handshake is complete holds no configuration, and a QUIC
+                // client sends no TLS message after its Finished (RFC 9001 §4.4, §6): its TLS
+                // would refuse any as unexpected (alert 10, RFC 8446 §6.2)
+                return Err(TransportError {
+                    code: TransportErrorCode::crypto(UNEXPECTED_MESSAGE),
+                    frame: None,
+                    reason: "TLS message after the handshake".into(),
+                });
+            }
             let config = configs
                 .session_config(self.shared_config)
                 .ok_or_else(released_config)?;
@@ -3575,6 +3589,14 @@ impl Connection {
             // Server-only
             self.spaces.get_mut(SpaceId::Data).pending.handshake_done = true;
             self.discard_space(now, SpaceId::Handshake);
+            // Nothing the handshake has not made needs the configuration the connection was
+            // accepted under: its tickets were made as it read the client's Finished, and a token
+            // it issues later is sealed under the endpoint's current configuration, which is the one
+            // that validates it. So a replaced configuration lives no longer than the handshakes
+            // begun under it, however long the connections it accepted live.
+            self.holds_config = false;
+            self.endpoint_events
+                .push_back(EndpointEventInner::ConfigReleased);
         }
 
         self.events.push_back(Event::Connected);
@@ -4602,10 +4624,10 @@ impl Connection {
         }
         let space = self.spaces.get_mut(space_id);
         while let Some(remote_addr) = space.pending.new_tokens.pop() {
-            let Some(server_config) = configs.server_config(ServerConfigHandle(self.shared_config))
-            else {
-                // The configuration that would sign the token is gone; send none rather than one
-                // the server cannot validate
+            // Sealed under the configuration that will validate it: the one the endpoint accepts
+            // new connections under, which a connection accepted under a replaced one outlives
+            let Some(server_config) = configs.current_server_config() else {
+                // The server accepts no connections, so no token it seals could be validated
                 space.pending.new_tokens.clear();
                 break;
             };
@@ -5068,10 +5090,14 @@ impl Connection {
     }
 }
 
+/// The TLS alert a server's TLS sends for a message it does not expect (RFC 8446 §6.2)
+const UNEXPECTED_MESSAGE: u8 = 10;
+
 /// The error for a connection whose configuration's slot no longer holds it
 ///
-/// The endpoint keeps a slot until the last connection started under it drains, so this is not
-/// reached through the endpoint; it is still a typed error, not an assumption.
+/// The endpoint keeps a slot while a connection holds it (a server's through its handshake, a
+/// client's until it drains), and a connection consults its slot only while it holds it, so this is
+/// not reached through the endpoint; it is still a typed error, not an assumption.
 fn released_config() -> TransportError {
     TransportError::INTERNAL_ERROR("connection's configuration released while in use")
 }

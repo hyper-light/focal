@@ -381,240 +381,142 @@ fn network_manifest_and_read_chunk_require_exact_authorized_transfer() {
     ));
 }
 
-#[tokio::test]
-async fn download_upper_bound_returns_store_sized_pages_with_exact_eof() {
-    let root = tempfile::tempdir().unwrap();
-    let store_limits = StoreLimits {
-        max_content_bytes: 16 * 1024,
-        max_staging_bytes: 16 * 1024,
-        chunk_bytes: 4 * 1024,
-        ..limits()
-    };
-    let mut store = ContentStore::open(root.path(), store_limits).unwrap();
-    let bytes = vec![42; 6 * 1024];
-    let upload = UploadId([1; 16]);
-    store
-        .begin(
-            upload,
-            ContentDomainId(TenantId::from_u128(1).0),
-            ContentClass::Evidence,
-            bytes.len() as u64,
-            None,
+#[test]
+fn download_upper_bound_returns_store_sized_pages_with_exact_eof() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let store_limits = StoreLimits {
+            max_content_bytes: 16 * 1024,
+            max_staging_bytes: 16 * 1024,
+            chunk_bytes: 4 * 1024,
+            ..limits()
+        };
+        let mut store = ContentStore::open(root.path(), store_limits).unwrap();
+        let bytes = vec![42; 6 * 1024];
+        let upload = UploadId([1; 16]);
+        store
+            .begin(
+                upload,
+                ContentDomainId(TenantId::from_u128(1).0),
+                ContentClass::Evidence,
+                bytes.len() as u64,
+                None,
+            )
+            .unwrap();
+        for (index, part) in bytes.chunks(4 * 1024).enumerate() {
+            store
+                .append(upload, (index * 4 * 1024) as u64, part)
+                .unwrap();
+        }
+        let reference = store.seal(upload).unwrap();
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            store,
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
         )
         .unwrap();
-    for (index, part) in bytes.chunks(4 * 1024).enumerate() {
-        store
-            .append(upload, (index * 4 * 1024) as u64, part)
-            .unwrap();
-    }
-    let reference = store.seal(upload).unwrap();
-    let budget = memory();
-    let (host, owner) = ContentHost::spawn(
-        store,
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let ledger = ledger(1, 1);
-    host.install_policy(policy(ledger)).await.unwrap();
-    for (offset, length, eof) in [(0, 4 * 1024, false), (4 * 1024, 2 * 1024, true)] {
-        let response = host
-            .request(request(
-                ledger,
-                1,
-                None,
-                1,
-                Operation::Download {
-                    content: reference.clone(),
-                    offset,
-                    max_bytes: 65 * 1024,
-                },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.value().result,
-            Response::Content(ContentChunk {
-                offset,
-                bytes: vec![42; length],
-                eof,
-            })
-        );
-    }
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(budget.stats().used, 0);
-}
-
-#[tokio::test]
-async fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custody() {
-    let root = tempfile::tempdir().unwrap();
-    let budget = memory();
-    let (host, owner) = ContentHost::spawn(
-        ContentStore::open(root.path(), limits()).unwrap(),
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let a = ledger(1, 1);
-    let b = ledger(2, 1);
-    host.install_policy(policy(a)).await.unwrap();
-    host.clone().install_policy(policy(b)).await.unwrap();
-    let upload = [7; 16];
-    let bytes = b"abcdefgh";
-    for ledger in [a, b] {
-        let begin = request(
-            ledger,
-            1,
-            None,
-            1,
-            Operation::Upload(UploadRequest::Begin {
-                upload,
-                length: 8,
-                digest: ContentHash(*blake3::hash(bytes).as_bytes()),
-                class: ContentClass::Evidence,
-            }),
-        );
-        let response = host.request(begin).await.unwrap();
-        assert_eq!(
-            response.value().result,
-            Response::Upload(UploadReply::Offset(0))
-        );
-        drop(response);
-        for (index, part) in bytes.chunks(4).enumerate() {
-            let append = request(
-                ledger,
-                1,
-                None,
-                2,
-                Operation::Upload(UploadRequest::Append {
-                    upload,
-                    offset: (index * 4) as u64,
-                    bytes: part.to_vec(),
-                }),
-            );
-            let response = host.request(append).await.unwrap();
+        let ledger = ledger(1, 1);
+        host.install_policy(policy(ledger)).await.unwrap();
+        for (offset, length, eof) in [(0, 4 * 1024, false), (4 * 1024, 2 * 1024, true)] {
+            let response = host
+                .request(request(
+                    ledger,
+                    1,
+                    None,
+                    1,
+                    Operation::Download {
+                        content: reference.clone(),
+                        offset,
+                        max_bytes: 65 * 1024,
+                    },
+                ))
+                .await
+                .unwrap();
             assert_eq!(
                 response.value().result,
-                Response::Upload(UploadReply::Offset(((index + 1) * 4) as u64))
+                Response::Content(ContentChunk {
+                    offset,
+                    bytes: vec![42; length],
+                    eof,
+                })
             );
         }
-        let denied = host
-            .request(request(
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
+}
+
+#[test]
+fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custody() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            ContentStore::open(root.path(), limits()).unwrap(),
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
+        .unwrap();
+        let a = ledger(1, 1);
+        let b = ledger(2, 1);
+        host.install_policy(policy(a)).await.unwrap();
+        host.clone().install_policy(policy(b)).await.unwrap();
+        let upload = [7; 16];
+        let bytes = b"abcdefgh";
+        for ledger in [a, b] {
+            let begin = request(
                 ledger,
                 1,
                 None,
-                3,
-                Operation::Upload(UploadRequest::Seal { upload }),
-            ))
-            .await;
-        assert!(matches!(denied, Err(AccessError::UnsupportedOperation)));
-    }
-    let a_ref = host
-        .seal_upload(
-            policy(a).scope(),
-            request(
-                a,
                 1,
-                None,
-                4,
-                Operation::Upload(UploadRequest::Seal { upload }),
-            ),
-        )
-        .await
-        .unwrap();
-    let b_ref = host
-        .seal_upload(
-            policy(b).scope(),
-            request(
-                b,
-                1,
-                None,
-                4,
-                Operation::Upload(UploadRequest::Seal { upload }),
-            ),
-        )
-        .await
-        .unwrap();
-    assert_ne!(a_ref.domain, b_ref.domain);
-    assert_ne!(a_ref.root, b_ref.root);
-    let descriptor = host
-        .export_manifest(policy(a).scope(), a_ref.clone())
-        .await
-        .unwrap();
-    let chunk = host
-        .clone()
-        .read_transfer_chunk(policy(a).scope(), a_ref.clone(), 1)
-        .await
-        .unwrap();
-    assert_eq!(chunk.value(), b"efgh");
-    let full = host
-        .read_bytes(policy(b).scope(), b_ref.clone(), 8)
-        .await
-        .unwrap();
-    assert_eq!(full.value(), bytes);
-    let denied = host
-        .request(request(
-            a,
-            1,
-            None,
-            5,
-            Operation::Download {
-                content: b_ref,
-                offset: 0,
-                max_bytes: 4,
-            },
-        ))
-        .await;
-    assert!(matches!(denied, Err(AccessError::Unauthorized)));
-    let downloaded = host
-        .request(request(
-            a,
-            1,
-            None,
-            6,
-            Operation::Download {
-                content: a_ref.clone(),
-                offset: 4,
-                max_bytes: 4,
-            },
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        downloaded.value().result,
-        Response::Content(ContentChunk {
-            offset: 4,
-            bytes: b"efgh".to_vec(),
-            eof: true
-        })
-    );
-    drop(downloaded);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    assert!(budget.stats().used > 0);
-    drop(descriptor);
-    drop(chunk);
-    drop(full);
-    assert_eq!(budget.stats().used, 0);
-    assert!(matches!(
-        host.install_policy(policy(a)).await,
-        Err(AccessError::Unavailable)
-    ));
-    // The one writer lock is released at shutdown; exact scoped upload seals
-    // and immutable content survive actual disk reopen under a fresh actor.
-    let (recovered, owner) = ContentHost::spawn(
-        ContentStore::open(root.path(), limits()).unwrap(),
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    recovered.install_policy(policy(a)).await.unwrap();
-    assert_eq!(
-        recovered
+                Operation::Upload(UploadRequest::Begin {
+                    upload,
+                    length: 8,
+                    digest: ContentHash(*blake3::hash(bytes).as_bytes()),
+                    class: ContentClass::Evidence,
+                }),
+            );
+            let response = host.request(begin).await.unwrap();
+            assert_eq!(
+                response.value().result,
+                Response::Upload(UploadReply::Offset(0))
+            );
+            drop(response);
+            for (index, part) in bytes.chunks(4).enumerate() {
+                let append = request(
+                    ledger,
+                    1,
+                    None,
+                    2,
+                    Operation::Upload(UploadRequest::Append {
+                        upload,
+                        offset: (index * 4) as u64,
+                        bytes: part.to_vec(),
+                    }),
+                );
+                let response = host.request(append).await.unwrap();
+                assert_eq!(
+                    response.value().result,
+                    Response::Upload(UploadReply::Offset(((index + 1) * 4) as u64))
+                );
+            }
+            let denied = host
+                .request(request(
+                    ledger,
+                    1,
+                    None,
+                    3,
+                    Operation::Upload(UploadRequest::Seal { upload }),
+                ))
+                .await;
+            assert!(matches!(denied, Err(AccessError::UnsupportedOperation)));
+        }
+        let a_ref = host
             .seal_upload(
                 policy(a).scope(),
                 request(
@@ -622,22 +524,126 @@ async fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custod
                     1,
                     None,
                     4,
-                    Operation::Upload(UploadRequest::Seal { upload })
-                )
+                    Operation::Upload(UploadRequest::Seal { upload }),
+                ),
             )
             .await
-            .unwrap(),
-        a_ref
-    );
-    let replay = recovered
-        .read_bytes(policy(a).scope(), a_ref, 8)
-        .await
+            .unwrap();
+        let b_ref = host
+            .seal_upload(
+                policy(b).scope(),
+                request(
+                    b,
+                    1,
+                    None,
+                    4,
+                    Operation::Upload(UploadRequest::Seal { upload }),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(a_ref.domain, b_ref.domain);
+        assert_ne!(a_ref.root, b_ref.root);
+        let descriptor = host
+            .export_manifest(policy(a).scope(), a_ref.clone())
+            .await
+            .unwrap();
+        let chunk = host
+            .clone()
+            .read_transfer_chunk(policy(a).scope(), a_ref.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(chunk.value(), b"efgh");
+        let full = host
+            .read_bytes(policy(b).scope(), b_ref.clone(), 8)
+            .await
+            .unwrap();
+        assert_eq!(full.value(), bytes);
+        let denied = host
+            .request(request(
+                a,
+                1,
+                None,
+                5,
+                Operation::Download {
+                    content: b_ref,
+                    offset: 0,
+                    max_bytes: 4,
+                },
+            ))
+            .await;
+        assert!(matches!(denied, Err(AccessError::Unauthorized)));
+        let downloaded = host
+            .request(request(
+                a,
+                1,
+                None,
+                6,
+                Operation::Download {
+                    content: a_ref.clone(),
+                    offset: 4,
+                    max_bytes: 4,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            downloaded.value().result,
+            Response::Content(ContentChunk {
+                offset: 4,
+                bytes: b"efgh".to_vec(),
+                eof: true
+            })
+        );
+        drop(downloaded);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        assert!(budget.stats().used > 0);
+        drop(descriptor);
+        drop(chunk);
+        drop(full);
+        assert_eq!(budget.stats().used, 0);
+        assert!(matches!(
+            host.install_policy(policy(a)).await,
+            Err(AccessError::Unavailable)
+        ));
+        // The one writer lock is released at shutdown; exact scoped upload seals
+        // and immutable content survive actual disk reopen under a fresh actor.
+        let (recovered, owner) = ContentHost::spawn(
+            ContentStore::open(root.path(), limits()).unwrap(),
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
         .unwrap();
-    assert_eq!(replay.value(), bytes);
-    drop(replay);
-    recovered.stop().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(budget.stats().used, 0);
+        recovered.install_policy(policy(a)).await.unwrap();
+        assert_eq!(
+            recovered
+                .seal_upload(
+                    policy(a).scope(),
+                    request(
+                        a,
+                        1,
+                        None,
+                        4,
+                        Operation::Upload(UploadRequest::Seal { upload })
+                    )
+                )
+                .await
+                .unwrap(),
+            a_ref
+        );
+        let replay = recovered
+            .read_bytes(policy(a).scope(), a_ref, 8)
+            .await
+            .unwrap();
+        assert_eq!(replay.value(), bytes);
+        drop(replay);
+        recovered.stop().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
 }
 
 #[test]
@@ -709,7 +715,8 @@ fn policy_capacity_and_memory_rejection_leave_all_installed_facts_unchanged() {
 }
 
 #[test]
-fn policy_update_without_timer_rejects_before_enqueue_and_releases_reservation() {
+fn policy_update_off_a_shard_rejects_before_enqueue_and_releases_reservation() {
+    use futures_util::FutureExt;
     let root = tempfile::tempdir().unwrap();
     let budget = memory();
     let (host, owner) = ContentHost::spawn(
@@ -720,12 +727,12 @@ fn policy_update_without_timer_rejects_before_enqueue_and_releases_reservation()
     )
     .unwrap();
     let initial = budget.stats().used;
-    let no_time = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
+    // Off a shard no wait for the owner's answer can be kept: refused before
+    // anything is queued or charged.
     assert_eq!(
-        no_time.block_on(host.replace_policy(None, policy(ledger(1, 1)))),
-        Err(AccessError::Unavailable)
+        host.replace_policy(None, policy(ledger(1, 1)))
+            .now_or_never(),
+        Some(Err(AccessError::Unavailable))
     );
     assert_eq!(budget.stats().used, initial);
     drop(host);
@@ -759,46 +766,51 @@ fn missing_runtime_rejects_before_enqueue_and_dropping_handles_stops_the_owner()
     assert_eq!(budget.stats().used, 0);
 }
 
-#[tokio::test]
-async fn abandoned_transfer_expires_without_another_network_request() {
-    let source = tempfile::tempdir().unwrap();
-    let target = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
-    let content = stored(&mut sender, 1, 1, b"abcdefgh");
-    let manifest = sender.export_manifest(&content).unwrap();
-    let budget = memory();
-    let mut config = CustodyConfig::new(1);
-    config.transfer_ttl = Duration::from_millis(20);
-    let (host, owner) = ContentHost::spawn(
-        ContentStore::open(target.path(), limits()).unwrap(),
-        config,
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let ledger = ledger(1, 1);
-    host.install_policy(policy(ledger)).await.unwrap();
-    let baseline = budget.stats().used;
-    let opened = host
-        .request(custody(
-            ledger,
-            1,
-            CustodyRequest::Open {
-                transfer: [5; 16],
-                policy_revision: 1,
-                content,
-                manifest: manifest.encoded().to_vec(),
-            },
-        ))
-        .await
+#[test]
+fn abandoned_transfer_expires_without_another_network_request() {
+    focal_rt::block_on(async move {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+        let content = stored(&mut sender, 1, 1, b"abcdefgh");
+        let manifest = sender.export_manifest(&content).unwrap();
+        let budget = memory();
+        let mut config = CustodyConfig::new(1);
+        config.transfer_ttl = Duration::from_millis(20);
+        let (host, owner) = ContentHost::spawn(
+            ContentStore::open(target.path(), limits()).unwrap(),
+            config,
+            WireLimits::default(),
+            budget.clone(),
+        )
         .unwrap();
-    drop(opened);
-    assert!(budget.stats().used > baseline);
-    focal_rt::time::pause(Duration::from_millis(400)).await;
-    assert_eq!(budget.stats().used, baseline);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(budget.stats().used, 0);
+        let ledger = ledger(1, 1);
+        host.install_policy(policy(ledger)).await.unwrap();
+        let baseline = budget.stats().used;
+        let opened = host
+            .request(custody(
+                ledger,
+                1,
+                CustodyRequest::Open {
+                    transfer: [5; 16],
+                    policy_revision: 1,
+                    content,
+                    manifest: manifest.encoded().to_vec(),
+                },
+            ))
+            .await
+            .unwrap();
+        drop(opened);
+        assert!(budget.stats().used > baseline);
+        focal_rt::time::sleep(Duration::from_millis(400))
+            .await
+            .unwrap();
+        assert_eq!(budget.stats().used, baseline);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
 }
 
 #[test]
@@ -2136,95 +2148,97 @@ fn a_restore_is_kept_between_asks_and_answers_once_done() {
 /// object of a hundred chunks — as many as the store's manifest bound names
 /// at these limits — each go a chunk a slice to their answers, one queued
 /// command a slice, the answer given by the last (the audit's F51).
-#[tokio::test]
-async fn a_seal_and_a_verification_go_through_the_owner_a_slice_at_a_time() {
-    let source = tempfile::tempdir().unwrap();
-    let target = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
-    let bytes: Vec<u8> = (0..400u32).map(|at| (at % 251) as u8).collect();
-    let content = stored(&mut sender, 1, 1, &bytes);
-    let manifest = sender.export_manifest(&content).unwrap();
-    let budget = memory();
-    let (host, owner) = ContentHost::spawn(
-        ContentStore::open(target.path(), limits()).unwrap(),
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let ledger = ledger(1, 1);
-    host.install_policy(policy(ledger)).await.unwrap();
-    let opened = host
-        .request(custody(
-            ledger,
-            1,
-            CustodyRequest::Open {
-                transfer: [5; 16],
-                policy_revision: 1,
-                content: content.clone(),
-                manifest: manifest.encoded().to_vec(),
-            },
-        ))
-        .await
+#[test]
+fn a_seal_and_a_verification_go_through_the_owner_a_slice_at_a_time() {
+    focal_rt::block_on(async move {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+        let bytes: Vec<u8> = (0..400u32).map(|at| (at % 251) as u8).collect();
+        let content = stored(&mut sender, 1, 1, &bytes);
+        let manifest = sender.export_manifest(&content).unwrap();
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            ContentStore::open(target.path(), limits()).unwrap(),
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
         .unwrap();
-    assert!(matches!(
-        opened.value().result,
-        Response::Custody(CustodyReply::Opened {
-            chunks: 100,
-            next_missing: 0
-        })
-    ));
-    drop(opened);
-    for (index, part) in bytes.chunks(4).enumerate() {
-        drop(
-            host.request(custody(
+        let ledger = ledger(1, 1);
+        host.install_policy(policy(ledger)).await.unwrap();
+        let opened = host
+            .request(custody(
                 ledger,
-                2,
-                CustodyRequest::Chunk {
+                1,
+                CustodyRequest::Open {
                     transfer: [5; 16],
-                    index: index as u32,
-                    bytes: part.to_vec(),
+                    policy_revision: 1,
+                    content: content.clone(),
+                    manifest: manifest.encoded().to_vec(),
                 },
             ))
             .await
-            .unwrap(),
+            .unwrap();
+        assert!(matches!(
+            opened.value().result,
+            Response::Custody(CustodyReply::Opened {
+                chunks: 100,
+                next_missing: 0
+            })
+        ));
+        drop(opened);
+        for (index, part) in bytes.chunks(4).enumerate() {
+            drop(
+                host.request(custody(
+                    ledger,
+                    2,
+                    CustodyRequest::Chunk {
+                        transfer: [5; 16],
+                        index: index as u32,
+                        bytes: part.to_vec(),
+                    },
+                ))
+                .await
+                .unwrap(),
+            );
+        }
+        let sealed = host
+            .request(custody(
+                ledger,
+                3,
+                CustodyRequest::Seal { transfer: [5; 16] },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &sealed.value().result,
+                Response::Custody(CustodyReply::Durable { content: sealed, .. }) if *sealed == content
+            ),
+            "{:?}",
+            sealed.value().result
         );
-    }
-    let sealed = host
-        .request(custody(
-            ledger,
-            3,
-            CustodyRequest::Seal { transfer: [5; 16] },
-        ))
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            &sealed.value().result,
-            Response::Custody(CustodyReply::Durable { content: sealed, .. }) if *sealed == content
-        ),
-        "{:?}",
-        sealed.value().result
-    );
-    drop(sealed);
-    let verified = host
-        .request(custody(
-            ledger,
-            4,
-            CustodyRequest::Verify {
-                policy_revision: 1,
-                content: content.clone(),
-            },
-        ))
-        .await
-        .unwrap();
-    assert!(matches!(
-        verified.value().result,
-        Response::Custody(CustodyReply::Durable { .. })
-    ));
-    drop(verified);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
+        drop(sealed);
+        let verified = host
+            .request(custody(
+                ledger,
+                4,
+                CustodyRequest::Verify {
+                    policy_revision: 1,
+                    content: content.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            verified.value().result,
+            Response::Custody(CustodyReply::Durable { .. })
+        ));
+        drop(verified);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+    }).unwrap()
 }
 
 /// What a small request waits for on the content owner while an upload of
@@ -2233,113 +2247,115 @@ async fn a_seal_and_a_verification_go_through_the_owner_a_slice_at_a_time() {
 /// one command, and a request queued behind it waited for all of it; a
 /// seal a chunk a slice leaves it a slice to wait for. A measurement, run
 /// by name on a quiet machine with half a gibibyte of disk free.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "a measurement; run by name on a quiet machine"]
-async fn measure_small_request_waits_while_a_large_upload_seals() {
-    const OBJECT: u64 = 256 << 20;
-    const CHUNK: usize = 1 << 20;
-    let root = tempfile::tempdir().unwrap();
-    let budget = MemoryBudget::new(1 << 30, 256 << 20).unwrap();
-    let (host, owner) = ContentHost::spawn(
-        ContentStore::open(
-            root.path(),
-            StoreLimits {
-                max_content_bytes: OBJECT,
-                max_staging_bytes: OBJECT,
-                max_uploads: 1,
-                chunk_bytes: CHUNK,
-                max_manifest_bytes: 64 * 1024,
-            },
+fn measure_small_request_waits_while_a_large_upload_seals() {
+    focal_rt::block_on(async move {
+        const OBJECT: u64 = 256 << 20;
+        const CHUNK: usize = 1 << 20;
+        let root = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(1 << 30, 256 << 20).unwrap();
+        let (host, owner) = ContentHost::spawn(
+            ContentStore::open(
+                root.path(),
+                StoreLimits {
+                    max_content_bytes: OBJECT,
+                    max_staging_bytes: OBJECT,
+                    max_uploads: 1,
+                    chunk_bytes: CHUNK,
+                    max_manifest_bytes: 64 * 1024,
+                },
+            )
+            .unwrap(),
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
         )
-        .unwrap(),
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let ledger = ledger(1, 1);
-    host.install_policy(policy(ledger)).await.unwrap();
-    let upload = [7; 16];
-    // Half a frame an append: its bytes and its envelope within the one
-    // frame a request may be (`WireLimits::max_frame_bytes`).
-    let append = WireLimits::default().max_frame_bytes as u64 / 2;
-    // No two chunks alike, so each is a file of its own: the byte at a
-    // position, mixed with its chunk's index.
-    let part = |offset: u64| -> Vec<u8> {
-        (offset..offset + append)
-            .map(|at| ((at % 251) as u8) ^ ((at / CHUNK as u64) as u8))
-            .collect()
-    };
-    let mut whole = blake3::Hasher::new();
-    for index in 0..OBJECT / append {
-        whole.update(&part(index * append));
-    }
-    host.request(request(
-        ledger,
-        1,
-        None,
-        1,
-        Operation::Upload(UploadRequest::Begin {
-            upload,
-            length: OBJECT,
-            digest: ContentHash(*whole.finalize().as_bytes()),
-            class: ContentClass::Evidence,
-        }),
-    ))
-    .await
-    .unwrap();
-    for index in 0..OBJECT / append {
+        .unwrap();
+        let ledger = ledger(1, 1);
+        host.install_policy(policy(ledger)).await.unwrap();
+        let upload = [7; 16];
+        // Half a frame an append: its bytes and its envelope within the one
+        // frame a request may be (`WireLimits::max_frame_bytes`).
+        let append = WireLimits::default().max_frame_bytes as u64 / 2;
+        // No two chunks alike, so each is a file of its own: the byte at a
+        // position, mixed with its chunk's index.
+        let part = |offset: u64| -> Vec<u8> {
+            (offset..offset + append)
+                .map(|at| ((at % 251) as u8) ^ ((at / CHUNK as u64) as u8))
+                .collect()
+        };
+        let mut whole = blake3::Hasher::new();
+        for index in 0..OBJECT / append {
+            whole.update(&part(index * append));
+        }
         host.request(request(
             ledger,
             1,
             None,
-            2 + u128::from(index),
-            Operation::Upload(UploadRequest::Append {
+            1,
+            Operation::Upload(UploadRequest::Begin {
                 upload,
-                offset: index * append,
-                bytes: part(index * append),
+                length: OBJECT,
+                digest: ContentHash(*whole.finalize().as_bytes()),
+                class: ContentClass::Evidence,
             }),
         ))
         .await
         .unwrap();
-    }
-    let seal = request(
-        ledger,
-        1,
-        None,
-        1 << 40,
-        Operation::Upload(UploadRequest::Seal { upload }),
-    );
-    let started = std::time::Instant::now();
-    let sealing = {
-        let host = host.clone();
-        let scope = policy(ledger).scope();
-        tokio::spawn(async move {
-            host.seal_upload(scope, seal)
-                .await
-                .map(|_| started.elapsed())
-        })
-    };
-    let mut waits = Vec::new();
-    while !sealing.is_finished() {
-        let asked = std::time::Instant::now();
-        host.disk_stats().await.unwrap();
-        waits.push(asked.elapsed());
-        focal_rt::time::pause(std::time::Duration::from_millis(1)).await;
-    }
-    let sealed = sealing.await.unwrap().unwrap();
-    waits.sort();
-    let quantile = |q: f64| waits[((waits.len() - 1) as f64 * q) as usize];
-    println!(
-        "a seal of {} MiB at {} KiB chunks took {sealed:?}; {} small requests during it waited p50 {:?}, p90 {:?}, p99 {:?}, max {:?}",
-        OBJECT >> 20,
-        CHUNK >> 10,
-        waits.len(),
-        quantile(0.5),
-        quantile(0.9),
-        quantile(0.99),
-        quantile(1.0),
-    );
-    host.stop().await.unwrap();
-    owner.join().unwrap();
+        for index in 0..OBJECT / append {
+            host.request(request(
+                ledger,
+                1,
+                None,
+                2 + u128::from(index),
+                Operation::Upload(UploadRequest::Append {
+                    upload,
+                    offset: index * append,
+                    bytes: part(index * append),
+                }),
+            ))
+            .await
+            .unwrap();
+        }
+        let seal = request(
+            ledger,
+            1,
+            None,
+            1 << 40,
+            Operation::Upload(UploadRequest::Seal { upload }),
+        );
+        let started = std::time::Instant::now();
+        let sealing = {
+            let host = host.clone();
+            let scope = policy(ledger).scope();
+            focal_rt::spawn(async move {
+                host.seal_upload(scope, seal)
+                    .await
+                    .map(|_| started.elapsed())
+            }).unwrap()
+        };
+        let mut waits = Vec::new();
+        while !sealing.is_finished() {
+            let asked = std::time::Instant::now();
+            host.disk_stats().await.unwrap();
+            waits.push(asked.elapsed());
+            focal_rt::time::sleep(std::time::Duration::from_millis(1)).await.unwrap();
+        }
+        let sealed = sealing.await.unwrap().unwrap();
+        waits.sort();
+        let quantile = |q: f64| waits[((waits.len() - 1) as f64 * q) as usize];
+        println!(
+            "a seal of {} MiB at {} KiB chunks took {sealed:?}; {} small requests during it waited p50 {:?}, p90 {:?}, p99 {:?}, max {:?}",
+            OBJECT >> 20,
+            CHUNK >> 10,
+            waits.len(),
+            quantile(0.5),
+            quantile(0.9),
+            quantile(0.99),
+            quantile(1.0),
+        );
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+    }).unwrap()
 }

@@ -1,7 +1,11 @@
-use std::{fmt, io, time::Instant};
+use std::fmt;
+#[cfg(feature = "qlog")]
+use std::{io, time::Instant};
 
+#[cfg(feature = "qlog")]
 use qlog::streamer::QlogStreamer;
 
+#[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
@@ -568,6 +572,7 @@ impl Default for AckFrequencyConfig {
     }
 }
 
+#[cfg(feature = "qlog")]
 /// Why a qlog stream could not be started
 #[derive(Debug, thiserror::Error)]
 pub enum QlogError {
@@ -579,6 +584,7 @@ pub enum QlogError {
     Start(#[from] qlog::Error),
 }
 
+#[cfg(feature = "qlog")]
 /// Configuration for qlog trace logging
 pub struct QlogConfig {
     writer: Option<Box<dyn io::Write + Send + Sync>>,
@@ -587,6 +593,7 @@ pub struct QlogConfig {
     start_time: Instant,
 }
 
+#[cfg(feature = "qlog")]
 impl QlogConfig {
     /// Where to write a qlog `TraceSeq`
     pub fn writer(&mut self, writer: Box<dyn io::Write + Send + Sync>) -> &mut Self {
@@ -646,6 +653,7 @@ impl QlogConfig {
     }
 }
 
+#[cfg(feature = "qlog")]
 impl Default for QlogConfig {
     #[allow(
         clippy::disallowed_methods,

@@ -2170,7 +2170,7 @@ fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
         .unwrap();
         let server = Arc::new(
             QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 wire.clone(),
@@ -2449,7 +2449,7 @@ fn a_missing_runtime_returns_errors_before_socket_or_handler_work() {
     .unwrap();
     assert!(matches!(
         QuicServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
             tls,
             PeerRegistry::new(4).unwrap(),
             limits.clone(),
@@ -2713,7 +2713,7 @@ fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
                 .unwrap();
             let server = Arc::new(
                 QuicServer::bind(
-                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                     server_tls,
                     registry,
                     limits(),
@@ -3281,7 +3281,7 @@ mod admission {
         .unwrap();
         let server = Arc::new(
             QuicServer::bind_admitting(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 quick(),
@@ -3628,7 +3628,7 @@ mod admission {
             let budget = MemoryBudget::new(frame + frame / 2, 0).unwrap();
             let server = Arc::new(
                 QuicServer::bind_admitting(
-                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                     tls,
                     registry,
                     limits(),
@@ -4419,7 +4419,7 @@ fn a_peers_time_to_answer_begins_when_it_has_what_was_asked() {
         .unwrap();
         let server = Arc::new(
             QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 wire.clone(),
@@ -4508,7 +4508,7 @@ impl SlowRig {
         .unwrap();
         let server = Arc::new(
             QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 wire.clone(),
@@ -4864,7 +4864,7 @@ async fn direct_case(
     .unwrap();
     let server = Arc::new(
         QuicServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
             tls,
             registry,
             wire.clone(),
@@ -5067,7 +5067,7 @@ fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_e
         .unwrap();
         let server = Arc::new(
             QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                 tls,
                 registry,
                 limits(),
@@ -5142,7 +5142,7 @@ fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_e
             .unwrap();
             Arc::new(
                 QuicServer::bind(
-                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                     tls,
                     registry.clone(),
                     limits(),
@@ -5789,7 +5789,7 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
             focal_rt::block_on(async move {
                 let server = Arc::new(
                     QuicServer::bind(
-                        "127.0.0.1:0".parse().unwrap(),
+                        "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                         tls,
                         registry,
                         server_limits,

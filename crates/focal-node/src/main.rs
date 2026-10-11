@@ -370,9 +370,9 @@ async fn run(args: Args) -> Result<()> {
         Commands::Code { command } => {
             cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
         }
-        Commands::Context { command } => {
-            cli::context::run(&settings, command).await.map_err(Into::into)
-        }
+        Commands::Context { command } => cli::context::run(&settings, command)
+            .await
+            .map_err(Into::into),
         Commands::Start {
             advertise,
             listen,
@@ -438,33 +438,37 @@ async fn run(args: Args) -> Result<()> {
                     shape_only: false,
                     native,
                 },
-        } => cli::schema_validate(&settings,
+        } => cli::schema_validate(
+            &settings,
             args.client_context.as_deref(),
             &operation,
             input,
             native,
-        ).await
+        )
+        .await
         .map_err(Into::into),
         Commands::Schema { command } => cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => cli::discovery::completion(shell).map_err(Into::into),
-        Commands::Status => {
-            cli::status(&settings, args.client_context.as_deref()).await.map_err(Into::into)
+        Commands::Status => cli::status(&settings, args.client_context.as_deref())
+            .await
+            .map_err(Into::into),
+        Commands::Request(command) => {
+            Ok(cli::request(&settings, command, args.client_context.as_deref()).await?)
         }
-        Commands::Request(command) => Ok(cli::request(&settings,
-            command,
-            args.client_context.as_deref(),
-        ).await?),
-        Commands::Manual(command) => Ok(cli::run(&settings,
-            *command,
-            args.client_context.as_deref(),
-        ).await?),
-        Commands::Deployment { command } => cli::deployment::run(&settings,
-            cli::deployment::Inputs {
-                config: args.config.as_deref(),
-                data_dir_override,
-            },
-            command,
-        ).await,
+        Commands::Manual(command) => {
+            Ok(cli::run(&settings, *command, args.client_context.as_deref()).await?)
+        }
+        Commands::Deployment { command } => {
+            cli::deployment::run(
+                &settings,
+                cli::deployment::Inputs {
+                    config: args.config.as_deref(),
+                    data_dir_override,
+                },
+                command,
+            )
+            .await
+        }
     }
 }
 fn output_response(reply: ResponseEnvelope) -> Result<()> {

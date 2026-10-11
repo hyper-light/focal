@@ -27,20 +27,14 @@ pub(super) fn validation_cursor(
     Ok(output::hex(&bytes))
 }
 
-async fn fetch(
-    context: &Context,
-    request: Operation,
-) -> Result<ListPage> {
+async fn fetch(context: &Context, request: Operation) -> Result<ListPage> {
     let envelope = context.envelope(request)?;
     match context.client.request(envelope).await?.result {
         Response::Listed(page) => Ok(page),
         _ => Err(CliError::InvalidResponse),
     }
 }
-pub(super) async fn list(
-    context: &Context,
-    command: ListCommand,
-) -> Result<()> {
+pub(super) async fn list(context: &Context, command: ListCommand) -> Result<()> {
     let (kind, args) = match command {
         ListCommand::Claims(args) => (ObjectKind::Claim, args),
         ListCommand::Testaments(args) => (ObjectKind::Testament, args),
@@ -70,11 +64,7 @@ pub(super) async fn list(
     }
     output::page(fetch(context, request).await?, args.output.format)
 }
-async fn exact(
-    context: &Context,
-    kind: ObjectKind,
-    id: &str,
-) -> Result<(ReadToken, ReadObject)> {
+async fn exact(context: &Context, kind: ObjectKind, id: &str) -> Result<(ReadToken, ReadObject)> {
     let read = GetDocument {
         id: id.to_owned(),
         prefix: None,
@@ -95,10 +85,7 @@ async fn exact(
     }
     Ok((page.token, object))
 }
-async fn validation(
-    context: &Context,
-    args: GetValidationArgs,
-) -> Result<()> {
+async fn validation(context: &Context, args: GetValidationArgs) -> Result<()> {
     let id = ValidationId(parse_id(&args.id)?);
     let (consistency, after) = match args.cursor {
         None => (ReadConsistency::Linearizable, None),
@@ -135,7 +122,10 @@ async fn validation(
     }
     let request = context.envelope(Operation::Read(read))?;
     if args.context {
-        let view = context.client.validation_context(request).await
+        let view = context
+            .client
+            .validation_context(request)
+            .await
             .map_err(super::validation_context_error)?;
         return output::validation_context(&view, args.output.format);
     }
@@ -150,10 +140,7 @@ async fn validation(
     }
     output::object(page.token, &object, args.output.format)
 }
-pub(super) async fn get(
-    context: &Context,
-    command: GetCommand,
-) -> Result<()> {
+pub(super) async fn get(context: &Context, command: GetCommand) -> Result<()> {
     let (token, object, format) = match command {
         GetCommand::Claim(args) => {
             if let Some(flag) = args.filters.native_only() {
@@ -182,7 +169,10 @@ pub(super) async fn get(
                 }
                 None => selection,
             };
-            let page = context.client.claim_get(context.envelope(operation)?).await
+            let page = context
+                .client
+                .claim_get(context.envelope(operation)?)
+                .await
                 .map_err(|error| match error {
                     focal_client::claim_get::ClaimGetError::Client(error) => {
                         CliError::Client(error)
@@ -229,11 +219,7 @@ pub(super) async fn get(
 
 /// Stream one authenticated fixed-prefix page at a time. A sink failure never
 /// advances past the page that could not be completely flushed.
-async fn list_all(
-    context: &Context,
-    mut request: Operation,
-    format: OutputFormat,
-) -> Result<()> {
+async fn list_all(context: &Context, mut request: Operation, format: OutputFormat) -> Result<()> {
     use hyper_rt::combine::{Either, race2};
     use std::io::{self, Write};
     let mut pages = 0u64;
@@ -246,9 +232,9 @@ async fn list_all(
             "list output interrupted",
         ))
     };
-    let result=async {
+    let result = async {
         loop {
-            let envelope=context.envelope(request.clone())?;
+            let envelope = context.envelope(request.clone())?;
             let response = match race2(context.client.request(envelope), interrupt.wait()).await {
                 Either::First(reply) => reply?,
                 Either::Second(signal) => {
@@ -256,15 +242,21 @@ async fn list_all(
                     return Err(interrupted());
                 }
             };
-            let Response::Listed(page)=response.result else {return Err(CliError::InvalidResponse);};
-            if prefix.is_some_and(|token|token!=page.token)
-                || page.next.as_ref().is_some_and(|next|Some(next)==selection_request(&request).and_then(|query|query.cursor.as_ref()))
-                || (page.next.is_some() && page.visited==0) {
+            let Response::Listed(page) = response.result else {
+                return Err(CliError::InvalidResponse);
+            };
+            if prefix.is_some_and(|token| token != page.token)
+                || page.next.as_ref().is_some_and(|next| {
+                    Some(next)
+                        == selection_request(&request).and_then(|query| query.cursor.as_ref())
+                })
+                || (page.next.is_some() && page.visited == 0)
+            {
                 return Err(CliError::InvalidResponse);
             }
-            prefix=Some(page.token);
-            let mut bytes=ListOutput(Vec::new());
-            output::page_stream_to(&page,&mut bytes,format)?;
+            prefix = Some(page.token);
+            let mut bytes = ListOutput(Vec::new());
+            output::page_stream_to(&page, &mut bytes, format)?;
             let written = async {
                 stdout.write_all(&bytes.0).await?;
                 stdout.flush().await
@@ -276,14 +268,17 @@ async fn list_all(
                     return Err(interrupted());
                 }
             }
-            pages=pages.checked_add(1).ok_or(InputError::Capacity)?;
+            pages = pages.checked_add(1).ok_or(InputError::Capacity)?;
             // Drop both the page and its encoded buffer before admitting another
             // network response. Empty matching pages still carry continuation.
-            let query=selection_request_mut(&mut request).ok_or(CliError::InvalidResponse)?;
-            query.cursor=page.next;
-            if query.cursor.is_none() {return Ok(());}
+            let query = selection_request_mut(&mut request).ok_or(CliError::InvalidResponse)?;
+            query.cursor = page.next;
+            if query.cursor.is_none() {
+                return Ok(());
+            }
         }
-    }.await;
+    }
+    .await;
     if result.is_err() {
         let mut error = io::stderr().lock();
         let _ = writeln!(

@@ -5,21 +5,22 @@
 //! 51(5), 2002): heartbeats every `η`, trusted while one is fresh, freshness at the expected arrival
 //! plus a margin `α`. A crash is detected within `E(D) + α + η` (their Theorem 4). Its mistakes are
 //! bounded from the measured arrivals alone, through the one-sided (Cantelli) inequality
-//! `Pr(X − E ≥ x) ≤ V / (V + x²)`, which holds for any distribution with that mean and variance, in
-//! one of two forms:
-//! - **per arrival**, the node-pair stream's ([`configure_arrivals`], [`arrival_detector_at`],
-//!   [`lateness_bound`]): a freshness point errs only when the heartbeat taken after it comes past
-//!   it, so the detector errs at most once a heartbeat taken, with chance at most
-//!   `β(α) = u + (1 − u)·V/(V + (α − μ)²)` for `α > μ`, over the lateness `ℓ` of each heartbeat
-//!   taken past its expected arrival (mean `μ`, variance `V`) and the chance `u` that one is past
-//!   every lateness seen ([`Arrivals`], `docs/timing.md` §2.2). One factor, whatever the heartbeats
-//!   the margin holds: it assumes no independence between them, so any margin is admitted, and a
-//!   heartbeat the sender skipped or the network lost is the next one's lateness;
-//! - **Theorem 7's product**, a SWIM member's probe detector's (`hyper-swim`, §2.7; [`detector_at`],
-//!   [`mistake_bound`]): `β = Π_{j=0}^{k₀} (V + p_L·x_j²) / (V + x_j²)`, `x_j = α − jη`, over the
-//!   heartbeats still fresh, `k₀ = ⌈α/η⌉ − 1`, with the loss `p_L` and the delay's variance. The
-//!   product takes the heartbeats in the margin as independent, which the traces refute below the
-//!   correlation time `T_c` ([`Floors`]); below it the margin holds one heartbeat.
+//! `Pr(X − E ≥ x) ≤ V / (V + x²)`, which holds for any distribution with that mean and variance,
+//! **per arrival** ([`configure_arrivals`], [`arrival_detector_at`], [`lateness_bound`]): a
+//! freshness point errs only when the heartbeat taken after it comes past it, so the detector errs
+//! at most once a heartbeat taken, with chance at most `β(α) = u + (1 − u)·V/(V + (α − μ)²)` for
+//! `α > μ`, over the lateness `ℓ` of each heartbeat taken past its expected arrival (mean `μ`,
+//! variance `V`) and the chance `u` that one is past every lateness seen ([`Arrivals`],
+//! `docs/timing.md` §2.2). One factor, whatever the heartbeats the margin holds: it assumes no
+//! independence between them, so any margin is admitted, and a heartbeat the sender skipped or the
+//! network lost is the next one's lateness. The node-pair stream's detector is configured so, and
+//! a SWIM member's probe detector too (`hyper-swim`, §2.7): a pair's probes never overlap, so each
+//! is judged alone, with the round trip's lateness from its mean and the loss in place of `u`.
+//!
+//! Theorem 7's product, `β = Π_{j=0}^{k₀} (V + p_L·x_j²) / (V + x_j²)`, `x_j = α − jη`, over the
+//! heartbeats still fresh, `k₀ = ⌈α/η⌉ − 1` ([`mistake_bound`]), takes the heartbeats in the
+//! margin as independent, which the traces refute below the correlation time `T_c`; it configures
+//! nothing, and the trace analyser reports it beside the per-arrival bound.
 //!
 //! Chen et al. configure `η` and `α` from requirements an application states. Here they minimize
 //! what those requirements stand for, a group's expected unavailability
@@ -177,8 +178,8 @@ fn golden(mut low: f64, mut high: f64, resolution: f64, f: &impl Fn(f64) -> f64)
 /// point is late or lost, `Π_{j≥0, x_j>0} (V + p_L x_j²)/(V + x_j²)` with `x_j = α − jη`, for margin
 /// `alpha`, interval `eta`, variance `variance` and loss `loss`. The product is a ratio of squares, so
 /// any one unit serves for the times (seconds, nanoseconds) with its square for the variance. The
-/// probe configurator ([`detector_at`]) and the trace analyser (`crates/hyper-timing-trace`) both
-/// use this one, so the bound they report and the one the configurator minimizes cannot differ.
+/// trace analyser (`crates/hyper-timing-trace`) reports it; no configurator minimizes it, since the
+/// product's independence fails below the correlation time (`docs/timing.md` §2.2).
 pub fn mistake_bound(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
     beta(loss, variance, eta, alpha)
 }
@@ -198,118 +199,6 @@ fn beta(loss: f64, variance: f64, eta: f64, alpha: f64) -> f64 {
         x -= eta;
     }
     product
-}
-
-/// The expected share of time a group cannot commit with detector `(eta, alpha)`, seconds.
-fn unavailability(link: &LinkBehaviour, costs: &Costs, eta: f64, alpha: f64) -> f64 {
-    let variance = link.delay_deviation.as_secs_f64().powi(2);
-    let mtbf = costs.mtbf.as_secs_f64();
-    let election = costs.election.as_secs_f64();
-    let detected = link.mean_delay.as_secs_f64() + alpha + eta + election;
-    detected / mtbf + election * beta(link.loss, variance, eta, alpha) / eta
-}
-
-/// The measured floors under a detector's interval (`docs/timing.md` §2.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Floors {
-    /// The timer's granularity `G`: how late a timed wait ends. The search's resolution too, as
-    /// nothing finer can be kept.
-    pub granularity: Duration,
-    /// The sender's stability floor, `E[flush] + G`: a sender that flushes before each heartbeat
-    /// cannot keep a shorter interval (Lindley's condition).
-    pub sender: Duration,
-    /// The link's correlation time `T_c`: heartbeats closer than this are late together, so a margin
-    /// holding two or more of them may count on Theorem 7's product only at `η ≥ T_c`.
-    pub correlation: Duration,
-}
-
-/// The detector that minimizes a group's expected unavailability on `link` at a given `interval`,
-/// Theorem 7's: the margin alone is searched. Below the correlation time the margin holds one
-/// heartbeat (`α < η`), whose bound is a single Cantelli factor; at or past it, any margin, its
-/// heartbeats independent. `None` on a link that loses every heartbeat, at a zero interval, or where
-/// a granularity, MTBF or election time is not a positive finite time.
-pub fn detector_at(
-    link: &LinkBehaviour,
-    costs: &Costs,
-    floors: &Floors,
-    interval: Duration,
-) -> Option<Detector> {
-    let resolution = resolution(link, costs, floors)?;
-    let eta = interval.as_secs_f64();
-    if eta <= 0.0 {
-        return None;
-    }
-    let single = eta < floors.correlation.as_secs_f64();
-    let (alpha, value) = best_margin(link, costs, resolution, eta, single);
-    detector(link, eta, alpha, value)
-}
-
-/// The search's resolution, the granularity in seconds, or `None` when nothing can be configured: a
-/// link that loses every heartbeat, or a granularity, MTBF or election time that is not a positive
-/// finite time.
-fn resolution(link: &LinkBehaviour, costs: &Costs, floors: &Floors) -> Option<f64> {
-    let resolution = floors.granularity.as_secs_f64();
-    let mtbf = costs.mtbf.as_secs_f64();
-    let election = costs.election.as_secs_f64();
-    if !(0.0..1.0).contains(&link.loss) || resolution <= 0.0 || mtbf <= 0.0 || election <= 0.0 {
-        return None;
-    }
-    Some(resolution)
-}
-
-/// The detector `(eta, alpha)` on `link`, seconds, with its unavailability `value`.
-fn detector(link: &LinkBehaviour, eta: f64, alpha: f64, value: f64) -> Option<Detector> {
-    let variance = link.delay_deviation.as_secs_f64().powi(2);
-    let beta = beta(link.loss, variance, eta, alpha);
-    Some(Detector {
-        interval: Duration::try_from_secs_f64(eta).ok()?,
-        margin: Duration::try_from_secs_f64(alpha).ok()?,
-        detection: Duration::try_from_secs_f64(link.mean_delay.as_secs_f64() + alpha + eta).ok()?,
-        mistake_recurrence: if beta > 0.0 {
-            Duration::try_from_secs_f64(eta / beta).unwrap_or(Duration::MAX)
-        } else {
-            Duration::MAX
-        },
-        unavailability: value,
-    })
-}
-
-/// The best margin for interval `eta` and its `U`, to within `resolution`. With `single`, the
-/// margin stays below the interval.
-///
-/// `U ≥ α / MTBF`, so a margin past `MTBF · U*` for any `U*` reached costs more than the margin
-/// that reached it. The bracket is therefore closed from above by probing `α = η, 2η, 4η, …` while
-/// `α / MTBF` is below the least `U` seen: each probe can only lower that least `U`, so the bracket
-/// keeps every margin that could do better. On a lossy link, where `U(η, η)` is large (one
-/// heartbeat in the margin bounds a mistake by little more than the loss), it is far tighter than
-/// `MTBF · U(η, η)`, whose margins hold thousands of heartbeats for `β`'s product to multiply. The
-/// probes end once a doubling would pass `MTBF · U*`, at most the doublings an `f64` holds.
-fn best_margin(
-    link: &LinkBehaviour,
-    costs: &Costs,
-    resolution: f64,
-    eta: f64,
-    single: bool,
-) -> (f64, f64) {
-    let high = if single {
-        (eta - resolution).max(0.0)
-    } else {
-        let mtbf = costs.mtbf.as_secs_f64();
-        let mut least = unavailability(link, costs, eta, eta);
-        let mut alpha = eta;
-        loop {
-            let next = alpha * 2.0;
-            if !next.is_finite() || next >= mtbf * least {
-                break;
-            }
-            least = least.min(unavailability(link, costs, eta, next));
-            alpha = next;
-        }
-        (mtbf * least).max(eta)
-    };
-    minimize(0.0, high, resolution, |alpha| {
-        unavailability(link, costs, eta, alpha)
-    })
 }
 
 /// A nanosecond in seconds: the resolution of every stamp the estimates are taken from, the
@@ -699,49 +588,6 @@ mod tests {
         assert!(spacing_below(3, 2, x).equals(one.add(power(rest, 3).times(Ratio(-1, 1)))));
     }
 
-    /// The margin's bracket closed by probing finds the margin the whole bracket `[0, MTBF·U(η,η)]`
-    /// finds, to within the search's resolution, on links from lossless to lossy.
-    #[test]
-    fn the_probed_bracket_keeps_the_best_margin() {
-        let mut state = 0x2545_F491_4F6C_DD1Du64;
-        let mut draw = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        };
-        for _ in 0..24 {
-            let link = LinkBehaviour {
-                loss: draw() * 0.6,
-                mean_delay: Duration::ZERO,
-                delay_deviation: Duration::from_secs_f64(1e-5 + draw() * 2e-2),
-            };
-            let costs = Costs {
-                election: Duration::from_secs_f64(1e-4 + draw() * 1e-2),
-                mtbf: Duration::from_secs_f64(10.0 + draw() * 3e6),
-            };
-            let resolution = 1e-5 + draw() * 1e-3;
-            let eta = resolution * (1.0 + draw() * 500.0);
-            let (alpha, value) = best_margin(&link, &costs, resolution, eta, false);
-            let whole =
-                (costs.mtbf.as_secs_f64() * unavailability(&link, &costs, eta, eta)).max(eta);
-            let (_, before) = minimize(0.0, whole, resolution, |a| {
-                unavailability(&link, &costs, eta, a)
-            });
-            // Within the resolution: the better of the two is no more than a step of `G` better.
-            let step = unavailability(&link, &costs, eta, alpha + resolution).min(unavailability(
-                &link,
-                &costs,
-                eta,
-                (alpha - resolution).max(0.0),
-            ));
-            assert!(
-                value <= before.max(step) * (1.0 + 1e-9),
-                "{link:?} {costs:?} η {eta}: {value} against {before}"
-            );
-        }
-    }
-
     #[test]
     fn no_election_without_a_majority() {
         assert_eq!(election_span(5, 2, ms(1.0), ms(2.0), ms(0.05)), None);
@@ -896,9 +742,9 @@ mod tests {
 
     /// A margin is not capped by the interval: on a link whose deviation is several intervals and
     /// whose receiver's granularity is past the interval (an E2E pair of `docs/timing.md` §2.9 that
-    /// the single-heartbeat cap configured with `α = 0`: `η` 1.64 ms, `G` 5.2 ms, deviation 8 ms
-    /// past the mean), the margin covers the deviation and the unavailability is far below one,
-    /// where the cap left no margin at all.
+    /// the single-heartbeat cap configured with `α = 0` and an unavailability past one: `η` 1.64 ms,
+    /// `G` 5.2 ms, deviation 8 ms past the mean), the margin covers the deviation and the
+    /// unavailability is far below one.
     #[test]
     fn a_margin_covers_a_deviation_of_several_intervals() {
         let costs = Costs {
@@ -907,23 +753,6 @@ mod tests {
         };
         let granularity = ms(5.195);
         let interval = ms(1.640);
-        let capped = detector_at(
-            &LinkBehaviour {
-                loss: 0.5431,
-                mean_delay: Duration::ZERO,
-                delay_deviation: ms(8.0),
-            },
-            &costs,
-            &Floors {
-                granularity,
-                sender: granularity,
-                correlation: Duration::MAX,
-            },
-            interval,
-        )
-        .unwrap();
-        assert_eq!(capped.margin, Duration::ZERO);
-        assert!(capped.unavailability > 1.0, "{capped:?}");
         let arrivals = Arrivals {
             unseen: 0.01,
             lateness: ms(1.6),
@@ -977,23 +806,24 @@ mod tests {
             election: ms(10.0),
             mtbf: Duration::from_secs(3600),
         };
-        let dead = LinkBehaviour {
-            loss: 1.0,
+        let dead = Arrivals {
+            unseen: 1.0,
+            lateness: Duration::ZERO,
+            deviation: ms(1.0),
             mean_delay: ms(1.0),
-            delay_deviation: ms(1.0),
         };
-        let floors = Floors {
-            granularity: ms(1.0),
-            sender: ms(1.0),
-            correlation: ms(1.0),
+        assert_eq!(arrival_detector_at(&dead, &costs, ms(1.0), ms(1.0)), None);
+        let link = Arrivals {
+            unseen: 0.0,
+            ..dead
         };
-        assert_eq!(detector_at(&dead, &costs, &floors, ms(1.0)), None);
-        let link = LinkBehaviour { loss: 0.0, ..dead };
-        let zero = Floors {
-            granularity: Duration::ZERO,
-            ..floors
-        };
-        assert_eq!(detector_at(&link, &costs, &zero, ms(1.0)), None);
-        assert_eq!(detector_at(&link, &costs, &floors, Duration::ZERO), None);
+        assert_eq!(
+            arrival_detector_at(&link, &costs, Duration::ZERO, ms(1.0)),
+            None
+        );
+        assert_eq!(
+            arrival_detector_at(&link, &costs, ms(1.0), Duration::ZERO),
+            None
+        );
     }
 }

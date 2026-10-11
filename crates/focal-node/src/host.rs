@@ -4,7 +4,9 @@ use crate::embedded::{EmbeddedNode, NodeError};
 use focal_ledger::{LedgerError, Submission};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
+use focal_rt::watch;
 use focal_wire::*;
+use hyper_rt::sync::OneshotSender;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -13,8 +15,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use focal_rt::watch;
-use hyper_rt::sync::OneshotSender;
 
 enum Work {
     Request(
@@ -142,7 +142,8 @@ impl LocalHost {
         waiting
             .try_reserve_exact(INGRESS)
             .map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
-        let (liveness, ended) = watch::channel(()).map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
+        let (liveness, ended) =
+            watch::channel(()).map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
         let mut views = crate::reads::ReadViews::new();
         let mut streams =
             crate::streams::Streams::new().map_err(|error| NodeError::Domain(error.to_string()))?;
@@ -249,7 +250,8 @@ impl LocalHost {
     /// Returns Capacity without enqueueing when ingress is full; callers can
     /// retry after draining ingress. No blocking task or extra thread is needed.
     pub async fn stop(&self) -> Result<(), NodeError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {
@@ -266,10 +268,11 @@ impl LocalHost {
     }
 }
 impl HostOwner {
-    /// Joins without blocking the async executor. Unlike Tokio's blocking-pool
-    /// spawn, OS thread exhaustion is returned by Builder as an I/O error.
+    /// Joins without blocking the shard: the join waits on a thread of its
+    /// own, and OS thread exhaustion is returned by Builder as an I/O error.
     pub async fn join_async(self) -> Result<(), NodeError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
         let _bridge = std::thread::Builder::new()
             .name("focal-owner-join".into())
             .spawn(move || {
@@ -973,51 +976,54 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
 
-    #[tokio::test]
-    async fn local_replies_retain_only_their_owned_bytes_through_owner_shutdown() {
-        let root = tempfile::tempdir().unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.node.data_dir = Some(root.path().to_owned());
-        let node = EmbeddedNode::open(&settings).unwrap();
-        let identity = node.identity.clone();
-        let limits = WireLimits::default();
-        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-        let peer = AuthenticatedPeer::local(PeerGrant {
-            principal: identity.issuer,
-            tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
-            role: PeerRole::Actor,
+    #[test]
+    fn local_replies_retain_only_their_owned_bytes_through_owner_shutdown() {
+        focal_rt::block_on(async move {
+            let root = tempfile::tempdir().unwrap();
+            let mut settings = crate::config::Settings::default();
+            settings.node.data_dir = Some(root.path().to_owned());
+            let node = EmbeddedNode::open(&settings).unwrap();
+            let identity = node.identity.clone();
+            let limits = WireLimits::default();
+            let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+            let peer = AuthenticatedPeer::local(PeerGrant {
+                principal: identity.issuer,
+                tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
+                role: PeerRole::Actor,
+            })
+            .unwrap();
+            let request = RequestEnvelope {
+                protocol: PROTOCOL_VERSION,
+                ledger: identity.ledger,
+                route_epoch: RouteEpoch(1),
+                request_epoch: RequestEpoch(1),
+                request_id: RequestId::from_u128(1),
+                operation: Operation::Read(ReadRequest {
+                    consistency: ReadConsistency::Linearizable,
+                    query: ReadQuery::Objects(Vec::new()),
+                    max_items: 1,
+                }),
+            };
+            let first =
+                focal_wire::dispatch_accounted(&host, peer.clone(), request.clone(), &limits).await;
+            assert!(matches!(first.envelope().result, Response::Read(_)));
+            let held = host.budget.stats().ordinary_used;
+            assert!(
+                held > 0 && held < 1024 * 1024,
+                "small reply retained full page allowance: {held}"
+            );
+            let second = focal_wire::dispatch_accounted(&host, peer, request, &limits).await;
+            assert!(matches!(second.envelope().result, Response::Read(_)));
+            assert_eq!(host.budget.stats().ordinary_used, held * 2);
+            drop(first);
+            assert_eq!(host.budget.stats().ordinary_used, held);
+            host.stop().await.unwrap();
+            owner.join().unwrap();
+            assert_eq!(host.budget.stats().ordinary_used, held);
+            drop(second);
+            assert_eq!(host.budget.stats().used, 0);
         })
-        .unwrap();
-        let request = RequestEnvelope {
-            protocol: PROTOCOL_VERSION,
-            ledger: identity.ledger,
-            route_epoch: RouteEpoch(1),
-            request_epoch: RequestEpoch(1),
-            request_id: RequestId::from_u128(1),
-            operation: Operation::Read(ReadRequest {
-                consistency: ReadConsistency::Linearizable,
-                query: ReadQuery::Objects(Vec::new()),
-                max_items: 1,
-            }),
-        };
-        let first =
-            focal_wire::dispatch_accounted(&host, peer.clone(), request.clone(), &limits).await;
-        assert!(matches!(first.envelope().result, Response::Read(_)));
-        let held = host.budget.stats().ordinary_used;
-        assert!(
-            held > 0 && held < 1024 * 1024,
-            "small reply retained full page allowance: {held}"
-        );
-        let second = focal_wire::dispatch_accounted(&host, peer, request, &limits).await;
-        assert!(matches!(second.envelope().result, Response::Read(_)));
-        assert_eq!(host.budget.stats().ordinary_used, held * 2);
-        drop(first);
-        assert_eq!(host.budget.stats().ordinary_used, held);
-        host.stop().await.unwrap();
-        owner.join().unwrap();
-        assert_eq!(host.budget.stats().ordinary_used, held);
-        drop(second);
-        assert_eq!(host.budget.stats().used, 0);
+        .unwrap()
     }
 
     #[test]

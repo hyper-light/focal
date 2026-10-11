@@ -2,7 +2,7 @@ use std::{
     cmp::{self, Reverse},
     collections::{BinaryHeap, HashMap, hash_map},
     convert::TryFrom,
-    fmt, mem,
+    fmt,
     net::{IpAddr, SocketAddr},
 };
 
@@ -54,10 +54,9 @@ pub struct Endpoint {
     connections: Slab<ConnectionMeta>,
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
     config: EndpointConfig,
-    /// The server and client configurations this endpoint and its connections share
+    /// The server and client configurations this endpoint and its connections share, the one new
+    /// incoming connections are accepted under among them
     configs: Configs,
-    /// The configuration new incoming connections are accepted under
-    server_config: Option<ServerConfigHandle>,
     /// Whether the underlying UDP socket promises not to fragment packets
     allow_mtud: bool,
     /// Time at which a stateless reset was most recently sent
@@ -108,7 +107,9 @@ impl Endpoint {
         };
         let mut configs = Configs::new(config.config_slots);
         // The slab is empty and has at least one slot, so the insertion cannot be refused
-        let server_config = server_config.and_then(|c| configs.insert_server(c).ok());
+        configs
+            .set_current_server(server_config)
+            .unwrap_or_default();
         let congestion_memory =
             CongestionMemory::new(config.careful_resume.map_or(0, |c| c.remembered));
         let loss_memory = LossMemory::new(config.loss_memory.0);
@@ -119,7 +120,6 @@ impl Endpoint {
             local_cid_generator: config.cid_generator.clone_box(),
             config,
             configs,
-            server_config,
             allow_mtud,
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
@@ -150,21 +150,15 @@ impl Endpoint {
     /// Replace the server configuration, affecting new incoming connections only
     ///
     /// Pending incoming connections retain the configuration active when they first arrived. The
-    /// replaced configuration is dropped once the last connection started under it drains. Refused
-    /// with [`ConfigsFull`] when every slot holds a configuration still in use; the current
-    /// configuration is then kept.
+    /// replaced configuration is dropped once the last handshake begun under it ends: a connection
+    /// it accepted outlives it, and the tokens such a connection issues from then on are sealed
+    /// under the replacement, which validates them. Refused with [`ConfigsFull`] when every slot
+    /// holds a configuration still in use; the current configuration is then kept.
     pub fn set_server_config(
         &mut self,
         server_config: Option<ServerConfig>,
     ) -> Result<(), ConfigsFull> {
-        let new = match server_config {
-            Some(config) => Some(self.configs.insert_server(config)?),
-            None => None,
-        };
-        if let Some(old) = mem::replace(&mut self.server_config, new) {
-            self.configs.supersede(old.0);
-        }
-        Ok(())
+        self.configs.set_current_server(server_config)
     }
 
     /// Add a client configuration for [`connect`](Self::connect) to use
@@ -199,9 +193,9 @@ impl Endpoint {
     /// Stop offering a server configuration inserted with
     /// [`insert_server_config`](Self::insert_server_config)
     ///
-    /// The configuration is dropped once the last connection accepted with it drains.
+    /// The configuration is dropped once the last handshake begun under it ends.
     pub fn retire_server_config(&mut self, handle: ServerConfigHandle) {
-        if self.server_config != Some(handle) {
+        if self.configs.current_server() != Some(handle) {
             self.configs.supersede(handle.0);
         }
     }
@@ -209,7 +203,8 @@ impl Endpoint {
     /// The current server configuration, mutably: a test changes it in place, keeping its keys
     #[cfg(test)]
     pub(crate) fn server_config_mut(&mut self) -> Option<&mut ServerConfig> {
-        self.configs.server_config_mut(self.server_config?)
+        let current = self.configs.current_server()?;
+        self.configs.server_config_mut(current)
     }
 
     /// The configurations this endpoint and its connections share
@@ -265,19 +260,37 @@ impl Endpoint {
             }
             Resume(leaves) => self.remember(ch, leaves),
             Losses(now, fit) => self.learn_losses(ch, now, &fit),
-            Drained => {
-                if let Some(conn) = self.connections.try_remove(ch.0) {
-                    self.index.remove(&conn);
-                    self.configs.release(conn.config);
-                } else {
-                    // This indicates a bug in downstream code, which could cause spurious
-                    // connection loss instead of this error if the CID was (re)allocated prior to
-                    // the illegal call.
-                    error!(id = ch.0, "unknown connection drained");
-                }
-            }
+            ConfigReleased => self.release_config(ch),
+            Drained => self.drained(ch),
         }
         None
+    }
+
+    /// Stops counting connection `ch` on the configuration it was started from: a server's
+    /// handshake is complete, and nothing after it is lent that configuration
+    fn release_config(&mut self, ch: ConnectionHandle) {
+        if let Some(config) = self
+            .connections
+            .get_mut(ch.0)
+            .and_then(|conn| conn.config.take())
+        {
+            self.configs.release(config);
+        }
+    }
+
+    /// Forgets connection `ch`, which has drained, and releases its configuration if it still
+    /// held one
+    fn drained(&mut self, ch: ConnectionHandle) {
+        if let Some(conn) = self.connections.try_remove(ch.0) {
+            self.index.remove(&conn);
+            if let Some(config) = conn.config {
+                self.configs.release(config);
+            }
+        } else {
+            // This indicates a bug in downstream code, which could cause spurious connection loss
+            // instead of this error if the CID was (re)allocated prior to the illegal call.
+            error!(id = ch.0, "unknown connection drained");
+        }
     }
 
     /// Adds what connection `ch` counted of its path's loss bursts to the endpoint's memory of its
@@ -387,7 +400,7 @@ impl Endpoint {
         version: u32,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
-        if self.server_config.is_none() {
+        if self.configs.current_server().is_none() {
             debug!("dropping packet with unsupported version");
             return None;
         }
@@ -806,7 +819,7 @@ impl Endpoint {
         // Routed here only with an Initial header
         let header = event.first_decode.initial_header().ok_or(None)?;
 
-        let Some(server_handle) = self.server_config else {
+        let Some(server_handle) = self.configs.current_server() else {
             debug!("packet for unrecognized connection {}", dst_cid);
             return Err(self.stateless_reset(event.now, datagram_len, addresses, *dst_cid, buf));
         };
@@ -1484,7 +1497,7 @@ impl Endpoint {
             addresses,
             side,
             reset_token: None,
-            config: shared_config,
+            config: Some(shared_config),
         });
 
         self.index.insert_conn(addresses, loc_cid, ch, side);
@@ -1602,7 +1615,7 @@ impl fmt::Debug for Endpoint {
             .field("index", &self.index)
             .field("connections", &self.connections)
             .field("config", &self.config)
-            .field("server_config", &self.server_config)
+            .field("server_config", &self.configs.current_server())
             // incoming_buffers too large
             .field("incoming_buffers.len", &self.incoming_buffers.len())
             .field(
@@ -1850,8 +1863,9 @@ pub(crate) struct ConnectionMeta {
     /// Reset token provided by the peer for the CID we're currently sending to, and the address
     /// being sent to
     reset_token: Option<(SocketAddr, ResetToken)>,
-    /// The configuration slot the connection counts on, released when it drains
-    config: ConfigKey,
+    /// The configuration slot the connection counts on: a server's until its handshake completes
+    /// ([`EndpointEventInner::ConfigReleased`]), a client's until it drains
+    config: Option<ConfigKey>,
 }
 
 /// Internal identifier for a `Connection` currently associated with an endpoint

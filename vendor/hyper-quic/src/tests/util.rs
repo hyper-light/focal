@@ -446,16 +446,18 @@ impl TestEndpoint {
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            // Each connection takes its own timer and its own events. Upstream's loop handed every
+            // queued event to the first connection it visited and kept one timer for all, the last
+            // visited connection's: with two connections, which one heard the other's datagrams
+            // followed the map's order, and a timer of the others was lost.
+            let mut timeout: Option<Instant> = None;
             for (ch, conn) in self.connections.iter_mut() {
-                if self.timeout.is_some_and(|x| x <= now) {
-                    self.timeout = None;
+                if conn.poll_timeout().is_some_and(|x| x <= now) {
                     conn.handle_timeout(now);
                 }
 
-                for (_, mut events) in self.conn_events.drain() {
-                    for event in events.drain(..) {
-                        conn.handle_event(event, self.endpoint.configs_mut());
-                    }
+                for event in self.conn_events.remove(ch).unwrap_or_default() {
+                    conn.handle_event(event, self.endpoint.configs_mut());
                 }
 
                 while let Some(event) = conn.poll_endpoint_events() {
@@ -468,8 +470,9 @@ impl TestEndpoint {
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
                 }
-                self.timeout = conn.poll_timeout();
+                timeout = min_opt(timeout, conn.poll_timeout());
             }
+            self.timeout = timeout;
 
             if endpoint_events.is_empty() {
                 break;

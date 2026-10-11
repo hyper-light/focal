@@ -12,7 +12,6 @@ use focal_model::{
 use std::{
     collections::BTreeMap,
     io::Cursor,
-    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,28 +19,26 @@ fn budget() -> MemoryBudget {
     MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap()
 }
 fn tls(invitation: &Invitation, authority: &BootstrapAuthority) -> rustls::ClientConnection {
-    // Rustls requires shared configuration. No application-owned shared state.
+    let mut client_config = invitation.client_config().unwrap();
     let mut client = rustls::ClientConnection::new(
-        Arc::new(invitation.client_config().unwrap()),
+        &mut client_config,
         rustls::pki_types::ServerName::try_from("localhost").unwrap(),
     )
     .unwrap();
-    let mut server = rustls::ServerConnection::new(Arc::new(
-        authority.server_identity().server_config().unwrap(),
-    ))
-    .unwrap();
+    let mut server_config = authority.server_identity().server_config().unwrap();
+    let mut server = rustls::ServerConnection::new(&server_config).unwrap();
     for _ in 0..32 {
         if client.wants_write() {
             let mut bytes = Vec::new();
             client.write_tls(&mut bytes).unwrap();
             server.read_tls(&mut Cursor::new(bytes)).unwrap();
-            server.process_new_packets().unwrap();
+            server.process_new_packets(&mut server_config).unwrap();
         }
         if server.wants_write() {
             let mut bytes = Vec::new();
             server.write_tls(&mut bytes).unwrap();
             client.read_tls(&mut Cursor::new(bytes)).unwrap();
-            client.process_new_packets().unwrap();
+            client.process_new_packets(&mut client_config).unwrap();
         }
         if !client.is_handshaking() && !server.is_handshaking() {
             return client;

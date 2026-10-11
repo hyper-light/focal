@@ -12,7 +12,7 @@ const GROUP: [u8; 16] = [212; 16];
 
 struct Fixture {
     owner: Owner<NoDirectoryAuthority>,
-    outgoing: async_mpsc::Receiver<ControlReplicationFrame>,
+    outgoing: hyper_rt::sync::ChannelReceiver<ControlReplicationFrame>,
     follower: ControlReplica,
     budget: MemoryBudget,
     /// The follower's own budget: a test fills it to refuse a delivery.
@@ -86,7 +86,7 @@ impl Fixture {
         )
         .unwrap();
         follower.drain(&NoDirectoryAuthority).unwrap();
-        let (outbound, outgoing) = async_mpsc::channel(32);
+        let (outbound, outgoing) = hyper_rt::sync::channel(32).unwrap();
         let status = replica.status();
         let (progress, _watch) = watch::channel(ControlProgressState {
             value: ControlProgress {
@@ -110,7 +110,8 @@ impl Fixture {
                 failure: None,
             },
             _allocation: None,
-        });
+        })
+        .unwrap();
         let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
         let owner = Owner {
             stopping: None,
@@ -179,7 +180,7 @@ impl Fixture {
         for _ in 0..32 {
             self.owner.replica.tick().unwrap();
             self.owner.drain().unwrap();
-            while let Ok(frame) = self.outgoing.try_recv() {
+            while let Ok(Some(frame)) = self.outgoing.try_recv() {
                 let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
                     &frame.request.operation
                 else {
@@ -200,7 +201,7 @@ impl Fixture {
         self.deliver(frame);
         for _ in 0..8 {
             self.owner.drain().unwrap();
-            while let Ok(frame) = self.outgoing.try_recv() {
+            while let Ok(Some(frame)) = self.outgoing.try_recv() {
                 self.deliver(frame);
             }
         }
@@ -241,7 +242,7 @@ fn control_snapshot_local_queue_and_frame_limit_rejection_release_flow_control()
         fixture.owner.drain().unwrap();
         let old_limit = fixture.owner.limits.max_frame_bytes;
         if queue {
-            let (closed, receive) = async_mpsc::channel(1);
+            let (closed, receive) = hyper_rt::sync::channel(1).unwrap();
             drop(receive);
             fixture.owner.outbound = closed;
         } else {
@@ -267,7 +268,7 @@ fn control_snapshot_local_queue_and_frame_limit_rejection_release_flow_control()
             fixture.owner.drain().unwrap();
         }
         assert!(fixture.owner.dropped > dropped);
-        let (outbound, outgoing) = async_mpsc::channel(32);
+        let (outbound, outgoing) = hyper_rt::sync::channel(32).unwrap();
         fixture.owner.outbound = outbound;
         fixture.outgoing = outgoing;
         fixture.owner.limits.max_frame_bytes = old_limit;
@@ -300,7 +301,7 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
     for _ in 0..4 {
         fixture.owner.replica.tick().unwrap();
         fixture.owner.drain().unwrap();
-        while let Ok(frame) = fixture.outgoing.try_recv() {
+        while let Ok(Some(frame)) = fixture.outgoing.try_recv() {
             let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
                 &frame.request.operation
             else {

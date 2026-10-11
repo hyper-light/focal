@@ -13,9 +13,9 @@ use focal_memory::{
     Allocation, BudgetKind, BudgetLane, BudgetStats, DiskStats, MemoryBudget, MemoryError,
 };
 use focal_wire::PeerPoolStats;
-use std::fmt::Write as _;
 use futures_util::FutureExt;
 use hyper_rt::combine::{Either, race2};
+use std::fmt::Write as _;
 
 /// How often the service samples a fresh snapshot.
 pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1092,6 +1092,11 @@ impl MetricsSnapshot {
             "Peer connections opened.",
             self.peers.connections_opened,
         );
+        text.counter(
+            "focal_peer_closes_refused_total",
+            "Unwanted peer connections whose close the endpoint could not queue, its shard's tasks all taken; each idles out at its idle timeout instead.",
+            self.peers.closes_refused,
+        );
         text.gauge(
             "focal_peer_connections_cached",
             "Peer connections held open.",
@@ -1762,8 +1767,7 @@ pub async fn serve_loopback(
     let at_once = max_scrapes();
     // The listener closes a connection past the budget at once: the one
     // beyond the operators the admin socket admits.
-    let budget =
-        hyper_rt::tcp::ConnectionBudget::new(u64::try_from(at_once).unwrap_or(u64::MAX))?;
+    let budget = hyper_rt::tcp::ConnectionBudget::new(u64::try_from(at_once).unwrap_or(u64::MAX))?;
     let listener = listener.with_budget(budget);
     let mut serving = focal_rt::Concurrent::new(at_once)?;
     loop {
@@ -1871,6 +1875,7 @@ mod tests {
                 cached_connections: 1,
                 inflight: 0,
                 bulk_inflight: 0,
+                closes_refused: 0,
             },
             listener: focal_wire::AdmissionStats::default(),
             peer_rtts: vec![PeerRtt {
@@ -2013,67 +2018,90 @@ mod tests {
     /// A round takes every answer that comes and closes at its deadline:
     /// the late and the failed stay unobserved, in their places. On the
     /// paused clock the answers and the deadline fall in their order.
-    #[tokio::test(start_paused = true)]
-    async fn a_round_closes_at_its_deadline_with_the_late_unobserved() {
-        let deadline = focal_rt::time::Instant::now() + std::time::Duration::from_millis(100);
-        let asks: Vec<std::pin::Pin<Box<dyn Future<Output = Option<u8>> + Send>>> = vec![
-            Box::pin(async { Some(1) }),
-            Box::pin(async {
-                focal_rt::time::pause(std::time::Duration::from_secs(10)).await;
-                Some(2)
-            }),
-            Box::pin(async { None }),
-            Box::pin(async {
-                focal_rt::time::pause(std::time::Duration::from_millis(10)).await;
-                Some(4)
-            }),
-        ];
-        let answers = collect(asks, deadline).await;
-        assert_eq!(answers, vec![Some(1), None, None, Some(4)]);
-        assert_eq!(focal_rt::time::Instant::now(), deadline);
+    #[test]
+    fn a_round_closes_at_its_deadline_with_the_late_unobserved() {
+        focal_rt::simulate(0, async move {
+            let deadline = focal_rt::time::Instant::now()
+                .saturating_add(std::time::Duration::from_millis(100));
+            let asks: Vec<std::pin::Pin<Box<dyn Future<Output = Option<u8>> + Send>>> = vec![
+                Box::pin(async { Some(1) }),
+                Box::pin(async {
+                    focal_rt::time::sleep(std::time::Duration::from_secs(10))
+                        .await
+                        .unwrap();
+                    Some(2)
+                }),
+                Box::pin(async { None }),
+                Box::pin(async {
+                    focal_rt::time::sleep(std::time::Duration::from_millis(10))
+                        .await
+                        .unwrap();
+                    Some(4)
+                }),
+            ];
+            let answers = collect(asks, deadline).await;
+            assert_eq!(answers, vec![Some(1), None, None, Some(4)]);
+            assert_eq!(focal_rt::time::Instant::now(), deadline);
+        })
+        .unwrap()
+        .expect("the test ended")
     }
     /// The loopback serves the page's text as it was rendered, judges the
     /// request before it writes, and a scrape that never speaks costs no
     /// other scrape its answer.
-    #[tokio::test]
-    async fn a_silent_scrape_delays_no_other_and_the_text_is_the_page_s() {
-        use tokio::net::{TcpListener, TcpStream};
-        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
-        let page = MetricsPage::new(snapshot(budget.stats()), &budget).unwrap();
-        let rendered = page.text.clone();
-        let (_publish, view) = tokio::sync::watch::channel(Some(page));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve_loopback(listener, view));
-        let silent = TcpStream::connect(address).await.unwrap();
-        let exchange = |request: &'static str| async move {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            stream.write_all(request.as_bytes()).await.unwrap();
-            let mut reply = Vec::new();
-            stream.read_to_end(&mut reply).await.unwrap();
-            let reply = String::from_utf8(reply).unwrap();
-            let (head, body) = reply.split_once("\r\n\r\n").unwrap();
-            (head.to_owned(), body.to_owned())
-        };
-        let (head, body) = exchange("GET /metrics HTTP/1.0\r\n\r\n").await;
-        assert!(head.starts_with("HTTP/1.0 200 OK"), "{head}");
-        assert_eq!(body, rendered);
-        let (head, body) = exchange("GET /nothing HTTP/1.0\r\n\r\n").await;
-        assert!(head.starts_with("HTTP/1.0 404"), "{head}");
-        assert_eq!(body, "not found\n");
-        let (head, _) = exchange("POST /metrics HTTP/1.0\r\n\r\n").await;
-        assert!(head.starts_with("HTTP/1.0 405"), "{head}");
-        // Three answers while the silent scrape still holds its connection:
-        // served side by side, not behind its two-second bound, which
-        // would have released it first.
-        let silent = silent.into_std().unwrap();
-        assert_eq!(
-            silent.peek(&mut [0u8; 1]).map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::WouldBlock),
-            "the silent scrape was released before the others were answered"
-        );
-        drop(silent);
-        server.abort();
+    #[test]
+    fn a_silent_scrape_delays_no_other_and_the_text_is_the_page_s() {
+        focal_rt::block_on(async move {
+            use hyper_rt::tcp::{TcpListener, TcpStream};
+            let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+            let page = MetricsPage::new(snapshot(budget.stats()), &budget).unwrap();
+            let rendered = page.text.clone();
+            let (_publish, view) = focal_rt::watch::channel(Some(page)).unwrap();
+            let listener = TcpListener::bind(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                loopback_backlog(),
+            )
+            .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = focal_rt::spawn(serve_loopback(listener, view)).unwrap();
+            let silent = TcpStream::connect(address).await.unwrap();
+            let exchange = |request: &'static str| async move {
+                let stream = TcpStream::connect(address).await.unwrap();
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut reply = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    reply.extend_from_slice(&buffer[..read]);
+                }
+                let reply = String::from_utf8(reply).unwrap();
+                let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+                (head.to_owned(), body.to_owned())
+            };
+            let (head, body) = exchange("GET /metrics HTTP/1.0\r\n\r\n").await;
+            assert!(head.starts_with("HTTP/1.0 200 OK"), "{head}");
+            assert_eq!(body, rendered);
+            let (head, body) = exchange("GET /nothing HTTP/1.0\r\n\r\n").await;
+            assert!(head.starts_with("HTTP/1.0 404"), "{head}");
+            assert_eq!(body, "not found\n");
+            let (head, _) = exchange("POST /metrics HTTP/1.0\r\n\r\n").await;
+            assert!(head.starts_with("HTTP/1.0 405"), "{head}");
+            // Three answers while the silent scrape still holds its connection:
+            // served side by side, not behind its two-second bound, which
+            // would have released it first.
+            // Still open, nothing to read: not released.
+            assert_eq!(
+                silent.try_read(&mut [0u8; 1]).unwrap(),
+                None,
+                "the silent scrape was released before the others were answered"
+            );
+            drop(silent);
+            server.abort();
+        })
+        .unwrap()
     }
     /// The node's identity is one series, its labels escaped; every other
     /// series carries its own labels alone, the target's being the scraper's

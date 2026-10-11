@@ -1,6 +1,6 @@
 use super::*;
 
-fn read(fixture: &mut Fixture, id: u128) -> oneshot::Receiver<OwnedResponse> {
+fn read(fixture: &mut Fixture, id: u128) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let owner = &mut fixture.owners[0];
     let verified = verify_request(
         actor(),
@@ -22,7 +22,7 @@ fn read(fixture: &mut Fixture, id: u128) -> oneshot::Receiver<OwnedResponse> {
         .reserve(BudgetKind::Query, BudgetLane::Ordinary, 4 * 1024 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
@@ -36,12 +36,12 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
     let mut first = read(&mut fixture, 1);
     fixture.owners[0].drain().unwrap();
     assert!(
-        matches!(first.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        matches!(first.try_recv(), Ok(None)),
         "do not release a locally known epoch before this read's quorum"
     );
     let mut full = read(&mut fixture, 2);
     assert!(matches!(
-        full.try_recv().unwrap().envelope().result,
+        full.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Capacity)
     ));
     assert_eq!(fixture.owners[0].pending.len(), 1);
@@ -58,7 +58,7 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
         fixture.pump();
     }
     assert!(matches!(
-        route_changed.try_recv().unwrap().envelope().result,
+        route_changed.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     fixture.owners[0].config.route_epoch = RouteEpoch(1);
@@ -66,7 +66,7 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
     fixture.owners[0].pending.front_mut().unwrap().deadline = 0;
     fixture.owners[0].expire_pending();
     assert!(matches!(
-        deadline.try_recv().unwrap().envelope().result,
+        deadline.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     let mut term_changed = read(&mut fixture, 4);
@@ -83,7 +83,7 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
         }
         let mut frames = Vec::new();
         for (index, outgoing) in fixture.outgoing.iter_mut().enumerate().skip(1) {
-            while let Ok(frame) = outgoing.try_recv() {
+            while let Ok(Some(frame)) = outgoing.try_recv() {
                 frames.push((index as u64 + 1, frame));
             }
         }
@@ -124,7 +124,7 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
         fixture.pump();
     }
     assert!(matches!(
-        term_changed.try_recv().unwrap().envelope().result,
+        term_changed.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     assert_eq!(fixture.owners[0].session.sequence(), before);

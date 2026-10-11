@@ -36,7 +36,7 @@ pub(super) use args::{Commands, RequestArgs, RequestCommand};
 pub(super) fn check_request_file(path: &std::path::Path) -> Result<()> {
     request_files::check(path)
 }
-use focal_client::{Client, ClientError, RetryPolicy, LocalTransport, input::*, pending::*};
+use focal_client::{Client, ClientError, LocalTransport, RetryPolicy, input::*, pending::*};
 use focal_model::*;
 use focal_node::{config::Settings, embedded::decode_identity};
 use focal_wire::*;
@@ -220,7 +220,11 @@ impl Interrupt {
     }
     /// Waits for Ctrl-C; an error when no wait could be kept.
     pub(super) async fn wait(&self) -> std::io::Result<()> {
-        self.0.recv().await.map(|_| ()).map_err(std::io::Error::other)
+        self.0
+            .recv()
+            .await
+            .map(|_| ())
+            .map_err(std::io::Error::other)
     }
 }
 /// Buffers of the streaming commands' standard output, and their size: a
@@ -258,10 +262,7 @@ pub(super) async fn run(
             command: monitor::MonitorCommand::Get(args),
         } => return monitor::get(&context, args).await,
         Commands::Watch { command } => {
-            return watch::run(&context,
-                command,
-                focal_client::watch::WatchEngine::Legacy,
-            ).await;
+            return watch::run(&context, command, focal_client::watch::WatchEngine::Legacy).await;
         }
         Commands::Ledger { command } => return graph::run(&context, command).await,
         Commands::Validator { command } => return validators::run(&context, command).await,
@@ -301,11 +302,7 @@ pub(super) async fn run(
     };
     submit(&context, command, options).await
 }
-async fn submit(
-    context: &Context,
-    command: Command,
-    options: MutationOptions,
-) -> Result<()> {
+async fn submit(context: &Context, command: Command, options: MutationOptions) -> Result<()> {
     let mut request = context.envelope(Operation::Submit {
         expected_revision: options.expected_revision.map(ObjectRevision),
         command,
@@ -327,11 +324,10 @@ async fn submit(
             .claim_id()
             .ok_or(InputError::Invalid("claim is required"))?;
         *expected_revision = Some(
-            context.client.claim_revision(
-                    context.build.ledger,
-                    claim,
-                    request.request_id,
-                ).await?
+            context
+                .client
+                .claim_revision(context.build.ledger, claim, request.request_id)
+                .await?
                 .ok_or(InputError::Invalid("claim was not found"))?,
         );
     }
@@ -421,10 +417,7 @@ async fn drive(
     }
     output::journal(journal, format)
 }
-pub(super) async fn status(
-    settings: &Settings,
-    selection: Option<&str>,
-) -> Result<()> {
+pub(super) async fn status(settings: &Settings, selection: Option<&str>) -> Result<()> {
     let context = Context::open(settings, selection)?;
     if native::detect(&context).await?.standing().is_some() {
         return native::status(&context, OutputFormat::Json).await;
@@ -547,20 +540,28 @@ pub(super) async fn request(
                 operation_id,
                 output,
             }),
-        ) => managed::acknowledge(&Context::open(settings, selection)?,
-            &operation_id,
-            output.format,
-        ).await,
+        ) => {
+            managed::acknowledge(
+                &Context::open(settings, selection)?,
+                &operation_id,
+                output.format,
+            )
+            .await
+        }
         (
             None,
             Some(RequestCommand::Seal {
                 operation_id,
                 output,
             }),
-        ) => managed::seal(&Context::open(settings, selection)?,
-            &operation_id,
-            output.format,
-        ).await,
+        ) => {
+            managed::seal(
+                &Context::open(settings, selection)?,
+                &operation_id,
+                output.format,
+            )
+            .await
+        }
         (
             None,
             Some(RequestCommand::Status {

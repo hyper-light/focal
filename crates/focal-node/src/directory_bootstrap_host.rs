@@ -69,7 +69,8 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 1024)
             .map_err(|_| DirectoryBootstrapError::Capacity)?
             .commit();
-        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
         self.sender
             .try_send(Work::PrepareDirectory {
                 plan: Box::new(plan),

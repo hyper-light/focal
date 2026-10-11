@@ -52,7 +52,8 @@ impl ControlHost {
         let reply_charge = input
             .split_off(512)
             .map_err(|_| DirectoryBootstrapError::Capacity)?;
-        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
         self.sender
             .try_send(Work::RefreshDirectory {
                 permit: Box::new(permit),

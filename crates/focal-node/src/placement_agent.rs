@@ -54,14 +54,14 @@ use focal_wire::{
     PeerGrant, PeerRole, PeerSendError, RequestEnvelope,
 };
 use futures_util::FutureExt;
+use hyper_rt::combine::{Either, race2};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     time::Duration,
 };
-use hyper_rt::combine::{Either, race2};
-use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 
 /// Seconds between routine load reports; a report is also due whenever the
 /// node's enrollment generation changes or no report exists.
@@ -667,70 +667,85 @@ impl PlacementAgent {
             loop {
                 // A job first, then the tick once it is due.
                 match race2(jobs.recv(), focal_rt::time::sleep_until(next)).await {
-                    Either::First(job) => {
-                        match job {
-                            Err(SyncError::Closed(())) => return Err(AgentError::Stopped),
-                            Err(_) => return Err(AgentError::Runtime),
-                            Ok(AgentJob::Sign(job)) => {
-                                let SignJob { permit, reply } = *job;
-                                let _ = reply.send(permit.sign(&self.credentials));
-                            }
-                            Ok(AgentJob::Collect(job)) => {
-                                let CollectJob { request, reply } = *job;
-                                let result = self.collect(handles, pool, request).await;
-                                let _ = reply.send(result);
-                            }
-                            Ok(AgentJob::Status(reply)) => {
-                                let usage = handles.fleet.tenant_usage().await.unwrap_or_default();
-                                let _ = reply.send(self.status(usage));
-                            }
-                            Ok(AgentJob::Credentials(material)) => {
-                                self.credentials = *material;
-                            }
-                            Ok(AgentJob::Directory(reply)) => {
-                                let _ = reply.send(crate::placement_control::DirectoryReport {
-                                    observed_at: self.observed_at,
-                                    partitions: self.last_observed.clone(),
-                                });
-                            }
-                            Ok(AgentJob::CreateSession(job)) => {
-                                let CreateSessionJob { tenant, name, reply } = *job;
-                                let result = self.create_session(handles, tenant, &name).await;
-                                let _ = reply.send(result);
-                            }
-                            Ok(AgentJob::RestoreSession(job)) => {
-                                let crate::placement_control::RestoreSessionJob { request, reply } = *job;
-                                let result = self.restore_session(handles, request).await;
-                                let _ = reply.send(result);
-                            }
-                            Ok(AgentJob::PlanSession(job)) => {
-                                let PlanSessionJob {
-                                    ledger,
-                                    durability,
-                                    dry_run,
-                                    reply,
-                                } = *job;
-                                self.queue_plan_request(ledger, durability, dry_run, reply);
-                            }
-                            Ok(AgentJob::PlanControl(job)) => {
-                                let crate::placement_control::PlanControlJob { durability, reply } = *job;
-                                let result = self.plan_control(handles, pool, durability).await;
-                                let _ = reply.send(result);
-                            }
-                            Ok(AgentJob::MoveRange(job)) => {
-                                if self.move_requests.len() >= MAX_MOVE_REQUESTS
-                                    || self.move_requests.try_reserve(1).is_err()
-                                {
-                                    let _ = job.reply.send(Err(AgentError::Capacity));
-                                } else {
-                                    self.move_requests.push(*job);
-                                }
+                    Either::First(job) => match job {
+                        Err(SyncError::Closed(())) => return Err(AgentError::Stopped),
+                        Err(_) => return Err(AgentError::Runtime),
+                        Ok(AgentJob::Sign(job)) => {
+                            let SignJob { permit, reply } = *job;
+                            let _ = reply.send(permit.sign(&self.credentials));
+                        }
+                        Ok(AgentJob::Collect(job)) => {
+                            let CollectJob { request, reply } = *job;
+                            let result =
+                                focal_rt::boxed(|| self.collect(handles, pool, request)).await;
+                            let _ = reply.send(result);
+                        }
+                        Ok(AgentJob::Status(reply)) => {
+                            let usage = focal_rt::boxed(|| handles.fleet.tenant_usage())
+                                .await
+                                .unwrap_or_default();
+                            let _ = reply.send(self.status(usage));
+                        }
+                        Ok(AgentJob::Credentials(material)) => {
+                            self.credentials = *material;
+                        }
+                        Ok(AgentJob::Directory(reply)) => {
+                            let _ = reply.send(crate::placement_control::DirectoryReport {
+                                observed_at: self.observed_at,
+                                partitions: self.last_observed.clone(),
+                            });
+                        }
+                        Ok(AgentJob::CreateSession(job)) => {
+                            let CreateSessionJob {
+                                tenant,
+                                name,
+                                reply,
+                            } = *job;
+                            let result =
+                                focal_rt::boxed(|| self.create_session(handles, tenant, &name))
+                                    .await;
+                            let _ = reply.send(result);
+                        }
+                        Ok(AgentJob::RestoreSession(job)) => {
+                            let crate::placement_control::RestoreSessionJob { request, reply } =
+                                *job;
+                            let result =
+                                focal_rt::boxed(|| self.restore_session(handles, request)).await;
+                            let _ = reply.send(result);
+                        }
+                        Ok(AgentJob::PlanSession(job)) => {
+                            let PlanSessionJob {
+                                ledger,
+                                durability,
+                                dry_run,
+                                reply,
+                            } = *job;
+                            self.queue_plan_request(ledger, durability, dry_run, reply);
+                        }
+                        Ok(AgentJob::PlanControl(job)) => {
+                            let crate::placement_control::PlanControlJob { durability, reply } =
+                                *job;
+                            let result =
+                                focal_rt::boxed(|| self.plan_control(handles, pool, durability))
+                                    .await;
+                            let _ = reply.send(result);
+                        }
+                        Ok(AgentJob::MoveRange(job)) => {
+                            if self.move_requests.len() >= MAX_MOVE_REQUESTS
+                                || self.move_requests.try_reserve(1).is_err()
+                            {
+                                let _ = job.reply.send(Err(AgentError::Capacity));
+                            } else {
+                                self.move_requests.push(*job);
                             }
                         }
-                    }
+                    },
                     Either::Second(slept) => {
                         slept.map_err(|_| AgentError::Runtime)?;
-                        let pause = match self.tick(handles, pool).await {
+                        // Each job's future, and the tick's, is built in a frame of its own
+                        // and boxed: this loop's poll frame holds a pointer to whichever
+                        // runs, not room for every one of them.
+                        let pause = match focal_rt::boxed(|| self.tick(handles, pool)).await {
                             Ok(_) => {
                                 self.last_error = None;
                                 TICK
@@ -1542,9 +1557,10 @@ impl PlacementAgent {
             request_id: self.next_request_id()?,
             operation: Operation::PeerControl { group, request },
         };
-        let bytes = focal_rt::time::timeout(REMOTE_TIMEOUT, pool.send_peer_control(target, &envelope))
-            .await
-            .map_err(|_| AgentError::Transport(PeerSendError::Lost))??;
+        let bytes =
+            focal_rt::time::timeout(REMOTE_TIMEOUT, pool.send_peer_control(target, &envelope))
+                .await
+                .map_err(|_| AgentError::Transport(PeerSendError::Lost))??;
         match ControlReply::decode(&bytes, ControlHost::wire_limits().max_frame_bytes as usize)
             .map_err(|_| AgentError::Identity)?
         {
@@ -3473,19 +3489,21 @@ async fn submit_partition(
                     request: body,
                 },
             };
-            let bytes =
-                match focal_rt::time::timeout(REMOTE_TIMEOUT, pool.send_placement(*target, &envelope))
-                    .await
-                {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(PeerSendError::Rejected(AccessError::Unauthorized))) => {
-                        return Err(ControlFailure::Unauthorized);
-                    }
-                    Ok(Err(PeerSendError::Rejected(AccessError::Capacity))) => {
-                        return Err(ControlFailure::Capacity);
-                    }
-                    Ok(Err(_)) | Err(_) => return Err(ControlFailure::OutcomeUnknown),
-                };
+            let bytes = match focal_rt::time::timeout(
+                REMOTE_TIMEOUT,
+                pool.send_placement(*target, &envelope),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(PeerSendError::Rejected(AccessError::Unauthorized))) => {
+                    return Err(ControlFailure::Unauthorized);
+                }
+                Ok(Err(PeerSendError::Rejected(AccessError::Capacity))) => {
+                    return Err(ControlFailure::Capacity);
+                }
+                Ok(Err(_)) | Err(_) => return Err(ControlFailure::OutcomeUnknown),
+            };
             match ControlReply::decode(&bytes, ControlHost::wire_limits().max_frame_bytes as usize)
                 .map_err(ControlFailure::from)?
             {

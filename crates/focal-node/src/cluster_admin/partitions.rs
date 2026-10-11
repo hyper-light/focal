@@ -292,7 +292,9 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::sleep(REMOVE_DRAIN_POLL)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
         }
         Err(ClusterAdminError::PartitionPending {
             node,
@@ -329,7 +331,9 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::sleep(REMOVE_DRAIN_POLL)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
         }
         let current = self.partition_configuration(partition).await?;
         Err(ControlFailure::NotLeader {
@@ -369,7 +373,9 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::sleep(REMOVE_DRAIN_POLL)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
         }
         Err(ClusterAdminError::LeaderLeaving(leaving))
     }

@@ -94,6 +94,40 @@ fn use_token() {
     assert_eq!(pair.server.known_cids(), 0);
 }
 
+/// A token is sealed under the configuration that will validate it: the server's current one. A
+/// connection accepted under a configuration replaced during its handshake issues its tokens,
+/// which follow the handshake, under the replacement, so a client that returns with one is
+/// validated without a retry.
+#[test]
+fn a_token_issued_after_a_replacement_validates_under_it() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_config = pair.add_client_config(client_config());
+    let client_ch = pair.begin_connect_shared(client_config);
+    // The server accepts the connection under its first configuration and answers.
+    pair.drive_client();
+    pair.drive_server();
+    pair.server.assert_accept();
+    // A replacement draws a token key of its own, while the handshake is under way.
+    pair.server
+        .set_server_config(Some(server_config()))
+        .unwrap();
+    pair.drive();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.server.known_connections(), 0);
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        IncomingConnectionBehavior::Accept
+    });
+    pair.connect_with_shared(client_config);
+}
+
 #[test]
 fn retry_then_use_token() {
     let _guard = subscribe();

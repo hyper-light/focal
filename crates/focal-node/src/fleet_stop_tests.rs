@@ -35,7 +35,7 @@ fn stop_drains_election_readiness_without_waiting_and_reopens_the_same_prefix() 
         }
         let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
         let (sender, _receiver) = mpsc::sync_channel(4);
-        let (outbound, _outgoing) = async_mpsc::channel(4);
+        let (outbound, _outgoing) = hyper_rt::sync::channel(4).unwrap();
         let (host, mut owner) = ReplicaHost::assemble(
             session,
             ReplicaConfig::new(RootCommandId::from_u128(912)),
@@ -48,7 +48,7 @@ fn stop_drains_election_readiness_without_waiting_and_reopens_the_same_prefix() 
         .unwrap();
         // Call exactly the same owned Stop handler used by direct/group hosts,
         // without allowing an initial worker tick to hide the readiness window.
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
         assert!(owner.accept(Work::Stop(send)).unwrap());
         receive.blocking_recv().unwrap().unwrap();
         assert_eq!(owner.session.status().committed_index, 1);

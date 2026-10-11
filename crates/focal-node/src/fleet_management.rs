@@ -1007,7 +1007,8 @@ impl ReplicaFleet {
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
         let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
-        let (outbound, outgoing) = hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
+        let (outbound, outgoing) =
+            hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
             entries: BTreeMap::new(),

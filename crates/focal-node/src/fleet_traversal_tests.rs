@@ -24,7 +24,7 @@ fn request(
     fixture: &mut Fixture,
     peer: AuthenticatedPeer,
     query: TraversalRequest,
-) -> oneshot::Receiver<OwnedResponse> {
+) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
         ledger: identity().ledger,
@@ -40,7 +40,7 @@ fn request(
         .reserve(BudgetKind::Query, BudgetLane::Ordinary, 4 * 1024 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
@@ -59,14 +59,11 @@ fn traversal_requires_quorum_and_preserves_exact_pages_across_later_writes() {
     for _ in 0..5 {
         fixture.owners[0].drain().unwrap();
     }
-    assert!(matches!(
-        first.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(first.try_recv(), Ok(None)));
     for _ in 0..10 {
         fixture.pump();
     }
-    let first = page(first.try_recv().unwrap());
+    let first = page(first.try_recv().unwrap().unwrap());
     let prefix = first.token;
     assert_eq!(first.objects.len(), 1);
     assert_eq!(first.stop, TraversalStop::PageLimit);
@@ -89,11 +86,13 @@ fn traversal_requires_quorum_and_preserves_exact_pages_across_later_writes() {
         let result = page(
             request(&mut fixture, actor(), query.clone())
                 .try_recv()
+                .unwrap()
                 .unwrap(),
         );
         let repeated = page(
             request(&mut fixture, actor(), query.clone())
                 .try_recv()
+                .unwrap()
                 .unwrap(),
         );
         assert_eq!(
@@ -135,7 +134,7 @@ fn traversal_cursor_rejects_tamper_query_principal_route_and_expiry() {
     for _ in 0..10 {
         fixture.pump();
     }
-    let first = page(received.try_recv().unwrap());
+    let first = page(received.try_recv().unwrap().unwrap());
     let mut exact = query();
     exact.cursor = first.next;
     let mut changed = exact.clone();
@@ -143,6 +142,7 @@ fn traversal_cursor_rejects_tamper_query_principal_route_and_expiry() {
     assert!(matches!(
         request(&mut fixture, actor(), changed)
             .try_recv()
+            .unwrap()
             .unwrap()
             .into_envelope()
             .result,
@@ -158,6 +158,7 @@ fn traversal_cursor_rejects_tamper_query_principal_route_and_expiry() {
         request(&mut fixture, peer, exact.clone())
             .try_recv()
             .unwrap()
+            .unwrap()
             .into_envelope()
             .result,
         Response::Error(AccessError::Unauthorized)
@@ -168,6 +169,7 @@ fn traversal_cursor_rejects_tamper_query_principal_route_and_expiry() {
         request(&mut fixture, actor(), changed)
             .try_recv()
             .unwrap()
+            .unwrap()
             .into_envelope()
             .result,
         Response::Error(AccessError::InvalidRequest)
@@ -177,6 +179,7 @@ fn traversal_cursor_rejects_tamper_query_principal_route_and_expiry() {
     assert!(matches!(
         request(&mut fixture, actor(), exact)
             .try_recv()
+            .unwrap()
             .unwrap()
             .into_envelope()
             .result,

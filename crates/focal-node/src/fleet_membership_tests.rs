@@ -40,7 +40,7 @@ fn checked_transfer_uses_the_owner_configuration_and_preserves_domain_prefix() {
     let view = session.membership().unwrap();
     let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
     let (sender, _receiver) = mpsc::sync_channel(4);
-    let (outbound, mut outgoing) = async_mpsc::channel(16);
+    let (outbound, mut outgoing) = hyper_rt::sync::channel(16).unwrap();
     let (_host, mut owner) = ReplicaHost::assemble(
         session,
         ReplicaConfig::new(RootCommandId::from_u128(90)),
@@ -79,7 +79,7 @@ fn checked_transfer_uses_the_owner_configuration_and_preserves_domain_prefix() {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
             .unwrap()
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
         owner
             .accept(Work::Transfer(
                 target,
@@ -102,7 +102,7 @@ fn checked_transfer_uses_the_owner_configuration_and_preserves_domain_prefix() {
             owner.session.membership().unwrap().configuration_index,
             view.configuration_index
         );
-        while outgoing.try_recv().is_ok() {}
+        while outgoing.try_recv().is_ok_and(|item| item.is_some()) {}
         assert_eq!(budget.stats().used, baseline);
     }
 }
@@ -127,7 +127,7 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
     }
     let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
     let (sender, _receiver) = mpsc::sync_channel(4);
-    let (outbound, mut outgoing) = async_mpsc::channel(4);
+    let (outbound, mut outgoing) = hyper_rt::sync::channel(4).unwrap();
     let (_host, mut owner) = ReplicaHost::assemble(
         session,
         ReplicaConfig::new(RootCommandId::from_u128(73)),
@@ -150,7 +150,7 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
         .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
         .unwrap()
         .commit();
-    let (send, mut receive) = oneshot::channel();
+    let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
     owner.accept_membership(
         MembershipCall {
             request: Some(request.clone()),
@@ -188,12 +188,12 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
             .is_some()
     );
     assert!(
-        matches!(receive.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        matches!(receive.try_recv(), Ok(None)),
         "durable apply alone does not release the reply"
     );
     owner.drain().unwrap();
-    let reply = receive.try_recv().unwrap().unwrap();
-    while outgoing.try_recv().is_ok() {}
+    let reply = receive.try_recv().unwrap().unwrap().unwrap();
+    while outgoing.try_recv().is_ok_and(|item| item.is_some()) {}
     assert_eq!(reply.view().configuration.learners, vec![2]);
     assert!(owner.memberships.is_empty());
     assert_eq!(owner.memberships.capacity(), 0);
@@ -217,7 +217,7 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
             .unwrap()
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
         owner.accept_membership(
             MembershipCall {
                 request: Some(request.clone()),
@@ -250,7 +250,7 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
         for _ in 0..3 {
             owner.drain().unwrap();
         }
-        while outgoing.try_recv().is_ok() {}
+        while outgoing.try_recv().is_ok_and(|item| item.is_some()) {}
         assert!(
             owner
                 .session
@@ -305,7 +305,7 @@ fn stop_with_uncommitted_membership_preserves_unknown_intent_without_checkpoint(
     };
     let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
     let (sender, _receiver) = mpsc::sync_channel(4);
-    let (outbound, _outgoing) = async_mpsc::channel(16);
+    let (outbound, _outgoing) = hyper_rt::sync::channel(16).unwrap();
     let (_host, mut owner) = ReplicaHost::assemble(
         session,
         ReplicaConfig::new(RootCommandId::from_u128(83)),
@@ -320,7 +320,7 @@ fn stop_with_uncommitted_membership_preserves_unknown_intent_without_checkpoint(
         .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.accept_membership(
         MembershipCall {
             request: Some(request.clone()),
@@ -337,7 +337,7 @@ fn stop_with_uncommitted_membership_preserves_unknown_intent_without_checkpoint(
             .unwrap()
             .is_none()
     );
-    let (stop_send, stop_receive) = oneshot::channel();
+    let (stop_send, stop_receive) = hyper_rt::sync::oneshot().unwrap();
     assert!(owner.accept(Work::Stop(stop_send)).unwrap());
     stop_receive.blocking_recv().unwrap().unwrap();
     owner.close();

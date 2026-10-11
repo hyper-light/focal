@@ -16,10 +16,10 @@ use focal_core::native::ContentRoot;
 use focal_core::native::record_codec::{InspectionLimits, StructuralArchive};
 use focal_evidence::{CollectorConfig, ProtectionSet};
 use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef, LedgerId};
+use focal_rt::watch;
 use focal_wire::AccessError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use focal_rt::watch;
 
 /// Milliseconds between passes; one minute by default.
 pub const INTERVAL_ENV: &str = "FOCAL_GC_INTERVAL_MS";
@@ -164,7 +164,9 @@ impl GcAgent {
             return Err(AccessError::Unavailable);
         }
         loop {
-            focal_rt::time::pause(self.interval).await;
+            focal_rt::time::sleep(self.interval)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
             // A pass that cannot run now (a store that refuses, a replica
             // that is stopping) waits for the next tick; nothing is inferred.
             let _ = self.pass(handles).await;

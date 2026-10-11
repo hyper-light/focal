@@ -1,8 +1,8 @@
 //! OS-main-thread file ownership, with bounded network pages between writes.
 use super::{CliError, Context, Result};
 use focal_client::{Client, ClientError, ClientTransport};
-use focal_model::{Artifact, ArtifactPayload};
-use focal_wire::{Operation, RequestEnvelope, Response};
+use focal_model::{Artifact, ArtifactPayload, ContentRef};
+use focal_wire::{ContentChunk, Operation, RequestEnvelope, Response};
 use futures_util::FutureExt;
 use std::{
     fs::{self, File, OpenOptions},
@@ -13,19 +13,17 @@ use std::{
 
 const PAGE_BYTES: u32 = 64 * 1024;
 
-pub(super) async fn artifact(
-    context: &Context,
-    artifact: &Artifact,
-    output: &Path,
-) -> Result<()> {
+pub(super) async fn artifact(context: &Context, artifact: &Artifact, output: &Path) -> Result<()> {
     if artifact.content().ledger != context.build.ledger {
         return Err(CliError::InvalidResponse);
     }
-    payload(&context.client,
+    payload(
+        &context.client,
         |operation| context.envelope(operation),
         &artifact.content().payload,
         output,
-    ).await
+    )
+    .await
 }
 
 async fn payload<T: ClientTransport>(
@@ -43,17 +41,11 @@ async fn payload<T: ClientTransport>(
     match payload {
         ArtifactPayload::Inline(bytes) => temporary.file.write_all(bytes)?,
         ArtifactPayload::Content(content) => {
-            let mut download = focal_client::artifact_transfer::PayloadDownload::new(
-                content.clone(),
-                content.length,
-                PAGE_BYTES,
-            )
-            .map_err(|_| CliError::InvalidResponse)?;
-            while !download.complete() {
+            stream(content, &mut temporary.file, async |offset, max_bytes| {
                 let request = envelope(Operation::Download {
                     content: content.clone(),
-                    offset: download.offset(),
-                    max_bytes: PAGE_BYTES,
+                    offset,
+                    max_bytes,
                 })?;
                 // A dependency that unwinds ends the download as a transport
                 // failure; the owner still removes the temporary file.
@@ -61,21 +53,38 @@ async fn payload<T: ClientTransport>(
                     .catch_unwind()
                     .await
                     .map_err(|_| CliError::Client(ClientError::Transport))??;
-                let Response::Content(chunk) = response.result else {
-                    return Err(CliError::InvalidResponse);
-                };
-                download
-                    .accept(&chunk, &mut temporary.file)
-                    .map_err(|error| match error {
-                        focal_client::artifact_transfer::TransferError::Io(error) => {
-                            CliError::Io(error)
-                        }
-                        _ => CliError::InvalidResponse,
-                    })?;
-            }
+                match response.result {
+                    Response::Content(chunk) => Ok(chunk),
+                    _ => Err(CliError::InvalidResponse),
+                }
+            })
+            .await?;
         }
     }
     temporary.install(output)
+}
+
+/// The content's pages into `file`, each asked by `read` at the download's
+/// offset and accepted only if it continues it exactly.
+async fn stream(
+    content: &ContentRef,
+    file: &mut File,
+    mut read: impl AsyncFnMut(u64, u32) -> Result<ContentChunk>,
+) -> Result<()> {
+    let mut download = focal_client::artifact_transfer::PayloadDownload::new(
+        content.clone(),
+        content.length,
+        PAGE_BYTES,
+    )
+    .map_err(|_| CliError::InvalidResponse)?;
+    while !download.complete() {
+        let chunk = read(download.offset(), PAGE_BYTES).await?;
+        download.accept(&chunk, file).map_err(|error| match error {
+            focal_client::artifact_transfer::TransferError::Io(error) => CliError::Io(error),
+            _ => CliError::InvalidResponse,
+        })?;
+    }
+    Ok(())
 }
 
 pub(super) struct Temporary {
@@ -261,16 +270,20 @@ mod tests {
             reference.root,
             ContentHash(*blake3::hash(&bytes).as_bytes())
         );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        for (name, data) in [
-            ("content", ArtifactPayload::Content(reference)),
-            ("inline", ArtifactPayload::Inline(bytes.clone())),
-        ] {
+        let paths = directory.path().to_path_buf();
+        let expected = bytes.clone();
+        focal_rt::block_on(async move {
+            for (name, data) in [
+                ("content", ArtifactPayload::Content(reference)),
+                ("inline", ArtifactPayload::Inline(expected)),
+            ] {
+                let output = paths.join(name);
+                payload(&client, envelope, &data, &output).await.unwrap();
+            }
+        })
+        .unwrap();
+        for name in ["content", "inline"] {
             let output = directory.path().join(name);
-            payload(&runtime, &client, envelope, &data, &output).unwrap();
             assert_eq!(fs::read(&output).unwrap(), bytes);
             #[cfg(unix)]
             {
@@ -306,7 +319,7 @@ mod tests {
         for malformed in 0..6 {
             let output = directory.path().join(format!("{malformed}"));
             let mut temporary = Temporary::create(&output).unwrap();
-            let result = stream(&reference(4), &mut temporary.file, |offset, _| {
+            let result = stream(&reference(4), &mut temporary.file, async |offset, _| {
                 if offset == 0 {
                     return Ok(ContentChunk {
                         offset: 0,
@@ -346,7 +359,9 @@ mod tests {
                         eof: true,
                     },
                 })
-            });
+            })
+            .now_or_never()
+            .expect("the scripted reader never waits");
             assert!(matches!(result, Err(CliError::InvalidResponse)));
             drop(temporary);
             assert!(!output.exists());
@@ -354,23 +369,20 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
     #[test]
-    fn missing_runtime_drivers_are_typed_and_leave_no_output_or_temporary() {
+    fn off_a_shard_a_download_is_refused_typed_and_leaves_no_output_or_temporary() {
         let directory = tempfile::tempdir().unwrap();
         let (client, reference) = store(&directory.path().join("store"), b"bytes");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
         let output = directory.path().join("output");
-        assert!(
+        assert!(matches!(
             payload(
-                &runtime,
                 &client,
                 envelope,
                 &ArtifactPayload::Content(reference),
                 &output
             )
-            .is_err()
-        );
+            .now_or_never(),
+            Some(Err(CliError::Client(ClientError::Transport)))
+        ));
         assert!(!output.exists());
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }

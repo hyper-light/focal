@@ -5,8 +5,8 @@
 //! the enrollment host it runs itself (24 §11).
 use crate::{network_listener::ListenerIdentity, placement_control::PlacementHandle};
 use focal_enrollment::{EnrollmentReceipt, JoinFailure};
-use serde::{Deserialize, Serialize};
 use hyper_rt::sync::{ChannelReceiver, OneshotSender};
+use serde::{Deserialize, Serialize};
 
 /// A credential is renewed once this fraction of its lifetime remains: a
 /// third, the practice ACME clients follow (Let's Encrypt's integration

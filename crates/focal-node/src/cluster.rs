@@ -8,13 +8,13 @@ use focal_enrollment::*;
 use focal_log::SharedWal;
 use focal_memory::MemoryBudget;
 use focal_model::RequestId;
+use hyper_rt::sync::OneshotSender;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread::JoinHandle,
 };
-use hyper_rt::sync::OneshotSender;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
@@ -402,7 +402,8 @@ impl EnrollmentHost {
     }
     /// A full queue returns Capacity without enqueueing; drain ingress and retry.
     pub async fn stop(&self) -> Result<(), ClusterError> {
-        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| ClusterError::Enrollment(EnrollmentError::Capacity))?;
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| ClusterError::Enrollment(EnrollmentError::Capacity))?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {

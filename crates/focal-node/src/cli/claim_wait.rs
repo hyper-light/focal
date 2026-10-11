@@ -57,10 +57,7 @@ pub(crate) struct WaitArgs {
     #[command(flatten)]
     pub(super) output: super::args::OutputOptions,
 }
-pub(super) async fn run(
-    context: &Context,
-    args: WaitArgs,
-) -> Result<()> {
+pub(super) async fn run(context: &Context, args: WaitArgs) -> Result<()> {
     let fields = args.claim.is_some() || args.until.is_some() || args.timeout_ms.is_some();
     let document: ClaimWaitDocument = match args.input.load(fields)? {
         Some(document) => document,

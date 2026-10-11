@@ -223,11 +223,18 @@ enum Receiver {
 impl Receiver {
     /// The next frame; `None` once every sender is gone and the channel
     /// is drained. A wait the channel refuses (off a shard) is an error.
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Frame>, focal_rt::RtError>> {
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame>, focal_rt::RtError>> {
         let polled = match self {
-            Self::Single(receiver) => pin!(receiver.recv()).poll(cx).map(|r| r.map(Frame::Session)),
+            Self::Single(receiver) => pin!(receiver.recv())
+                .poll(cx)
+                .map(|r| r.map(Frame::Session)),
             Self::Fleet(receiver) => receiver.poll_recv(cx).map(|r| r.map(Frame::Session)),
-            Self::Control(receiver) => pin!(receiver.recv()).poll(cx).map(|r| r.map(Frame::Control)),
+            Self::Control(receiver) => pin!(receiver.recv())
+                .poll(cx)
+                .map(|r| r.map(Frame::Control)),
             Self::Directory(receiver) => receiver.poll_recv(cx).map(|r| r.map(Frame::Control)),
         };
         polled.map(|received| match received {
@@ -386,7 +393,9 @@ async fn drive<C: Carrier>(
                     .map_err(|_| ReplicationDriverError::Worker)?;
                 match result {
                     Ok(()) => report.accepted = report.accepted.saturating_add(1),
-                    Err(PeerSendError::Busy) => report.saturated = report.saturated.saturating_add(1),
+                    Err(PeerSendError::Busy) => {
+                        report.saturated = report.saturated.saturating_add(1)
+                    }
                     Err(_) => report.lost = report.lost.saturating_add(1),
                 }
                 // The peer's place is free: its next frame takes it.

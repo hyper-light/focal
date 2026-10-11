@@ -36,8 +36,10 @@ use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget, MemoryError,
 };
 use focal_model::*;
+use focal_rt::time::Instant;
 use focal_wire::*;
 use futures_util::FutureExt;
+use hyper_rt::sync::{ChannelReceiver, OneshotReceiver};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -47,8 +49,6 @@ use std::{
     task::Poll,
     time::Duration,
 };
-use focal_rt::time::Instant;
-use hyper_rt::sync::{ChannelReceiver, OneshotReceiver};
 
 #[path = "network_directory.rs"]
 mod network_directory;
@@ -633,7 +633,7 @@ impl NetworkService {
     pub fn handles(&self) -> NetworkHandles {
         self.handles.clone()
     }
-    /// Open physical owners on a Tokio runtime with IO and time enabled. Their
+    /// Open physical owners on a hyper-rt shard. Their
     /// directory lock remains owned until every worker has joined, even if this
     /// future is canceled after the first worker starts.
     pub async fn open(settings: &Settings) -> Result<Self, ServiceError> {
@@ -1642,10 +1642,25 @@ impl NetworkService {
         })
     }
 
-    /// Drive borrowed ingress and egress on a runtime with IO and time enabled.
-    /// Shutdown closes admission and joins disk owners; cancellation keeps the
-    /// directory locked while any externally retained physical handle is live.
-    pub async fn run_until<F, R>(
+    /// Drive borrowed ingress and egress on a hyper-rt shard. Shutdown closes
+    /// admission and joins disk owners; cancellation keeps the directory
+    /// locked while any externally retained physical handle is live. Boxed by
+    /// a plain function, as [`Self::open_with_socket`] is: a caller's frame,
+    /// and every future that awaits this one, holds a pointer to the run, not
+    /// its state (in a debug build a test's 2 MiB thread overflowed on the
+    /// copies of it each frame held).
+    pub fn run_until<F, R>(
+        self,
+        shutdown: F,
+        on_status: R,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<ServiceStopped, ServiceError>>>>
+    where
+        F: Future<Output = std::io::Result<()>>,
+        R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
+    {
+        Box::pin(self.run_until_inner(shutdown, on_status))
+    }
+    async fn run_until_inner<F, R>(
         mut self,
         shutdown: F,
         on_status: R,
@@ -1739,6 +1754,7 @@ impl NetworkService {
         F: Future<Output = std::io::Result<()>>,
         R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
     {
+        // What the run consumes is taken first; from then on the service is only read.
         let controller = self
             .controller
             .take()
@@ -1747,383 +1763,188 @@ impl NetworkService {
             .control_output
             .take()
             .ok_or(ServiceError::Owner("egress already consumed"))?;
+        let directory_startup = self.directory_startup.take();
+        let ledger_output = self.ledger_output.take();
+        let metrics_listener = self.metrics_listener.take();
+        let evidence = self.evidence.take();
+        let signer = self.signer.take();
+        let agent = self.agent.take();
+        let archive_agent = self.archive_agent.take();
+        let gc_agent = self.gc_agent.take();
+        let liveness_driver = self.liveness.take();
+        let route_driver = self.routes.take();
+        let requests = self
+            .credential_requests
+            .take()
+            .ok_or(ServiceError::Owner("credential requests already consumed"))?;
+        let this: &Self = self;
+        let owners = this
+            .owners
+            .as_ref()
+            .ok_or(ServiceError::Owner("missing node owner"))?;
         // The drivers hold what the pool itself admits: every connection's
         // lane at once. A send is started only when its peer's lane has a
         // place for it (`replication::drive`), so a peer that stopped
         // answering holds its own lane and nothing of another's (the
         // audit's F42).
-        let inflight = self.pool.limits().max_inflight;
-        let control_driver = drive_control_replication(output, &self.pool, inflight);
-        let directory_startup = self.directory_startup.take();
-        let owners = self
-            .owners
-            .as_ref()
-            .ok_or(ServiceError::Owner("missing node owner"))?;
-        let directory_driver = async {
-            match directory_startup {
-                Some(startup) => startup.run(&self.handles.control, &self.pool, owners).await,
-                None => std::future::pending().await,
-            }
-        };
-        let ledger_output = self.ledger_output.take();
-        let metrics_listener = self.metrics_listener.take();
-        let ledger_driver = async {
+        let inflight = this.pool.limits().max_inflight;
+        // Every driver below is made inside `boxed`, never in this function's own frame: a debug
+        // build keeps each future made here as a temporary of its own, at once, and the drivers
+        // together were 605 KiB of this frame, which with the frames beneath it overflowed a 2 MiB
+        // thread. Here each is a pointer.
+        let mut control_driver =
+            focal_rt::boxed(|| drive_control_replication(output, &this.pool, inflight));
+        let mut ledger_driver = focal_rt::boxed(|| async move {
             match ledger_output {
-                Some(output) => drive_fleet_replication(output, &self.pool, inflight)
+                Some(output) => drive_fleet_replication(output, &this.pool, inflight)
                     .await
                     .map(|_| ()),
                 None => std::future::pending().await,
             }
-        };
-        let evidence = self.evidence.take();
-        let evidence_driver = async {
-            match evidence {
-                Some(driver) => driver.run(&self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let signer = self.signer.take();
+        });
         let signer_control = if signer.is_some() {
             Some(NetworkEnrollmentControl::new(
-                &self.pool,
-                &self.handles.control,
-                self.authority.clone(),
-                &self.registry,
-                self.presented.clone(),
+                &this.pool,
+                &this.handles.control,
+                this.authority.clone(),
+                &this.registry,
+                this.presented.clone(),
                 RouteEpoch(1),
-                &self.budget,
+                &this.budget,
             )?)
         } else {
             None
         };
-        let signer_driver = async {
-            match (signer, signer_control.as_ref()) {
-                (Some(driver), Some(control)) => driver.run(control).await,
-                _ => std::future::pending().await,
-            }
-        };
-        let network = self
-            .listener
-            .serve(self.data.clone(), self.enrollment.clone());
-        let local = self.local.serve(self.data.clone());
-        let admin = async {
-            match &self.admin {
-                Some((server, handler)) => server.serve(handler.clone()).await,
-                None => std::future::pending().await,
-            }
-        };
+        let signer_control = signer_control.as_ref();
+        let mut network = focal_rt::boxed(|| {
+            this.listener
+                .serve(this.data.clone(), this.enrollment.clone())
+        });
         let swap = crate::credential_renewal::CredentialSwap {
-            listener: Some(self.listener.identity().map_err(ServiceError::Wire)?),
-            placement: self.handles.placement.clone(),
-            requests: self
-                .credential_requests
-                .take()
-                .ok_or(ServiceError::Owner("credential requests already consumed"))?,
+            listener: Some(this.listener.identity().map_err(ServiceError::Wire)?),
+            placement: this.handles.placement.clone(),
+            requests,
         };
-        let controller = controller.run(&self.pool, &self.handles.control, &self.registry, swap);
-        let agent = self.agent.take();
-        let placement_agent = async {
-            match agent {
-                Some(agent) => agent.run(&self.handles, &self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let archive_agent = self.archive_agent.take();
-        let archive_agent = async {
-            match archive_agent {
-                Some(agent) => agent.run(&self.handles).await,
-                None => std::future::pending().await,
-            }
-        };
-        let gc_agent = self.gc_agent.take();
-        let gc_agent = async {
-            match gc_agent {
-                Some(agent) => agent.run(&self.handles).await,
-                None => std::future::pending().await,
-            }
-        };
-        let liveness_driver = self.liveness.take();
-        let liveness = async {
-            match liveness_driver {
-                Some(driver) => driver.run(&self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let route_driver = self.routes.take();
-        let routes = async {
-            match route_driver {
-                Some(driver) => driver.run(&self.handles, &self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let managed_support = crate::managed_support::drive(
-            &self.handles.fleet,
-            &self.pool,
-            &self.budget,
-            &self.handles.content,
-        );
-        // The metrics sampler publishes a fresh snapshot on a fixed cadence
-        // (24 §23); the admin socket and the loopback endpoint render the
-        // latest one, never sampling on a caller's behalf.
-        let metrics_sampler = async {
-            // Where each family's listing resumes, and what every session
-            // counted (the audit's F26); none when no page could list each
-            // family, and then no page is published.
-            let mut rounds =
-                crate::metrics::rounds::Rounds::new(&self.metrics_labels, self.budget.clone());
-            loop {
-                // A round has the cadence to observe its sessions: a slow
-                // or stuck owner costs its entry, never the round, and the
-                // next round starts on the cadence whatever this one took
-                // (the audit's F65). The text is rendered here, once. A
-                // round refused its room keeps the last page, whose sample
-                // time says its age, and the next page counts it.
-                let started = Instant::now();
-                if let Some(rounds) = rounds.as_mut() {
-                    let page = match self.sample_metrics(started, rounds).await {
-                        Ok(snapshot) => {
-                            crate::metrics::MetricsPage::new(snapshot, &self.budget).ok()
-                        }
-                        Err(_) => None,
-                    };
-                    match page {
-                        Some(page) => {
-                            self.metrics.send_replace(Some(page));
-                        }
-                        None => rounds.refused(),
-                    }
-                }
-                // A sleep refused (no wheel to keep it) ends the sampler, never spins it.
-                if focal_rt::time::sleep_until(
-                    started
-                        .checked_add(crate::metrics::SAMPLE_INTERVAL)
-                        .unwrap_or(started),
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-        };
-        // The root group's tick period follows the round trips this node
-        // measures to the group's other voters (27 §3.1 P2). A group inside
-        // one period keeps the configured period; a far one is stretched so
-        // its election timeout stays ten round-trip tails of its slowest
-        // voter. While the root cannot be observed the last pace stands.
-        let pacer = async {
-            loop {
-                if let Ok(observation) = self.handles.control.observe_root().await {
-                    let local = self.status.node;
-                    let paths: Vec<focal_timing::PathRtt> = observation
-                        .configuration()
-                        .configuration
-                        .voters
-                        .iter()
-                        .filter(|voter| **voter != local)
-                        .filter_map(|voter| self.pool.path(*voter))
-                        .collect();
-                    self.handles.control.pace(paths.iter());
-                    // What the root's commits wait on among its voters: how
-                    // late each answers the group's messages, which it does
-                    // once its owner has taken and persisted them, or the
-                    // age of one still out where that is more (27 §8.4).
-                    let voters = &observation.configuration().configuration.voters;
-                    let tails: Vec<Duration> = voters
-                        .iter()
-                        .filter(|voter| **voter != local)
-                        .filter_map(|voter| self.pool.replication_lateness(*voter))
-                        .collect();
-                    self.handles.control.quorum(tails, voters.len());
-                }
-                // Every hosted session paces itself by its own voters: a
-                // session whose voters are near keeps the configured period
-                // beside one whose voters are far.
-                let local = self.status.node;
-                let pace_session = |host: &ReplicaHost| {
-                    let progress = host.progress();
-                    let paths: Vec<focal_timing::PathRtt> = progress
-                        .voters
-                        .iter()
-                        .filter(|voter| **voter != local)
-                        .filter_map(|voter| self.pool.path(*voter))
-                        .collect();
-                    host.pace(paths.iter());
-                    // How late the session's other voters answer its
-                    // messages (27 §8.4), as the root's.
-                    let tails: Vec<Duration> = progress
-                        .voters
-                        .iter()
-                        .filter(|voter| **voter != local)
-                        .filter_map(|voter| self.pool.replication_lateness(*voter))
-                        .collect();
-                    host.quorum(tails, progress.voters.len());
-                    // And what each path holds in flight bounds the bytes
-                    // a leader sends its peer ahead of its answers (27 §11):
-                    // the voters, and the members the directory admitted,
-                    // which a leader catches up before they vote.
-                    let windows: Vec<(u64, u64, u64)> = progress
-                        .voters
-                        .iter()
-                        .chain(progress.admitted.iter())
-                        .filter(|peer| **peer != local)
-                        .filter_map(|peer| {
-                            Some((
-                                *peer,
-                                self.pool.window(*peer)?,
-                                self.pool.path(*peer)?.smoothed_ns(),
-                            ))
-                        })
-                        // A path nothing was measured on says nothing: the
-                        // peer keeps what it has.
-                        .filter(|(_, _, round_trip_ns)| *round_trip_ns > 0)
-                        .collect();
-                    host.inflight_windows(windows);
-                };
-                if let Some(host) = &self.handles.ledger {
-                    pace_session(host);
-                }
-                let mut after = None;
-                while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
-                    pace_session(&host);
-                    after = Some(ledger);
-                    hyper_rt::futures::yield_now().await;
-                }
-                if focal_rt::time::sleep(Duration::from_secs(1)).await.is_err() {
-                    return;
-                }
-            }
-        };
-        let metrics_view = self.metrics.subscribe();
-        let metrics_endpoint = async {
-            match metrics_listener {
-                Some(listener) => crate::metrics::serve_loopback(listener, metrics_view).await,
-                None => std::future::pending().await,
-            }
-        };
-        let ready = async {
-            if let Some(ledger) = &self.handles.ledger {
-                loop {
-                    let peer = AuthenticatedPeer::local(PeerGrant {
-                        principal: signer_principal(self.authority.identity().cluster.0),
-                        tenants: BTreeSet::from([self.status.ledger.tenant]),
-                        role: PeerRole::Runtime,
-                    })?;
-                    if matches!(
-                        self.handles
-                            .control
-                            .read(peer, RequestId::from_u128(1), ControlRead::Membership)
-                            .await,
-                        Ok(ControlReadResult::Membership(_))
-                    ) && {
-                        // The founder's replica is running with a known
-                        // leader: itself, or another voter of the group it
-                        // rejoined after a restart (it follows then, and its
-                        // local socket routes to the leader as any node's).
-                        let progress = ledger.progress();
-                        !progress.stopped && progress.leader != 0
-                    } && self.handles.directory.host().is_some_and(|host| {
-                        // The partition's replica likewise: it leads, or it
-                        // follows a known leader among the voters the group
-                        // grew to (F24); readiness never requires leadership.
-                        let progress = host.progress();
-                        !progress.stopped && progress.applied_index > 0 && progress.leader != 0
-                    }) {
-                        break;
-                    }
-                    focal_rt::time::sleep(Duration::from_millis(25)).await?;
-                }
-                let mut status = self.status.clone();
-                status.condition = "Ready";
-                on_status(&status)?;
-            } else {
-                on_status(&self.status)?;
-            }
-            std::future::pending::<Result<(), ServiceError>>().await
-        };
-        let handles = &self.handles;
-        // The listener and the two egress drivers outlive the race: the stop phase polls them
-        // again while the owners stop.
-        let mut network = std::pin::pin!(network);
-        let mut control_driver = std::pin::pin!(control_driver);
-        let mut ledger_driver = std::pin::pin!(ledger_driver);
+        let metrics_view = this.metrics.subscribe();
+        let on_status = &mut on_status;
+        let handles = &this.handles;
         // Every other driver, each mapped to how its end ends the run: a shutdown signalled
         // (`true`), the run over with nothing to stop (`false`), or why it failed.
         let mut drivers: [Ending<'_>; 18] = [
-            Box::pin(async { shutdown.await.map_err(ServiceError::Io).map(|()| true) }),
-            Box::pin(async { ready.await.map(|()| false) }),
-            Box::pin(async {
-                local
+            focal_rt::boxed(
+                || async move { shutdown.await.map_err(ServiceError::Io).map(|()| true) },
+            ),
+            focal_rt::boxed(|| async move { this.ready(on_status).await.map(|()| false) }),
+            focal_rt::boxed(|| async move {
+                this.local
+                    .serve(this.data.clone())
                     .await
                     .map_err(ServiceError::Wire)
                     .and(Err(ServiceError::Owner("local listener ended")))
             }),
-            Box::pin(async {
-                admin
-                    .await
-                    .map_err(ServiceError::Wire)
-                    .and(Err(ServiceError::Owner("admin listener ended")))
+            focal_rt::boxed(|| async move {
+                match &this.admin {
+                    Some((server, handler)) => server.serve(handler.clone()).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Wire)
+                .and(Err(ServiceError::Owner("admin listener ended")))
             }),
-            Box::pin(async {
+            focal_rt::boxed(|| async move {
                 controller
+                    .run(&this.pool, &this.handles.control, &this.registry, swap)
                     .await
                     .map_err(ServiceError::Controller)
                     .and(Err(ServiceError::Owner("controller ended")))
             }),
-            Box::pin(async {
-                placement_agent
-                    .await
-                    .map_err(ServiceError::Agent)
-                    .and(Err(ServiceError::Owner("placement agent ended")))
+            focal_rt::boxed(|| async move {
+                match agent {
+                    Some(agent) => agent.run(&this.handles, &this.pool).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Agent)
+                .and(Err(ServiceError::Owner("placement agent ended")))
             }),
-            Box::pin(async {
-                archive_agent
-                    .await
-                    .map_err(ServiceError::Access)
-                    .and(Err(ServiceError::Owner("archive agent ended")))
+            focal_rt::boxed(|| async move {
+                match archive_agent {
+                    Some(agent) => agent.run(&this.handles).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Access)
+                .and(Err(ServiceError::Owner("archive agent ended")))
             }),
-            Box::pin(async {
-                gc_agent
-                    .await
-                    .map_err(ServiceError::Access)
-                    .and(Err(ServiceError::Owner("collector agent ended")))
+            focal_rt::boxed(|| async move {
+                match gc_agent {
+                    Some(agent) => agent.run(&this.handles).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Access)
+                .and(Err(ServiceError::Owner("collector agent ended")))
             }),
-            Box::pin(async { directory_driver.await.map(|()| false) }),
-            Box::pin(async {
-                liveness.await;
+            focal_rt::boxed(|| async move {
+                match directory_startup {
+                    Some(startup) => startup.run(&this.handles.control, &this.pool, owners).await,
+                    None => std::future::pending().await,
+                }
+                .map(|()| false)
+            }),
+            focal_rt::boxed(|| async move {
+                if let Some(driver) = liveness_driver {
+                    driver.run(&this.pool).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
                 Err(ServiceError::Owner("liveness driver ended"))
             }),
-            Box::pin(async {
-                routes.await;
+            focal_rt::boxed(|| async move {
+                if let Some(driver) = route_driver {
+                    driver.run(&this.handles, &this.pool).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
                 Err(ServiceError::Owner("route cache driver ended"))
             }),
-            Box::pin(async {
-                let _ = managed_support.await;
+            focal_rt::boxed(|| async move {
+                crate::managed_support::drive(
+                    &this.handles.fleet,
+                    &this.pool,
+                    &this.budget,
+                    &this.handles.content,
+                )
+                .await;
                 Err(ServiceError::Owner("managed capability driver ended"))
             }),
-            Box::pin(async {
-                let _ = evidence_driver.await;
+            focal_rt::boxed(|| async move {
+                let _ = match evidence {
+                    Some(driver) => driver.run(&this.pool).await,
+                    None => std::future::pending().await,
+                };
                 Err(ServiceError::Owner("evidence driver ended"))
             }),
-            Box::pin(async {
-                let _ = signer_driver.await;
+            focal_rt::boxed(|| async move {
+                let _ = match (signer, signer_control) {
+                    (Some(driver), Some(control)) => driver.run(control).await,
+                    _ => std::future::pending().await,
+                };
                 Err(ServiceError::Owner("enrollment driver ended"))
             }),
-            Box::pin(async {
-                metrics_sampler.await;
+            focal_rt::boxed(|| async move {
+                this.sample_on_cadence().await;
                 Err(ServiceError::Owner("metrics sampler ended"))
             }),
-            Box::pin(async {
-                pacer.await;
+            focal_rt::boxed(|| async move {
+                this.pace().await;
                 Err(ServiceError::Owner("pace driver ended"))
             }),
-            Box::pin(async {
-                metrics_endpoint
-                    .await
-                    .map_err(ServiceError::Rt)
-                    .and(Err(ServiceError::Owner("metrics endpoint ended")))
+            focal_rt::boxed(|| async move {
+                match metrics_listener {
+                    Some(listener) => crate::metrics::serve_loopback(listener, metrics_view).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Rt)
+                .and(Err(ServiceError::Owner("metrics endpoint ended")))
             }),
-            Box::pin(async {
+            focal_rt::boxed(|| async move {
                 handles.control.closed().await;
                 Err(match handles.control.progress().failure {
                     Some(failure) => ServiceError::ControlOwner(failure),
@@ -2170,7 +1991,7 @@ impl NetworkService {
         // and the drivers that carry theirs are still polled — a leader among them hands its log
         // off first (27 §5), which is messages both ways. A driver that ends here was closed by an
         // owner that stopped; it is not what ends the service.
-        let mut stops = std::pin::pin!(stop_owners(handles));
+        let mut stops = focal_rt::boxed(|| stop_owners(handles));
         let (mut network_ended, mut control_ended, mut ledger_ended) = (false, false, false);
         let stopped = std::future::poll_fn(|context| {
             if let Poll::Ready(stopped) = stops.as_mut().poll(context) {
@@ -2189,6 +2010,181 @@ impl NetworkService {
         })
         .await;
         Ok(Some(stopped))
+    }
+    /// Publishes a fresh metrics snapshot on a fixed cadence (24 §23); the
+    /// admin socket and the loopback endpoint render the latest one, never
+    /// sampling on a caller's behalf.
+    async fn sample_on_cadence(&self) {
+        // Where each family's listing resumes, and what every session
+        // counted (the audit's F26); none when no page could list each
+        // family, and then no page is published.
+        let mut rounds =
+            crate::metrics::rounds::Rounds::new(&self.metrics_labels, self.budget.clone());
+        loop {
+            // A round has the cadence to observe its sessions: a slow
+            // or stuck owner costs its entry, never the round, and the
+            // next round starts on the cadence whatever this one took
+            // (the audit's F65). The text is rendered here, once. A
+            // round refused its room keeps the last page, whose sample
+            // time says its age, and the next page counts it.
+            let started = Instant::now();
+            if let Some(rounds) = rounds.as_mut() {
+                let page = match focal_rt::boxed(|| self.sample_metrics(started, rounds)).await {
+                    Ok(snapshot) => crate::metrics::MetricsPage::new(snapshot, &self.budget).ok(),
+                    Err(_) => None,
+                };
+                match page {
+                    Some(page) => {
+                        self.metrics.send_replace(Some(page));
+                    }
+                    None => rounds.refused(),
+                }
+            }
+            // A sleep refused (no wheel to keep it) ends the sampler, never spins it.
+            if focal_rt::time::sleep_until(
+                started
+                    .checked_add(crate::metrics::SAMPLE_INTERVAL)
+                    .unwrap_or(started),
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
+    /// The root group's tick period follows the round trips this node
+    /// measures to the group's other voters (27 §3.1 P2). A group inside
+    /// one period keeps the configured period; a far one is stretched so
+    /// its election timeout stays ten round-trip tails of its slowest
+    /// voter. While the root cannot be observed the last pace stands.
+    async fn pace(&self) {
+        loop {
+            if let Ok(observation) = self.handles.control.observe_root().await {
+                let local = self.status.node;
+                let paths: Vec<focal_timing::PathRtt> = observation
+                    .configuration()
+                    .configuration
+                    .voters
+                    .iter()
+                    .filter(|voter| **voter != local)
+                    .filter_map(|voter| self.pool.path(*voter))
+                    .collect();
+                self.handles.control.pace(paths.iter());
+                // What the root's commits wait on among its voters: how
+                // late each answers the group's messages, which it does
+                // once its owner has taken and persisted them, or the
+                // age of one still out where that is more (27 §8.4).
+                let voters = &observation.configuration().configuration.voters;
+                let tails: Vec<Duration> = voters
+                    .iter()
+                    .filter(|voter| **voter != local)
+                    .filter_map(|voter| self.pool.replication_lateness(*voter))
+                    .collect();
+                self.handles.control.quorum(tails, voters.len());
+            }
+            // Every hosted session paces itself by its own voters: a
+            // session whose voters are near keeps the configured period
+            // beside one whose voters are far.
+            let local = self.status.node;
+            let pace_session = |host: &ReplicaHost| {
+                let progress = host.progress();
+                let paths: Vec<focal_timing::PathRtt> = progress
+                    .voters
+                    .iter()
+                    .filter(|voter| **voter != local)
+                    .filter_map(|voter| self.pool.path(*voter))
+                    .collect();
+                host.pace(paths.iter());
+                // How late the session's other voters answer its
+                // messages (27 §8.4), as the root's.
+                let tails: Vec<Duration> = progress
+                    .voters
+                    .iter()
+                    .filter(|voter| **voter != local)
+                    .filter_map(|voter| self.pool.replication_lateness(*voter))
+                    .collect();
+                host.quorum(tails, progress.voters.len());
+                // And what each path holds in flight bounds the bytes
+                // a leader sends its peer ahead of its answers (27 §11):
+                // the voters, and the members the directory admitted,
+                // which a leader catches up before they vote.
+                let windows: Vec<(u64, u64, u64)> = progress
+                    .voters
+                    .iter()
+                    .chain(progress.admitted.iter())
+                    .filter(|peer| **peer != local)
+                    .filter_map(|peer| {
+                        Some((
+                            *peer,
+                            self.pool.window(*peer)?,
+                            self.pool.path(*peer)?.smoothed_ns(),
+                        ))
+                    })
+                    // A path nothing was measured on says nothing: the
+                    // peer keeps what it has.
+                    .filter(|(_, _, round_trip_ns)| *round_trip_ns > 0)
+                    .collect();
+                host.inflight_windows(windows);
+            };
+            if let Some(host) = &self.handles.ledger {
+                pace_session(host);
+            }
+            let mut after = None;
+            while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
+                pace_session(&host);
+                after = Some(ledger);
+                hyper_rt::futures::yield_now().await;
+            }
+            if focal_rt::time::sleep(Duration::from_secs(1)).await.is_err() {
+                return;
+            }
+        }
+    }
+    /// Says the node is ready once its founder's replica and partition serve with a known leader;
+    /// a host that runs no session says so at once. Then holds until the run ends.
+    async fn ready<R>(&self, on_status: &mut R) -> Result<(), ServiceError>
+    where
+        R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
+    {
+        if let Some(ledger) = &self.handles.ledger {
+            loop {
+                let peer = AuthenticatedPeer::local(PeerGrant {
+                    principal: signer_principal(self.authority.identity().cluster.0),
+                    tenants: BTreeSet::from([self.status.ledger.tenant]),
+                    role: PeerRole::Runtime,
+                })?;
+                if matches!(
+                    self.handles
+                        .control
+                        .read(peer, RequestId::from_u128(1), ControlRead::Membership)
+                        .await,
+                    Ok(ControlReadResult::Membership(_))
+                ) && {
+                    // The founder's replica is running with a known
+                    // leader: itself, or another voter of the group it
+                    // rejoined after a restart (it follows then, and its
+                    // local socket routes to the leader as any node's).
+                    let progress = ledger.progress();
+                    !progress.stopped && progress.leader != 0
+                } && self.handles.directory.host().is_some_and(|host| {
+                    // The partition's replica likewise: it leads, or it
+                    // follows a known leader among the voters the group
+                    // grew to (F24); readiness never requires leadership.
+                    let progress = host.progress();
+                    !progress.stopped && progress.applied_index > 0 && progress.leader != 0
+                }) {
+                    break;
+                }
+                focal_rt::time::sleep(Duration::from_millis(25)).await?;
+            }
+            let mut status = self.status.clone();
+            status.condition = "Ready";
+            on_status(&status)?;
+        } else {
+            on_status(&self.status)?;
+        }
+        std::future::pending::<Result<(), ServiceError>>().await
     }
 }
 /// A driver of the service's run, boxed beside the others it races, mapped to how its end ends

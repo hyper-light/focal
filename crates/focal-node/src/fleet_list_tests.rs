@@ -57,7 +57,7 @@ fn pump_sessions(sessions: &mut [Session]) {
 struct Fixture {
     _hosts: Vec<ReplicaHost>,
     owners: Vec<Owner>,
-    outgoing: Vec<async_mpsc::Receiver<ReplicationFrame>>,
+    outgoing: Vec<hyper_rt::sync::ChannelReceiver<ReplicationFrame>>,
 }
 impl Fixture {
     fn open(path: &std::path::Path) -> Self {
@@ -115,7 +115,7 @@ impl Fixture {
         for session in sessions {
             let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
             let (sender, _receiver) = mpsc::sync_channel(4);
-            let (outbound, outgoing) = async_mpsc::channel(128);
+            let (outbound, outgoing) = hyper_rt::sync::channel(128).unwrap();
             let (host, owner) = ReplicaHost::assemble(
                 session,
                 ReplicaConfig::new(identity().root),
@@ -138,7 +138,7 @@ impl Fixture {
         }
         let mut messages = Vec::new();
         for (sender, receiver) in self.outgoing.iter_mut().enumerate() {
-            while let Ok(frame) = receiver.try_recv() {
+            while let Ok(Some(frame)) = receiver.try_recv() {
                 messages.push((sender as u64 + 1, frame));
             }
         }
@@ -154,7 +154,11 @@ impl Fixture {
                 .unwrap();
         }
     }
-    fn request(&mut self, node: usize, list: ListRequest) -> oneshot::Receiver<OwnedResponse> {
+    fn request(
+        &mut self,
+        node: usize,
+        list: ListRequest,
+    ) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
         let request = RequestEnvelope {
             protocol: PROTOCOL_VERSION,
             ledger: identity().ledger,
@@ -170,7 +174,7 @@ impl Fixture {
             .reserve(BudgetKind::Query, BudgetLane::Ordinary, 4 * 1024 * 1024)
             .unwrap()
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
         owner.request(verified, send, charge, None, None);
         receive
     }
@@ -210,13 +214,13 @@ fn quorum_list_requires_fresh_barrier_and_continuations_keep_the_committed_prefi
         fixture.owners[0].drain().unwrap();
     }
     assert!(
-        matches!(first.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        matches!(first.try_recv(), Ok(None)),
         "a previously authoritative leader cannot answer a new list without a current quorum read"
     );
     for _ in 0..10 {
         fixture.pump();
     }
-    let first = listed(first.try_recv().unwrap());
+    let first = listed(first.try_recv().unwrap().unwrap());
     assert_eq!(first.objects.len(), 1);
     assert!(first.next.is_some());
     let prefix = first.token;
@@ -234,7 +238,7 @@ fn quorum_list_requires_fresh_barrier_and_continuations_keep_the_committed_prefi
     let mut count = 1;
     while continuation.cursor.is_some() {
         let mut response = fixture.request(0, continuation.clone());
-        let page = listed(response.try_recv().unwrap()); // exact pages need no new quorum exchange
+        let page = listed(response.try_recv().unwrap().unwrap()); // exact pages need no new quorum exchange
         assert_eq!(page.token, prefix);
         assert_eq!(page.objects.len(), 1);
         assert!(!matches!(page.objects[0],ReadObject::Claim{id,..} if id==ClaimId::from_u128(4)));
@@ -247,20 +251,17 @@ fn quorum_list_requires_fresh_barrier_and_continuations_keep_the_committed_prefi
     for _ in 0..3 {
         fixture.owners[0].drain().unwrap();
     }
-    assert!(matches!(
-        minority.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(minority.try_recv(), Ok(None)));
     fixture.owners[0].pending.front_mut().unwrap().deadline = 0;
     fixture.owners[0].expire_pending();
     assert!(matches!(
-        minority.try_recv().unwrap().into_envelope().result,
+        minority.try_recv().unwrap().unwrap().into_envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     assert!(fixture.owners[0].pending.is_empty());
     let mut follower = fixture.request(1, list());
     assert!(matches!(
-        follower.try_recv().unwrap().into_envelope().result,
+        follower.try_recv().unwrap().unwrap().into_envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     for owner in &mut fixture.owners {

@@ -1,6 +1,6 @@
 use super::*;
 
-fn read(fixture: &mut Fixture, id: u128) -> oneshot::Receiver<OwnedResponse> {
+fn read(fixture: &mut Fixture, id: u128) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let owner = &mut fixture.owners[0];
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -20,7 +20,7 @@ fn read(fixture: &mut Fixture, id: u128) -> oneshot::Receiver<OwnedResponse> {
         .reserve(BudgetKind::Query, BudgetLane::Completion, bound * 32 + 4096)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
@@ -33,13 +33,10 @@ fn monitor_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
     fixture.owners[0].config.pending_clients = 1;
     let mut first = read(&mut fixture, 1);
     fixture.owners[0].drain().unwrap();
-    assert!(matches!(
-        first.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(first.try_recv(), Ok(None)));
     let mut full = read(&mut fixture, 2);
     assert!(matches!(
-        full.try_recv().unwrap().envelope().result,
+        full.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Capacity)
     ));
     let held = fixture.owners[0].budget.stats().used;
@@ -51,7 +48,7 @@ fn monitor_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
     fixture.owners[0].pending.front_mut().unwrap().deadline = 0;
     fixture.owners[0].expire_pending();
     assert!(matches!(
-        expired.try_recv().unwrap().envelope().result,
+        expired.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     let mut routed = read(&mut fixture, 4);
@@ -60,7 +57,7 @@ fn monitor_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
         fixture.pump();
     }
     assert!(matches!(
-        routed.try_recv().unwrap().envelope().result,
+        routed.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     fixture.owners[0].config.route_epoch = RouteEpoch(1);
@@ -68,7 +65,7 @@ fn monitor_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
     for _ in 0..10 {
         fixture.pump();
     }
-    let reply = delivered.try_recv().unwrap();
+    let reply = delivered.try_recv().unwrap().unwrap();
     assert!(matches!(reply.envelope().result, Response::Monitor(_)));
     let held = fixture.owners[0].budget.stats().used;
     drop(reply);
@@ -77,7 +74,7 @@ fn monitor_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
     let mut stopped = read(&mut fixture, 6);
     fixture.owners[0].close();
     assert!(matches!(
-        stopped.try_recv().unwrap().envelope().result,
+        stopped.try_recv().unwrap().unwrap().envelope().result,
         Response::Error(AccessError::Unavailable)
     ));
     for owner in &mut fixture.owners {

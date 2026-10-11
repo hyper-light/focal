@@ -88,172 +88,176 @@ fn assert_read_denied(response: ResponseEnvelope) {
     );
 }
 
-#[tokio::test]
-async fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_revocation() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(directory.path().into());
-    settings.node.advertise = Some("127.0.0.1:7443".into());
-    let network = FoundingNetwork::open(&settings).await.unwrap();
-    let namespace = network.state.genesis.root_namespace;
-    let (registry, peer) = cached_peer(&network);
-    let revoke = revocation(&network);
-    let group = network.control.identity().group;
-    let mut message = focal_consensus::Message::default();
-    message.msg_type = focal_consensus::MessageType::MsgHeartbeatResponse;
-    message.from = network.directory.identity().node;
-    message.to = message.from;
-    message.term = network.control.status().term;
-    let raft_operation = Operation::Raft {
-        group,
-        message: focal_consensus::encode_message(&message).unwrap(),
-    };
-    // Both requests pass transport verification before revocation. The registry
-    // intentionally remains stale: only the owner sees the committed change.
-    let stale_raft = request(peer.clone(), namespace, 1, raft_operation.clone());
-    let stale_read = request(peer.clone(), namespace, 2, read_operation(group));
-    let (host, owner, _outgoing) = ControlHost::spawn(
-        network.control,
-        NoDirectoryAuthority,
-        ControlHostConfig::new(namespace),
-        network.budget.clone(),
-    )
-    .unwrap();
-    assert_eq!(
-        host.handle(&request(peer.clone(), namespace, 3, raft_operation))
-            .await
-            .result,
-        Response::PeerAccepted
-    );
-    assert!(matches!(
-        host.read(peer.clone(), RequestId::from_u128(4), ControlRead::State)
-            .await
-            .unwrap(),
-        ControlReadResult::State(_)
-    ));
-    let operator = AuthenticatedPeer::local(PeerGrant {
-        principal: ParticipantId(revoke.id.client),
-        tenants: BTreeSet::from([namespace.tenant]),
-        role: PeerRole::Runtime,
+#[test]
+fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_revocation() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(directory.path().into());
+        settings.node.advertise = Some("127.0.0.1:7443".into());
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        let namespace = network.state.genesis.root_namespace;
+        let (registry, peer) = cached_peer(&network);
+        let revoke = revocation(&network);
+        let group = network.control.identity().group;
+        let mut message = focal_consensus::Message::default();
+        message.msg_type = focal_consensus::MessageType::MsgHeartbeatResponse;
+        message.from = network.directory.identity().node;
+        message.to = message.from;
+        message.term = network.control.status().term;
+        let raft_operation = Operation::Raft {
+            group,
+            message: focal_consensus::encode_message(&message).unwrap(),
+        };
+        // Both requests pass transport verification before revocation. The registry
+        // intentionally remains stale: only the owner sees the committed change.
+        let stale_raft = request(peer.clone(), namespace, 1, raft_operation.clone());
+        let stale_read = request(peer.clone(), namespace, 2, read_operation(group));
+        let (host, owner, _outgoing) = ControlHost::spawn(
+            network.control,
+            NoDirectoryAuthority,
+            ControlHostConfig::new(namespace),
+            network.budget.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.handle(&request(peer.clone(), namespace, 3, raft_operation))
+                .await
+                .result,
+            Response::PeerAccepted
+        );
+        assert!(matches!(
+            host.read(peer.clone(), RequestId::from_u128(4), ControlRead::State)
+                .await
+                .unwrap(),
+            ControlReadResult::State(_)
+        ));
+        let operator = AuthenticatedPeer::local(PeerGrant {
+            principal: ParticipantId(revoke.id.client),
+            tenants: BTreeSet::from([namespace.tenant]),
+            role: PeerRole::Runtime,
+        })
+        .unwrap();
+        let receipt = host.submit(operator, revoke).await.unwrap();
+        assert!(receipt.committed_index > 0);
+        assert!(
+            registry
+                .authenticate(peer.certificate_fingerprint().unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            host.handle(&stale_raft).await.result,
+            Response::Error(AccessError::Unauthorized)
+        );
+        assert_read_denied(host.handle(&stale_read).await);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
     })
-    .unwrap();
-    let receipt = host.submit(operator, revoke).await.unwrap();
-    assert!(receipt.committed_index > 0);
-    assert!(
-        registry
-            .authenticate(peer.certificate_fingerprint().unwrap())
-            .is_ok()
-    );
-    assert_eq!(
-        host.handle(&stale_raft).await.result,
-        Response::Error(AccessError::Unauthorized)
-    );
-    assert_read_denied(host.handle(&stale_read).await);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
+    .unwrap()
 }
 
-#[tokio::test]
-async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(directory.path().into());
-    settings.node.advertise = Some("127.0.0.1:7443".into());
-    let network = FoundingNetwork::open(&settings).await.unwrap();
-    let namespace = network.state.genesis.root_namespace;
-    let (_registry, peer) = cached_peer(&network);
-    let revoke = revocation(&network);
-    let group = network.control.identity().group;
-    let status = network.control.status();
-    let (outbound, _outgoing) = async_mpsc::channel(32);
-    let (progress, _progress) = watch::channel(ControlProgressState {
-        value: ControlProgress {
-            identity: network.control.identity(),
-            node: status.node_id,
-            leader: status.leader_id,
-            term: status.term,
-            applied_index: network.control.applied_index(),
-            revisions: network.control.revisions(),
-            dropped_replication: 0,
-            peers_unreachable: 0,
+#[test]
+fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(directory.path().into());
+        settings.node.advertise = Some("127.0.0.1:7443".into());
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        let namespace = network.state.genesis.root_namespace;
+        let (_registry, peer) = cached_peer(&network);
+        let revoke = revocation(&network);
+        let group = network.control.identity().group;
+        let status = network.control.status();
+        let (outbound, _outgoing) = hyper_rt::sync::channel(32).unwrap();
+        let (progress, _progress) = watch::channel(ControlProgressState {
+            value: ControlProgress {
+                identity: network.control.identity(),
+                node: status.node_id,
+                leader: status.leader_id,
+                term: status.term,
+                applied_index: network.control.applied_index(),
+                revisions: network.control.revisions(),
+                dropped_replication: 0,
+                peers_unreachable: 0,
+                appends_rejected: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
+                stopped: false,
+                snapshot_index: 0,
+                peers: Vec::new(),
+                failure: None,
+            },
+            _allocation: None,
+        })
+        .unwrap();
+        let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
+        let mut owner = Owner {
+            stopping: None,
+            replica: network.control,
+            initial: None,
+            verifier: NoDirectoryAuthority,
+            config: ControlHostConfig::new(namespace),
+            limits: ControlHost::wire_limits(),
+            budget: network.budget.clone(),
+            pending: VecDeque::new(),
+            directory: None,
+            authority_refresh: None,
+            snapshot_feedback: Default::default(),
+            outbound,
+            progress,
+            nonce: 0,
+            dropped: 0,
+            ordered: std::collections::BTreeMap::new(),
+            resequencer: crate::resequence::Resequencer::new(
+                focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+                crate::fleet::LOST_PEERS,
+            ),
+            stepped: Vec::new(),
+            waiting_frames: std::collections::VecDeque::new(),
             appends_rejected: 0,
             frames_held: 0,
             frames_let_go: 0,
             frames_stale: 0,
-            peer_reports_coalesced: 0,
-            peer_reports_dropped: 0,
-            stopped: false,
-            snapshot_index: 0,
-            peers: Vec::new(),
+            took_turn: false,
+            unreachable: 0,
+            lost_sender: lost.0,
+            lost: lost.1,
+            lost_peers: Vec::new(),
+            lost_coalesced: 0,
+            lost_dropped: 0,
             failure: None,
-        },
-        _allocation: None,
-    });
-    let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
-    let mut owner = Owner {
-        stopping: None,
-        replica: network.control,
-        initial: None,
-        verifier: NoDirectoryAuthority,
-        config: ControlHostConfig::new(namespace),
-        limits: ControlHost::wire_limits(),
-        budget: network.budget.clone(),
-        pending: VecDeque::new(),
-        directory: None,
-        authority_refresh: None,
-        snapshot_feedback: Default::default(),
-        outbound,
-        progress,
-        nonce: 0,
-        dropped: 0,
-        ordered: std::collections::BTreeMap::new(),
-        resequencer: crate::resequence::Resequencer::new(
-            focal_consensus::DEFAULT_INFLIGHT_WINDOW,
-            crate::fleet::LOST_PEERS,
-        ),
-        stepped: Vec::new(),
-        waiting_frames: std::collections::VecDeque::new(),
-        appends_rejected: 0,
-        frames_held: 0,
-        frames_let_go: 0,
-        frames_stale: 0,
-        took_turn: false,
-        unreachable: 0,
-        lost_sender: lost.0,
-        lost: lost.1,
-        lost_peers: Vec::new(),
-        lost_coalesced: 0,
-        lost_dropped: 0,
-        failure: None,
-        pace: Default::default(),
-    };
-    let charge = owner
-        .budget
-        .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 8192)
-        .unwrap()
-        .commit();
-    let (reply, mut receive) = oneshot::channel();
-    owner.request(
-        request(peer, namespace, 1, read_operation(group)),
-        reply,
-        charge,
-    );
-    assert_eq!(owner.pending.len(), 1);
-    assert!(matches!(
-        receive.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
-    assert!(matches!(
-        owner
-            .replica
-            .submit(revoke.clone(), &NoDirectoryAuthority)
-            .unwrap(),
-        ControlSubmission::Pending(_)
-    ));
-    // Publish the revoke and the earlier read barrier in one owner turn. The
-    // result must check the newly published enrollment before it leaves.
-    owner.drain().unwrap();
-    assert!(owner.replica.receipt(revoke.id).unwrap().is_some());
-    assert!(owner.pending.is_empty());
-    assert_read_denied(receive.try_recv().unwrap().response);
+            pace: Default::default(),
+        };
+        let charge = owner
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 8192)
+            .unwrap()
+            .commit();
+        let (reply, mut receive) = hyper_rt::sync::oneshot().unwrap();
+        owner.request(
+            request(peer, namespace, 1, read_operation(group)),
+            reply,
+            charge,
+        );
+        assert_eq!(owner.pending.len(), 1);
+        assert!(matches!(receive.try_recv(), Ok(None)));
+        assert!(matches!(
+            owner
+                .replica
+                .submit(revoke.clone(), &NoDirectoryAuthority)
+                .unwrap(),
+            ControlSubmission::Pending(_)
+        ));
+        // Publish the revoke and the earlier read barrier in one owner turn. The
+        // result must check the newly published enrollment before it leaves.
+        owner.drain().unwrap();
+        assert!(owner.replica.receipt(revoke.id).unwrap().is_some());
+        assert!(owner.pending.is_empty());
+        assert_read_denied(receive.try_recv().unwrap().unwrap().response);
+    })
+    .unwrap()
 }

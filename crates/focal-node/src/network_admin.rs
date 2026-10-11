@@ -2372,70 +2372,76 @@ mod tests {
             AccessError::OutcomeUnknown
         );
     }
-    #[tokio::test]
-    async fn admin_rejects_remote_runtime_wrong_issuer_and_generic_control() {
-        let disk = tempfile::tempdir().unwrap();
-        let mut settings = Settings::default();
-        settings.node.data_dir = Some(disk.path().to_owned());
-        settings.node.advertise = Some("127.0.0.1:7443".into());
-        let network = FoundingNetwork::open(&settings).await.unwrap();
-        let budget = MemoryBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap();
-        let admin = LocalNetworkAdmin::new(
-            &network.directory,
-            network.state.genesis.root,
-            network.state.advertise,
-            network.enrollment.clone(),
-            budget.clone(),
-        )
-        .unwrap();
-        let request = AdminCommand::invitation("worker-2")
-            .unwrap()
-            .request(network.directory.identity())
+    #[test]
+    fn admin_rejects_remote_runtime_wrong_issuer_and_generic_control() {
+        focal_rt::block_on(async move {
+            let disk = tempfile::tempdir().unwrap();
+            let mut settings = Settings::default();
+            settings.node.data_dir = Some(disk.path().to_owned());
+            settings.node.advertise = Some("127.0.0.1:7443".into());
+            let network = FoundingNetwork::open(&settings).await.unwrap();
+            let budget = MemoryBudget::new(4 * 1024 * 1024, 1024 * 1024).unwrap();
+            let admin = LocalNetworkAdmin::new(
+                &network.directory,
+                network.state.genesis.root,
+                network.state.advertise,
+                network.enrollment.clone(),
+                budget.clone(),
+            )
             .unwrap();
-        let tenant = request.ledger.tenant;
-        let grant = |principal| PeerGrant {
-            principal,
-            tenants: BTreeSet::from([tenant]),
-            role: PeerRole::Runtime,
-        };
-        let mut wrong = network.directory.identity().issuer.0;
-        wrong[0] ^= 1;
-        let local = AuthenticatedPeer::local(grant(ParticipantId(wrong))).unwrap();
-        assert_eq!(
-            admin
-                .handle(&verify_request(local, request.clone(), &admin_wire_limits()).unwrap())
-                .await
-                .result,
-            Response::Error(AccessError::Unauthorized)
-        );
-        let peers = PeerRegistry::new(1).unwrap();
-        let certificate = &network.credentials.certificate_chain()[0];
-        let fingerprint = peers
-            .register_certificate(certificate, grant(network.directory.identity().issuer))
-            .unwrap();
-        let remote = peers.authenticate(fingerprint).unwrap();
-        assert_eq!(
-            admin
-                .handle(&verify_request(remote, request.clone(), &admin_wire_limits()).unwrap())
-                .await
-                .result,
-            Response::Error(AccessError::Unauthorized)
-        );
-        let mut wrong_command = request;
-        if let Operation::Control { request, .. } = &mut wrong_command.operation {
-            *request = vec![1, 0];
-        }
-        let local = AuthenticatedPeer::local(grant(network.directory.identity().issuer)).unwrap();
-        let response = admin
-            .handle_accounted(&verify_request(local, wrong_command, &admin_wire_limits()).unwrap())
-            .await;
-        assert!(budget.stats().used > 0);
-        assert!(budget.stats().used < WORKSPACE);
-        assert_eq!(
-            response.envelope().result,
-            Response::Error(AccessError::InvalidRequest)
-        );
-        drop(response);
-        assert_eq!(budget.stats().used, 0);
+            let request = AdminCommand::invitation("worker-2")
+                .unwrap()
+                .request(network.directory.identity())
+                .unwrap();
+            let tenant = request.ledger.tenant;
+            let grant = |principal| PeerGrant {
+                principal,
+                tenants: BTreeSet::from([tenant]),
+                role: PeerRole::Runtime,
+            };
+            let mut wrong = network.directory.identity().issuer.0;
+            wrong[0] ^= 1;
+            let local = AuthenticatedPeer::local(grant(ParticipantId(wrong))).unwrap();
+            assert_eq!(
+                admin
+                    .handle(&verify_request(local, request.clone(), &admin_wire_limits()).unwrap())
+                    .await
+                    .result,
+                Response::Error(AccessError::Unauthorized)
+            );
+            let peers = PeerRegistry::new(1).unwrap();
+            let certificate = &network.credentials.certificate_chain()[0];
+            let fingerprint = peers
+                .register_certificate(certificate, grant(network.directory.identity().issuer))
+                .unwrap();
+            let remote = peers.authenticate(fingerprint).unwrap();
+            assert_eq!(
+                admin
+                    .handle(&verify_request(remote, request.clone(), &admin_wire_limits()).unwrap())
+                    .await
+                    .result,
+                Response::Error(AccessError::Unauthorized)
+            );
+            let mut wrong_command = request;
+            if let Operation::Control { request, .. } = &mut wrong_command.operation {
+                *request = vec![1, 0];
+            }
+            let local =
+                AuthenticatedPeer::local(grant(network.directory.identity().issuer)).unwrap();
+            let response = admin
+                .handle_accounted(
+                    &verify_request(local, wrong_command, &admin_wire_limits()).unwrap(),
+                )
+                .await;
+            assert!(budget.stats().used > 0);
+            assert!(budget.stats().used < WORKSPACE);
+            assert_eq!(
+                response.envelope().result,
+                Response::Error(AccessError::InvalidRequest)
+            );
+            drop(response);
+            assert_eq!(budget.stats().used, 0);
+        })
+        .unwrap()
     }
 }

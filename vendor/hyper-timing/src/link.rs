@@ -1014,8 +1014,9 @@ impl LinkEstimator {
         }
     }
 
-    /// What a probe detector's configurator is fed (Theorem 7's product, `qos::detector_at`;
-    /// hyper-swim's): the loss `p = 1 − (1 − p_L)(1 − 1/(m + 1))` over the history's `m`
+    /// What a probe detector's configurator is fed (hyper-swim's, through the per-arrival
+    /// configurator with the round trip's lateness from its mean): the loss
+    /// `p = 1 − (1 − p_L)(1 − 1/(m + 1))` over the history's `m`
     /// independent heartbeats, the mean delay (zero where the sender's schedule is unknown: Chen et
     /// al.'s NFD-E bound on detection is then past `E(D)`, and the configured interval and margin do
     /// not depend on it) and the deviation of the prediction errors.

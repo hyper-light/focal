@@ -53,10 +53,7 @@ pub(crate) struct ContractFilters {
     #[command(flatten)]
     output: OutputOptions,
 }
-pub(super) async fn run(
-    context: &Context,
-    command: ValidatorCommand,
-) -> Result<()> {
+pub(super) async fn run(context: &Context, command: ValidatorCommand) -> Result<()> {
     let (id, version, filters, exact) = match command {
         ValidatorCommand::List {
             id,
@@ -85,8 +82,9 @@ pub(super) async fn run(
     }
     .build(&context.build, exact)?;
     let page = context
-            .client
-            .validators(context.envelope(Operation::Validators(query.clone()))?).await?;
+        .client
+        .validators(context.envelope(Operation::Validators(query.clone()))?)
+        .await?;
     match filters.output.format {
         OutputFormat::Json | OutputFormat::Yaml => {
             #[derive(serde::Serialize)]

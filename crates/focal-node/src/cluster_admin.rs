@@ -11,7 +11,7 @@ use focal_client::admin::{
 };
 use focal_control::*;
 use focal_enrollment::PrivateJournal;
-use focal_wire::{AccessError, Response, LocalRemote, WireError};
+use focal_wire::{AccessError, LocalRemote, Response, WireError};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -1401,7 +1401,9 @@ impl ClusterAdmin {
                 });
             }
             waited = waited.saturating_add(1);
-            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::sleep(REMOVE_DRAIN_POLL)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
             placement = self.placement_view().await?;
         }
         let mut record = None;
@@ -1621,7 +1623,9 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::sleep(REMOVE_DRAIN_POLL)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
         }
         Err(ClusterAdminError::LeaderLeaving(leaving))
     }
@@ -1669,7 +1673,9 @@ impl ClusterAdmin {
                     Err(error) => return Err(error),
                 }
             }
-            focal_rt::time::pause(REMOVE_DRAIN_POLL).await;
+            focal_rt::time::sleep(REMOVE_DRAIN_POLL)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
         }
         let AdminResult::Membership { leader, .. } = self.read(AdminRead::Membership).await? else {
             return Err(ClusterAdminError::Invalid);

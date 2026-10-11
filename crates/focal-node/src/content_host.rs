@@ -1,5 +1,5 @@
 //! One bounded disk owner per node, shared by every installed session policy.
-//! Async calls require a Tokio runtime with IO and time drivers enabled.
+//! Async calls run on a hyper-rt shard.
 use crate::custody::{
     Accounted, CustodyConfig, CustodyPolicy, CustodyScope, CustodyStore, Pass, RestoreAsk, Step,
     content_error,
@@ -10,6 +10,7 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
 use futures_util::FutureExt;
+use hyper_rt::sync::OneshotSender;
 use std::{
     future::Future,
     pin::Pin,
@@ -17,7 +18,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use hyper_rt::sync::OneshotSender;
 
 /// The slices a pass over a whole object takes at most (the audit's F51): a
 /// chunk each of as many as a manifest names — thirty-three bytes a chunk at

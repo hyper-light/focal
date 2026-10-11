@@ -378,7 +378,7 @@ impl CommonState {
                         error!(
                             "traffic keys exhausted, closing connection to prevent security failure"
                         );
-                        self.send_close_notify();
+                        self.close_on_exhausted_keys();
                         return;
                     }
                 }
@@ -583,6 +583,26 @@ impl CommonState {
         self.send_close_notify();
         self.check_required_size(outgoing_tls, [].into_iter())?;
         self.write_fragments(outgoing_tls, [].into_iter())
+    }
+
+    /// Queues a `close_notify` warning alert where the traffic keys ran out, as
+    /// [`Self::send_close_notify`] does but through the alert branch of
+    /// [`Self::send_single_fragment`] directly: the close never re-enters the send path that asked
+    /// for it, so sending is not recursive. Only an encrypting connection runs out of keys, and an
+    /// alert is one record of two bytes, under any fragment's size. Nothing is queued once a
+    /// `close_notify` or a fatal alert was sent.
+    fn close_on_exhausted_keys(&mut self) {
+        if self.sent_fatal_alert {
+            return;
+        }
+        debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
+        self.sent_fatal_alert = true;
+        self.has_sent_close_notify = true;
+        let alert = PlainMessage::from(Message::build_alert(
+            AlertLevel::Warning,
+            AlertDescription::CloseNotify,
+        ));
+        self.encrypt_and_queue(alert.borrow_outbound());
     }
 
     fn send_warning_alert_no_log(&mut self, desc: AlertDescription) {

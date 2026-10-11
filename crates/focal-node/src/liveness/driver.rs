@@ -1008,15 +1008,13 @@ impl LivenessDriver {
         let timeout = Duration::from_millis(self.config.timeout_cap_ms);
         let envelope = self.envelope(body);
         let pushed = inflight.push_pinned(Box::pin(async move {
-            let result = match focal_rt::time::timeout(
-                timeout,
-                pool.probe_at(target, address, &envelope),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(PeerSendError::Lost),
-            };
+            let result =
+                match focal_rt::time::timeout(timeout, pool.probe_at(target, address, &envelope))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(PeerSendError::Lost),
+                };
             Done::Confirm {
                 node: target,
                 address,

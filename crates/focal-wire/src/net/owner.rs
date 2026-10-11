@@ -597,7 +597,12 @@ impl Owner {
                     .driver
                     .endpoint()
                     .set_tls(*tls)
-                    .map_err(|_| WireError::Authentication);
+                    // The endpoint's configuration slots full is its capacity reached, not a
+                    // credential refused; anything else is the TLS the caller built.
+                    .map_err(|refusal| match refusal {
+                        Refusal::Quic => WireError::Access(AccessError::Capacity),
+                        _ => WireError::Authentication,
+                    });
                 let _ = reply.send(set);
             }
             Command::Stats { reply } => {

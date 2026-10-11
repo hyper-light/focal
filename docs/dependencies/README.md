@@ -1,6 +1,6 @@
 # Dependency review
 
-The [inventory](inventory.tsv) records all 286 external packages from `cargo metadata --format-version 1 --locked --offline` on 2026-10-05, including build, development, and target-conditional dependencies. Every package declares license metadata. `Cargo.lock` is the reproducibility authority; refresh this inventory when dependencies change.
+The [inventory](inventory.tsv) records all 291 external packages from `cargo metadata --format-version 1 --locked --offline` on 2026-10-10, including build, development, and target-conditional dependencies. Every package declares license metadata. `Cargo.lock` is the reproducibility authority; refresh this inventory when dependencies change.
 
 The full `cargo-deny` 0.20.2 check passed on 2026-09-05 against the fetched RustSec database and [repository policy](../../deny.toml), targeting arm64 macOS and x86-64 Linux: zero advisory, ban, license, or source errors. Ten duplicate-version warnings remain. No advisories are suppressed. Repeat with `cargo deny check advisories bans licenses sources`; this remains a blocking CI gate.
 
@@ -13,6 +13,17 @@ The initial deprecated `serde_yaml` adapter was replaced with `serde-saphyr` 1.2
 Code mode (2026-10-04, [07](../archictecutre/07-decisions-and-traceability.md) F59) adds `rquickjs` 0.14.0 with `rquickjs-core` and `rquickjs-sys` (QuickJS-NG 0.16.2, C, compiled by `cc` from the crate's own sources with pre-generated bindings for all eight release targets, so no `bindgen` at build time), and through `rquickjs-core`'s `hashbrown` the packages `allocator-api2` and `foldhash`. `relative-path` is locked but built for no focal target. All are MIT, MIT OR Apache-2.0 or Zlib. Only the `std` feature is enabled: no loader, no `parallel`, no futures integration. `cargo deny check advisories bans licenses sources` passed with them.
 
 The comparison generator `tools/compare` (2026-10-04, [competitive p99 plan](../qualification/competitive-p99.md)) drives each competitor through its canonical client: `async-nats` 0.50 (with `aws-lc-rs`, never `ring`), `rdkafka` 0.39 over librdkafka 2.12.1 built from `rdkafka-sys`'s vendored source (no TLS, SASL or compression features; by its autotools build, and on Windows, which cannot run that shell script, by its CMake build), `redis` 1.7 and `hdrhistogram` 7.6. They add 75 external packages, all built into that tool alone and into no focal executable (`cargo tree -p focal-node --target all` contains none of them). Among them are `rustls-native-certs`, `security-framework`, `schannel`, `openssl-probe` and `webpki-roots` (CDLA-Permissive-2.0, locked through `async-nats`'s optional features and built for no focal target), which focal's own binaries still leave out: focal pins invitation CAs and never reads a platform trust store. The license policy carries its one exception for them: `xxhash-rust` 0.8.19 is BSL-1.0 (OSI approved, FSF free, no notice required for binaries) and an unconditional dependency of `redis`, so `deny.toml` allows BSL-1.0 for that crate alone rather than for the graph. `cargo deny check advisories bans licenses sources` passed on 2026-10-05 with four duplicate-version warnings (`getrandom`, `syn`, `synstructure`, `untrusted`).
+
+Since 2026-10-10 focal runs on hyper-rt and talks over hyper-transport, hyper-quic and hyper-tls, vendored from the shared repository like the consensus crates (`vendor/README.md`; all thirteen `hyper-*` crates at one revision).
+- `tokio`, `quinn`, `quinn-proto`, `quinn-udp` and crates.io's `rustls` are in no focal crate's graph: `cargo tree -p focal-node --target all -i <crate>` matches none of them, and the same holds for `focal-load`.
+- `tokio` stays in the lockfile for `tools/compare` alone, the never-shipped generator whose competitors' canonical clients (`async-nats`, `redis`) run on it. `rustls` stays through `async-nats`.
+- The transport crates bring:
+  - `brotli` and `zlib-rs`, hyper-tls's certificate compression (BSD-3-Clause AND MIT, and Zlib).
+  - `fastbloom` with `siphasher` and `libm`, hyper-quic's address-validation token log.
+- hyper-quic is built without its `qlog` feature. `qlog` turns on serde_json's `preserve_order` for the whole build, and every serde_json map in focal then iterated in insertion order rather than sorted. focal's schemas, output and canonical documents are written against sorted maps, and the CLI suite caught the change. So `qlog` and what it brings (`serde_with`, `darling`) are in no focal build (the shared crate's VENDORED.md §20).
+- `terminal_size` came separately, with `focal-tui`.
+- `quinn`'s `wasm-bindgen` family, `web-time`, `js-sys`, `bumpalo` and `cfg_aliases` left the lockfile with it.
+- `cargo deny check advisories bans licenses sources` passed on 2026-10-10 with four duplicate-version warnings (`getrandom`, `syn`, `synstructure`, `untrusted`).
 
 The license policy checks declared permissive expressions and detected license text. The inventory is not a distribution notice bundle or a legal review. Release-specific notices and binary/source distribution qualification remain unfinished; no release certification is implied by passing this audit.
 

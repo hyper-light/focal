@@ -83,6 +83,7 @@ pub use config::{
     ServerConfig, ServerConfigHandle, StdSystemTime, TimeSource, TransportConfig,
     ValidationTokenConfig,
 };
+#[cfg(feature = "qlog")]
 pub use config::{QlogConfig, QlogError};
 
 pub mod crypto;

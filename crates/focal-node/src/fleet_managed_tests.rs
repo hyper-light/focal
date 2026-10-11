@@ -33,10 +33,16 @@ fn register() -> RequestEnvelope {
         },
     }
 }
-fn assemble(session: Session) -> (Owner, async_mpsc::Receiver<ReplicationFrame>, MemoryBudget) {
+fn assemble(
+    session: Session,
+) -> (
+    Owner,
+    hyper_rt::sync::ChannelReceiver<ReplicationFrame>,
+    MemoryBudget,
+) {
     let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
     let (sender, _receiver) = mpsc::sync_channel(4);
-    let (outbound, outgoing) = async_mpsc::channel(32);
+    let (outbound, outgoing) = hyper_rt::sync::channel(32).unwrap();
     let (_, mut owner) = ReplicaHost::assemble(
         session,
         ReplicaConfig::new(RootCommandId::from_u128(814)),
@@ -71,7 +77,7 @@ fn support(owner: &mut Owner) -> Result<ManagedSupportReply, LedgerError> {
         .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.accept_managed_support(
         SupportCall {
             received: None,
@@ -133,7 +139,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
         .unwrap()
         .commit();
-    let (send, mut receive) = oneshot::channel();
+    let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
     owner
         .accept(Work::Request(
             Box::new(AdmittedRequest {
@@ -148,10 +154,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
     assert!(owner.session.persistence_pending());
     assert!(owner.session.managed_support_demanded());
     assert_eq!(owner.deferred_managed.len(), 1);
-    assert!(matches!(
-        receive.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(receive.try_recv(), Ok(None)));
     assert!(matches!(
         owner.session.managed_support(),
         Err(LedgerError::Consensus(
@@ -173,7 +176,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
         .unwrap()
         .commit();
-    let (send, mut expired) = oneshot::channel();
+    let (send, mut expired) = hyper_rt::sync::oneshot().unwrap();
     owner
         .accept(Work::Request(
             Box::new(AdmittedRequest {
@@ -189,7 +192,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
     owner.progress_managed().unwrap();
     assert!(owner.session.persistence_pending());
     assert!(owner.deferred_managed.is_empty());
-    let response = expired.try_recv().unwrap();
+    let response = expired.try_recv().unwrap().unwrap();
     assert!(matches!(
         response.envelope().result,
         Response::Error(AccessError::OutcomeUnknown)
@@ -281,7 +284,7 @@ fn trusted_membership_nominates_real_joining_decoder_and_waits_for_fact() {
         .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
         .unwrap()
         .commit();
-    let (send, mut receive) = oneshot::channel();
+    let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
     owner.accept_membership(
         MembershipCall {
             request: Some(request.clone()),
@@ -312,15 +315,15 @@ fn trusted_membership_nominates_real_joining_decoder_and_waits_for_fact() {
     let mut wait = on_writes(&owner);
     loop {
         owner.drain().unwrap();
-        while outgoing.try_recv().is_ok() {}
+        while outgoing.try_recv().is_ok_and(|item| item.is_some()) {}
         match receive.try_recv() {
-            Ok(Ok(reply)) => {
+            Ok(Some(Ok(reply))) => {
                 assert_eq!(reply.view().configuration.learners, [2]);
                 drop(reply);
                 break;
             }
-            Ok(Err(error)) => panic!("{error:?}"),
-            Err(oneshot::error::TryRecvError::Empty) => {}
+            Ok(Some(Err(error))) => panic!("{error:?}"),
+            Ok(None) => {}
             Err(error) => panic!("{error:?}"),
         };
         if let Err(spent) = wait.check(&[writes(&owner)]) {
@@ -389,7 +392,7 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
         settle(&mut leader);
         leader.tick().unwrap();
         settle(&mut leader);
-        while let Ok(frame) = outgoing.try_recv() {
+        while let Ok(Some(frame)) = outgoing.try_recv() {
             let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
                 &frame.request.operation
             else {
@@ -412,7 +415,7 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
                 floor_rejected = true;
             }
         }
-        while let Ok(frame) = replies.try_recv() {
+        while let Ok(Some(frame)) = replies.try_recv() {
             let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
                 &frame.request.operation
             else {
@@ -484,7 +487,7 @@ fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission
         .reserve(BudgetKind::Pending, BudgetLane::Completion, 256 * 1024)
         .unwrap()
         .commit();
-    let (send, mut receive) = oneshot::channel();
+    let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
     let max_frame = owner.limits.max_frame_bytes;
     if force_admission {
         owner.limits.max_frame_bytes = 1;
@@ -503,7 +506,7 @@ fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission
     // Keep the transport admission restriction through async Ready completion.
     settle(owner);
     owner.limits.max_frame_bytes = max_frame;
-    let reply = receive.try_recv().unwrap();
+    let reply = receive.try_recv().unwrap().unwrap();
     let accepted = matches!(reply.envelope().result, Response::PeerAccepted);
     frame.report_snapshot(accepted);
     accepted
@@ -546,10 +549,10 @@ fn a_learner_added_past_the_snapshot_is_seeded_whoever_made_the_change() {
         settle(&mut leader);
         leader.tick().unwrap();
         settle(&mut leader);
-        while let Ok(frame) = outgoing.try_recv() {
+        while let Ok(Some(frame)) = outgoing.try_recv() {
             deliver_frame(&mut learner, frame, false);
         }
-        while let Ok(frame) = replies.try_recv() {
+        while let Ok(Some(frame)) = replies.try_recv() {
             deliver_frame(&mut leader, frame, false);
         }
         settle(&mut learner);
@@ -583,7 +586,7 @@ fn a_learner_added_past_the_snapshot_is_seeded_whoever_made_the_change() {
     for _ in 0..4 {
         settle(&mut leader);
         leader.tick().unwrap();
-        while outgoing.try_recv().is_ok() {}
+        while outgoing.try_recv().is_ok_and(|item| item.is_some()) {}
     }
     assert!(leader.session.configuration_index() > refreshed);
     assert_eq!(leader.session.snapshot_index(), refreshed);
@@ -616,7 +619,7 @@ fn a_lost_peer_reported_while_a_write_persists_is_told_next_period() {
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
         .unwrap()
         .commit();
-    let (send, _receive) = oneshot::channel();
+    let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
     owner
         .accept(Work::Request(
             Box::new(AdmittedRequest {
@@ -659,7 +662,7 @@ fn lost_peers_are_held_each_once_and_told_when_the_core_can_be() {
         .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
         .unwrap()
         .commit();
-    let (send, _receive) = oneshot::channel();
+    let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
     owner
         .accept(Work::Request(
             Box::new(AdmittedRequest {

@@ -579,9 +579,9 @@ impl<T: ClientTransport> Client<T> {
             )
         });
         let mut write_uncertain = false;
-        // A missing Tokio driver or a transport dependency failure must not
-        // unwind through an SDK caller. After entering a mutation exchange,
-        // failure cannot establish that no bytes reached the authority.
+        // A dependency's panic must not unwind through an SDK caller. After
+        // entering a mutation exchange, failure cannot establish that no bytes
+        // reached the authority.
         let result = {
             let mut exchange =
                 std::pin::pin!(self.request_inner(&mut request, &mut write_uncertain));

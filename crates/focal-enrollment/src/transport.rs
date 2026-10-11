@@ -32,10 +32,11 @@ pub const ENROLLMENT_PROTOCOL: EnrollmentProtocol = EnrollmentProtocol {
     alpn: ENROLLMENT_ALPN,
     max_message_bytes: 16 * 1024,
 };
-/// A redemption's kind on the enrollment protocol.
-const JOIN: u8 = 1;
+/// A redemption's kind on the enrollment protocol: its message a [`JoinRequest`], its answer a
+/// [`JoinResponse`].
+pub const JOIN: u8 = 1;
 /// A renewal's kind on the enrollment protocol.
-const RENEW: u8 = 3;
+pub const RENEW: u8 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TransportLimits {

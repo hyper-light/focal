@@ -142,10 +142,7 @@ fn existing(context: &Context) -> Result<Option<UploadStore>> {
     }
     Ok(None)
 }
-pub(super) async fn artifact(
-    context: &Context,
-    mut args: ArtifactArgs,
-) -> Result<()> {
+pub(super) async fn artifact(context: &Context, mut args: ArtifactArgs) -> Result<()> {
     let path = args
         .payload_file
         .take()
@@ -160,16 +157,9 @@ pub(super) async fn artifact(
     args.text = Some(String::new());
     let (mut document, options) = documents::artifact(args)?;
     document.payload = PayloadDocument::Inline { bytes: Vec::new() };
-    large(context,
-        source,
-        Document::Attach(document),
-        options,
-    ).await
+    large(context, source, Document::Attach(document), options).await
 }
-pub(super) async fn register(
-    context: &Context,
-    mut args: RegisterArtifactArgs,
-) -> Result<()> {
+pub(super) async fn register(context: &Context, mut args: RegisterArtifactArgs) -> Result<()> {
     let path = args
         .payload_file
         .take()
@@ -189,11 +179,7 @@ pub(super) async fn register(
         return Err(CliError::InvalidResponse);
     };
     document.payload = PayloadDocument::Inline { bytes: Vec::new() };
-    large(context,
-        source,
-        Document::Register(document),
-        options,
-    ).await
+    large(context, source, Document::Register(document), options).await
 }
 async fn large(
     context: &Context,
@@ -206,9 +192,7 @@ async fn large(
     let identity = if let Some(path) = &options.operation {
         Identity::Legacy(path_bytes(path))
     } else {
-        Identity::Managed(managed::reserve_for_submission(context,
-            &mut options,
-        ).await?)
+        Identity::Managed(managed::reserve_for_submission(context, &mut options).await?)
     };
     let attachment = Attachment {
         version: 2,
@@ -352,11 +336,7 @@ async fn finish(
     drop(journal);
     Ok((attachment.document, options))
 }
-async fn submit(
-    context: &Context,
-    document: Document,
-    options: MutationOptions,
-) -> Result<()> {
+async fn submit(context: &Context, document: Document, options: MutationOptions) -> Result<()> {
     let authored = document.authored();
     if options.operation.is_none() {
         return managed::submit(context, authored, options).await;
@@ -415,11 +395,7 @@ pub(super) async fn resume_legacy(
     }
     resume(context, Identity::Legacy(path_bytes(path)), format).await
 }
-async fn resume(
-    context: &Context,
-    identity: Identity,
-    format: OutputFormat,
-) -> Result<bool> {
+async fn resume(context: &Context, identity: Identity, format: OutputFormat) -> Result<bool> {
     let Some(store) = existing(context)? else {
         return Ok(false);
     };

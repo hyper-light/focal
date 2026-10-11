@@ -6,11 +6,16 @@
 //! lent it by the endpoint.
 //!
 //! The endpoint counts the connections and incoming attempts on each slot. That count is
-//! bookkeeping, not ownership: it rises when a connection or attempt is created and falls on the
-//! connection's `Drained` event or when the attempt is accepted, refused, retried or ignored. A
-//! configuration that has been superseded (replaced as the server configuration, or retired by the
-//! application) is reclaimed once its count reaches zero, so a rotation costs memory only while
-//! the connections started under the old configuration live.
+//! bookkeeping, not ownership: it rises when a connection or attempt is created and falls when the
+//! attempt is accepted, refused, retried or ignored, when a server connection's handshake completes
+//! (nothing after it needs the configuration it was accepted under: its tickets were made in the
+//! handshake, and a token it issues later is sealed under the current configuration, which is the
+//! one that validates it), and when a client connection drains (its configuration stores the
+//! tickets its server sends after the handshake). A configuration that has been superseded
+//! (replaced as the server configuration, or retired by the application) is reclaimed once its
+//! count reaches zero: a replaced server configuration lives no longer than the handshakes begun
+//! under it, however long the connections it accepted live, and a retired client configuration as
+//! long as the connections made with it.
 
 use std::num::NonZeroUsize;
 
@@ -21,13 +26,16 @@ use crate::crypto::SessionConfig;
 
 /// The number of configuration slots an endpoint has unless configured otherwise
 ///
-/// Derived, not measured: an endpoint holds at most one current configuration per side (server and
-/// client) and, during a rotation, the one it replaced, whose connections are still draining.
-/// Rotation is driven by certificate renewal, measured in days (Let's Encrypt's short-lived
-/// certificates last 6 days; CA/B Forum ballot SC-081 caps lifetimes at 47 days by 2029), far
-/// longer than a connection's idle timeout, so a third generation does not overlap the first.
-/// Two sides × two generations = 4. An application that keeps more configurations alive at once
-/// raises it through [`EndpointConfig::config_slots`](super::EndpointConfig::config_slots).
+/// Derived, not measured: an endpoint holds one current configuration per side (server and
+/// client) and, while it replaces one, the replacement. A replaced server configuration is held
+/// only by the handshakes begun under it, so it is gone within a handshake's lifetime; a retired
+/// client configuration is held by the connections made with it, which an application replacing
+/// its identity retires (they authenticated as an identity it no longer holds). Two sides × two
+/// generations = 4 serves an endpoint that replaces a configuration less often than that. One
+/// that may replace sooner, or keeps a client's connections across replacements, sets the bound
+/// from what it holds through [`EndpointConfig::config_slots`](super::EndpointConfig::config_slots):
+/// every replaced configuration still held has an incoming attempt, a handshake or a client's
+/// connection holding it.
 pub(crate) const DEFAULT_CONFIG_SLOTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(3);
 
 /// The configurations an endpoint and its connections share
@@ -37,6 +45,9 @@ pub(crate) const DEFAULT_CONFIG_SLOTS: NonZeroUsize = NonZeroUsize::MIN.saturati
 pub struct Configs {
     slots: Vec<Slot>,
     capacity: NonZeroUsize,
+    /// The configuration new incoming connections are accepted under, and whose token key seals
+    /// the address validation tokens a server's connections issue
+    current_server: Option<ServerConfigHandle>,
 }
 
 struct Slot {
@@ -102,7 +113,36 @@ impl Configs {
         Self {
             slots: Vec::new(),
             capacity,
+            current_server: None,
         }
+    }
+
+    /// The configuration new incoming connections are accepted under
+    pub(crate) fn current_server(&self) -> Option<ServerConfigHandle> {
+        self.current_server
+    }
+
+    /// The configuration new incoming connections are accepted under, whose token key seals the
+    /// address validation tokens a server issues: a later connection is validated under it
+    pub fn current_server_config(&self) -> Option<&ServerConfig> {
+        self.server_config(self.current_server?)
+    }
+
+    /// Make `config` the configuration new incoming connections are accepted under, or accept
+    /// none, superseding the one it replaces; refused with [`ConfigsFull`] when every slot holds a
+    /// configuration still in use, the current one then kept
+    pub(crate) fn set_current_server(
+        &mut self,
+        config: Option<ServerConfig>,
+    ) -> Result<(), ConfigsFull> {
+        let new = match config {
+            Some(config) => Some(self.insert_server(config)?),
+            None => None,
+        };
+        if let Some(old) = std::mem::replace(&mut self.current_server, new) {
+            self.supersede(old.0);
+        }
+        Ok(())
     }
 
     /// The number of configurations held, current or superseded

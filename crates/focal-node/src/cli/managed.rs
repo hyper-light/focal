@@ -90,10 +90,7 @@ fn find(context: &Context, id: ManagedOperationId) -> Result<ManagedRequests> {
     }
     retired.ok_or_else(|| ManagedStoreError::Missing.into())
 }
-async fn maintain(
-    context: &Context,
-    requests: &ManagedRequests,
-) -> Result<()> {
+async fn maintain(context: &Context, requests: &ManagedRequests) -> Result<()> {
     // Slot discovery and exact pending controls are bounded by the coordinator;
     // cap total exchanges as an additional foreground operation budget.
     for _ in 0..4096 {
@@ -180,11 +177,7 @@ fn deferred(error: &CliError) {
         "Receipt cleanup deferred: {error}. Saved recovery remains available."
     );
 }
-async fn delivered(
-    context: &Context,
-    requests: &ManagedRequests,
-    id: ManagedOperationId,
-) {
+async fn delivered(context: &Context, requests: &ManagedRequests, id: ManagedOperationId) {
     let maintained = match requests.mark_delivered(id).map_err(other) {
         Ok(_) => maintain(context, requests).await,
         Err(error) => Err(error),
@@ -240,11 +233,10 @@ pub(super) async fn submit(
                     context,
                     id,
                     Recovery::Reserved,
-                    context.client.claim_revision(
-                            context.build.ledger,
-                            claim,
-                            id.key(context.operation).id,
-                        ).await
+                    context
+                        .client
+                        .claim_revision(context.build.ledger, claim, id.key(context.operation).id)
+                        .await
                         .map_err(CliError::from)
                         .and_then(|revision| {
                             revision
@@ -302,12 +294,7 @@ pub(super) async fn submit(
         context,
         id,
         Recovery::Retry,
-        drive(context,
-            &requests,
-            &store,
-            id,
-            options.output.format,
-        ).await,
+        drive(context, &requests, &store, id, options.output.format).await,
     )
 }
 async fn drive(
@@ -322,8 +309,10 @@ async fn drive(
         None => {
             let prepared = store.request(id)?;
             match context
-                    .client
-                    .submit_managed_outcome(prepared.request, context.operation).await {
+                .client
+                .submit_managed_outcome(prepared.request, context.operation)
+                .await
+            {
                 Ok(focal_client::ManagedSubmitOutcome::Committed(reply)) => {
                     store.record_receipt(id, &reply.receipt)?;
                     reply.receipt
@@ -366,11 +355,7 @@ async fn show_receipt(
     delivered(context, requests, id).await;
     Ok(())
 }
-pub(super) async fn retry(
-    context: &Context,
-    text: &str,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn retry(context: &Context, text: &str, format: OutputFormat) -> Result<()> {
     let id = text.parse()?;
     let requests = find(context, id)?;
     let store = recovering(
@@ -441,8 +426,9 @@ pub(super) async fn inspect(
         })?;
         request.protocol = MANAGED_PROTOCOL_VERSION;
         let reply = context
-                .client
-                .request_stream_read(request, context.operation).await?;
+            .client
+            .request_stream_read(request, context.operation)
+            .await?;
         if let RequestStreamReadResult::Receipt {
             resolution: ManagedReceiptResolution::Retained(receipt),
             ..
@@ -493,10 +479,7 @@ fn validate_remote_receipt(
     }
     Ok(())
 }
-pub(super) async fn reserve(
-    context: &Context,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn reserve(context: &Context, format: OutputFormat) -> Result<()> {
     let requests = open(context)?;
     maintain(context, &requests).await?;
     let id = requests
@@ -595,22 +578,14 @@ pub(super) fn pending(context: &Context, format: OutputFormat) -> Result<()> {
     out.flush()?;
     Ok(())
 }
-pub(super) async fn acknowledge(
-    context: &Context,
-    text: &str,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn acknowledge(context: &Context, text: &str, format: OutputFormat) -> Result<()> {
     let id = text.parse()?;
     let requests = find(context, id)?;
     requests.mark_delivered(id).map_err(other)?;
     maintain(context, &requests).await?;
     render(id, "Acknowledged", None, format)
 }
-pub(super) async fn seal(
-    context: &Context,
-    text: &str,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn seal(context: &Context, text: &str, format: OutputFormat) -> Result<()> {
     let id = text.parse()?;
     let requests = find(context, id)?;
     let result = async {
@@ -785,6 +760,7 @@ fn render_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
 
     fn create(root: &std::path::Path) -> ManagedOperationStore {
         let context = OperationContext {
@@ -902,10 +878,12 @@ mod tests {
         let other = store.reserve(RequestId::from_u128(22)).unwrap();
         store.prepare_seal(other, RequestId::from_u128(23)).unwrap();
         let mut controls = Vec::new();
-        let receipt = seal_receipt(&store, id, || {
+        let receipt = seal_receipt(&store, id, async || {
             controls.push(finish_seal(&store, 11 + controls.len() as u64));
             Ok(())
         })
+        .now_or_never()
+        .expect("the test's upkeep never waits")
         .unwrap();
         assert_eq!(
             controls.iter().map(|key| key.id).collect::<Vec<_>>(),
@@ -939,10 +917,12 @@ mod tests {
         let pending = store.prepare_seal(other, RequestId::from_u128(23)).unwrap();
         let mut calls = 0;
         assert!(matches!(
-            seal_receipt(&store, id, || {
+            seal_receipt(&store, id, async || {
                 calls += 1;
                 Ok(())
-            }),
+            })
+            .now_or_never()
+            .expect("the test's upkeep never waits"),
             Err(CliError::Managed(ManagedStoreError::ControlPending))
         ));
         assert_eq!(calls, 8);

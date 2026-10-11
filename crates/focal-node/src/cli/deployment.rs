@@ -356,11 +356,7 @@ fn network(settings: &Settings) -> crate::Result<bool> {
     ))
 }
 
-async fn plan(
-    settings: &Settings,
-    output: Option<&Path>,
-    dry_run: bool,
-) -> crate::Result<()> {
+async fn plan(settings: &Settings, output: Option<&Path>, dry_run: bool) -> crate::Result<()> {
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
     let requested = settings.policy_intent();
@@ -507,27 +503,16 @@ fn read_plan(path: &Path) -> crate::Result<DeploymentPlan> {
     Ok(DeploymentPlan::decode(&bytes)?)
 }
 
-async fn apply(
-    settings: &Settings,
-    plan_file: &Path,
-    wait: u64,
-) -> crate::Result<()> {
+async fn apply(settings: &Settings, plan_file: &Path, wait: u64) -> crate::Result<()> {
     let plan = read_plan(plan_file)?;
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
-    let report = deployment::apply::apply(
-        &admin,
-        network,
-        &plan,
-        Duration::from_secs(wait),
-    ).await?;
+    let report =
+        deployment::apply::apply(&admin, network, &plan, Duration::from_secs(wait)).await?;
     crate::print_json(&serde_json::json!({"schema_version": 1, "result": report}))
 }
 
-async fn status(
-    settings: &Settings,
-    plan: Option<&str>,
-) -> crate::Result<()> {
+async fn status(settings: &Settings, plan: Option<&str>) -> crate::Result<()> {
     let plan_id = match plan {
         Some(text) => Some(
             focal_client::input::parse_id(text)

@@ -310,55 +310,52 @@ fn authored_documents_never_merge_with_flags_or_accept_wire_authority() {
 
 #[test]
 fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(directory.path().to_owned());
-    let node = focal_node::embedded::EmbeddedNode::open(&settings).unwrap();
-    let identity = node.identity.clone();
-    drop(node);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    assert_eq!(
-        Context::open(&settings, None).unwrap().build.actor,
-        identity.issuer
-    );
-    for marker in ["JOIN", "JOIN.initialized"] {
-        let path = directory.path().join(marker);
-        std::fs::write(&path, b"joined state must not be decoded by a client").unwrap();
-        let result = run(
-            &runtime,
-            &settings,
-            command(&["claim", "post", "00000000000000000000000000000001"]),
-            None,
-        );
-        assert!(
-            matches!(result, Err(CliError::Input(message)) if message.contains("local node client context"))
-        );
-        assert!(!directory.path().join("client").exists());
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(directory.path().to_owned());
+        let node = focal_node::embedded::EmbeddedNode::open(&settings).unwrap();
+        let identity = node.identity.clone();
+        drop(node);
         assert_eq!(
-            decode_identity(&directory.path().join("IDENTITY")).unwrap(),
-            identity
+            Context::open(&settings, None).unwrap().build.actor,
+            identity.issuer
         );
-        std::fs::remove_file(path).unwrap();
-    }
-    // Even an incomplete dangling marker is evidence of joined ownership. A
-    // symlink marker is a Unix-only shape (creating one needs privilege on
-    // Windows); the private-file checks reject a reparse point there anyway.
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(
-            directory.path().join("absent"),
-            directory.path().join("JOIN"),
-        )
-        .unwrap();
-        assert!(matches!(
-            Context::open(&settings, None),
-            Err(CliError::Input(_))
-        ));
-        assert!(!directory.path().join("client").exists());
-    }
+        for marker in ["JOIN", "JOIN.initialized"] {
+            let path = directory.path().join(marker);
+            std::fs::write(&path, b"joined state must not be decoded by a client").unwrap();
+            let result = run(&settings,
+                command(&["claim", "post", "00000000000000000000000000000001"]),
+                None,
+            ).await;
+            assert!(
+                matches!(result, Err(CliError::Input(message)) if message.contains("local node client context"))
+            );
+            assert!(!directory.path().join("client").exists());
+            assert_eq!(
+                decode_identity(&directory.path().join("IDENTITY")).unwrap(),
+                identity
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        // Even an incomplete dangling marker is evidence of joined ownership. A
+        // symlink marker is a Unix-only shape (creating one needs privilege on
+        // Windows); the private-file checks reject a reparse point there anyway.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                directory.path().join("absent"),
+                directory.path().join("JOIN"),
+            )
+            .unwrap();
+            assert!(matches!(
+                Context::open(&settings, None),
+                Err(CliError::Input(_))
+            ));
+            assert!(!directory.path().join("client").exists());
+        }
+    })
+    .unwrap()
 }
 
 #[test]

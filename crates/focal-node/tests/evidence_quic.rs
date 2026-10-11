@@ -29,6 +29,7 @@ use focal_node::{
         ReplicationDriverError, ReplicationReport, drive_fleet_replication, drive_replication,
     },
 };
+use focal_rt::JoinHandle;
 use focal_wire::*;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
@@ -40,7 +41,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::task::JoinHandle;
 #[path = "support/relay.rs"]
 mod relay;
 const ACTOR: ParticipantId = ParticipantId::from_u128(909);
@@ -169,7 +169,9 @@ async fn eventual(remote: &QuicRemote, request: &RequestEnvelope) -> ResponseEnv
             return response;
         }
         last = Some(response);
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        focal_rt::time::sleep(Duration::from_millis(25))
+            .await
+            .unwrap();
     }
     panic!("exact retry did not complete: {last:?}")
 }
@@ -229,7 +231,7 @@ impl Pki {
     }
     fn connector(&self, identity: &CertificateIdentity) -> QuicConnector {
         let tls = client_tls(identity.tls(), self.roots(), &wire_limits()).unwrap();
-        QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire_limits()).unwrap()
+        QuicConnector::bind_standalone("127.0.0.1:0".parse().unwrap(), tls, wire_limits()).unwrap()
     }
 }
 #[derive(Clone)]
@@ -281,7 +283,7 @@ impl RequestHandler for TestService {
     }
 }
 enum TestReplication {
-    Single(tokio::sync::mpsc::Receiver<ReplicationFrame>),
+    Single(hyper_rt::sync::ChannelReceiver<ReplicationFrame>),
     Managed(FleetReplication),
 }
 impl TestReplication {
@@ -303,7 +305,7 @@ struct Replica {
     content_owner: Option<ContentOwner>,
     server: Arc<QuicServer>,
     serving: Option<JoinHandle<Result<(), WireError>>>,
-    pool: Arc<PeerConnectionPool>,
+    pool: std::rc::Rc<PeerConnectionPool>,
     driver: Option<JoinHandle<()>>,
     actor: QuicRemote,
     other: QuicRemote,
@@ -521,7 +523,7 @@ impl Fleet {
             }
             let server = Arc::new(
                 QuicServer::bind(
-                    "127.0.0.1:0".parse().unwrap(),
+                    "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
                     server_tls(identity.tls(), pki.roots(), &wire_limits()).unwrap(),
                     peers,
                     wire_limits(),
@@ -530,14 +532,15 @@ impl Fleet {
                 .unwrap(),
             );
             let serving_server = server.clone();
-            let serving = tokio::spawn(async move { serving_server.serve(service).await });
+            let serving =
+                focal_rt::spawn(async move { serving_server.serve(service).await }).unwrap();
             let connector = match slow {
                 Some(slow) if slow.old.contains(&id) => {
                     pki.connector(identity).offering(&OLDER_PROFILES).unwrap()
                 }
                 _ => pki.connector(identity),
             };
-            let pool = Arc::new(
+            let pool = std::rc::Rc::new(
                 PeerConnectionPool::new(
                     connector,
                     PeerPoolLimits {
@@ -611,12 +614,16 @@ impl Fleet {
         {
             pool.replace_routes(1, routes.clone()).unwrap();
             let sending = pool.clone();
-            let driver = tokio::spawn(async move {
-                let (replication, evidence) =
-                    tokio::join!(channel.drive(&sending), evidence_driver.run(&sending));
+            let driver = focal_rt::spawn(async move {
+                let (replication, evidence) = hyper_rt::combine::join2(
+                    channel.drive(&sending),
+                    evidence_driver.run(&sending),
+                )
+                .await;
                 assert!(replication.unwrap().peak_inflight <= 4);
                 evidence.unwrap();
-            });
+            })
+            .unwrap();
             replicas.push(Replica {
                 host,
                 manager,
@@ -726,7 +733,7 @@ impl Fleet {
                     self.report()
                 );
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     async fn all_at(&self, sequence: SessionSeq) {
@@ -741,7 +748,7 @@ impl Fleet {
                     self.report()
                 );
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     fn omit_route(&mut self, source: usize, target: u64) {
@@ -781,7 +788,7 @@ impl Fleet {
             self.stop_ordering(index).await;
         }
         for replica in &self.replicas {
-            replica.server.close();
+            replica.server.close().unwrap();
         }
         for replica in &mut self.replicas {
             replica.serving.take().unwrap().await.unwrap().unwrap();
@@ -797,7 +804,7 @@ impl Fleet {
 impl Drop for Fleet {
     fn drop(&mut self) {
         for replica in &self.replicas {
-            replica.server.close();
+            replica.server.close().unwrap();
             replica.pool.close();
             if let Some(task) = &replica.serving {
                 task.abort();
@@ -965,13 +972,19 @@ fn attach(id: u128, reference: &ContentRef) -> RequestEnvelope {
         },
     )
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn placed_copies_artifact_attachment_and_cold_leader_pull_use_real_quic() {
-    evidence_scenario(false).await;
+#[test]
+fn placed_copies_artifact_attachment_and_cold_leader_pull_use_real_quic() {
+    focal_rt::block_on(async move {
+        evidence_scenario(false).await;
+    })
+    .unwrap()
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_routing_preserves_custody_artifact_retry_and_cold_leader_failover_over_quic() {
-    evidence_scenario(true).await;
+#[test]
+fn managed_routing_preserves_custody_artifact_retry_and_cold_leader_failover_over_quic() {
+    focal_rt::block_on(async move {
+        evidence_scenario(true).await;
+    })
+    .unwrap()
 }
 async fn evidence_scenario(managed: bool) {
     let data = tempfile::tempdir().unwrap();
@@ -1329,7 +1342,9 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
                 "the seal did not complete in {budget:?} at {bits} bit/s: {spent}: {response:?}"
             );
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        focal_rt::time::sleep(Duration::from_millis(250))
+            .await
+            .unwrap();
     };
     let took = began.elapsed();
     let Response::Upload(UploadReply::Sealed(reference)) = &sealed.result else {
@@ -1375,19 +1390,28 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
 }
 
 /// 66 s for the chunk, past the lease of 60.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second() {
-    a_chunk_reaches_its_copy_across(128_000).await;
+#[test]
+fn a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second() {
+    focal_rt::block_on(async move {
+        a_chunk_reaches_its_copy_across(128_000).await;
+    })
+    .unwrap()
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "a measurement of minutes; run by name"]
-async fn a_megabyte_chunk_reaches_its_copy_across_64_kbit_per_second() {
-    a_chunk_reaches_its_copy_across(64_000).await;
+fn a_megabyte_chunk_reaches_its_copy_across_64_kbit_per_second() {
+    focal_rt::block_on(async move {
+        a_chunk_reaches_its_copy_across(64_000).await;
+    })
+    .unwrap()
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "a measurement of a quarter of an hour; run by name"]
-async fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
-    a_chunk_reaches_its_copy_across(8_000).await;
+fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
+    focal_rt::block_on(async move {
+        a_chunk_reaches_its_copy_across(8_000).await;
+    })
+    .unwrap()
 }
 
 /// A copy is sent the chunks it lacks and none it holds (24 §20, the
@@ -1397,21 +1421,23 @@ async fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
 /// profile asks the copy what it holds and sends the one chunk it lacks; a
 /// holder offering what a binary before the profile offered is told the
 /// first chunk lacked and sends three, as every holder did.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds() {
-    let ordered = bytes_crossed_for_a_second_object(&[]).await;
-    let older = bytes_crossed_for_a_second_object(&[1]).await;
-    println!(
-        "a second object sharing three chunks of four: {ordered} bytes crossed toward the copy with its inventory asked, {older} with the first chunk lacked"
-    );
-    assert!(
-        ordered < 2 * SHARED_CHUNK as u64,
-        "{ordered} bytes crossed toward the copy for one chunk of {SHARED_CHUNK} it lacked"
-    );
-    assert!(
-        older >= 3 * SHARED_CHUNK as u64,
-        "{older} bytes crossed where the older ask sends three chunks of {SHARED_CHUNK}"
-    );
+#[test]
+fn a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds() {
+    focal_rt::block_on(async move {
+        let ordered = bytes_crossed_for_a_second_object(&[]).await;
+        let older = bytes_crossed_for_a_second_object(&[1]).await;
+        println!(
+            "a second object sharing three chunks of four: {ordered} bytes crossed toward the copy with its inventory asked, {older} with the first chunk lacked"
+        );
+        assert!(
+            ordered < 2 * SHARED_CHUNK as u64,
+            "{ordered} bytes crossed toward the copy for one chunk of {SHARED_CHUNK} it lacked"
+        );
+        assert!(
+            older >= 3 * SHARED_CHUNK as u64,
+            "{older} bytes crossed where the older ask sends three chunks of {SHARED_CHUNK}"
+        );
+    }).unwrap()
 }
 const SHARED_CHUNK: usize = 64 * 1024;
 /// The bytes that crossed toward the copy while a second object, differing
@@ -1467,7 +1493,7 @@ async fn sealed(fleet: &Fleet, leader: usize, slow: &Slow, id: u8, bytes: &[u8])
                 if let Err(spent) = wait.check(&fleet.periods(&live)) {
                     panic!("the seal of object {id} did not complete in {budget:?}: {spent}");
                 }
-                tokio::time::sleep(TICK).await;
+                focal_rt::time::sleep(TICK).await.unwrap();
             }
             other => panic!("the seal of object {id}: {other:?}"),
         }

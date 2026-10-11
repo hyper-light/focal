@@ -132,8 +132,7 @@ impl<T> Sender<T> {
     }
     /// The receivers alive now: a snapshot, as another thread may clone or drop one at once.
     pub fn receiver_count(&self) -> usize {
-        Arc::strong_count(&self.shared)
-            .saturating_sub(self.shared.senders.load(Ordering::Acquire))
+        Arc::strong_count(&self.shared).saturating_sub(self.shared.senders.load(Ordering::Acquire))
     }
     /// A receiver that has seen the latest version.
     pub fn subscribe(&self) -> Receiver<T> {
@@ -172,12 +171,12 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let before = self
-            .shared
-            .senders
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
-                Some(live.saturating_sub(1))
-            });
+        let before =
+            self.shared
+                .senders
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                    Some(live.saturating_sub(1))
+                });
         // The word closes as its last sender drops: every wait sees the end.
         if matches!(before, Ok(1) | Ok(0)) {
             drop(hold(&self.shared.word).take());

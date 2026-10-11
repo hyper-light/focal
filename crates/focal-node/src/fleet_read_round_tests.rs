@@ -1,7 +1,7 @@
 use super::*;
 use focal_consensus::MessageType;
 
-fn summary(owner: &Owner, id: u128) -> (Work, oneshot::Receiver<OwnedResponse>) {
+fn summary(owner: &Owner, id: u128) -> (Work, hyper_rt::sync::OneshotReceiver<OwnedResponse>) {
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
         ledger: identity().ledger,
@@ -17,7 +17,7 @@ fn summary(owner: &Owner, id: u128) -> (Work, oneshot::Receiver<OwnedResponse>) 
         .reserve(BudgetKind::Query, BudgetLane::Ordinary, bound * 32 + 4096)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     (
         Work::Request(
             Box::new(AdmittedRequest {
@@ -36,7 +36,7 @@ fn summary(owner: &Owner, id: u128) -> (Work, oneshot::Receiver<OwnedResponse>) 
 fn rounds(fixture: &mut Fixture) -> Vec<(u64, Vec<u8>)> {
     let mut rounds = Vec::new();
     let mut frames = Vec::new();
-    while let Ok(frame) = fixture.outgoing[0].try_recv() {
+    while let Ok(Some(frame)) = fixture.outgoing[0].try_recv() {
         frames.push(frame);
     }
     for frame in frames {
@@ -105,7 +105,7 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
         assert_eq!(fixture.owners[0].session.reads_waiting(), 0);
         for mut reply in replies {
             assert!(matches!(
-                reply.try_recv().unwrap().envelope().result,
+                reply.try_recv().unwrap().unwrap().envelope().result,
                 Response::Summary(_)
             ));
         }
@@ -132,7 +132,7 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
         .reserve(BudgetKind::Pending, BudgetLane::Completion, 1024 * 1024)
         .unwrap()
         .commit();
-    let (send, mut written) = oneshot::channel();
+    let (send, mut written) = hyper_rt::sync::oneshot().unwrap();
     sender
         .try_send(Work::Request(
             Box::new(AdmittedRequest {
@@ -160,15 +160,15 @@ fn reads_queued_together_leave_in_one_round_and_all_are_answered() {
         fixture.pump();
     }
     assert!(matches!(
-        answer.try_recv().unwrap().envelope().result,
+        answer.try_recv().unwrap().unwrap().envelope().result,
         Response::Summary(_)
     ));
     assert!(matches!(
-        written.try_recv().unwrap().envelope().result,
+        written.try_recv().unwrap().unwrap().envelope().result,
         Response::Submitted(_)
     ));
     assert!(matches!(
-        late_answer.try_recv().unwrap().envelope().result,
+        late_answer.try_recv().unwrap().unwrap().envelope().result,
         Response::Summary(_)
     ));
 }
@@ -189,7 +189,10 @@ fn a_leader_that_steps_down_within_its_term_answers_its_waiting_reads_at_once() 
     let (work, mut answer) = summary(&fixture.owners[0], 6_000);
     assert!(!fixture.owners[0].accept(work).unwrap());
     fixture.owners[0].drain().unwrap();
-    assert!(answer.try_recv().is_err(), "the read waits for its round");
+    assert!(
+        matches!(answer.try_recv(), Ok(None)),
+        "the read waits for its round"
+    );
     // Nothing more reaches the followers, nor comes back: the leader hears
     // from no quorum and steps down, in its term.
     let term = fixture.owners[0].session.scalars().term;
@@ -199,14 +202,17 @@ fn a_leader_that_steps_down_within_its_term_answers_its_waiting_reads_at_once() 
         }
         fixture.owners[0].session.tick().unwrap();
         fixture.owners[0].drain().unwrap();
-        while fixture.outgoing[0].try_recv().is_ok() {}
+        while fixture.outgoing[0]
+            .try_recv()
+            .is_ok_and(|item| item.is_some())
+        {}
     }
     let status = fixture.owners[0].session.scalars();
     assert_eq!(status.role, StateRole::Follower);
     assert_eq!(status.term, term, "within its term");
     assert!(
         matches!(
-            answer.try_recv().unwrap().envelope().result,
+            answer.try_recv().unwrap().unwrap().envelope().result,
             Response::Error(AccessError::Unavailable)
         ),
         "answered at the step-down, not at its deadline"

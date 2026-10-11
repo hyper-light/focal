@@ -89,7 +89,12 @@ pub fn local_config() -> RuntimeConfig {
 
 /// Runs `future` to completion as the root task of one shard on this thread; whatever it spawned and
 /// left running is cancelled and joined before this returns.
+///
+/// The future is boxed on entry: a root is often large (a command's or a test's whole state), and a
+/// debug build copies a value on the stack each time it is passed on, so only the pointer travels
+/// past here.
 pub fn block_on<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<T, RtError> {
+    let future = Box::pin(future);
     let mut runtime = LocalRuntime::new(&local_config())?;
     runtime.block_on(future)
 }
@@ -102,6 +107,7 @@ pub fn block_on_shards<T: Send + 'static>(
     shards: u16,
     future: impl Future<Output = T> + Send + 'static,
 ) -> Result<T, RtError> {
+    let future = Box::pin(future);
     let config = RuntimeConfig {
         shards,
         ..local_config()
@@ -129,6 +135,7 @@ pub fn simulate<T: Send + 'static>(
     seed: u64,
     future: impl Future<Output = T> + Send + 'static,
 ) -> Result<Option<T>, RtError> {
+    let future = Box::pin(future);
     let mut sim = hyper_rt::SimRuntime::new(&local_config(), seed)?;
     let shard = *sim.shard_ids().first().ok_or(RtError::BadConfig {
         what: "a runtime of no shards",
@@ -273,31 +280,178 @@ impl<F: Future + ?Sized> Concurrent<F> {
     }
 }
 
+/// `make`'s future, boxed where it is made: its value is built in this function's frame, gone before
+/// the caller polls it. A debug build keeps each future an `async fn` makes as a temporary of its own
+/// poll frame, at once; a caller that awaits many large futures, made through this, holds a pointer
+/// for each, and its frame stays small however deep the chain of awaits beneath it.
+pub fn boxed<'a, F: Future + 'a>(
+    make: impl FnOnce() -> F,
+) -> Pin<Box<dyn Future<Output = F::Output> + 'a>> {
+    Box::pin(make())
+}
+
+/// A task spawned on the current shard whose output is awaited later (what tokio's `JoinHandle`
+/// was): awaited, its output, or [`JoinError`] when it ended without one. Dropping the handle
+/// leaves the task running; [`JoinHandle::abort`] cancels it.
+#[derive(Debug)]
+pub struct JoinHandle<T> {
+    output: std::cell::RefCell<hyper_rt::sync::OneshotReceiver<T>>,
+    /// What [`JoinHandle::is_finished`] found ended, kept for the join.
+    ended: std::cell::RefCell<Option<Result<T, JoinError>>>,
+    task: hyper_rt::TaskId,
+    /// Whether [`JoinHandle::abort`] cancelled it: an output it never gave is then `Cancelled`.
+    aborted: std::cell::Cell<bool>,
+}
+
+/// Why a joined task gave no output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum JoinError {
+    /// Its handle cancelled it before it ended.
+    #[error("the task was cancelled")]
+    Cancelled,
+    /// It ended without its output: it unwound, or its shard cancelled it.
+    #[error("the task ended without its output")]
+    Lost,
+    /// The join was awaited off a shard: no wake could be kept.
+    #[error("no wait for the task could be kept")]
+    Refused,
+}
+
+/// Spawns `future` on the current shard, its output kept for the handle. Refused off a shard, at
+/// the shard's task bound, or at the runtime's cell bound.
+pub fn spawn<T: 'static>(
+    future: impl Future<Output = T> + 'static,
+) -> Result<JoinHandle<T>, RtError> {
+    // Boxed first: the task's frame holds the pointer, never a copy of a large future.
+    let future = Box::pin(future);
+    let (sender, output) = hyper_rt::sync::oneshot()?;
+    let task = hyper_rt::futures::spawn_detached(async move {
+        // A handle dropped before the end leaves nobody to take the output.
+        let _ = sender.send(future.await);
+    })?;
+    Ok(JoinHandle {
+        output: std::cell::RefCell::new(output),
+        ended: std::cell::RefCell::new(None),
+        task,
+        aborted: std::cell::Cell::new(false),
+    })
+}
+
+impl JoinError {
+    /// Whether the handle cancelled the task (tokio's `JoinError::is_cancelled`).
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+impl<T> JoinHandle<T> {
+    /// Cancels the task; what it held is dropped as it ends, and the handle's join is
+    /// `Cancelled` unless the output came first.
+    pub fn abort(&self) {
+        self.aborted.set(true);
+        // A task already ended has nothing to cancel.
+        let _ = hyper_rt::futures::cancel(self.task);
+    }
+
+    /// Whether the task has ended: its output is in, or it ended without one.
+    pub fn is_finished(&self) -> bool {
+        if self.ended.borrow().is_some() {
+            return true;
+        }
+        let ended = match self.output.borrow_mut().try_recv() {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => return false,
+            Err(_) => Err(self.lost()),
+        };
+        *self.ended.borrow_mut() = Some(ended);
+        true
+    }
+
+    fn lost(&self) -> JoinError {
+        if self.aborted.get() {
+            JoinError::Cancelled
+        } else {
+            JoinError::Lost
+        }
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, JoinError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(ended) = self.ended.borrow_mut().take() {
+            return Poll::Ready(ended);
+        }
+        let lost = self.lost();
+        let mut output = self.output.borrow_mut();
+        Pin::new(&mut *output).poll(cx).map(|output| {
+            output.map_err(|refused| match refused {
+                hyper_rt::sync::SyncError::NotOnShardThread(()) => JoinError::Refused,
+                _ => lost,
+            })
+        })
+    }
+}
+
+/// Every one of `futures`' outputs, in their order, the futures running together in this task: as
+/// many at once as were given, which bounds them.
+pub async fn join_all<F: Future>(
+    futures: impl IntoIterator<Item = F>,
+) -> Result<Vec<F::Output>, RtError> {
+    let futures: Vec<F> = futures.into_iter().collect();
+    let count = futures.len();
+    let mut set = Concurrent::new(count)?;
+    for (index, future) in futures.into_iter().enumerate() {
+        set.push(async move { (index, future.await) })?;
+    }
+    let mut ended = Vec::new();
+    ended
+        .try_reserve_exact(count)
+        .map_err(|_| RtError::Capacity {
+            what: "joined outputs",
+            bound: count,
+        })?;
+    while let Some(output) = set.join_next().await {
+        ended.push(output);
+    }
+    // As they ended, then in the order given: each output is kept, none dropped.
+    ended.sort_unstable_by_key(|(index, _)| *index);
+    Ok(ended.into_iter().map(|(_, output)| output).collect())
+}
+
+/// The jobs that may wait for a place of one of the blocking pool's shares: a job waits only while
+/// a task awaits its result, and a root holds at most [`LOCAL_TASKS`] tasks, so a line this long is
+/// never what refuses an awaited job. The pool holds a waiting job's memory only while it waits.
+const WAITING: usize = LOCAL_TASKS;
+
 /// The blocking pool's share name resolution runs under (`hyper_rt::dns::SHARE`): four lookups at
 /// once, what a node resolves in one round of its peers' announced names (24 §24) beside a client's
-/// endpoint; a fifth waits for the queue or is refused, typed.
+/// endpoint; the lookups past them wait their turn, in order.
 pub const DNS: hyper_rt::blocking::Share = hyper_rt::blocking::Share {
     name: hyper_rt::dns::SHARE,
     limit: 4,
+    waiting: WAITING,
 };
 
 /// The share whole-file work runs under (a backup's copy, a bootstrap's store setup): two at once,
-/// a device's sequential stream each, so the work never takes the threads resolution needs.
+/// a device's sequential stream each, so the work never takes the threads resolution needs; the
+/// work past them waits its turn, in order, as nodes starting together do.
 pub const FILES: hyper_rt::blocking::Share = hyper_rt::blocking::Share {
     name: "files",
     limit: 2,
+    waiting: WAITING,
 };
 
 /// The share long computation runs under (a placement's rewrite of its directory): two at once, so
-/// a rewrite in flight never holds every worker.
+/// a rewrite in flight never holds every worker; the rewrites past them wait their turn, in order.
 pub const WORK: hyper_rt::blocking::Share = hyper_rt::blocking::Share {
     name: "work",
     limit: 2,
+    waiting: WAITING,
 };
 
 /// Starts the process's blocking pool with focal's shares, once; a later call reports how the first
-/// went. A worker for each share's every job, so no job of a share waits for another share's, and a
-/// queue of as many again.
+/// went. A worker for each share's every place, so no job of a share waits for another share's.
 pub fn blocking() -> Result<(), RtError> {
     static STARTED: std::sync::OnceLock<Result<(), RtError>> = std::sync::OnceLock::new();
     STARTED
@@ -307,11 +461,7 @@ pub fn blocking() -> Result<(), RtError> {
                 .iter()
                 .map(|share| share.limit)
                 .fold(0usize, usize::saturating_add);
-            hyper_rt::blocking::start(hyper_rt::blocking::Config {
-                workers,
-                queue: workers,
-                shares,
-            })
+            hyper_rt::blocking::start(hyper_rt::blocking::Config { workers, shares })
         })
         .clone()
 }
@@ -319,7 +469,7 @@ pub fn blocking() -> Result<(), RtError> {
 /// Why work handed to the blocking pool gave no result.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PoolError {
-    /// The pool refused the job: its share or its queue full, or no pool running.
+    /// The pool refused the job: its share's places and line full, or no pool running.
     #[error("the blocking pool refused the job: {0}")]
     Refused(RtError),
     /// The job ended without its result: it unwound on its worker.
@@ -341,6 +491,43 @@ pub async fn on_pool<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spawned_task_gives_its_output_to_its_handle_and_an_aborted_one_is_cancelled() {
+        let (output, aborted) = block_on(async {
+            let answered = spawn(async {
+                hyper_rt::futures::sleep(1_000_000).await.unwrap();
+                5u8
+            })
+            .unwrap();
+            let waiting = spawn(std::future::pending::<u8>()).unwrap();
+            hyper_rt::futures::yield_now().await;
+            assert!(!waiting.is_finished());
+            waiting.abort();
+            hyper_rt::futures::yield_now().await;
+            assert!(waiting.is_finished());
+            (answered.await, waiting.await)
+        })
+        .unwrap();
+        assert_eq!(output, Ok(5));
+        assert_eq!(aborted, Err(JoinError::Cancelled));
+    }
+
+    #[test]
+    fn join_all_gives_every_output_in_the_order_given_however_they_end() {
+        let outputs = block_on(async {
+            join_all(
+                [30_000_000u64, 10_000_000, 20_000_000].map(|after| async move {
+                    hyper_rt::futures::sleep(after).await.unwrap();
+                    after
+                }),
+            )
+            .await
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(outputs, vec![30_000_000, 10_000_000, 20_000_000]);
+    }
 
     #[test]
     fn a_local_shard_runs_a_future_and_its_timers() {

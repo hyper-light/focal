@@ -22,7 +22,7 @@ fn opening(fixture: &mut Fixture, id: u128) -> Work {
         .reserve(BudgetKind::Pending, BudgetLane::Completion, 64 * 1024)
         .unwrap()
         .commit();
-    let (send, _answered) = oneshot::channel();
+    let (send, _answered) = hyper_rt::sync::oneshot().unwrap();
     Work::Request(
         Box::new(AdmittedRequest {
             verified,
@@ -92,7 +92,7 @@ fn node_peer(node: u64) -> AuthenticatedPeer {
 }
 /// Node 2's answer to a heartbeat sent to the follower `owner`, which the
 /// core passes over: a follower takes no heartbeat's answer.
-fn passed_over(owner: &Owner, id: u128) -> (Work, oneshot::Receiver<OwnedResponse>) {
+fn passed_over(owner: &Owner, id: u128) -> (Work, hyper_rt::sync::OneshotReceiver<OwnedResponse>) {
     let message = focal_consensus::Message {
         msg_type: focal_consensus::MessageType::MsgHeartbeatResponse,
         from: 2,
@@ -117,7 +117,7 @@ fn passed_over(owner: &Owner, id: u128) -> (Work, oneshot::Receiver<OwnedRespons
         .reserve(BudgetKind::Query, BudgetLane::Completion, 64 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     (
         Work::Request(
             Box::new(AdmittedRequest {
@@ -154,7 +154,7 @@ fn a_peer_frame_that_leaves_nothing_ready_is_answered_by_its_batchs_drain() {
     assert!(!follower.take(work, &receiver).unwrap());
     assert!(!follower.session.has_ready(), "nothing was left ready");
     assert!(matches!(
-        answer.try_recv().unwrap().envelope().result,
+        answer.try_recv().unwrap().unwrap().envelope().result,
         Response::PeerAccepted
     ));
     // A grouped owner's session: every request is taken in a batch.
@@ -162,11 +162,14 @@ fn a_peer_frame_that_leaves_nothing_ready_is_answered_by_its_batchs_drain() {
     let (work, mut answer) = passed_over(follower, 2);
     assert!(!follower.accept(work).unwrap());
     assert!(!follower.session.has_ready(), "nothing was left ready");
-    assert!(answer.try_recv().is_err(), "answered at the batch's drain");
+    assert!(
+        matches!(answer.try_recv(), Ok(None)),
+        "answered at the batch's drain"
+    );
     assert!(follower.group_deadline().unwrap() <= Instant::now());
     assert!(!follower.progress_group().unwrap());
     assert!(matches!(
-        answer.try_recv().unwrap().envelope().result,
+        answer.try_recv().unwrap().unwrap().envelope().result,
         Response::PeerAccepted
     ));
 }

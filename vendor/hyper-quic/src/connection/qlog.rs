@@ -1,5 +1,8 @@
+//! A connection's qlog events. Built without the `qlog` feature, no stream can be made: the
+//! stream type has no values, and the sink emits nothing.
 use std::time::Duration;
 
+#[cfg(feature = "qlog")]
 use qlog::{
     events::{
         Event, EventData,
@@ -9,6 +12,7 @@ use qlog::{
     },
     streamer::QlogStreamer,
 };
+#[cfg(feature = "qlog")]
 use tracing::warn;
 
 use crate::{
@@ -18,8 +22,15 @@ use crate::{
 };
 
 /// One connection's qlog output stream, owned by that connection
+#[cfg(feature = "qlog")]
 pub struct QlogStream(pub(crate) QlogStreamer);
 
+/// One connection's qlog output stream: without the `qlog` feature there is none to give a
+/// connection, so the type has no values.
+#[cfg(not(feature = "qlog"))]
+pub enum QlogStream {}
+
+#[cfg(feature = "qlog")]
 impl QlogStream {
     fn emit_event(&mut self, orig_rem_cid: ConnectionId, event: EventData, now: Instant) {
         // Time will be overwritten by `add_event_with_instant`
@@ -35,6 +46,7 @@ impl QlogStream {
 /// A connection's [`QlogStream`], if it has one
 #[derive(Default)]
 pub(crate) struct QlogSink {
+    #[cfg(feature = "qlog")]
     stream: Option<QlogStream>,
 }
 
@@ -46,6 +58,7 @@ impl QlogSink {
         now: Instant,
         orig_rem_cid: ConnectionId,
     ) {
+        #[cfg(feature = "qlog")]
         {
             let Some(stream) = self.stream.as_mut() else {
                 return;
@@ -57,6 +70,8 @@ impl QlogSink {
 
             stream.emit_event(orig_rem_cid, EventData::MetricsUpdated(metrics), now);
         }
+        #[cfg(not(feature = "qlog"))]
+        let _ = (pto_count, path, now, orig_rem_cid);
     }
 
     pub(super) fn emit_packet_lost(
@@ -68,6 +83,7 @@ impl QlogSink {
         now: Instant,
         orig_rem_cid: ConnectionId,
     ) {
+        #[cfg(feature = "qlog")]
         {
             let Some(stream) = self.stream.as_mut() else {
                 return;
@@ -91,6 +107,8 @@ impl QlogSink {
 
             stream.emit_event(orig_rem_cid, EventData::PacketLost(event), now);
         }
+        #[cfg(not(feature = "qlog"))]
+        let _ = (pn, info, loss_delay, space, now, orig_rem_cid);
     }
 
     pub(super) fn emit_packet_sent(
@@ -102,6 +120,7 @@ impl QlogSink {
         now: Instant,
         orig_rem_cid: ConnectionId,
     ) {
+        #[cfg(feature = "qlog")]
         {
             let Some(stream) = self.stream.as_mut() else {
                 return;
@@ -119,6 +138,8 @@ impl QlogSink {
 
             stream.emit_event(orig_rem_cid, EventData::PacketSent(event), now);
         }
+        #[cfg(not(feature = "qlog"))]
+        let _ = (pn, len, space, is_0rtt, now, orig_rem_cid);
     }
 
     pub(super) fn emit_packet_received(
@@ -129,6 +150,7 @@ impl QlogSink {
         now: Instant,
         orig_rem_cid: ConnectionId,
     ) {
+        #[cfg(feature = "qlog")]
         {
             let Some(stream) = self.stream.as_mut() else {
                 return;
@@ -145,15 +167,25 @@ impl QlogSink {
 
             stream.emit_event(orig_rem_cid, EventData::PacketReceived(event), now);
         }
+        #[cfg(not(feature = "qlog"))]
+        let _ = (pn, space, is_0rtt, now, orig_rem_cid);
     }
 }
 
 impl From<Option<QlogStream>> for QlogSink {
+    #[cfg(feature = "qlog")]
     fn from(stream: Option<QlogStream>) -> Self {
         Self { stream }
     }
+    #[cfg(not(feature = "qlog"))]
+    fn from(stream: Option<QlogStream>) -> Self {
+        // No stream exists to be given: `stream` is `None`.
+        let _ = stream;
+        Self {}
+    }
 }
 
+#[cfg(feature = "qlog")]
 fn packet_type(space: SpaceId, is_0rtt: bool) -> PacketType {
     match space {
         SpaceId::Initial => PacketType::Initial,

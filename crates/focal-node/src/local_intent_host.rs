@@ -63,7 +63,9 @@ pub(crate) async fn save_local_intent(
                 if Instant::now() >= deadline {
                     return Err(LocalIntentError::Capacity);
                 }
-                focal_rt::time::pause(Duration::from_millis(10)).await;
+                focal_rt::time::sleep(Duration::from_millis(10))
+                    .await
+                    .map_err(|_| LocalIntentError::Unavailable)?;
             }
             Ok(Err(failure)) => {
                 *journal = failure.rejected.map(|(owner, _)| owner);

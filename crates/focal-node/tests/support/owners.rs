@@ -72,9 +72,33 @@ pub async fn counted<F: Future>(
     let mut wait = focal_timing::ProgressDeadline::begin(&counters(), budget, FROZEN);
     let mut what = std::pin::pin!(what);
     loop {
-        tokio::select! {
-            output = &mut what => return Ok(output),
-            () = tokio::time::sleep(poll) => wait.check(&counters())?,
+        match hyper_rt::combine::race2(&mut what, focal_rt::time::sleep(poll)).await {
+            hyper_rt::combine::Either::First(output) => return Ok(output),
+            hyper_rt::combine::Either::Second(slept) => {
+                slept.expect("a test waits on its shard");
+                wait.check(&counters())?;
+            }
+        }
+    }
+}
+
+/// [`counted`] for counters read by a wait of their own: an endpoint's, asked
+/// of its owner task.
+pub async fn counted_async<F: Future>(
+    counters: impl AsyncFn() -> Vec<u64>,
+    budget: u64,
+    poll: Duration,
+    what: F,
+) -> Result<F::Output, focal_timing::Spent> {
+    let mut wait = focal_timing::ProgressDeadline::begin(&counters().await, budget, FROZEN);
+    let mut what = std::pin::pin!(what);
+    loop {
+        match hyper_rt::combine::race2(&mut what, focal_rt::time::sleep(poll)).await {
+            hyper_rt::combine::Either::First(output) => return Ok(output),
+            hyper_rt::combine::Either::Second(slept) => {
+                slept.expect("a test waits on its shard");
+                wait.check(&counters().await)?;
+            }
         }
     }
 }

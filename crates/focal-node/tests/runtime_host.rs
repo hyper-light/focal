@@ -436,7 +436,7 @@ fn request(id: u128, operation: Operation) -> RequestEnvelope {
 struct Fleet {
     hosts: Vec<ReplicaHost>,
     owners: Vec<ReplicaOwner>,
-    pumps: Vec<tokio::task::JoinHandle<()>>,
+    pumps: Vec<focal_rt::JoinHandle<()>>,
     isolated: Arc<AtomicU8>,
 }
 impl Fleet {
@@ -466,8 +466,8 @@ impl Fleet {
             .map(|(index, mut channel)| {
                 let hosts = hosts.clone();
                 let isolated = isolated.clone();
-                tokio::spawn(async move {
-                    while let Some(frame) = channel.recv().await {
+                focal_rt::spawn(async move {
+                    while let Ok(frame) = channel.recv().await {
                         let source = index as u8 + 1;
                         let blocked = isolated.load(Ordering::SeqCst);
                         if blocked == source || blocked == frame.target as u8 {
@@ -494,6 +494,7 @@ impl Fleet {
                         );
                     }
                 })
+                .unwrap()
             })
             .collect();
         Self {
@@ -562,7 +563,7 @@ impl Fleet {
             if let Some(spent) = self.spent(&mut wait) {
                 panic!("runtime did not finish through replica owner: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     async fn all_at(&self, sequence: SessionSeq) {
@@ -575,7 +576,7 @@ impl Fleet {
             if let Some(spent) = self.spent(&mut wait) {
                 panic!("the replicas did not reach {sequence:?}: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     async fn stop(mut self) {
@@ -601,116 +602,122 @@ impl Drop for Fleet {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn threaded_owners_recover_execution_after_leader_loss_and_restart() {
-    let root = tempfile::tempdir().unwrap();
-    let nodes = prepared_sessions(root.path());
-    let catalog = catalog();
-    let late = Arc::new(LatePass {
-        calls: AtomicUsize::new(0),
-        cancelled: AtomicUsize::new(0),
-        released: AtomicBool::new(false),
-    });
-    let calls = Arc::new(AtomicUsize::new(0));
-    let executor = Arc::new(Counted {
-        calls: calls.clone(),
-        inner: RegistryExecutor::new(catalog.clone(), Arc::new(InlineOnly)),
-    });
-    let fleet = Fleet::start(
-        nodes,
-        vec![
-            runtime(catalog.clone(), late.clone(), false),
-            runtime(catalog.clone(), executor.clone(), false),
-            runtime(catalog.clone(), executor.clone(), false),
-        ],
-    );
-    // Released when the test ends, passing or not, before the fleet stops.
-    let _release = Release(late.clone());
-    let mut wait = fleet.deadline(Duration::from_secs(10));
-    while late.calls.load(Ordering::SeqCst) == 0 {
-        if let Some(spent) = fleet.spent(&mut wait) {
-            panic!("the late run never began: {spent}");
+#[test]
+fn threaded_owners_recover_execution_after_leader_loss_and_restart() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let nodes = prepared_sessions(root.path());
+        let catalog = catalog();
+        let late = Arc::new(LatePass {
+            calls: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(Counted {
+            calls: calls.clone(),
+            inner: RegistryExecutor::new(catalog.clone(), Arc::new(InlineOnly)),
+        });
+        let fleet = Fleet::start(
+            nodes,
+            vec![
+                runtime(catalog.clone(), late.clone(), false),
+                runtime(catalog.clone(), executor.clone(), false),
+                runtime(catalog.clone(), executor.clone(), false),
+            ],
+        );
+        // Released when the test ends, passing or not, before the fleet stops.
+        let _release = Release(late.clone());
+        let mut wait = fleet.deadline(Duration::from_secs(10));
+        while late.calls.load(Ordering::SeqCst) == 0 {
+            if let Some(spent) = fleet.spent(&mut wait) {
+                panic!("the late run never began: {spent}");
+            }
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
-        tokio::time::sleep(TICK).await;
-    }
-    fleet.isolated.store(1, Ordering::SeqCst);
-    let (_, sequence) = fleet.terminal(Some(0)).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    // The isolated former leader cancels its run when it learns it no longer
-    // leads, which its own quorum check decides on its own clock — after the
-    // majority has already finished. The property is that the run is
-    // cancelled, exactly once, not that it happens before the successor ends.
-    let mut wait = fleet.deadline(Duration::from_secs(30));
-    while late.cancelled.load(Ordering::SeqCst) == 0 {
-        if let Some(spent) = fleet.spent(&mut wait) {
-            panic!("the isolated former leader never cancelled its run: {spent}");
+        fleet.isolated.store(1, Ordering::SeqCst);
+        let (_, sequence) = fleet.terminal(Some(0)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The isolated former leader cancels its run when it learns it no longer
+        // leads, which its own quorum check decides on its own clock — after the
+        // majority has already finished. The property is that the run is
+        // cancelled, exactly once, not that it happens before the successor ends.
+        let mut wait = fleet.deadline(Duration::from_secs(30));
+        while late.cancelled.load(Ordering::SeqCst) == 0 {
+            if let Some(spent) = fleet.spent(&mut wait) {
+                panic!("the isolated former leader never cancelled its run: {spent}");
+            }
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
-        tokio::time::sleep(TICK).await;
-    }
-    assert_eq!(late.cancelled.load(Ordering::SeqCst), 1);
-    fleet.isolated.store(0, Ordering::SeqCst);
-    fleet.all_at(sequence).await;
-    fleet.stop().await;
+        assert_eq!(late.cancelled.load(Ordering::SeqCst), 1);
+        fleet.isolated.store(0, Ordering::SeqCst);
+        fleet.all_at(sequence).await;
+        fleet.stop().await;
 
-    let nodes = open_sessions(root.path());
-    assert!(nodes.iter().all(|session| !session.is_authoritative()));
-    let runtimes = (0..3)
-        .map(|_| runtime(catalog.clone(), executor.clone(), false))
-        .collect();
-    let restarted = Fleet::start(nodes, runtimes);
-    let (_, recovered) = restarted.terminal(None).await;
-    assert_eq!(sequence, recovered);
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "recovery reran durable completed evidence"
-    );
-    restarted.stop().await;
+        let nodes = open_sessions(root.path());
+        assert!(nodes.iter().all(|session| !session.is_authoritative()));
+        let runtimes = (0..3)
+            .map(|_| runtime(catalog.clone(), executor.clone(), false))
+            .collect();
+        let restarted = Fleet::start(nodes, runtimes);
+        let (_, recovered) = restarted.terminal(None).await;
+        assert_eq!(sequence, recovered);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "recovery reran durable completed evidence"
+        );
+        restarted.stop().await;
+    })
+    .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn runtime_capacity_keeps_the_replicated_owner_serving() {
-    let root = tempfile::tempdir().unwrap();
-    let nodes = prepared_sessions(root.path());
-    let before = nodes[0].sequence();
-    let catalog = catalog();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let executor = Arc::new(Counted {
-        calls: calls.clone(),
-        inner: RegistryExecutor::new(catalog.clone(), Arc::new(InlineOnly)),
-    });
-    let runtimes = (0..3)
-        .map(|_| runtime(catalog.clone(), executor.clone(), true))
-        .collect();
-    let fleet = Fleet::start(nodes, runtimes);
-    // The owners run the periods a quarter of a second holds at their tick,
-    // the runtime refusing for capacity all the while: no call is made.
-    let mut ran = fleet.deadline(Duration::from_millis(250));
-    loop {
-        match fleet.spent(&mut ran) {
-            Some(focal_timing::Spent::Budget { .. }) => break,
-            Some(stalled) => panic!("the owners ran no period: {stalled}"),
-            None => tokio::time::sleep(TICK).await,
+#[test]
+fn runtime_capacity_keeps_the_replicated_owner_serving() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let nodes = prepared_sessions(root.path());
+        let before = nodes[0].sequence();
+        let catalog = catalog();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(Counted {
+            calls: calls.clone(),
+            inner: RegistryExecutor::new(catalog.clone(), Arc::new(InlineOnly)),
+        });
+        let runtimes = (0..3)
+            .map(|_| runtime(catalog.clone(), executor.clone(), true))
+            .collect();
+        let fleet = Fleet::start(nodes, runtimes);
+        // The owners run the periods a quarter of a second holds at their tick,
+        // the runtime refusing for capacity all the while: no call is made.
+        let mut ran = fleet.deadline(Duration::from_millis(250));
+        loop {
+            match fleet.spent(&mut ran) {
+                Some(focal_timing::Spent::Budget { .. }) => break,
+                Some(stalled) => panic!("the owners ran no period: {stalled}"),
+                None => focal_rt::time::sleep(TICK).await.unwrap(),
+            }
         }
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(fleet.hosts.iter().all(|host| !host.progress().stopped));
-    let response = dispatch(
-        &fleet.hosts[0],
-        actor(),
-        request(
-            77,
-            Operation::OpenEpoch {
-                epoch: RequestEpoch(1),
-            },
-        ),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
-    let Response::Submitted(MutationReply::Committed(receipt)) = response.result else {
-        panic!("{response:?}");
-    };
-    assert_eq!(receipt.sequence, SessionSeq(before.0 + 1));
-    fleet.all_at(receipt.sequence).await;
-    fleet.stop().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(fleet.hosts.iter().all(|host| !host.progress().stopped));
+        let response = dispatch(
+            &fleet.hosts[0],
+            actor(),
+            request(
+                77,
+                Operation::OpenEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            ),
+            &ReplicaHost::wire_limits(),
+        )
+        .await;
+        let Response::Submitted(MutationReply::Committed(receipt)) = response.result else {
+            panic!("{response:?}");
+        };
+        assert_eq!(receipt.sequence, SessionSeq(before.0 + 1));
+        fleet.all_at(receipt.sequence).await;
+        fleet.stop().await;
+    })
+    .unwrap()
 }

@@ -11,11 +11,11 @@ use focal_control::{ControlBootstrap, ControlRead, ControlReadResult, ControlRep
 use focal_directory::{Delegation, DirectoryError, RouteCache, RouteCacheConfig, SessionRoute};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch};
+use focal_rt::time::Instant;
 use focal_wire::{
     AuthenticatedPeer, MAX_PEER_CONTROL_REQUEST_BYTES, Operation, PROTOCOL_VERSION,
     PeerConnectionPool, PeerGrant, PeerRole, RequestEnvelope, RouteHint,
 };
-use focal_rt::time::Instant;
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender};
 use std::{collections::BTreeSet, time::Duration};

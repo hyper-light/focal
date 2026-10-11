@@ -7,12 +7,18 @@ rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hyper-light/hyper-raft"
 
+[features]
+# qlog traces. Off in focal: `qlog` turns on serde_json's `preserve_order` for the whole build,
+# and focal's schemas, output and canonical documents are written against sorted maps (the shared
+# crate's VENDORED.md §20).
+qlog = ["dep:qlog"]
+
 [dependencies]
 aws-lc-rs = { version = "1.9", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 bytes = "1"
 fastbloom = { version = "0.17", default-features = false }
 lru-slab = "0.1.2"
-qlog = "0.15.2"
+qlog = { version = "0.15.2", optional = true }
 rand = "0.10.1"
 rand_pcg = "0.10"
 rustc-hash = "2"

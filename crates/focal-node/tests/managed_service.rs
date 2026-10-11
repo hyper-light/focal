@@ -74,219 +74,220 @@ fn candidate(wal: &SharedWal, tenant: &MemoryBudget, id: u128) -> FleetReplica {
     config.request_timeout = Duration::from_millis(500);
     FleetReplica { session, config }
 }
-#[tokio::test]
-async fn one_handler_routes_live_installations_without_management_round_trips_and_preserves_scopes()
-{
-    let data = tempfile::tempdir().unwrap();
-    let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
-    let tenants: Vec<_> = (0..2)
-        .map(|_| budget.child(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap())
-        .collect();
-    let wal = SharedWal::open_with_budget(
-        data.path().join("wal"),
-        WalOptions::new(WalIdentity {
-            node: 1,
-            cluster: CLUSTER,
-            stream: 0,
-        }),
-        WalWriterLimits::default(),
-        budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
-    )
-    .unwrap();
-    let (manager, owner, outgoing) = ReplicaFleet::spawn_managed(
-        1,
-        CLUSTER,
-        vec![focal_consensus::NodeStorage::Wal(wal.clone())],
-        tenants
-            .iter()
-            .enumerate()
-            .map(|(index, budget)| FleetTenant {
-                tenant: ledger(index as u128 + 1).tenant,
-                weight: 1,
-                budget: budget.clone(),
-            })
-            .collect(),
-        budget.clone(),
-        ReplicaHost::wire_limits(),
-        ManagedFleetConfig {
-            max_sessions: 2,
-            management_queue: 1,
-        },
-    )
-    .unwrap();
-    let (content, content_owner) = ContentHost::spawn(
-        ContentStore::open(
-            data.path().join("content"),
-            StoreLimits {
-                max_content_bytes: 1024 * 1024,
-                max_staging_bytes: 4 * 1024 * 1024,
-                max_uploads: 8,
-                chunk_bytes: 4096,
-                max_manifest_bytes: 65536,
+#[test]
+fn one_handler_routes_live_installations_without_management_round_trips_and_preserves_scopes() {
+    focal_rt::block_on(async move {
+        let data = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+        let tenants: Vec<_> = (0..2)
+            .map(|_| budget.child(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap())
+            .collect();
+        let wal = SharedWal::open_with_budget(
+            data.path().join("wal"),
+            WalOptions::new(WalIdentity {
+                node: 1,
+                cluster: CLUSTER,
+                stream: 0,
+            }),
+            WalWriterLimits::default(),
+            budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let (manager, owner, outgoing) = ReplicaFleet::spawn_managed(
+            1,
+            CLUSTER,
+            vec![focal_consensus::NodeStorage::Wal(wal.clone())],
+            tenants
+                .iter()
+                .enumerate()
+                .map(|(index, budget)| FleetTenant {
+                    tenant: ledger(index as u128 + 1).tenant,
+                    weight: 1,
+                    budget: budget.clone(),
+                })
+                .collect(),
+            budget.clone(),
+            ReplicaHost::wire_limits(),
+            ManagedFleetConfig {
+                max_sessions: 2,
+                management_queue: 1,
             },
         )
-        .unwrap(),
-        CustodyConfig::new(1),
-        ReplicaHost::wire_limits(),
-        budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
-    )
-    .unwrap();
-    let (evidence, driver) = EvidenceCoordinator::channel(
-        content.clone(),
-        1,
-        vec![],
-        budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
-        2,
-    )
-    .unwrap();
-    let service = ManagedService::new(manager.clone(), content.clone(), evidence);
-    let empty = dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
-    assert_eq!(empty.result, Response::Error(AccessError::Unavailable));
-    let foreign = dispatch(&service, actor(2), request(1), &ReplicaHost::wire_limits()).await;
-    assert_eq!(foreign.result, Response::Error(AccessError::Unauthorized));
-    let installed = manager
-        .install(1, candidate(&wal, &tenants[0], 1))
-        .await
         .unwrap();
-    let original = installed.value().clone();
-    // Holding the only management slot would block an inspect round trip. Data
-    // uses the same registry through a short borrowed lookup and still commits.
-    assert!(matches!(
-        manager.inspect(ledger(1)).await,
-        Err(FleetError::Capacity)
-    ));
-    let first = dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
-    assert!(
-        matches!(
-            first.result,
-            Response::Submitted(MutationReply::Committed(_))
-        ),
-        "{first:?}"
-    );
-    let first_status = dispatch(
-        &service,
-        actor(1),
-        reconcile(1),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
-    let Response::Submitted(MutationReply::Committed(expected)) = &first.result else {
-        panic!("receipt")
-    };
-    assert!(
-        matches!(&first_status.result,Response::Reconciled(reply) if matches!(&reply.page.result,ReconcileResult::Receipt { resolution:ReceiptResolution::Committed(receipt),.. } if **receipt==*expected))
-    );
-    drop(installed);
-    let second = {
-        let reply = manager
-            .install(2, candidate(&wal, &tenants[1], 2))
-            .await
-            .unwrap();
-        reply.value().clone()
-    };
-    let second_response =
-        dispatch(&service, actor(2), request(2), &ReplicaHost::wire_limits()).await;
-    assert!(
-        matches!(
-            second_response.result,
-            Response::Submitted(MutationReply::Committed(_))
-        ),
-        "{second_response:?}"
-    );
-    assert_eq!(
-        dispatch(&service, actor(2), request(1), &ReplicaHost::wire_limits())
-            .await
-            .result,
-        foreign.result
-    );
-    original.host().stop().await.unwrap();
-    original.host().closed().await;
-    assert_eq!(
-        dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits())
-            .await
-            .result,
-        empty.result
-    );
-    manager
-        .remove(3, ledger(1), original.incarnation())
-        .await
-        .unwrap();
-    let replacement = {
-        let reply = manager
-            .install(4, candidate(&wal, &tenants[0], 1))
-            .await
-            .unwrap();
-        reply.value().clone()
-    };
-    assert_ne!(original.incarnation(), replacement.incarnation());
-    assert!(matches!(
-        dispatch(
-            original.host(),
-            actor(1),
-            request(1),
-            &ReplicaHost::wire_limits()
+        let (content, content_owner) = ContentHost::spawn(
+            ContentStore::open(
+                data.path().join("content"),
+                StoreLimits {
+                    max_content_bytes: 1024 * 1024,
+                    max_staging_bytes: 4 * 1024 * 1024,
+                    max_uploads: 8,
+                    chunk_bytes: 4096,
+                    max_manifest_bytes: 65536,
+                },
+            )
+            .unwrap(),
+            CustodyConfig::new(1),
+            ReplicaHost::wire_limits(),
+            budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
         )
-        .await
-        .result,
-        Response::Error(_)
-    ));
-    assert_eq!(
-        dispatch(
-            original.host(),
+        .unwrap();
+        let (evidence, driver) = EvidenceCoordinator::channel(
+            content.clone(),
+            1,
+            vec![],
+            budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
+            2,
+        )
+        .unwrap();
+        let service = ManagedService::new(manager.clone(), content.clone(), evidence);
+        let empty = dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
+        assert_eq!(empty.result, Response::Error(AccessError::Unavailable));
+        let foreign = dispatch(&service, actor(2), request(1), &ReplicaHost::wire_limits()).await;
+        assert_eq!(foreign.result, Response::Error(AccessError::Unauthorized));
+        let installed = manager
+            .install(1, candidate(&wal, &tenants[0], 1))
+            .await
+            .unwrap();
+        let original = installed.value().clone();
+        // Holding the only management slot would block an inspect round trip. Data
+        // uses the same registry through a short borrowed lookup and still commits.
+        assert!(matches!(
+            manager.inspect(ledger(1)).await,
+            Err(FleetError::Capacity)
+        ));
+        let first = dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
+        assert!(
+            matches!(
+                first.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{first:?}"
+        );
+        let first_status = dispatch(
+            &service,
             actor(1),
             reconcile(1),
-            &ReplicaHost::wire_limits()
+            &ReplicaHost::wire_limits(),
         )
-        .await
-        .result,
-        Response::Error(AccessError::Unavailable)
-    );
-    let retained_status = dispatch_accounted(
-        &service,
-        actor(1),
-        reconcile(1),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
-    let (Response::Reconciled(recovered), Response::Reconciled(original_status)) =
-        (&retained_status.envelope().result, &first_status.result)
-    else {
-        panic!("reconciled")
-    };
-    assert_eq!(recovered.page, original_status.page);
-    assert_eq!(recovered.token, original_status.token);
-    assert!(recovered.applied_index >= original_status.applied_index);
-    let retained =
-        dispatch_accounted(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
-    assert_eq!(retained.envelope(), &first);
-    manager.shutdown().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(
-        dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits())
+        .await;
+        let Response::Submitted(MutationReply::Committed(expected)) = &first.result else {
+            panic!("receipt")
+        };
+        assert!(
+            matches!(&first_status.result,Response::Reconciled(reply) if matches!(&reply.page.result,ReconcileResult::Receipt { resolution:ReceiptResolution::Committed(receipt),.. } if **receipt==*expected))
+        );
+        drop(installed);
+        let second = {
+            let reply = manager
+                .install(2, candidate(&wal, &tenants[1], 2))
+                .await
+                .unwrap();
+            reply.value().clone()
+        };
+        let second_response =
+            dispatch(&service, actor(2), request(2), &ReplicaHost::wire_limits()).await;
+        assert!(
+            matches!(
+                second_response.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{second_response:?}"
+        );
+        assert_eq!(
+            dispatch(&service, actor(2), request(1), &ReplicaHost::wire_limits())
+                .await
+                .result,
+            foreign.result
+        );
+        original.host().stop().await.unwrap();
+        original.host().closed().await;
+        assert_eq!(
+            dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits())
+                .await
+                .result,
+            empty.result
+        );
+        manager
+            .remove(3, ledger(1), original.incarnation())
+            .await
+            .unwrap();
+        let replacement = {
+            let reply = manager
+                .install(4, candidate(&wal, &tenants[0], 1))
+                .await
+                .unwrap();
+            reply.value().clone()
+        };
+        assert_ne!(original.incarnation(), replacement.incarnation());
+        assert!(matches!(
+            dispatch(
+                original.host(),
+                actor(1),
+                request(1),
+                &ReplicaHost::wire_limits()
+            )
             .await
             .result,
-        empty.result
-    );
-    content.stop().await.unwrap();
-    content_owner.join().unwrap();
-    drop(driver);
-    drop(service);
-    drop(content);
-    drop(original);
-    drop(second);
-    drop(replacement);
-    drop(manager);
-    drop(outgoing);
-    drop(wal);
-    assert!(
-        budget.stats().used > 0,
-        "delivered response lost the tenant/node allowance"
-    );
-    drop(retained);
-    assert!(
-        budget.stats().used > 0,
-        "reconciliation response lost its allowance on teardown"
-    );
-    drop(retained_status);
-    assert_eq!(budget.stats().used, 0);
+            Response::Error(_)
+        ));
+        assert_eq!(
+            dispatch(
+                original.host(),
+                actor(1),
+                reconcile(1),
+                &ReplicaHost::wire_limits()
+            )
+            .await
+            .result,
+            Response::Error(AccessError::Unavailable)
+        );
+        let retained_status = dispatch_accounted(
+            &service,
+            actor(1),
+            reconcile(1),
+            &ReplicaHost::wire_limits(),
+        )
+        .await;
+        let (Response::Reconciled(recovered), Response::Reconciled(original_status)) =
+            (&retained_status.envelope().result, &first_status.result)
+        else {
+            panic!("reconciled")
+        };
+        assert_eq!(recovered.page, original_status.page);
+        assert_eq!(recovered.token, original_status.token);
+        assert!(recovered.applied_index >= original_status.applied_index);
+        let retained =
+            dispatch_accounted(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
+        assert_eq!(retained.envelope(), &first);
+        manager.shutdown().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(
+            dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits())
+                .await
+                .result,
+            empty.result
+        );
+        content.stop().await.unwrap();
+        content_owner.join().unwrap();
+        drop(driver);
+        drop(service);
+        drop(content);
+        drop(original);
+        drop(second);
+        drop(replacement);
+        drop(manager);
+        drop(outgoing);
+        drop(wal);
+        assert!(
+            budget.stats().used > 0,
+            "delivered response lost the tenant/node allowance"
+        );
+        drop(retained);
+        assert!(
+            budget.stats().used > 0,
+            "reconciliation response lost its allowance on teardown"
+        );
+        drop(retained_status);
+        assert_eq!(budget.stats().used, 0);
+    }).unwrap()
 }

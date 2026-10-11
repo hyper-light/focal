@@ -345,135 +345,134 @@ fn build_history(
 
 #[test]
 fn concurrent_traced_clients_produce_a_linearizable_native_history() {
-    let root = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
-        .unwrap();
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+            .unwrap();
 
-    let node = EmbeddedNode::open(&settings).unwrap();
-    let ledger = node.identity.ledger;
-    let issuer = node.identity.issuer;
-    let worker = node.identity.worker;
-    let context = OperationContext {
-        cluster: node.identity.cluster,
-        ledger,
-        principal: issuer,
-    };
-    let limits = WireLimits::default();
-    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-
-    let make_client = || {
-        let peer = AuthenticatedPeer::local(PeerGrant {
-            principal: context.principal,
-            tenants: BTreeSet::from([ledger.tenant]),
-            role: PeerRole::Runtime,
-        })
-        .unwrap();
-        Client::new(
-            EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
-            RetryPolicy::default(),
-            limits.clone(),
-            1,
-        )
-        .unwrap()
-    };
-
-    let sink_a = Arc::new(RecordingSink::default());
-    let sink_b = Arc::new(RecordingSink::default());
-    let client_a = make_client().with_trace(Box::new(SinkHandle(Arc::clone(&sink_a))));
-    let client_b = make_client().with_trace(Box::new(SinkHandle(Arc::clone(&sink_b))));
-
-    // Two clients (same principal, disjoint request ids and claim ids) submit
-    // creates in an interleaved order. Each reply is the owner's authoritative
-    // statement of a durable commit.
-    let mut publications: Vec<MutationReceipt> = Vec::new();
-    let submit = |client: &Client<EmbeddedTransport<LocalHost>>,
-                  request: u128,
-                  claim: u128|
-     -> NativeReceipt {
-        let envelope = create_envelope(ledger, issuer, worker, request, claim);
-        match runtime.block_on(client.request(envelope)).unwrap().result {
-            Response::Native(NativeMutationReply::Committed(reply)) => reply,
-            other => panic!("native create ({request}): {other:?}"),
-        }
-    };
-    // Interleave A, B, A, B.
-    for (client, request, claim) in [
-        (&client_a, 1u128, 100u128),
-        (&client_b, 3, 200),
-        (&client_a, 2, 101),
-        (&client_b, 4, 201),
-    ] {
-        let reply = submit(client, request, claim);
-        let key = RequestKey {
+        let node = EmbeddedNode::open(&settings).unwrap();
+        let ledger = node.identity.ledger;
+        let issuer = node.identity.issuer;
+        let worker = node.identity.worker;
+        let context = OperationContext {
+            cluster: node.identity.cluster,
+            ledger,
             principal: issuer,
-            epoch: RequestEpoch(1),
-            id: RequestId::from_u128(request),
         };
-        publications.push(receipt(ledger, key, reply.sequence, reply.intent));
-    }
-    publications.sort_by_key(|receipt| receipt.sequence.0);
-    assert_eq!(
-        publications.iter().map(|r| r.sequence).collect::<Vec<_>>(),
-        vec![SessionSeq(1), SessionSeq(2), SessionSeq(3), SessionSeq(4)],
-        "the owner assigned a contiguous commit order"
-    );
+        let limits = WireLimits::default();
+        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
 
-    let traces = vec![(issuer, sink_a.drain()), (issuer, sink_b.drain())];
-    // Each traced exchange committed and its trace matches the owner's receipt.
-    for (_, entries) in &traces {
-        assert_eq!(entries.len(), 2, "each client submitted two creates");
-        for entry in entries {
-            assert!(entry.mutation);
-            let TraceOutcome::Committed {
-                sequence,
-                command_hash,
-            } = entry.outcome
-            else {
-                panic!(
-                    "expected a committed native create, got {:?}",
-                    entry.outcome
-                );
+        let make_client = || {
+            let peer = AuthenticatedPeer::local(PeerGrant {
+                principal: context.principal,
+                tenants: BTreeSet::from([ledger.tenant]),
+                role: PeerRole::Runtime,
+            })
+            .unwrap();
+            Client::new(
+                EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
+                RetryPolicy::default(),
+                limits.clone(),
+                1,
+            )
+            .unwrap()
+        };
+
+        let sink_a = Arc::new(RecordingSink::default());
+        let sink_b = Arc::new(RecordingSink::default());
+        let client_a = make_client().with_trace(Box::new(SinkHandle(Arc::clone(&sink_a))));
+        let client_b = make_client().with_trace(Box::new(SinkHandle(Arc::clone(&sink_b))));
+
+        // Two clients (same principal, disjoint request ids and claim ids) submit
+        // creates in an interleaved order. Each reply is the owner's authoritative
+        // statement of a durable commit.
+        let mut publications: Vec<MutationReceipt> = Vec::new();
+        let submit = async |client: &Client<EmbeddedTransport<LocalHost>>,
+                            request: u128,
+                            claim: u128|
+               -> NativeReceipt {
+            let envelope = create_envelope(ledger, issuer, worker, request, claim);
+            match client.request(envelope).await.unwrap().result {
+                Response::Native(NativeMutationReply::Committed(reply)) => reply,
+                other => panic!("native create ({request}): {other:?}"),
+            }
+        };
+        // Interleave A, B, A, B.
+        for (client, request, claim) in [
+            (&client_a, 1u128, 100u128),
+            (&client_b, 3, 200),
+            (&client_a, 2, 101),
+            (&client_b, 4, 201),
+        ] {
+            let reply = submit(client, request, claim).await;
+            let key = RequestKey {
+                principal: issuer,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
             };
-            let published = publications
-                .iter()
-                .find(|r| r.key.id == entry.request_id)
-                .expect("every traced commit is published");
-            assert_eq!(published.sequence, sequence);
-            assert_eq!(published.command_hash, command_hash);
+            publications.push(receipt(ledger, key, reply.sequence, reply.intent));
         }
-    }
+        publications.sort_by_key(|receipt| receipt.sequence.0);
+        assert_eq!(
+            publications.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![SessionSeq(1), SessionSeq(2), SessionSeq(3), SessionSeq(4)],
+            "the owner assigned a contiguous commit order"
+        );
 
-    let initial = [Initial {
-        ledger,
-        sequence: SessionSeq(publications[0].sequence.0 - 1),
-        state_hash: ContentHash([0; 32]),
-    }];
-    let events = build_history(&traces, &publications);
-    let report = history::check(&initial, &events, 256).unwrap();
-    assert_eq!(report.publications, 4);
-    assert_eq!(report.reads, 0);
-    assert_eq!(report.unknown, 0);
-    assert_eq!(report.pending, 0);
+        let traces = vec![(issuer, sink_a.drain()), (issuer, sink_b.drain())];
+        // Each traced exchange committed and its trace matches the owner's receipt.
+        for (_, entries) in &traces {
+            assert_eq!(entries.len(), 2, "each client submitted two creates");
+            for entry in entries {
+                assert!(entry.mutation);
+                let TraceOutcome::Committed {
+                    sequence,
+                    command_hash,
+                } = entry.outcome
+                else {
+                    panic!(
+                        "expected a committed native create, got {:?}",
+                        entry.outcome
+                    );
+                };
+                let published = publications
+                    .iter()
+                    .find(|r| r.key.id == entry.request_id)
+                    .expect("every traced commit is published");
+                assert_eq!(published.sequence, sequence);
+                assert_eq!(published.command_hash, command_hash);
+            }
+        }
 
-    // A checker sanity anchor: dropping a publication breaks the prefix, so a
-    // fabricated success (one no owner receipt backs) is caught.
-    let mut tampered = events.clone();
-    tampered.retain(|event| !matches!(event, Event::Publish { receipt, .. } if receipt.sequence == SessionSeq(4)));
-    assert!(
-        history::check(&initial, &tampered, 256).is_err(),
-        "a completion without its publication must be rejected"
-    );
+        let initial = [Initial {
+            ledger,
+            sequence: SessionSeq(publications[0].sequence.0 - 1),
+            state_hash: ContentHash([0; 32]),
+        }];
+        let events = build_history(&traces, &publications);
+        let report = history::check(&initial, &events, 256).unwrap();
+        assert_eq!(report.publications, 4);
+        assert_eq!(report.reads, 0);
+        assert_eq!(report.unknown, 0);
+        assert_eq!(report.pending, 0);
 
-    drop(client_a);
-    drop(client_b);
-    drop(host);
-    owner.join().unwrap();
+        // A checker sanity anchor: dropping a publication breaks the prefix, so a
+        // fabricated success (one no owner receipt backs) is caught.
+        let mut tampered = events.clone();
+        tampered.retain(|event| !matches!(event, Event::Publish { receipt, .. } if receipt.sequence == SessionSeq(4)));
+        assert!(
+            history::check(&initial, &tampered, 256).is_err(),
+            "a completion without its publication must be rejected"
+        );
+
+        drop(client_a);
+        drop(client_b);
+        drop(host);
+        owner.join().unwrap();
+    })
+    .unwrap()
 }
 
 /// A transport that forwards to the owner but drops the reply until `deliver`
@@ -505,140 +504,146 @@ impl<T: ClientTransport> ClientTransport for DropReplies<T> {
 
 #[test]
 fn lost_reply_then_exact_retry_commits_exactly_once() {
-    let root = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        focal_node::native_activation::activate_local(
+            &settings,
+            NativeContentProfile::ProjectionOnly,
+        )
         .unwrap();
 
-    let node = EmbeddedNode::open(&settings).unwrap();
-    let ledger = node.identity.ledger;
-    let issuer = node.identity.issuer;
-    let worker = node.identity.worker;
-    let cluster = node.identity.cluster;
-    let limits = WireLimits::default();
-    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-    let _ = OperationContext {
-        cluster,
-        ledger,
-        principal: issuer,
-    };
+        let node = EmbeddedNode::open(&settings).unwrap();
+        let ledger = node.identity.ledger;
+        let issuer = node.identity.issuer;
+        let worker = node.identity.worker;
+        let cluster = node.identity.cluster;
+        let limits = WireLimits::default();
+        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+        let _ = OperationContext {
+            cluster,
+            ledger,
+            principal: issuer,
+        };
 
-    let deliver = Arc::new(AtomicBool::new(false));
-    let peer = AuthenticatedPeer::local(PeerGrant {
-        principal: issuer,
-        tenants: BTreeSet::from([ledger.tenant]),
-        role: PeerRole::Runtime,
+        let deliver = Arc::new(AtomicBool::new(false));
+        let peer = AuthenticatedPeer::local(PeerGrant {
+            principal: issuer,
+            tenants: BTreeSet::from([ledger.tenant]),
+            role: PeerRole::Runtime,
+        })
+        .unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        // A short policy so the first request exhausts its window quickly and the
+        // application observes an unknown outcome.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            max_elapsed: std::time::Duration::from_secs(5),
+            base_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+        };
+        let client = Client::new(
+            DropReplies {
+                inner: EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
+                deliver: Arc::clone(&deliver),
+            },
+            policy,
+            limits.clone(),
+            1,
+        )
+        .unwrap()
+        .with_trace(Box::new(SinkHandle(Arc::clone(&sink))));
+
+        // First attempt: replies are dropped, so the client exhausts its window and
+        // reports an unknown outcome — though the owner committed the request.
+        let first = client
+            .request(create_envelope(ledger, issuer, worker, 1, 100))
+            .await;
+        assert!(
+            matches!(first, Err(ClientError::OutcomeUnknown { .. })),
+            "a lost reply on a mutation is an unknown outcome, got {first:?}"
+        );
+
+        // The application retries the identical request; the reply now arrives and
+        // the owner returns the same committed receipt (exact retry, no re-commit).
+        deliver.store(true, Ordering::SeqCst);
+        let retry_receipt = match client
+            .request(create_envelope(ledger, issuer, worker, 1, 100))
+            .await
+            .unwrap()
+            .result
+        {
+            Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
+            other => panic!("exact retry: {other:?}"),
+        };
+        assert_eq!(retry_receipt.sequence, SessionSeq(1), "exactly one commit");
+
+        // A second, cleanly-delivered create.
+        let second_receipt = match client
+            .request(create_envelope(ledger, issuer, worker, 2, 101))
+            .await
+            .unwrap()
+            .result
+        {
+            Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
+            other => panic!("second create: {other:?}"),
+        };
+        assert_eq!(second_receipt.sequence, SessionSeq(2));
+
+        let key1 = RequestKey {
+            principal: issuer,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(1),
+        };
+        let key2 = RequestKey {
+            principal: issuer,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(2),
+        };
+        let publications = vec![
+            receipt(ledger, key1, retry_receipt.sequence, retry_receipt.intent),
+            receipt(ledger, key2, second_receipt.sequence, second_receipt.intent),
+        ];
+
+        let entries = sink.drain();
+        // Three exchanges: unknown, then the committed retry, then the second create.
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[0].outcome, TraceOutcome::Unknown));
+        assert_eq!(entries[0].request_id, RequestId::from_u128(1));
+        assert!(matches!(entries[1].outcome, TraceOutcome::Committed { .. }));
+        assert_eq!(entries[1].request_id, RequestId::from_u128(1));
+
+        let traces = vec![(issuer, entries)];
+        let initial = [Initial {
+            ledger,
+            sequence: SessionSeq(0),
+            state_hash: ContentHash([0; 32]),
+        }];
+        let events = build_history(&traces, &publications);
+        let report = history::check(&initial, &events, 256).unwrap();
+        assert_eq!(report.publications, 2, "the retried request committed once");
+        assert_eq!(report.unknown, 1, "the lost-reply attempt is unknown");
+        assert_eq!(report.pending, 0);
+
+        // If the owner had double-committed the retried key, the checker would catch
+        // it: a second publication of key one at the next contiguous sequence keeps
+        // the prefix whole, so the key collision is what trips the checker.
+        let mut doubled = events.clone();
+        doubled.push(Event::Publish {
+            receipt: receipt(ledger, key1, SessionSeq(3), retry_receipt.intent),
+            state_hash: state_marker(SessionSeq(3)),
+        });
+        assert_eq!(
+            history::check(&initial, &doubled, 256),
+            Err(history::HistoryError::DuplicateCommit)
+        );
+
+        drop(client);
+        drop(host);
+        owner.join().unwrap();
     })
-    .unwrap();
-    let sink = Arc::new(RecordingSink::default());
-    // A short policy so the first request exhausts its window quickly and the
-    // application observes an unknown outcome.
-    let policy = RetryPolicy {
-        max_attempts: 3,
-        max_elapsed: std::time::Duration::from_secs(5),
-        base_backoff: std::time::Duration::from_millis(1),
-        max_backoff: std::time::Duration::from_millis(5),
-    };
-    let client = Client::new(
-        DropReplies {
-            inner: EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
-            deliver: Arc::clone(&deliver),
-        },
-        policy,
-        limits.clone(),
-        1,
-    )
     .unwrap()
-    .with_trace(Box::new(SinkHandle(Arc::clone(&sink))));
-
-    // First attempt: replies are dropped, so the client exhausts its window and
-    // reports an unknown outcome — though the owner committed the request.
-    let first = runtime.block_on(client.request(create_envelope(ledger, issuer, worker, 1, 100)));
-    assert!(
-        matches!(first, Err(ClientError::OutcomeUnknown { .. })),
-        "a lost reply on a mutation is an unknown outcome, got {first:?}"
-    );
-
-    // The application retries the identical request; the reply now arrives and
-    // the owner returns the same committed receipt (exact retry, no re-commit).
-    deliver.store(true, Ordering::SeqCst);
-    let retry_receipt = match runtime
-        .block_on(client.request(create_envelope(ledger, issuer, worker, 1, 100)))
-        .unwrap()
-        .result
-    {
-        Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
-        other => panic!("exact retry: {other:?}"),
-    };
-    assert_eq!(retry_receipt.sequence, SessionSeq(1), "exactly one commit");
-
-    // A second, cleanly-delivered create.
-    let second_receipt = match runtime
-        .block_on(client.request(create_envelope(ledger, issuer, worker, 2, 101)))
-        .unwrap()
-        .result
-    {
-        Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
-        other => panic!("second create: {other:?}"),
-    };
-    assert_eq!(second_receipt.sequence, SessionSeq(2));
-
-    let key1 = RequestKey {
-        principal: issuer,
-        epoch: RequestEpoch(1),
-        id: RequestId::from_u128(1),
-    };
-    let key2 = RequestKey {
-        principal: issuer,
-        epoch: RequestEpoch(1),
-        id: RequestId::from_u128(2),
-    };
-    let publications = vec![
-        receipt(ledger, key1, retry_receipt.sequence, retry_receipt.intent),
-        receipt(ledger, key2, second_receipt.sequence, second_receipt.intent),
-    ];
-
-    let entries = sink.drain();
-    // Three exchanges: unknown, then the committed retry, then the second create.
-    assert_eq!(entries.len(), 3);
-    assert!(matches!(entries[0].outcome, TraceOutcome::Unknown));
-    assert_eq!(entries[0].request_id, RequestId::from_u128(1));
-    assert!(matches!(entries[1].outcome, TraceOutcome::Committed { .. }));
-    assert_eq!(entries[1].request_id, RequestId::from_u128(1));
-
-    let traces = vec![(issuer, entries)];
-    let initial = [Initial {
-        ledger,
-        sequence: SessionSeq(0),
-        state_hash: ContentHash([0; 32]),
-    }];
-    let events = build_history(&traces, &publications);
-    let report = history::check(&initial, &events, 256).unwrap();
-    assert_eq!(report.publications, 2, "the retried request committed once");
-    assert_eq!(report.unknown, 1, "the lost-reply attempt is unknown");
-    assert_eq!(report.pending, 0);
-
-    // If the owner had double-committed the retried key, the checker would catch
-    // it: a second publication of key one at the next contiguous sequence keeps
-    // the prefix whole, so the key collision is what trips the checker.
-    let mut doubled = events.clone();
-    doubled.push(Event::Publish {
-        receipt: receipt(ledger, key1, SessionSeq(3), retry_receipt.intent),
-        state_hash: state_marker(SessionSeq(3)),
-    });
-    assert_eq!(
-        history::check(&initial, &doubled, 256),
-        Err(history::HistoryError::DuplicateCommit)
-    );
-
-    drop(client);
-    drop(host);
-    owner.join().unwrap();
 }
 
 /// Project one recovered native outcome to the generic receipt the checker
@@ -653,87 +658,90 @@ fn outcome_to_receipt(outcome: &focal_core::native::NativeOutcome) -> MutationRe
 
 #[test]
 fn offline_reader_is_an_independent_publication_source() {
-    // The strongest black-box form: publications come not from the client's
-    // replies but from reopening the stopped node's durable log independently
-    // (focal_node::history), then the client's traced observations are checked
-    // against that independent order. A node that acked without committing would
-    // be caught here.
-    let root = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    focal_rt::block_on(async move {
+        // The strongest black-box form: publications come not from the client's
+        // replies but from reopening the stopped node's durable log independently
+        // (focal_node::history), then the client's traced observations are checked
+        // against that independent order. A node that acked without committing would
+        // be caught here.
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().into());
+        focal_node::native_activation::activate_local(
+            &settings,
+            NativeContentProfile::ProjectionOnly,
+        )
         .unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().into());
-    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+
+        let node = EmbeddedNode::open(&settings).unwrap();
+        let identity = node.identity.clone();
+        let ledger = identity.ledger;
+        let issuer = identity.issuer;
+        let worker = identity.worker;
+        let limits = WireLimits::default();
+        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+
+        let peer = AuthenticatedPeer::local(PeerGrant {
+            principal: issuer,
+            tenants: BTreeSet::from([ledger.tenant]),
+            role: PeerRole::Runtime,
+        })
         .unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let client = Client::new(
+            EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
+            RetryPolicy::default(),
+            limits.clone(),
+            1,
+        )
+        .unwrap()
+        .with_trace(Box::new(SinkHandle(Arc::clone(&sink))));
 
-    let node = EmbeddedNode::open(&settings).unwrap();
-    let identity = node.identity.clone();
-    let ledger = identity.ledger;
-    let issuer = identity.issuer;
-    let worker = identity.worker;
-    let limits = WireLimits::default();
-    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-
-    let peer = AuthenticatedPeer::local(PeerGrant {
-        principal: issuer,
-        tenants: BTreeSet::from([ledger.tenant]),
-        role: PeerRole::Runtime,
-    })
-    .unwrap();
-    let sink = Arc::new(RecordingSink::default());
-    let client = Client::new(
-        EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
-        RetryPolicy::default(),
-        limits.clone(),
-        1,
-    )
-    .unwrap()
-    .with_trace(Box::new(SinkHandle(Arc::clone(&sink))));
-
-    let mut owner_receipts = Vec::new();
-    for (request, claim) in [(1u128, 100u128), (2, 101), (3, 102)] {
-        match runtime
-            .block_on(client.request(create_envelope(ledger, issuer, worker, request, claim)))
-            .unwrap()
-            .result
-        {
-            Response::Native(NativeMutationReply::Committed(reply)) => {
-                owner_receipts.push((reply.sequence, reply.intent))
+        let mut owner_receipts = Vec::new();
+        for (request, claim) in [(1u128, 100u128), (2, 101), (3, 102)] {
+            match client
+                .request(create_envelope(ledger, issuer, worker, request, claim))
+                .await
+                .unwrap()
+                .result
+            {
+                Response::Native(NativeMutationReply::Committed(reply)) => {
+                    owner_receipts.push((reply.sequence, reply.intent))
+                }
+                other => panic!("create: {other:?}"),
             }
-            other => panic!("create: {other:?}"),
         }
-    }
-    let entries = sink.drain();
+        let entries = sink.drain();
 
-    // Stop the node so its durable log can be reopened offline.
-    drop(client);
-    drop(host);
-    owner.join().unwrap();
+        // Stop the node so its durable log can be reopened offline.
+        drop(client);
+        drop(host);
+        owner.join().unwrap();
 
-    // Independent recovery of the committed prefix (no live server).
-    let outcomes = focal_node::history::offline_native_publications(root.path(), &identity)
-        .expect("offline reopen of the stopped node");
-    let recovered: Vec<(SessionSeq, ContentHash)> = outcomes
-        .iter()
-        .map(|outcome| (outcome.sequence, outcome.intent))
-        .collect();
-    assert_eq!(
-        recovered, owner_receipts,
-        "the independently recovered prefix agrees with the owner's replies"
-    );
+        // Independent recovery of the committed prefix (no live server).
+        let outcomes = focal_node::history::offline_native_publications(root.path(), &identity)
+            .expect("offline reopen of the stopped node");
+        let recovered: Vec<(SessionSeq, ContentHash)> = outcomes
+            .iter()
+            .map(|outcome| (outcome.sequence, outcome.intent))
+            .collect();
+        assert_eq!(
+            recovered, owner_receipts,
+            "the independently recovered prefix agrees with the owner's replies"
+        );
 
-    let publications: Vec<MutationReceipt> = outcomes.iter().map(outcome_to_receipt).collect();
-    let traces = vec![(issuer, entries)];
-    let initial = [Initial {
-        ledger,
-        sequence: SessionSeq(publications[0].sequence.0 - 1),
-        state_hash: ContentHash([0; 32]),
-    }];
-    let events = build_history(&traces, &publications);
-    let report = history::check(&initial, &events, 256).unwrap();
-    assert_eq!(report.publications, 3);
-    assert_eq!(report.unknown, 0);
-    assert_eq!(report.pending, 0);
+        let publications: Vec<MutationReceipt> = outcomes.iter().map(outcome_to_receipt).collect();
+        let traces = vec![(issuer, entries)];
+        let initial = [Initial {
+            ledger,
+            sequence: SessionSeq(publications[0].sequence.0 - 1),
+            state_hash: ContentHash([0; 32]),
+        }];
+        let events = build_history(&traces, &publications);
+        let report = history::check(&initial, &events, 256).unwrap();
+        assert_eq!(report.publications, 3);
+        assert_eq!(report.unknown, 0);
+        assert_eq!(report.pending, 0);
+    })
+    .unwrap()
 }

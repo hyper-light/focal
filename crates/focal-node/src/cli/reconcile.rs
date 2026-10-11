@@ -3,14 +3,12 @@
 use super::*;
 use serde::Serialize;
 
-async fn fetch(
-    context: &Context,
-    query: ReconcileQuery,
-) -> Result<ReconcileReply> {
+async fn fetch(context: &Context, query: ReconcileQuery) -> Result<ReconcileReply> {
     let request = context.envelope(Operation::Reconcile(query))?;
     Ok(context
-            .client
-            .reconcile(request, context.operation.principal).await?)
+        .client
+        .reconcile(request, context.operation.principal)
+        .await?)
 }
 
 pub(super) async fn query(
@@ -27,12 +25,14 @@ pub(super) async fn inspect(
     format: OutputFormat,
 ) -> Result<()> {
     let request = journal.business_request()?;
-    let reply = fetch(context,
+    let reply = fetch(
+        context,
         ReconcileQuery::Receipt {
             epoch: request.request_epoch,
             request: request.request_id,
         },
-    ).await?;
+    )
+    .await?;
     if let ReconcileResult::Receipt { resolution, .. } = &reply.page.result {
         match resolution {
             ReceiptResolution::Committed(receipt) => journal.validate_business_receipt(receipt)?,
