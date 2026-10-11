@@ -1439,3 +1439,61 @@ fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
     )
     .unwrap();
 }
+
+/// Measurement, not a check: a session's work per claim as a node's owner
+/// does it, from each request's frame (decoded, prepared, made durable and
+/// published) on the standard limits. The frames are made first, as a client
+/// makes them. `CLAIMS` claims a session (5,000 unless set), `ROUNDS` sessions
+/// for a profiler to sample; the time includes the log's writes and syncs.
+#[test]
+#[ignore = "measurement"]
+fn measure_time_per_claim_from_its_frame() {
+    let claims: u128 = std::env::var("CLAIMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    let rounds: u32 = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = MemoryBudget::new(1 << 30, 64 << 20).unwrap();
+        let standard = NativeSessionLimits::standard(focal_model::ContentDomainId([7; 16]));
+        let mut session = open_with(dir.path(), &parent, standard).unwrap();
+        lead(&mut session);
+        let frames: Vec<Vec<u8>> = (1..=claims)
+            .map(|request| frame(&create(request, 1_000_000 + request)))
+            .collect();
+        // As a loaded owner runs: claims pending together share the log's
+        // syncs, and a claim refused while too many are pending waits for
+        // the session to make progress.
+        let started = std::time::Instant::now();
+        let mut refused = 0u64;
+        for (index, bytes) in frames.iter().enumerate() {
+            let mut attempts = 0;
+            loop {
+                match session.propose_native_frame(context(), bytes) {
+                    Ok(_) => {
+                        let _ = session.try_poll().unwrap();
+                        break;
+                    }
+                    Err(error) => {
+                        attempts += 1;
+                        refused += 1;
+                        assert!(attempts < 1_000, "claim {index}: {error:?}");
+                        let _ = session.poll().unwrap();
+                    }
+                }
+            }
+        }
+        for _ in 0..64 {
+            let _ = session.poll().unwrap();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "round {round}: {claims} claims, {:.1} µs a claim, {refused} refusals waited out",
+            elapsed.as_secs_f64() * 1e6 / claims as f64
+        );
+    }
+}
