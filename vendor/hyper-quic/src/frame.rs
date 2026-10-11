@@ -600,7 +600,18 @@ impl Iter {
         let ty = self.bytes.get::<FrameType>()?;
         self.last_ty = Some(ty);
         Ok(match ty {
-            FrameType::PADDING => Frame::Padding,
+            FrameType::PADDING => {
+                // The run of PADDING is taken as one frame: each is a zero byte of no meaning
+                // (RFC 9000 §19.1), and every reader passes them over. The run's length is what
+                // the scan found, at most what remains.
+                let run = self
+                    .bytes
+                    .iter()
+                    .position(|byte| *byte != 0)
+                    .unwrap_or(self.bytes.len());
+                self.bytes.advance(run);
+                Frame::Padding
+            }
             FrameType::RESET_STREAM => Frame::ResetStream(ResetStream {
                 id: self.bytes.get()?,
                 error_code: self.bytes.get()?,
@@ -996,6 +1007,44 @@ mod test {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    /// A run of PADDING is decoded as one frame. Each PADDING byte is a frame of no meaning (RFC
+    /// 9000 §19.1), and decoded one at a time a datagram padded to the path's MTU cost its receiver
+    /// some 1,400 frames: a path's warm-up and its MTU probes are such datagrams, and a server that
+    /// five hundred fresh connections warm up decodes hundreds of megabytes of them.
+    #[test]
+    fn a_run_of_padding_is_one_frame() {
+        let mut buf = vec![0u8; 100];
+        buf.push(FrameType::PING.0 as u8);
+        buf.extend([0u8; 50]);
+        let frames = frames(buf);
+        assert_eq!(frames.len(), 3);
+        assert_matches!(frames[0], Frame::Padding);
+        assert_matches!(frames[1], Frame::Ping);
+        assert_matches!(frames[2], Frame::Padding);
+    }
+
+    /// Measurement, not a check: what decoding a PING padded to 1,452 bytes costs. Run with
+    /// `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_a_padded_datagram() {
+        const ROUNDS: u32 = 100_000;
+        let mut buf = vec![FrameType::PING.0 as u8];
+        buf.resize(1_452, 0);
+        let payload = Bytes::from(buf);
+        let started = std::time::Instant::now();
+        let mut decoded = 0usize;
+        for _ in 0..ROUNDS {
+            decoded += Iter::new(payload.clone()).unwrap().count();
+        }
+        let took = started.elapsed();
+        println!(
+            "{:.0} ns a padded datagram, {} frames each",
+            took.as_nanos() as f64 / f64::from(ROUNDS),
+            decoded / ROUNDS as usize
+        );
     }
 
     #[test]
