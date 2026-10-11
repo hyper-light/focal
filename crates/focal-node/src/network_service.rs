@@ -1558,6 +1558,8 @@ impl NetworkService {
                 achieved_max_failures: directory_listed.and_then(|listed| listed.3),
                 blocked: directory_listed.and_then(|listed| listed.4),
                 tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
+                write_window: host.write_window(),
+                writes_admitted: host.writes_admitted(),
                 broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
                 pace_samples: host.current_pace().samples,
                 periods: host.periods(),

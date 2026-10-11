@@ -245,6 +245,11 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
             panic!("create: {reply:?}")
         };
         assert_eq!(receipt.counts.created, 1);
+        // The write held its place in the session's write window until it
+        // was answered, and the window the owner states stayed within its
+        // bounds (`write_window`).
+        assert_eq!(host.writes_admitted(), 0);
+        assert!(host.write_window() >= 4, "{}", host.write_window());
         let objects = call(
             &host,
             ISSUER,

@@ -82,6 +82,7 @@ mod streams_tests;
 mod test_waits;
 pub mod topology;
 pub mod upgrade;
+mod write_window;
 
 mod managed_support;
 
