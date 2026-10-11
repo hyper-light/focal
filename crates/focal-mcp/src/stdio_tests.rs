@@ -241,21 +241,21 @@ fn answer(observed: Observed, result: MutationReply) {
 fn application(response: &Value) -> ApplicationResult {
     serde_json::from_value(response["result"]["structuredContent"].clone()).unwrap()
 }
-fn inspect_when_retired(runner: &mut Running, start: u64) -> ApplicationResult {
-    for offset in 0..40 {
-        let id = start + offset;
-        runner.tool(id, "request.inspect", json!({"operation_id":OPERATION_ID}));
-        let response = runner.response(id);
-        if response["result"].get("structuredContent").is_some() {
-            assert_eq!(
-                response["result"]["isError"], false,
-                "inspection is successful even while its saved mutation is pending"
-            );
-            return application(&response);
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    panic!("cancelled backend did not release active protocol slot")
+/// An inspection asked right after a cancellation: served at once, behind the
+/// cancelled call at the worker, never refused because that call had not yet
+/// ended when it was asked (a cancelled call holds no capacity).
+fn inspect_after_cancel(runner: &mut Running, id: u64) -> ApplicationResult {
+    runner.tool(id, "request.inspect", json!({"operation_id":OPERATION_ID}));
+    let response = runner.response(id);
+    assert!(
+        response["result"].get("structuredContent").is_some(),
+        "an inspection after a cancellation was refused: {response}"
+    );
+    assert_eq!(
+        response["result"]["isError"], false,
+        "inspection is successful even while its saved mutation is pending"
+    );
+    application(&response)
 }
 
 #[test]
@@ -291,13 +291,9 @@ fn pending_mutation_keeps_control_responsive_cancel_suppressed_and_restart_retri
     );
     runner
         .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}));
-    // The server's threads report no period: the wedge window bounds it.
-    let deadline = Instant::now() + FROZEN;
-    while !pending.abandoned() {
-        assert!(Instant::now() < deadline, "backend request did not cancel");
-        thread::sleep(Duration::from_millis(2));
-    }
-    let inspected = inspect_when_retired(&mut runner, 10);
+    // Asked before the cancelled call has ended: it waits behind it.
+    let inspected = inspect_after_cancel(&mut runner, 10);
+    assert!(pending.abandoned(), "backend request did not cancel");
     assert_eq!(inspected.condition, "Pending");
     assert_eq!(inspected.operation_id.as_deref(), Some(OPERATION_ID));
     assert!(
