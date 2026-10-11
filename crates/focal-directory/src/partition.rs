@@ -1271,6 +1271,13 @@ fn validate_partition(
     }
     Ok(())
 }
+impl PartitionCheckpoint {
+    /// What this checkpoint's tables hold, row by row, as a partition's owner
+    /// charges its own state: what a holder of a copy charges for keeping it.
+    pub fn charged_bytes(&self) -> Result<usize, DirectoryError> {
+        partition_charge(self)
+    }
+}
 fn partition_charge(state: &PartitionCheckpoint) -> Result<usize, DirectoryError> {
     let mut bytes = add(
         add(size_of::<PartitionVersion>(), ALLOCATOR_OVERHEAD)?,

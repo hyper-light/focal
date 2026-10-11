@@ -510,7 +510,8 @@ pub struct PlacementAgent {
     /// Where sessions are led, as one revision of one partition's
     /// directory commits it: counted once for every session of a pass.
     pub(super) leading: Option<Leading>,
-    _allocation: Allocation,
+    /// What the agent's tables hold (`memory`).
+    tables: Allocation,
 }
 /// The voters of `descriptor`'s active placement that the directory places
 /// in the zone of its preferred leader; none while that zone is not known.
@@ -565,14 +566,10 @@ impl PlacementAgent {
             storage,
             jobs,
         } = inputs;
-        // Covers the bounded partition and authority projections, the
-        // journals, one readiness proof and one registration plan at a time.
-        let allocation = budget
-            .reserve(
-                BudgetKind::Control,
-                BudgetLane::Completion,
-                32 * 1024 * 1024,
-            )
+        // What the agent's tables hold, charged as they grow and settled after
+        // every pass and job (`memory`): nothing yet.
+        let tables = budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 0)
             .map_err(|_| AgentError::Capacity)?
             .commit();
         let mut custody = BTreeMap::new();
@@ -628,7 +625,7 @@ impl PlacementAgent {
                 ),
             ),
             leading: None,
-            _allocation: allocation,
+            tables,
         })
     }
     /// The client identity of this node's agent on a local metadata owner.
@@ -760,6 +757,8 @@ impl PlacementAgent {
                         next = now.checked_add(pause).unwrap_or(now);
                     }
                 }
+                // What the job or the pass left the agent's tables holding.
+                self.settle();
             }
         })
         .catch_unwind()
@@ -994,6 +993,11 @@ impl PlacementAgent {
         // read refused) leaves the operator's view as it was, dated as it
         // was: an empty view would read as a cluster without partitions.
         if observed.is_empty() {
+            return Ok(AgentStep::Idle);
+        }
+        // Funded before it grows anything: a pass the budget has no room
+        // for is not made, and nothing of it grows.
+        if self.fund_pass(&observed).is_err() {
             return Ok(AgentStep::Idle);
         }
         // The last-observed snapshot only feeds the operator's on-demand
@@ -3530,6 +3534,8 @@ impl crate::fleet::FleetManager {
 
 #[path = "placement_controller.rs"]
 pub(crate) mod controller;
+#[path = "placement_agent_memory.rs"]
+mod memory;
 #[path = "partition_split.rs"]
 pub mod split;
 

@@ -168,6 +168,18 @@ impl IntentJournal {
     pub(crate) fn pending(&self) -> Option<&ControlRequest> {
         self.saved.pending.as_ref()
     }
+    /// What this journal holds in memory: its pending request (at the bytes
+    /// it encodes to, which every heap field of it is no larger than, and its
+    /// own size) and the other clients' retry windows.
+    pub(crate) fn held_bytes(&self) -> Option<usize> {
+        let pending = match &self.saved.pending {
+            Some(request) => postcard::experimental::serialized_size(request)
+                .ok()?
+                .checked_add(size_of::<ControlRequest>())?,
+            None => 0,
+        };
+        focal_memory::map_bytes::<[u8; 16], u64>(self.saved.windows.len())?.checked_add(pending)
+    }
     pub(crate) fn completed(&self) -> u64 {
         self.saved.completed
     }
