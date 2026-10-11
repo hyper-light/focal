@@ -32,6 +32,9 @@ crc32fast = "1.5"
 getrandom = "0.3"
 rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
+# Pin projection for focal-rt's named waits (`timeout`): the work held in place,
+# once, with no `unsafe` of focal's own (hyper-rt's choice for its combinators).
+pin-project-lite = "0.2.17"
 # The durable shell around the core, vendored from hyper-raft with the log and
 # block layers and the liveness stream it builds on (vendor/*/SNAPSHOT; 27 §15).
 hyper-block = { version = "0.1.0", path = "vendor/hyper-block" }

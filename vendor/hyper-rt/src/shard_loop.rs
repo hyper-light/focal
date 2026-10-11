@@ -271,6 +271,8 @@ impl Shard {
                 timers: config.timers_per_shard,
                 interests: config.interests_per_shard,
                 generation_base,
+                // The wheel's own tick (`Wheel::new` takes at least a nanosecond).
+                timer_tick_ns: config.timer_tick_ns.max(1),
             },
             is_sim,
             driver.clock(),

@@ -484,7 +484,7 @@ where
     };
     for (index, ask) in asks.into_iter().enumerate() {
         let ask = std::panic::AssertUnwindSafe(ask).catch_unwind();
-        if asking.push(async move { (index, ask.await) }).is_err() {
+        if asking.push(focal_rt::keyed(index, ask)).is_err() {
             break;
         }
     }

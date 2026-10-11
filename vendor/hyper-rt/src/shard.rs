@@ -314,6 +314,8 @@ pub struct ShardContext {
     pub(crate) quantum_ns: Cell<u64>,
     /// The measured scheduler overrun, published by the loop.
     pub(crate) scheduler_overrun_ns: Cell<u64>,
+    /// The timer wheel's tick: a deadline is kept on the tick after it.
+    timer_tick_ns: u64,
     /// Spawns refused because no slot was free (folded into the loop's counters).
     pub(crate) refused_spawns: Cell<u64>,
     /// Sleeps that found every timer taken and waited for one (folded into the loop's counters).
@@ -348,6 +350,7 @@ pub(crate) struct DeskShape {
     pub(crate) timers: usize,
     pub(crate) interests: usize,
     pub(crate) generation_base: u32,
+    pub(crate) timer_tick_ns: u64,
 }
 
 impl ShardContext {
@@ -415,6 +418,7 @@ impl ShardContext {
             activity_ns: Cell::new(None),
             quantum_ns: Cell::new(1),
             scheduler_overrun_ns: Cell::new(0),
+            timer_tick_ns: shape.timer_tick_ns,
             refused_spawns: Cell::new(0),
             timer_waits: Cell::new(0),
             is_sim,
@@ -485,6 +489,12 @@ impl ShardContext {
     /// The measured scheduler overrun, nanoseconds: how late the shard's steps have run after its waits.
     pub fn scheduler_overrun_ns(&self) -> u64 {
         self.scheduler_overrun_ns.get()
+    }
+
+    /// The timer wheel's tick, nanoseconds: a sleep ends on the tick after its deadline, so up to a tick
+    /// later than due by design (and later still by the scheduler's overrun).
+    pub fn timer_tick_ns(&self) -> u64 {
+        self.timer_tick_ns
     }
 
     /// The shard's counters as of the start of the current step.

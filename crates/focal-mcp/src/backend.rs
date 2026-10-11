@@ -25,46 +25,45 @@ type Boxed<'a, T> = std::pin::Pin<Box<dyn Future<Output = Result<T, BackendError
 /// A branch that answers the call.
 type Branch<'a> = Boxed<'a, (&'static str, OperationOutput)>;
 
-/// `work`, with an unwind out of a dependency it polls contained: refused `Transport`, its
-/// in-flight wait and what it held dropped as it is.
-async fn contained<T>(
+// The waits around a call's work are named ones, which hold the work once: as `async fn`s each held
+// it twice, and the three nested around a branch held it eight times (32,608 bytes; `focal_rt`'s
+// `adapt`).
+
+/// `work`, with an unwind out of a dependency it polls contained: refused `Transport`, and the
+/// work never polled again.
+fn contained<T>(
     work: impl Future<Output = Result<T, BackendError>>,
-) -> Result<T, BackendError> {
-    let mut work = std::pin::pin!(work);
-    std::future::poll_fn(|context| {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(context)))
-        {
-            Ok(poll) => poll,
-            Err(_) => std::task::Poll::Ready(Err(BackendError::Client(ClientError::Transport))),
-        }
-    })
-    .await
+) -> impl Future<Output = Result<T, BackendError>> {
+    focal_rt::contained(work, || Err(BackendError::Client(ClientError::Transport)))
 }
 
 /// `work` within `period` on the shard's clock: `elapsed` once the period is over, `Transport` off
 /// a shard, where no deadline can be kept.
-async fn within<T>(
+fn within<T>(
     period: std::time::Duration,
     work: impl Future<Output = Result<T, BackendError>>,
     elapsed: impl FnOnce() -> BackendError,
-) -> Result<T, BackendError> {
+) -> impl Future<Output = Result<T, BackendError>> {
     let nanos = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
-    match hyper_rt::futures::within(nanos, work).await {
-        Ok(Some(done)) => done,
-        Ok(None) => Err(elapsed()),
-        Err(_) => Err(BackendError::Client(ClientError::Transport)),
-    }
+    focal_rt::map(
+        hyper_rt::futures::within(nanos, work),
+        move |waited| match waited {
+            Ok(Some(done)) => done,
+            Ok(None) => Err(elapsed()),
+            Err(_) => Err(BackendError::Client(ClientError::Transport)),
+        },
+    )
 }
 
 /// `work`, or `Cancelled` once `cancel` fires.
-async fn cancellable<T, E: From<BackendError>>(
+fn cancellable<T, E: From<BackendError>>(
     cancel: &mut Cancel,
     work: impl Future<Output = Result<T, E>>,
-) -> Result<T, E> {
-    match race2(work, cancel).await {
+) -> impl Future<Output = Result<T, E>> {
+    focal_rt::map(race2(work, cancel), |raced| match raced {
         Either::First(done) => done,
         Either::Second(_) => Err(BackendError::Cancelled.into()),
-    }
+    })
 }
 
 // OperationStore owns the bounded catalogue and exact prepared requests. It is

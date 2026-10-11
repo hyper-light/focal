@@ -878,6 +878,7 @@ dependencies = [
  "focal-wire",
  "getrandom 0.3.4",
  "hyper-rt",
+ "pin-project-lite",
  "rquickjs",
  "serde",
  "serde-saphyr",
@@ -995,6 +996,7 @@ name = "focal-rt"
 version = "0.1.0"
 dependencies = [
  "hyper-rt",
+ "pin-project-lite",
  "thiserror",
 ]
 
@@ -1360,6 +1362,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "libc",
+ "pin-project-lite",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]

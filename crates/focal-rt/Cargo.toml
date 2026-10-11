@@ -12,4 +12,5 @@ workspace = true
 
 [dependencies]
 hyper-rt.workspace = true
+pin-project-lite.workspace = true
 thiserror.workspace = true

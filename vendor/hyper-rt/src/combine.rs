@@ -7,9 +7,12 @@
 //! picks at random). A caller that must not starve a later branch puts it first, or bounds the earlier one.
 //! The losers are dropped when the race returns, which is what cancel-safe futures are for.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+use pin_project_lite::pin_project;
 
 use crate::error::RtError;
 use crate::futures::{Join, join, spawn};
@@ -37,76 +40,248 @@ pub enum Either3<A, B, C> {
 }
 
 /// The first of `a` and `b` to finish; the other is dropped. Polls `a` first.
-pub async fn race2<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
-    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(out) = a.as_mut().poll(cx) {
-            return Poll::Ready(Either::First(out));
-        }
-        if let Poll::Ready(out) = b.as_mut().poll(cx) {
-            return Poll::Ready(Either::Second(out));
-        }
-        Poll::Pending
-    })
-    .await
+pub fn race2<A: Future, B: Future>(a: A, b: B) -> Race2<A, B> {
+    Race2 {
+        a,
+        b,
+        finished: false,
+    }
 }
 
 /// The first of `a`, `b` and `c` to finish; the others are dropped. Polls in that order.
-pub async fn race3<A: Future, B: Future, C: Future>(
-    a: A,
-    b: B,
-    c: C,
-) -> Either3<A::Output, B::Output, C::Output> {
-    let (mut a, mut b, mut c) = (std::pin::pin!(a), std::pin::pin!(b), std::pin::pin!(c));
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(out) = a.as_mut().poll(cx) {
-            return Poll::Ready(Either3::First(out));
-        }
-        if let Poll::Ready(out) = b.as_mut().poll(cx) {
-            return Poll::Ready(Either3::Second(out));
-        }
-        if let Poll::Ready(out) = c.as_mut().poll(cx) {
-            return Poll::Ready(Either3::Third(out));
-        }
-        Poll::Pending
-    })
-    .await
+pub fn race3<A: Future, B: Future, C: Future>(a: A, b: B, c: C) -> Race3<A, B, C> {
+    Race3 {
+        a,
+        b,
+        c,
+        finished: false,
+    }
 }
 
 /// Both outputs, the futures running together in this task.
-pub async fn join2<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
-    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
-    let (mut out_a, mut out_b) = (None, None);
-    std::future::poll_fn(|cx| {
-        if out_a.is_none()
-            && let Poll::Ready(out) = a.as_mut().poll(cx)
-        {
-            out_a = Some(out);
-        }
-        if out_b.is_none()
-            && let Poll::Ready(out) = b.as_mut().poll(cx)
-        {
-            out_b = Some(out);
-        }
-        match (out_a.take(), out_b.take()) {
-            (Some(a), Some(b)) => Poll::Ready((a, b)),
-            (a, b) => {
-                (out_a, out_b) = (a, b);
-                Poll::Pending
-            }
-        }
-    })
-    .await
+pub fn join2<A: Future, B: Future>(a: A, b: B) -> Join2<A, B> {
+    Join2 {
+        a: Slot::Running { future: a },
+        b: Slot::Running { future: b },
+    }
 }
 
 /// All three outputs, the futures running together in this task.
-pub async fn join3<A: Future, B: Future, C: Future>(
-    a: A,
-    b: B,
-    c: C,
-) -> (A::Output, B::Output, C::Output) {
-    let ((a, b), c) = join2(join2(a, b), c).await;
-    (a, b, c)
+pub fn join3<A: Future, B: Future, C: Future>(a: A, b: B, c: C) -> Join3<A, B, C> {
+    Join3 {
+        a: Slot::Running { future: a },
+        b: Slot::Running { future: b },
+        c: Slot::Running { future: c },
+    }
+}
+
+// Each combinator is a named future holding what it was given in place, once. As `async fn`s they held each
+// future twice, the argument beside the pinned local it moved into (rust-lang/rust#62958), so every level of
+// nesting doubled what it held and a debug build copied it on the stack besides (docs/runtime.md §3.8).
+
+pin_project! {
+    /// The wait of [`race2`].
+    #[must_use = "a race does nothing unless awaited"]
+    pub struct Race2<A, B> {
+        #[pin]
+        a: A,
+        #[pin]
+        b: B,
+        // Set once a future has finished: the race is not polled again, and a finished future never is.
+        finished: bool,
+    }
+}
+
+impl<A: Future, B: Future> Future for Race2<A, B> {
+    type Output = Either<A::Output, B::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if *this.finished {
+            return Poll::Pending;
+        }
+        let won = if let Poll::Ready(out) = this.a.poll(cx) {
+            Either::First(out)
+        } else if let Poll::Ready(out) = this.b.poll(cx) {
+            Either::Second(out)
+        } else {
+            return Poll::Pending;
+        };
+        *this.finished = true;
+        Poll::Ready(won)
+    }
+}
+
+impl<A, B> fmt::Debug for Race2<A, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Race2")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+pin_project! {
+    /// The wait of [`race3`].
+    #[must_use = "a race does nothing unless awaited"]
+    pub struct Race3<A, B, C> {
+        #[pin]
+        a: A,
+        #[pin]
+        b: B,
+        #[pin]
+        c: C,
+        finished: bool,
+    }
+}
+
+impl<A: Future, B: Future, C: Future> Future for Race3<A, B, C> {
+    type Output = Either3<A::Output, B::Output, C::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if *this.finished {
+            return Poll::Pending;
+        }
+        let won = if let Poll::Ready(out) = this.a.poll(cx) {
+            Either3::First(out)
+        } else if let Poll::Ready(out) = this.b.poll(cx) {
+            Either3::Second(out)
+        } else if let Poll::Ready(out) = this.c.poll(cx) {
+            Either3::Third(out)
+        } else {
+            return Poll::Pending;
+        };
+        *this.finished = true;
+        Poll::Ready(won)
+    }
+}
+
+impl<A, B, C> fmt::Debug for Race3<A, B, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Race3")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+pin_project! {
+    /// One future of a join: running, finished with its output held (the future itself dropped), or its
+    /// output handed on.
+    #[project = SlotProj]
+    #[project_replace = SlotReplace]
+    // The tag stays out of the future's bytes: a niche there would be read to match the slot while the
+    // running future is lent out pinned (tokio's `MaybeDone` holds the same, rust-lang/miri#3780).
+    #[repr(C)]
+    enum Slot<F: Future> {
+        Running {
+            #[pin]
+            future: F,
+        },
+        Done {
+            output: F::Output,
+        },
+        Taken,
+    }
+}
+
+impl<F: Future> Slot<F> {
+    /// Polls a running future, keeping its output once it has one; whether the output is held.
+    fn poll_done(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> bool {
+        let output = match self.as_mut().project() {
+            SlotProj::Running { future } => match future.poll(cx) {
+                Poll::Ready(output) => output,
+                Poll::Pending => return false,
+            },
+            SlotProj::Done { .. } => return true,
+            SlotProj::Taken => return false,
+        };
+        // The finished future is dropped here, in place, and what it held let go with it.
+        self.set(Slot::Done { output });
+        true
+    }
+
+    /// The held output, the slot left taken; `None` (and the slot unchanged) when it holds none.
+    fn take(self: Pin<&mut Self>) -> Option<F::Output> {
+        if !matches!(&*self, Slot::Done { .. }) {
+            return None;
+        }
+        match self.project_replace(Slot::Taken) {
+            SlotReplace::Done { output } => Some(output),
+            SlotReplace::Running { .. } | SlotReplace::Taken => None,
+        }
+    }
+}
+
+pin_project! {
+    /// The wait of [`join2`].
+    #[must_use = "a join does nothing unless awaited"]
+    pub struct Join2<A: Future, B: Future> {
+        #[pin]
+        a: Slot<A>,
+        #[pin]
+        b: Slot<B>,
+    }
+}
+
+impl<A: Future, B: Future> Future for Join2<A, B> {
+    type Output = (A::Output, B::Output);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let a = this.a.as_mut().poll_done(cx);
+        let b = this.b.as_mut().poll_done(cx);
+        if !(a && b) {
+            return Poll::Pending;
+        }
+        match (this.a.take(), this.b.take()) {
+            (Some(a), Some(b)) => Poll::Ready((a, b)),
+            // Each held its output a moment ago; a join whose outputs were handed on waits.
+            _ => Poll::Pending,
+        }
+    }
+}
+
+impl<A: Future, B: Future> fmt::Debug for Join2<A, B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Join2").finish_non_exhaustive()
+    }
+}
+
+pin_project! {
+    /// The wait of [`join3`].
+    #[must_use = "a join does nothing unless awaited"]
+    pub struct Join3<A: Future, B: Future, C: Future> {
+        #[pin]
+        a: Slot<A>,
+        #[pin]
+        b: Slot<B>,
+        #[pin]
+        c: Slot<C>,
+    }
+}
+
+impl<A: Future, B: Future, C: Future> Future for Join3<A, B, C> {
+    type Output = (A::Output, B::Output, C::Output);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let a = this.a.as_mut().poll_done(cx);
+        let b = this.b.as_mut().poll_done(cx);
+        let c = this.c.as_mut().poll_done(cx);
+        if !(a && b && c) {
+            return Poll::Pending;
+        }
+        match (this.a.take(), this.b.take(), this.c.take()) {
+            (Some(a), Some(b), Some(c)) => Poll::Ready((a, b, c)),
+            _ => Poll::Pending,
+        }
+    }
+}
+
+impl<A: Future, B: Future, C: Future> fmt::Debug for Join3<A, B, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Join3").finish_non_exhaustive()
+    }
 }
 
 /// A bounded set of tasks spawned on the current shard, awaited as they end (tokio's `JoinSet`): at most

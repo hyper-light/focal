@@ -61,20 +61,17 @@ pub(crate) fn require_runtime() -> Result<(), WireError> {
 }
 
 /// An exchange contained by an unwind boundary: a dependency that unwinds
-/// ends the exchange, typed, and it is dropped and never polled again
-/// (CLAUDE.md §1: the boundary is the last fence, never the fix).
-pub(crate) async fn transport_exchange<T>(
+/// ends the exchange, typed, and it is never polled again (CLAUDE.md §1: the
+/// boundary is the last fence, never the fix). Off a shard it is refused
+/// before it is polled. Named waits around the exchange, which they hold
+/// once (`focal_rt::adapt`).
+pub(crate) fn transport_exchange<T>(
     exchange: impl std::future::Future<Output = Result<T, WireError>>,
-) -> Result<T, WireError> {
-    require_runtime()?;
-    let mut exchange = std::pin::pin!(exchange);
-    std::future::poll_fn(|context| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            exchange.as_mut().poll(context)
-        }))
-        .unwrap_or_else(|_| std::task::Poll::Ready(Err(WireError::Connection)))
-    })
-    .await
+) -> impl std::future::Future<Output = Result<T, WireError>> {
+    focal_rt::on_shard(
+        focal_rt::contained(exchange, || Err(WireError::Connection)),
+        || Err(WireError::Connection),
+    )
 }
 
 mod monitor;

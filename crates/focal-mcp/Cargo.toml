@@ -18,6 +18,7 @@ thiserror.workspace = true
 getrandom.workspace = true
 focal-rt = { version = "0.1.0", path = "../focal-rt" }
 hyper-rt.workspace = true
+pin-project-lite.workspace = true
 rquickjs.workspace = true
 serde_saphyr.workspace = true
 aws-lc-rs = "1.18"

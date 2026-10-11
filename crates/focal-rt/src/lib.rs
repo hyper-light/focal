@@ -28,8 +28,11 @@ use std::task::{Context, Poll};
 use hyper_rt::runtime::{LocalRuntime, interests_for};
 pub use hyper_rt::{RtError, Runtime, RuntimeConfig};
 
+mod adapt;
 pub mod time;
 pub mod watch;
+
+pub use adapt::{Contained, Keyed, Map, OnShard, contained, keyed, map, on_shard};
 
 /// Tasks one shard of the local runtime holds at once: what a test or a command keeps in flight,
 /// its connections' exchanges among them. A task past it is refused `TooManyTasks`, typed, and the
@@ -402,7 +405,7 @@ pub async fn join_all<F: Future>(
     let count = futures.len();
     let mut set = Concurrent::new(count)?;
     for (index, future) in futures.into_iter().enumerate() {
-        set.push(async move { (index, future.await) })?;
+        set.push(keyed(index, future))?;
     }
     let mut ended = Vec::new();
     ended

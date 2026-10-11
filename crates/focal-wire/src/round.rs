@@ -58,7 +58,7 @@ where
     let mut exchanges = Concurrent::new(MAX_ROUND_PEERS).map_err(|_| RoundError::Capacity)?;
     for (peer, ask) in asks {
         exchanges
-            .push(async move { (peer, ask.await) })
+            .push(focal_rt::keyed(peer, ask))
             .map_err(|_| RoundError::Capacity)?;
     }
     let asked = exchanges.len();

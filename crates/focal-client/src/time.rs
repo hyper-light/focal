@@ -39,17 +39,18 @@ impl Instant {
 }
 
 /// What `future` yields within `period`, or `None` once the period is over. Off a shard no
-/// deadline can be kept: refused `Transport` before the work begins.
-pub(crate) async fn within<F: Future>(
+/// deadline can be kept: refused `Transport` before the work begins. Named waits around the
+/// work, which they hold once (`focal_rt::adapt`).
+pub(crate) fn within<F: Future>(
     period: Duration,
     future: F,
-) -> Result<Option<F::Output>, ClientError> {
-    if !on_a_shard() {
-        return Err(ClientError::Transport);
-    }
-    hyper_rt::futures::within(nanos(period), future)
-        .await
-        .map_err(|_| ClientError::Transport)
+) -> impl Future<Output = Result<Option<F::Output>, ClientError>> {
+    focal_rt::on_shard(
+        focal_rt::map(hyper_rt::futures::within(nanos(period), future), |waited| {
+            waited.map_err(|_| ClientError::Transport)
+        }),
+        || Err(ClientError::Transport),
+    )
 }
 
 /// What `future` answers when polled once off any shard: a client's call is refused there at once,

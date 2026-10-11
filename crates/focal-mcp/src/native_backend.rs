@@ -17,7 +17,6 @@ use focal_client::{ClientError, ClientTransport};
 use focal_model::RequestId;
 use focal_native_client::{CompileLimits, DriveError, NativeContentProfile, Preparation};
 use focal_wire::*;
-use hyper_rt::combine::{Either, race2};
 use serde_json::Value;
 use std::cell::Cell;
 use std::future::Future;
@@ -57,22 +56,58 @@ impl Drop for Held<'_, '_> {
     }
 }
 impl<T: ClientTransport> Waits<'_, '_, T> {
-    async fn race<R>(
+    /// `work`, or `Cancelled` once the call's cancellation fires; refused `Transport`, before the
+    /// work is polled, while another wait holds the cancellation.
+    fn race<R>(
         &self,
         work: impl Future<Output = Result<R, DriveError>>,
-    ) -> Result<R, DriveError> {
-        let mut held = Held {
-            cell: self.cancel,
-            cancel: self.cancel.take(),
-        };
-        let cancel = held
-            .cancel
-            .as_deref_mut()
-            .ok_or(DriveError::Client(ClientError::Transport))?;
-        match race2(work, cancel).await {
-            Either::First(done) => done,
-            Either::Second(_) => Err(DriveError::Cancelled),
+    ) -> impl Future<Output = Result<R, DriveError>> {
+        Raced {
+            work,
+            held: Held {
+                cell: self.cancel,
+                cancel: self.cancel.take(),
+            },
+            finished: false,
         }
+    }
+}
+pin_project_lite::pin_project! {
+    /// The wait of [`Waits::race`]: a named one, which holds the work once (an `async fn` held it
+    /// twice), the cancellation it took given back as it is dropped.
+    struct Raced<'a, 'b, F> {
+        #[pin]
+        work: F,
+        held: Held<'a, 'b>,
+        // Set once the wait has its output: the work, finished, is never polled again.
+        finished: bool,
+    }
+}
+impl<R, F: Future<Output = Result<R, DriveError>>> Future for Raced<'_, '_, F> {
+    type Output = Result<R, DriveError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        if *this.finished {
+            return std::task::Poll::Pending;
+        }
+        let Some(cancel) = this.held.cancel.as_deref_mut() else {
+            *this.finished = true;
+            return std::task::Poll::Ready(Err(DriveError::Client(ClientError::Transport)));
+        };
+        // The work first, so an answer and the cancellation together give the answer.
+        let raced = if let std::task::Poll::Ready(done) = this.work.poll(cx) {
+            done
+        } else if std::pin::Pin::new(cancel).poll(cx).is_ready() {
+            Err(DriveError::Cancelled)
+        } else {
+            return std::task::Poll::Pending;
+        };
+        *this.finished = true;
+        std::task::Poll::Ready(raced)
     }
 }
 impl<T: ClientTransport> focal_native_client::Reads for Waits<'_, '_, T> {

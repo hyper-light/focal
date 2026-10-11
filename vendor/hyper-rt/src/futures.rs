@@ -6,6 +6,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use pin_project_lite::pin_project;
+
 use crate::error::RtError;
 use crate::registry;
 use crate::shard::{ShardId, TaskId, TimerId, boxed};
@@ -32,6 +34,13 @@ pub fn now_ns() -> u64 {
 /// p99, scheduler quantum)").
 pub fn scheduler_overrun_ns() -> u64 {
     registry::with_current(|ctx| ctx.scheduler_overrun_ns()).unwrap_or(0)
+}
+
+/// The current shard's timer tick in nanoseconds ([`crate::shard::ShardContext::timer_tick_ns`]): a sleep
+/// ends up to a tick later than due by design, and later still by [`scheduler_overrun_ns`]. A wait that must
+/// end before another's (an answer before its asker gives up) sets both aside. Zero off a shard thread.
+pub fn timer_tick_ns() -> u64 {
+    registry::with_current(|ctx| ctx.timer_tick_ns()).unwrap_or(0)
 }
 
 /// The current shard's step quantum in nanoseconds (§4.3, "a step longer than a peer's wake starves the
@@ -227,20 +236,58 @@ impl Future for Sleep {
 /// `Counters::timer_waits`), so under timer exhaustion it is enforced late, never early; the shard's timer
 /// bound is derived to cover its tasks' concurrent waits, which makes that count an overload tripwire. The one race every timed wait in the workspace uses; before 2026-09-30 each call site raced
 /// a pinned sleep by hand and read a refused sleep's completion as the deadline.
-pub async fn within<F: Future>(ns: u64, work: F) -> Result<Option<F::Output>, RtError> {
-    let mut work = std::pin::pin!(work);
-    let mut deadline = std::pin::pin!(sleep(ns));
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(output) = work.as_mut().poll(cx) {
-            return Poll::Ready(Ok(Some(output)));
+pub fn within<F: Future>(ns: u64, work: F) -> Within<F> {
+    Within {
+        work,
+        deadline: sleep(ns),
+        finished: false,
+    }
+}
+
+pin_project! {
+    /// The wait of [`within`]: the work and its deadline, held in place. A named future rather than an
+    /// `async fn`, which held the work twice (docs/runtime.md §3.8).
+    #[must_use = "a timed wait does nothing unless awaited"]
+    pub struct Within<F> {
+        #[pin]
+        work: F,
+        deadline: Sleep,
+        // Set once the wait has its output: the work, finished, is never polled again.
+        finished: bool,
+    }
+}
+
+impl<F: Future> Future for Within<F> {
+    type Output = Result<Option<F::Output>, RtError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if *this.finished {
+            return Poll::Pending;
         }
-        match deadline.as_mut().poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(None)),
-            Poll::Ready(Err(refusal)) => Poll::Ready(Err(refusal)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await
+        let output = if let Poll::Ready(output) = this.work.poll(cx) {
+            Ok(Some(output))
+        } else {
+            match Pin::new(&mut *this.deadline).poll(cx) {
+                Poll::Ready(Ok(())) => Ok(None),
+                Poll::Ready(Err(refusal)) => Err(refusal),
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        *this.finished = true;
+        // The deadline's timer is let go now, not when the wait is dropped: a sleep not yet polled holds none.
+        *this.deadline = sleep(0);
+        Poll::Ready(output)
+    }
+}
+
+impl<F> std::fmt::Debug for Within<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Within")
+            .field("deadline", &self.deadline)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for Sleep {

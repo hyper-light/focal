@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-wire = { version = "0.1.0", path = "../focal-wire" }
+focal-rt = { version = "0.1.0", path = "../focal-rt" }
 focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
 postcard.workspace = true
 thiserror.workspace = true
@@ -21,7 +22,6 @@ getrandom.workspace = true
 
 [dev-dependencies]
 focal-core = { version = "0.1.0", path = "../focal-core" }
-focal-rt = { version = "0.1.0", path = "../focal-rt" }
 tempfile.workspace = true
 
 [lints]
