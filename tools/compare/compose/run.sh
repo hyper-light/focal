@@ -118,6 +118,8 @@ EOF
       # owners' longest periods, for whether a stall was the disk's.
       dc exec -T "$n" focal --data-dir /data inspect node --metrics \
         > "$out/$report.$n.metrics.txt" 2>/dev/null || true
+      # The node's log, its last 4000 lines: what it said while it fell behind.
+      dc logs --no-color --tail 4000 "$n" > "$out/$report.$n.log" 2>/dev/null || true
     done
     ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
