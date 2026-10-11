@@ -14279,3 +14279,49 @@ recursion), `cargo deny check advisories bans licenses sources` (its first run c
 advisory database, a network timeout; the second passed), and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3271
 passed, 0 failed, 20 ignored.
+
+### 2026-10-11 — A wake is counted where it is seen; a stopped session names its cause; the stall test's stall outlasts the transport's bound
+
+**Wakes counted after a drain are published.** The wake test
+(`fleet::async_tests::a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits`)
+read sessions as never woken: one of a hundred once in about a hundred runs, and 17 of 100 on a
+loaded workstation. Traced with each session's arm, fire, signal and step, every one of those
+sessions had been woken. Its tick came as the log answered, and drained the answered write before
+the owner took the answer's signal. The signal was then counted (`waits_answered`), but its step had
+nothing to drain, and only a drain published progress. So the count stayed unpublished until the
+session's next write.
+
+The shared owner's counts (the answer, a sweep, a hand-off) now go through `Owner::count_*`, which
+mark the progress stale, and a session's step publishes it at its end when nothing else did. A test
+counts the three wakes after the drain and reads them at the next step (it read `(0, 0, 0)` for
+`(1, 1, 1)` before). The full wake test passed 30 runs of 30 under load. The test's statement
+that its owners' ticks are ten seconds away is corrected: the first tick after a write keeps the
+cadence it was set at.
+
+**A stopped native session names what stopped it.** The first error it failed closed on (its
+committed delivery, the flush after it, or a submission) is kept, up to 512 bytes of its text, and
+every refusal after it is `Stopped(cause)` where it was a bare `Failed`. A follower of the
+comparison's cluster had stopped with only "native session stopped after committed application
+failure; reopen to recover" (run 38128096900).
+
+**The stall test's stall outlasts the transport's bound.** `a_stall_past_the_request_deadline_keeps_
+the_connection` failed on Windows in 9 of 10 runs: its stalled request was answered at 903 ms. Traced
+on Windows CI, it went as follows:
+- The server's last datagram before its stall arrived just after the request went, and counted as
+  heard in the transport's first window. That datagram acknowledged only what the client sent
+  before the request.
+- hyper-transport gives a peer that stopped answering up within one or two windows (its `Progress`).
+  A window is the request's deadline plus the path's probe timeout, near 175 ms on Windows CI.
+- So the second window ended at 962 ms, after the 900 ms stall.
+
+The stall is now two windows of the probe timeout measured before it, plus a deadline. The client
+waits for the server to say the stall is over before asking again. Ten runs of ten pass on Windows
+(run 38146192403).
+
+The gate on the landing tree (head `68e2dd1`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3272
+passed, 0 failed, 20 ignored.
