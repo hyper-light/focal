@@ -1471,15 +1471,65 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
         *byte = if *byte == b' ' { b'\t' } else { b' ' };
     }
     sealed(&fleet, leader, &slow, 1, &first).await;
+    // The count is of the copy's chunks, so no path warm-up toward the copy is still to come: a
+    // connection that has not measured its path warms it up when idle, once, and an idle gap of the
+    // seal's exchanges is when it may (Linux CI: a warm-up's 160 datagrams in the count, 2 runs of
+    // 3). Its padding is not taken out of the count instead: the relay counts a datagram once it
+    // has carried it, or never if it drops it, and the sender as it sends.
+    let warmed = warm_ups_ended_toward(&fleet, &slow, 2).await;
     let before = fleet.relays[1].carried_toward_back();
     let reference = sealed(&fleet, leader, &slow, 2, &second).await;
     let crossed = fleet.relays[1].carried_toward_back() - before;
+    assert_eq!(
+        warm_up_bytes_toward(&fleet, 2).await,
+        warmed,
+        "no warm-up sent toward the copy while its chunk was counted"
+    );
     assert_bytes(
         download(&fleet.replicas[1].actor, &reference).await,
         &second,
     );
     fleet.stop().await;
     crossed
+}
+/// Wait until no other node's connection to node `target` has a path warm-up still to come
+/// (`PathFacts::warming_up`), within four exchanges across the path in the replicas' periods, as a
+/// seal is waited; the warm-up bytes those connections have sent it then.
+async fn warm_ups_ended_toward(fleet: &Fleet, slow: &Slow, target: u64) -> u64 {
+    let budget = slow.dial().max(DIAL) * 4;
+    let (live, mut wait) = fleet.wait(budget);
+    loop {
+        let mut pending = false;
+        for (index, replica) in fleet.replicas.iter().enumerate() {
+            if index as u64 + 1 == target {
+                continue;
+            }
+            if let Some(path) = replica.pool.path_now(target).await {
+                pending |= path.warming_up;
+            }
+        }
+        if !pending {
+            return warm_up_bytes_toward(fleet, target).await;
+        }
+        if let Err(spent) = wait.check(&fleet.periods(&live)) {
+            panic!("a warm-up toward node {target} did not end in {budget:?}: {spent}");
+        }
+        focal_rt::time::sleep(TICK).await.unwrap();
+    }
+}
+/// The bytes the other nodes' connections to node `target` have sent it as their paths' warm-up
+/// (`PathFacts::warm_up_bytes`).
+async fn warm_up_bytes_toward(fleet: &Fleet, target: u64) -> u64 {
+    let mut bytes = 0;
+    for (index, replica) in fleet.replicas.iter().enumerate() {
+        if index as u64 + 1 == target {
+            continue;
+        }
+        if let Some(path) = replica.pool.path_now(target).await {
+            bytes += path.warm_up_bytes;
+        }
+    }
+    bytes
 }
 /// Upload `bytes` to the leader and seal, asking the seal again, exactly,
 /// while the copy is being made: for as long as four exchanges across the

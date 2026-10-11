@@ -634,6 +634,24 @@ impl PeerConnectionPool {
     pub fn window(&self, target: u64) -> Option<u64> {
         self.facts(target).map(|facts| facts.cwnd)
     }
+    /// What the path to `target` measures now, read from its open connection; `None` while no
+    /// connection to it is open. [`Self::window`] gives what it measured when its connection last
+    /// answered; this asks the connection (whether its path's warm-up is still to come,
+    /// `PathFacts::warming_up`, for one).
+    pub async fn path_now(&self, target: u64) -> Option<PathFacts> {
+        let slot = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.cached.get(&target).map(|entry| entry.slot.clone()))?;
+        let remote = slot
+            .connection
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|entry| entry.remote.clone())?;
+        remote.path().await
+    }
     /// What the path to `target` measured when its connection last answered; `None` while no
     /// connection to it has.
     fn facts(&self, target: u64) -> Option<PathFacts> {
