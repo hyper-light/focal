@@ -711,6 +711,24 @@ mended where it is made (hyper-quic: the peer's acknowledgement delay out of the
 datagram's time in the socket measured by the kernel) and Copa measured again against BBR on
 both, the busy machine and the grids.
 
+BBR was measured above as upstream quinn ships it, starting at 200 datagrams (240,000 bytes) where
+RFC 9002 §7.2 starts a sender at ten. The path's warm-up spends up to sixteen initial windows, so
+with that window it sent up to 3.84 MB of padding a connection, and the control plane's quorum test
+failed under it (doc 09, 2026-10-11). BBR now starts at RFC 9002's window (hyper-raft `ee57b45`,
+hyper-quic's `VENDORED.md` §21). Measured again with it, every system on one runner with a local
+NVMe disk (run 38141716895, 15 s warm-up and 60 s measured each rate):
+
+| System | 100/s acknowledged, p99 | 200/s | 1,000/s | 4,000/s |
+|---|---|---|---|---|
+| focal, BBR | 100%, 18.5 ms | 100%, 62.5 ms | 54%, 340 ms | 4%, 5.3 s |
+| Kafka | 100%, 9.1 ms | 100%, 8.6 ms | 100%, 9.0 ms | 100%, 9.6 ms |
+| NATS JetStream | 100%, 3.2 ms | 100%, 2.6 ms | 100%, 2.4 ms | 78%, 1.9 s |
+| Redis | 100%, 12.3 ms | 100%, 7.4 ms | 100%, 3.7 ms | 100%, 4.5 ms |
+
+What is left at 1,000 a second and past it is the node's one CPU, which the law does not decide: a
+profile of the leader (run 38142415872) finds its network threads taking half of it at 1,000 a
+second and two thirds at 4,000, the session owner the rest.
+
 **Two things the law does otherwise than it was taken**, both found on paths that
 hold megabytes in flight, where the law as taken carried 69% of 10 Mbit/s at 300 ms
 and opened its window to three megabytes on a path that holds one:

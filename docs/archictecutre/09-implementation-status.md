@@ -14217,3 +14217,65 @@ The gate on the landing tree (head `d98f858`, macOS 26.4.1 arm64, under other wo
 recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3271
 passed, 0 failed, 20 ignored.
+
+### 2026-10-11 — BBR is the law of focal's connections
+
+The comparison (`.github/workflows/compare.yml`, one ubuntu-24.04 runner) regressed when focal
+moved onto hyper-rt and hyper-transport. Bisected on the comparison itself, the move's landing
+(`d6b7aaa`) regressed and the commit before it (`743201f`) did not. At 100 writes a second focal
+acknowledged 86% of its writes with a p99 of 2.5 s, where it had acknowledged every one at 5.1 ms.
+
+The cause was found by tracing a local three-process cluster, not by reading code:
+- Replication frames took a median of 89 ms from the leader's wire to the follower's admission
+  on loopback, and 3.4 s at p99.
+- `sample` of a follower that fell behind found every thread idle: it was waiting on the network,
+  not on its CPU.
+- Every connection's congestion window was 2,904 bytes, two datagrams, at p10 and p50. Copa's
+  pacing rate was 67 to 229 kB/s.
+
+Copa counts in each round trip the peer's held acknowledgement and the time a datagram waits in a
+socket for its shard, and reads them as a queue (doc 27 §7, "On a busy machine"). Frames then
+arrived late and out of order, the resequencer let the later ones go, and the followers refused
+the appends and called elections.
+
+With the law the only change, focal alone on the same runner:
+
+| Law | 100/s acknowledged, p99 | 200/s acknowledged, p99 | 1,000/s acknowledged, p99 |
+|---|---|---|---|
+| Copa | 86%, 2,473 ms | 51%, 1,349 ms | 12%, 649 ms |
+| CUBIC | 100%, 18.6 ms | 100%, 43.8 ms | 61%, 357 ms |
+| BBR | 100%, 5.1 ms | 100%, 25.4 ms | 43%, 699 ms |
+
+BBR is chosen. It neither fails the busy machine nor stalls on the network grids' lossy paths;
+CUBIC stalled on five of them. Copa's measurement is to be mended in hyper-quic (its sample less
+the peer's acknowledgement delay, and a datagram's socket time from the kernel), and Copa measured
+again on both.
+
+The gate found what the switch exposed (`793136e`). control_quic's quorum test failed 9 runs of
+10 under BBR; Copa passed all ten. Its three metadata owners run in one process, their QUIC
+endpoints on one thread. Traced:
+- 7,600 near-MTU datagrams (10.6 MB) passed in a test whose messages are 80–210 bytes;
+- they were the path's warm-up (hyper-quic, Careful Resume): PING and PADDING an idle connection
+  sends to measure its path;
+- one connection sent 2,546 of them, and the thread spent itself decoding the padding.
+
+The warm-up measures to four initial windows a round trip and spends at most sixteen, and BBR's
+initial window was upstream quinn's 200 datagrams (240,000 bytes). That is Chromium's bound on a
+window resumed from a cached bandwidth, not a start; RFC 9002 §7.2 starts a sender at ten. Fixed
+where it is made, in the shared repository (hyper-raft `ee57b45`, with a test of every law's
+warm-up against sixteen initial windows), and taken here as a new snapshot of the thirteen
+crates. The test passes 10 runs of 10 at a load of 27.
+
+Also in this landing (`31c3172`): the checker of runtime recursion reads Rust's v0 names with
+its own demangler. A Linux runner's c++filt prints crate disambiguators and a macOS runner's reads
+no v0 name; on CI the check refused to run at all (run 38131224019). Its demangler reads the same
+text as LLVM's c++filt on all 295,468 symbols of the workspace's IR.
+
+The gate on the landing tree (head `793136e`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources` (its first run could not fetch the
+advisory database, a network timeout; the second passed), and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3271
+passed, 0 failed, 20 ignored.
