@@ -14031,3 +14031,37 @@ does not call `aio` yet: whether its log writes through it is a separate change,
 measured before and after, so this snapshot claims no gain of its own. hyper-raft
 `docs/research/issuer-completions.md` §8 states the design and `docs/benchmarks.md` its
 measurements.
+
+### 2026-10-11 — focal runs on hyper-rt and hyper-transport: tokio and quinn are gone
+
+Every library and binary of focal's own now runs on hyper-rt's shards and speaks QUIC through
+hyper-transport. `cargo tree -e normal -i quinn` matches nothing. `cargo tree -e normal -i tokio`
+reaches one workspace member, `tools/compare`, whose Kafka, NATS and Redis clients need it. The
+shared crates are vendored at hyper-raft `8fc46b5` (main's `67f038d` with focal's
+`focal-transport-hooks` branch on top, under the shared repository's review).
+
+The gate on the landing tree (the move merged with f26-metrics `606f57c`, head `8683981`), macOS
+26.4.1 arm64, run under other work's load, exit 0:
+`cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes, 15
+vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1149 production sources, no policy allowance),
+`cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 164 test binaries,
+3259 passed, 0 failed, 20 ignored.
+
+What the move found, each fixed at its cause (the commits name each measurement):
+- An `async fn` that awaits a future it was handed holds that future twice (rust-lang/rust#62958),
+  so every wrapper doubled what it wrapped. hyper-rt's combinators and `within`, and focal's own
+  adapters, are named futures now. A timed enrollment round went from 61,528 bytes to 5,768, and an
+  MCP artifact branch from 32,608 to 4,128 (`-Zprint-type-sizes` on the focal binary).
+- A handler slower than its asker's period now answers "not yet" within that period, measured from
+  the request's arrival. The asker also allows the path's probe timeout (RFC 9002 §6.2.1) for the
+  answer to arrive. The 1 MB seal across 128 kbit/s seals.
+- A node's stop phase holds its drivers until its owners have stopped, so a leader's hand-off is
+  heard and reported.
+- A connection's greeting is kept per connection, for as long as that connection is up. Before,
+  two of three clients of one identity that connected at once were refused as ungreeted.
+- A node's memory is told by kind (`focal_memory_used_by_kind_bytes{kind}`). That metric showed
+  that at a container's 256 MB the network controller's and the placement agent's fixed
+  prepayments (64 MiB and 32 MiB) left too little to place a session that survives one failure.
+  The next batch charges what they hold instead.
