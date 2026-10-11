@@ -5935,6 +5935,11 @@ fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
 /// scheduler blocks it; the connection's liveness is its own idle bound,
 /// never the request timeout (a busy machine lost every connection it held to
 /// a half-second stall when the two were one, 2026-10-07).
+/// DIAG: milliseconds since the first call, one clock for both threads.
+fn diag_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
 #[test]
 fn a_stall_past_the_request_deadline_keeps_the_connection() {
     focal_rt::block_on(async move {
@@ -5977,7 +5982,9 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
                     Arc::new(|verified: VerifiedRequest| async move {
                         if verified.request().request_id == RequestId::from_u128(1) {
                             // The whole runtime stalls: nothing of this process runs.
+                            eprintln!("DIAG server stall begins at {} ms", diag_ms());
                             std::thread::sleep(DEADLINE * 3);
+                            eprintln!("DIAG server stall ends at {} ms", diag_ms());
                         }
                         response(verified.request())
                     });
@@ -6007,8 +6014,24 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
             facts.map(|f| (f.rtt, f.min_rtt, f.probe_timeout))
         );
         // The stalled request ends at its deadline, not with its connection.
+        let ticks = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u64>::new()));
+        let ticking = ticks.clone();
+        let ticker = spawn(async move {
+            for _ in 0..200 {
+                ticking.borrow_mut().push(diag_ms());
+                pause(Duration::from_millis(20)).await;
+            }
+        });
+        eprintln!("DIAG client asks at {} ms", diag_ms());
         let began = hyper_rt::futures::now_ns();
         let stalled = remote.request(&request(1)).await;
+        eprintln!("DIAG client answered at {} ms", diag_ms());
+        ticker.abort();
+        {
+            let ticks = ticks.borrow();
+            let widest = ticks.windows(2).map(|w| (w[1] - w[0], w[0])).max();
+            eprintln!("DIAG client ticks {}, widest gap {:?} (gap ms, from ms)", ticks.len(), widest);
+        }
         let facts = remote.path().await;
         eprintln!(
             "DIAG stall: {:?} after {} ms, tick {} ns, overrun {} ns, facts after: rtt/min_rtt/pto {:?}",
