@@ -23,10 +23,10 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
-        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW,
-        GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        OPEN_ALWAYS, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
     },
     System::{
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
@@ -383,7 +383,11 @@ fn info_at(path: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let wide = wide(path);
     // SAFETY: `wide` is NUL-terminated. Open a query-only handle (no access
     // rights requested); FILE_FLAG_BACKUP_SEMANTICS lets it open a directory
-    // too. The handle is closed below.
+    // too, and FILE_FLAG_OPEN_REPARSE_POINT names the path itself, never
+    // what a reparse point leads to, as `symlink_metadata` does on Unix: an
+    // AF_UNIX socket's file is a reparse point that cannot be followed, so
+    // without it a local server had no identity for its socket and left the
+    // file behind. The handle is closed below.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -391,7 +395,7 @@ fn info_at(path: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null_mut(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
         )
     };
