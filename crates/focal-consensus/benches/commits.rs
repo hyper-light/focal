@@ -39,7 +39,7 @@ use std::{
 /// A member's storage: focal-log's WAL in its directory, or a hyper-log of its own there.
 enum Store {
     Wal,
-    Shell(Log<DeviceFile>),
+    Shell(Box<Log<DeviceFile>>),
 }
 
 impl Store {
@@ -110,7 +110,7 @@ fn open(config: NodeConfig, dir: &Path) -> (Store, DurableNode) {
         focal_consensus::ShellStorage::new(dir, &log, disk, identity, budget.clone(), &key_file)
             .unwrap();
     let node = DurableNode::open_on_shell(config, &storage, &budget, no_needs).unwrap();
-    (Store::Shell(log), node)
+    (Store::Shell(Box::new(log)), node)
 }
 
 const PAYLOAD: usize = 256;
