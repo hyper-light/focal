@@ -255,22 +255,20 @@ impl NativeSessionLimits {
     /// checkpoint's bounds following it. A root is charged to the engine's
     /// budget, so it holds at most as many rows as that budget keeps resident,
     /// and admission refuses a mutation whose projected checkpoint would pass
-    /// the assembled bound (`checkpointable`): both grow with the allowance,
-    /// never below the standard ones.
+    /// the assembled bound (`checkpointable`): both follow the allowance,
+    /// down as well as up, so an engine on a small node refuses at what it
+    /// can hold rather than holding what it cannot.
     pub fn standard_within(
         content_domain: focal_model::ContentDomainId,
         memory_bytes: usize,
     ) -> Self {
         let mut limits = Self::standard(content_domain);
-        let memory_bytes = memory_bytes.max(limits.memory_bytes);
         limits.memory_bytes = memory_bytes;
         limits.completion_reserve_bytes = memory_bytes / 8;
-        limits.checkpoint.rows = limits.checkpoint.rows.max(
-            memory_bytes
-                .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
-                .unwrap_or(0),
-        );
-        limits.checkpoint.assembled_bytes = limits.checkpoint.assembled_bytes.max(memory_bytes);
+        limits.checkpoint.rows = memory_bytes
+            .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+            .unwrap_or(0);
+        limits.checkpoint.assembled_bytes = memory_bytes;
         limits.checkpoint = limits.checkpoint.derived();
         limits
     }

@@ -63,17 +63,19 @@ pub struct SessionLimits {
 }
 
 impl SessionLimits {
-    /// The standard limits for a session allowed `memory_bytes`, never below
-    /// the standard allowance: its completion reserve an eighth of it, as the
+    /// The standard limits for a session allowed `memory_bytes`, however
+    /// small its node: its completion reserve an eighth of it, as the
     /// standard 32 of 256 MiB. Its native engine is allowed half
     /// ([`crate::NativeSessionLimits::standard_within`]), as the standard 128
-    /// of 256 MiB.
+    /// of 256 MiB. A session refuses, typed, what its allowance cannot hold:
+    /// 48 MiB held 2,803 claims and 96 MiB 5,875 before refusing
+    /// `Capacity`, each node serving on.
     pub fn within(memory_bytes: usize) -> Self {
-        let mut limits = Self::default();
-        let memory_bytes = memory_bytes.max(limits.memory_bytes);
-        limits.memory_bytes = memory_bytes;
-        limits.completion_reserve_bytes = memory_bytes / 8;
-        limits
+        Self {
+            memory_bytes,
+            completion_reserve_bytes: memory_bytes / 8,
+            ..Self::default()
+        }
     }
     /// The memory a session's native engine is allowed under `self`.
     pub fn native_memory_bytes(&self) -> usize {

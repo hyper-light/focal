@@ -44,19 +44,23 @@ pub(crate) fn node_budget(settings: &Settings) -> Result<MemoryBudget, MemoryErr
     MemoryBudget::new(bytes, bytes / 4)
 }
 
-/// The allowance of a session this node founds: half its envelope, never
-/// below the standard session allowance.
+/// The allowance of a session this node founds: half its envelope, at least
+/// half the least envelope a node holds (`MIN_NODE_BYTES`). It was once never
+/// below the standard 256 MiB, more than a 256 MB container's whole envelope:
+/// no node of such a cluster could seat a second copy, so no session there
+/// could survive a failure.
 pub(crate) fn founded_session_bytes(settings: &Settings) -> usize {
-    (node_bytes(settings) / 2).max(SessionLimits::default().memory_bytes)
+    node_bytes(settings) / 2
 }
 
-/// A session's allowance from its committed requirement: a requirement below
-/// the standard allowance (none was committed before sessions carried one)
-/// is the standard allowance.
+/// A session's allowance from its committed requirement. A requirement of
+/// zero is none committed (a session registered before sessions carried
+/// one), and such a session has the standard allowance it was founded with.
 pub(crate) fn session_bytes(required_memory: u64) -> usize {
-    usize::try_from(required_memory)
-        .unwrap_or(usize::MAX)
-        .max(SessionLimits::default().memory_bytes)
+    if required_memory == 0 {
+        return SessionLimits::default().memory_bytes;
+    }
+    usize::try_from(required_memory).unwrap_or(usize::MAX)
 }
 
 /// Where the node keeps the allowance of the session it founded.
@@ -109,17 +113,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_operator_setting_wins_and_a_session_takes_half_never_below_standard() {
+    fn an_operator_setting_wins_and_a_session_takes_half_however_small() {
         let mut settings = Settings::default();
         settings.node.memory_bytes = Some(4 << 30);
         assert_eq!(node_bytes(&settings), 4 << 30);
         assert_eq!(founded_session_bytes(&settings), 2 << 30);
+        // A 256 MB container's envelope founds a session another such node
+        // can seat.
+        settings.node.memory_bytes = Some(192 << 20);
+        assert_eq!(founded_session_bytes(&settings), 96 << 20);
         settings.node.memory_bytes = Some(MIN_NODE_BYTES);
+        assert_eq!(founded_session_bytes(&settings), 32 << 20);
+        // Below the least envelope, the least envelope.
+        settings.node.memory_bytes = Some(MIN_NODE_BYTES / 2);
         assert_eq!(
-            founded_session_bytes(&settings),
-            SessionLimits::default().memory_bytes
+            node_bytes(&settings),
+            usize::try_from(MIN_NODE_BYTES).unwrap()
         );
         assert_eq!(session_bytes(0), SessionLimits::default().memory_bytes);
+        assert_eq!(session_bytes(96 << 20), 96 << 20);
         assert_eq!(session_bytes(3 << 30), 3 << 30);
     }
 

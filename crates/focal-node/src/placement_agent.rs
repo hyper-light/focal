@@ -3073,7 +3073,10 @@ impl PlacementAgent {
                     .copied()
                     .collect(),
                 created: false,
-                memory: plan.desired.policy.required_memory.max(standard_memory()),
+                memory: u64::try_from(crate::memory_envelope::session_bytes(
+                    plan.desired.policy.required_memory,
+                ))
+                .unwrap_or(u64::MAX),
             };
             let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
             if installs.record.installed.len() >= MAX_INSTALLED {
