@@ -47,8 +47,9 @@ pub struct Report {
     pub read_latency_ns: Latency,
     /// Concurrent callers the run used.
     pub workers: u16,
-    /// Distinct refusal reasons seen, at most a few, for diagnosis.
-    pub refusals: Vec<String>,
+    /// The refusal reasons seen, at most a few, each with how many writes it
+    /// refused (an unknown outcome's reason with how many it left unknown).
+    pub refusals: Vec<(String, u64)>,
     /// `reopen: true`: closing the node and reopening its directory until it
     /// serves again, in milliseconds.
     pub reopen_ms: Option<u128>,
