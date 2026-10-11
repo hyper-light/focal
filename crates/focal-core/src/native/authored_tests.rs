@@ -643,6 +643,38 @@ pub(in crate::native) fn replay_fixture() -> (Core<NativeState>, [NativeInput; 3
     )
 }
 
+/// The core a measurement grows: the tests' small leaves, or with
+/// `FOCAL_MEASURE_PAGE_BYTES` set, a node's (focal-ledger's session limits:
+/// 128 entries a leaf, at most that many bytes, 256 changes a batch).
+fn measured_core() -> Core<NativeState> {
+    let Some(page_bytes) = std::env::var("FOCAL_MEASURE_PAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    else {
+        return core();
+    };
+    let limits = NativeLimits {
+        range: RangeConfig {
+            page_entries: 128,
+            page_bytes,
+            max_batch_entries: 256,
+            ..RangeConfig::default()
+        },
+        plan_nodes: 64,
+        plan_edges: 65_536,
+        preparation_bytes: 1 << 20,
+        evaluations_per_claim: 64,
+        ..NativeLimits::default()
+    };
+    Core::new_native_authored(
+        ledger(),
+        RangeId(405),
+        limits,
+        MemoryBudget::new(512 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+    )
+    .unwrap()
+}
+
 /// Measurement, not a check: the owner's CPU per authored claim creation,
 /// prepare (decode-free: the input is built) and publish apart, over a core
 /// that grows to `CLAIMS`. Run with `--release --ignored --nocapture`.
@@ -659,13 +691,13 @@ fn measure_time_per_authored_claim() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
     for _ in 1..rounds {
-        let mut core = core();
+        let mut core = measured_core();
         for id in 1..=claims {
             let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
             core.publish_native(prepared).unwrap();
         }
     }
-    let mut core = core();
+    let mut core = measured_core();
     let (mut prepare_ns, mut publish_ns) = (0u128, 0u128);
     let mut window = (0u128, 0u128);
     for id in 1..=claims {

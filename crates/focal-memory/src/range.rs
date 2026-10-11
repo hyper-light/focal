@@ -689,7 +689,7 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                 .checked_sub(base_after)
                 .ok_or(MemoryError::MissingKey)?;
             let rank = checked_add(output_after, untouched)?;
-            let old_page = base.pages.get(group.rank);
+            let old_page = group.page;
             let selected = changes
                 .as_slice()
                 .get(..group.count)
@@ -702,16 +702,16 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                 let mut produced = 0;
                 self.merge_page_with(old, changes, count, (source, lane), copy, &mut |page| {
                     let at = checked_add(rank, produced)?;
-                    pages = if replace && produced == 0 {
-                        pages.replace(at, page, &mut directory_build)?
+                    if replace && produced == 0 {
+                        pages.replace_owned(at, page, &mut directory_build)?;
                     } else {
-                        pages.insert(at, page, &mut directory_build)?
-                    };
+                        pages.insert_owned(at, page, &mut directory_build)?;
+                    }
                     produced = checked_add(produced, 1)?;
                     Ok(())
                 })?;
                 if replace && produced == 0 {
-                    pages = pages.remove(rank, &mut directory_build)?;
+                    pages.remove_owned(rank, &mut directory_build)?;
                 }
                 Ok::<usize, MemoryError>(produced)
             };

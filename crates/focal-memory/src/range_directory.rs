@@ -154,9 +154,22 @@ type Unwinding<K, V> = (std::vec::IntoIter<Arc<Node<K, V>>>, Allocation);
 /// directory shares only loses a handle here (`Arc::into_inner`, which gives
 /// the node to exactly one of the handles let go at once).
 fn release<K, V>(node: Arc<Node<K, V>>) {
+    // Most handles let go are shared (an edit's copy replacing a node) or a
+    // leaf's: those end here, before the unwinding stack is laid out.
+    let Some(Node {
+        links: Links::Branches(children),
+        _allocation: allocation,
+        ..
+    }) = Arc::into_inner(node)
+    else {
+        return;
+    };
     let mut unwinding: [Option<Unwinding<K, V>>; MAX_LEVELS] = std::array::from_fn(|_| None);
-    let mut depth = 0usize;
-    let mut next = Some(node);
+    if let Some(frame) = unwinding.first_mut() {
+        *frame = Some((ManuallyDrop::into_inner(children).into_iter(), allocation));
+    }
+    let mut depth = 1usize;
+    let mut next = None;
     loop {
         if let Some(node) = next.take()
             && let Some(Node {
@@ -315,10 +328,24 @@ impl<K, V> PageDirectory<K, V> {
 /// Whether a span beginning with prefix `first` and key `start` begins at or
 /// before the sought `key`, whose prefix is `probe`: the prefixes decide where
 /// they differ, and where they tie the keys do, compared past the prefix
-/// (`RangeKey::cmp_past_prefix`).
-fn at_or_before<K: crate::RangeKey>(first: u128, start: Option<&K>, probe: u128, key: &K) -> bool {
+/// (`RangeKey::cmp_past_prefix`). The span's first key is read only where the
+/// prefixes tie: a node's is at the end of its leftmost path.
+fn at_or_before<'a, K: crate::RangeKey + 'a>(
+    first: u128,
+    start: impl FnOnce() -> Option<&'a K>,
+    probe: u128,
+    key: &K,
+) -> bool {
     first < probe
-        || (first == probe && start.is_some_and(|start| start.cmp_past_prefix(key).is_le()))
+        || (first == probe && start().is_some_and(|start| start.cmp_past_prefix(key).is_le()))
+}
+
+/// The page a key's span is in, found by [`PageDirectory::locate`]: its rank,
+/// the page, and the page after it.
+pub(super) struct Located<'a, K, V> {
+    pub rank: usize,
+    pub page: &'a Arc<Page<K, V>>,
+    pub next: Option<&'a Arc<Page<K, V>>>,
 }
 
 impl<K: crate::RangeKey, V> PageDirectory<K, V> {
@@ -337,7 +364,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                         .partition_point(|page| {
                             at_or_before(
                                 page.first,
-                                page.entries.first().map(|entry| &entry.key),
+                                || page.entries.first().map(|entry| &entry.key),
                                 probe,
                                 key,
                             )
@@ -348,7 +375,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                 Links::Branches(children) => {
                     let local = children
                         .partition_point(|child| {
-                            at_or_before(child.first, child.first_key(), probe, key)
+                            at_or_before(child.first, || child.first_key(), probe, key)
                         })
                         .saturating_sub(1);
                     node = children.get(local)?.as_ref();
@@ -357,15 +384,25 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         }
     }
 
-    /// The page whose span holds `key`. The prefixes cached beside pages and
-    /// nodes decide every comparison where they differ; where they tie, the
-    /// keys do. The sought key's prefix is computed once.
+    /// The rank of the page whose span holds `key` ([`Self::locate`]).
     pub(super) fn page_index(&self, key: &K) -> usize {
-        let Some(mut node) = self.root.node() else {
-            return 0;
-        };
+        self.locate(key).map_or(0, |located| located.rank)
+    }
+
+    /// The page whose span holds `key`, its rank and the page after it, by
+    /// one descent: what grouping a batch's changes by page reads. The
+    /// prefixes cached beside pages and nodes decide every comparison where
+    /// they differ; where they tie, the keys do. The sought key's prefix is
+    /// computed once. The page after is the next in the leaf reached, or past
+    /// its end the first of the subtree after the path at the deepest level
+    /// that has one. The grouping found the page's rank, the page by rank, and
+    /// the page after by rank again: three descents a group, each summing the
+    /// pages left of its path at every level.
+    pub(super) fn locate(&self, key: &K) -> Option<Located<'_, K, V>> {
+        let mut node = self.root.node()?;
         let probe = key.order_prefix();
         let mut rank = 0usize;
+        let mut after: Option<&Node<K, V>> = None;
         loop {
             match &node.links {
                 Links::Leaves(pages) => {
@@ -373,27 +410,36 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                         .partition_point(|page| {
                             at_or_before(
                                 page.first,
-                                page.entries.first().map(|entry| &entry.key),
+                                || page.entries.first().map(|entry| &entry.key),
                                 probe,
                                 key,
                             )
                         })
                         .saturating_sub(1);
-                    return rank.saturating_add(local);
+                    let next = match local.checked_add(1).and_then(|next| pages.get(next)) {
+                        Some(next) => Some(next),
+                        None => after.and_then(Node::first_page),
+                    };
+                    return Some(Located {
+                        rank: rank.saturating_add(local),
+                        page: pages.get(local)?,
+                        next,
+                    });
                 }
                 Links::Branches(children) => {
                     let local = children
                         .partition_point(|child| {
-                            at_or_before(child.first, child.first_key(), probe, key)
+                            at_or_before(child.first, || child.first_key(), probe, key)
                         })
                         .saturating_sub(1);
                     for child in children.iter().take(local) {
                         rank = rank.saturating_add(child.pages);
                     }
-                    let Some(child) = children.get(local) else {
-                        return rank;
-                    };
-                    node = child;
+                    if let Some(sibling) = local.checked_add(1).and_then(|next| children.get(next))
+                    {
+                        after = Some(sibling);
+                    }
+                    node = children.get(local)?;
                 }
             }
         }
@@ -434,20 +480,208 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         Ok(Self { root })
     }
 
+    /// A directory that is this one with the page at `index` replaced: a
+    /// shared copy, edited by [`Self::replace_owned`].
+    #[cfg(test)]
     pub(super) fn replace(
         &self,
         index: usize,
         page: Arc<Page<K, V>>,
         build: &mut DirectoryBuild<'_>,
     ) -> Result<Self, MemoryError> {
+        let mut next = self.shared();
+        next.replace_owned(index, page, build)?;
+        Ok(next)
+    }
+
+    /// Replaces the page at `index`. A node this directory shares with
+    /// another is copied the first time an edit passes it ([`owned`]) and
+    /// changed where it is after that, so a preparation that edits many
+    /// pages copies each node on their paths once (Rodeh 2008, "B-trees,
+    /// shadowing, and clones") where it copied every node of every path and
+    /// let go of the copies the next edit replaced.
+    pub(super) fn replace_owned(
+        &mut self,
+        index: usize,
+        page: Arc<Page<K, V>>,
+        build: &mut DirectoryBuild<'_>,
+    ) -> Result<(), MemoryError> {
         if index >= self.len() {
             return Err(MemoryError::MissingKey);
         }
-        self.check_page(index, true, &page)?;
-        let root = self.root.node().ok_or(MemoryError::MissingKey)?;
-        Ok(Self {
-            root: replace_node(root, index, page, build)?,
+        let route = self.route(index, false, &page)?;
+        self.own(&route, false, build)?;
+        let first = page.first;
+        self.apply(&route, false, first, |pages, rank| {
+            let slot = pages.get_mut(rank).ok_or(MemoryError::MissingKey)?;
+            drop(std::mem::replace(slot, page));
+            Ok(())
         })
+    }
+
+    /// Inserts `page` at `index` as [`Self::replace_owned`] replaces one,
+    /// where the leaf it goes in has room; one that would split, or an empty
+    /// directory, takes the edit that copies its path ([`Self::insert`]).
+    pub(super) fn insert_owned(
+        &mut self,
+        index: usize,
+        page: Arc<Page<K, V>>,
+        build: &mut DirectoryBuild<'_>,
+    ) -> Result<(), MemoryError> {
+        if index > self.len() {
+            return Err(MemoryError::MissingKey);
+        }
+        let route = match self.root.node() {
+            Some(_) => Some(self.route(index, true, &page)?),
+            None => None,
+        };
+        let Some(route) = route.filter(|route| route.width < MAX) else {
+            *self = self.insert(index, page, build)?;
+            return Ok(());
+        };
+        // No node counts more pages than the root.
+        checked_add(self.len(), 1)?;
+        self.own(&route, true, build)?;
+        let first = page.first;
+        self.apply(&route, true, first, |pages, rank| {
+            if rank > pages.len() || pages.len() >= pages.capacity() {
+                return Err(invalid("directory leaf has no room for an insert"));
+            }
+            pages.insert(rank, page);
+            Ok(())
+        })
+    }
+
+    /// Removes the page at `index`, by the edit that copies its path
+    /// ([`Self::remove`]): a removal can merge leaves, and one is rare.
+    pub(super) fn remove_owned(
+        &mut self,
+        index: usize,
+        build: &mut DirectoryBuild<'_>,
+    ) -> Result<(), MemoryError> {
+        *self = self.remove(index, build)?;
+        Ok(())
+    }
+
+    /// Where an edit of the page at `index` goes (with `insertion`, of a page
+    /// put at `index`), read before anything changes, `page` checked against
+    /// the pages it will sit between: its neighbours in the leaf reached, or
+    /// past the leaf's ends, those beside it in the directory.
+    fn route(
+        &self,
+        index: usize,
+        insertion: bool,
+        page: &Page<K, V>,
+    ) -> Result<Route, MemoryError> {
+        let root = self.root.node().ok_or(MemoryError::MissingKey)?;
+        let (descent, pages, rank) = Descent::to_leaf(root, index, insertion)?;
+        let left = match rank.checked_sub(1) {
+            Some(local) => pages.get(local),
+            None => index.checked_sub(1).and_then(|index| self.get(index)),
+        };
+        let (after, next) = if insertion {
+            (rank, index)
+        } else {
+            (checked_add(rank, 1)?, checked_add(index, 1)?)
+        };
+        let right = match pages.get(after) {
+            Some(page) => Some(page),
+            None => self.get(next),
+        };
+        check_between(left.map(AsRef::as_ref), page, right.map(AsRef::as_ref))?;
+        let mut children = [0usize; MAX_LEVELS];
+        for (slot, &(_, child)) in children
+            .iter_mut()
+            .zip(descent.steps.iter().take(descent.depth))
+        {
+            *slot = child;
+        }
+        let mut leftmost_from = descent.depth;
+        while let Some(level) = leftmost_from.checked_sub(1) {
+            if children.get(level) != Some(&0) {
+                break;
+            }
+            leftmost_from = level;
+        }
+        Ok(Route {
+            children,
+            depth: descent.depth,
+            rank,
+            width: pages.len(),
+            leftmost_from,
+        })
+    }
+
+    /// Makes each node on `route` this directory's own ([`owned`]) and, with
+    /// `grow`, gives its leaf room for one more page: what may be refused is
+    /// refused here, a copy holding what the node it replaced held.
+    fn own(
+        &mut self,
+        route: &Route,
+        grow: bool,
+        build: &mut DirectoryBuild<'_>,
+    ) -> Result<(), MemoryError> {
+        let mut handle = self.root.0.as_mut().ok_or(MemoryError::MissingKey)?;
+        let mut level = 0usize;
+        loop {
+            let Node {
+                links,
+                _allocation: allocation,
+                ..
+            } = owned(handle, build)?;
+            match links {
+                Links::Branches(children) => {
+                    let child = *route
+                        .children
+                        .get(level)
+                        .filter(|_| level < route.depth)
+                        .ok_or(invalid("directory deeper than an edit's route"))?;
+                    handle = children.get_mut(child).ok_or(MemoryError::MissingKey)?;
+                    level = level.saturating_add(1);
+                }
+                Links::Leaves(pages) => {
+                    if grow && pages.len() >= pages.capacity() {
+                        make_room(pages, allocation, build)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Applies an edit along `route`, whose nodes are this directory's own
+    /// ([`Self::own`]): where `added`, each node counts one more page; a node
+    /// whose first page the edit changes takes `first`; the leaf takes `edit`.
+    fn apply(
+        &mut self,
+        route: &Route,
+        added: bool,
+        first: u128,
+        edit: impl FnOnce(&mut Vec<Arc<Page<K, V>>>, usize) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        let mut handle = self.root.0.as_mut().ok_or(MemoryError::MissingKey)?;
+        let mut level = 0usize;
+        loop {
+            let node = Arc::get_mut(handle).ok_or(invalid("an edited directory node is shared"))?;
+            if added {
+                node.pages = checked_add(node.pages, 1)?;
+            }
+            if route.rank == 0 && level >= route.leftmost_from {
+                node.first = first;
+            }
+            match &mut node.links {
+                Links::Branches(children) => {
+                    let child = *route
+                        .children
+                        .get(level)
+                        .filter(|_| level < route.depth)
+                        .ok_or(invalid("directory deeper than an edit's route"))?;
+                    handle = children.get_mut(child).ok_or(MemoryError::MissingKey)?;
+                    level = level.saturating_add(1);
+                }
+                Links::Leaves(pages) => return edit(pages, route.rank),
+            }
+        }
     }
 
     pub(super) fn remove(
@@ -482,39 +716,17 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         replacing: bool,
         page: &Page<K, V>,
     ) -> Result<(), MemoryError> {
-        let first = page
-            .entries
-            .first()
-            .ok_or(invalid("empty directory page"))?;
-        let last = page.entries.last().ok_or(invalid("empty directory page"))?;
-        let mut previous = None;
-        for entry in &page.entries {
-            if previous.is_some_and(|key| key >= &entry.key) {
-                return Err(MemoryError::InvalidNeighbors);
-            }
-            previous = Some(&entry.key);
-        }
-        if index
-            .checked_sub(1)
-            .and_then(|index| self.get(index))
-            .and_then(|page| page.entries.last())
-            .is_some_and(|entry| entry.key >= first.key)
-        {
-            return Err(MemoryError::InvalidNeighbors);
-        }
+        let left = index.checked_sub(1).and_then(|index| self.get(index));
         let next = if replacing {
             checked_add(index, 1)?
         } else {
             index
         };
-        if self
-            .get(next)
-            .and_then(|page| page.entries.first())
-            .is_some_and(|entry| entry.key <= last.key)
-        {
-            return Err(MemoryError::InvalidNeighbors);
-        }
-        Ok(())
+        check_between(
+            left.map(AsRef::as_ref),
+            page,
+            self.get(next).map(AsRef::as_ref),
+        )
     }
 
     #[cfg(test)]
@@ -631,10 +843,14 @@ impl<K, V> Node<K, V> {
     }
 
     fn first_key(&self) -> Option<&K> {
+        Some(&self.first_page()?.entries.first()?.key)
+    }
+
+    fn first_page(&self) -> Option<&Arc<Page<K, V>>> {
         let mut node = self;
         loop {
             match &node.links {
-                Links::Leaves(pages) => return Some(&pages.first()?.entries.first()?.key),
+                Links::Leaves(pages) => return pages.first(),
                 Links::Branches(children) => node = children.first()?,
             }
         }
@@ -662,6 +878,118 @@ fn node_charge<K, V>(width: usize) -> Result<usize, MemoryError> {
         checked_add(node, handles)?,
         checked_mul(2, ALLOCATOR_OVERHEAD)?,
     )
+}
+
+/// Refuses `page` unless its keys rise strictly, its first after `left`'s
+/// last and its last before `right`'s first.
+fn check_between<K: crate::RangeKey, V>(
+    left: Option<&Page<K, V>>,
+    page: &Page<K, V>,
+    right: Option<&Page<K, V>>,
+) -> Result<(), MemoryError> {
+    let first = page
+        .entries
+        .first()
+        .ok_or(invalid("empty directory page"))?;
+    let last = page.entries.last().ok_or(invalid("empty directory page"))?;
+    let mut previous = None;
+    for entry in &page.entries {
+        if previous.is_some_and(|key| key >= &entry.key) {
+            return Err(MemoryError::InvalidNeighbors);
+        }
+        previous = Some(&entry.key);
+    }
+    if left
+        .and_then(|page| page.entries.last())
+        .is_some_and(|entry| entry.key >= first.key)
+        || right
+            .and_then(|page| page.entries.first())
+            .is_some_and(|entry| entry.key <= last.key)
+    {
+        return Err(MemoryError::InvalidNeighbors);
+    }
+    Ok(())
+}
+
+/// Where an edit goes, read before anything changes: the child taken at each
+/// branch from the root down, the rank within the leaf reached, that leaf's
+/// width, and the level from which every child taken was the first (where
+/// the rank is 0, the edited page is first in each of those subtrees).
+struct Route {
+    children: [usize; MAX_LEVELS],
+    depth: usize,
+    rank: usize,
+    width: usize,
+    leftmost_from: usize,
+}
+
+/// The node `handle` holds, made its directory's own: one no other handle
+/// holds is changed where it is; one another directory shares is copied
+/// ([`shadow`]) and the copy put in its place.
+fn owned<'a, K, V>(
+    handle: &'a mut Arc<Node<K, V>>,
+    build: &mut DirectoryBuild<'_>,
+) -> Result<&'a mut Node<K, V>, MemoryError> {
+    if Arc::get_mut(handle).is_none() {
+        let copy = shadow(handle, build)?;
+        release(std::mem::replace(handle, copy));
+    }
+    Arc::get_mut(handle).ok_or(invalid("a directory node made its own is shared"))
+}
+
+/// A copy of `node` for a directory to change: its pages or children, each
+/// handle shared, charged at its width.
+fn shadow<K, V>(
+    node: &Node<K, V>,
+    build: &mut DirectoryBuild<'_>,
+) -> Result<Arc<Node<K, V>>, MemoryError> {
+    let allocation = build.allocate(node_charge::<K, V>(node.width())?)?;
+    let links = match &node.links {
+        Links::Leaves(pages) => {
+            let mut copy = bounded_vec(pages.len())?;
+            copy.extend(pages.iter().map(Arc::clone));
+            Links::Leaves(copy)
+        }
+        Links::Branches(children) => {
+            let mut copy = Gathered::with_capacity(children.len())?;
+            copy.0.extend(children.iter().map(Arc::clone));
+            Links::Branches(copy.into_children())
+        }
+    };
+    Ok(Arc::new(Node {
+        links,
+        first: node.first,
+        pages: node.pages,
+        level: node.level,
+        _allocation: allocation,
+    }))
+}
+
+/// Room in a leaf for one more page, its handle charged to the node.
+fn make_room<K, V>(
+    pages: &mut Vec<Arc<Page<K, V>>>,
+    allocation: &mut Allocation,
+    build: &mut DirectoryBuild<'_>,
+) -> Result<(), MemoryError> {
+    let before = pages.capacity();
+    let mut handle = build.allocate(size_of::<Arc<Page<K, V>>>())?;
+    allocation.absorb(&mut handle)?;
+    #[cfg(test)]
+    let additional = super::preflight_tests::allocation_capacity(1)?;
+    #[cfg(not(test))]
+    let additional = 1;
+    pages
+        .try_reserve_exact(additional)
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    // What is charged is one handle more: a larger grant is refused, as
+    // `bounded_vec` refuses one.
+    if pages.capacity() > checked_add(before, 1)? {
+        return Err(MemoryError::Capacity {
+            requested: pages.capacity(),
+            available: checked_add(before, 1)?,
+        });
+    }
+    Ok(())
 }
 
 /// A node of `count` pages. Their order is checked where `seam` says the
@@ -979,34 +1307,6 @@ fn insert_node<K: crate::RangeKey, V>(
     Ok(split)
 }
 
-fn replace_node<K: crate::RangeKey, V>(
-    node: &Node<K, V>,
-    rank: usize,
-    page: Arc<Page<K, V>>,
-    build: &mut DirectoryBuild<'_>,
-) -> Result<Held<K, V>, MemoryError> {
-    let (descent, pages, rank) = Descent::to_leaf(node, rank, false)?;
-    let items = Splice::new(pages, rank, 1, Some(&page), None)?;
-    let mut node = leaf(
-        items.len()?,
-        |i| items.get(i).map(Arc::clone),
-        |i| items.seam(i),
-        build,
-    )?;
-    for &(children, index) in descent.upward() {
-        node = {
-            let items = Splice::new(children, index, 1, node.handle(), None)?;
-            branch(
-                items.len()?,
-                |i| items.get(i).map(Held::share),
-                |i| items.seam(i),
-                build,
-            )?
-        };
-    }
-    Ok(node)
-}
-
 fn remove_node<K: crate::RangeKey, V>(
     node: &Node<K, V>,
     rank: usize,
@@ -1274,6 +1574,16 @@ fn audit<K: crate::RangeKey, V>(node: &Node<K, V>, root: bool) -> bool {
     if !(minimum..=MAX).contains(&node.width()) {
         return false;
     }
+    // The prefix a node caches is its first page's, and a page's is its first key's.
+    if !node.first_page().is_some_and(|page| {
+        page.first == node.first
+            && page
+                .entries
+                .first()
+                .is_some_and(|entry| entry.key.order_prefix() == page.first)
+    }) {
+        return false;
+    }
     match &node.links {
         Links::Leaves(pages) => {
             node.level == 0
@@ -1447,6 +1757,199 @@ mod tests {
             &mut build,
         )
         .unwrap()
+    }
+
+    /// The nodes from the root to the page at `index`, each with its width.
+    fn path(
+        directory: &PageDirectory<u64, u64>,
+        mut index: usize,
+    ) -> Vec<(*const Node<u64, u64>, usize)> {
+        let mut path = Vec::new();
+        let mut node = directory.root.handle().unwrap();
+        loop {
+            path.push((Arc::as_ptr(node), node.width()));
+            match &node.links {
+                Links::Leaves(_) => return path,
+                Links::Branches(children) => {
+                    let (child, within) = child_at(children, index, false).unwrap();
+                    node = &children[child];
+                    index = within;
+                }
+            }
+        }
+    }
+
+    /// Edits of many pages copy each node on their paths once: replacing a
+    /// page in each of several leaves issues the charge of the union of their
+    /// paths, each node at its width, where copying every path for every edit
+    /// issued the sum. The edited directory holds the base's pages but those
+    /// replaced, and the base keeps every page it had.
+    #[test]
+    fn edits_of_many_pages_copy_each_node_on_their_paths_once() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
+        let base = built(&budget, MAX * MAX + 7);
+        assert_eq!(base.height(), 3);
+        let before: Vec<_> = base.iter().map(Arc::as_ptr).collect();
+        // Leaves under both of the root's children, two pages in one leaf
+        // twice, and the first page, the first of every node above it.
+        let ranks = [0, 40, 41, 600, 1000, 1030];
+        let mut union = std::collections::BTreeMap::new();
+        let mut summed = 0;
+        for &rank in &ranks {
+            for (node, width) in path(&base, rank) {
+                summed += node_charge::<u64, u64>(width).unwrap();
+                union.insert(node, width);
+            }
+        }
+        let once: usize = union
+            .values()
+            .map(|width| node_charge::<u64, u64>(*width).unwrap())
+            .sum();
+        assert_eq!(union.len(), 7);
+        assert!(once * 2 < summed);
+        let mut edited = base.shared();
+        let mut build = DirectoryBuild::new(&budget, BudgetLane::Completion, usize::MAX);
+        let mut replaced = Vec::new();
+        for &rank in &ranks {
+            // Odd keys: each new page sorts between the old one's neighbours.
+            let page = page(&budget, u64::try_from(rank).unwrap() * 2 + 1);
+            replaced.push(Arc::as_ptr(&page));
+            edited.replace_owned(rank, page, &mut build).unwrap();
+        }
+        assert_eq!(usize::MAX - build.remaining, once);
+        assert!(edited.check_shape());
+        assert!(base.check_shape());
+        assert_eq!(base.iter().map(Arc::as_ptr).collect::<Vec<_>>(), before);
+        for (rank, page) in edited.iter().enumerate() {
+            match ranks.iter().position(|edit| *edit == rank) {
+                Some(edit) => assert_eq!(Arc::as_ptr(page), replaced[edit], "rank {rank}"),
+                None => assert_eq!(Arc::as_ptr(page), before[rank], "rank {rank}"),
+            }
+        }
+        drop(edited);
+        drop(base);
+        assert_eq!(budget.stats().used, 0);
+    }
+
+    /// An edit made in place that is refused at any byte short of what it
+    /// needs leaves its directory holding every page it held, in order and
+    /// in shape: a node copied before the refusal holds what the one it
+    /// replaced held. Dropping the directory gives back all it took. Two
+    /// edits run in each directory, so the second meets nodes the first made
+    /// its own: a replace, and an insert into a leaf with room, which grows
+    /// the leaf in place.
+    #[test]
+    fn an_edit_in_place_refused_at_any_point_keeps_every_page_and_gives_back_all_it_took() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
+        // Two leaves of 31 under a root: room in each.
+        let base = built(&budget, 2 * MAX - 2);
+        assert_eq!(base.height(), 2);
+        let keys = |directory: &PageDirectory<u64, u64>| -> Vec<u64> {
+            directory.iter().map(|page| page.entries[0].key).collect()
+        };
+        let original = keys(&base);
+        let before = budget.stats();
+        type InPlace<'a> = dyn Fn(&mut PageDirectory<u64, u64>, &mut DirectoryBuild<'_>) -> Result<(), MemoryError>
+            + 'a;
+        let mut replaced = original.clone();
+        replaced[3] = 7;
+        let mut inserted = original.clone();
+        inserted.insert(3, 5);
+        // Each edit's name, its two steps, and the keys after the first and
+        // after both.
+        type Case<'a> = (
+            &'a str,
+            &'a InPlace<'a>,
+            &'a InPlace<'a>,
+            Vec<u64>,
+            Vec<u64>,
+        );
+        let edits: [Case<'_>; 2] = [
+            (
+                "replace",
+                &|directory, build| directory.replace_owned(3, page(&budget, 7), build),
+                &|directory, build| directory.replace_owned(4, page(&budget, 9), build),
+                replaced.clone(),
+                {
+                    let mut both = replaced;
+                    both[4] = 9;
+                    both
+                },
+            ),
+            (
+                "insert",
+                &|directory, build| directory.insert_owned(3, page(&budget, 5), build),
+                // After the first: 0, 2, 4, 5, 6, 8, 10 and on; 9 goes at 6.
+                &|directory, build| directory.insert_owned(6, page(&budget, 9), build),
+                inserted.clone(),
+                {
+                    let mut both = inserted;
+                    both.insert(6, 9);
+                    both
+                },
+            ),
+        ];
+        for (name, first, second, halfway, done) in edits {
+            let mut refused = 0;
+            loop {
+                let mut directory = base.shared();
+                let mut build = DirectoryBuild::new(&budget, BudgetLane::Completion, refused);
+                let result = first(&mut directory, &mut build)
+                    .and_then(|()| second(&mut directory, &mut build));
+                assert!(directory.check_shape(), "{name} at {refused} bytes");
+                let now = keys(&directory);
+                drop(directory);
+                assert_eq!(
+                    budget.stats().used,
+                    before.used,
+                    "{name} at {refused} bytes"
+                );
+                if result.is_ok() {
+                    assert_eq!(now, done, "{name}");
+                    break;
+                }
+                assert!(
+                    now == original || now == halfway,
+                    "{name} refused at {refused} bytes holds {now:?}"
+                );
+                refused += 1;
+                assert!(
+                    refused < 1 << 16,
+                    "{name} is refused past any path's charge"
+                );
+            }
+            assert!(refused > 0, "{name} needs room to build");
+        }
+        assert_eq!(keys(&base), original);
+        drop(base);
+        assert_eq!(budget.stats().used, 0);
+    }
+
+    /// One descent by key finds a key's page, the page's rank and the page
+    /// after it, at every page of a three-level directory: on a page's first
+    /// key, between two pages' keys, and past the last page, where there is
+    /// none after.
+    #[test]
+    fn locating_a_key_finds_its_page_its_rank_and_the_page_after() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
+        let directory = built(&budget, MAX * MAX + 7);
+        assert_eq!(directory.height(), 3);
+        for rank in 0..directory.len() {
+            let key = u64::try_from(rank).unwrap() * 2;
+            for sought in [key, key + 1] {
+                let located = directory.locate(&sought).unwrap();
+                assert_eq!(located.rank, rank, "key {sought}");
+                assert!(Arc::ptr_eq(located.page, directory.get(rank).unwrap()));
+                match directory.get(rank + 1) {
+                    Some(next) => assert!(Arc::ptr_eq(located.next.unwrap(), next), "key {sought}"),
+                    None => assert!(located.next.is_none(), "key {sought}"),
+                }
+                assert_eq!(directory.page_index(&sought), rank);
+            }
+        }
+        assert!(PageDirectory::<u64, u64>::new().locate(&0).is_none());
+        drop(directory);
+        assert_eq!(budget.stats().used, 0);
     }
 
     /// An edit of a directory, made within the build it is given.

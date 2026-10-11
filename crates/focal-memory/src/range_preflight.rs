@@ -284,7 +284,7 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             let selected = remaining
                 .get(..group.count)
                 .ok_or(MemoryError::MissingKey)?;
-            match base.pages.get(group.rank) {
+            match group.page {
                 None if base.pages.is_empty() => {
                     let produced =
                         count.merge::<K, V>(&[], selected, self.config, self.partition)?;
