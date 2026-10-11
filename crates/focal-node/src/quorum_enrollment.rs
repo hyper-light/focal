@@ -575,13 +575,6 @@ impl QuorumEnrollmentDriver {
         control: &impl EnrollmentControl,
     ) -> Result<(EnrollmentRegistry, Allocation), QuorumEnrollmentError> {
         self.check_router(control)?;
-        let bytes = self
-            .config
-            .limits
-            .max_checkpoint_bytes
-            .checked_mul(4)
-            .ok_or(EnrollmentError::Capacity)?;
-        let charge = reserve(&self.budget, BudgetKind::Control, bytes)?;
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|_| EnrollmentError::Crypto)?;
         let state = focal_rt::time::timeout(
@@ -593,9 +586,21 @@ impl QuorumEnrollmentDriver {
         if state.identity != self.config.root {
             return Err(QuorumEnrollmentError::Identity);
         }
+        // The directory the read carried goes here; the registry's bytes
+        // stay until they are restored.
         let ControlBootstrap::Root { enrollment, .. } = state.state else {
             return Err(QuorumEnrollmentError::Identity);
         };
+        // What restoring the registry holds, known from its bytes before it
+        // is decoded, the bytes themselves while they are, and the one
+        // command a step prepares from the registry and its encoding.
+        let bytes = EnrollmentRegistry::restore_bound(enrollment.len())?
+            .checked_add(enrollment.len())
+            .and_then(|bytes| {
+                bytes.checked_add(focal_enrollment::MAX_MESSAGE_BYTES.checked_mul(2)?)
+            })
+            .ok_or(EnrollmentError::Capacity)?;
+        let charge = reserve(&self.budget, BudgetKind::Control, bytes)?;
         let registry = EnrollmentRegistry::restore(
             &enrollment,
             self.config.root.cluster.0,

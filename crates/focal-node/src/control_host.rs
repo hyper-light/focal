@@ -267,12 +267,19 @@ pub struct RootObservation {
     contacts: ContactSnapshot,
     configuration: ControlConfiguration,
     authority: Option<focal_directory::AuthorityCheckpoint>,
+    enrollment_restore: usize,
     _input: Allocation,
     _state: Allocation,
 }
 impl RootObservation {
     pub fn snapshot(&self) -> &ControlSnapshot {
         &self.snapshot
+    }
+    /// What restoring the enrollment registry this snapshot holds takes at
+    /// most (`EnrollmentRegistry::restore_bytes`), as the owner measured the
+    /// registry it encoded: what a reader charges before decoding it.
+    pub fn enrollment_restore(&self) -> usize {
+        self.enrollment_restore
     }
     pub fn contacts(&self) -> &ContactSnapshot {
         &self.contacts
@@ -1362,6 +1369,13 @@ impl<V: AuthorityVerifier> Owner<V> {
         else {
             return Err(ControlFailure::WrongOwner);
         };
+        let enrollment_restore = self
+            .replica
+            .enrollment()
+            .map(focal_enrollment::EnrollmentRegistry::restore_bytes)
+            .transpose()
+            .map_err(|_| ControlFailure::Capacity)?
+            .unwrap_or(0);
         Ok(RootObservation {
             snapshot,
             contacts,
@@ -1370,6 +1384,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 .replica
                 .authority()
                 .map(|authority| authority.checkpoint().clone()),
+            enrollment_restore,
             _input: input,
             _state: state,
         })

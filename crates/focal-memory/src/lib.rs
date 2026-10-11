@@ -132,3 +132,35 @@ pub(crate) fn checked_mul(left: usize, right: usize) -> Result<usize, MemoryErro
 
 /// Conservative bookkeeping for each allocation the engine itself creates.
 pub const ALLOCATOR_OVERHEAD: usize = 4 * std::mem::size_of::<usize>();
+
+/// What one entry of a `BTreeMap<K, V>` holds at most, its share of its node
+/// included: std's nodes hold eleven entries and every node but the root is
+/// kept at least five full, so an entry's share of its node is at most eleven
+/// fifths of an entry, and of the node's twelve links, its header and its
+/// allocation a fifth: three entries' bytes and one allocation's bookkeeping
+/// bound it. The heap a key or value holds itself is its owner's to add.
+pub fn map_entry_bytes<K, V>() -> Option<usize> {
+    std::mem::size_of::<K>()
+        .checked_add(std::mem::size_of::<V>())?
+        .checked_mul(3)?
+        .checked_add(ALLOCATOR_OVERHEAD)
+}
+
+/// What a `BTreeMap<K, V>` (or a `BTreeSet<K>`, whose values take no room)
+/// of `entries` holds at most: each entry's share (`map_entry_bytes`) and one
+/// whole node besides, for the root, the one node that may be less than five
+/// full. An empty map allocates nothing.
+pub fn map_bytes<K, V>(entries: usize) -> Option<usize> {
+    if entries == 0 {
+        return Some(0);
+    }
+    // A node: eleven entries, twelve links, its parent link, index and length.
+    let node = std::mem::size_of::<K>()
+        .checked_add(std::mem::size_of::<V>())?
+        .checked_mul(11)?
+        .checked_add(std::mem::size_of::<usize>().checked_mul(14)?)?
+        .checked_add(ALLOCATOR_OVERHEAD)?;
+    entries
+        .checked_mul(map_entry_bytes::<K, V>()?)?
+        .checked_add(node)
+}

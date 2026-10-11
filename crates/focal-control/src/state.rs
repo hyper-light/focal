@@ -181,7 +181,7 @@ impl Machine {
                 let _decode = budget.reserve(
                     BudgetKind::Recovery,
                     BudgetLane::Completion,
-                    charge(enrollment.len().saturating_add(8192), 32)?,
+                    EnrollmentRegistry::restore_bound(enrollment.len())?,
                 )?;
                 let enrollment = EnrollmentRegistry::restore(
                     &enrollment,
@@ -192,7 +192,7 @@ impl Machine {
                     .reserve(
                         BudgetKind::Control,
                         BudgetLane::Completion,
-                        charge(enrollment.charged_bytes(), 16)?,
+                        enrollment.held_bytes()?,
                     )?
                     .commit();
                 Self::Root {
@@ -434,20 +434,15 @@ impl Machine {
                 Err(focal_directory::DirectoryError::UnverifiedAuthority.into())
             }
             (Self::Root { enrollment, .. }, ControlCommand::Enrollment(command)) => {
-                let bytes = enrollment
-                    .charged_bytes()
-                    .checked_add(command_bytes)
-                    .and_then(|n| n.checked_add(8192))
-                    .ok_or(ControlError::Capacity)?;
                 let allocation = budget
                     .reserve(
                         BudgetKind::Control,
                         BudgetLane::Completion,
-                        charge(bytes, 16)?,
+                        enrollment.prepare_bytes(command_bytes)?,
                     )?
                     .commit();
                 let update = enrollment.prepare_command(command)?;
-                if charge(update.charged_bytes(), 16)? > allocation.bytes() {
+                if update.held_bytes()? > allocation.bytes() {
                     return Err(ControlError::Capacity);
                 }
                 Ok(PreparedMachine::Enrollment { update, allocation })

@@ -65,7 +65,12 @@ fn controller_admission_precedes_private_journal_and_releases_on_drop() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let (state, receipt, credentials) = founder(directory.path()).await;
-        let small = MemoryBudget::new(1024 * 1024, 512 * 1024).unwrap();
+        // No room to decode the genesis registry: refused before the journal.
+        let ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {
+            panic!("root genesis");
+        };
+        let decoding = EnrollmentRegistry::restore_bound(enrollment.len()).unwrap();
+        let small = MemoryBudget::new(decoding - 1, 0).unwrap();
         assert!(matches!(
             NetworkController::new(
                 state.clone(),
@@ -87,7 +92,11 @@ fn controller_admission_precedes_private_journal_and_releases_on_drop() {
             budget.clone(),
         )
         .unwrap();
-        assert_eq!(budget.stats().used, 64 * 1024 * 1024);
+        // It holds the founder's genesis enrollment and one route through the
+        // sponsor: what they take, never a prepayment.
+        let held = budget.stats().used;
+        assert!(held > 0 && held < decoding, "{held} of {decoding}");
+        assert!(directory.path().join("ROOT-ADMISSION.initialized").exists());
         drop(controller);
         assert_eq!(budget.stats().used, 0);
     })
@@ -267,6 +276,100 @@ fn projection_export_pressure_clears_grants_after_committed_revocation() {
             registry.authenticate(fingerprint),
             Err(AccessError::Unauthorized)
         ));
+        drop(observation);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_refresh_is_charged_what_it_decodes_and_keeps_and_refused_without_it() {
+    focal_rt::block_on(async move {
+        use crate::{cluster::NoDirectoryAuthority, control_host::ControlHostConfig};
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(directory.path().to_owned());
+        settings.node.advertise = Some("127.0.0.1:45678".into());
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        let registry = PeerRegistry::new(4).unwrap();
+        let limits = ControlHost::wire_limits();
+        let pool = PeerConnectionPool::new(
+            QuicConnector::bind_standalone(
+                "127.0.0.1:0".parse().unwrap(),
+                client_tls(
+                    TlsIdentity::from_pkcs8(
+                        network.credentials.certificate_chain().to_vec(),
+                        network.credentials.private_key_der().to_vec(),
+                    ),
+                    vec![network.state.sponsor.ca_certificate.clone()],
+                    &limits,
+                    focal_wire::net::Sender::Node,
+                )
+                .unwrap(),
+                limits,
+            )
+            .unwrap(),
+            PeerPoolLimits::default(),
+        )
+        .unwrap();
+        let (host, owner, _outgoing) = ControlHost::spawn_recovered(
+            network.control,
+            NoDirectoryAuthority,
+            ControlHostConfig::new(network.state.genesis.root_namespace),
+            MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
+            network.recovered,
+        )
+        .unwrap();
+        let budget = MemoryBudget::new(128 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+        let mut controller = NetworkController::new(
+            network.state.clone(),
+            network.receipt.clone(),
+            network.credentials.clone(),
+            directory.path().to_owned(),
+            budget.clone(),
+        )
+        .unwrap();
+        let founded = budget.stats().used;
+        let observation = host.observe_root().await.unwrap();
+        assert!(observation.enrollment_restore() > 0);
+        let fingerprint = certificate_fingerprint(&network.receipt.certificate);
+        // No room to decode what was observed: refused, nothing installed.
+        let pressure = budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                budget.stats().limit - founded - observation.enrollment_restore() + 1,
+            )
+            .unwrap();
+        assert!(matches!(
+            controller.refresh(&observation, &pool, &registry, unix_time().unwrap()),
+            Err(ControllerError::Capacity)
+        ));
+        assert!(registry.authenticate(fingerprint).is_err());
+        assert_eq!(budget.stats().used, founded + pressure.bytes());
+        drop(pressure);
+        // With room, the projection is installed and kept charged; the
+        // decode's charge went with the refresh.
+        controller
+            .refresh(&observation, &pool, &registry, unix_time().unwrap())
+            .unwrap();
+        assert!(registry.authenticate(fingerprint).is_ok());
+        let refreshed = budget.stats().used;
+        assert!(refreshed > founded, "{refreshed} of {founded}");
+        assert!(
+            refreshed - founded < observation.enrollment_restore(),
+            "{refreshed} of {founded}"
+        );
+        // Refreshing again replaces the projection's charge: nothing grows.
+        for _ in 0..8 {
+            controller
+                .refresh(&observation, &pool, &registry, unix_time().unwrap())
+                .unwrap();
+            assert_eq!(budget.stats().used, refreshed);
+        }
+        drop(controller);
+        assert_eq!(budget.stats().used, 0);
         drop(observation);
         host.stop().await.unwrap();
         owner.join().unwrap();

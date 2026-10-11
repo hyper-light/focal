@@ -160,7 +160,7 @@ impl InstalledAuthority {
                     .reserve(
                         BudgetKind::Control,
                         BudgetLane::Completion,
-                        charge(enrollment.charged_bytes(), 16)?,
+                        enrollment.held_bytes()?,
                     )?
                     .commit(),
                 registry: enrollment,

@@ -756,6 +756,11 @@ impl PreparedEnrollmentUpdate {
     pub fn charged_bytes(&self) -> usize {
         self.next.charged_bytes
     }
+    /// What the registry this update publishes holds in memory
+    /// (`EnrollmentRegistry::held_bytes`).
+    pub fn held_bytes(&self) -> Result<usize, EnrollmentError> {
+        self.next.held_bytes()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1089,8 +1094,244 @@ impl EnrollmentRegistry {
     pub fn applied_index(&self) -> u64 {
         self.applied_index
     }
+    /// The committed size the registry's limits are decided against
+    /// (`max_checkpoint_bytes`), alike on every replica. It measures no
+    /// process's memory: what holding the registry takes is `held_bytes`.
     pub fn charged_bytes(&self) -> usize {
         self.charged_bytes
+    }
+    /// What this registry holds in this process's memory at most, its own
+    /// fields aside: each map's nodes (`focal_memory::map_bytes`) and every
+    /// certificate, name and endorsement its records hold. Local accounting,
+    /// never replicated; a process charges it for holding a registry. A
+    /// registry of 64 enrollments, half with an open invitation beside,
+    /// held 124 KB where its committed size is 93 KB: open invitations are
+    /// small to encode and as large as an enrollment's record in a map.
+    pub fn held_bytes(&self) -> Result<usize, EnrollmentError> {
+        use focal_memory::map_bytes;
+        let mut bytes = buffer_bytes(self.ca_certificate.capacity())?;
+        let mut add = |more: Option<usize>| {
+            bytes = more
+                .and_then(|more| bytes.checked_add(more))
+                .ok_or(EnrollmentError::Capacity)?;
+            Ok::<_, EnrollmentError>(())
+        };
+        add(map_bytes::<InvitationId, InviteMetadata>(
+            self.records.len(),
+        ))?;
+        for record in self.records.values() {
+            if let Some(receipt) = &record.receipt {
+                add(Some(receipt_bytes(receipt)?))?;
+            }
+        }
+        add(map_bytes::<Fingerprint, InvitationId>(
+            self.certificates.len(),
+        ))?;
+        add(map_bytes::<Fingerprint, InvitationId>(
+            self.enrolled_keys.len(),
+        ))?;
+        add(map_bytes::<Fingerprint, RetiredCredential>(
+            self.retired.len(),
+        ))?;
+        for retired in self.retired.values() {
+            add(Some(receipt_bytes(&retired.receipt)?))?;
+        }
+        add(map_bytes::<[u8; 16], ()>(self.tenants.len()))?;
+        add(map_bytes::<(i64, InvitationId), ()>(self.closing.len()))?;
+        if let Some(staged) = &self.bootstrap.successor {
+            add(map_bytes::<InvitationId, ()>(staged.awaiting.len()))?;
+        }
+        for issuer in [
+            Some(&self.issuer.current),
+            self.issuer.successor.as_ref().map(|staged| &staged.record),
+            self.issuer.retiring.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            add(Some(buffer_bytes(issuer.certificate.capacity())?))?;
+            if let Some(endorsement) = &issuer.endorsement {
+                add(Some(buffer_bytes(endorsement.capacity())?))?;
+            }
+        }
+        Ok(bytes)
+    }
+    /// What restoring this registry's checkpoint (`restore`) holds at most
+    /// at once: the registry restored (`held_bytes`), the indexes the
+    /// restore rebuilds beside it to check its own against them, and the
+    /// check of one certificate against one issuer at a time. What a
+    /// process charges before it decodes a checkpoint this registry made.
+    pub fn restore_bytes(&self) -> Result<usize, EnrollmentError> {
+        use focal_memory::map_bytes;
+        let enrolled = self.certificates.len();
+        let receipts = self
+            .records
+            .values()
+            .filter_map(|record| record.receipt.as_ref())
+            .chain(self.retired.values().map(|retired| &retired.receipt))
+            .map(|receipt| receipt.certificate.len())
+            .max()
+            .unwrap_or(0);
+        let issuers = self.issuer.roots().map(<[u8]>::len).max().unwrap_or(0);
+        [
+            receipts
+                .checked_add(issuers)
+                .and_then(|bytes| bytes.checked_mul(CHECK_BYTES_PER_BYTE)),
+            map_bytes::<Fingerprint, InvitationId>(enrolled),
+            map_bytes::<Fingerprint, InvitationId>(self.enrolled_keys.len()),
+            map_bytes::<u64, ()>(enrolled),
+            // The closing index is collected through a vector before it is
+            // built.
+            self.records
+                .len()
+                .checked_mul(size_of::<(i64, InvitationId)>())
+                .and_then(|bytes| bytes.checked_add(focal_memory::ALLOCATOR_OVERHEAD)),
+        ]
+        .into_iter()
+        .try_fold(self.held_bytes()?, |bytes, more| {
+            more.and_then(|more| bytes.checked_add(more))
+        })
+        .ok_or(EnrollmentError::Capacity)
+    }
+    /// What restoring a checkpoint of `encoded` bytes holds at most at once,
+    /// known before it is decoded: as many entries of one kind as the bytes
+    /// could hold at the fewest bytes one encodes to, each held as
+    /// `restore_bytes` counts it — whichever kind takes most — with every
+    /// certificate and name no larger than its bytes, each map's root, and
+    /// one certificate's check. Looser than the `restore_bytes` of the
+    /// registry decoded: what a process charges when no owner measured it.
+    pub fn restore_bound(encoded: usize) -> Result<usize, EnrollmentError> {
+        use focal_memory::{ALLOCATOR_OVERHEAD, map_bytes, map_entry_bytes};
+        let sum = |parts: &[Option<usize>]| {
+            parts
+                .iter()
+                .try_fold(0usize, |total, part| total.checked_add((*part)?))
+                .ok_or(EnrollmentError::Capacity)
+        };
+        let receipt = EnrollmentReceipt {
+            invitation: [0; 16],
+            request: [0; 16],
+            identity: AssignedIdentity {
+                cluster: [0; 16],
+                role: EnrollmentRole::Node,
+                node_id: None,
+                principal: [0; 16],
+                server_name: String::new(),
+            },
+            public_key: [0; 32],
+            csr_hash: [0; 32],
+            issued_at: 0,
+            expires_at: 0,
+            revision: 0,
+            certificate: Vec::new(),
+        };
+        // A record: its entry, its certificate's and key's, its closing,
+        // what the restore rebuilds to check them (certificate, key, node,
+        // the closing index's vector) and its certificate's and name's
+        // allocations.
+        let record = (
+            encoded_len(&InviteMetadata {
+                id: [0; 16],
+                cluster: [0; 16],
+                role: EnrollmentRole::Node,
+                expires_at: 0,
+                token_hash: [0; 32],
+                trust: [0; 32],
+                revoked: false,
+                receipt: None,
+            })?,
+            sum(&[
+                map_entry_bytes::<InvitationId, InviteMetadata>(),
+                map_entry_bytes::<Fingerprint, InvitationId>(),
+                map_entry_bytes::<Fingerprint, InvitationId>(),
+                map_entry_bytes::<(i64, InvitationId), ()>(),
+                map_entry_bytes::<Fingerprint, InvitationId>(),
+                map_entry_bytes::<Fingerprint, InvitationId>(),
+                map_entry_bytes::<u64, ()>(),
+                Some(size_of::<(i64, InvitationId)>()),
+                ALLOCATOR_OVERHEAD.checked_mul(2),
+            ])?,
+        );
+        let retired = (
+            encoded_len(&RetiredCredential {
+                invitation: [0; 16],
+                receipt,
+                retire_at: 0,
+            })?,
+            sum(&[
+                map_entry_bytes::<Fingerprint, RetiredCredential>(),
+                ALLOCATOR_OVERHEAD.checked_mul(2),
+            ])?,
+        );
+        let tenant = (
+            size_of::<[u8; 16]>(),
+            sum(&[map_entry_bytes::<[u8; 16], ()>()])?,
+        );
+        let awaiting = (
+            size_of::<InvitationId>(),
+            sum(&[map_entry_bytes::<InvitationId, ()>()])?,
+        );
+        let entries = [record, retired, tenant, awaiting]
+            .into_iter()
+            .try_fold(0usize, |most, (least, held)| {
+                Some(
+                    most.max(
+                        encoded
+                            .checked_div(least)?
+                            .checked_add(1)?
+                            .checked_mul(held)?,
+                    ),
+                )
+            })
+            .ok_or(EnrollmentError::Capacity)?;
+        // Each map's root, the one node that may be less than five full.
+        let root = |entries: Option<usize>, entry: Option<usize>| {
+            entries.and_then(|bytes| bytes.checked_sub(entry?))
+        };
+        sum(&[
+            // Every certificate, name and endorsement as many bytes as it
+            // encodes to, and the allocations of the fixed ones.
+            Some(encoded),
+            Some(entries),
+            ALLOCATOR_OVERHEAD.checked_mul(8),
+            root(
+                map_bytes::<InvitationId, InviteMetadata>(1),
+                map_entry_bytes::<InvitationId, InviteMetadata>(),
+            ),
+            root(
+                map_bytes::<Fingerprint, InvitationId>(1),
+                map_entry_bytes::<Fingerprint, InvitationId>(),
+            )
+            .and_then(|node| node.checked_mul(4)),
+            root(
+                map_bytes::<Fingerprint, RetiredCredential>(1),
+                map_entry_bytes::<Fingerprint, RetiredCredential>(),
+            ),
+            root(
+                map_bytes::<[u8; 16], ()>(1),
+                map_entry_bytes::<[u8; 16], ()>(),
+            )
+            .and_then(|node| node.checked_mul(2)),
+            root(
+                map_bytes::<(i64, InvitationId), ()>(1),
+                map_entry_bytes::<(i64, InvitationId), ()>(),
+            ),
+            root(map_bytes::<u64, ()>(1), map_entry_bytes::<u64, ()>()),
+            encoded
+                .min(MAX_ISSUER_BYTES.saturating_mul(2))
+                .checked_mul(CHECK_BYTES_PER_BYTE),
+        ])
+    }
+    /// What preparing a command of `command` encoded bytes holds at most
+    /// (`prepare_command`): the copy it is applied to, as this registry holds
+    /// it, what the command's bytes could add (`restore_bound`), and a
+    /// staged successor's awaited invitations, which are the open ones and
+    /// carried by no command.
+    pub fn prepare_bytes(&self, command: usize) -> Result<usize, EnrollmentError> {
+        focal_memory::map_bytes::<InvitationId, ()>(self.records.len())
+            .and_then(|awaiting| awaiting.checked_add(self.held_bytes().ok()?))
+            .and_then(|bytes| bytes.checked_add(Self::restore_bound(command).ok()?))
+            .ok_or(EnrollmentError::Capacity)
     }
     pub fn limits(&self) -> &EnrollmentLimits {
         &self.limits
@@ -3019,15 +3260,35 @@ fn closed_at(record: &InviteMetadata) -> i64 {
 fn record_charge(record: &InviteMetadata) -> Result<usize, EnrollmentError> {
     // Canonical payload plus map keys/node overhead. The fixed 8 KiB registry
     // reservation covers its CA certificate, counters and collection headers.
-    encode(record)?
-        .len()
+    encoded_len(record)?
         .checked_add(128)
         .and_then(|value| value.checked_add(if record.receipt.is_some() { 256 } else { 0 }))
         .ok_or(EnrollmentError::Capacity)
 }
+/// What checking a certificate against an issuer holds while it is checked,
+/// per byte of the two: x509-parser's parses of both and the signature's
+/// verification held at most 4.7 times their bytes (tests/registry_heap.rs,
+/// on the shapes this registry issues); this is that measurement's next
+/// power of two. A certificate is 4096 bytes at most, whatever it holds.
+const CHECK_BYTES_PER_BYTE: usize = 8;
+/// What a buffer of `capacity` bytes holds: its bytes and its allocation's
+/// bookkeeping; an empty one allocates nothing.
+fn buffer_bytes(capacity: usize) -> Result<usize, EnrollmentError> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    capacity
+        .checked_add(focal_memory::ALLOCATOR_OVERHEAD)
+        .ok_or(EnrollmentError::Capacity)
+}
+/// What a receipt holds beyond its own fields: its certificate and its name.
+fn receipt_bytes(receipt: &EnrollmentReceipt) -> Result<usize, EnrollmentError> {
+    buffer_bytes(receipt.certificate.capacity())?
+        .checked_add(buffer_bytes(receipt.identity.server_name.capacity())?)
+        .ok_or(EnrollmentError::Capacity)
+}
 fn retired_charge(retired: &RetiredCredential) -> Result<usize, EnrollmentError> {
-    encode(retired)?
-        .len()
+    encoded_len(retired)?
         .checked_add(128)
         .ok_or(EnrollmentError::Capacity)
 }

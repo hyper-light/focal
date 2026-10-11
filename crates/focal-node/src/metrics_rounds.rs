@@ -182,18 +182,6 @@ pub fn choose<K: Ord + Copy>(
     Ok((chosen, last_other.or(last_flagged).or(cursor)))
 }
 
-/// What one entry of a `BTreeMap<K, V>` holds at most: std's nodes hold
-/// eleven entries and are kept at least five full, so an entry's share of
-/// its node is at most eleven fifths of an entry, and of the node's twelve
-/// links and its allocation a fifth: three entries' bytes and one
-/// allocation's bookkeeping bound it.
-pub fn map_entry_bytes<K, V>() -> Option<usize> {
-    size_of::<K>()
-        .checked_add(size_of::<V>())?
-        .checked_mul(3)?
-        .checked_add(ALLOCATOR_OVERHEAD)
-}
-
 /// A hosted session's last round: its installation's sequence, its counts
 /// then, and whether that round asked its owner and was not answered.
 #[derive(Debug, Clone, Copy)]
@@ -292,7 +280,7 @@ impl Rounds {
         &mut self,
         hosted: &[(LedgerId, u64, SessionCounters)],
     ) -> Result<SessionCounters, MemoryError> {
-        let bytes = map_entry_bytes::<LedgerId, Last>()
+        let bytes = focal_memory::map_entry_bytes::<LedgerId, Last>()
             .and_then(|entry| entry.checked_mul(hosted.len()))
             .ok_or(MemoryError::Capacity {
                 requested: usize::MAX,

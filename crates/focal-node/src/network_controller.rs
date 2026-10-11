@@ -238,6 +238,16 @@ async fn observe_projection(
     }
 }
 
+/// A refresh this node had no memory for: nothing it could vouch for stays
+/// granted, as when the root cannot be observed (`observe_projection`), and
+/// the root is observed again after the retry pause.
+async fn refused(registry: &PeerRegistry) -> Result<(), ControllerError> {
+    registry.replace_grants(BTreeMap::new())?;
+    focal_rt::time::sleep(OBSERVATION_RETRY)
+        .await
+        .map_err(|_| ControllerError::Runtime)
+}
+
 /// Install grants from the recovered durable prefix before opening ingress.
 /// Immutable genesis must never resurrect a later revocation during restart.
 /// A newly joined node may not yet occur in its local prefix; its sponsor already
@@ -320,6 +330,82 @@ fn enrolled_keys(
     Ok(keys)
 }
 
+/// Reserve `bytes` of control memory for what the controller holds; a refusal
+/// is the controller's `Capacity`.
+fn charge(budget: &MemoryBudget, bytes: usize) -> Result<Allocation, ControllerError> {
+    Ok(budget
+        .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)
+        .map_err(|_| ControllerError::Capacity)?
+        .commit())
+}
+/// What a receipt holds beyond its own fields: its certificate and its name.
+fn receipt_bytes(receipt: &EnrollmentReceipt) -> Option<usize> {
+    receipt
+        .certificate
+        .capacity()
+        .checked_add(receipt.identity.server_name.capacity())?
+        .checked_add(focal_memory::ALLOCATOR_OVERHEAD.checked_mul(2)?)
+}
+/// What `count` routes naming `names` bytes hold, here and in the pool's
+/// copy: their map, and each route's certificate name and advertised name.
+fn route_bytes(count: usize, names: usize) -> Option<usize> {
+    focal_memory::map_bytes::<u64, PeerEndpoint>(count)?
+        .checked_add(names)?
+        .checked_add(count.checked_mul(focal_memory::ALLOCATOR_OVERHEAD.checked_mul(2)?)?)?
+        .checked_mul(2)
+}
+/// What a refresh builds and keeps at most, before it is built: a grant
+/// for every enrollment and every certificate a renewal retired, a key for
+/// every enrollment (each grant naming at most two tenants, `node_grant`),
+/// a route for every contact and one through the sponsor (`route_bytes`),
+/// every contact eligible, and the trusted issuers listed on the way. A
+/// route through the sponsor, and the founder's contact without a name of
+/// its own, name the sponsor's endpoint (`sponsor` bytes).
+fn projection_bytes(
+    enrollment: &EnrollmentRegistry,
+    contacts: &[ContactRecord],
+    sponsor: usize,
+    now: i64,
+) -> Option<usize> {
+    use focal_memory::{ALLOCATOR_OVERHEAD, map_bytes};
+    let tenants = map_bytes::<TenantId, ()>(2)?;
+    let enrolled = enrollment.enrollments().count();
+    let retired = enrollment.retired(now).count();
+    let granted = enrolled.checked_add(retired)?;
+    let names = contacts.iter().try_fold(0usize, |bytes, contact| {
+        bytes
+            .checked_add(contact.server_name.len())?
+            .checked_add(contact.endpoint.as_ref().map_or(0, String::len))
+    })?;
+    // The sponsor's route names the founder's certificate, and both it and
+    // the founder's contact may name the sponsor.
+    let founder = enrollment
+        .enrollments()
+        .map(|receipt| receipt.identity.server_name.len())
+        .max()
+        .unwrap_or(0);
+    let names = names
+        .checked_add(founder)?
+        .checked_add(sponsor.checked_mul(2)?)?;
+    let issuers = enrollment
+        .issuers()
+        .trusted()
+        .try_fold(0usize, |bytes, issuer| {
+            bytes
+                .checked_add(size_of::<focal_enrollment::IssuerRecord>())?
+                .checked_add(issuer.certificate.len())?
+                .checked_add(issuer.endorsement.as_ref().map_or(0, Vec::len))?
+                .checked_add(ALLOCATOR_OVERHEAD.checked_mul(2)?)
+        })?;
+    map_bytes::<[u8; 32], PeerGrant>(granted)?
+        .checked_add(granted.checked_mul(tenants)?)?
+        .checked_add(map_bytes::<[u8; 32], EnrolledKey>(enrolled)?)?
+        .checked_add(enrolled.checked_mul(tenants)?)?
+        .checked_add(route_bytes(contacts.len().checked_add(1)?, names)?)?
+        .checked_add(map_bytes::<u64, ()>(contacts.len())?)?
+        .checked_add(retired.checked_mul(size_of::<&EnrollmentReceipt>())?)?
+        .checked_add(issuers)
+}
 fn genesis_enrollment(state: &NetworkState) -> Result<EnrollmentRegistry, ControllerError> {
     let ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {
         return Err(ControllerError::Identity);
@@ -1020,8 +1106,17 @@ pub struct NetworkController {
     /// The failure-domain labels this node announces with its contact
     /// (24 §22).
     topology: crate::config::Topology,
+    /// The founder's enrollment as the genesis committed it: the route to
+    /// the founder before the observed registry names one, decoded once.
+    genesis_founder: EnrollmentReceipt,
     budget: MemoryBudget,
-    _allocation: Allocation,
+    /// What the genesis founder's enrollment holds, and the one route to the
+    /// founder taken through the sponsor before any refresh (here and in
+    /// the pool).
+    _genesis: Allocation,
+    /// What the last refresh installed, by its entries
+    /// (`projection_bytes`): released when the next one replaces it.
+    projection: Option<Allocation>,
 }
 impl NetworkController {
     /// Announce this node's declared topology, and (on the founder) register
@@ -1091,16 +1186,35 @@ impl NetworkController {
         root: PathBuf,
         budget: MemoryBudget,
     ) -> Result<Self, ControllerError> {
-        // Covers the bounded root checkpoint decode, grants, contact candidates,
-        // journal and old/new route maps. No per-peer shared ownership is added.
-        let allocation = budget
-            .reserve(
-                BudgetKind::Control,
-                BudgetLane::Completion,
-                64 * 1024 * 1024,
-            )
-            .map_err(|_| ControllerError::Capacity)?
-            .commit();
+        let genesis_founder = {
+            let ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {
+                return Err(ControllerError::Identity);
+            };
+            let _decoding = charge(
+                &budget,
+                EnrollmentRegistry::restore_bound(enrollment.len())?,
+            )?;
+            genesis_enrollment(&state)?
+                .enrollments()
+                .next()
+                .cloned()
+                .ok_or(ControllerError::Identity)?
+        };
+        let genesis = charge(
+            &budget,
+            receipt_bytes(&genesis_founder)
+                .and_then(|bytes| {
+                    bytes.checked_add(route_bytes(
+                        1,
+                        genesis_founder
+                            .identity
+                            .server_name
+                            .len()
+                            .checked_add(state.sponsor.endpoint.len())?,
+                    )?)
+                })
+                .ok_or(ControllerError::Capacity)?,
+        )?;
         let admission = if state.node == state.genesis.founder.node {
             Some(RootAdmission::open(&state, &root)?)
         } else {
@@ -1136,8 +1250,10 @@ impl NetworkController {
             pin_reads: 0,
             local_grant: None,
             topology: crate::config::Topology::default(),
+            genesis_founder,
             budget,
-            _allocation: allocation,
+            _genesis: genesis,
+            projection: None,
         })
     }
     pub fn run<'a>(
@@ -1226,12 +1342,28 @@ impl NetworkController {
                 // Export may wait behind disk IO. Authorization uses the time
                 // at projection, never the pre-await timestamp.
                 now = unix_time()?;
-                (eligible, next_transition) = self.refresh(&next, pool, registry, now)?;
+                match self.refresh(&next, pool, registry, now) {
+                    Ok(refreshed) => (eligible, next_transition) = refreshed,
+                    Err(ControllerError::Capacity) => {
+                        drop(next);
+                        refused(registry).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 observed = Some(next);
             } else if now >= next_transition || previous_time.is_some_and(|previous| now < previous)
             {
                 let current = observed.as_ref().ok_or(ControllerError::Identity)?;
-                (eligible, next_transition) = self.refresh(current, pool, registry, now)?;
+                match self.refresh(current, pool, registry, now) {
+                    Ok(refreshed) => (eligible, next_transition) = refreshed,
+                    Err(ControllerError::Capacity) => {
+                        observed = None;
+                        refused(registry).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             previous_time = Some(now);
             {
@@ -1795,6 +1927,9 @@ impl NetworkController {
         let ControlBootstrap::Root { enrollment, .. } = &snapshot.state else {
             return Err(ControllerError::Identity);
         };
+        // The registry decoded for this refresh, charged as its owner
+        // measured it, for the refresh.
+        let _decoding = charge(&self.budget, observed.enrollment_restore())?;
         let enrollment = EnrollmentRegistry::restore(
             enrollment,
             self.state.genesis.founder.cluster,
@@ -1825,6 +1960,17 @@ impl NetworkController {
             self.recorded_level = level;
         }
         self.publish_local_grant(&enrollment);
+        // What this refresh builds and keeps, charged before it is built.
+        let projection = charge(
+            &self.budget,
+            projection_bytes(
+                &enrollment,
+                &observed.contacts().contacts.records,
+                self.state.sponsor.endpoint.len(),
+                now,
+            )
+            .ok_or(ControllerError::Capacity)?,
+        )?;
         let grants = active_grants(&enrollment, &self.state, now)?;
         let known = enrollment
             .enrollments()
@@ -1844,17 +1990,10 @@ impl NetworkController {
         // supplied by an arbitrary peer. A committed contact can supersede it.
         // The founder's certificate as committed now: the genesis one until
         // the founder renews its credential, the renewal after (24 §11).
-        let founder = match enrollment
+        let founder = enrollment
             .enrollments()
             .find(|listed| listed.identity.node_id == Some(self.state.genesis.founder.node))
-        {
-            Some(founder) => founder.clone(),
-            None => genesis_enrollment(&self.state)?
-                .enrollments()
-                .next()
-                .cloned()
-                .ok_or(ControllerError::Identity)?,
-        };
+            .unwrap_or(&self.genesis_founder);
         // The sponsor is routed to while the founder's enrollment stands —
         // its key enrolled and unrevoked — whether or not the certificate
         // the observed registry names for it is still valid. A joiner's
@@ -1993,6 +2132,9 @@ impl NetworkController {
             self.routes = routes;
             self.route_revision = revision;
         }
+        // The previous projection is gone from the peer registry and the
+        // routes; its charge goes with it.
+        self.projection = Some(projection);
         Ok((eligible, next_transition))
     }
     /// Whether a committed contact record already states what this node
@@ -2102,18 +2244,15 @@ impl NetworkController {
         let Some((address, name)) = dial else {
             return Ok(());
         };
+        // The one route a node holds before any refresh: what `_genesis`
+        // charges. Past a refresh, the routes were charged with it.
         if !self.routes.contains_key(&founder_node) {
-            let initial = genesis_enrollment(&self.state)?;
-            let founder = initial
-                .enrollments()
-                .next()
-                .ok_or(ControllerError::Identity)?;
             let mut routes = self.routes.clone();
             routes.insert(
                 founder_node,
                 PeerEndpoint {
                     address,
-                    server_name: founder.identity.server_name.clone(),
+                    server_name: self.genesis_founder.identity.server_name.clone(),
                     name,
                 },
             );

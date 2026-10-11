@@ -100,13 +100,30 @@ fn random<const N: usize>() -> Result<[u8; N], EnrollmentError> {
 fn hash(domain: &'static str, bytes: &[u8]) -> Fingerprint {
     blake3::derive_key(domain, bytes)
 }
+/// A message as bytes, held in exactly the room it takes: the whole message
+/// bound was once zeroed for each and kept as the result's capacity.
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, EnrollmentError> {
-    let mut bytes = vec![0; MAX_MESSAGE_BYTES];
+    let mut bytes = vec![0; encoded_len(value)?];
     let used = postcard::to_slice(value, &mut bytes)
         .map_err(|_| EnrollmentError::Capacity)?
         .len();
-    bytes.truncate(used);
+    if used != bytes.len() {
+        return Err(EnrollmentError::Capacity);
+    }
     Ok(bytes)
+}
+/// The length of `encode(value)`, counted without making the bytes; a
+/// message past the bound is refused as `encode` refuses it.
+fn encoded_len<T: serde::Serialize>(value: &T) -> Result<usize, EnrollmentError> {
+    let size = postcard::serialize_with_flavor::<T, _, usize>(
+        value,
+        postcard::ser_flavors::Size::default(),
+    )
+    .map_err(|_| EnrollmentError::Capacity)?;
+    if size > MAX_MESSAGE_BYTES {
+        return Err(EnrollmentError::Capacity);
+    }
+    Ok(size)
 }
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, EnrollmentError> {
     if bytes.len() > MAX_MESSAGE_BYTES {
