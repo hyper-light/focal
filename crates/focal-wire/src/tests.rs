@@ -6001,8 +6001,24 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
             QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, short, budget()).unwrap();
         let remote = connector.connect(address, "localhost").await.unwrap();
         assert!(remote.request(&request(0)).await.is_ok());
+        let facts = remote.path().await;
+        eprintln!(
+            "DIAG stall facts before: rtt/min_rtt/pto {:?}",
+            facts.map(|f| (f.rtt, f.min_rtt, f.probe_timeout))
+        );
         // The stalled request ends at its deadline, not with its connection.
-        assert!(remote.request(&request(1)).await.is_err());
+        let began = hyper_rt::futures::now_ns();
+        let stalled = remote.request(&request(1)).await;
+        let facts = remote.path().await;
+        eprintln!(
+            "DIAG stall: {:?} after {} ms, tick {} ns, overrun {} ns, facts after: rtt/min_rtt/pto {:?}",
+            stalled.as_ref().map(|_| "answered"),
+            (hyper_rt::futures::now_ns() - began) / 1_000_000,
+            hyper_rt::futures::timer_tick_ns(),
+            hyper_rt::futures::scheduler_overrun_ns(),
+            facts.map(|f| (f.rtt, f.min_rtt, f.probe_timeout))
+        );
+        assert!(stalled.is_err());
         pause(DEADLINE * 3).await;
         // A remote is its connection: one that went is not asked again.
         assert!(
