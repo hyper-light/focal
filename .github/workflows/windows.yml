@@ -32,7 +32,7 @@ jobs:
       - name: Platform FFI tests (DACL, SID, file identity, locks, paths)
         shell: bash
         run: cargo test -p focal-platform --locked
-      - name: Wire tests (named-pipe local transport round-trip)
+      - name: Wire tests (AF_UNIX local transport round-trip)
         shell: bash
         run: cargo test -p focal-wire --locked
       - name: Enrollment tests (private credential persistence, PKI, invitations)

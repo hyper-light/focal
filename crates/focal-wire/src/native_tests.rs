@@ -832,11 +832,9 @@ fn native_replies_are_validated_against_the_request_identity_and_bounds() {
     );
 }
 
-#[cfg(unix)]
 struct NativeEcho {
     native: bool,
 }
-#[cfg(unix)]
 impl RequestHandler for NativeEcho {
     fn supports_managed_requests(&self) -> bool {
         true
