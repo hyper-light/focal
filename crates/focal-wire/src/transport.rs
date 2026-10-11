@@ -9,7 +9,7 @@ use crate::net::{
 };
 use crate::*;
 use focal_memory::MemoryBudget;
-use hyper_transport::congestion::{Congestion, CopaConfig};
+use hyper_transport::congestion::{BbrConfig, Congestion};
 use hyper_transport::tls::Tls;
 use hyper_transport::{Classes, Config, Endpoint, Limits, PathFacts, PeerId};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -349,11 +349,17 @@ pub(crate) fn listener_client() -> Result<rustls::ClientConfig, WireError> {
     Ok(tls)
 }
 
-/// The congestion law focal's connections run: Copa, chosen by measurement over focal's grids (27
-/// §3.1 P10, F39): it stalled on no path and kept what is asked beside a transfer from waiting for
-/// a full queue (hyper-raft docs/transport.md §4d).
+/// The congestion law focal's connections run: BBR (27 §3.1 P10, §7). Copa was chosen over
+/// focal's network grids (F39), where it stalled on no path and kept what is asked beside a
+/// transfer from waiting for a full queue; on hyper-rt it reads a busy machine as a full queue. Its
+/// round trips count the peer's held acknowledgement and the time a datagram waits in a socket
+/// for its shard, so at 100 writes a second its window sat at two datagrams on every path: frames
+/// arrived late and out of order, followers fell behind and asked for elections, and the
+/// comparison acknowledged 86% of its writes at a p99 of 2.5 s. BBR, measured on the same runner,
+/// acknowledged every write with a p99 of 5.1 ms at 100 a second and 25.4 ms at 200, and stalled
+/// on none of the network grids' paths (CUBIC stalled on five of them).
 fn congestion() -> Congestion {
-    Congestion::Copa(CopaConfig::default())
+    Congestion::Bbr(BbrConfig::default())
 }
 
 /// The datagrams one system call carries each way: hyper-rt's batch bound, at most the 64

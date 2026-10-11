@@ -625,6 +625,7 @@ error that stopped it).
 | | *State 2026-09-28:* built (section 5): leadership returns to the preferred leader and to its zone, preferred leaders are spread when sessions are placed and moved when the spread drifts. Three real processes whose sessions were all led by their founder spread them one each and every log is led where its placement prefers ([09](09-implementation-status.md)). | |
 | G | P10 congestion measurement; decide | bake-off numbers recorded |
 | | *State 2026-09-28:* measured and decided (section 7): Copa is the law of focal's connections, a stream is given a megabyte ahead of its reader, and what a group needs goes before what is asked, and that before content. | |
+| | *State 2026-10-11:* measured again on a busy machine and decided (section 7, "On a busy machine"): BBR is the law of focal's connections. Copa on hyper-rt reads a busy machine as a full queue and holds two datagrams a round trip. | |
 
 Each stage closes on the workspace gates and on CI for Linux, macOS and Windows.
 
@@ -681,6 +682,34 @@ what quinn does not let a law decide is the pacing, which stays quinn's. Where C
 the worse: on a path of 1 Mbit/s and 20 ms its exchanges take 134 ms at the 99th
 percentile where CUBIC's take 78, since it keeps about two datagrams queued, each 10 ms
 at that rate.
+
+**On a busy machine (2026-10-11).** The grids model the network's delay and none of the
+machine's. On hyper-rt a datagram that arrives while its shard is busy waits in the socket
+until the shard reads it, and a lone packet's acknowledgement is held for the peer's
+`max_ack_delay`. Copa's round-trip samples (`now − sent` for each packet acknowledged) count
+both, and Copa takes their excess over the least round trip for a queue. In the comparison's
+cluster (three nodes of two CPUs on a four-CPU runner, 100 writes a second) and in three
+processes on a loaded workstation, every connection's window sat at 2,904 bytes, two
+datagrams, at the 10th and 50th percentiles, and the pacing rate at 67 to 229 kB/s: what one
+over δ times 25 ms gives. A catch-up append of 90 kB took 30 round trips, frames reached
+followers hundreds of milliseconds to seconds late and out of order, the resequencer let the
+later ones go past their patience, the followers refused the appends and called elections. The
+same runner, the law the only change (focal only, 15 s warm-up and 60 s measured each rate):
+
+| Law | 100/s acknowledged, p99 | 200/s acknowledged, p99 | 1,000/s acknowledged, p99 |
+|---|---|---|---|
+| Copa | 86%, 2,473 ms | 51%, 1,349 ms | 12%, 649 ms |
+| CUBIC | 100%, 18.6 ms | 100%, 43.8 ms | 61%, 357 ms |
+| BBR | 100%, 5.1 ms | 100%, 25.4 ms | 43%, 699 ms |
+
+Under BBR and CUBIC every node keeps up at every rate to 1,000 a second: no peer unreachable,
+no replication frame dropped. BBR is chosen: of the three it is the one that neither fails the
+busy machine (Copa) nor stalls on the grids' lossy paths (CUBIC, on five), and its exchanges at
+the rates the cluster keeps are the shortest. What it gives up is the queue it keeps on a long
+path (p99 2.14 of the best on the grids, where Copa's was 1.08); Copa's measurement is to be
+mended where it is made (hyper-quic: the peer's acknowledgement delay out of the sample, and a
+datagram's time in the socket measured by the kernel) and Copa measured again against BBR on
+both, the busy machine and the grids.
 
 **Two things the law does otherwise than it was taken**, both found on paths that
 hold megabytes in flight, where the law as taken carried 69% of 10 Mbit/s at 300 ms
