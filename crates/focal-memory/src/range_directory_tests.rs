@@ -642,6 +642,14 @@ fn a_search_by_cached_prefix_finds_exactly_what_the_whole_key_order_holds() {
     assert!(store.root.pages.check_shape());
     let held: std::collections::BTreeSet<u32> = keys.iter().copied().collect();
     for k in 0..12_002u32 {
+        // One descent by key finds the page the rank names, ties included.
+        let pages = &store.root.pages;
+        let by_rank = pages.get(pages.page_index(&Coarse(k)));
+        let by_key = pages.page_of(&Coarse(k));
+        assert!(
+            matches!((by_rank, by_key), (Some(a), Some(b)) if Arc::ptr_eq(a, b)),
+            "key {k}"
+        );
         let found = store.get(&Coarse(k)).copied();
         if held.contains(&k) {
             assert_eq!(found, Some(u64::from(k)), "key {k}");

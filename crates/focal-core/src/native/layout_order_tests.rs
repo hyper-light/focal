@@ -166,6 +166,36 @@ fn the_order_is_total_agrees_with_equality_and_ends_at_the_sentinel() {
     }
 }
 
+/// Past an equal order prefix, the order is the whole order's: on every pair of the corpus whose
+/// affinities are equal (an object's rows, the control rows, an index's bucket),
+/// `cmp_past_prefix` is `cmp`, and the prefix agrees with the order everywhere.
+#[test]
+fn the_order_past_an_equal_prefix_is_the_whole_order() {
+    use focal_memory::RangeKey;
+    let keys = corpus();
+    let mut tied = 0usize;
+    for a in &keys {
+        for b in &keys {
+            if a.order_prefix() == b.order_prefix() {
+                tied += 1;
+                assert_eq!(a.cmp_past_prefix(b), a.cmp(b), "{a:?} vs {b:?}");
+            } else {
+                assert_eq!(
+                    a.order_prefix().cmp(&b.order_prefix()),
+                    a.cmp(b),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+    // Not vacuous: the corpus holds many keys of one affinity.
+    assert!(
+        tied > keys.len() * 4,
+        "{tied} tied pairs of {} keys",
+        keys.len()
+    );
+}
+
 /// The comparison that stops at the first deciding field is the full order key's, on every pair of the corpus.
 #[test]
 fn the_early_comparison_is_the_order_keys() {

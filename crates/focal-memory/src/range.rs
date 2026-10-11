@@ -245,9 +245,18 @@ pub(crate) struct Root<K, V> {
 
 impl<K: crate::RangeKey, V> Root<K, V> {
     pub fn get(&self, key: &K) -> Option<&Entry<K, V>> {
-        let page = self.pages.get(self.page_index(key))?;
+        let page = self.pages.page_of(key)?;
+        // The sought key's prefix once; an entry's against it, and past it
+        // only where they tie.
+        let probe = key.order_prefix();
         page.entries
-            .binary_search_by(|entry| entry.key.cmp(key))
+            .binary_search_by(|entry| {
+                entry
+                    .key
+                    .order_prefix()
+                    .cmp(&probe)
+                    .then_with(|| entry.key.cmp_past_prefix(key))
+            })
             .ok()
             .and_then(|index| page.entries.get(index))
     }

@@ -11,6 +11,15 @@ pub trait RangeKey: Ord {
     fn order_prefix(&self) -> u128 {
         0
     }
+    /// The order of this key and `other`, whose prefixes are equal: what is
+    /// left of the order past the prefix. A key whose prefix is a field of its
+    /// order compares the rest here without reading that field again (a search
+    /// compares whole keys only where prefixes tie, and there they tie by
+    /// construction). It must agree with `cmp` wherever the prefixes are equal;
+    /// the default is `cmp` itself.
+    fn cmp_past_prefix(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp(other)
+    }
 }
 
 macro_rules! whole {

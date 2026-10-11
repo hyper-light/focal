@@ -384,6 +384,16 @@ impl focal_memory::RangeKey for Key {
     fn order_prefix(&self) -> u128 {
         u128::from_be_bytes(affinity(self))
     }
+    /// Past an equal affinity, the order is the family's and then the fields':
+    /// neither key's affinity is read again (a claim's rows all share its
+    /// affinity, so its lookups tie on the prefix, and each tie read both
+    /// affinities again: a quarter of the owner's CPU went to the directory's
+    /// search, a 2026-10-11 profile of the comparison's leader).
+    fn cmp_past_prefix(&self, other: &Self) -> std::cmp::Ordering {
+        family(self)
+            .cmp(&family(other))
+            .then_with(|| same_family(self, other))
+    }
 }
 impl PartialOrd for Key {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {

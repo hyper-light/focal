@@ -312,7 +312,51 @@ impl<K, V> PageDirectory<K, V> {
     }
 }
 
+/// Whether a span beginning with prefix `first` and key `start` begins at or
+/// before the sought `key`, whose prefix is `probe`: the prefixes decide where
+/// they differ, and where they tie the keys do, compared past the prefix
+/// (`RangeKey::cmp_past_prefix`).
+fn at_or_before<K: crate::RangeKey>(first: u128, start: Option<&K>, probe: u128, key: &K) -> bool {
+    first < probe
+        || (first == probe && start.is_some_and(|start| start.cmp_past_prefix(key).is_le()))
+}
+
 impl<K: crate::RangeKey, V> PageDirectory<K, V> {
+    /// The page whose span holds `key`, found by one descent: what a lookup
+    /// reads. `page_index` gives the page's rank, which costs a sum of the
+    /// pages left of the path at every level, and `get` finds a page by rank by
+    /// walking down again: a lookup by key did both (a 2026-10-11 profile of
+    /// the comparison's leader: a quarter of the owner's CPU in the search).
+    pub(super) fn page_of(&self, key: &K) -> Option<&Arc<Page<K, V>>> {
+        let mut node = self.root.node()?;
+        let probe = key.order_prefix();
+        loop {
+            match &node.links {
+                Links::Leaves(pages) => {
+                    let local = pages
+                        .partition_point(|page| {
+                            at_or_before(
+                                page.first,
+                                page.entries.first().map(|entry| &entry.key),
+                                probe,
+                                key,
+                            )
+                        })
+                        .saturating_sub(1);
+                    return pages.get(local);
+                }
+                Links::Branches(children) => {
+                    let local = children
+                        .partition_point(|child| {
+                            at_or_before(child.first, child.first_key(), probe, key)
+                        })
+                        .saturating_sub(1);
+                    node = children.get(local)?.as_ref();
+                }
+            }
+        }
+    }
+
     /// The page whose span holds `key`. The prefixes cached beside pages and
     /// nodes decide every comparison where they differ; where they tie, the
     /// keys do. The sought key's prefix is computed once.
@@ -327,9 +371,12 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                 Links::Leaves(pages) => {
                     let local = pages
                         .partition_point(|page| {
-                            page.first < probe
-                                || (page.first == probe
-                                    && page.entries.first().is_some_and(|entry| &entry.key <= key))
+                            at_or_before(
+                                page.first,
+                                page.entries.first().map(|entry| &entry.key),
+                                probe,
+                                key,
+                            )
                         })
                         .saturating_sub(1);
                     return rank.saturating_add(local);
@@ -337,9 +384,7 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
                 Links::Branches(children) => {
                     let local = children
                         .partition_point(|child| {
-                            child.first < probe
-                                || (child.first == probe
-                                    && child.first_key().is_some_and(|first| first <= key))
+                            at_or_before(child.first, child.first_key(), probe, key)
                         })
                         .saturating_sub(1);
                     for child in children.iter().take(local) {
