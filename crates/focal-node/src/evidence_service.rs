@@ -92,6 +92,8 @@ impl EvidencePlacement {
         if plan.voters.len() > 1024 || plan.content_copies.len() > 1024 {
             return Err(AccessError::Capacity);
         }
+        // The regions of this placement's members alone: every transfer the
+        // fence judges is to or from one of them.
         let fence = crate::placement_executor::ResidencyFence::new(
             placement
                 .residency
@@ -100,6 +102,9 @@ impl EvidencePlacement {
                 .collect(),
             nodes
                 .iter()
+                .filter(|node| {
+                    plan.voters.contains(&node.id) || plan.content_copies.contains(&node.id)
+                })
                 .map(|node| (node.id, crate::topology::ids(&node.topology).0))
                 .collect(),
         )

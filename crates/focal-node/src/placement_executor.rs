@@ -15,7 +15,10 @@ pub enum ExecutorError {
     #[error("executor bounds exceeded")]
     Capacity,
 }
-/// A session's residency and the region every known node reported.
+/// A session's residency and the region each of its placement's members
+/// reported: every transfer the fence judges is to or from a member (a copy
+/// or a voter), so the regions of the cluster's other nodes are not its to
+/// hold. It held every node's, a copy of the node table per hosted session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResidencyFence {
     residency: BTreeSet<RegionId>,
@@ -30,6 +33,22 @@ impl ResidencyFence {
             return Err(ExecutorError::Capacity);
         }
         Ok(Self { residency, regions })
+    }
+    /// The fence of a placement of `members`, each with the region `regions`
+    /// names for it (a member that reported none is of unknown region, outside
+    /// every boundary).
+    pub fn for_members<'a>(
+        residency: BTreeSet<RegionId>,
+        members: impl IntoIterator<Item = &'a u64>,
+        regions: &BTreeMap<u64, RegionId>,
+    ) -> Result<Self, ExecutorError> {
+        let mut known = BTreeMap::new();
+        for member in members {
+            if let Some(region) = regions.get(member) {
+                known.insert(*member, *region);
+            }
+        }
+        Self::new(residency, known)
     }
     /// No boundary: every node may hold a copy.
     pub fn open() -> Self {
@@ -61,12 +80,15 @@ impl ResidencyFence {
             })
         }
     }
-    /// The bytes this fence holds, for the placement's charge.
+    /// The bytes this fence holds, for the placement's charge: its two maps'
+    /// nodes (`focal_memory::map_bytes`).
     pub fn bytes(&self) -> Result<usize, ExecutorError> {
-        self.residency
-            .len()
-            .checked_mul(32)
-            .and_then(|n| n.checked_add(self.regions.len().checked_mul(32)?))
+        focal_memory::map_bytes::<RegionId, ()>(self.residency.len())
+            .and_then(|n| {
+                n.checked_add(focal_memory::map_bytes::<u64, RegionId>(
+                    self.regions.len(),
+                )?)
+            })
             .ok_or(ExecutorError::Capacity)
     }
 }
@@ -98,5 +120,22 @@ mod tests {
         assert!(open.admits(2) && open.admits(3));
         assert!(ResidencyFence::open().admits(9));
         assert!(fence.bytes().unwrap() > 0);
+    }
+    #[test]
+    fn a_placements_fence_holds_its_members_regions_alone() {
+        let a = RegionId([1; 16]);
+        let regions: BTreeMap<u64, RegionId> = (1..=1000).map(|node| (node, a)).collect();
+        let fence =
+            ResidencyFence::for_members(BTreeSet::from([a]), [3, 7, 9, 2000].iter(), &regions)
+                .unwrap();
+        assert!(fence.admits(3) && fence.admits(7) && fence.admits(9));
+        // A member that reported no region is outside the boundary.
+        assert!(!fence.admits(2000));
+        // Three regions held, whatever the cluster's size.
+        assert_eq!(
+            fence.bytes().unwrap(),
+            focal_memory::map_bytes::<RegionId, ()>(1).unwrap()
+                + focal_memory::map_bytes::<u64, RegionId>(3).unwrap()
+        );
     }
 }

@@ -1778,9 +1778,12 @@ impl PlacementAgent {
         copies: BTreeSet<u64>,
         residency: BTreeSet<focal_directory::RegionId>,
     ) -> Result<(), AgentError> {
-        let fence =
-            crate::placement_executor::ResidencyFence::new(residency, self.node_regions.clone())
-                .map_err(|_| AgentError::Capacity)?;
+        let fence = crate::placement_executor::ResidencyFence::for_members(
+            residency,
+            voters.union(&copies),
+            &self.node_regions,
+        )
+        .map_err(|_| AgentError::Capacity)?;
         let previous = self.custody.get(&scope.ledger).copied();
         if previous == Some(scope) && self.fences.get(&scope.ledger) == Some(&fence) {
             return Ok(());
