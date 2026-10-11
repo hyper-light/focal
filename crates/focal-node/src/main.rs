@@ -11,6 +11,12 @@
     )
 )]
 mod cli;
+
+/// The musl lanes' allocator: musl's own (mallocng) takes one lock for every
+/// thread's allocations and gives freed pages back to the system at once.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::{FromArgMatches, Parser, Subcommand};
 use cli::cluster::ClusterCommand;
 use focal_model::*;

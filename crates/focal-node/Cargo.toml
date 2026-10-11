@@ -65,3 +65,7 @@ focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-supp
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs", "x509-parser"] }
+
+# The musl lanes' allocator (an experiment: diag, not for merge).
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1.52"
