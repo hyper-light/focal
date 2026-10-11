@@ -1771,7 +1771,10 @@ impl PlacementAgent {
             .map_err(|failure| AgentError::Fleet(failure.error))?;
         self.install_custody(handles, scope, voters, copies, residency)
             .await?;
-        Ok(installed.value().host().clone())
+        handles
+            .fleet
+            .host_of(installed.value())
+            .map_err(AgentError::Fleet)
     }
     /// Install one custody scope for a hosted ledger, replacing the previous.
     async fn install_custody(

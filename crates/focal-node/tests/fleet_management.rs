@@ -29,6 +29,28 @@ fn ledger(index: u128) -> LedgerId {
         session: SessionId::from_u128(index),
     }
 }
+/// What an install answered and the host it named, taken while that
+/// incarnation was the one installed: a handle these tests keep past the
+/// session's removal or replacement, to find it fenced.
+#[derive(Clone)]
+struct Installed {
+    installed: FleetInstalled,
+    host: ReplicaHost,
+}
+impl Installed {
+    fn of(manager: &FleetManager, installed: &FleetInstalled) -> Self {
+        Self {
+            installed: *installed,
+            host: manager.host_of(installed).unwrap(),
+        }
+    }
+    fn host(&self) -> &ReplicaHost {
+        &self.host
+    }
+    fn incarnation(&self) -> FleetIncarnation {
+        self.installed.incarnation
+    }
+}
 struct Fixture {
     manager: FleetManager,
     owner: ReplicaOwner,
@@ -138,7 +160,7 @@ fn live_install_remove_reopen_fences_stale_handles_and_preserves_exact_durable_r
             .install(1, candidate(&fleet.wal, &fleet.tenant, 1))
             .await
             .unwrap();
-        let original = installed.value().clone();
+        let original = Installed::of(&fleet.manager, installed.value());
         drop(installed);
         let first = epoch(original.host(), 1).await;
         assert!(
@@ -160,7 +182,7 @@ fn live_install_remove_reopen_fences_stale_handles_and_preserves_exact_durable_r
             .install(2, candidate(&fleet.wal, &fleet.tenant, 2))
             .await
             .unwrap();
-        let second_owned = second.value().clone();
+        let second_owned = Installed::of(&fleet.manager, second.value());
         drop(second);
         let second = second_owned;
         let response = epoch(second.host(), 2).await;
@@ -192,7 +214,7 @@ fn live_install_remove_reopen_fences_stale_handles_and_preserves_exact_durable_r
             .install(4, candidate(&fleet.wal, &fleet.tenant, 1))
             .await
             .unwrap();
-        let replacement_owned = replacement.value().clone();
+        let replacement_owned = Installed::of(&fleet.manager, replacement.value());
         drop(replacement);
         let replacement = replacement_owned;
         assert_ne!(replacement.incarnation(), original.incarnation());
@@ -238,7 +260,10 @@ fn cancelled_install_is_inspectable_and_only_latest_sequence_is_retryable() {
         .await;
         drop(install);
         let inspection = fleet.manager.inspect(ledger(1)).await.unwrap();
-        let host = inspection.value().as_ref().unwrap().host().clone();
+        let host = fleet
+            .manager
+            .host_of(inspection.value().as_ref().unwrap())
+            .unwrap();
         let incarnation = inspection.value().as_ref().unwrap().incarnation();
         drop(inspection);
         let retry = fleet.manager.retry_install(1).await.unwrap();
@@ -289,7 +314,7 @@ fn candidate_validation_and_retained_reply_capacity_bound_admission() {
             ),
             "delivered response retains bounded management slot"
         );
-        let original = delivered.value().clone();
+        let original = Installed::of(&fleet.manager, delivered.value());
         drop(delivered);
         let extra = fleet
             .manager
@@ -404,7 +429,7 @@ fn committed_placement_witness_waits_for_apply_and_route_changes_close_stale_inc
                 .install(1, candidate(&fleet.wal, &fleet.tenant, 1))
                 .await
                 .unwrap();
-            installed.value().clone()
+            Installed::of(&fleet.manager, installed.value())
         };
         let first = epoch(original.host(), 1).await;
         assert!(
@@ -496,7 +521,7 @@ fn committed_placement_witness_waits_for_apply_and_route_changes_close_stale_inc
         candidate.config.route_epoch = RouteEpoch(2);
         let replacement = {
             let installed = fleet.manager.install(3, candidate).await.unwrap();
-            installed.value().clone()
+            Installed::of(&fleet.manager, installed.value())
         };
         let replay = dispatch(
             replacement.host(),
@@ -576,7 +601,7 @@ fn removing_final_session_on_stalled_writer_does_not_block_live_installation() {
         .unwrap();
         let installed = {
             let reply = manager.install(1, first).await.unwrap();
-            reply.value().clone()
+            Installed::of(&manager, reply.value())
         };
         let committed = epoch(installed.host(), 1).await;
         assert!(matches!(
@@ -609,7 +634,7 @@ fn removing_final_session_on_stalled_writer_does_not_block_live_installation() {
         .await;
         let live = match &replacement {
             Ok(Ok(reply)) => {
-                let host = reply.value().host();
+                let host = &manager.host_of(reply.value()).unwrap();
                 Some(owners::within(&[host], Duration::from_secs(2), TICK, epoch(host, 2)).await)
             }
             _ => None,
@@ -650,7 +675,7 @@ fn stop_all_quiesces_concurrent_installation_and_stops_every_live_incarnation() 
                 .install(1, candidate(&fleet.wal, &fleet.tenant, 1))
                 .await
                 .unwrap();
-            reply.value().clone()
+            Installed::of(&fleet.manager, reply.value())
         };
         let second = {
             let reply = fleet
@@ -658,7 +683,7 @@ fn stop_all_quiesces_concurrent_installation_and_stops_every_live_incarnation() 
                 .install(2, candidate(&fleet.wal, &fleet.tenant, 2))
                 .await
                 .unwrap();
-            reply.value().clone()
+            Installed::of(&fleet.manager, reply.value())
         };
         let later = candidate(&fleet.wal, &fleet.tenant, 3);
         let mut stopping = Box::pin(fleet.manager.stop_all());

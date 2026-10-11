@@ -440,13 +440,11 @@ impl Fleet {
                     },
                 )
                 .unwrap();
-                let host = manager
+                let installed = manager
                     .install(1, FleetReplica { session, config })
                     .await
-                    .unwrap()
-                    .value()
-                    .host()
-                    .clone();
+                    .unwrap();
+                let host = manager.host_of(installed.value()).unwrap();
                 (
                     host,
                     owner,

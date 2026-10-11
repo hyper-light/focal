@@ -100,6 +100,37 @@ impl FleetInstallation {
     pub fn host(&self) -> &ReplicaHost {
         &self.host
     }
+    /// What a reply tells of this installation (`FleetInstalled`).
+    fn installed(&self) -> FleetInstalled {
+        FleetInstalled {
+            ledger: self.ledger,
+            group: self.group,
+            incarnation: self.incarnation,
+        }
+    }
+}
+/// What an install, a retry or an inspection answers: which incarnation of
+/// which session's group is installed. A reply carries no handle on the
+/// replica's owner: that handle holds the owner's input queue, and a reply
+/// waits in that queue's own messages, so a reply that held it held a way
+/// back to the queue it came by (a drop cycle the recursion check refuses,
+/// CLAUDE.md §1a). The host is taken from the fleet (`host_of`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FleetInstalled {
+    pub ledger: LedgerId,
+    pub group: [u8; 16],
+    pub incarnation: FleetIncarnation,
+}
+impl FleetInstalled {
+    pub fn ledger(&self) -> LedgerId {
+        self.ledger
+    }
+    pub fn group(&self) -> [u8; 16] {
+        self.group
+    }
+    pub fn incarnation(&self) -> FleetIncarnation {
+        self.incarnation
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FleetRemoval {
@@ -126,17 +157,17 @@ pub(in crate::fleet) enum ManagementWork {
     Install {
         sequence: u64,
         replica: Box<FleetReplica>,
-        reply: Reply<FleetInstallation>,
+        reply: Reply<FleetInstalled>,
         permit: ManagementPermit,
     },
     Retry {
         sequence: u64,
-        reply: Reply<FleetInstallation>,
+        reply: Reply<FleetInstalled>,
         permit: ManagementPermit,
     },
     Inspect {
         ledger: LedgerId,
-        reply: Reply<Option<FleetInstallation>>,
+        reply: Reply<Option<FleetInstalled>>,
         permit: ManagementPermit,
     },
     Remove {
@@ -218,6 +249,20 @@ impl FleetManager {
     /// no owner round trip or mutable session access is involved.
     pub fn current_host(&self, ledger: LedgerId) -> Result<ReplicaHost, FleetError> {
         self.replica_target(ledger).map(|(_, host)| host)
+    }
+    /// The host of what an install, a retry or an inspection answered, while
+    /// that incarnation is the one installed: a later install or a removal of
+    /// the session since is `Unavailable` for it.
+    pub fn host_of(&self, installed: &FleetInstalled) -> Result<ReplicaHost, FleetError> {
+        let state = self.state.borrow();
+        let entry = state
+            .entries
+            .get(&installed.ledger)
+            .ok_or(FleetError::Unavailable)?;
+        if entry.incarnation != installed.incarnation || entry.group != installed.group {
+            return Err(FleetError::Unavailable);
+        }
+        Ok(entry.host.clone())
     }
     pub(crate) fn replica_target(
         &self,
@@ -370,7 +415,7 @@ impl FleetManager {
         &self,
         sequence: u64,
         replica: FleetReplica,
-    ) -> Result<FleetReply<FleetInstallation>, FleetInstallFailure> {
+    ) -> Result<FleetReply<FleetInstalled>, FleetInstallFailure> {
         let permit = match self.validate(&replica).and_then(|()| self.permit()) {
             Ok(permit) => permit,
             Err(error) => {
@@ -454,7 +499,7 @@ impl FleetManager {
     pub async fn retry_install(
         &self,
         sequence: u64,
-    ) -> Result<FleetReply<FleetInstallation>, FleetError> {
+    ) -> Result<FleetReply<FleetInstalled>, FleetError> {
         let permit = self.permit()?;
         let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Retry {
@@ -467,7 +512,7 @@ impl FleetManager {
     pub async fn inspect(
         &self,
         ledger: LedgerId,
-    ) -> Result<FleetReply<Option<FleetInstallation>>, FleetError> {
+    ) -> Result<FleetReply<Option<FleetInstalled>>, FleetError> {
         let permit = self.permit()?;
         let (reply, response) = hyper_rt::sync::oneshot().map_err(|_| FleetError::Capacity)?;
         self.send(ManagementWork::Inspect {
@@ -842,7 +887,7 @@ impl ManagementOwner {
             } => {
                 let result = self.install(group, sequence, *replica);
                 let _ = reply.send(result.map(|value| FleetReply {
-                    value,
+                    value: value.installed(),
                     _permit: permit,
                 }));
             }
@@ -852,7 +897,7 @@ impl ManagementOwner {
                 permit,
             } => {
                 let _ = reply.send(self.retry(sequence).map(|value| FleetReply {
-                    value,
+                    value: value.installed(),
                     _permit: permit,
                 }));
             }
@@ -862,7 +907,12 @@ impl ManagementOwner {
                 permit,
             } => {
                 let _ = reply.send(Ok(FleetReply {
-                    value: self.state.borrow().entries.get(&ledger).cloned(),
+                    value: self
+                        .state
+                        .borrow()
+                        .entries
+                        .get(&ledger)
+                        .map(FleetInstallation::installed),
                     _permit: permit,
                 }));
             }

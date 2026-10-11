@@ -1118,7 +1118,7 @@ impl NetworkService {
                 )
                 .await
                 .map_err(|failure| failure.error)?;
-            Some(installed.value().host().clone())
+            Some(fleet.host_of(installed.value())?)
         } else {
             None
         };

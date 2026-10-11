@@ -47,8 +47,9 @@ mod placement_owner;
 mod range_owner;
 use evidence_owner::{EvidenceCall, PendingEvidenceCall};
 pub use grouped::management::{
-    FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
-    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, MAX_SESSIONS, ManagedFleetConfig,
+    FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetInstalled,
+    FleetManager, FleetRemoval, FleetReply, FleetStatus, FleetStopReport, MAX_SESSIONS,
+    ManagedFleetConfig,
 };
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
 pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};

@@ -19,6 +19,29 @@ use focal_node::{
 };
 use focal_wire::*;
 use std::time::Duration;
+/// What an install answered and the host it named, taken while that
+/// incarnation was the one installed: a handle this test keeps past the
+/// session's replacement, to find it fenced.
+#[derive(Clone)]
+struct Installed {
+    installed: FleetInstalled,
+    host: ReplicaHost,
+}
+impl Installed {
+    fn of(manager: &FleetManager, installed: &FleetInstalled) -> Self {
+        Self {
+            installed: *installed,
+            host: manager.host_of(installed).unwrap(),
+        }
+    }
+    fn host(&self) -> &ReplicaHost {
+        &self.host
+    }
+    fn incarnation(&self) -> FleetIncarnation {
+        self.installed.incarnation
+    }
+}
+
 const CLUSTER: [u8; 16] = [154; 16];
 fn ledger(id: u128) -> LedgerId {
     LedgerId {
@@ -148,7 +171,7 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
             .install(1, candidate(&wal, &tenants[0], 1))
             .await
             .unwrap();
-        let original = installed.value().clone();
+        let original = Installed::of(&manager, installed.value());
         // Holding the only management slot would block an inspect round trip. Data
         // uses the same registry through a short borrowed lookup and still commits.
         assert!(matches!(
@@ -182,7 +205,7 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
                 .install(2, candidate(&wal, &tenants[1], 2))
                 .await
                 .unwrap();
-            reply.value().clone()
+            Installed::of(&manager, reply.value())
         };
         let second_response =
             dispatch(&service, actor(2), request(2), &ReplicaHost::wire_limits()).await;
@@ -216,7 +239,7 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
                 .install(4, candidate(&wal, &tenants[0], 1))
                 .await
                 .unwrap();
-            reply.value().clone()
+            Installed::of(&manager, reply.value())
         };
         assert_ne!(original.incarnation(), replacement.incarnation());
         assert!(matches!(
