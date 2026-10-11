@@ -3171,3 +3171,85 @@ fn membership_request(
         change,
     }
 }
+
+/// Native writes admitted while their host defers proposals (a batch it
+/// takes) are encoded and not proposed; when the batch ends they are proposed
+/// as one, and each follower is sent one append of them all, where each
+/// proposed as it came sent each follower an append, drew an answer and a
+/// commit's broadcast of its own. Every write commits on every replica.
+#[test]
+fn writes_admitted_while_deferred_reach_each_follower_as_one_append() {
+    let mut cluster = Cluster::new(3, &[true, true, true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    cluster.settle(&[]);
+    cluster.node(1).set_native_proposals_deferred(true);
+    let mut written = Vec::new();
+    for claim in 1..=5u128 {
+        let input = creation(cluster.next(PARTIES.issuer), claim);
+        let key = input.request;
+        cluster.clock += 1;
+        let clock = cluster.clock;
+        let store = &mut cluster.stores[0];
+        let submission = cluster.nodes[0]
+            .as_mut()
+            .unwrap()
+            .propose_native(
+                context(PARTIES.issuer, clock),
+                input,
+                NativeCustody::Store(store),
+            )
+            .unwrap();
+        let NativeSubmission::Pending { outcome, .. } = submission else {
+            panic!("a fresh write committed at once: {submission:?}")
+        };
+        written.push((key, outcome));
+    }
+    // Deferred: nothing of them is sent.
+    let sent = |cluster: &mut Cluster| {
+        let mut sent = Vec::new();
+        for _ in 0..8 {
+            match cluster.node(1).poll() {
+                Ok(events) => sent.extend(events.messages),
+                Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => {}
+                Err(error) => panic!("poll: {error:?}"),
+            }
+        }
+        sent
+    };
+    let before = sent(&mut cluster);
+    assert!(
+        before
+            .iter()
+            .all(|message| message.msg_type != MessageType::MsgAppend || message.entries.is_empty()),
+        "{before:?}"
+    );
+    for message in before {
+        let to = message.to;
+        cluster.node(to).step(message).unwrap();
+    }
+    // The batch ends: one proposal of all five, one append to each follower.
+    cluster.node(1).flush_deferred_native_proposals().unwrap();
+    let after = sent(&mut cluster);
+    let mut appends: Vec<(u64, usize)> = after
+        .iter()
+        .filter(|message| message.msg_type == MessageType::MsgAppend && !message.entries.is_empty())
+        .map(|message| (message.to, message.entries.len()))
+        .collect();
+    appends.sort_unstable();
+    assert_eq!(appends, vec![(2, 5), (3, 5)]);
+    for message in after {
+        let to = message.to;
+        cluster.node(to).step(message).unwrap();
+    }
+    cluster.settle(&[]);
+    for id in 1..=3 {
+        for (key, outcome) in &written {
+            assert_eq!(
+                cluster.node(id).native_outcome(*key).unwrap(),
+                Some(*outcome),
+                "replica {id}"
+            );
+        }
+    }
+}

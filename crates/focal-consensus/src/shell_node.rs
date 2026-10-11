@@ -479,6 +479,24 @@ impl ShellNode {
         let proposed = self.replica.propose(Vec::new(), owned);
         self.heard(proposed)
     }
+    /// As [`Self::propose_borrowed_in`], every entry of `entries` in one
+    /// proposal (`core_state::proposal`), refused whole.
+    pub fn propose_batch_borrowed_in<'a>(
+        &mut self,
+        entries: impl Iterator<Item = &'a [u8]> + Clone,
+        lane: BudgetLane,
+    ) -> Result<(), ConsensusError> {
+        self.check_participating()?;
+        core_state::check_leader(self.replica.core())?;
+        let (count, _) = core_state::check_batch(&self.config, entries.clone())?;
+        if count == 0 {
+            return Ok(());
+        }
+        let message = core_state::proposal(self.config.node_id, entries, count)?;
+        self.replica.budget_mut().lane = lane;
+        let proposed = self.replica.step(message);
+        self.heard(proposed)
+    }
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {
         self.check_participating()?;
         core_state::check_message(&self.config, &message)?;

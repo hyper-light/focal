@@ -367,6 +367,9 @@ impl ReplicaFleet {
             )?;
             owner.nonblocking = true;
             owner.batching = true;
+            // Its native proposals wait for its drains, as its drains wait
+            // for its batches (`Owner::drain_with_runtime`).
+            owner.session.set_native_proposals_deferred(true);
             owner.session.notify_persisted(Some(wake.persisted(ledger)));
             owner.incarnation = incarnation;
             owner.next_tick = now;
