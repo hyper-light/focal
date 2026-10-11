@@ -189,13 +189,22 @@ struct Outcome {
     unknown: u64,
     hits: u64,
     created: Vec<u128>,
-    refusals: Vec<String>,
+    refusals: Vec<(String, u64)>,
 }
 
-fn note(refusals: &mut Vec<String>, reason: String) {
+/// Counts one refusal of `reason`: a reason already seen counts once more,
+/// and a new one is kept while fewer than `MAX_REFUSALS` are (each count is
+/// what decides a fix: a refusal at the session's door costs the network a
+/// round, one after the owner prepared costs the owner too).
+fn note(refusals: &mut Vec<(String, u64)>, reason: String) {
+    note_count(refusals, reason, 1);
+}
+fn note_count(refusals: &mut Vec<(String, u64)>, reason: String, count: u64) {
     let reason: String = reason.chars().take(MAX_REASON_CHARS).collect();
-    if refusals.len() < MAX_REFUSALS && !refusals.contains(&reason) {
-        refusals.push(reason);
+    if let Some((_, seen)) = refusals.iter_mut().find(|(seen, _)| *seen == reason) {
+        *seen = seen.saturating_add(count);
+    } else if refusals.len() < MAX_REFUSALS {
+        refusals.push((reason, count));
     }
 }
 
@@ -989,8 +998,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     )?;
     let mut refusals = Vec::new();
     for outcome in &write_outcomes {
-        for reason in &outcome.refusals {
-            note(&mut refusals, reason.clone());
+        for (reason, count) in &outcome.refusals {
+            note_count(&mut refusals, reason.clone(), *count);
         }
     }
 
