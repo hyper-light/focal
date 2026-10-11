@@ -1029,50 +1029,81 @@ fn valid_id(v: &Value, max: usize) -> bool {
         _ => false,
     }
 }
+/// The memory `v` holds, every node of it counted: a walk over an explicit
+/// stack of the nodes still to visit (no recursion), in the order a
+/// depth-first walk visits them. Each node visited takes one of `left`, and a
+/// container's nodes are refused before they are stacked when `left` could not
+/// take them all, so the stack never holds more than `left` allows; a node
+/// deeper than `max_depth` is refused.
 fn value_cost(
     v: &Value,
     depth: usize,
     max_depth: usize,
     left: &mut usize,
 ) -> Result<usize, ProtocolError> {
-    *left = left.checked_sub(1).ok_or(ProtocolError::Capacity)?;
-    if depth > max_depth {
-        return Err(ProtocolError::Limits);
-    }
-    let next = depth.checked_add(1).ok_or(ProtocolError::Capacity)?;
-    let mut cost = 128usize;
-    match v {
-        Value::String(s) => {
-            cost = cost
-                .checked_add(s.capacity())
-                .ok_or(ProtocolError::Capacity)?
+    let mut cost = 0usize;
+    let mut pending: Vec<(&Value, usize)> = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| ProtocolError::Capacity)?;
+    pending.push((v, depth));
+    while let Some((value, depth)) = pending.pop() {
+        *left = left.checked_sub(1).ok_or(ProtocolError::Capacity)?;
+        if depth > max_depth {
+            return Err(ProtocolError::Limits);
         }
-        Value::Array(a) => {
-            cost = cost
-                .checked_add(
-                    a.capacity()
-                        .checked_mul(std::mem::size_of::<Value>())
-                        .ok_or(ProtocolError::Capacity)?,
-                )
-                .ok_or(ProtocolError::Capacity)?;
-            for item in a {
+        let next = depth.checked_add(1).ok_or(ProtocolError::Capacity)?;
+        cost = cost.checked_add(128).ok_or(ProtocolError::Capacity)?;
+        match value {
+            Value::String(s) => {
                 cost = cost
-                    .checked_add(value_cost(item, next, max_depth, left)?)
-                    .ok_or(ProtocolError::Capacity)?;
+                    .checked_add(s.capacity())
+                    .ok_or(ProtocolError::Capacity)?
             }
-        }
-        Value::Object(o) => {
-            for (key, item) in o {
+            Value::Array(a) => {
                 cost = cost
-                    .checked_add(key.capacity())
-                    .and_then(|n| n.checked_add(128))
+                    .checked_add(
+                        a.capacity()
+                            .checked_mul(std::mem::size_of::<Value>())
+                            .ok_or(ProtocolError::Capacity)?,
+                    )
                     .ok_or(ProtocolError::Capacity)?;
-                cost = cost
-                    .checked_add(value_cost(item, next, max_depth, left)?)
-                    .ok_or(ProtocolError::Capacity)?;
+                stack_children(&mut pending, a.iter().rev(), a.len(), next, *left)?;
             }
+            Value::Object(o) => {
+                for key in o.keys() {
+                    cost = cost
+                        .checked_add(key.capacity())
+                        .and_then(|n| n.checked_add(128))
+                        .ok_or(ProtocolError::Capacity)?;
+                }
+                stack_children(&mut pending, o.values().rev(), o.len(), next, *left)?;
+            }
+            _ => {}
         }
-        _ => {}
     }
     Ok(cost)
+}
+/// Stacks a container's `count` children at `depth`, last first so the first
+/// is visited first; refused when the stack would hold more nodes than `left`
+/// could still take.
+fn stack_children<'a>(
+    pending: &mut Vec<(&'a Value, usize)>,
+    children: impl Iterator<Item = &'a Value>,
+    count: usize,
+    depth: usize,
+    left: usize,
+) -> Result<(), ProtocolError> {
+    if pending
+        .len()
+        .checked_add(count)
+        .is_none_or(|held| held > left)
+    {
+        return Err(ProtocolError::Capacity);
+    }
+    pending
+        .try_reserve(count)
+        .map_err(|_| ProtocolError::Capacity)?;
+    pending.extend(children.map(|child| (child, depth)));
+    Ok(())
 }

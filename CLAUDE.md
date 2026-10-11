@@ -27,6 +27,33 @@ Production code returns and handles errors. It never aborts the thread it runs o
   `cfg_attr(test, allow(..))` block the other crates use, or an `allow` inside
   a `#[cfg(test)]` item.
 
+## 1a. No runtime recursion. Ever.
+
+No function calls itself at runtime, directly or through others. A stack is a
+bound nobody states, and a stack overflow aborts the process (rule 1). The ban
+covers:
+
+- recursive functions and mutual recursion;
+- an async function that awaits a boxed call of itself;
+- the recursive drop of a self-referential type.
+
+Walk trees, chains, nested encodings and retries with a loop over an explicit
+stack or queue whose bound is stated. Reaching the bound is a typed refusal
+(rule 2).
+
+- Compile-time recursion is not runtime recursion: macros, const evaluation,
+  trait resolution.
+- `bash scripts/check-production.sh` enforces it with
+  `scripts/check_recursion.py`, which proves itself on its fixtures first. It
+  makes two checks:
+  - It reads the LLVM IR of every library and binary target, unoptimised so
+    every call is explicit. It refuses any cycle in the call graph that passes
+    through the workspace's code, the vendored `hyper-*` crates included.
+  - It reads the source and refuses a function that calls itself by name,
+    including the boxed-future form the IR cannot see.
+- Recursion inside a third-party dependency is listed, not edited: record it
+  with the bound that holds it, or replace the dependency.
+
 ## 2. Nothing grows without a bound.
 
 Every collection, queue, cache, map, log, journal, retry loop and wait has a

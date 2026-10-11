@@ -1564,18 +1564,7 @@ fn atomic_install(path: &Path, bytes: &[u8]) -> Result<(), ContentError> {
 }
 
 fn durable_directory(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        durable_directory(parent)?;
-    }
-    fs::create_dir(path)?;
-    sync_directory(path)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        sync_directory(parent)?;
-    }
-    Ok(())
+    focal_platform::fs::create_dir_all_durable(path, |dir| fs::create_dir(dir))
 }
 fn sync_directory(path: &Path) -> std::io::Result<()> {
     focal_platform::sync_dir(path)

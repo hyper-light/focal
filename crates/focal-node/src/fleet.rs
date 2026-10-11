@@ -2543,32 +2543,7 @@ impl Owner {
                 let _ = response.send(self.registration_facts(charge));
             }
             Work::Request(request, response, charge) => {
-                let waiting = self.session.reads_waiting();
-                self.request(
-                    request.verified,
-                    response,
-                    charge,
-                    request.witness,
-                    request.native,
-                );
-                // A request that only asked a read is not drained for here:
-                // the owner's loop takes what else is queued first, and the
-                // round that leaves with its drain carries every read asked
-                // by then (27 §9). Reads queued together are confirmed by
-                // one round of heartbeats, and one asked alone leaves with
-                // the drain that follows at once. Nor is a proposal, in a
-                // batch: the batch's drain writes every proposal of it at
-                // once. A proposal drained for as it came started its write
-                // there, and a session with a write out is dispatched
-                // nothing, so each write carried one proposal — a group
-                // committing six entries a second held 28 requests queued
-                // behind it (six fleets at once, 2026-10-03). The batch owes
-                // its drain all the same (`Owner::drain_owed`).
-                if self.batching {
-                    self.drain_owed = true;
-                } else if self.session.reads_waiting() <= waiting || !self.session.reads_unasked() {
-                    self.drain()?;
-                }
+                self.accept_request(request, response, charge)?;
             }
             Work::Probe(request, response, charge) => {
                 let result = self.probe_receipt(&request).map(|known| ReceiptProbe {
@@ -2603,22 +2578,7 @@ impl Owner {
             }
             Work::ManagedSupport(call, charge) => self.accept_managed_support(*call, charge),
             Work::ActivateNative(call, response, charge) => {
-                let result = if self.session.legacy_populated() {
-                    wall_ms().and_then(|now| {
-                        self.session.propose_native_import(
-                            focal_ledger::NativeContentProfile::ProjectionOnly,
-                            None,
-                            now,
-                            call.chunk_bytes,
-                            call.max_manifest_bytes,
-                        )
-                    })
-                } else {
-                    self.session.propose_native_activation(call.profile)
-                };
-                drop(charge);
-                self.drain()?;
-                let _ = response.send(result);
+                self.accept_activation(&call, response, charge)?;
             }
             Work::Admit(members, near, response, charge) => {
                 self.admitted = members;
@@ -2780,6 +2740,86 @@ impl Owner {
             }
         }
         Ok(false)
+    }
+    /// Work the managed gate deferred, taken once the gate passed it
+    /// (`progress_managed`): only the kinds the gate defers, so taking one
+    /// never reaches the owner's progress, which is what takes the deferred
+    /// (no recursion). Any other kind is refused, as it was never deferred.
+    pub(super) fn accept_deferred(&mut self, work: Work) -> Result<(), LedgerError> {
+        match work {
+            Work::Request(request, response, charge) => {
+                self.accept_request(request, response, charge)
+            }
+            Work::ManagedSupport(call, charge) => {
+                self.accept_managed_support(*call, charge);
+                Ok(())
+            }
+            Work::ActivateNative(call, response, charge) => {
+                self.accept_activation(&call, response, charge)
+            }
+            other => {
+                managed_support_owner::reject_managed_work(other, LedgerError::Failed);
+                Ok(())
+            }
+        }
+    }
+    fn accept_request(
+        &mut self,
+        request: Box<AdmittedRequest>,
+        response: OneshotSender<OwnedResponse>,
+        charge: Allocation,
+    ) -> Result<(), LedgerError> {
+        let waiting = self.session.reads_waiting();
+        self.request(
+            request.verified,
+            response,
+            charge,
+            request.witness,
+            request.native,
+        );
+        // A request that only asked a read is not drained for here:
+        // the owner's loop takes what else is queued first, and the
+        // round that leaves with its drain carries every read asked
+        // by then (27 §9). Reads queued together are confirmed by
+        // one round of heartbeats, and one asked alone leaves with
+        // the drain that follows at once. Nor is a proposal, in a
+        // batch: the batch's drain writes every proposal of it at
+        // once. A proposal drained for as it came started its write
+        // there, and a session with a write out is dispatched
+        // nothing, so each write carried one proposal — a group
+        // committing six entries a second held 28 requests queued
+        // behind it (six fleets at once, 2026-10-03). The batch owes
+        // its drain all the same (`Owner::drain_owed`).
+        if self.batching {
+            self.drain_owed = true;
+        } else if self.session.reads_waiting() <= waiting || !self.session.reads_unasked() {
+            self.drain()?;
+        }
+        Ok(())
+    }
+    fn accept_activation(
+        &mut self,
+        call: &ActivateNativeCall,
+        response: OneshotSender<Result<(), LedgerError>>,
+        charge: Allocation,
+    ) -> Result<(), LedgerError> {
+        let result = if self.session.legacy_populated() {
+            wall_ms().and_then(|now| {
+                self.session.propose_native_import(
+                    focal_ledger::NativeContentProfile::ProjectionOnly,
+                    None,
+                    now,
+                    call.chunk_bytes,
+                    call.max_manifest_bytes,
+                )
+            })
+        } else {
+            self.session.propose_native_activation(call.profile)
+        };
+        drop(charge);
+        self.drain()?;
+        let _ = response.send(result);
+        Ok(())
     }
     fn begin_stop(
         &mut self,

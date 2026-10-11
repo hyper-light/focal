@@ -184,15 +184,20 @@ pub(crate) fn page(
         role,
         route,
     };
-    let archived = |object: NativeObject| match object {
-        NativeObject::Missing(reference) => NativeObject::Missing(reference),
-        object => NativeObject::Archived(Box::new(NativeArchivedObject {
-            bundle: query.bundle,
-            bytes: query.bytes,
-            root: header.root,
-            through: header.through,
-            object,
-        })),
+    // A bundle's core holds its family's rows, never another archive: an object read from it that
+    // is archived is a corrupt bundle, not one to nest.
+    let archived = |object: NativeObject| -> Result<NativeObject, AccessError> {
+        Ok(match object {
+            NativeObject::Missing(reference) => NativeObject::Missing(reference),
+            object => NativeObject::Archived(Box::new(NativeArchivedObject {
+                bundle: query.bundle,
+                bytes: query.bytes,
+                root: header.root,
+                through: header.through,
+                object: NativeBundledObject::try_from(object)
+                    .map_err(|_| AccessError::Unavailable)?,
+            })),
+        })
     };
     let first = native_reads::object(&reader, query.object)?;
     let mut objects = Vec::new();
@@ -207,7 +212,7 @@ pub(crate) fn page(
         }
         _ => None,
     };
-    objects.push(archived(first));
+    objects.push(archived(first)?);
     if let Some((claim, validation)) = expansion {
         let evaluations = native_reads::page(
             &reader,
@@ -233,7 +238,9 @@ pub(crate) fn page(
         objects
             .try_reserve(evaluations.objects.len())
             .map_err(|_| AccessError::Capacity)?;
-        objects.extend(evaluations.objects.into_iter().map(archived));
+        for object in evaluations.objects {
+            objects.push(archived(object)?);
+        }
         for key in keys {
             if objects.len() >= read.max_items as usize {
                 break;
@@ -253,7 +260,9 @@ pub(crate) fn page(
             objects
                 .try_reserve(results.objects.len())
                 .map_err(|_| AccessError::Capacity)?;
-            objects.extend(results.objects.into_iter().map(archived));
+            for object in results.objects {
+                objects.push(archived(object)?);
+            }
         }
         objects.truncate(read.max_items as usize);
     }

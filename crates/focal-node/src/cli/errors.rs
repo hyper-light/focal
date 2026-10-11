@@ -4,8 +4,12 @@ use serde::Serialize;
 use std::{error::Error, io::Write};
 
 pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
-    if let Some(error) = error.downcast_ref::<CliError>() {
-        return match error {
+    // A `CliError::Other` carries the error to classify: the chain of them the
+    // error owns is walked one level a turn of this loop, never by recursion,
+    // and ends where the error does.
+    let mut error = error;
+    while let Some(cli) = error.downcast_ref::<CliError>() {
+        return match cli {
             CliError::Input(_) => Failure::error("invalid_input", 2),
             CliError::Document(error) => failure::input(error),
             CliError::Client(error) => failure::client(error),
@@ -52,7 +56,10 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
                     Failure::error("operation_conflict", 5)
                 }
             },
-            CliError::Other(error) => classification(error.as_ref()),
+            CliError::Other(inner) => {
+                error = inner.as_ref();
+                continue;
+            }
             CliError::Io(error) => io(error),
         };
     }

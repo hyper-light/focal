@@ -387,7 +387,42 @@ impl MemoryBudget {
             bytes,
         }))
     }
+    /// Take `bytes` of `kind` on `lane` at this budget and each ancestor, up
+    /// the chain one level a turn (no recursion, and no longer than the tree is
+    /// deep): a funded level ends the walk by moving its ancestors' credit into
+    /// the charge's kind instead of charging them. A level that refuses gives
+    /// back what the levels below it took, from this one up, as
+    /// `release_tree` does.
     fn reserve_tree(
+        &self,
+        kind: BudgetKind,
+        lane: BudgetLane,
+        bytes: usize,
+    ) -> Result<(), MemoryError> {
+        let mut current = self;
+        let mut taken: usize = 0;
+        loop {
+            if let Err(error) = current.reserve_local(kind, lane, bytes) {
+                self.release_levels(kind, lane, bytes, taken);
+                return Err(error);
+            }
+            taken = taken.saturating_add(1);
+            let Some(parent) = &current.0.parent else {
+                return Ok(());
+            };
+            if current.0.backing.lane().is_some() {
+                // Local capacity is exclusively acquired before ancestor credit
+                // changes category. No ancestor total or lane admission occurs.
+                parent.reclassify_tree(BudgetKind::Reserved, kind, bytes);
+                return Ok(());
+            }
+            current = parent;
+        }
+    }
+    /// One level's share of [`Self::reserve_tree`]: its lane check, its
+    /// elastic credit, its counters and its kind, all given back if one
+    /// refuses.
+    fn reserve_local(
         &self,
         kind: BudgetKind,
         lane: BudgetLane,
@@ -427,17 +462,19 @@ impl MemoryBudget {
         }
         // A category can never exceed total, so this addition cannot overflow.
         self.0.kinds.get(kind).fetch_add(bytes, Ordering::AcqRel);
-        if let Some(parent) = &self.0.parent {
-            if self.0.backing.lane().is_some() {
-                // Local capacity is exclusively acquired before ancestor credit
-                // changes category. No ancestor total or lane admission occurs.
-                parent.reclassify_tree(BudgetKind::Reserved, kind, bytes);
-            } else if let Err(error) = parent.reserve_tree(kind, lane, bytes) {
-                self.release_local(kind, lane, bytes);
-                return Err(error);
-            }
-        }
         Ok(())
+    }
+    /// Gives back what the first `levels` levels from this one up took for a
+    /// reservation a level above them refused.
+    fn release_levels(&self, kind: BudgetKind, lane: BudgetLane, bytes: usize, levels: usize) {
+        let mut budget = Some(self);
+        for _ in 0..levels {
+            let Some(current) = budget else {
+                return;
+            };
+            current.release_local(kind, lane, bytes);
+            budget = current.0.parent.as_ref();
+        }
     }
     fn release_local(&self, kind: BudgetKind, lane: BudgetLane, bytes: usize) {
         self.0.kinds.get(kind).fetch_sub(bytes, Ordering::AcqRel);

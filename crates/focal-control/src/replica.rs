@@ -445,13 +445,13 @@ impl ControlReplica {
             ControlRead::RouteChanges { .. } => self.machine.route_log_charge(),
             ControlRead::AdminReceipt { .. } => 2048 * 16 + 4096,
             ControlRead::StateAndAuthority => {
-                return self
-                    .read_charge(&ControlRead::State)?
-                    .checked_add(self.read_charge(&ControlRead::Authority)?)
+                // Two reads in one, each charged as it is alone.
+                return read_charged(self.machine.export_estimate()?)?
+                    .checked_add(read_charged(self.machine.authority_estimate()?)?)
                     .ok_or(ControlError::Capacity);
             }
         };
-        charge(bytes.checked_add(4096).ok_or(ControlError::Capacity)?, 4)
+        read_charged(bytes)
     }
     /// Local committed data only. A host claiming a linearizable result must
     /// first complete a matching ReadIndex. Every export retains its read
@@ -1784,4 +1784,10 @@ fn parked_bytes(read: &ReadBarrier) -> Result<usize, ControlError> {
     size_of::<ReadBarrier>()
         .checked_add(read.context.capacity())
         .ok_or(ControlError::Capacity)
+}
+
+/// What a read of `bytes` is charged: the bytes and its envelope's 4 KiB, in
+/// the units `charge` reserves.
+fn read_charged(bytes: usize) -> Result<usize, ControlError> {
+    charge(bytes.checked_add(4096).ok_or(ControlError::Capacity)?, 4)
 }

@@ -47,7 +47,7 @@ jobs:
         env:
           TOOLCHAIN: ${{ needs.guard.outputs.toolchain }}
         run: |
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt --component clippy --component llvm-tools
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
       - run: python3 scripts/check-contracts.py

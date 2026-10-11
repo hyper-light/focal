@@ -502,29 +502,54 @@ pub trait Medium {
     fn exists(&self, path: &Path) -> io::Result<bool>;
     fn read(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>>;
 }
+/// Creates `path` and each of its missing ancestors with `make`, from the
+/// outermost down, each made durable in itself and in the parent that holds
+/// its name (doc 20 §3). The missing ancestors are found by walking up from
+/// `path`, a walk as long as the path has components, so the list they are
+/// kept in is bounded by the path itself; no call recurses.
+pub fn create_dir_all_durable(
+    path: &Path,
+    mut make: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = Some(path);
+    while let Some(dir) = at.filter(|dir| !dir.as_os_str().is_empty()) {
+        if dir.is_dir() {
+            break;
+        }
+        missing.push(dir);
+        at = dir.parent();
+    }
+    for dir in missing.into_iter().rev() {
+        make(dir)?;
+        crate::sync_dir(dir)?;
+        if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            crate::sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+/// [`create_dir_all_durable`] with each directory private to its owner where
+/// the platform has modes (0700), as a node's data directories are.
+pub fn create_dir_all_private(path: &Path) -> io::Result<()> {
+    create_dir_all_durable(path, |dir| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(dir)
+        }
+    })
+}
 /// The real filesystem.
 #[derive(Debug, Default)]
 pub struct FileMedium;
 impl Medium for FileMedium {
     fn create_dir(&mut self, path: &Path) -> io::Result<()> {
-        if path.is_dir() {
-            return Ok(());
-        }
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            self.create_dir(parent)?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new().mode(0o700).create(path)?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir(path)?;
-        crate::sync_dir(path)?;
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            crate::sync_dir(parent)?;
-        }
-        Ok(())
+        create_dir_all_private(path)
     }
     fn create(&mut self, path: &Path) -> io::Result<()> {
         std::fs::OpenOptions::new()

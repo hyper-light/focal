@@ -1,14 +1,36 @@
 use super::*;
+/// What one pass of [`ManagedRequests::maintenance`] came to.
+enum Pass {
+    /// The saved wire action, or none (boxed as the record holds it).
+    Done(Option<Box<RequestEnvelope>>),
+    /// A closed generation rotated: the record names the next one's
+    /// registration, which the next pass sends.
+    Rotated,
+}
 impl ManagedRequests {
     /// Return the exact saved wire action, with every private lock released.
     /// None means ownership is ready and no delivered prefix needs acknowledgment.
+    ///
+    /// A closed generation rotates once, and the record then names the next
+    /// generation's registration, so a second pass never rotates: two passes
+    /// at most, one after the other (no recursion), and a second rotation in
+    /// one call is a corrupt record.
     pub fn maintenance(
         &self,
         ids: &mut impl IdGenerator,
     ) -> Result<Option<RequestEnvelope>, ManagedRequestsError> {
+        match self.maintenance_pass(ids)? {
+            Pass::Done(request) => Ok(request.map(|request| *request)),
+            Pass::Rotated => match self.maintenance_pass(ids)? {
+                Pass::Done(request) => Ok(request.map(|request| *request)),
+                Pass::Rotated => Err(ManagedRequestsError::Corrupt),
+            },
+        }
+    }
+    fn maintenance_pass(&self, ids: &mut impl IdGenerator) -> Result<Pass, ManagedRequestsError> {
         let (directory, mut state) = self.load()?;
         if let Some(request) = &state.pending {
-            return Ok(Some(request.as_ref().clone()));
+            return Ok(Pass::Done(Some(request.clone())));
         }
         if let Phase::Initialize(initial) = &state.phase {
             ManagedOperationStore::finish_initialization(
@@ -73,7 +95,7 @@ impl ManagedRequests {
                     // below continues with its registration.
                     self.begin_rotation(&directory, &mut state, status.stream)?;
                     drop(directory);
-                    return self.maintenance(ids);
+                    return Ok(Pass::Rotated);
                 }
                 let control = if let Some(control) = store.pending_control()? {
                     Some(control)
@@ -104,7 +126,7 @@ impl ManagedRequests {
                     if pruned {
                         self.save(&directory, &state, true)?;
                     }
-                    return Ok(None);
+                    return Ok(Pass::Done(None));
                 };
                 self.control(&control)
             }
@@ -117,9 +139,10 @@ impl ManagedRequests {
                 return Err(ManagedRequestsError::Corrupt);
             }
         };
-        state.pending = Some(Box::new(request.clone()));
+        let request = Box::new(request);
+        state.pending = Some(request.clone());
         self.save(&directory, &state, true)?;
-        Ok(Some(request))
+        Ok(Pass::Done(Some(request)))
     }
     /// Client routing may change only the physical route epoch. Receipt scope,
     /// request ID, payload and principal remain bound to the saved action.

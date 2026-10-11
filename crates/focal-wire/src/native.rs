@@ -1295,8 +1295,22 @@ pub struct NativeLegacyRow {
     #[serde(with = "focal_memory::serde_bytes")]
     pub bytes: Vec<u8>,
 }
+/// An object a native read answers with: one of the core's, an archived one, or what stands in
+/// for one.
+pub type NativeObject = NativeObjectIn<Box<NativeArchivedObject>>;
+/// An object of a retired family's archive bundle: any object but an archived one, since a bundle
+/// holds its family's core rows and never another bundle's. The type nests one archive deep at
+/// most, so encoding, decoding, cloning and dropping an object never recurse through it.
+pub type NativeBundledObject = NativeObjectIn<NoArchive>;
+/// What a bundled object holds where an object holds an archived one: nothing, as a bundle holds
+/// no archive. Decoding a bundled object that names one refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoArchive {}
+/// The objects a native read answers with, `A` what an archived one holds: [`NativeObject`]'s an
+/// archived object, [`NativeBundledObject`]'s none. Both encode alike, variant for variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NativeObject {
+#[serde(rename = "NativeObject")]
+pub enum NativeObjectIn<A> {
     Claim(Box<NativeClaim>),
     Definition(Box<NativeDefinition>),
     Evaluation(Box<NativeEvaluation>),
@@ -1322,7 +1336,7 @@ pub enum NativeObject {
     /// An object read from a retired family's archive bundle (the audit's
     /// F11): the object as the family's core held it at the prefix the
     /// bundle claims, and the bundle it came from.
-    Archived(Box<NativeArchivedObject>),
+    Archived(A),
     /// A principal's request generation window (F12).
     Epochs(Box<NativeEpochWindow>),
     /// The outcome asked for left the live core into a seal (F12): where to
@@ -1376,7 +1390,37 @@ pub struct NativeArchivedObject {
     pub bytes: u64,
     pub root: ClaimId,
     pub through: SessionSeq,
-    pub object: NativeObject,
+    pub object: NativeBundledObject,
+}
+/// An object as a bundle holds it; an archived object, which no bundle holds, is given back.
+impl TryFrom<NativeObject> for NativeBundledObject {
+    type Error = NativeObject;
+    fn try_from(object: NativeObject) -> Result<Self, NativeObject> {
+        Ok(match object {
+            NativeObjectIn::Claim(object) => NativeObjectIn::Claim(object),
+            NativeObjectIn::Definition(object) => NativeObjectIn::Definition(object),
+            NativeObjectIn::Evaluation(object) => NativeObjectIn::Evaluation(object),
+            NativeObjectIn::Result(object) => NativeObjectIn::Result(object),
+            NativeObjectIn::Artifact(object) => NativeObjectIn::Artifact(object),
+            NativeObjectIn::Work(object) => NativeObjectIn::Work(object),
+            NativeObjectIn::Diagnostic(object) => NativeObjectIn::Diagnostic(object),
+            NativeObjectIn::Response(object) => NativeObjectIn::Response(object),
+            NativeObjectIn::ResultTestament(object) => NativeObjectIn::ResultTestament(object),
+            NativeObjectIn::Receipt(object) => NativeObjectIn::Receipt(object),
+            NativeObjectIn::Monitor(object) => NativeObjectIn::Monitor(object),
+            NativeObjectIn::Outcome(object) => NativeObjectIn::Outcome(object),
+            NativeObjectIn::CreationResult(object) => NativeObjectIn::CreationResult(object),
+            NativeObjectIn::Event(object) => NativeObjectIn::Event(object),
+            NativeObjectIn::Context(object) => NativeObjectIn::Context(object),
+            NativeObjectIn::Standing(object) => NativeObjectIn::Standing(object),
+            NativeObjectIn::Legacy(object) => NativeObjectIn::Legacy(object),
+            NativeObjectIn::Missing(reference) => NativeObjectIn::Missing(reference),
+            NativeObjectIn::Retired(object) => NativeObjectIn::Retired(object),
+            NativeObjectIn::Epochs(object) => NativeObjectIn::Epochs(object),
+            NativeObjectIn::Sealed(object) => NativeObjectIn::Sealed(object),
+            archived @ NativeObjectIn::Archived(_) => return Err(archived),
+        })
+    }
 }
 /// The continuation of a retired claim: its final binding and status, the
 /// archive bundle holding its family's rows (an object of the ledger's

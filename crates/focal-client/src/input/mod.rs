@@ -4,6 +4,7 @@
 mod build;
 mod decode;
 mod documents;
+pub mod shape;
 mod vocabulary;
 pub use decode::{InputFormat, MAX_INPUT_BYTES, parse_document};
 pub use documents::*;

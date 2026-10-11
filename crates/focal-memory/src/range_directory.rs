@@ -697,23 +697,73 @@ fn child_at<K, V>(
     Err(MemoryError::MissingKey)
 }
 
+/// The branches a walk from a node down to one of its leaves passed, each
+/// with the child it took, outermost first: at most [`MAX_LEVELS`], the
+/// deepest a directory is built, held in place, so a path is rebuilt upward
+/// with no allocation and no recursion.
+struct Descent<'a, K, V> {
+    steps: [Step<'a, K, V>; MAX_LEVELS],
+    depth: usize,
+}
+
+/// A branch a walk passed (its children) and the child it took.
+type Step<'a, K, V> = (&'a [Arc<Node<K, V>>], usize);
+
+/// The leaf a walk reached: the branches it passed, the leaf's pages and the
+/// rank within the leaf.
+type Reached<'a, K, V> = (Descent<'a, K, V>, &'a [Arc<Page<K, V>>], usize);
+
+impl<'a, K, V> Descent<'a, K, V> {
+    /// Walks from `node` to the leaf holding `rank` (with `insertion`, the
+    /// leaf a page at `rank` goes in): the branches passed, the leaf's pages,
+    /// and the rank within the leaf.
+    fn to_leaf(
+        mut node: &'a Node<K, V>,
+        mut rank: usize,
+        insertion: bool,
+    ) -> Result<Reached<'a, K, V>, MemoryError> {
+        let mut descent = Self {
+            steps: [(&[] as &[Arc<Node<K, V>>], 0); MAX_LEVELS],
+            depth: 0,
+        };
+        loop {
+            match &node.links {
+                Links::Leaves(pages) => return Ok((descent, pages.as_slice(), rank)),
+                Links::Branches(children) => {
+                    let (index, within) = child_at(children, rank, insertion)?;
+                    let child = children.get(index).ok_or(MemoryError::MissingKey)?;
+                    let step = descent
+                        .steps
+                        .get_mut(descent.depth)
+                        .ok_or(invalid("directory deeper than its levels"))?;
+                    *step = (children.as_slice(), index);
+                    descent.depth = descent.depth.saturating_add(1);
+                    node = child;
+                    rank = within;
+                }
+            }
+        }
+    }
+
+    /// The branches passed, innermost first: the order a path is rebuilt in.
+    fn upward(&self) -> impl Iterator<Item = &(&'a [Arc<Node<K, V>>], usize)> {
+        self.steps.iter().take(self.depth).rev()
+    }
+}
+
 fn insert_node<K: crate::RangeKey, V>(
     node: &Node<K, V>,
     rank: usize,
     page: Arc<Page<K, V>>,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Split<K, V>, MemoryError> {
-    match &node.links {
-        Links::Leaves(pages) => {
-            split_leaves(&Splice::new(pages, rank, 0, Some(page), None)?, build)
-        }
-        Links::Branches(children) => {
-            let (index, rank) = child_at(children, rank, true)?;
-            let child = children.get(index).ok_or(MemoryError::MissingKey)?;
-            let (left, right) = insert_node(child, rank, page, build)?;
-            split_branches(&Splice::new(children, index, 1, Some(left), right)?, build)
-        }
+    let (descent, pages, rank) = Descent::to_leaf(node, rank, true)?;
+    let mut split = split_leaves(&Splice::new(pages, rank, 0, Some(page), None)?, build)?;
+    for &(children, index) in descent.upward() {
+        let (left, right) = split;
+        split = split_branches(&Splice::new(children, index, 1, Some(left), right)?, build)?;
     }
+    Ok(split)
 }
 
 fn replace_node<K: crate::RangeKey, V>(
@@ -722,29 +772,24 @@ fn replace_node<K: crate::RangeKey, V>(
     page: Arc<Page<K, V>>,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Arc<Node<K, V>>, MemoryError> {
-    match &node.links {
-        Links::Leaves(pages) => {
-            let items = Splice::new(pages, rank, 1, Some(page), None)?;
-            leaf(
-                items.len()?,
-                |i| items.get(i).map(Arc::clone),
-                |i| items.seam(i),
-                build,
-            )
-        }
-        Links::Branches(children) => {
-            let (index, rank) = child_at(children, rank, false)?;
-            let child = children.get(index).ok_or(MemoryError::MissingKey)?;
-            let child = replace_node(child, rank, page, build)?;
-            let items = Splice::new(children, index, 1, Some(child), None)?;
-            branch(
-                items.len()?,
-                |i| items.get(i).map(Arc::clone),
-                |i| items.seam(i),
-                build,
-            )
-        }
+    let (descent, pages, rank) = Descent::to_leaf(node, rank, false)?;
+    let items = Splice::new(pages, rank, 1, Some(page), None)?;
+    let mut node = leaf(
+        items.len()?,
+        |i| items.get(i).map(Arc::clone),
+        |i| items.seam(i),
+        build,
+    )?;
+    for &(children, index) in descent.upward() {
+        let items = Splice::new(children, index, 1, Some(node), None)?;
+        node = branch(
+            items.len()?,
+            |i| items.get(i).map(Arc::clone),
+            |i| items.seam(i),
+            build,
+        )?;
     }
+    Ok(node)
 }
 
 fn remove_node<K: crate::RangeKey, V>(
@@ -752,40 +797,37 @@ fn remove_node<K: crate::RangeKey, V>(
     rank: usize,
     build: &mut DirectoryBuild<'_>,
 ) -> Result<Option<Arc<Node<K, V>>>, MemoryError> {
-    match &node.links {
-        Links::Leaves(pages) => {
-            let items = Splice::new(pages, rank, 1, None, None)?;
-            if items.len()? == 0 {
-                return Ok(None);
+    let (descent, pages, rank) = Descent::to_leaf(node, rank, false)?;
+    let items = Splice::new(pages, rank, 1, None, None)?;
+    let mut node = if items.len()? == 0 {
+        None
+    } else {
+        Some(leaf(
+            items.len()?,
+            |i| items.get(i).map(Arc::clone),
+            |i| items.seam(i),
+            build,
+        )?)
+    };
+    for &(children, index) in descent.upward() {
+        let items = match node {
+            Some(child) if child.width() < MIN && children.len() > 1 => {
+                repair(children, index, child, build)?
             }
-            Ok(Some(leaf(
+            child => Splice::new(children, index, 1, child, None)?,
+        };
+        node = if items.len()? == 0 {
+            None
+        } else {
+            Some(branch(
                 items.len()?,
                 |i| items.get(i).map(Arc::clone),
                 |i| items.seam(i),
                 build,
-            )?))
-        }
-        Links::Branches(children) => {
-            let (index, rank) = child_at(children, rank, false)?;
-            let old = children.get(index).ok_or(MemoryError::MissingKey)?;
-            let child = remove_node(old, rank, build)?;
-            let items = match child {
-                Some(child) if child.width() < MIN && children.len() > 1 => {
-                    repair(children, index, child, build)?
-                }
-                child => Splice::new(children, index, 1, child, None)?,
-            };
-            if items.len()? == 0 {
-                return Ok(None);
-            }
-            Ok(Some(branch(
-                items.len()?,
-                |i| items.get(i).map(Arc::clone),
-                |i| items.seam(i),
-                build,
-            )?))
-        }
+            )?)
+        };
     }
+    Ok(node)
 }
 
 fn repair<'a, K: crate::RangeKey, V>(

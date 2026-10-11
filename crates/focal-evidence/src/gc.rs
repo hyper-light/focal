@@ -284,6 +284,11 @@ fn split_name(entry: &fs::DirEntry) -> Option<(String, String)> {
     Some((stem.to_owned(), extension.to_owned()))
 }
 
+/// The directories a quarantine round holds below its root, deepest: the kind
+/// (`objects`) and a domain under it, its files under that (`quarantine`'s
+/// `objects/<domain>`; a custody record's kind holds its files directly).
+const ROUND_DIRECTORIES: usize = 2;
+
 impl ContentStore {
     fn quarantine_root(&self) -> PathBuf {
         self.root.join("quarantine")
@@ -942,18 +947,49 @@ impl ContentStore {
         }
         Ok(Some(walk))
     }
+    /// Delete one kind's tree of a round: a walk over an explicit stack of the
+    /// directories open, each removed once its entries are, every entry
+    /// visited and every file counted as deleted. A round is at most
+    /// [`ROUND_DIRECTORIES`] deep below its root, so a deeper tree is not a
+    /// round's and is refused; no call recurses.
     fn delete_tree(&mut self, path: &Path, budget: &mut usize) -> Result<(), ContentError> {
         let metadata = fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                self.visit(budget);
-                self.delete_tree(&entry.path(), budget)?;
-            }
-            fs::remove_dir(path)?;
-            return Ok(());
+        if !metadata.is_dir() {
+            return self.delete_file(path, metadata.len());
         }
-        let bytes = metadata.len();
+        let mut open: Vec<(PathBuf, ReadDir)> = Vec::new();
+        open.try_reserve_exact(ROUND_DIRECTORIES)
+            .map_err(|_| ContentError::Capacity)?;
+        open.push((path.to_path_buf(), fs::read_dir(path)?));
+        loop {
+            let next = match open.last_mut() {
+                Some((_, entries)) => entries.next(),
+                None => return Ok(()),
+            };
+            match next {
+                Some(entry) => {
+                    let child = entry?.path();
+                    self.visit(budget);
+                    let metadata = fs::symlink_metadata(&child)?;
+                    if !metadata.is_dir() {
+                        self.delete_file(&child, metadata.len())?;
+                    } else if open.len() < ROUND_DIRECTORIES {
+                        let entries = fs::read_dir(&child)?;
+                        open.push((child, entries));
+                    } else {
+                        return Err(ContentError::Invalid);
+                    }
+                }
+                None => {
+                    if let Some((directory, _)) = open.pop() {
+                        fs::remove_dir(&directory)?;
+                    }
+                }
+            }
+        }
+    }
+    /// Delete one file of a round, counted with its bytes.
+    fn delete_file(&mut self, path: &Path, bytes: u64) -> Result<(), ContentError> {
         fs::remove_file(path)?;
         self.collector.report.deleted = self.collector.report.deleted.saturating_add(1);
         self.collector.report.bytes_deleted =

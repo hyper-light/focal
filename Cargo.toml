@@ -112,3 +112,9 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+# The build `scripts/check_recursion.py` reads (CLAUDE.md §1a): unoptimised, so every call is an
+# explicit `call`, and one codegen unit, so each crate's IR is one file.
+[profile.recursion-ir]
+inherits = "dev"
+codegen-units = 1

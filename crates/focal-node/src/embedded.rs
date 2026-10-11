@@ -11,7 +11,7 @@ use focal_log::{SharedWal, WalIdentity, WalOptions};
 use focal_model::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
 };
@@ -284,24 +284,7 @@ pub(crate) fn check_policy(
     Ok(crate::config::policy::read_committed(root)?)
 }
 pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
-    if path.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        durable_dir(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(path)?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(path)?;
-    focal_platform::sync_dir(path)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        focal_platform::sync_dir(parent)?;
-    }
-    Ok(())
+    focal_platform::fs::create_dir_all_private(path)
 }
 pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let temporary = path.with_extension("install");
@@ -321,6 +304,7 @@ pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[test]
     fn identity_and_owner_survive_restart() {
         let dir = tempfile::tempdir().unwrap();

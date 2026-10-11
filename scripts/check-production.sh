@@ -8,6 +8,12 @@
 # allowances stay scoped to test builds (`cfg_attr(test, allow(..))`, an
 # attribute inside a `#[cfg(test)]` item), which `--lib --bins` never
 # compiles. The policy check proves itself on its fixtures first.
+#
+# No runtime recursion (CLAUDE.md §1a): `check_recursion.py` reads the
+# unoptimised LLVM IR of every library and binary target, the vendored
+# `hyper-*` crates included, and refuses any call-graph cycle through the
+# workspace's code, and the source for a future-returning function that calls
+# itself; it proves itself on its fixtures first.
 set -euo pipefail
 task_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$task_root"
@@ -25,3 +31,4 @@ bash scripts/cargo.sh clippy --workspace --lib --bins --locked -- \
   -D clippy::todo \
   -D clippy::unimplemented \
   -D clippy::dbg_macro
+python3 scripts/check_recursion.py

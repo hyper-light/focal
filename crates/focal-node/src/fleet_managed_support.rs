@@ -393,7 +393,7 @@ impl Owner {
             match self.managed_gate(&pending.work) {
                 Ok(true) => {
                     let before = self.pending.len();
-                    self.accept(pending.work)?;
+                    self.accept_deferred(pending.work)?;
                     if self.pending.len() > before
                         && let Some(accepted) = self.pending.back_mut()
                     {

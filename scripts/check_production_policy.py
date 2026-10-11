@@ -39,7 +39,7 @@ LINT = re.compile(r"\bclippy::(" + "|".join(LINTS) + r")\b")
 ALLOW = re.compile(r"#!?\[\s*allow\s*\(")
 CFG_TEST = re.compile(r"#\[\s*cfg\s*\(\s*(?:test|any\s*\([^)]*\btest\b[^)]*\))\s*\)\s*\]")
 PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
-MOD_ITEM = re.compile(r"\bmod\s+(\w+)\s*(\{|;)")
+MOD_ITEM = re.compile(r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(\w+)\s*(\{|;)")
 TEST_TREE = re.compile(r"(^|/)(tests|benches|examples)(/|$)")
 
 
