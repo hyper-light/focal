@@ -11,6 +11,7 @@ fn model_error(error: DecodeError) -> ContractError {
         _ => ContractError::Capacity,
     }
 }
+#[derive(Clone, Copy)]
 struct Metadata {
     declaration: validation::CheckedDeclaration,
     specification: ContentHash,
@@ -33,14 +34,15 @@ fn metadata(
     })
 }
 
-struct Declarations<'b, 'a> {
+/// A read of a claim's declaration bodies from the frame.
+struct Reads<'b, 'a> {
     reader: Reader<'b, 'a>,
     left: usize,
     principal: Principal,
-    limits: AuthoredCreationLimits,
+    limits: &'b AuthoredCreationLimits,
 }
-impl Iterator for Declarations<'_, '_> {
-    type Item = Result<validation::CheckedDeclaration, ContractError>;
+impl Iterator for Reads<'_, '_> {
+    type Item = Result<Metadata, ContractError>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.left == 0 {
             return if self.reader.tail.is_empty() {
@@ -51,9 +53,9 @@ impl Iterator for Declarations<'_, '_> {
             };
         }
         let value = (|| {
-            let value = metadata(&mut self.reader, self.principal, self.limits)?;
+            let value = metadata(&mut self.reader, self.principal, *self.limits)?;
             self.left = subtract(self.left, 1)?;
-            Ok(value.declaration)
+            Ok(value)
         })();
         if value.is_err() {
             self.left = 0;
@@ -62,6 +64,29 @@ impl Iterator for Declarations<'_, '_> {
         Some(value.map_err(model_error))
     }
 }
+/// A pass over a cohort's declarations: those it holds, or read from the frame.
+enum Declarations<'s, 'b, 'a> {
+    Held(&'s [Option<Metadata>]),
+    Read(Reads<'b, 'a>),
+}
+impl Iterator for Declarations<'_, '_, '_> {
+    type Item = Result<validation::CheckedDeclaration, ContractError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Held(values) => {
+                let (first, rest) = values.split_first()?;
+                *values = rest;
+                Some(
+                    first
+                        .map(|value| value.declaration)
+                        .ok_or(ContractError::InvalidManifest),
+                )
+            }
+            Self::Read(values) => Some(values.next()?.map(|value| value.declaration)),
+        }
+    }
+}
+
 struct Cohort<'b, 'a> {
     claim: &'b ClaimView<'a>,
     declarations: &'a [u8],
@@ -69,6 +94,20 @@ struct Cohort<'b, 'a> {
     budget: &'b Budget,
     principal: Principal,
     limits: AuthoredCreationLimits,
+    held: super::held::Held<Metadata>,
+}
+impl<'a> Cohort<'_, 'a> {
+    fn read(&self) -> Reads<'_, 'a> {
+        Reads {
+            reader: Reader {
+                tail: self.declarations,
+                budget: self.budget,
+            },
+            left: self.count,
+            principal: self.principal,
+            limits: &self.limits,
+        }
+    }
 }
 impl<'a> aggregation::AcceptanceSource for Cohort<'_, 'a> {
     type Slot<'s>
@@ -80,7 +119,7 @@ impl<'a> aggregation::AcceptanceSource for Cohort<'_, 'a> {
     where
         Self: 's;
     type Declarations<'s>
-        = Declarations<'s, 'a>
+        = Declarations<'s, 's, 'a>
     where
         Self: 's;
     fn slot_count(&self) -> usize {
@@ -93,15 +132,15 @@ impl<'a> aggregation::AcceptanceSource for Cohort<'_, 'a> {
         self.claim.slots_from(&self.budget.source)
     }
     fn declarations(&self) -> Self::Declarations<'_> {
-        Declarations {
-            reader: Reader {
-                tail: self.declarations,
-                budget: self.budget,
-            },
-            left: self.count,
-            principal: self.principal,
-            limits: self.limits,
+        match self.held.replay() {
+            Some(values) => Declarations::Held(values),
+            None => Declarations::Read(self.read()),
         }
+    }
+    /// A cohort that holds its declarations replays them; its slots are read
+    /// from the borrowed frame, which does not change, by the same decoder.
+    fn replays(&self) -> bool {
+        self.held.replay().is_some()
     }
 }
 
@@ -113,14 +152,18 @@ pub(super) fn cohort(
     limits: AuthoredCreationLimits,
     budget: &Budget,
 ) -> Result<(), DecodeError> {
-    let source = Cohort {
+    let mut source = Cohort {
         claim: group.claim.source(),
         declarations: group.declarations,
         count: group.count,
         budget,
         principal,
         limits,
+        held: super::held::Held::none(),
     };
+    // Each body is read, checked and stamped once, for every pass after.
+    let (held, _) = super::held::Held::read(source.read())?;
+    source.held = held;
     let acceptance = aggregation::AcceptancePolicy::prepare_source(
         claim,
         issuer,
@@ -136,21 +179,34 @@ pub(super) fn cohort(
         budget.native.charge(1)?;
         let requirement = requirement?;
         let mut found = false;
-        let mut rows = Reader {
-            tail: group.declarations,
-            budget,
-        };
-        for _ in 0..group.count {
-            budget.native.charge(1)?;
-            let value = metadata(&mut rows, principal, limits)?;
+        let mut matches = |value: Metadata| {
             if value.declaration.binding().object.0 == requirement.id.0 {
                 if value.specification != requirement.specification {
-                    return Err(ContractError::ContentConflict.into());
+                    return Err(ContractError::ContentConflict);
                 }
                 found = true;
             }
+            Ok(())
+        };
+        match source.held.replay() {
+            Some(values) => {
+                for value in values {
+                    budget.native.charge(1)?;
+                    matches(value.ok_or(ContractError::InvalidManifest)?)?;
+                }
+            }
+            None => {
+                let mut rows = Reader {
+                    tail: group.declarations,
+                    budget,
+                };
+                for _ in 0..group.count {
+                    budget.native.charge(1)?;
+                    matches(metadata(&mut rows, principal, limits)?)?;
+                }
+                rows.finish()?;
+            }
         }
-        rows.finish()?;
         if !found {
             return Err(ContractError::InvalidPolicy.into());
         }

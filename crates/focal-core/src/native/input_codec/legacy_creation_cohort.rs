@@ -138,32 +138,6 @@ impl Iterator for CheckedValues<'_, '_> {
     }
 }
 
-/// How many of a claim's checked declarations its cohort holds.
-const HELD: usize = 8;
-
-/// A claim's checked declarations, as its cohort's first pass read them: the
-/// acceptance source's later passes replay them where each read, checked and
-/// stamped every body from the frame again (17 reads of a body for a claim of
-/// one declaration, 2026-10-11). A frame is borrowed and does not change, so a
-/// replay is what a read would give. A claim of more declarations than are
-/// held is read from the frame at every pass, as before.
-#[derive(Clone, Copy)]
-pub(super) struct Held {
-    values: [Option<CheckedDeclaration>; HELD],
-    len: usize,
-    complete: bool,
-}
-
-impl Held {
-    pub(super) const fn none() -> Self {
-        Self {
-            values: [None; HELD],
-            len: 0,
-            complete: false,
-        }
-    }
-}
-
 pub(super) struct Cohort<'w, 'a> {
     pub(super) slots: Span<'a>,
     pub(super) declarations: Span<'a>,
@@ -172,24 +146,14 @@ pub(super) struct Cohort<'w, 'a> {
     pub(super) principal: Principal,
     pub(super) limits: validation::Limits,
     pub(super) work: &'w Work,
-    pub(super) held: Held,
+    pub(super) held: super::super::held::Held<CheckedDeclaration>,
 }
 
 impl Cohort<'_, '_> {
     /// Reads the claim's declarations from the frame once, holding them for
     /// the passes after (if they fit), and counts them.
     pub(super) fn hold(&mut self) -> Result<usize, ContractError> {
-        let mut held = Held::none();
-        let mut count = 0usize;
-        for value in self.read() {
-            let value = value?;
-            if let Some(slot) = held.values.get_mut(count) {
-                *slot = Some(value);
-            }
-            count = count.checked_add(1).ok_or(ContractError::Capacity)?;
-        }
-        held.len = count;
-        held.complete = count <= HELD;
+        let (held, count) = super::super::held::Held::read(self.read())?;
         self.held = held;
         self.count = count;
         Ok(count)
@@ -252,14 +216,14 @@ impl aggregation::AcceptanceSource for Cohort<'_, '_> {
         )
     }
     fn declarations(&self) -> Self::Declarations<'_> {
-        match self.held.values.get(..self.held.len) {
-            Some(values) if self.held.complete => Declarations::Held(values),
-            _ => Declarations::Read(self.read()),
+        match self.held.replay() {
+            Some(values) => Declarations::Held(values),
+            None => Declarations::Read(self.read()),
         }
     }
     /// A cohort that holds its declarations replays them; its slots are read
     /// from the borrowed frame, which does not change, by the same decoder.
     fn replays(&self) -> bool {
-        self.held.complete
+        self.held.replay().is_some()
     }
 }
