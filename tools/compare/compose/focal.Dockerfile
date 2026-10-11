@@ -29,7 +29,7 @@ RUN --mount=type=cache,id=focal-bench-target,target=/src/target \
 FROM public.ecr.aws/docker/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
 # The data and client directories private, as the shipped image makes its
 # own: a named volume takes the mode of the directory it first mounts over.
-RUN apk add --no-cache iproute2 && install -d -m 0700 /data /client
+RUN apk add --no-cache iproute2 perf && install -d -m 0700 /data /client
 COPY --from=build /out/focal /usr/local/bin/focal
 COPY --from=build /out/focal-load /usr/local/bin/focal-load
 COPY --from=build /out/focal-compare /usr/local/bin/focal-compare
