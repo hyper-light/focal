@@ -29,12 +29,12 @@ thread_local! {
 /// waiting so recursion and allocation drops never retain a RefCell borrow.
 /// A failed test releases its worker through Gate::drop; timeouts cannot panic
 /// inside an Allocation destructor or strand the test process indefinitely.
-pub(super) fn pause(step: Step, budget: &MemoryBudget) {
+pub(super) fn pause(step: Step, level: &Level) {
     let hook = HOOK.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot
             .as_ref()
-            .is_some_and(|hook| hook.step == step && Arc::ptr_eq(&hook.source.0, &budget.0))
+            .is_some_and(|hook| hook.step == step && std::ptr::eq(hook.source.level, level))
         {
             slot.take()
         } else {

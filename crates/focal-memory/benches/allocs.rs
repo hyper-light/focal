@@ -10,8 +10,10 @@
 )]
 //! Allocation counts for the admission path: `MemoryBudget::reserve` /
 //! `commit` / drop must be zero-alloc (the budget is atomic counters behind
-//! one `Arc`; a permit is a plain struct), a child budget is one `Arc`, and an
-//! `Arena` page is one boxed slice plus its directory.
+//! one `Arc`; a permit is a plain struct), a child budget is three
+//! allocations (its level, the chain its handles share and its list of
+//! ancestors: no level holds another, so no drop recurses), and an `Arena`
+//! page is one boxed slice plus its directory.
 #[path = "support/alloc_count.rs"]
 mod alloc_count;
 
