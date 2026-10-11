@@ -45,10 +45,23 @@ TEST_TREE = re.compile(r"(^|/)(tests|benches|examples)(/|$)")
 
 DEFINE = re.compile(r'^define\b[^@]*@("(?:[^"\\]|\\.)*"|[-a-zA-Z$._0-9]+)\(')
 CALL = re.compile(r'\b(?:call|invoke)\b[^@]*?@("(?:[^"\\]|\\.)*"|[-a-zA-Z$._0-9]+)\(')
+# A crate's disambiguator, as GNU `c++filt` prints it after the crate's name (`core[846817f7]::`):
+# binutils demangles verbosely by default, where LLVM's demangler leaves it out. Only a bracketed
+# hex number right after an identifier is one; a slice type (`&[f32]`) follows no identifier.
+DISAMBIGUATOR = re.compile(r"(?<=[A-Za-z0-9_])\[[0-9a-f]+\]")
+
+
+def plain(name: str) -> str:
+    """A demangled path without crate disambiguators: what `ours` reads a function's crate from,
+    whichever demangler printed it."""
+    return DISAMBIGUATOR.sub("", name)
+
+
 def demangler() -> list[str]:
-    """The command that demangles Rust's v0 symbols here: the toolchain's `llvm-cxxfilt` (rustup's
-    `llvm-tools`), else the platform's `c++filt` (LLVM's, or binutils' since 2.36). Refused, never
-    skipped, when neither does."""
+    """The command that demangles Rust's v0 symbols here: an `llvm-cxxfilt` (the toolchain's, if its
+    `llvm-tools` carries one, or one on the path), else the platform's `c++filt` (LLVM's, or
+    binutils' since 2.36, whose crate disambiguators `plain` drops). Refused, never skipped, when
+    none does."""
     sysroot = subprocess.run(
         ["rustc", "--print", "sysroot"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -67,11 +80,11 @@ def demangler() -> list[str]:
             )
         except OSError:
             continue
-        if probe.stdout.strip() == "mycrate::foo":
+        if plain(probe.stdout.strip()) == "mycrate::foo":
             return command
     raise SystemExit(
-        "no demangler of Rust's v0 symbols: install rustup's llvm-tools component "
-        "(`rustup component add llvm-tools`) or binutils 2.36 or later"
+        "no demangler of Rust's v0 symbols: install binutils 2.36 or later (GNU c++filt) "
+        "or LLVM's llvm-cxxfilt"
     )
 
 
@@ -87,7 +100,7 @@ def demangle_all(symbols: set[str]) -> dict[str, str]:
         text=True,
         check=True,
     ).stdout.splitlines()
-    return dict(zip(ordered, names))
+    return dict(zip(ordered, (plain(name) for name in names)))
 
 
 def read_graph(files: list[Path]) -> dict[str, set[str]]:
@@ -479,6 +492,18 @@ def report(refused: list[list[str]], listed: list[list[str]], sources: list[str]
 
 def self_test() -> None:
     """The checker on its fixtures: each refusal it must make, and the listing it must not refuse."""
+    # GNU c++filt's verbose crates read as LLVM's terse ones; a slice type keeps its brackets.
+    for printed, read in (
+        ("focal_fixture[3f2a9b]::walk", "focal_fixture::walk"),
+        ("<focal_fixture[3f2a9b]::Node as core[846817f7]::ops::drop::Drop>::drop",
+         "<focal_fixture::Node as core::ops::drop::Drop>::drop"),
+        ("<[f32] as focal_fixture::Sum>::sum", "<[f32] as focal_fixture::Sum>::sum"),
+        ("focal_fixture::take::<&[ab]>", "focal_fixture::take::<&[ab]>"),
+    ):
+        if plain(printed) != read:
+            raise SystemExit(f"self-test: {printed!r} read as {plain(printed)!r}, not {read!r}")
+    if not ours(plain("focal_fixture[3f2a9b]::walk"), {"focal_fixture"}):
+        raise SystemExit("self-test: a disambiguated crate's function was not taken for its own")
     crates = {"focal_fixture"}
     graph = read_graph(sorted((FIXTURES / "ir").glob("*.ll")))
     refused, listed = judge(components(graph), crates)
