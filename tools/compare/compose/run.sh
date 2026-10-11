@@ -100,11 +100,28 @@ warmup_ms: $(( warmup * 1000 ))
 EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
+    # The leader's processor with call graphs, twenty seconds into the
+    # measured window: who copies and who hashes.
+    if [ "$rate" -ge 1000 ]; then
+      dc exec -d focal1 sh -c "sleep $(( warmup + 20 )); perf record -F 199 --call-graph dwarf,16384 -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
+    fi
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
       evidence
       exit 1
+    fi
+    if [ "$rate" -ge 1000 ]; then
+      echo "::group::leader callers (focal at $rate/s)"
+      dc exec -T focal1 sh -c "cat /data/perf.log; perf report -i /data/perf.data --stdio --no-children --sort comm -g none 2>/dev/null | head -20" || true
+      # The owner's inclusive time by function (what each call costs with
+      # everything it calls), then its own time, then the rest of the process.
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --children --comm focal-node-sess --sort symbol -g none --percent-limit 0.8 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -150" || true
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --comm focal-node-sess --sort symbol -g none --percent-limit 0.25 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -100" || true
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --sort comm,tid -g none 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -30" || true
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --children --comm focal --sort symbol -g none --percent-limit 1.5 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -100" || true
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --comm focal --sort symbol -g none --percent-limit 0.4 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -60" || true
+      echo "::endgroup::"
     fi
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
