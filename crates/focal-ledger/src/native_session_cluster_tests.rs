@@ -206,7 +206,18 @@ impl Cluster {
                     Err(error) => match error.class() {
                         FailureClass::Retryable if retry_ok.contains(&id) => {}
                         FailureClass::FailClosed if fail_ok.contains(&id) => {
-                            assert!(matches!(node.poll(), Err(NativeSessionError::Failed)));
+                            // Every refusal after names what the session
+                            // stopped on, not only that it stopped.
+                            let cause = error.to_string();
+                            match node.poll() {
+                                Err(NativeSessionError::Stopped(named)) => assert_eq!(
+                                    &*named,
+                                    &cause[..cause.floor_char_boundary(512)],
+                                    "node {id}"
+                                ),
+                                Err(other) => panic!("node {id} after failing closed: {other:?}"),
+                                Ok(_) => panic!("node {id} polled on after failing closed"),
+                            }
                             failed.push(id);
                             progressed = true;
                         }
@@ -785,9 +796,10 @@ fn corrupted_record_bytes_stop_only_the_receiving_replica_and_never_apply() {
         cluster.node(2).outcome(committed.invocation).unwrap(),
         Some(committed)
     );
+    // It names what stopped it: the damaged record, not only that it stopped.
     assert!(matches!(
         cluster.node(3).outcome(committed.invocation),
-        Err(NativeSessionError::Failed)
+        Err(NativeSessionError::Stopped(cause)) if !cause.is_empty()
     ));
     // The healthy majority keeps committing; the damaged log is refused on reopen.
     cluster.corrupt_to = None;

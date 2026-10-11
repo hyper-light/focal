@@ -301,6 +301,11 @@ pub enum NativeSessionError {
     Legacy,
     #[error("native session stopped after committed application failure; reopen to recover")]
     Failed,
+    /// [`Self::Failed`], naming what stopped it: the first error the session
+    /// failed closed on, so the stop it reports is its cause and not only
+    /// that it stopped.
+    #[error("native session stopped after committed application failure ({0}); reopen to recover")]
+    Stopped(Box<str>),
     #[error("content named by a committed fact is not local yet; poll again once custody arrives")]
     CustodyPending,
     #[error("a committed layout change is in flight; propose again once it applies")]
@@ -394,6 +399,7 @@ impl NativeSessionError {
             | Self::Corrupt
             | Self::Legacy
             | Self::Failed
+            | Self::Stopped(_)
             | Self::OutcomeBound { .. } => FailClosed,
         }
     }
