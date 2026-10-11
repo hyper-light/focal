@@ -17,6 +17,54 @@ const CAPACITY_RESENDS: u32 = 3;
 /// service still opening) before the refusal is reported: at the largest
 /// backoff these span the default policy's clock, which bounds them all.
 const UNAVAILABLE_RESENDS: u32 = 64;
+/// The client's capacity resends, in thousandths of a token: ten tokens,
+/// gRPC's retry throttling (gRFC A6) at its example service config's values.
+const RETRY_TOKENS: u64 = 10_000;
+/// What an answered request earns the budget: a tenth of a token (A6's
+/// `tokenRatio` of 0.1).
+const RETRY_EARNED: u64 = 100;
+/// What a capacity refusal spends: one token (A6: a failed attempt).
+const RETRY_SPENT: u64 = 1_000;
+/// The resends a client makes after capacity refusals, throttled as gRPC
+/// throttles retries (gRFC A6). A node that refuses for capacity is
+/// overloaded, and a resend that it refuses again only adds to its load: in
+/// the comparison at 1,000 writes a second the leader refused 73,318
+/// requests at its sessions' doors while the generator gave up on 27,448, its
+/// clients asking each about three times over (compare run 38141716895). Each
+/// capacity refusal spends a token, each answer earns a tenth of one, and a
+/// refused request is resent only while more than half the tokens remain:
+/// under a lasting overload each request is asked once and its refusal
+/// reported, and the budget refills as answers come back.
+struct RetryBudget(std::sync::atomic::AtomicU64);
+impl RetryBudget {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(RETRY_TOKENS))
+    }
+    /// A capacity refusal: spends a token, and says whether the budget still
+    /// allows the resend.
+    fn refused(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = self
+            .0
+            .fetch_update(Relaxed, Relaxed, |tokens| {
+                Some(tokens.saturating_sub(RETRY_SPENT))
+            })
+            .unwrap_or(0);
+        before > RETRY_TOKENS / 2
+    }
+    /// An answered request: earns a tenth of a token, up to the budget.
+    fn answered(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self.0.fetch_update(Relaxed, Relaxed, |tokens| {
+            Some(tokens.saturating_add(RETRY_EARNED).min(RETRY_TOKENS))
+        });
+    }
+    /// The tokens left, in thousandths.
+    #[cfg(test)]
+    fn tokens(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -185,6 +233,8 @@ pub struct Client<T: ClientTransport> {
     /// Per-client call counter, stamped onto each traced exchange to order and
     /// pair concurrent invocations. Untouched when `trace` is `None`.
     calls: std::sync::atomic::AtomicU64,
+    /// What this client may still resend after capacity refusals (`RetryBudget`).
+    retries: RetryBudget,
 }
 
 /// Single-host wall-clock nanoseconds for trace timestamps; a clock that runs
@@ -291,6 +341,7 @@ impl<T: ClientTransport> Client<T> {
             }),
             trace: None,
             calls: std::sync::atomic::AtomicU64::new(0),
+            retries: RetryBudget::new(),
         })
     }
 
@@ -619,6 +670,18 @@ impl<T: ClientTransport> Client<T> {
         }
         outcome
     }
+    /// The client's capacity resend budget left, in thousandths of a token.
+    #[cfg(test)]
+    pub(crate) fn retry_tokens(&self) -> u64 {
+        self.retries.tokens()
+    }
+    /// A capacity refusal after `refusals` before it: spent from the budget,
+    /// and resent only within the resends a request is given and while the
+    /// budget allows (`RetryBudget`). The refusal not resent is reported.
+    fn resend_capacity(&self, refusals: u32) -> bool {
+        let allowed = self.retries.refused();
+        allowed && refusals < CAPACITY_RESENDS
+    }
     async fn request_inner(
         &self,
         request: &mut RequestEnvelope,
@@ -709,7 +772,7 @@ impl<T: ClientTransport> Client<T> {
                             refused = true;
                         }
                         Response::Error(AccessError::Capacity)
-                            if capacity_refusals < CAPACITY_RESENDS =>
+                            if self.resend_capacity(capacity_refusals) =>
                         {
                             capacity_refusals = capacity_refusals.saturating_add(1);
                             last_refusal = Some(AccessError::Capacity);
@@ -721,7 +784,18 @@ impl<T: ClientTransport> Client<T> {
                             }
                             return Err(ClientError::Access(error.clone()));
                         }
-                        _ => return Ok(response),
+                        Response::Native(NativeMutationReply::Refused(refusal))
+                            if matches!(refusal.kind, NativeRefusalKind::Capacity) =>
+                        {
+                            // The owner's own capacity, reported to the caller as it
+                            // is, and spent from the budget as a refusal is.
+                            let _ = self.retries.refused();
+                            return Ok(response);
+                        }
+                        _ => {
+                            self.retries.answered();
+                            return Ok(response);
+                        }
                     }
                 }
                 // Refused before anything was sent (no connection to send it
@@ -735,7 +809,7 @@ impl<T: ClientTransport> Client<T> {
                     refused = true;
                 }
                 Ok(Err(WireError::Access(AccessError::Capacity)))
-                    if capacity_refusals < CAPACITY_RESENDS =>
+                    if self.resend_capacity(capacity_refusals) =>
                 {
                     capacity_refusals = capacity_refusals.saturating_add(1);
                     last_refusal = Some(AccessError::Capacity);

@@ -209,6 +209,29 @@ async fn a_ticket_that_never_commits_is_reported_unknown_with_the_exact_request_
     );
 }
 
+/// The owner's refusal for capacity spends from the client's resend budget,
+/// as a refusal at the door does (`RetryBudget`): five of them leave half,
+/// which allows no resend. Any other native refusal is an answer, and earns.
+#[test]
+fn a_native_refusal_for_capacity_spends_the_resend_budget() {
+    focal_rt::block_on(a_native_refusal_for_capacity_spends_the_resend_budget_on_a_shard())
+        .unwrap();
+}
+async fn a_native_refusal_for_capacity_spends_the_resend_budget_on_a_shard() {
+    let capacity = NativeMutationReply::Refused(NativeRefusal {
+        kind: NativeRefusalKind::Capacity,
+        detail: "native owner bound exceeded: pending candidates".into(),
+    });
+    let (refused, _) = client(true, vec![capacity.clone(); 5]);
+    for _ in 0..5 {
+        assert_eq!(refused.submit_native(submit()).await.unwrap(), capacity);
+    }
+    assert_eq!(refused.retry_tokens(), 5_000);
+    let (answered, _) = client(true, vec![refusal()]);
+    assert_eq!(answered.submit_native(submit()).await.unwrap(), refusal());
+    assert_eq!(answered.retry_tokens(), 10_000);
+}
+
 #[test]
 fn refusals_are_final_replies_even_after_an_uncertain_attempt() {
     focal_rt::block_on(refusals_are_final_replies_even_after_an_uncertain_attempt_on_a_shard())
