@@ -108,10 +108,12 @@ services:
     <<: *focal
     command: ["sh", "-c", "n=0; until [ -s /invite/focal3.invite ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal --config /etc/focal/focal3.yaml --data-dir /data start node --listen 0.0.0.0:7443 --advertise focal3:7443 --invite-file /invite/focal3.invite"]
     volumes: ["./focal3.yaml:/etc/focal/focal3.yaml:ro", "focal3:/data", "invites:/invite"]
-  # The generator, on the bench network as every system's generator runs.
+  # The generator, on the bench network as every system's generator runs. An
+  # A/B of two focal builds drives both with one build's generator
+  # (compare-ab.yml), so only the nodes differ between its sides.
   focal-load:
     <<: *limits
-    image: focal:bench
+    image: ${FOCAL_LOAD_IMAGE:-focal:bench}
     profiles: [focal]
     command: ["sleep", "86400"]
     volumes: ["./focal-target.yaml:/etc/focal/target.yaml:ro", "invites:/invite", "focal-client:/client", "reports:/reports"]
