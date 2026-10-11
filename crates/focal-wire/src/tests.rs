@@ -5929,12 +5929,20 @@ fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
 }
 
 /// A peer whose process stalls for longer than a request's deadline keeps its
-/// connections: the request that waited ends at its deadline, and the next
-/// one on the same connection is served once the stall is over. The stall is
-/// the server's whole runtime blocked, endpoint and all, as a starved
-/// scheduler blocks it; the connection's liveness is its own idle bound,
-/// never the request timeout (a busy machine lost every connection it held to
-/// a half-second stall when the two were one, 2026-10-07).
+/// connections: the request that waited ends unanswered, and the next one on
+/// the same connection is served once the stall is over. The stall is the
+/// server's whole runtime blocked, endpoint and all, as a starved scheduler
+/// blocks it; the connection's liveness is its own idle bound, never the
+/// request timeout (a busy machine lost every connection it held to a
+/// half-second stall when the two were one, 2026-10-07).
+///
+/// The transport gives a silent peer up within one or two of its windows,
+/// each the deadline and the path's probe timeout (hyper-transport's
+/// `Progress`): a datagram the peer sent just before it stalled counts as
+/// heard in the first. So the stall outlasts two windows of the probe timeout
+/// measured before it, and a deadline more. Three deadlines did not on
+/// Windows CI, where the probe timeout is near 175 ms: the request was
+/// answered at 903 ms, its second window ending at 962 (2026-10-11).
 #[test]
 fn a_stall_past_the_request_deadline_keeps_the_connection() {
     focal_rt::block_on(async move {
@@ -5960,7 +5968,12 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
         // Told across the threads: the server's shard is a runtime of its own.
         let (stop_tx, stop_rx) = hyper_rt::sync::oneshot::<()>().unwrap();
         let server_limits = short.clone();
+        // How long the stall lasts, set once the path is measured, and that it is over.
+        let stall = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stalling, ended) = (stall.clone(), over.clone());
         let serving = std::thread::spawn(move || {
+            let (stall, over) = (stalling, ended);
             focal_rt::block_on(async move {
                 let server = Arc::new(
                     QuicServer::bind(
@@ -5974,12 +5987,18 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
                 );
                 address_tx.send(server.local_addr().unwrap()).unwrap();
                 let handler: Arc<dyn RequestHandler> =
-                    Arc::new(|verified: VerifiedRequest| async move {
-                        if verified.request().request_id == RequestId::from_u128(1) {
-                            // The whole runtime stalls: nothing of this process runs.
-                            std::thread::sleep(DEADLINE * 3);
+                    Arc::new(move |verified: VerifiedRequest| {
+                        let (stall, over) = (stall.clone(), over.clone());
+                        async move {
+                            if verified.request().request_id == RequestId::from_u128(1) {
+                                // The whole runtime stalls: nothing of this process runs.
+                                std::thread::sleep(Duration::from_nanos(
+                                    stall.load(Ordering::Acquire),
+                                ));
+                                over.store(true, Ordering::Release);
+                            }
+                            response(verified.request())
                         }
-                        response(verified.request())
                     });
                 let running = server.clone();
                 let task = spawn(async move { running.serve(handler).await });
@@ -6001,9 +6020,20 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
             QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, short, budget()).unwrap();
         let remote = connector.connect(address, "localhost").await.unwrap();
         assert!(remote.request(&request(0)).await.is_ok());
-        // The stalled request ends at its deadline, not with its connection.
+        let window = DEADLINE + remote.path().await.unwrap().probe_timeout;
+        let outlasts = window * 2 + DEADLINE;
+        stall.store(
+            u64::try_from(outlasts.as_nanos()).unwrap(),
+            Ordering::Release,
+        );
+        // The stalled request ends unanswered, not with its connection.
         assert!(remote.request(&request(1)).await.is_err());
-        pause(DEADLINE * 3).await;
+        // The fact the next request needs, waited on, the stall's own length its bound.
+        let waited = std::time::Instant::now();
+        while !over.load(Ordering::Acquire) {
+            assert!(waited.elapsed() < outlasts * 4, "the stall never ended");
+            pause(DEADLINE / 10).await;
+        }
         // A remote is its connection: one that went is not asked again.
         assert!(
             remote.request(&request(2)).await.is_ok(),
