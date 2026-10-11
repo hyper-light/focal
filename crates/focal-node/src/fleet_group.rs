@@ -542,7 +542,7 @@ impl GroupOwner {
             if !owner.session.persistence_pending() {
                 continue;
             }
-            owner.waits_swept = owner.waits_swept.saturating_add(1);
+            owner.count_swept();
             if owner.wake_at > now {
                 self.deadlines.remove(&(owner.wake_at, *ledger));
                 owner.wake_at = now;
@@ -842,12 +842,12 @@ impl GroupOwner {
             return;
         };
         if let Some(owner) = self.sessions.get_mut(&ledger) {
-            owner.waits_answered = owner.waits_answered.saturating_add(1);
+            owner.count_answered();
         }
         self.due(ledger);
         if let Some(waiting) = self.unwoken.pop_first() {
             if let Some(owner) = self.sessions.get_mut(&waiting) {
-                owner.waits_handed = owner.waits_handed.saturating_add(1);
+                owner.count_handed();
             }
             self.due(waiting);
         }
@@ -893,5 +893,82 @@ mod tests {
             (wake())();
         }
         assert!(overflows.try_recv().is_ok());
+    }
+
+    /// A wake this owner counts for a session — an answer's signal, a sweep,
+    /// a hand-off — is published at the session's next step, whether or not
+    /// that step has anything to drain. A tick that comes as the log answers
+    /// drains the answered write before the answer's signal is taken; the
+    /// signal's step then drains nothing, and its count stayed unpublished
+    /// until the session's next write (the wake test read 17 sessions of 100
+    /// as never woken, each drained by its tick within milliseconds of its
+    /// signal).
+    #[test]
+    fn a_wake_counted_after_the_drain_is_published_at_the_next_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = LedgerId {
+            tenant: focal_model::TenantId::from_u128(2),
+            session: focal_model::SessionId::from_u128(3),
+        };
+        let mut session = Session::open(
+            directory.path(),
+            ledger,
+            focal_consensus::NodeConfig::single(1, [82; 16], ledger.session.0),
+            focal_ledger::SessionLimits::default(),
+        )
+        .unwrap();
+        session.campaign().unwrap();
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let (outbound, _outgoing) = hyper_rt::sync::channel(32).unwrap();
+        let (host, mut owner) = ReplicaHost::assemble(
+            session,
+            ReplicaConfig::new(focal_model::RootCommandId::from_u128(4)),
+            ReplicaHost::wire_limits(),
+            None,
+            MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap(),
+            HostSender::Direct(sender),
+            outbound,
+        )
+        .unwrap();
+        owner.nonblocking = true;
+        // The election written and drained, charged to the log's writes: the
+        // session has nothing left to persist or drain.
+        let writes = |owner: &Owner| {
+            owner
+                .session
+                .shared_wal()
+                .unwrap()
+                .stats()
+                .map_or(0, |stats| stats.group_commits)
+        };
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &[writes(&owner)],
+            u64::MAX,
+            crate::test_waits::FROZEN,
+        );
+        while owner.session.persistence_pending() || owner.session.has_ready() {
+            owner.progress_group().unwrap();
+            if let Err(spent) = wait.check(&[writes(&owner)]) {
+                panic!("the session never settled: {spent}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        owner.progress_group().unwrap();
+        let before = host.progress();
+        // What `signalled` and `sweep` count, the write already drained.
+        owner.count_answered();
+        owner.count_swept();
+        owner.count_handed();
+        owner.progress_group().unwrap();
+        assert!(!owner.session.persistence_pending() && !owner.session.has_ready());
+        let after = host.progress();
+        assert_eq!(
+            (after.waits_answered, after.waits_swept, after.waits_handed),
+            (
+                before.waits_answered + 1,
+                before.waits_swept + 1,
+                before.waits_handed + 1
+            )
+        );
     }
 }

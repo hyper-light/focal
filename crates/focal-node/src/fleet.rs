@@ -975,6 +975,13 @@ struct Owner {
     waits_swept: u64,
     /// `ReplicaProgress::waits_handed`.
     waits_handed: u64,
+    /// That a wake the owner sharing this replica's thread counted
+    /// (`waits_answered`, `waits_swept`, `waits_handed`) is not yet in the
+    /// published progress: the replica's next step publishes it, drained or
+    /// not. A tick that comes as the log answers drains the answered write
+    /// before the answer's signal is taken, and the signal's step then has
+    /// nothing to drain.
+    progress_stale: bool,
     progress: watch::Sender<ProgressState>,
     /// Drawn when this owner started: with the node id it scopes every read
     /// context the owner mints, so a nonce that restarts from zero, or one
@@ -1225,6 +1232,7 @@ impl ReplicaHost {
             waits_answered: 0,
             waits_swept: 0,
             waits_handed: 0,
+            progress_stale: false,
             progress,
             incarnation,
             nonce: 0,
@@ -2495,7 +2503,28 @@ impl Owner {
             self.beat_if_due()?;
             self.slow.note("beat", started);
         }
+        if self.progress_stale {
+            self.publish_progress(false);
+        }
         Ok(false)
+    }
+    /// The log's answer to this replica's write woke its owner
+    /// (`GroupOwner::signalled`), published at the replica's next step.
+    fn count_answered(&mut self) {
+        self.waits_answered = self.waits_answered.saturating_add(1);
+        self.progress_stale = true;
+    }
+    /// A sweep looked at this replica (`GroupOwner::sweep`), published at
+    /// the replica's next step.
+    fn count_swept(&mut self) {
+        self.waits_swept = self.waits_swept.saturating_add(1);
+        self.progress_stale = true;
+    }
+    /// Another replica's answered write made this one due
+    /// (`GroupOwner::signalled`), published at the replica's next step.
+    fn count_handed(&mut self) {
+        self.waits_handed = self.waits_handed.saturating_add(1);
+        self.progress_stale = true;
     }
     fn group_deadline(&self) -> Result<Instant, LedgerError> {
         if self.stopping.is_some() || self.evidence.is_some() {
@@ -2942,7 +2971,8 @@ impl Owner {
         }
         self.publish_progress(true);
     }
-    fn publish_progress(&self, stopped: bool) {
+    fn publish_progress(&mut self, stopped: bool) {
+        self.progress_stale = false;
         let status = self.session.status();
         self.progress.send_modify(|state| {
             state.value = ReplicaProgress {

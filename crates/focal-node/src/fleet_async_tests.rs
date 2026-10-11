@@ -498,7 +498,12 @@ fn stopping_last_session_on_a_stalled_writer_does_not_join_it_on_the_fleet_worke
 /// The owners' ticks are stretched to ten seconds here, the longest an
 /// owner's may be, so that a wake the log's answer failed to deliver is
 /// left to a tick. A first statement held the commits to five seconds of
-/// the clock, which three suites at once passed (2026-10-03).
+/// the clock, which three suites at once passed (2026-10-03). The first
+/// tick after a write still comes at the cadence it was set at, and one that
+/// comes as the log answers drains the session before the answer's signal
+/// is taken: the signal is counted all the same, and published at the
+/// session's next step (`Owner::count_answered`; unpublished, it read as a
+/// session never woken: 17 of 100 on a loaded workstation, 2026-10-11).
 #[test]
 fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits() {
     focal_rt::block_on(async move {
