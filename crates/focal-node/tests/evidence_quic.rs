@@ -229,8 +229,13 @@ impl Pki {
     fn roots(&self) -> Vec<Vec<u8>> {
         vec![self.certificate.der().to_vec()]
     }
-    fn connector(&self, identity: &CertificateIdentity) -> QuicConnector {
-        let tls = client_tls(identity.tls(), self.roots(), &wire_limits()).unwrap();
+    /// A connector of `identity`, granted as `role`.
+    fn connector(
+        &self,
+        identity: &CertificateIdentity,
+        role: focal_wire::net::Sender,
+    ) -> QuicConnector {
+        let tls = client_tls(identity.tls(), self.roots(), &wire_limits(), role).unwrap();
         QuicConnector::bind_standalone("127.0.0.1:0".parse().unwrap(), tls, wire_limits()).unwrap()
     }
 }
@@ -331,9 +336,10 @@ impl Fleet {
         let actor_id = pki.issue("actor.focal.test".into(), false);
         let other_id = pki.issue("other.focal.test".into(), false);
         let rogue_id = pki.issue("unassigned-node.focal.test".into(), true);
-        let actor = pki.connector(&actor_id);
-        let other = pki.connector(&other_id);
-        let rogue = pki.connector(&rogue_id);
+        let actor = pki.connector(&actor_id, focal_wire::net::Sender::Participant);
+        let other = pki.connector(&other_id, focal_wire::net::Sender::Participant);
+        // Granted as a node it is not one of the fleet's.
+        let rogue = pki.connector(&rogue_id, focal_wire::net::Sender::Node);
         let facts: Vec<_> = (1..=3)
             .map(|id| NodeFacts {
                 id,
@@ -535,10 +541,11 @@ impl Fleet {
             let serving =
                 focal_rt::spawn(async move { serving_server.serve(service).await }).unwrap();
             let connector = match slow {
-                Some(slow) if slow.old.contains(&id) => {
-                    pki.connector(identity).offering(&OLDER_PROFILES).unwrap()
-                }
-                _ => pki.connector(identity),
+                Some(slow) if slow.old.contains(&id) => pki
+                    .connector(identity, focal_wire::net::Sender::Node)
+                    .offering(&OLDER_PROFILES)
+                    .unwrap(),
+                _ => pki.connector(identity, focal_wire::net::Sender::Node),
             };
             let pool = std::rc::Rc::new(
                 PeerConnectionPool::new(

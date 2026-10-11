@@ -62,6 +62,9 @@ pub struct Served {
     pub negotiated: Option<Negotiated>,
     /// The round trip its connection measures now.
     pub path: Duration,
+    /// When its head arrived, on the shard's clock (nanoseconds): its answer's time is counted
+    /// from then, however long it waited for its body and its task.
+    pub arrived_ns: u64,
 }
 
 /// A served request's answer: the reply, or `None` to refuse the exchange (its stream is reset,
@@ -203,8 +206,9 @@ impl Network {
     /// it moves. `enrollment` is the most a message of the enrollment protocol carries, for a
     /// listener that serves it; elsewhere its kinds are refused. The owner serves nothing until it
     /// is given what to serve ([`Command::Serve`]).
+    /// The owner of `driver`, whose endpoint sends as `role` (what its identity is granted as).
     pub(crate) fn start(
-        driver: Driver,
+        (driver, role): (Driver, Sender),
         limits: WireLimits,
         queue: usize,
         revocations: Option<WatchReceiver>,
@@ -212,7 +216,7 @@ impl Network {
     ) -> Result<Self, WireError> {
         let (commands, receiver) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
         let (answers, answered) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
-        let owner = Owner::new(driver, limits, answers, enrollment);
+        let owner = Owner::new((driver, role), limits, answers, enrollment);
         hyper_rt::futures::spawn_detached(owner.run(receiver, answered, revocations))
             .map_err(|_| WireError::Connection)?;
         Ok(Self { commands })
@@ -274,11 +278,11 @@ impl Network {
 
 /// A peer of the endpoint, as the owner keeps it.
 struct PeerState {
-    /// Its connection now, while one is up.
-    epoch: Option<Epoch>,
-    /// What its connection negotiated: this side's answer to its greeting, or the answer to this
-    /// side's.
-    negotiated: Option<Negotiated>,
+    /// Its connections up now, each with what its greeting negotiated (this side's answer to the
+    /// peer's greeting, or the answer to this side's): the one a dial of this side's holds, or as
+    /// many as the peer's identity is admitted (`AdmissionLimits`), each greeted on its own. The
+    /// newest is the current one, which a dial links to.
+    connections: BTreeMap<Epoch, Option<Negotiated>>,
     /// This side dialed it: the route it was dialed for, the profiles it is offered, its greeting
     /// in flight, and who waits for the connection.
     dialed: Option<DialState>,
@@ -304,6 +308,19 @@ pub(crate) struct Asked {
     bytes: Vec<u8>,
     secret: bool,
 }
+impl PeerState {
+    /// The current connection: the newest up, and what it negotiated.
+    fn current(&self) -> Option<(Epoch, Option<Negotiated>)> {
+        self.connections
+            .last_key_value()
+            .map(|(epoch, negotiated)| (*epoch, *negotiated))
+    }
+    /// What the connection of `epoch` negotiated, once its greeting was answered.
+    fn negotiated(&self, epoch: Epoch) -> Option<Negotiated> {
+        self.connections.get(&epoch).copied().flatten()
+    }
+}
+
 impl Asked {
     /// The body of a request of `kind`.
     pub(crate) fn of(kind: Kind, bytes: Vec<u8>) -> Self {
@@ -336,6 +353,10 @@ struct Asking {
 /// An exchange a peer asked.
 struct Serving {
     peer: PeerId,
+    /// The connection the request came on.
+    epoch: Epoch,
+    /// When its head arrived, on the shard's clock.
+    arrived_ns: u64,
     kind: Kind,
     class: TrafficClass,
     /// The request's body, as it is read, and the bytes of the sender's share it holds.
@@ -351,6 +372,9 @@ struct Serving {
 
 struct Owner {
     driver: Driver,
+    /// What the endpoint's identity is granted as: with a message's kind, the class it is asked in,
+    /// as its peer gives it.
+    role: Sender,
     /// The last instant the shard's clock gave: what an endpoint call is stamped with should the
     /// clock be unreadable (an owner whose shard is ending).
     last: Instant,
@@ -421,7 +445,7 @@ fn unreachable(refusal: Option<Refusal>) -> WireError {
 
 impl Owner {
     fn new(
-        driver: Driver,
+        (driver, role): (Driver, Sender),
         limits: WireLimits,
         answers: CommandSender<(ExchangeId, Option<Reply>)>,
         enrollment: Option<u32>,
@@ -429,6 +453,7 @@ impl Owner {
         let last = driver.clock().unwrap_or_else(|_| Instant::now());
         Self {
             driver,
+            role,
             last,
             limits,
             serve: None,
@@ -628,8 +653,9 @@ impl Owner {
                     let Some(body) = serving.parked.take() else {
                         continue;
                     };
-                    let (peer, kind, class) = (serving.peer, serving.kind, serving.class);
-                    self.handle(exchange, peer, kind, class, body);
+                    let (peer, epoch) = (serving.peer, serving.epoch);
+                    let (kind, class) = (serving.kind, serving.class);
+                    self.handle(exchange, (peer, epoch), (kind, class), body);
                 }
             }
             Command::Path { peer, reply } => {
@@ -700,8 +726,7 @@ impl Owner {
         self.peers.insert(
             peer,
             PeerState {
-                epoch: None,
-                negotiated: None,
+                connections: BTreeMap::new(),
                 dialed: Some(DialState {
                     route,
                     offers,
@@ -760,7 +785,7 @@ impl Owner {
             let _ = reply.send(Err(WireError::Connection));
             return;
         };
-        if let (Some(epoch), Some(negotiated)) = (state.epoch, state.negotiated) {
+        if let Some((epoch, Some(negotiated))) = state.current() {
             let _ = reply.send(Ok(Linked {
                 peer,
                 epoch,
@@ -780,7 +805,7 @@ impl Owner {
         dial.waiting.push(reply);
         // A dial in progress or a connection being greeted is joined; a route whose connection
         // went is dialed again, once.
-        let idle = !dial.dialing && state.epoch.is_none();
+        let idle = !dial.dialing && state.connections.is_empty();
         if idle {
             self.dial(peer, address);
         }
@@ -809,7 +834,11 @@ impl Owner {
         period: Duration,
         reply: OneshotSender<Result<Answer, Failed>>,
     ) {
-        let current = self.peers.get(&peer).and_then(|state| state.epoch);
+        let current = self
+            .peers
+            .get(&peer)
+            .and_then(|state| state.current())
+            .map(|(current, _)| current);
         if current != Some(epoch) || self.closing {
             let _ = reply.send(Err(Failed {
                 error: WireError::Connection,
@@ -817,7 +846,7 @@ impl Owner {
             }));
             return;
         }
-        let Some(class) = FocalClasses::class_of(kind, Sender::Node) else {
+        let Some(class) = FocalClasses::class_of(kind, self.role) else {
             let _ = reply.send(Err(Failed {
                 error: WireError::InvalidFrame,
                 closed: false,
@@ -849,7 +878,16 @@ impl Owner {
         period: Duration,
         reply: Option<OneshotSender<Result<Answer, Failed>>>,
     ) -> Result<ExchangeId, (Refusal, Option<OneshotSender<Result<Answer, Failed>>>)> {
-        let progress = match Progress::new(period) {
+        // The peer is given `period` to answer once it has the request, and its answer the path's
+        // probe timeout to arrive (RFC 9002 §6.2.1): judged at the period alone, an answer sent a
+        // moment before it was late by its own flight (the 1 MB seal across 128 kbit/s, two runs
+        // of three, 2026-10-10). The peer answers "not yet" within the period by its own margin.
+        let delivery = self
+            .driver
+            .endpoint()
+            .path(peer)
+            .map_or(Duration::ZERO, |facts| facts.probe_timeout);
+        let progress = match Progress::new(period.saturating_add(delivery)) {
             Ok(progress) => progress,
             Err(refusal) => return Err((refusal, reply)),
         };
@@ -1023,10 +1061,11 @@ impl Owner {
             Event::Request {
                 exchange,
                 peer,
+                epoch,
                 kind,
                 class,
                 body,
-            } => self.request(exchange, peer, kind, class, body),
+            } => self.request((exchange, peer, epoch), kind, class, body),
             Event::Reply { exchange, body } => self.reply(exchange, body),
             Event::BodyReady { exchange } => {
                 if self.asking.contains_key(&exchange) {
@@ -1101,12 +1140,11 @@ impl Owner {
         self.dialed(peer);
         self.driver.endpoint().directory_mut().set_live(peer, true);
         let state = self.peers.entry(peer).or_insert(PeerState {
-            epoch: None,
-            negotiated: None,
+            connections: BTreeMap::new(),
             dialed: None,
         });
-        state.epoch = Some(epoch);
-        state.negotiated = None;
+        // Its own, until its greeting is answered; the peer's other connections keep theirs.
+        state.connections.insert(epoch, None);
         let Some(dial) = state.dialed.as_mut() else {
             return;
         };
@@ -1153,11 +1191,10 @@ impl Owner {
         let Some(state) = self.peers.get_mut(&peer) else {
             return;
         };
-        if state.epoch != Some(epoch) {
+        if state.connections.remove(&epoch).is_none() || !state.connections.is_empty() {
+            // Not one of its connections, or not its last: the peer is up on another.
             return;
         }
-        state.epoch = None;
-        state.negotiated = None;
         self.driver.endpoint().directory_mut().set_live(peer, false);
         // A dial whose connection closed before its greeting was answered: its certificate
         // refused by the listener (RFC 8446 §4.4.4), or the listener full.
@@ -1191,7 +1228,7 @@ impl Owner {
         let never = self
             .peers
             .get(&peer)
-            .is_some_and(|state| state.epoch.is_none() && state.negotiated.is_none());
+            .is_some_and(|state| state.connections.is_empty());
         if never && let Some(state) = self.peers.remove(&peer) {
             if let Some(dial) = state.dialed {
                 self.routes.remove(&dial.route);
@@ -1206,7 +1243,7 @@ impl Owner {
         let live = self
             .peers
             .values()
-            .filter(|state| state.epoch.is_some())
+            .filter(|state| !state.connections.is_empty())
             .count();
         self.driver
             .endpoint()
@@ -1219,13 +1256,17 @@ impl Owner {
 
     fn request(
         &mut self,
-        exchange: ExchangeId,
-        peer: PeerId,
+        (exchange, peer, epoch): (ExchangeId, PeerId, Epoch),
         kind: Kind,
         class: TrafficClass,
         body: Option<u64>,
     ) {
-        let negotiated = self.peers.get(&peer).and_then(|state| state.negotiated);
+        // The profile of the connection the request came on: a peer's connections are greeted
+        // each on its own.
+        let negotiated = self
+            .peers
+            .get(&peer)
+            .and_then(|state| state.negotiated(epoch));
         // What the body may be: a greeting's bound, an enrollment message's, or the profile the
         // connection negotiated; a request before its connection's greeting is refused, as is a
         // message of the enrollment protocol where it is not served.
@@ -1295,6 +1336,8 @@ impl Owner {
             exchange,
             Serving {
                 peer,
+                epoch,
+                arrived_ns: hyper_rt::futures::now_ns(),
                 kind,
                 class,
                 reading: Some(reading),
@@ -1327,7 +1370,8 @@ impl Owner {
         let Some(reading) = serving.reading.take() else {
             return;
         };
-        let (peer, kind, class) = (serving.peer, serving.kind, serving.class);
+        let (peer, epoch) = (serving.peer, serving.epoch);
+        let (kind, class) = (serving.kind, serving.class);
         // The body leaves the reservation for its handler; its bytes go back to the budget, and
         // the sender's share stays held until the exchange ends.
         let granted = reading.granted();
@@ -1343,28 +1387,27 @@ impl Owner {
             }
             return;
         }
-        self.handle(exchange, peer, kind, class, body);
+        self.handle(exchange, (peer, epoch), (kind, class), body);
     }
 
     /// A request read whole: a greeting is answered here, the rest go to their tasks.
     fn handle(
         &mut self,
         exchange: ExchangeId,
-        peer: PeerId,
-        kind: Kind,
-        class: TrafficClass,
+        (peer, epoch): (PeerId, Epoch),
+        (kind, class): (Kind, TrafficClass),
         body: Vec<u8>,
     ) {
         match kind {
-            Kind::Hello => self.greet(exchange, peer, &body),
+            Kind::Hello => self.greet(exchange, (peer, epoch), &body),
             Kind::Operation(_) | Kind::Enrollment(_) => {
-                self.dispatch(exchange, peer, kind, class, body)
+                self.dispatch(exchange, (peer, epoch), (kind, class), body)
             }
         }
     }
 
     /// Answers a peer's greeting with the profile both speak.
-    fn greet(&mut self, exchange: ExchangeId, peer: PeerId, body: &[u8]) {
+    fn greet(&mut self, exchange: ExchangeId, (peer, epoch): (PeerId, Epoch), body: &[u8]) {
         let reply = match decode_payload::<Hello>(body) {
             Ok(hello) => {
                 let [managed, participant, native, ordered] = self
@@ -1376,8 +1419,13 @@ impl Owner {
                     .negotiate_ordered(&hello, managed, participant, native, ordered)
                 {
                     Ok(negotiated) => {
-                        if let Some(state) = self.peers.get_mut(&peer) {
-                            state.negotiated = Some(negotiated);
+                        // The connection it came on is greeted; the peer's others are as they were.
+                        if let Some(greeted) = self
+                            .peers
+                            .get_mut(&peer)
+                            .and_then(|state| state.connections.get_mut(&epoch))
+                        {
+                            *greeted = Some(negotiated);
                         }
                         HelloReply::Accepted(negotiated)
                     }
@@ -1394,11 +1442,14 @@ impl Owner {
     fn dispatch(
         &mut self,
         exchange: ExchangeId,
-        peer: PeerId,
-        kind: Kind,
-        class: TrafficClass,
+        (peer, epoch): (PeerId, Epoch),
+        (kind, class): (Kind, TrafficClass),
         body: Vec<u8>,
     ) {
+        let arrived_ns = self
+            .serving
+            .get(&exchange)
+            .map_or_else(hyper_rt::futures::now_ns, |serving| serving.arrived_ns);
         let Some(from) = self.driver.endpoint().directory().inbound(peer).cloned() else {
             self.end_serving(exchange);
             return;
@@ -1408,7 +1459,10 @@ impl Owner {
             .endpoint()
             .path(peer)
             .map_or(Duration::ZERO, |facts| facts.rtt);
-        let negotiated = self.peers.get(&peer).and_then(|state| state.negotiated);
+        let negotiated = self
+            .peers
+            .get(&peer)
+            .and_then(|state| state.negotiated(epoch));
         let served = Served {
             kind,
             class,
@@ -1416,6 +1470,7 @@ impl Owner {
             from,
             negotiated,
             path,
+            arrived_ns,
         };
         let Some(serve) = self.serve.as_ref() else {
             self.end_serving(exchange);
@@ -1514,7 +1569,8 @@ impl Owner {
         let Some(state) = self.peers.get_mut(&peer) else {
             return;
         };
-        let Some(epoch) = state.epoch else {
+        // This side's greeting went on its dial's connection, the current one.
+        let Some((epoch, _)) = state.current() else {
             return;
         };
         let (max_frame_bytes, max_items) = (self.limits.max_frame_bytes, self.limits.max_items);
@@ -1538,7 +1594,9 @@ impl Owner {
         dial.hello = None;
         match outcome {
             Ok(negotiated) => {
-                state.negotiated = Some(negotiated);
+                if let Some(greeted) = state.connections.get_mut(&epoch) {
+                    *greeted = Some(negotiated);
+                }
                 let linked = Linked {
                     peer,
                     epoch,

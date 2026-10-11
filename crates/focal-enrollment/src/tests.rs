@@ -727,7 +727,10 @@ async fn pin_precedes_token_and_unknown_commit_retries() {
     let limits = TransportLimits::default();
     let connector = focal_wire::QuicConnector::bind(
         "127.0.0.1:0".parse().unwrap(),
-        focal_wire::ClientTls::from_config(invitation.client_config().unwrap()),
+        focal_wire::ClientTls::from_config(
+            invitation.client_config().unwrap(),
+            focal_wire::net::Sender::Joiner,
+        ),
         limits.wire().unwrap(),
         limits.budget().unwrap(),
     )

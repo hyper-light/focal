@@ -11,7 +11,7 @@ use crate::*;
 use focal_memory::MemoryBudget;
 use hyper_transport::congestion::{Congestion, CopaConfig};
 use hyper_transport::tls::Tls;
-use hyper_transport::{Config, Endpoint, Limits, PathFacts, PeerId};
+use hyper_transport::{Classes, Config, Endpoint, Limits, PathFacts, PeerId};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{net::SocketAddr, time::Duration};
 
@@ -158,9 +158,9 @@ pub fn endpoint_limits(
 }
 
 /// What an endpoint under `limits` and `admission` holds of its budget at most, bytes, in two
-/// parts: the transport's own — its receive pool and each connection's receive window, charged to
-/// the ordinary lane — and its messages', a body each way on each stream of each connection at the
-/// frame bound, charged to the lane its class is funded from. A budget of both funds the endpoint
+/// parts: the transport's own — its socket's buffers, its receive pool and each connection's
+/// receive window, charged to the ordinary lane — and its messages', a body each way on each
+/// stream of each connection at the frame bound, charged to the lane its class is funded from. A budget of both funds the endpoint
 /// so that the transport's own bounds refuse before the budget does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndpointBytes {
@@ -180,13 +180,21 @@ pub fn endpoint_bytes(
         .saturating_mul(2)
         .saturating_mul(u64::from(endpoint.streams_per_connection))
         .saturating_mul(connections);
+    let socket = u64::try_from(endpoint_socket_bytes()).unwrap_or(u64::MAX);
     Ok(EndpointBytes {
         transport: endpoint
             .window_ceiling
             .saturating_mul(connections)
-            .saturating_add(pool),
+            .saturating_add(pool)
+            .saturating_add(socket),
         messages,
     })
+}
+
+/// What an endpoint's socket is charged for its life, bytes: the most it holds, its receive
+/// buffers and its outbox (`hyper_rt::udp::Io::held_bound`).
+pub fn endpoint_socket_bytes() -> usize {
+    hyper_rt::udp::Io { batch: IO_BATCH }.held_bound()
 }
 
 /// What one endpoint of `limits` may hold, as an allowance: [`endpoint_bytes`] at the admission
@@ -212,8 +220,16 @@ pub fn endpoint_budget(
 
 /// The server side of focal's TLS: what a listener presents and verifies its clients by.
 pub struct ServerTls(rustls::ServerConfig);
-/// The client side of focal's TLS: what a dial presents and verifies its server by.
-pub struct ClientTls(rustls::ClientConfig);
+/// The client side of focal's TLS: what a dial presents and verifies its server by, and the role
+/// its identity is granted as. A message's class is its kind's for its sender's role, decided alike
+/// by the server, which knows the role from the grant, and by the dialer, which sends it in that
+/// class (`net::classes`): a connector of a node's identity is a node's, any other a participant's,
+/// a join's a joiner's. A connector told a role its identity is not granted has its exchanges
+/// refused for their classes.
+pub struct ClientTls {
+    config: rustls::ClientConfig,
+    role: Sender,
+}
 impl ServerTls {
     /// A configuration the caller built: its certificate resolver, client verifier and protocols
     /// (a listener that serves enrollment beside the data protocol). The endpoint holds it to the
@@ -228,14 +244,19 @@ impl ServerTls {
     }
 }
 impl ClientTls {
-    /// A configuration the caller built (an enrollment's pinned verifier, without client auth).
-    pub fn from_config(config: rustls::ClientConfig) -> Self {
-        Self(config)
+    /// A configuration the caller built (an enrollment's pinned verifier, without client auth),
+    /// for an identity granted as `role`.
+    pub fn from_config(config: rustls::ClientConfig, role: Sender) -> Self {
+        Self { config, role }
+    }
+    /// The role the identity is granted as.
+    pub fn role(&self) -> Sender {
+        self.role
     }
     /// The configuration, for an endpoint a test drives itself.
     #[cfg(test)]
     pub(crate) fn into_config(self) -> rustls::ClientConfig {
-        self.0
+        self.config
     }
 }
 
@@ -268,6 +289,7 @@ pub fn client_tls(
     identity: TlsIdentity,
     server_roots: Vec<Vec<u8>>,
     limits: &WireLimits,
+    role: Sender,
 ) -> Result<ClientTls, WireError> {
     limits.validate()?;
     let provider = crate::crypto_provider();
@@ -280,7 +302,7 @@ pub fn client_tls(
     )
     .build()
     .map_err(|_| WireError::Authentication)?;
-    client_tls_with(identity, verifier, limits)
+    client_tls_with(identity, verifier, limits, role)
 }
 /// [`client_tls`] for a client that adopts an issuer a verified chain
 /// carried endorsed and it did not hold (24 §11): the configuration, and
@@ -289,18 +311,20 @@ pub fn client_tls_adopting(
     identity: TlsIdentity,
     server_roots: Vec<Vec<u8>>,
     limits: &WireLimits,
+    role: Sender,
 ) -> Result<(ClientTls, crate::AdoptedRoots), WireError> {
     limits.validate()?;
     let (verifier, adopted) = crate::AdoptingServerVerifier::new(
         crate::TrustRoots::new(server_roots)?,
         crate::crypto_provider(),
     )?;
-    Ok((client_tls_with(identity, verifier, limits)?, adopted))
+    Ok((client_tls_with(identity, verifier, limits, role)?, adopted))
 }
 fn client_tls_with(
     identity: TlsIdentity,
     verifier: Box<dyn rustls::client::danger::ServerCertVerifier>,
     limits: &WireLimits,
+    role: Sender,
 ) -> Result<ClientTls, WireError> {
     limits.validate()?;
     let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto_provider())
@@ -311,7 +335,7 @@ fn client_tls_with(
         .with_client_auth_cert(identity.certificate_chain, identity.private_key)
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(ClientTls(tls))
+    Ok(ClientTls { config: tls, role })
 }
 /// The client side of a listener, which never dials: no root, so no server verifies, and the
 /// data protocol named so the endpoint takes it.
@@ -341,7 +365,7 @@ const IO_BATCH: usize = 32;
 #[allow(clippy::too_many_arguments)]
 fn start(
     bind: Bind,
-    tls: Tls,
+    (tls, role): (Tls, Sender),
     directory: NetDirectory,
     limits: &WireLimits,
     admission: &AdmissionLimits,
@@ -349,10 +373,10 @@ fn start(
     revocations: Option<hyper_rt::sync::WatchReceiver>,
     enrollment: Option<u32>,
 ) -> Result<(Network, SocketAddr), WireError> {
-    let driver = endpoint_driver(bind, tls, directory, limits, admission, budget)?;
+    let driver = endpoint_driver(bind, (tls, role), directory, limits, admission, budget)?;
     let local = driver.local_addr().map_err(|_| WireError::Connection)?;
     let network = Network::start(
-        driver,
+        (driver, role),
         limits.clone(),
         command_queue(limits),
         revocations,
@@ -390,10 +414,11 @@ impl From<std::net::UdpSocket> for Bind {
 }
 
 /// An endpoint carrying focal's traffic on `bind`, its socket the current shard's, and not yet
-/// driven: what [`start`] gives an owner.
+/// driven: what [`start`] gives an owner. `role` is what the endpoint's identity is granted as,
+/// which with a message's kind gives the class it sends it in.
 pub(crate) fn endpoint_driver(
     bind: impl Into<Bind>,
-    tls: Tls,
+    (tls, role): (Tls, Sender),
     directory: NetDirectory,
     limits: &WireLimits,
     admission: &AdmissionLimits,
@@ -401,20 +426,18 @@ pub(crate) fn endpoint_driver(
 ) -> Result<Driver, WireError> {
     let config = Config {
         tls,
-        role: Sender::Node,
+        role,
         limits: endpoint_limits(limits, admission)?,
         congestion: congestion(),
     };
+    let io = hyper_rt::udp::Io { batch: IO_BATCH };
+    // The socket's buffers are the endpoint's from the start: charged their bound now.
+    let budget = NetBudget::new(budget, endpoint_socket_bytes()).map_err(|_| WireError::Limit)?;
     // Made the instant before the driver anchors its clock to the shard's: every later instant
     // the driver gives it is that anchor's or after.
-    let endpoint: Endpoint<FocalClasses, NetBudget, NetDirectory> = Endpoint::new(
-        config,
-        NetBudget::new(budget),
-        directory,
-        std::time::Instant::now(),
-    )
-    .map_err(|_| WireError::Authentication)?;
-    let io = hyper_rt::udp::Io { batch: IO_BATCH };
+    let endpoint: Endpoint<FocalClasses, NetBudget, NetDirectory> =
+        Endpoint::new(config, budget, directory, std::time::Instant::now())
+            .map_err(|_| WireError::Authentication)?;
     match bind.into() {
         Bind::Address(address) => Driver::bind(endpoint, address, io),
         Bind::Socket(socket) => hyper_rt::udp::UdpSocket::adopt(socket.into())
@@ -481,9 +504,10 @@ impl QuicServer {
             server: Some(tls.0),
             client: listener_client()?,
         };
+        // A listener is a node's: what it sends, it sends as one.
         let (network, address) = start(
             address.into(),
-            tls,
+            (tls, Sender::Node),
             directory,
             &limits,
             &admission,
@@ -601,7 +625,11 @@ impl<H: RequestHandler + Clone> DataService<H> {
         Box::pin(async move { this.answer_now(served).await })
     }
     async fn answer_now(self, served: Served) -> Option<Reply> {
-        let Inbound::Data { fingerprint, .. } = served.from else {
+        let Inbound::Data {
+            fingerprint,
+            peer: authenticated,
+        } = served.from
+        else {
             return None;
         };
         let Kind::Operation(tag) = served.kind else {
@@ -609,8 +637,12 @@ impl<H: RequestHandler + Clone> DataService<H> {
         };
         let negotiated = served.negotiated?;
         let request: RequestEnvelope = decode_payload(&served.body).ok()?;
-        // The operation is the one its kind named, of the class it was carried in.
-        if request.operation.registered_tag() != tag || request.operation.class() != served.class {
+        // The operation is the one its kind named, of the class its sender's role carries it in.
+        let carried = FocalClasses::class_of(
+            Kind::Operation(request.operation.registered_tag()),
+            Sender::of(authenticated.role()),
+        );
+        if request.operation.registered_tag() != tag || carried != Some(served.class) {
             return None;
         }
         let mut limits = self.limits.clone();
@@ -620,7 +652,14 @@ impl<H: RequestHandler + Clone> DataService<H> {
             // What is dispatched is authorized by the grant current now, never by one captured
             // before its body arrived (the audit's F35).
             let peer = self.registry.authenticate(fingerprint).ok()?;
-            dispatch_accounted_by(&self.handler, peer, request, &limits, served.path).await
+            dispatch_accounted_by(
+                &self.handler,
+                peer,
+                request,
+                &limits,
+                (served.path, served.arrived_ns),
+            )
+            .await
         } else {
             OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
         };
@@ -650,6 +689,8 @@ impl<H: RequestHandler + Clone> Serve for DataService<H> {
 pub struct QuicConnector {
     network: Network,
     limits: WireLimits,
+    /// What the connector's identity is granted as: a replacement identity must be the same.
+    role: Sender,
     /// The profiles offered in every Hello, the newest first: all this
     /// binary speaks, unless [`Self::offering`] made it an older one.
     offers: Vec<u16>,
@@ -678,13 +719,14 @@ impl QuicConnector {
         limits.validate()?;
         let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
         let directory = NetDirectory::dialing(limits.max_connections);
+        let role = tls.role;
         let tls = Tls {
             server: None,
-            client: tls.0,
+            client: tls.config,
         };
         let (network, _) = start(
             Bind::Address(address),
-            tls,
+            (tls, role),
             directory,
             &limits,
             &admission,
@@ -695,6 +737,7 @@ impl QuicConnector {
         Ok(Self {
             network,
             limits,
+            role,
             offers: OFFERED_PROTOCOLS.to_vec(),
         })
     }
@@ -726,10 +769,15 @@ impl QuicConnector {
     }
     /// Present another client identity on every connection opened from now
     /// on; connections already open keep the identity they were opened with.
+    /// The identity is granted as the one it replaces (a renewal), or it is
+    /// refused: the connector's messages are sent in its role's classes.
     pub async fn replace_tls(&self, tls: ClientTls) -> Result<(), WireError> {
+        if tls.role != self.role {
+            return Err(WireError::Limit);
+        }
         let tls = Box::new(Tls {
             server: None,
-            client: tls.0,
+            client: tls.config,
         });
         self.network
             .call(|reply| Command::SetTls { tls, reply })

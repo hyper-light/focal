@@ -794,6 +794,7 @@ impl NetworkService {
                 ),
                 state.sponsor.root_certificates(),
                 &limits,
+                focal_wire::net::Sender::Node,
             )?,
             limits.clone(),
             focal_wire::endpoint_budget(&limits, Some(&budget))?,

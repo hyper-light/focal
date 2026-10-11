@@ -473,7 +473,8 @@ impl EnrollmentClient {
     ) -> Result<JoinResponse, JoinTransportError> {
         let connector = QuicConnector::bind(
             self.address,
-            ClientTls::from_config(tls),
+            // A joiner: no grant yet, the enrollment protocol alone.
+            ClientTls::from_config(tls, focal_wire::net::Sender::Joiner),
             self.limits.wire()?,
             self.limits.budget()?,
         )

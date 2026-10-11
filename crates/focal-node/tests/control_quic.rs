@@ -121,10 +121,11 @@ impl Identity {
     fn tls(&self) -> TlsIdentity {
         TlsIdentity::from_pkcs8(vec![self.certificate.clone()], self.key.clone())
     }
-    fn connector(&self, roots: &[Vec<u8>]) -> QuicConnector {
+    /// A connector of this identity, granted as `role`.
+    fn connector(&self, roots: &[Vec<u8>], role: focal_wire::net::Sender) -> QuicConnector {
         QuicConnector::bind_standalone(
             "127.0.0.1:0".parse().unwrap(),
-            client_tls(self.tls(), roots.to_vec(), &limits()).unwrap(),
+            client_tls(self.tls(), roots.to_vec(), &limits(), role).unwrap(),
             limits(),
         )
         .unwrap()
@@ -398,8 +399,8 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
         roots.push(authority.ca_certificate().to_vec());
         let operator = pki.issue("operator.focal.test".into());
         let actor = pki.issue("actor.focal.test".into());
-        let operator_connector = operator.connector(&roots);
-        let actor_connector = actor.connector(&roots);
+        let operator_connector = operator.connector(&roots, focal_wire::net::Sender::Participant);
+        let actor_connector = actor.connector(&roots, focal_wire::net::Sender::Participant);
         let mut routes = BTreeMap::new();
         let mut pending = Vec::new();
         for (index, (identity, (replica, allowance))) in identities.iter().zip(seeded).enumerate() {
@@ -453,7 +454,7 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
                 focal_rt::spawn(async move { serving_server.serve(handler).await }).unwrap();
             let pool = std::rc::Rc::new(
                 PeerConnectionPool::new(
-                    identity.connector(&roots),
+                    identity.connector(&roots, focal_wire::net::Sender::Node),
                     PeerPoolLimits {
                         max_routes: 3,
                         max_connections: 3,
@@ -509,7 +510,7 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
         assert_eq!(receipt.revisions.root, 1);
         // Enrolled nodes discover public control state and membership through the
         // same quorum barrier, without receiving operator/control-write authority.
-        let node_connector = identities[0].connector(&roots);
+        let node_connector = identities[0].connector(&roots, focal_wire::net::Sender::Node);
         let node_remote = node_connector
             .connect(
                 replicas[first].server.local_addr().unwrap(),

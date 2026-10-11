@@ -146,18 +146,26 @@ pub async fn dispatch_accounted(
     request: RequestEnvelope,
     limits: &WireLimits,
 ) -> OwnedResponse {
-    dispatch_accounted_by(handler, peer, request, limits, std::time::Duration::ZERO).await
+    dispatch_accounted_by(
+        handler,
+        peer,
+        request,
+        limits,
+        (std::time::Duration::ZERO, hyper_rt::futures::now_ns()),
+    )
+    .await
 }
 /// [`dispatch_accounted`] for a request that came by a path whose round
 /// trip is `path`, as the serving connection measures it: what a handler
-/// holds a frame that overtook another for (27 §12). Zero where there is
-/// no path.
+/// holds a frame that overtook another for (27 §12), zero where there is
+/// no path; and whose head arrived at `arrived_ns` on the shard's clock,
+/// which its answer's time is counted from.
 pub async fn dispatch_accounted_by(
     handler: &dyn RequestHandler,
     peer: AuthenticatedPeer,
     request: RequestEnvelope,
     limits: &WireLimits,
-    path: std::time::Duration,
+    (path, arrived_ns): (std::time::Duration, u64),
 ) -> OwnedResponse {
     if let Err(error) = limits.validate() {
         return OwnedResponse::new(request.reply(Response::Error(error)));
@@ -202,7 +210,10 @@ pub async fn dispatch_accounted_by(
                 .reply(Response::Error(AccessError::UnsupportedProtocol)),
         );
     }
-    let period = answer_within(limits.request_timeout, path);
+    // Counted from when the head arrived: what the request waited for its body and its task is
+    // the answer's time spent already.
+    let waited = hyper_rt::futures::now_ns().saturating_sub(arrived_ns);
+    let period = answer_within(limits.request_timeout, path).saturating_sub(waited);
     let response =
         match hyper_rt::futures::within(period, handler.handle_accounted(&verified)).await {
             Ok(Some(response)) => response,

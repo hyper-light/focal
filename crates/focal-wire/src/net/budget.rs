@@ -1,7 +1,9 @@
 //! The transport's bytes, held against the node's memory budget (`focal_memory::MemoryBudget`), as
 //! focal-wire held the request bodies it admitted (the audit's F03): every byte hyper-transport
 //! reserves — a connection's receive window, a message's head, a body the owner reads, a frame — is
-//! a `Pending` charge before it is allocated, given back when the reservation is.
+//! a `Pending` charge before it is allocated, given back when the reservation is. The endpoint's
+//! socket is charged the most it holds (`hyper_rt::udp::Io::held_bound`: its receive buffers and its
+//! outbox) when the endpoint is made, and given back when it is dropped.
 //!
 //! The control class (consensus, liveness, the fleet's own control) is funded from the completion
 //! lane, which ordinary work cannot spend, so participants' bodies and content never starve what keeps
@@ -22,6 +24,8 @@ const COMPLETION: u8 = 2;
 #[derive(Debug)]
 pub(crate) struct NetBudget {
     budget: MemoryBudget,
+    /// The endpoint's socket, charged its bound for the endpoint's life.
+    socket: Allocation,
     /// What the endpoint holds on each lane, one allocation each: a grant is absorbed into it, a
     /// release shrinks it.
     ordinary: Option<Allocation>,
@@ -33,6 +37,8 @@ pub(crate) struct NetBudget {
 /// What an endpoint holds of the budget, and what it was refused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NetBudgetStats {
+    /// Bytes the endpoint's socket is charged, on the ordinary lane.
+    pub socket: usize,
     /// Bytes held on the ordinary lane.
     pub ordinary: usize,
     /// Bytes held on the completion lane.
@@ -42,17 +48,28 @@ pub struct NetBudgetStats {
 }
 
 impl NetBudget {
-    pub(crate) fn new(budget: MemoryBudget) -> Self {
-        Self {
+    /// The budget of an endpoint whose socket holds at most `socket` bytes, which are charged now
+    /// and held while the endpoint lives; refused when the budget cannot fund them.
+    pub(crate) fn new(
+        budget: MemoryBudget,
+        socket: usize,
+    ) -> Result<Self, focal_memory::MemoryError> {
+        let socket = budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, socket)?
+            .commit();
+        Ok(Self {
             budget,
+            socket,
             ordinary: None,
             completion: None,
             refused: 0,
-        }
+        })
     }
 
-    /// What the lane a class's bodies are funded from holds in all, bytes: the budget's limit for
-    /// the control class, which may spend the completion reserve, and the rest for the others.
+    /// What the lane a class's bodies are funded from holds for the endpoint's peers in all, bytes:
+    /// the budget's limit for the control class, which may spend the completion reserve, and the
+    /// rest for the others, less the socket's charge, which is the endpoint's own and no peer's
+    /// share of it.
     pub(crate) fn capacity(&self, class: TrafficClass) -> u64 {
         let stats = self.budget.stats();
         let lane = match class {
@@ -61,11 +78,12 @@ impl NetBudget {
                 stats.limit.saturating_sub(stats.completion_reserve)
             }
         };
-        u64::try_from(lane).unwrap_or(u64::MAX)
+        u64::try_from(lane.saturating_sub(self.socket.bytes())).unwrap_or(u64::MAX)
     }
 
     pub(crate) fn stats(&self) -> NetBudgetStats {
         NetBudgetStats {
+            socket: self.socket.bytes(),
             ordinary: self.ordinary.as_ref().map_or(0, Allocation::bytes),
             completion: self.completion.as_ref().map_or(0, Allocation::bytes),
             refused: self.refused,
@@ -146,7 +164,7 @@ mod tests {
     #[test]
     fn every_byte_is_charged_on_its_lane_and_given_back_there() {
         let memory = budget(1 << 20, 64 << 10);
-        let mut net = NetBudget::new(memory.clone());
+        let mut net = NetBudget::new(memory.clone(), 0).unwrap();
         let control = net
             .reserve(1000, Lane::Class(TrafficClass::Control))
             .unwrap();
@@ -159,6 +177,7 @@ mod tests {
         assert_eq!(
             net.stats(),
             NetBudgetStats {
+                socket: 0,
                 ordinary: 8000,
                 completion: 1000,
                 refused: 0
@@ -178,7 +197,7 @@ mod tests {
     #[test]
     fn ordinary_bytes_never_take_the_completion_reserve_and_control_still_can() {
         let memory = budget(64 << 10, 16 << 10);
-        let mut net = NetBudget::new(memory);
+        let mut net = NetBudget::new(memory, 0).unwrap();
         let held = net
             .reserve(48 << 10, Lane::Class(TrafficClass::Exchange))
             .unwrap();
@@ -193,5 +212,31 @@ mod tests {
         net.release(held);
         net.release(control);
         assert_eq!((net.stats().ordinary, net.stats().completion), (0, 0));
+    }
+
+    /// The socket is charged its bound when the endpoint is made, held while it lives and given back
+    /// with it; a budget that cannot fund the socket refuses the endpoint.
+    #[test]
+    fn the_socket_is_charged_its_bound_for_the_endpoints_life() {
+        let memory = budget(1 << 20, 64 << 10);
+        let socket = hyper_rt::udp::Io { batch: 4 }.held_bound();
+        let net = NetBudget::new(memory.clone(), socket).unwrap();
+        assert_eq!(net.stats().socket, socket);
+        // What the endpoint's peers share is the lane less the socket.
+        let lane = (1usize << 20) - (64 << 10) - socket;
+        assert_eq!(
+            net.capacity(TrafficClass::Exchange),
+            u64::try_from(lane).unwrap()
+        );
+        assert_eq!(
+            net.capacity(TrafficClass::Control),
+            u64::try_from((1usize << 20) - socket).unwrap()
+        );
+        assert_eq!(memory.stats().used_by(BudgetKind::Pending), socket);
+        drop(net);
+        assert_eq!(memory.stats().used_by(BudgetKind::Pending), 0);
+        let small = budget(socket - 1, 0);
+        assert!(NetBudget::new(small.clone(), socket).is_err());
+        assert_eq!(small.stats().used, 0);
     }
 }

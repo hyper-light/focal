@@ -148,6 +148,19 @@ pub(crate) struct Headers {
 // point to that anyone reads.
 unsafe impl Send for Headers {}
 
+/// The bytes one message of a batch holds in a send's and a receive's headers together, and in the
+/// receive's account of it: what [`super::Io::held_bound`] adds a message on Linux.
+pub(crate) const fn message_bytes() -> usize {
+    let headers = size_of::<libc::mmsghdr>()
+        .saturating_add(size_of::<libc::iovec>())
+        .saturating_add(size_of::<libc::sockaddr_storage>())
+        .saturating_add(size_of::<Control>())
+        .saturating_add(size_of::<usize>());
+    headers
+        .saturating_mul(2)
+        .saturating_add(size_of::<Received>())
+}
+
 impl Headers {
     /// Headers for up to `batch` messages.
     pub(crate) fn new(batch: usize) -> Self {

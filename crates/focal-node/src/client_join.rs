@@ -339,6 +339,7 @@ impl PendingClientJoin {
             ),
             self.trust_roots()?,
             limits,
+            focal_wire::net::Sender::Participant,
         )?;
         let actor = focal_model::ParticipantId(receipt.identity.principal);
         Ok(EnrolledClient {

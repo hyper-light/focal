@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyper_transport::{Authenticated, Directory, PeerId};
 
 use super::classes::Sender;
-use crate::{AuthenticatedPeer, PeerRegistry, PeerRole, certificate_fingerprint};
+use crate::{AuthenticatedPeer, PeerRegistry, certificate_fingerprint};
 
 /// The leaves a dial accepts, beside the chain and name its TLS verified: a leaf is accepted when
 /// its BLAKE3 key derivation under `context` — the caller's own fingerprint domain — is one of
@@ -245,10 +245,7 @@ impl Directory for NetDirectory {
             .as_ref()?
             .authenticate_certificate(certificate)
             .ok()?;
-        let sender = match peer.role() {
-            PeerRole::Node { .. } => Sender::Node,
-            PeerRole::Actor | PeerRole::Evaluator | PeerRole::Runtime => Sender::Participant,
-        };
+        let sender = Sender::of(peer.role());
         let fingerprint = certificate_fingerprint(certificate);
         let id = match self.by_fingerprint.get(&fingerprint).copied() {
             Some(id) => {

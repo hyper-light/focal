@@ -437,7 +437,13 @@ fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and
                 focal_rt::spawn(async move { serving_server.serve(handler).await }).unwrap();
             let connector = QuicConnector::bind_standalone(
                 "127.0.0.1:0".parse().unwrap(),
-                client_tls(tls(material), roots.clone(), &limits).unwrap(),
+                client_tls(
+                    tls(material),
+                    roots.clone(),
+                    &limits,
+                    focal_wire::net::Sender::Node,
+                )
+                .unwrap(),
                 limits.clone(),
             )
             .unwrap();

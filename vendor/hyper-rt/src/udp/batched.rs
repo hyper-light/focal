@@ -53,6 +53,30 @@ pub struct Io {
     pub batch: usize,
 }
 
+impl Io {
+    /// The most a real socket batched by this `Io` holds while it lives, bytes, and so what its owner
+    /// charges for it: its receive buffers ([`RECEIVE_BYTES`] each, `batch` of them on Linux and one
+    /// elsewhere), its outbox (`batch` slots, each a datagram or a segmented send of at most
+    /// [`RECEIVE_BYTES`], [`IoStats::oversize`] past it) and, on Linux, the message headers of a send and a
+    /// receive. A socket holds as much once it has sent its largest datagrams and received a full batch.
+    pub fn held_bound(&self) -> usize {
+        let receive = if cfg!(target_os = "linux") {
+            self.batch
+        } else {
+            1
+        };
+        let slot = RECEIVE_BYTES.saturating_add(size_of::<Slot>());
+        #[cfg(target_os = "linux")]
+        let headers = linux::message_bytes().saturating_mul(self.batch);
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        receive
+            .saturating_mul(RECEIVE_BYTES)
+            .saturating_add(self.batch.saturating_mul(slot))
+            .saturating_add(headers)
+    }
+}
+
 /// What a socket has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IoStats {
@@ -78,6 +102,9 @@ pub struct IoStats {
     /// Whether the kernel stamps each datagram received (Linux's `SO_TIMESTAMPNS`, macOS's
     /// `SO_TIMESTAMP_MONOTONIC`); otherwise a datagram is stamped when it is read.
     pub kernel_stamps: bool,
+    /// Datagrams dropped because they were larger than a slot holds ([`RECEIVE_BYTES`]): no UDP payload
+    /// or segmented send is, so one is a caller's fault, and the slot never grows past its bound for it.
+    pub oversize: u64,
 }
 
 /// Where and when a datagram arrived.
@@ -370,14 +397,44 @@ impl Batched {
         self.slots.get_mut(self.queued)
     }
 
-    /// Queues the slot [`Batched::slot`] gave.
+    /// Queues the slot [`Batched::slot`] gave; one filled past [`RECEIVE_BYTES`] is dropped and counted
+    /// ([`IoStats::oversize`]) and gives back what it grew past its bound.
     pub fn commit(&mut self) {
+        if let Some(slot) = self.slots.get_mut(self.queued)
+            && slot.bytes.len() > RECEIVE_BYTES
+        {
+            slot.bytes.clear();
+            slot.bytes.shrink_to(RECEIVE_BYTES);
+            self.stats.oversize = self.stats.oversize.saturating_add(1);
+            return;
+        }
         self.queued = self.queued.saturating_add(1).min(self.batch);
+    }
+
+    /// What the socket holds now, bytes: its receive buffers, its outbox's slots and what each slot holds,
+    /// and on Linux its message headers. Never more than [`Io::held_bound`] of its `Io`.
+    pub fn held_bytes(&self) -> usize {
+        let buffers = self.buffers.iter().fold(0usize, |held, buffer| {
+            held.saturating_add(buffer.capacity())
+        });
+        let slots = self.slots.iter().fold(0usize, |held, slot| {
+            held.saturating_add(size_of::<Slot>())
+                .saturating_add(slot.bytes.capacity())
+        });
+        #[cfg(target_os = "linux")]
+        let headers = linux::message_bytes().saturating_mul(self.batch);
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        buffers.saturating_add(slots).saturating_add(headers)
     }
 
     /// Queues a copy of `bytes` for `to`; with the outbox full it is dropped and counted, and `false`
     /// returned.
     pub fn queue(&mut self, to: SocketAddr, bytes: &[u8]) -> bool {
+        if bytes.len() > RECEIVE_BYTES {
+            self.stats.oversize = self.stats.oversize.saturating_add(1);
+            return false;
+        }
         let Some(slot) = self.slot() else {
             self.stats.outbox_full = self.stats.outbox_full.saturating_add(1);
             return false;

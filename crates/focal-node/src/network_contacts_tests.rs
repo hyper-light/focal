@@ -197,6 +197,7 @@ fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lost_rep
                 ),
                 vec![authority.ca_certificate().to_vec()],
                 &limits,
+                focal_wire::net::Sender::Node,
             )
             .unwrap(),
             limits.clone(),

@@ -259,6 +259,7 @@ fn pool() -> PeerConnectionPool {
         TlsIdentity::from_pkcs8(vec![cert.clone()], identity.signing_key.serialize_der()),
         vec![cert],
         &WireLimits::default(),
+        focal_wire::net::Sender::Node,
     )
     .unwrap();
     let limits = WireLimits::default();

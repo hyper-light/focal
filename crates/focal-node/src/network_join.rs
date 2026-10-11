@@ -641,6 +641,7 @@ impl JoinedNode {
                     ),
                     self.state.sponsor.root_certificates(),
                     &limits,
+                    focal_wire::net::Sender::Node,
                 )?,
                 limits.clone(),
             )?;

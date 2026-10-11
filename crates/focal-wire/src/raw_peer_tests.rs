@@ -34,12 +34,16 @@ impl RawPeer {
 
     /// A connection to `to` under `tls`, up and not greeted.
     pub(super) async fn dial(tls: ClientTls, to: std::net::SocketAddr) -> Self {
+        let role = tls.role();
         let mut driver = endpoint_driver(
             "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
-            Tls {
-                server: None,
-                client: tls.into_config(),
-            },
+            (
+                Tls {
+                    server: None,
+                    client: tls.into_config(),
+                },
+                role,
+            ),
             NetDirectory::dialing(4),
             &limits(),
             &AdmissionLimits::for_connections(4),
@@ -317,10 +321,13 @@ impl RawServer {
     pub(super) fn listen(tls: ServerTls, registry: PeerRegistry, limits: WireLimits) -> Self {
         let driver = endpoint_driver(
             "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
-            Tls {
-                server: Some(tls.into_config()),
-                client: crate::transport::listener_client().unwrap(),
-            },
+            (
+                Tls {
+                    server: Some(tls.into_config()),
+                    client: crate::transport::listener_client().unwrap(),
+                },
+                crate::net::Sender::Node,
+            ),
             NetDirectory::serving(registry, None, 16),
             &limits,
             &AdmissionLimits::for_connections(4),

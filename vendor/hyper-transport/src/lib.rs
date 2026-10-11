@@ -155,6 +155,10 @@ pub enum Event<C: Classes> {
         exchange: ExchangeId,
         /// Who asked.
         peer: PeerId,
+        /// The epoch of the connection it came on: a peer may hold more than one connection to
+        /// this side at once (its identity's, up to its admission bound), and what an owner keeps
+        /// for a connection is found by it.
+        epoch: Epoch,
         /// What was asked.
         kind: C::Kind,
         /// The class the kind and the asker's role give.
@@ -239,12 +243,13 @@ impl<C: Classes> Debug for Event<C> {
             Self::Request {
                 exchange,
                 peer,
+                epoch,
                 kind,
                 class,
                 body,
             } => write!(
                 formatter,
-                "Request {{ exchange: {exchange:?}, peer: {peer}, kind: {kind:?}, class: {class:?}, body: {body:?} }}"
+                "Request {{ exchange: {exchange:?}, peer: {peer}, epoch: {epoch}, kind: {kind:?}, class: {class:?}, body: {body:?} }}"
             ),
             Self::Reply { exchange, body } => {
                 write!(

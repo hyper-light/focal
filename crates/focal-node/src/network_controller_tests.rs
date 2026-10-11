@@ -304,6 +304,7 @@ fn off_a_shard_or_stopped_controller_clears_existing_ingress_grants() {
             ),
             vec![network.state.sponsor.ca_certificate.clone()],
             &limits,
+            focal_wire::net::Sender::Node,
         )
         .unwrap()
     };
@@ -430,7 +431,7 @@ fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections() {
         let pool = PeerConnectionPool::new(
             QuicConnector::bind_standalone(
                 "127.0.0.1:0".parse().unwrap(),
-                client_tls(identity(), roots, &limits).unwrap(),
+                client_tls(identity(), roots, &limits, focal_wire::net::Sender::Node).unwrap(),
                 limits,
             )
             .unwrap(),
@@ -611,7 +612,7 @@ fn contact_announcement_reaches_alternate_after_blackholed_preferred_leader_with
         ]);
         let connector = QuicConnector::bind_standalone(
             "127.0.0.1:0".parse().unwrap(),
-            client_tls(identity(), roots, &limits).unwrap(),
+            client_tls(identity(), roots, &limits, focal_wire::net::Sender::Node).unwrap(),
             limits,
         )
         .unwrap();

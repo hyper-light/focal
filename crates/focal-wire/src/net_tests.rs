@@ -177,7 +177,7 @@ fn an_enrollment_message_is_answered_on_a_connection_of_its_own_and_only_from_a_
         client_tls.alpn_protocols = vec![ENROLL.to_vec()];
         let connector = QuicConnector::bind(
             "127.0.0.1:0".parse().unwrap(),
-            ClientTls::from_config(client_tls),
+            ClientTls::from_config(client_tls, Sender::Joiner),
             limits(),
             budget(),
         )

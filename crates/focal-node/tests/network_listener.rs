@@ -19,6 +19,7 @@ use focal_model::{
 use focal_node::{
     cluster::InviteIntent, control_host::*, network_listener::NetworkListener, quorum_enrollment::*,
 };
+use focal_wire::net::Sender;
 use focal_wire::*;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
@@ -95,6 +96,7 @@ fn discovery() -> RequestEnvelope {
         },
     }
 }
+/// A connector of a node's credential `material`.
 fn connector(material: &CredentialMaterial, ca: &[u8]) -> QuicConnector {
     QuicConnector::bind_standalone(
         "127.0.0.1:0".parse().unwrap(),
@@ -105,12 +107,15 @@ fn connector(material: &CredentialMaterial, ca: &[u8]) -> QuicConnector {
             ),
             vec![ca.to_vec()],
             &limits(),
+            Sender::Node,
         )
         .unwrap(),
         limits(),
     )
     .unwrap()
 }
+/// A client TLS offering `protocols`, presenting a node's credential `material` or nothing (a
+/// joiner's, which the data protocol refuses).
 fn raw_tls(ca: &[u8], material: Option<&CredentialMaterial>, protocols: Vec<Vec<u8>>) -> ClientTls {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(ca.to_vec())).unwrap();
@@ -133,7 +138,12 @@ fn raw_tls(ca: &[u8], material: Option<&CredentialMaterial>, protocols: Vec<Vec<
         None => builder.with_no_client_auth(),
     };
     tls.alpn_protocols = protocols;
-    ClientTls::from_config(tls)
+    let role = if material.is_some() {
+        Sender::Node
+    } else {
+        Sender::Joiner
+    };
+    ClientTls::from_config(tls, role)
 }
 // Deliberately represent the public serialized request to exercise hostile role
 // and CSR input. Test-only secrets are never formatted or logged.
@@ -162,7 +172,7 @@ async fn edited_join(
     // only once the server's leaf has passed the invitation's pins.
     let connector = QuicConnector::bind_standalone(
         "127.0.0.1:0".parse().unwrap(),
-        ClientTls::from_config(invitation.client_config().unwrap()),
+        ClientTls::from_config(invitation.client_config().unwrap(), Sender::Joiner),
         limits(),
     )
     .unwrap();
@@ -496,6 +506,7 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                 ),
                 vec![ca.clone()],
                 &limits(),
+                Sender::Participant,
             )
             .unwrap(),
             limits(),
@@ -534,18 +545,29 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                 .is_err()
         );
         // Closed transient handshakes/enrollment exchanges release their owned
-        // reservations; only the listener runtime and this established data
-        // connection remain resident. Charged to the listener's admission
-        // changes: each release it still owes pairs with a place it took, so the
-        // changes made so far bound them. An enrollment exchange ends without a
-        // change, its join timeout bounding it inside the frozen window.
+        // reservations; only the listener's own memory and this established data
+        // connection remain charged: its socket (charged at bind) and what its
+        // admission holds for the one connection left — the connection's window
+        // and the receive chunks the endpoint pooled for its life — with nothing
+        // pending. Charged to the listener's admission changes: each release it
+        // still owes pairs with a place it took, so the changes made so far bound
+        // them. An enrollment exchange ends without a change, its join timeout
+        // bounding it inside the frozen window.
         let taken = listener.admission().await.changes;
         owners::counted_async(
             async || vec![listener.admission().await.changes],
             taken,
             Duration::from_millis(5),
             async {
-                while network_budget.stats().used != listener_residency + 64 * 1024 {
+                loop {
+                    let admission = listener.admission().await;
+                    if admission.pending == 0
+                        && admission.connections == 1
+                        && admission.pooled > 0
+                        && network_budget.stats().used == listener_residency + admission.bytes
+                    {
+                        break;
+                    }
                     focal_rt::time::sleep(Duration::from_millis(5))
                         .await
                         .unwrap();
@@ -559,20 +581,53 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
             .connect(address, &founder_name)
             .await
             .unwrap();
-        let stats = network_budget.stats();
-        let pressure = network_budget
-            .reserve(
-                focal_memory::BudgetKind::Control,
-                focal_memory::BudgetLane::Ordinary,
-                stats.limit - stats.completion_reserve - stats.ordinary_used,
-            )
-            .unwrap()
-            .commit();
-        // The ordinary lane is full: no connection is admitted, and a
-        // participant's body is refused before any of it is allocated — the
-        // stream is reset as capacity, the connection kept. A node's body is
-        // funded from the completion reserve and served.
-        assert!(connector.connect(address, &founder_name).await.is_err());
+        // The ordinary lane is filled, and filled again with what the refused
+        // dial below gives back once its handshake has ended.
+        let fill = |pressure: &mut Option<focal_memory::Allocation>| {
+            let stats = network_budget.stats();
+            let room = stats.limit - stats.completion_reserve - stats.ordinary_used;
+            let mut more = network_budget
+                .reserve(
+                    focal_memory::BudgetKind::Control,
+                    focal_memory::BudgetLane::Ordinary,
+                    room,
+                )
+                .unwrap()
+                .commit();
+            match pressure {
+                Some(held) => held.absorb(&mut more).unwrap(),
+                None => *pressure = Some(more),
+            }
+        };
+        let mut pressure = None;
+        fill(&mut pressure);
+        // The ordinary lane is full: no connection is admitted (a dial of its
+        // own, as the route's is held and shared), and a participant's body is
+        // refused before any of it is allocated — the stream is reset as
+        // capacity, the connection kept. A node's body is funded from the
+        // completion reserve and served.
+        assert!(
+            connector
+                .connect_alone(address, &founder_name)
+                .await
+                .is_err()
+        );
+        let settled = listener.admission().await.changes;
+        owners::counted_async(
+            async || vec![listener.admission().await.changes],
+            settled,
+            Duration::from_millis(5),
+            async {
+                while listener.admission().await.pending != 0 {
+                    focal_rt::time::sleep(Duration::from_millis(5))
+                        .await
+                        .unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
+        fill(&mut pressure);
         assert!(actor.request(&discovery()).await.is_err());
         assert!(matches!(
             remote.request(&discovery()).await.unwrap().result,
@@ -591,9 +646,10 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
         remote.close().unwrap();
         listener.close();
         service.await.unwrap().unwrap();
-        // close() ends ingress; the still-owned Endpoint retains its runtime charge.
-        // NetworkService additionally waits for final socket/runtime release.
-        assert_eq!(network_budget.stats().used, listener_residency);
+        // close() ends the listener's owner, and its endpoint with it: every
+        // byte the listener held — its socket and the receive chunks it pooled
+        // for its life — is given back once its service has ended.
+        assert_eq!(network_budget.stats().used, 0);
         drop(listener);
         enrollment.stop().await.unwrap();
         signing.await.unwrap().unwrap();

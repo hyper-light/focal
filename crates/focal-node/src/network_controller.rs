@@ -1444,6 +1444,7 @@ impl NetworkController {
             ),
             roots,
             &ControlHost::wire_limits(),
+            focal_wire::net::Sender::Node,
         )
         .map_err(|_| ControllerError::Identity)?;
         pool.replace_identity(tls)
@@ -1478,6 +1479,7 @@ impl NetworkController {
             ),
             self.state.sponsor.root_certificates(),
             &ControlHost::wire_limits(),
+            focal_wire::net::Sender::Node,
         )
         .map_err(|_| RenewalError::Install)?;
         pool.replace_identity(tls)

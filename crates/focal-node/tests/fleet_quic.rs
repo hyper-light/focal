@@ -106,8 +106,13 @@ impl Pki {
     fn roots(&self) -> Vec<Vec<u8>> {
         vec![self.certificate.der().to_vec()]
     }
-    fn connector(&self, identity: &CertificateIdentity) -> QuicConnector {
-        let tls = client_tls(identity.tls(), self.roots(), &wire_limits()).unwrap();
+    /// A connector of `identity`, granted as `role`.
+    fn connector(
+        &self,
+        identity: &CertificateIdentity,
+        role: focal_wire::net::Sender,
+    ) -> QuicConnector {
+        let tls = client_tls(identity.tls(), self.roots(), &wire_limits(), role).unwrap();
         QuicConnector::bind_standalone("127.0.0.1:0".parse().unwrap(), tls, wire_limits()).unwrap()
     }
 }
@@ -343,7 +348,7 @@ impl Fleet {
             .map(|node| pki.issue(format!("node-{node}.focal.test"), true))
             .collect();
         let actor_identity = pki.issue("actor.focal.test".into(), false);
-        let actor = pki.connector(&actor_identity);
+        let actor = pki.connector(&actor_identity, focal_wire::net::Sender::Participant);
         let mut pending = Vec::new();
         let mut routes = BTreeMap::new();
         for (index, identity) in identities.iter().enumerate() {
@@ -475,10 +480,11 @@ impl Fleet {
             let handler = host.clone();
             let server_task = focal_rt::spawn(async move { serving.serve(handler).await }).unwrap();
             let connector = match shaped {
-                Some(shaped) if shaped.old.contains(&id) => {
-                    pki.connector(identity).offering(&OLDER_PROFILES).unwrap()
-                }
-                _ => pki.connector(identity),
+                Some(shaped) if shaped.old.contains(&id) => pki
+                    .connector(identity, focal_wire::net::Sender::Node)
+                    .offering(&OLDER_PROFILES)
+                    .unwrap(),
+                _ => pki.connector(identity, focal_wire::net::Sender::Node),
             };
             // A shaped fleet carries a burst as the product does: a lane of
             // the consensus window to each peer and a driver that holds

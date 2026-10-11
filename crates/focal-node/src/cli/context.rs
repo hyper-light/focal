@@ -770,16 +770,26 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 .map(|p| read_credential(p, false))
                 .collect::<Result<Vec<_>>>()?;
             let key = zeroize::Zeroizing::new(read_credential(&private_key, true)?);
+            // A context of an enrolled client's own credential: a participant's.
             let tls = client_tls(
                 TlsIdentity::from_pkcs8(chain.clone(), key.to_vec()),
                 roots.clone(),
                 &limits,
+                focal_wire::net::Sender::Participant,
             )
             .map_err(other)?;
             let remake_limits = limits.clone();
             let remake: MakeTls = Box::new(move || {
                 let identity = TlsIdentity::from_pkcs8(chain.clone(), key.to_vec());
-                Ok((client_tls(identity, roots.clone(), &remake_limits)?, None))
+                Ok((
+                    client_tls(
+                        identity,
+                        roots.clone(),
+                        &remake_limits,
+                        focal_wire::net::Sender::Participant,
+                    )?,
+                    None,
+                ))
             });
             let transport = Transport::Quic(Box::new(Remote {
                 tls: Mutex::new(Some((tls, None))),

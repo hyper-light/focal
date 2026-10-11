@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::Sender;
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use rcgen::{
@@ -439,12 +440,29 @@ fn connector(pki: &Pki, cert: Vec<u8>, key: Vec<u8>) -> QuicConnector {
     )
     .unwrap()
 }
-/// The client TLS of `cert`, trusting `pki`'s authority.
+/// The client TLS of `cert`, trusting `pki`'s authority: a participant's.
 fn client_identity(pki: &Pki, cert: Vec<u8>, key: Vec<u8>) -> ClientTls {
     client_tls(
         TlsIdentity::from_pkcs8(vec![cert], key),
         vec![pki.ca.der().to_vec()],
         &limits(),
+        Sender::Participant,
+    )
+    .unwrap()
+}
+/// A connector of a node's identity `cert`, as a node's pool dials.
+fn node_connector(pki: &Pki, cert: Vec<u8>, key: Vec<u8>) -> QuicConnector {
+    QuicConnector::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        client_tls(
+            TlsIdentity::from_pkcs8(vec![cert], key),
+            vec![pki.ca.der().to_vec()],
+            &limits(),
+            Sender::Node,
+        )
+        .unwrap(),
+        limits(),
+        budget(),
     )
     .unwrap()
 }
@@ -663,6 +681,48 @@ fn a_handler_slower_than_the_askers_period_is_answered_within_it() {
                 "ask {id}: {answered:?}"
             );
         }
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
+/// Each of an identity's connections is greeted on its own: its second connection, greeted and
+/// closed, leaves its first one's profile as it was, and the first is served on. Kept per peer,
+/// the second's greeting overwrote the first's and its close erased it, and the first's next
+/// request was refused as ungreeted (`network_listener`, a node whose probe of the listener closed
+/// beside its route's connection, 2026-10-10).
+#[test]
+fn a_second_connection_of_an_identity_leaves_the_first_greeted() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let (server, task) = server(&pki, registry, handler).await;
+        let address = server.local_addr().unwrap();
+        let first_process = connector(&pki, certificate.clone(), key.clone());
+        let second_process = connector(&pki, certificate, key);
+        let first = first_process.connect(address, "localhost").await.unwrap();
+        assert_eq!(
+            first.request(&request(1)).await.unwrap(),
+            response(&request(1))
+        );
+        let second = second_process.connect(address, "localhost").await.unwrap();
+        assert_eq!(
+            second.request(&request(2)).await.unwrap(),
+            response(&request(2))
+        );
+        second.close().unwrap();
+        admission_settles(&server, |stats| stats.connections == 1).await;
+        assert_eq!(
+            first.request(&request(3)).await.unwrap(),
+            response(&request(3))
+        );
         server.close().unwrap();
         task.join().await.unwrap();
     })
@@ -1171,7 +1231,7 @@ fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes()
         });
         let (server, task) = server(&pki, registry, handler).await;
         let pool = PeerConnectionPool::new(
-            connector(&pki, certificate, key),
+            node_connector(&pki, certificate, key),
             PeerPoolLimits {
                 retry_backoff: Duration::ZERO,
                 ..PeerPoolLimits::default()
@@ -1311,6 +1371,7 @@ fn an_operation_refused_or_unanswered_takes_no_other_exchange_with_its_connectio
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &wire,
+            Sender::Node,
         )
         .unwrap();
         let pool = Rc::new(
@@ -1473,7 +1534,7 @@ fn peer_pool_re_resolves_a_named_endpoint_when_its_address_stops_answering() {
             socket.local_addr().unwrap()
         };
         let pool = PeerConnectionPool::new(
-            connector(&pki, certificate, key),
+            node_connector(&pki, certificate, key),
             PeerPoolLimits {
                 retry_backoff: Duration::ZERO,
                 // The stale dial runs to the connector's own deadline first.
@@ -1571,7 +1632,7 @@ fn peer_pool_reaches_a_peer_that_moved_behind_its_name_while_every_caller_gives_
             socket.local_addr().unwrap()
         };
         let pool = PeerConnectionPool::new(
-            connector(&pki, certificate, key),
+            node_connector(&pki, certificate, key),
             PeerPoolLimits {
                 attempts: 1,
                 retry_backoff: Duration::ZERO,
@@ -1732,7 +1793,7 @@ fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadline() 
         let deadline = Duration::from_secs(60);
         let pool = Rc::new(
             PeerConnectionPool::new(
-                connector(&pki, certificate, key),
+                node_connector(&pki, certificate, key),
                 PeerPoolLimits {
                     timeout: deadline,
                     attempts: 2,
@@ -1803,8 +1864,11 @@ fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
             });
         let (server, task) = server(&pki, registry, handler).await;
         let pool = Rc::new(
-            PeerConnectionPool::new(connector(&pki, certificate, key), PeerPoolLimits::default())
-                .unwrap(),
+            PeerConnectionPool::new(
+                node_connector(&pki, certificate, key),
+                PeerPoolLimits::default(),
+            )
+            .unwrap(),
         );
         let endpoint = PeerEndpoint {
             address: server.local_addr().unwrap(),
@@ -1904,7 +1968,7 @@ fn a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused() {
         let (server, task) = server(&pki, registry, handler).await;
         let pool = Rc::new(
             PeerConnectionPool::new(
-                connector(&pki, certificate, key),
+                node_connector(&pki, certificate, key),
                 PeerPoolLimits {
                     per_peer_inflight: 1,
                     attempts: 1,
@@ -1984,7 +2048,7 @@ fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connections()
         let (server, task) = server(&pki, registry, handler).await;
         let pool = Rc::new(
             PeerConnectionPool::new(
-                connector(&pki, certificate, key),
+                node_connector(&pki, certificate, key),
                 PeerPoolLimits {
                     max_connections: 1,
                     max_inflight: 1,
@@ -2232,6 +2296,7 @@ fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &wire,
+            Sender::Node,
         )
         .unwrap();
         let connector =
@@ -2374,6 +2439,7 @@ fn content_waits_its_turn_and_refuses_nothing_a_group_sends() {
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &wire,
+            Sender::Node,
         )
         .unwrap();
         let connector =
@@ -2747,7 +2813,7 @@ fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
             client_tls.alpn_protocols = vec![protocol.to_vec()];
             let connector = QuicConnector::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                ClientTls::from_config(client_tls),
+                ClientTls::from_config(client_tls, Sender::Participant),
                 limits(),
                 budget(),
             )
@@ -2814,7 +2880,7 @@ fn a_peer_of_the_first_data_protocol_is_refused_at_the_handshake() {
         first.alpn_protocols = vec![b"focal/1".to_vec()];
         let old = QuicConnector::bind(
             "127.0.0.1:0".parse().unwrap(),
-            ClientTls::from_config(first),
+            ClientTls::from_config(first, Sender::Participant),
             limits(),
             budget(),
         )
@@ -3195,7 +3261,7 @@ fn an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take() {
         let ceiling = Duration::from_secs(30);
         let pool = Rc::new(
             PeerConnectionPool::new(
-                connector(&pki, certificate, key),
+                node_connector(&pki, certificate, key),
                 PeerPoolLimits {
                     timeout: ceiling,
                     ..PeerPoolLimits::default()
@@ -3668,9 +3734,10 @@ mod admission {
                 &limits(),
             )
             .unwrap();
-            // The ordinary lane holds a frame and a half: one peer's share is all of it (a frame
-            // at least), so the first body's reservation fits it and a second's would not.
-            let budget = MemoryBudget::new(frame + frame / 2, 0).unwrap();
+            // The ordinary lane holds the endpoint's socket and a frame and a half beside it: one
+            // peer's share is all of that (a frame at least), so the first body's reservation fits
+            // it and a second's would not.
+            let budget = MemoryBudget::new(endpoint_socket_bytes() + frame + frame / 2, 0).unwrap();
             let server = Arc::new(
                 QuicServer::bind_admitting(
                     "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
@@ -4024,6 +4091,7 @@ fn a_request_that_fails_alone_keeps_its_connection() {
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &quick,
+            Sender::Participant,
         )
         .unwrap();
         let connector =
@@ -4279,6 +4347,7 @@ async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
         TlsIdentity::from_pkcs8(vec![certificate], key),
         vec![pki.ca.der().to_vec()],
         &wire,
+        Sender::Node,
     )
     .unwrap();
     let connector =
@@ -4486,6 +4555,7 @@ fn a_peers_time_to_answer_begins_when_it_has_what_was_asked() {
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &wire,
+            Sender::Node,
         )
         .unwrap();
         let connector =
@@ -4568,6 +4638,7 @@ impl SlowRig {
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &wire,
+            Sender::Node,
         )
         .unwrap();
         let pool = PeerConnectionPool::new(
@@ -4924,6 +4995,7 @@ async fn direct_case(
         TlsIdentity::from_pkcs8(vec![certificate], key),
         vec![pki.ca.der().to_vec()],
         &wire,
+        Sender::Node,
     )
     .unwrap();
     let connector =
@@ -5130,6 +5202,7 @@ fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_e
                     TlsIdentity::from_pkcs8(chain, client_key.clone()),
                     roots.clone(),
                     &limits(),
+                    Sender::Participant,
                 )
                 .unwrap(),
                 limits(),
@@ -5202,6 +5275,7 @@ fn a_peer_whose_issuer_the_other_does_not_know_is_admitted_by_the_predecessors_e
                 TlsIdentity::from_pkcs8(vec![client_leaf, genesis.der().to_vec()], client_key),
                 roots.clone(),
                 &limits(),
+                Sender::Participant,
             )
             .unwrap(),
             limits(),
@@ -5390,6 +5464,7 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
                     TlsIdentity::from_pkcs8(vec![certificate.clone()], key.clone()),
                     vec![pki.ca.der().to_vec()],
                     &limits,
+                    Sender::Participant,
                 )
                 .unwrap(),
                 limits.clone(),
@@ -5646,7 +5721,7 @@ fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
             tls.alpn_protocols = vec![ALPN.to_vec()];
             QuicConnector::bind(
                 "127.0.0.1:0".parse().unwrap(),
-                ClientTls::from_config(tls),
+                ClientTls::from_config(tls, Sender::Participant),
                 limits(),
                 budget(),
             )
@@ -5731,7 +5806,7 @@ fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
         let (server, task) = server(&pki, registry, handler).await;
         let pool = Rc::new(
             PeerConnectionPool::new(
-                connector(&pki, certificate, key),
+                node_connector(&pki, certificate, key),
                 PeerPoolLimits {
                     timeout: Duration::from_secs(30),
                     ..PeerPoolLimits::default()
@@ -5864,6 +5939,7 @@ fn a_stall_past_the_request_deadline_keeps_the_connection() {
             TlsIdentity::from_pkcs8(vec![certificate], key),
             vec![pki.ca.der().to_vec()],
             &short,
+            Sender::Participant,
         )
         .unwrap();
         let connector =

@@ -3,7 +3,7 @@
 //! decided by its kind and by the role its sender authenticated as, before a byte of its body is
 //! read and never by anything the sender chooses (the audit's §13.3): an operation's kind is its
 //! registered tag ([`crate::Operation::registered_tag`]), and its class the tag's
-//! ([`TrafficClass::of_tag`]).
+//! ([`TrafficClass::of_tag`]) for a node, the tag's but never the control class for a participant.
 
 use hyper_transport::Classes;
 
@@ -30,6 +30,19 @@ pub enum Sender {
     Participant,
     /// A joiner: no certificate yet, on the enrollment protocol, which may send nothing else.
     Joiner,
+}
+
+impl Sender {
+    /// The role a grant authenticates its certificate as: a node's grant a node's, any other a
+    /// participant's.
+    pub fn of(role: crate::PeerRole) -> Self {
+        match role {
+            crate::PeerRole::Node { .. } => Self::Node,
+            crate::PeerRole::Actor | crate::PeerRole::Evaluator | crate::PeerRole::Runtime => {
+                Self::Participant
+            }
+        }
+    }
 }
 
 /// The code the greeting crosses as: past every registered tag's range (a tag is a `u16` the
@@ -65,8 +78,18 @@ impl Classes for FocalClasses {
             // A joiner may enroll and nothing else; anyone may enroll or renew.
             (Kind::Enrollment(_), _) => Some(TrafficClass::Control),
             (_, Sender::Joiner) => None,
-            (Kind::Hello, Sender::Node | Sender::Participant) => Some(TrafficClass::Control),
-            (Kind::Operation(tag), Sender::Node | Sender::Participant) => TrafficClass::of_tag(tag),
+            (Kind::Hello, Sender::Node) => Some(TrafficClass::Control),
+            (Kind::Operation(tag), Sender::Node) => TrafficClass::of_tag(tag),
+            // A participant's message is never the control class, funded from the completion
+            // reserve and sent first: what completes admitted work and keeps groups led is the
+            // nodes', and no participant spends or outranks it.
+            (Kind::Hello, Sender::Participant) => Some(TrafficClass::Exchange),
+            (Kind::Operation(tag), Sender::Participant) => {
+                TrafficClass::of_tag(tag).map(|class| match class {
+                    TrafficClass::Control => TrafficClass::Exchange,
+                    other => other,
+                })
+            }
         }
     }
 
@@ -117,21 +140,41 @@ mod tests {
         }
     }
 
+    /// A node's message is its tag's class; a participant's never the control class, which is
+    /// funded from the completion reserve and sent first: a participant's control-tagged
+    /// operation and its greeting are exchanges, so no participant can spend what completes
+    /// admitted work or outrank a node's control (the lane a body was admitted on before the move
+    /// to hyper-transport: the completion lane for a node, the ordinary one for any other
+    /// identity). A joiner may only enroll.
     #[test]
     fn every_registered_tag_has_a_class_and_a_joiner_may_only_enroll() {
         for tag in 1..=33 {
             let class = TrafficClass::of_tag(tag).unwrap_or_else(|| panic!("tag {tag}"));
-            for role in [Sender::Node, Sender::Participant] {
-                assert_eq!(
-                    FocalClasses::class_of(Kind::Operation(tag), role),
-                    Some(class)
-                );
-            }
+            assert_eq!(
+                FocalClasses::class_of(Kind::Operation(tag), Sender::Node),
+                Some(class)
+            );
+            assert_eq!(
+                FocalClasses::class_of(Kind::Operation(tag), Sender::Participant),
+                Some(match class {
+                    TrafficClass::Control => TrafficClass::Exchange,
+                    other => other,
+                }),
+                "tag {tag}"
+            );
             assert_eq!(
                 FocalClasses::class_of(Kind::Operation(tag), Sender::Joiner),
                 None
             );
         }
+        assert_eq!(
+            FocalClasses::class_of(Kind::Hello, Sender::Node),
+            Some(TrafficClass::Control)
+        );
+        assert_eq!(
+            FocalClasses::class_of(Kind::Hello, Sender::Participant),
+            Some(TrafficClass::Exchange)
+        );
         assert_eq!(FocalClasses::class_of(Kind::Hello, Sender::Joiner), None);
         for role in [Sender::Node, Sender::Participant, Sender::Joiner] {
             assert_eq!(

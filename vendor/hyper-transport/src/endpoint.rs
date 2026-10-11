@@ -177,6 +177,11 @@ pub struct PathFacts {
     pub pacing_rate: Option<u64>,
     /// The controller's slow-start threshold, bytes, when it keeps one.
     pub ssthresh: Option<u64>,
+    /// The path's probe timeout before backoff (RFC 9002 §6.2.1): the smoothed round trip, four
+    /// times its variation and the peer's acknowledgement delay, how long what is sent now may take
+    /// to be known delivered or lost. An asker that gives its peer a time to answer waits this on
+    /// top of it, for an answer sent at the deadline to arrive.
+    pub probe_timeout: Duration,
 }
 
 /// What the endpoint holds and what it refused.
@@ -939,6 +944,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             // qlog's bits a second, in bytes.
             pacing_rate: metrics.pacing_rate.and_then(|bits| bits.checked_div(8)),
             ssthresh: metrics.ssthresh,
+            probe_timeout: conn.quic.probe_timeout(),
         })
     }
 
@@ -1874,6 +1880,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 Event::Request {
                     exchange: ExchangeId(id),
                     peer,
+                    epoch: conn.epoch,
                     kind,
                     class,
                     body: prefix.body,
