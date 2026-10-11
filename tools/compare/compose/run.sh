@@ -42,6 +42,22 @@ evidence() {
   echo "::endgroup::"
 }
 cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
+# Each of the run's containers' CPU as its cgroup (v2) counts it, read on the
+# host so nothing runs inside a container: the microseconds it ran, and those
+# and the times its CPU quota held it back. Taken before and after the load,
+# each line `PHASE CONTAINER KEY VALUE`: a system's CPU per acknowledged write
+# is the difference over the writes it acknowledged. Prints nothing where the
+# host has no cgroup v2 hierarchy (a run on macOS).
+cpu_stat() {
+  local phase=$1 c pid group
+  echo "$phase - wall_usec $(date +%s%6N)"
+  for c in $(dc ps --format '{{.Name}}'); do
+    pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+    group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || continue
+    [ -n "$group" ] && [ -r "/sys/fs/cgroup$group/cpu.stat" ] || continue
+    awk -v p="$phase" -v c="$c" '{ print p, c, $1, $2 }' "/sys/fs/cgroup$group/cpu.stat"
+  done
+}
 # Each image the profile runs, pulled once and one at a time before the cluster
 # starts: a registry's anonymous pulls are rate-limited per address (ECR Public
 # answers `Rate exceeded` past about one a second, Docker Hub refuses past its
@@ -100,12 +116,14 @@ warmup_ms: $(( warmup * 1000 ))
 EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
+    cpu_stat before > "$out/$report.cpu.txt"
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
       evidence
       exit 1
     fi
+    cpu_stat after >> "$out/$report.cpu.txt"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
@@ -134,7 +152,9 @@ if [ "$system" != focal ]; then
       --endpoints "$endpoints" --rate "$rate" --payload "$payload" \
       --seconds "$seconds" --warmup "$warmup" --out "/reports/$report"
   }
+  cpu_stat before > "$out/$report.cpu.txt"
   retry 60 generate || { evidence; exit 1; }
+  cpu_stat after >> "$out/$report.cpu.txt"
   dc exec -T generator cat "/reports/$report" > "$out/$report"
 fi
 echo "wrote $out/$report"

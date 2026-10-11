@@ -108,6 +108,29 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, glob, os
+          def cpu(path, writes):
+              """The nodes' CPU over a run, from run.sh's cgroup counters taken
+              before and after the load: the busiest node's and all nodes'
+              microseconds per write and the busiest node's share of the wall
+              clock. Dashes where no counters were taken."""
+              seen = {}
+              try:
+                  lines = open(path + ".cpu.txt").read().splitlines()
+              except OSError:
+                  lines = []
+              for line in lines:
+                  parts = line.split()
+                  if len(parts) == 4 and parts[3].isdigit():
+                      phase, container, key, value = parts
+                      seen.setdefault(container, {}).setdefault(key, {})[phase] = int(value)
+              delta = {c: {k: v["after"] - v["before"] for k, v in keys.items() if len(v) == 2}
+                       for c, keys in seen.items()}
+              wall = delta.pop("-", {}).get("wall_usec", 0)
+              nodes = [d["usage_usec"] for c, d in delta.items()
+                       if "usage_usec" in d and "focal-load" not in c and "generator" not in c]
+              if not nodes or writes <= 0 or wall <= 0:
+                  return ("–", "–", "–")
+              return (max(nodes) / writes, sum(nodes) / writes, 100 * max(nodes) / wall)
           rows = []
           legacy_focal = False
           for path in sorted(glob.glob("tools/compare/compose/reports/*.json")):
@@ -120,13 +143,16 @@ jobs:
                   l = m["committed_latency_ns"] if m is not None else r["latency_ns"]
                   counts = m if m is not None else r
                   us = lambda v: v / 1000
+                  # The CPU counters span the whole load, warm-up included,
+                  # as do the run's committed writes.
                   rows.append((name, r["shape"].get("rate"), counts["committed"], counts["refused"] + counts["unknown"] + counts.get("expired", 0),
-                               us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])))
+                               us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])) + cpu(path, r["committed"]))
               elif "offered_per_second" in r:  # focal-compare
+                  # Every write it sent, warm-up included, as the counters span.
                   rows.append((name, r["offered_per_second"], r["acknowledged"], r["failed"] + r["refused_by_generator"],
-                               r["p50_us"], r["p99_us"], r["p999_us"], r["max_us"]))
-          print("| run | offered/s | acknowledged | failed or refused | p50 µs | p99 µs | p99.9 µs | max µs |")
-          print("|---|---|---|---|---|---|---|---|")
+                               r["p50_us"], r["p99_us"], r["p999_us"], r["max_us"]) + cpu(path, r["sent"]))
+          print("| run | offered/s | acknowledged | failed or refused | p50 µs | p99 µs | p99.9 µs | max µs | busiest node CPU µs/write | all nodes CPU µs/write | busiest node busy % |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|")
           for row in rows:
               print("| " + " | ".join(f"{v:,.0f}" if isinstance(v, float) else str(v) for v in row) + " |")
           if legacy_focal:
