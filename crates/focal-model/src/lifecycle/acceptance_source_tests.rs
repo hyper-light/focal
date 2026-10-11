@@ -178,6 +178,7 @@ struct Source<'a> {
     slot_fault: Cell<Fault>,
     declaration_fault: Cell<Fault>,
     check_fault: Cell<Fault>,
+    replays: Cell<bool>,
 }
 impl<'a> Source<'a> {
     fn new(slots: &'a [SlotPolicy<'a>], declarations: &'a [CheckedDeclaration]) -> Self {
@@ -195,6 +196,7 @@ impl<'a> Source<'a> {
             slot_fault: Cell::new(Fault::None),
             declaration_fault: Cell::new(Fault::None),
             check_fault: Cell::new(Fault::None),
+            replays: Cell::new(false),
         }
     }
     fn reset_scans(&self) {
@@ -265,6 +267,9 @@ impl<'a> AcceptanceSource for Source<'a> {
             error: ContractError::StaleEvaluation,
             index: 0,
         }
+    }
+    fn replays(&self) -> bool {
+        self.replays.get()
     }
 }
 fn prepare<'s, 'a>(source: &'s Source<'a>) -> AcceptanceSourcePlan<'s, Source<'a>> {
@@ -727,5 +732,72 @@ fn valid_alternate_proofs_and_slots_cannot_replace_any_inspection_or_copy_pass()
         source.reset_scans();
         let retry = prepare(&source).build(charge, visits).unwrap();
         assert_eq!(retry, reference);
+    }
+}
+
+/// A source that replays what it holds is inspected once: its passes are as
+/// many as any source's, its plan is the policy's, and its build reads only
+/// the passes that copy it (one declarations pass a declaration and one slots
+/// pass) where another source's build inspects it again first. Its copy is
+/// still hashed against the plan's intent, so a source that claims to replay
+/// and gives other declarations or slots to its copy is refused.
+#[test]
+fn a_replaying_source_is_inspected_once_and_its_copy_is_still_checked() {
+    let declarations = declarations();
+    let tokens = checked(&declarations);
+    let checks = [CHECK];
+    let slots = slots(&checks);
+    let reference =
+        AcceptancePolicy::new(binding(200), ISSUER, &slots, &declarations, limits()).unwrap();
+    let mut alternate = tokens.clone();
+    let mut changed_spec = specification(204, 9, TargetDeclaration::Increment);
+    changed_spec.program = programmatic(true);
+    alternate[3] = declaration(changed_spec).checked_declaration();
+    let altered_slots = [
+        slots[0],
+        SlotPolicy {
+            mode: ValidationMode::Observe,
+            ..slots[1]
+        },
+        slots[2],
+    ];
+    let source = Source {
+        alternate_slots: &altered_slots,
+        alternate_declarations: &alternate,
+        ..Source::new(&slots, &tokens)
+    };
+    source.replays.set(true);
+    let plan = prepare(&source);
+    assert_eq!(source.passes(), plan.inspection_passes());
+    assert_eq!(plan.intent_fingerprint(), reference.intent_fingerprint());
+    let charge = plan.construction_charge();
+    let visits = plan.build_visits();
+    source.reset_scans();
+    assert_eq!(plan.build(charge, visits).unwrap(), reference);
+    assert_eq!(
+        source.passes(),
+        AcceptanceSourcePasses {
+            declarations: tokens.len(),
+            slots: 1,
+        }
+    );
+    for declarations in [true, false] {
+        source.reset_scans();
+        let plan = prepare(&source);
+        source.reset_scans();
+        let switch = if declarations {
+            &source.switch_declarations_at
+        } else {
+            &source.switch_slots_at
+        };
+        switch.set(Some(1));
+        assert!(
+            matches!(
+                plan.build(charge, visits),
+                Err(ContractError::ContentConflict)
+            ),
+            "declarations {declarations}"
+        );
+        switch.set(None);
     }
 }

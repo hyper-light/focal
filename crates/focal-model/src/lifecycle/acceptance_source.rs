@@ -29,6 +29,17 @@ pub trait AcceptanceSource {
     fn declaration_count(&self) -> usize;
     fn slots(&self) -> Self::Slots<'_>;
     fn declarations(&self) -> Self::Declarations<'_>;
+    /// Whether every pass yields the items the first did: a source replaying
+    /// values it holds, or reading bytes it borrows (which cannot change while
+    /// borrowed) with the same decoder at every pass. A later pass over one is not
+    /// hashed to prove it agrees with the first (its order, counts and shape
+    /// are still checked), and a build from its plan does not inspect it
+    /// again; the build's policy is still hashed against the plan's intent.
+    /// Any other source's passes are each hashed and compared, and a build
+    /// inspects it again, so a source that changes is refused.
+    fn replays(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,8 +243,12 @@ fn scan_slots<S: AcceptanceSource>(
 ) -> Result<SlotShape, ContractError> {
     let (claim, issuer) = parent;
     visits.charge(512)?;
-    let mut hash = intent::Fingerprint::start(claim, issuer, 0);
-    hash.slots(count);
+    // A replayed pass agrees with the first by construction: it is not hashed.
+    let mut hash = (expected.is_none() || !source.replays()).then(|| {
+        let mut hash = intent::Fingerprint::start(claim, issuer, 0);
+        hash.slots(count);
+        hash
+    });
     let mut shape = SlotShape {
         hash: ContentHash([0; 32]),
         heap: bytes::array::<OwnedSlot>(count)?,
@@ -256,7 +271,9 @@ fn scan_slots<S: AcceptanceSource>(
             shape.allocations,
             bytes::allocation::<CheckPolicy>(fields.checks),
         )?;
-        hash.slot(fields);
+        if let Some(hash) = hash.as_mut() {
+            hash.slot(fields);
+        }
         consume(SlotEvent::Slot(fields), visits)?;
         visits.charge(1)?;
         let mut checks = slot.checks();
@@ -267,13 +284,19 @@ fn scan_slots<S: AcceptanceSource>(
             aggregation::check_policy_order(previous_check, check.declaration_index)?;
             aggregation::check_policy_validation(check)?;
             previous_check = Some(check.declaration_index);
-            hash.check(check);
+            if let Some(hash) = hash.as_mut() {
+                hash.check(check);
+            }
             consume(SlotEvent::Check(fields, check), visits)?;
         }
         end(&mut checks, visits)?;
     }
     end(&mut slots, visits)?;
-    shape.hash = hash.finish();
+    shape.hash = match (hash, expected) {
+        (Some(hash), _) => hash.finish(),
+        (None, Some(expected)) => expected.hash,
+        (None, None) => return Err(ContractError::InvalidManifest),
+    };
     if expected.is_some_and(|expected| expected != shape) {
         return Err(ContractError::ContentConflict);
     }
@@ -289,7 +312,9 @@ fn scan_declarations<S: AcceptanceSource>(
     mut consume: impl FnMut(usize, DeclaredObligation, &mut VisitBudget) -> Result<(), ContractError>,
 ) -> Result<ContentHash, ContractError> {
     visits.charge(512)?;
-    let mut hash = intent::Fingerprint::start(claim, issuer, count);
+    // A replayed pass agrees with the first by construction: it is not hashed.
+    let mut hash = (expected.is_none() || !source.replays())
+        .then(|| intent::Fingerprint::start(claim, issuer, count));
     visits.charge(1)?;
     let mut declarations = source.declarations();
     for position in 0..count {
@@ -297,11 +322,17 @@ fn scan_declarations<S: AcceptanceSource>(
         visits.charge(512)?;
         check_frame(claim, issuer, declaration)?;
         let row = record_checked(declaration);
-        hash.declaration(row);
+        if let Some(hash) = hash.as_mut() {
+            hash.declaration(row);
+        }
         consume(position, row, visits)?;
     }
     end(&mut declarations, visits)?;
-    let hash = hash.finish();
+    let hash = match (hash, expected) {
+        (Some(hash), _) => hash.finish(),
+        (None, Some(expected)) => expected,
+        (None, None) => return Err(ContractError::InvalidManifest),
+    };
     if expected.is_some_and(|expected| hash != expected) {
         return Err(ContractError::ContentConflict);
     }
@@ -566,21 +597,24 @@ fn build<S: AcceptanceSource>(
     bytes::fits(shape.quote.charge, max_bytes)?;
     bytes::fits(shape.quote.build_visits, max_visits)?;
     let mut visits = VisitBudget::new(shape.quote.build_visits);
-    let actual = inspect(
-        plan.source,
-        plan.claim,
-        plan.issuer,
-        plan.limits,
-        visits.remaining(),
-        plan.policy,
-    )?;
-    visits.charge(actual.inspection_visits)?;
-    if actual.counts != shape.counts
-        || actual.slots != shape.slots
-        || actual.declarations_hash != shape.declarations_hash
-        || actual.quote.intent != shape.quote.intent
-    {
-        return Err(ContractError::ContentConflict);
+    // A source that replays what its plan inspected is not inspected again.
+    if !plan.source.replays() {
+        let actual = inspect(
+            plan.source,
+            plan.claim,
+            plan.issuer,
+            plan.limits,
+            visits.remaining(),
+            plan.policy,
+        )?;
+        visits.charge(actual.inspection_visits)?;
+        if actual.counts != shape.counts
+            || actual.slots != shape.slots
+            || actual.declarations_hash != shape.declarations_hash
+            || actual.quote.intent != shape.quote.intent
+        {
+            return Err(ContractError::ContentConflict);
+        }
     }
     let frame = Frame {
         source: plan.source,
