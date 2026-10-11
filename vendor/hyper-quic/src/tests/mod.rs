@@ -855,6 +855,45 @@ fn a_window_used_up_grows_by_all_the_round_trip_after_acknowledges() {
     assert_eq!(cwnd, 27_622);
 }
 
+/// A warm-up measures a path to four initial windows a round trip. Over a path that carries far
+/// less, its packets queue, and with no loss to end it, it ran to its budget of sixteen initial
+/// windows, some twelve seconds of a 128 kbit/s path: focal's election votes waited behind it (CI,
+/// 4 of 6 runs of its 128 kbit/s crossing found no leader in ten seconds; none failed with the
+/// warm-up off). It is background traffic now, as LEDBAT++'s slow start is: two packets first on
+/// an idle path, and an end once the least of its recent RTT samples is 45 ms past the least of all
+/// (draft-irtf-iccrg-ledbat-plus-plus §4.1, §4.5). Here each side ends at its second sample,
+/// having cost the path less than the one first flight a connection may send it (RFC 9002 §7.2).
+/// Over a path that carries it, the warm-up still measures.
+#[test]
+fn a_warm_up_over_a_slow_path_ends_once_its_packets_queue_and_over_a_fast_one_measures_it() {
+    let _guard = subscribe();
+    let warm_up = |rate: Option<u64>| {
+        let mut pair = Pair::default();
+        pair.latency = Duration::from_millis(10);
+        pair.rate = rate;
+        let (client_ch, server_ch) = pair.connect();
+        pair.drive();
+        [
+            pair.client_conn_mut(client_ch).stats().path,
+            pair.server_conn_mut(server_ch).stats().path,
+        ]
+    };
+    // 128 kbit/s each way and a queue without bound: no loss ends the warm-up
+    for (side, path) in ["client", "server"].into_iter().zip(warm_up(Some(16_000))) {
+        assert_eq!(path.warm_up_end, Some(WarmUpEnd::Queued), "{side}");
+        assert_eq!(path.lost_packets, 0, "{side}");
+        let initial_window = 10 * u64::from(path.current_mtu);
+        let sent = path.sent_warm_up_packets * u64::from(path.current_mtu);
+        assert!(
+            sent < initial_window,
+            "{side}: the warm-up sent {sent} bytes, a first flight is {initial_window}"
+        );
+    }
+    for (side, path) in ["client", "server"].into_iter().zip(warm_up(None)) {
+        assert_eq!(path.warm_up_end, Some(WarmUpEnd::Measured), "{side}");
+    }
+}
+
 #[test]
 fn zero_rtt_happypath() {
     let _guard = subscribe();

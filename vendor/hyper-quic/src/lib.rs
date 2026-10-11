@@ -70,7 +70,7 @@ pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
     FinishError, FrameStats, MAX_STREAM_CHUNKS, PathStats, ReadError, ReadableError, RecvStream,
     RttEstimator, SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats,
-    WriteError, Written,
+    WarmUpEnd, WriteError, Written,
 };
 pub use connection::qlog::QlogStream;
 

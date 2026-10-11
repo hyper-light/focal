@@ -52,6 +52,12 @@ pub(super) struct Pair {
     pub(super) congestion_experienced: bool,
     // One-way
     pub(super) latency: Duration,
+    /// The bytes a second each direction's link carries, none for a link without a limit: what
+    /// it cannot carry yet waits, without bound, behind what it holds (a bottleneck's queue)
+    pub(super) rate: Option<u64>,
+    /// When the client's link to the server and the server's to the client are next free
+    client_link_free: Instant,
+    server_link_free: Instant,
     /// Number of spin bit flips
     pub(super) spins: u64,
     last_spin: bool,
@@ -97,6 +103,9 @@ impl Pair {
             time: now,
             mtu: DEFAULT_MTU,
             latency: Duration::ZERO,
+            rate: None,
+            client_link_free: now,
+            server_link_free: now,
             spins: 0,
             last_spin: false,
             congestion_experienced: false,
@@ -178,11 +187,10 @@ impl Pair {
             }
             if self.server.addr == packet.destination {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
-                self.server.inbound.push_back((
-                    self.time + self.latency,
-                    ecn,
-                    buffer.as_ref().into(),
-                ));
+                let sent = carried(self.time, &mut self.client_link_free, self.rate, &buffer);
+                self.server
+                    .inbound
+                    .push_back((sent + self.latency, ecn, buffer.as_ref().into()));
             }
         }
     }
@@ -199,11 +207,10 @@ impl Pair {
             }
             if self.client.addr == packet.destination {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
-                self.client.inbound.push_back((
-                    self.time + self.latency,
-                    ecn,
-                    buffer.as_ref().into(),
-                ));
+                let sent = carried(self.time, &mut self.server_link_free, self.rate, &buffer);
+                self.client
+                    .inbound
+                    .push_back((sent + self.latency, ecn, buffer.as_ref().into()));
             }
         }
     }
@@ -320,6 +327,17 @@ impl Pair {
     pub(super) fn server_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
         self.server_conn_mut(ch).datagrams()
     }
+}
+
+/// When a link of `rate` bytes a second, free from `free`, has carried `datagram` sent at `now`:
+/// once it has carried what it held before, at once without a rate
+fn carried(now: Instant, free: &mut Instant, rate: Option<u64>, datagram: &[u8]) -> Instant {
+    let Some(rate) = rate else {
+        return now;
+    };
+    let nanos = datagram.len() as u64 * 1_000_000_000 / rate;
+    *free = cmp::max(now, *free) + Duration::from_nanos(nanos);
+    *free
 }
 
 impl Default for Pair {

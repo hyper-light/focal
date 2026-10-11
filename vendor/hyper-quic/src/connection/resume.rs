@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::net::IpAddr;
 
-use super::RttEstimator;
+use super::{RttEstimator, WarmUpEnd};
 use crate::congestion::Controller;
 use crate::{Duration, Instant};
 
@@ -207,6 +207,80 @@ impl Observer {
     }
 }
 
+/// The warm-up is a background sender's slow start, as LEDBAT++'s (draft-irtf-iccrg-ledbat-plus-plus
+/// §4.1) is: it begins with two packets, "LEDBAT++ sender limits the initial window to 2 packets",
+/// where the connection's window would let ten go at once. Ten of the path's largest datagrams
+/// are 0.9 s of a 128 kbit/s path, a queue every other packet on it waits behind.
+const WARM_UP_INITIAL_PACKETS: u64 = 2;
+
+/// LEDBAT's current-delay filter (RFC 6817 §2.4.2, §2.5), which LEDBAT++ applies to RTT samples
+/// (§4.5: "the minimum of the 4 most recent delay samples"): one delayed or reordered
+/// acknowledgement is not a queue
+const CURRENT_FILTER: usize = 4;
+
+/// LEDBAT++'s target queueing delay (§4.5): 60 ms, RFC 6817's 100 ms ceiling lowered and still
+/// "larger than the typical TCP maximum acknowledgement delay"
+const TARGET: Duration = Duration::from_millis(60);
+
+/// LEDBAT++'s slow start ends once the queueing delay is "larger than 3/4ths of the target delay"
+/// (§4.1): 45 ms
+const SLOW_START_EXIT: Duration = match TARGET.checked_mul(3) {
+    Some(three) => match three.checked_div(4) {
+        Some(exit) => exit,
+        None => TARGET,
+    },
+    None => TARGET,
+};
+
+/// The queueing delay the warm-up's packets meet, LEDBAT's (RFC 6817 §3.1.2): a filtered sample's
+/// excess over the base, the least sample. A warm-up measures what the path carries in a round
+/// trip; once its packets queue, a round trip's count measures the queue as well (RFC 9959 §4.1:
+/// an overshoot is no basis for the capacity), and the queue holds every other packet on the path
+/// behind the warm-up's, which is background traffic.
+///
+/// Its samples are of its own packets alone, all of the path's MTU: a smaller packet's RTT is
+/// shorter by the time the path takes to carry the difference, which on a slow path is past the
+/// exit (91 ms of a 1,452-byte datagram at 128 kbit/s), so the path's least RTT, a small packet's,
+/// is no base for them. The first goes on an idle path, so its sample is the base at once.
+///
+/// LEDBAT++ filters by count alone. RFC 6817 §2.5 also requires that "samples in the list are not
+/// older than an RTT in the past", which matters on a slow path: there four samples can span
+/// several round trips of a growing queue, and the oldest would hold the filter at the base.
+#[derive(Debug, Default)]
+struct Delays {
+    /// The most recent samples, each with when it was taken; `next` the slot the next replaces
+    recent: [Option<(Instant, Duration)>; CURRENT_FILTER],
+    next: usize,
+    /// The least sample
+    base: Option<Duration>,
+}
+
+impl Delays {
+    /// A sample taken at `now`: whether the least of the most recent, none older than `rtt`, is
+    /// past the least sample by more than [`SLOW_START_EXIT`]
+    fn queued(&mut self, now: Instant, sample: Duration, rtt: Duration) -> bool {
+        let base = self.base.map_or(sample, |base| base.min(sample));
+        self.base = Some(base);
+        if let Some(slot) = self.recent.get_mut(self.next) {
+            *slot = Some((now, sample));
+        }
+        self.next = self
+            .next
+            .checked_add(1)
+            .filter(|next| *next < CURRENT_FILTER)
+            .unwrap_or(0);
+        let filtered = self
+            .recent
+            .iter()
+            .flatten()
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= rtt)
+            .map(|(_, sample)| *sample)
+            .min()
+            .unwrap_or(sample);
+        filtered.saturating_sub(base) > SLOW_START_EXIT
+    }
+}
+
 /// What a closing connection leaves in its endpoint's memory for its remote
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leaves {
@@ -252,11 +326,13 @@ enum Phase {
 /// The warm-up's state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WarmUp {
-    /// Not measuring: the connection was given a measurement, another connection is measuring, or
-    /// the warm-up ended
+    /// Not measuring: the connection was given a measurement, or another connection is measuring
     Off,
-    /// Measuring; `sent` the bytes its packets have carried
-    Measuring { sent: u64 },
+    /// Measuring; `sent` the bytes its packets have carried, `window` the bytes it lets the
+    /// connection have in flight, none before its first packet is sent
+    Measuring { sent: u64, window: Option<u64> },
+    /// The warm-up ended, for this reason
+    Ended(WarmUpEnd),
 }
 
 /// One connection's Careful Resume
@@ -271,6 +347,8 @@ pub(crate) struct CarefulResume {
     /// The configured maximum jump (§2.4's `max_jump`)
     max_jump: u64,
     observer: Observer,
+    /// The queueing delay the warm-up's packets meet
+    delays: Delays,
     warm_up: WarmUp,
     /// Whether the warm-up sent anything
     warmed: bool,
@@ -323,8 +401,12 @@ impl CarefulResume {
             holds: (grant != Grant::Neither).then_some(now),
             max_jump,
             observer: Observer::default(),
+            delays: Delays::default(),
             warm_up: match grant {
-                Grant::Measure if warm_up => WarmUp::Measuring { sent: 0 },
+                Grant::Measure if warm_up => WarmUp::Measuring {
+                    sent: 0,
+                    window: None,
+                },
                 _ => WarmUp::Off,
             },
             warmed: false,
@@ -332,11 +414,17 @@ impl CarefulResume {
         }
     }
 
-    /// Whether a warm-up packet of `bytes` may go: the connection is measuring, the measurement is
-    /// short of its target and the budget has room for it (the window and the pacer are the
-    /// caller's to check). A budget spent ends the warm-up.
-    pub(crate) fn warm_up_wants(&mut self, initial_window: u64, bytes: u64) -> bool {
-        let WarmUp::Measuring { sent } = self.warm_up else {
+    /// Whether a warm-up packet of `bytes` may go with `in_flight` bytes in flight: the connection
+    /// is measuring, the measurement is short of its target, the budget has room for the packet
+    /// and the warm-up's window too (the connection's window and the pacer are the caller's to
+    /// check). A budget spent ends the warm-up.
+    pub(crate) fn warm_up_wants(
+        &mut self,
+        initial_window: u64,
+        bytes: u64,
+        in_flight: u64,
+    ) -> bool {
+        let WarmUp::Measuring { sent, window } = self.warm_up else {
             return false;
         };
         let target = initial_window.saturating_mul(SAVE_FLOOR_WINDOWS);
@@ -346,17 +434,39 @@ impl CarefulResume {
             return false;
         }
         if sent.saturating_add(bytes) > budget {
-            self.warm_up = WarmUp::Off;
+            self.warm_up = WarmUp::Ended(WarmUpEnd::Budget);
             self.failed = true;
             return false;
         }
-        true
+        match window {
+            // Its first packet goes on an idle path, nothing of the connection's in flight: what
+            // its samples measure is then its own packets' queue against the path's least RTT
+            // (RFC 6817 §3.1.2), not one the connection's last flight left (the handshake's, at
+            // its end). It opens the window (`on_warm_up_sent`).
+            None => in_flight == 0,
+            Some(window) => in_flight.saturating_add(bytes) <= window,
+        }
     }
 
-    /// A warm-up packet of `bytes` was sent
+    /// An RTT sample (RFC 9002 §5's, the ACK delay taken out) of one of the warm-up's packets at
+    /// `now`, with the path's smoothed RTT `rtt`: a queueing delay past [`SLOW_START_EXIT`] ends
+    /// the warm-up as congestion does
+    pub(crate) fn on_rtt_sample(&mut self, now: Instant, sample: Duration, rtt: Duration) {
+        if !matches!(self.warm_up, WarmUp::Measuring { .. }) {
+            return;
+        }
+        if self.delays.queued(now, sample, rtt) {
+            self.failed = true;
+            self.warm_up = WarmUp::Ended(WarmUpEnd::Queued);
+        }
+    }
+
+    /// A warm-up packet of `bytes` was sent: the first opens the warm-up's window at two of them,
+    /// which only the acknowledgements after it grow
     pub(crate) fn on_warm_up_sent(&mut self, bytes: u64) {
-        if let WarmUp::Measuring { sent } = &mut self.warm_up {
+        if let WarmUp::Measuring { sent, window } = &mut self.warm_up {
             *sent = sent.saturating_add(bytes);
+            window.get_or_insert(bytes.saturating_mul(WARM_UP_INITIAL_PACKETS));
             self.warmed = true;
         }
     }
@@ -368,9 +478,17 @@ impl CarefulResume {
             return None;
         }
         let saved = self.own(initial_window, min_rtt)?;
-        self.warm_up = WarmUp::Off;
+        self.warm_up = WarmUp::Ended(WarmUpEnd::Measured);
         self.holds = None;
         Some(saved)
+    }
+
+    /// Why the warm-up ended, once it has
+    pub(crate) fn warm_up_end(&self) -> Option<WarmUpEnd> {
+        match self.warm_up {
+            WarmUp::Ended(end) => Some(end),
+            WarmUp::Off | WarmUp::Measuring { .. } => None,
+        }
     }
 
     /// Whether the controller's window is held as it is, not grown by acknowledgements: in the
@@ -412,6 +530,17 @@ impl CarefulResume {
     ) {
         self.observer
             .on_ack(now, bytes, largest_data_acked, data_sent);
+        // The warm-up's window grows by what each acknowledgement acknowledges, as slow start's
+        // does (RFC 9002 §7.3.1). LEDBAT++ grows its window by a GAIN of that, as little as 1/16
+        // on a short path (§4.1, §4.2), to share congestion avoidance among background flows; a
+        // warm-up never enters congestion avoidance, and its budget is slow start's geometric sum.
+        if let WarmUp::Measuring {
+            window: Some(window),
+            ..
+        } = &mut self.warm_up
+        {
+            *window = window.saturating_add(bytes);
+        }
         let acked_past = |pn: u64| largest_data_acked.is_some_and(|largest| largest >= pn);
         match &mut self.phase {
             Phase::Off => {}
@@ -454,10 +583,12 @@ impl CarefulResume {
     pub(crate) fn on_congestion(&mut self, controller: &mut dyn Controller) {
         // A warm-up measures the path as it was before congestion and goes no further (§4.1: an
         // overshoot is no basis for the capacity); what it had delivered is kept at the close
-        if matches!(self.warm_up, WarmUp::Measuring { .. }) && self.warmed {
-            self.failed = true;
+        if matches!(self.warm_up, WarmUp::Measuring { .. }) {
+            if self.warmed {
+                self.failed = true;
+            }
+            self.warm_up = WarmUp::Ended(WarmUpEnd::Congestion);
         }
-        self.warm_up = WarmUp::Off;
         match self.phase {
             Phase::Off | Phase::Retreat { .. } => {}
             Phase::Reconnaissance { .. } => self.phase = Phase::Off,
@@ -577,7 +708,9 @@ impl CarefulResume {
         self.phase = Phase::Off;
         self.given = None;
         self.observer = Observer::default();
-        self.warm_up = WarmUp::Off;
+        if matches!(self.warm_up, WarmUp::Measuring { .. }) {
+            self.warm_up = WarmUp::Ended(WarmUpEnd::PathChanged);
+        }
     }
 
     /// What this connection leaves for the next one to its remote at its close: its own
@@ -711,7 +844,7 @@ mod tests {
         let now = Instant::now();
         let mut cc = controller(now);
         let mut resume = CarefulResume::new(Grant::Measure, u64::MAX, true, now);
-        assert!(resume.warm_up_wants(IW, 1_200));
+        assert!(resume.warm_up_wants(IW, 1_200, 0));
         resume.on_ack(now, 1_000, Some(0), Some(10), 0, &rtt(SECOND), &mut cc);
         // 47,000 bytes a round trip: short of the target, nothing to publish
         resume.on_ack(
@@ -724,7 +857,7 @@ mod tests {
             &mut cc,
         );
         assert_eq!(resume.measured(IW, SECOND), None);
-        assert!(resume.warm_up_wants(IW, 1_200));
+        assert!(resume.warm_up_wants(IW, 1_200, 0));
         // 48,000, four initial windows: published at once, and the warm-up ends
         resume.on_ack(
             now + 2 * SECOND,
@@ -742,7 +875,8 @@ mod tests {
         };
         assert_eq!(resume.measured(IW, SECOND), Some(published));
         assert_eq!(resume.measured(IW, SECOND), None);
-        assert!(!resume.warm_up_wants(IW, 1_200));
+        assert!(!resume.warm_up_wants(IW, 1_200, 0));
+        assert_eq!(resume.warm_up_end(), Some(WarmUpEnd::Measured));
         // At the close it is kept again, the mark having been replaced by it
         assert_eq!(resume.observed(IW, SECOND), Leaves::Keep(published));
     }
@@ -754,8 +888,10 @@ mod tests {
         // Four times four initial windows of budget
         let mut resume = CarefulResume::new(Grant::Measure, u64::MAX, true, now);
         resume.on_warm_up_sent(16 * IW - 1_200);
-        assert!(resume.warm_up_wants(IW, 1_200));
-        assert!(!resume.warm_up_wants(IW, 1_201));
+        assert!(resume.warm_up_wants(IW, 1_200, 0));
+        assert_eq!(resume.warm_up_end(), None);
+        assert!(!resume.warm_up_wants(IW, 1_201, 0));
+        assert_eq!(resume.warm_up_end(), Some(WarmUpEnd::Budget));
 
         // Closed before its warm-up sent anything: the mark is released, no attempt recorded
         let resume = CarefulResume::new(Grant::Measure, u64::MAX, true, now);
@@ -763,7 +899,8 @@ mod tests {
         let mut resume = CarefulResume::new(Grant::Measure, u64::MAX, true, now);
         resume.on_warm_up_sent(1_200);
         resume.on_congestion(&mut cc);
-        assert!(!resume.warm_up_wants(IW, 1_200));
+        assert!(!resume.warm_up_wants(IW, 1_200, 0));
+        assert_eq!(resume.warm_up_end(), Some(WarmUpEnd::Congestion));
         // It warmed the path up and measured nothing: the attempt is recorded at the close
         assert_eq!(resume.observed(IW, SECOND), Leaves::Tried(now));
 
@@ -774,11 +911,120 @@ mod tests {
             (Grant::Neither, true),
         ] {
             let mut resume = CarefulResume::new(grant, u64::MAX, warm_up, now);
-            assert!(!resume.warm_up_wants(IW, 1_200), "{grant:?}");
+            assert!(!resume.warm_up_wants(IW, 1_200, 0), "{grant:?}");
+            // Nor did one end
+            resume.on_congestion(&mut cc);
+            resume.on_path_change();
+            assert_eq!(resume.warm_up_end(), None, "{grant:?}");
         }
         assert_eq!(
             CarefulResume::new(Grant::Neither, u64::MAX, true, now).observed(IW, SECOND),
             Leaves::Nothing
+        );
+    }
+
+    #[test]
+    fn a_queue_is_the_least_recent_sample_past_the_least_by_three_quarters_of_60_ms() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let base = ms(100);
+        assert_eq!(SLOW_START_EXIT, ms(45));
+        // The first sample is the base: no queue, however long
+        assert!(!Delays::default().queued(now, SECOND, SECOND));
+        // Past 45 ms of queueing delay, not at it
+        let judged = |delay: Duration| {
+            let mut delays = Delays::default();
+            assert!(!delays.queued(now, base, SECOND));
+            delays.queued(now + 2 * SECOND, base + delay, SECOND)
+        };
+        assert!(!judged(ms(45)));
+        assert!(judged(ms(46)));
+        // One sample at the base among the four most recent holds the filter there; the fifth
+        // replaces it
+        let mut delays = Delays::default();
+        assert!(!delays.queued(now, base, SECOND));
+        for _ in 1..CURRENT_FILTER {
+            assert!(!delays.queued(now, ms(900), SECOND));
+        }
+        assert!(delays.queued(now, ms(900), SECOND));
+        // None older than a round trip counts (RFC 6817 §2.5): over a slow path's growing queue
+        // the oldest of four would hold the filter at the base
+        let mut delays = Delays::default();
+        assert!(!delays.queued(now, base, SECOND));
+        assert!(!delays.queued(now + SECOND, ms(900), SECOND));
+        assert!(delays.queued(now + 2 * SECOND, ms(900), SECOND));
+        // A lower sample lowers the base
+        let mut delays = Delays::default();
+        assert!(!delays.queued(now, ms(200), SECOND));
+        assert!(!delays.queued(now + 2 * SECOND, base, SECOND));
+        assert!(delays.queued(now + 4 * SECOND, ms(200), SECOND));
+    }
+
+    #[test]
+    fn a_warm_up_begins_with_two_packets_and_grows_by_what_is_acknowledged() {
+        let now = Instant::now();
+        let mut cc = controller(now);
+        let mut resume = CarefulResume::new(Grant::Measure, u64::MAX, true, now);
+        // Acknowledgements before its first packet open nothing, and the first waits for an idle
+        // path
+        resume.on_ack(now, 9_000, Some(0), Some(1), 0, &rtt(SECOND), &mut cc);
+        assert!(!resume.warm_up_wants(IW, 1_200, 1));
+        assert_eq!(resume.warm_up_end(), None);
+        assert!(resume.warm_up_wants(IW, 1_200, 0));
+        resume.on_warm_up_sent(1_200);
+        assert!(resume.warm_up_wants(IW, 1_200, 1_200));
+        resume.on_warm_up_sent(1_200);
+        // A third waits, the warm-up held, not ended
+        assert!(!resume.warm_up_wants(IW, 1_200, 2_400));
+        assert_eq!(resume.warm_up_end(), None);
+        // Each acknowledgement grows the window by what it acknowledges
+        resume.on_ack(now, 1_200, Some(2), Some(3), 1_200, &rtt(SECOND), &mut cc);
+        assert!(resume.warm_up_wants(IW, 1_200, 2_400));
+        assert!(!resume.warm_up_wants(IW, 1_200, 3_600));
+    }
+
+    #[test]
+    fn a_warm_up_whose_packets_queue_ends_as_an_attempt() {
+        let now = Instant::now();
+        let mut cc = controller(now);
+        let ms = Duration::from_millis;
+        let base = ms(100);
+        let mut resume = CarefulResume::new(Grant::Measure, u64::MAX, true, now);
+        assert!(resume.warm_up_wants(IW, 1_200, 0));
+        resume.on_warm_up_sent(1_200);
+        // Its first packet's sample is the base; then its packets meet 40 ms of queueing: it goes
+        // on
+        resume.on_rtt_sample(now, base, SECOND);
+        for _ in 0..CURRENT_FILTER {
+            resume.on_rtt_sample(now, base + ms(40), SECOND);
+        }
+        assert!(resume.warm_up_wants(IW, 1_200, 0));
+        // Then 50 ms: once every recent sample is past 45 ms it ends, its packets queueing
+        for _ in 1..CURRENT_FILTER {
+            resume.on_rtt_sample(now, base + ms(50), SECOND);
+            assert_eq!(resume.warm_up_end(), None);
+        }
+        resume.on_rtt_sample(now, base + ms(50), SECOND);
+        assert_eq!(resume.warm_up_end(), Some(WarmUpEnd::Queued));
+        assert!(!resume.warm_up_wants(IW, 1_200, 0));
+        // Congestion after it does not undo its ending
+        resume.on_congestion(&mut cc);
+        assert_eq!(resume.warm_up_end(), Some(WarmUpEnd::Queued));
+        assert_eq!(resume.measured(IW, base), None);
+        // It warmed the path up and measured nothing: the attempt is recorded at the close
+        assert_eq!(resume.observed(IW, SECOND), Leaves::Tried(now));
+
+        // A connection not warming up judges nothing: its samples leave it as it was
+        let mut resume =
+            CarefulResume::new(Grant::Resume(saved(100_000, now)), u64::MAX, true, now);
+        resume.on_warm_up_sent(1_200);
+        resume.on_rtt_sample(now, base, SECOND);
+        for _ in 0..2 * CURRENT_FILTER {
+            resume.on_rtt_sample(now, SECOND, SECOND);
+        }
+        assert_eq!(
+            resume.observed(IW, SECOND),
+            Leaves::Keep(saved(100_000, now))
         );
     }
 

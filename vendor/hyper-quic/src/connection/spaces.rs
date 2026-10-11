@@ -428,6 +428,9 @@ pub(super) struct SentPacket {
     /// before this endpoint's handshake completed (0-RTT and 0.5-RTT data), or one in a datagram
     /// with a Handshake packet (the client's first 1-RTT data, beside its Finished)
     pub(super) handshake_flight: bool,
+    /// Whether the packet is the path's warm-up's (`Connection::write_warm_up`), whose samples
+    /// alone judge the warm-up's queue
+    pub(super) warm_up: bool,
     /// The next ack-eliciting packet this space sent after this one, if this one is ack-eliciting:
     /// its number and when it went, the neighbour whose fate says whether a loss of this one came
     /// in a burst (`losses.rs`)

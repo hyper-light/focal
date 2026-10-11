@@ -86,7 +86,7 @@ use spaces::{
 };
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats, WarmUpEnd};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -1389,10 +1389,11 @@ impl Connection {
         // ack-eliciting packet within the last smoothed round trip is receiving a flight: the
         // warm-up's packets would queue ahead of its acknowledgements on the path back and slow
         // the peer's transfer (measured: a mebibyte reply at 500 ms one way came 2.8 ms later).
-        if !self
-            .resume
-            .warm_up_wants(self.path.congestion.initial_window(), bytes)
-            || self.streams.has_unsent_data()
+        if !self.resume.warm_up_wants(
+            self.path.congestion.initial_window(),
+            bytes,
+            self.path.in_flight.bytes,
+        ) || self.streams.has_unsent_data()
         {
             return;
         }
@@ -1462,6 +1463,7 @@ impl Connection {
         // Nothing in it is sent again: a lost one is congestion, and ends the warm-up
         let sent_frames = SentFrames {
             non_retransmits: true,
+            warm_up: true,
             ..Default::default()
         };
         builder.finish_and_track(now, self, Some(sent_frames), buf);
@@ -1766,6 +1768,7 @@ impl Connection {
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        stats.path.warm_up_end = self.resume.warm_up_end();
 
         stats
     }
@@ -1968,7 +1971,7 @@ impl Connection {
         if ack.largest >= self.spaces.get(space).next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
-        let new_largest = self.record_largest_acked(space, ack.largest);
+        let (new_largest, warm_up_acked) = self.record_largest_acked(space, ack.largest);
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
@@ -1995,9 +1998,8 @@ impl Connection {
             self.spaces.get(space).largest_acked_packet,
         );
 
-        if new_largest && ack_eliciting_acked {
-            self.update_rtt(now, space, ack.delay);
-        }
+        let sample =
+            (new_largest && ack_eliciting_acked).then(|| self.update_rtt(now, space, ack.delay));
         if new_largest {
             let delivered_sent = self.spaces.get(space).largest_acked_packet_sent;
             self.ledger
@@ -2020,6 +2022,12 @@ impl Connection {
             &self.path.rtt,
             &mut *self.path.congestion,
         );
+        // The warm-up judges its queue by its own packets, of one size: a smaller packet's sample
+        // is shorter by the time the path takes to carry the difference (91 ms of a 1,452-byte
+        // datagram at 128 kbit/s), and one sent before the warm-up began met another flight's queue
+        if let Some(sample) = sample.filter(|_| warm_up_acked) {
+            self.resume.on_rtt_sample(now, sample, self.path.rtt.get());
+        }
         // The warm-up's measurement goes to the endpoint as soon as it is made
         if let Some(saved) = self
             .resume
@@ -2043,20 +2051,22 @@ impl Connection {
     }
 
     /// Records `largest` as the space's largest acknowledged packet if it is; returns whether it
-    /// was
-    fn record_largest_acked(&mut self, space: SpaceId, largest: u64) -> bool {
+    /// was, and whether it is a packet of the path's warm-up
+    fn record_largest_acked(&mut self, space: SpaceId, largest: u64) -> (bool, bool) {
         let space = self.spaces.get_mut(space);
         if space.largest_acked_packet.is_some_and(|pn| largest <= pn) {
-            return false;
+            return (false, false);
         }
         space.largest_acked_packet = Some(largest);
+        let mut warm_up = false;
         if let Some(info) = space.sent_packets.get(&largest) {
             // This should always succeed, but a misbehaving peer might ACK a packet we
             // haven't sent. At worst, that will result in us spuriously reducing the
             // congestion window.
             space.largest_acked_packet_sent = info.time_sent;
+            warm_up = info.warm_up;
         }
-        true
+        (true, warm_up)
     }
 
     /// Takes each newly acknowledged packet out of flight; returns whether any was
@@ -2106,8 +2116,10 @@ impl Connection {
         (ack_eliciting_acked, acked_bytes)
     }
 
-    /// Takes an RTT sample from an ACK of a new largest, ACK-eliciting packet
-    fn update_rtt(&mut self, now: Instant, space: SpaceId, encoded_delay: u64) {
+    /// Takes an RTT sample from an ACK of a new largest, ACK-eliciting packet; returns it with the
+    /// peer's ACK delay taken out as the estimator takes it out (RFC 9002 §5.3), so a delayed
+    /// acknowledgement is no queue
+    fn update_rtt(&mut self, now: Instant, space: SpaceId, encoded_delay: u64) -> Duration {
         let ack_delay = if space != SpaceId::Data {
             Duration::from_micros(0)
         } else {
@@ -2123,6 +2135,11 @@ impl Connection {
         if self.path.first_packet_after_rtt_sample.is_none() {
             self.path.first_packet_after_rtt_sample =
                 Some((space, self.spaces.get(space).next_packet_number));
+        }
+        if self.path.rtt.min().saturating_add(ack_delay) <= rtt {
+            rtt.saturating_sub(ack_delay)
+        } else {
+            rtt
         }
     }
 
@@ -5514,6 +5531,8 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    /// Whether the packet is the path's warm-up's: a PING and PADDING alone
+    warm_up: bool,
 }
 
 /// Compute the negotiated idle timeout based on local and remote max_idle_timeout transport parameters.

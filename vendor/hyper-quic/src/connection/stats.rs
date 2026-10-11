@@ -164,6 +164,25 @@ impl std::fmt::Debug for FrameStats {
     }
 }
 
+/// Why a path's warm-up ended: the measurement for Careful Resume it makes when nothing else uses
+/// the path (RFC 9959 §3.1)
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WarmUpEnd {
+    /// It measured four initial windows a round trip, the least measurement Careful Resume keeps
+    Measured,
+    /// Its packets queued on the path: the least of their recent RTTs was past the least of all
+    /// by three quarters of LEDBAT++'s 60 ms target (draft-irtf-iccrg-ledbat-plus-plus §4.1),
+    /// so the path carries no more than it had measured
+    Queued,
+    /// The path signalled congestion, a loss or an ECN-CE mark
+    Congestion,
+    /// It spent its budget without measuring four initial windows a round trip
+    Budget,
+    /// The path changed (a migration)
+    PathChanged,
+}
+
 /// Statistics related to a transmission path
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -193,6 +212,8 @@ pub struct PathStats {
     /// The packets the path's warm-up sent to measure it for Careful Resume (also counted by
     /// `sent_packets`)
     pub sent_warm_up_packets: u64,
+    /// Why the path's warm-up ended; none while it runs, or if the connection did not warm up
+    pub warm_up_end: Option<WarmUpEnd>,
     /// The number of times a black hole was detected in the path
     pub black_holes_detected: u64,
     /// Largest UDP payload size the path currently supports
