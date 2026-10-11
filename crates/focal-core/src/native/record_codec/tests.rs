@@ -22,7 +22,13 @@ fn inspection(bytes: usize) -> InspectionLimits {
 pub(super) fn encode(prepared: &NativePrepared) -> Vec<u8> {
     let plan = EncodingPlan::prepare(prepared, limits()).unwrap();
     let mut bytes = vec![0; plan.quote().bytes];
-    assert_eq!(plan.write_into(&mut bytes).unwrap(), plan.quote().hash);
+    let hash = plan.write_into(&mut bytes).unwrap();
+    // The record's hash is its trailer, the digest of every byte before it.
+    let (body, trailer) = bytes.split_at(bytes.len() - 32);
+    let mut expected = blake3::Hasher::new_derive_key(HASH_DOMAIN);
+    expected.update(body);
+    assert_eq!(hash.0, *expected.finalize().as_bytes());
+    assert_eq!(trailer, &hash.0);
     bytes
 }
 fn created(core: &Core<NativeState>) -> NativePrepared {
