@@ -13,7 +13,7 @@ FROM public.ecr.aws/docker/library/rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe
 RUN apk add --no-cache build-base protoc bash perl linux-headers
 WORKDIR /src
 COPY . .
-ENV RUSTFLAGS="-C target-feature=+crt-static" \
+ENV RUSTFLAGS="-C target-feature=+crt-static -C force-frame-pointers=yes" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc
 RUN --mount=type=cache,id=focal-bench-target,target=/src/target \
@@ -29,7 +29,7 @@ RUN --mount=type=cache,id=focal-bench-target,target=/src/target \
 FROM public.ecr.aws/docker/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
 # The data and client directories private, as the shipped image makes its
 # own: a named volume takes the mode of the directory it first mounts over.
-RUN apk add --no-cache iproute2 && install -d -m 0700 /data /client
+RUN apk add --no-cache iproute2 perf && install -d -m 0700 /data /client
 COPY --from=build /out/focal /usr/local/bin/focal
 COPY --from=build /out/focal-load /usr/local/bin/focal-load
 COPY --from=build /out/focal-compare /usr/local/bin/focal-compare

@@ -52,6 +52,9 @@ x-focal: &focal
   <<: *limits
   image: focal:bench
   profiles: [focal]
+  # Every node is sampled by perf while a run is under way (run.sh).
+  cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE, PERFMON]
+  security_opt: ["seccomp:unconfined"]
 
 services:
   nats1: { <<: *nats, environment: { NAME: nats1, SYNC: "${NATS_SYNC:-2m}" }, ports: ["14221:4222"] }
