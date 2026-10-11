@@ -925,6 +925,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         Ok(conn.epoch)
     }
 
+    /// Whether the connection of `epoch` to `peer` is up. A peer may hold several connections at
+    /// once (its identity's, up to its admission bound), and only its current one's lifecycle is
+    /// an event ([`Event::Connected`], [`Event::Closed`]): an owner that keeps something for each
+    /// connection a request came on ([`Event::Request`]'s epoch) lets an older one's go by this.
+    pub fn connection_live(&self, peer: PeerId, epoch: Epoch) -> bool {
+        self.conns.iter().flatten().any(|conn| {
+            !conn.lost && conn.epoch == epoch && conn.peer.is_some_and(|(of, _)| of == peer)
+        })
+    }
+
     /// What the path to `peer` measures now.
     pub fn path(&self, peer: PeerId) -> Option<PathFacts> {
         let key = self.core.connection_of(peer)?;

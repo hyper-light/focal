@@ -27,7 +27,7 @@ use hyper_rt::sync::{
 use hyper_rt::{RtError, TaskId};
 use hyper_transport::tls::Tls;
 use hyper_transport::{
-    Classes, Epoch, Event, ExchangeId, PathFacts, PeerId, Progress, Refusal, Reservation,
+    Classes, Endpoint, Epoch, Event, ExchangeId, PathFacts, PeerId, Progress, Refusal, Reservation,
 };
 
 use super::budget::{NetBudget, NetBudgetStats};
@@ -308,6 +308,20 @@ pub(crate) struct Asked {
     bytes: Vec<u8>,
     secret: bool,
 }
+/// Lets go what `state` keeps for `peer`'s connections that are no longer up. Only a peer's current
+/// connection's end is an event, so an older one's goes the next time the peer's connections change
+/// (hyper-transport's `connection_live`): what is kept stays within the connections the peer's
+/// identity is admitted, and one more.
+fn keep_live(
+    endpoint: &Endpoint<FocalClasses, NetBudget, NetDirectory>,
+    peer: PeerId,
+    state: &mut PeerState,
+) {
+    state
+        .connections
+        .retain(|epoch, _| endpoint.connection_live(peer, *epoch));
+}
+
 impl PeerState {
     /// The current connection: the newest up, and what it negotiated.
     fn current(&self) -> Option<(Epoch, Option<Negotiated>)> {
@@ -1143,8 +1157,10 @@ impl Owner {
             connections: BTreeMap::new(),
             dialed: None,
         });
-        // Its own, until its greeting is answered; the peer's other connections keep theirs.
+        // Its own, until its greeting is answered; the peer's other connections keep theirs, those
+        // still up.
         state.connections.insert(epoch, None);
+        keep_live(self.driver.endpoint(), peer, state);
         let Some(dial) = state.dialed.as_mut() else {
             return;
         };
@@ -1191,8 +1207,10 @@ impl Owner {
         let Some(state) = self.peers.get_mut(&peer) else {
             return;
         };
-        if state.connections.remove(&epoch).is_none() || !state.connections.is_empty() {
-            // Not one of its connections, or not its last: the peer is up on another.
+        state.connections.remove(&epoch);
+        keep_live(self.driver.endpoint(), peer, state);
+        if !state.connections.is_empty() {
+            // Not its last: the peer is up on another.
             return;
         }
         self.driver.endpoint().directory_mut().set_live(peer, false);
@@ -1419,14 +1437,16 @@ impl Owner {
                     .negotiate_ordered(&hello, managed, participant, native, ordered)
                 {
                     Ok(negotiated) => {
-                        // The connection it came on is greeted; the peer's others are as they were.
-                        if let Some(greeted) = self
-                            .peers
-                            .get_mut(&peer)
-                            .and_then(|state| state.connections.get_mut(&epoch))
-                        {
-                            *greeted = Some(negotiated);
-                        }
+                        // The connection it came on is greeted, told or not: a peer's lifecycle
+                        // tells its current connection alone, and waits behind the requests
+                        // that came before it, so a greeting may be the first this side hears of
+                        // its peer. The peer's other connections are as they were, those still up.
+                        let state = self.peers.entry(peer).or_insert(PeerState {
+                            connections: BTreeMap::new(),
+                            dialed: None,
+                        });
+                        state.connections.insert(epoch, Some(negotiated));
+                        keep_live(self.driver.endpoint(), peer, state);
                         HelloReply::Accepted(negotiated)
                     }
                     Err(error) => HelloReply::Rejected(error),

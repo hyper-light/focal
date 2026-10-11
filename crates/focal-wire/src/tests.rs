@@ -729,6 +729,55 @@ fn a_second_connection_of_an_identity_leaves_the_first_greeted() {
     .unwrap()
 }
 
+/// Connections of one identity made at once are each greeted and served, though a peer's lifecycle
+/// tells its current connection alone: kept only for the told connections, the greetings of the
+/// others went unrecorded and their requests were refused as ungreeted (three clients of one
+/// identity in cli_native_a4, 2026-10-10).
+#[test]
+fn connections_of_one_identity_made_at_once_are_each_greeted() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let (server, task) = server(&pki, registry, handler).await;
+        let address = server.local_addr().unwrap();
+        let processes: Vec<QuicConnector> = (0..3)
+            .map(|_| connector(&pki, certificate.clone(), key.clone()))
+            .collect();
+        let (a, b, c) = hyper_rt::combine::join3(
+            processes[0].connect(address, "localhost"),
+            processes[1].connect(address, "localhost"),
+            processes[2].connect(address, "localhost"),
+        )
+        .await;
+        let remotes = [a.unwrap(), b.unwrap(), c.unwrap()];
+        let (x, y, z) = hyper_rt::combine::join3(
+            remotes[0].request(&request(1)),
+            remotes[1].request(&request(2)),
+            remotes[2].request(&request(3)),
+        )
+        .await;
+        assert_eq!(x.unwrap(), response(&request(1)));
+        assert_eq!(y.unwrap(), response(&request(2)));
+        assert_eq!(z.unwrap(), response(&request(3)));
+        for (at, remote) in remotes.iter().enumerate() {
+            let id = 10 + at as u128;
+            assert_eq!(
+                remote.request(&request(id)).await.unwrap(),
+                response(&request(id))
+            );
+        }
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 #[test]
 fn a_complete_request_is_authorized_by_the_grant_current_at_dispatch() {
     focal_rt::block_on(async move {
