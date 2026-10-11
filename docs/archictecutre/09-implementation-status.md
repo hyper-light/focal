@@ -14065,3 +14065,38 @@ What the move found, each fixed at its cause (the commits name each measurement)
   that at a container's 256 MB the network controller's and the placement agent's fixed
   prepayments (64 MiB and 32 MiB) left too little to place a session that survives one failure.
   The next batch charges what they hold instead.
+
+### 2026-10-11 — The network controller holds what it is charged for; the shared crates at b13d50d
+
+The network controller no longer prepays a fixed 64 MiB of control memory. It charges what it holds
+and keeps, by entries: the founder's genesis enrollment (decoded once), its routes and the grant
+projection it installs. Each refresh charges the registry it decodes, at the size the root's owner
+measured it. A refresh it has no memory for is refused, and its grants are withdrawn, as when the
+root cannot be observed.
+
+Measuring a restored enrollment registry with a counting allocator (`tests/registry_heap.rs`) found
+that its committed size measures no memory. At 64 enrollments it held 123,704 bytes where
+`charged_bytes` says 93,503, and the root replica charged sixteen times that to hold it.
+`EnrollmentRegistry` gains `held_bytes`, `restore_bytes` and, from the bytes alone,
+`restore_bound`, each checked against the allocator for 0 to 64 enrollments. The same tracing found
+that every enrollment encode zeroed a 16 KiB buffer and kept it as the result's capacity. A
+1-enrollment restore's peak fell from 23,054 bytes to 10,684.
+
+In a 256 MB container (192 MiB envelope) per node, the charged `control` memory fell from about
+110 MB to 42–45 MB per node, and total charged use to 53–56 MB.
+
+Other changes in this landing:
+- A client call bounded by one deadline begins no read past it. A late wake no longer sends a third
+  read after the deadline has passed.
+- The native-profile local-socket test runs on every OS, as the AF_UNIX local transport does. This
+  is the Windows clippy failure of run 38117543277.
+- The shared crates are at hyper-raft `b13d50d`: main's `f358210`, which leaves no runtime
+  recursion in hyper-raft's code, with `focal-transport-hooks` rebased on top.
+
+The gate on the landing tree (head `11b8fd5`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1149 production sources, no policy allowance),
+`cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3263
+passed, 0 failed, 20 ignored.
