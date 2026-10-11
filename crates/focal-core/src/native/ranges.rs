@@ -205,6 +205,10 @@ fn reserve<T>(
     Ok(budget.reserve(BudgetKind::Roots, lane, bytes)?.commit())
 }
 
+/// How many rows a member's split point reads from its middle for an
+/// affinity that divides it.
+const SPLIT_SCAN: usize = 4096;
+
 fn route<T>(members: &[T], start: impl Fn(&T) -> Option<Affinity>, affinity: &Affinity) -> usize {
     members
         .partition_point(|member| start(member).is_none_or(|start| start <= *affinity))
@@ -443,17 +447,23 @@ impl NativeRanges {
     /// An affinity that divides the member at `index` near its middle (25
     /// §8): the first affinity boundary at or after the median row, so both
     /// sides keep rows; `None` when the member's rows share one affinity.
+    /// An affinity dividing member `index` near its middle: the first after
+    /// a row of a smaller one, from the page before its middle page on
+    /// (reached by one descent; the walk from its first row to its middle one
+    /// read half its rows, and its balancer asks again at every pass a split
+    /// is refused, which it is while candidates are pending). None where no
+    /// affinity changes within [`SPLIT_SCAN`] rows of there, or the member has
+    /// fewer than two rows.
     pub(super) fn member_split_point(&self, index: usize) -> Option<Affinity> {
         let store = self.stores.get(index)?;
-        let count = store.len();
-        if count < 2 {
+        if store.len() < 2 {
             return None;
         }
-        let middle = count / 2;
+        let start = (store.stats().pages / 2).saturating_sub(1);
         let mut previous: Option<Affinity> = None;
-        for (position, entry) in store.entries().enumerate() {
+        for entry in store.entries_from_page(start).take(SPLIT_SCAN) {
             let affinity = layout::affinity(&entry.key);
-            if position >= middle && previous.is_some_and(|before| affinity > before) {
+            if previous.is_some_and(|before| affinity > before) {
                 return Some(affinity);
             }
             previous = Some(affinity);

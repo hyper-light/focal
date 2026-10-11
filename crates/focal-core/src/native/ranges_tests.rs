@@ -451,3 +451,36 @@ fn layout_frames_refuse_disorder_duplicates_and_a_bounded_first_member() {
         Err(CodecError::InvalidTag("checkpoint checksum"))
     );
 }
+
+/// A member divides near its middle, at the first affinity after a row of a
+/// smaller one from the page before its middle page on (reached by a descent,
+/// not a walk from its first row): rows of smaller affinities lie on one side
+/// and the rest on the other, and neither side holds less than a quarter of
+/// the member's rows.
+#[test]
+fn a_member_divides_near_its_middle_from_its_middle_page() {
+    let mut core = f::core();
+    for id in 1..=300u128 {
+        f::publish(&mut core, 10, f::creation(id, id, &[], None));
+    }
+    let rows: Vec<Affinity> = core
+        .state
+        .rows
+        .entries()
+        .map(|entry| layout::affinity(&entry.key))
+        .collect();
+    assert!(
+        core.state.rows.stats().pages >= 8,
+        "{} pages",
+        core.state.rows.stats().pages
+    );
+    let at = core.native_member_split_point(0).unwrap();
+    let below = rows.iter().filter(|affinity| **affinity < at).count();
+    assert!(
+        below * 4 >= rows.len() && below * 4 <= rows.len() * 3,
+        "{below} of {} rows below the split",
+        rows.len()
+    );
+    assert!(rows.iter().any(|affinity| *affinity == at));
+    assert_eq!(core.native_member_split_point(1), None);
+}
