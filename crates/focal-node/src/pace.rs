@@ -71,6 +71,19 @@ struct TickShared {
     /// from the host's ingress until it is answered.
     write_window: AtomicU64,
     writes_admitted: AtomicU64,
+    /// The length of the window's last round, nanoseconds, as its owner
+    /// states it (`WriteWindow::round_ns`), zero before one has ended; and
+    /// since when the window has been full, on the pace's clock, zero while
+    /// it is not. A full window that drains within a round held a burst,
+    /// which it takes; one full for a whole round holds a standing queue,
+    /// past which a write is refused. CoDel's rule (RFC 8289 §3: a queue that
+    /// persists for an interval is no burst), its interval the writes' own
+    /// round trip, which the window measures, where a router must assume
+    /// one.
+    write_round_ns: AtomicU64,
+    write_full_since_ns: AtomicU64,
+    /// The writes taken past the window while it held a burst.
+    writes_absorbed: AtomicU64,
 }
 /// A write's place in its session's window, taken at the host's ingress
 /// (`TickPeriod::admit_write`) and held until the write is answered, given
@@ -87,11 +100,17 @@ impl WriteTicket {
 }
 impl Drop for WriteTicket {
     fn drop(&mut self) {
-        let _ = self.pace.0.writes_admitted.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |admitted| admitted.checked_sub(1),
-        );
+        let inner = &self.pace.0;
+        let left = inner
+            .writes_admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                admitted.checked_sub(1)
+            })
+            .map_or(0, |admitted| admitted.saturating_sub(1));
+        // A window with room is no longer full: its next fill starts anew.
+        if left < inner.write_window.load(Ordering::Acquire) {
+            inner.write_full_since_ns.store(0, Ordering::Release);
+        }
     }
 }
 /// Nanoseconds since the process began, the clock a write's admission and
@@ -298,29 +317,64 @@ impl TickPeriod {
             self.0.requests_refused.count(bound);
         }
     }
-    /// A place in the session's write window for one more write, while the
+    /// A place in the session's write window for one more write: while the
     /// window its owner states has one, or before it states one (the host's
-    /// queue bounds the writes then); none past it.
+    /// queue bounds the writes then); and past it while the window has been
+    /// full for less than its last round, a burst it takes (`write_round_ns`).
+    /// None past a window full for a round or more, or before a round has
+    /// been measured.
     pub(crate) fn admit_write(&self) -> Option<WriteTicket> {
-        let window = self.0.write_window.load(Ordering::Acquire);
-        self.0
+        self.admit_write_at(now_ns())
+    }
+    /// [`Self::admit_write`] at `now`, on the pace's clock.
+    fn admit_write_at(&self, now: u64) -> Option<WriteTicket> {
+        let inner = &self.0;
+        let window = inner.write_window.load(Ordering::Acquire);
+        let mut absorbed = false;
+        let admitted = inner
             .writes_admitted
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                absorbed = false;
                 if window == 0 || admitted < window {
-                    admitted.checked_add(1)
-                } else {
-                    None
+                    return admitted.checked_add(1);
                 }
+                let round = inner.write_round_ns.load(Ordering::Acquire);
+                let since = inner.write_full_since_ns.load(Ordering::Acquire);
+                let full_for = now.saturating_sub(since);
+                if round != 0 && (since == 0 || full_for < round) {
+                    absorbed = true;
+                    return admitted.checked_add(1);
+                }
+                None
             })
-            .ok()
-            .map(|_| WriteTicket {
-                pace: self.clone(),
-                admitted_ns: now_ns(),
-            })
+            .ok()?;
+        // The window filled with this write, or was full before it: its full
+        // span starts at the first write that met it full.
+        if window != 0 && admitted.saturating_add(1) >= window {
+            let _ = inner.write_full_since_ns.compare_exchange(
+                0,
+                now.max(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        if absorbed {
+            inner.writes_absorbed.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(WriteTicket {
+            pace: self.clone(),
+            admitted_ns: now,
+        })
     }
-    /// The owner states the window it learned.
-    pub(crate) fn set_write_window(&self, window: u64) {
+    /// The owner states the window it learned and the length of its last
+    /// round (zero before one has ended).
+    pub(crate) fn set_write_window(&self, window: u64, round_ns: u64) {
         self.0.write_window.store(window, Ordering::Release);
+        self.0.write_round_ns.store(round_ns, Ordering::Release);
+    }
+    /// The writes taken past the window while it held a burst.
+    pub(crate) fn writes_absorbed(&self) -> u64 {
+        self.0.writes_absorbed.load(Ordering::Acquire)
     }
     /// The writes admitted now, each holding its place.
     pub(crate) fn writes_admitted(&self) -> u64 {
@@ -521,5 +575,80 @@ mod frame_room_tests {
         assert!(pace.queue_frame().is_none());
         drop(fourth);
         assert_eq!(pace.frame_room(), (1, 0));
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+mod write_window_tests {
+    use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    /// A full window takes a burst while it has been full for less than its
+    /// last round, and counts what it took past the window; before a round
+    /// has been measured it takes nothing past the window.
+    #[test]
+    fn a_full_window_takes_a_burst_within_its_round() {
+        let pace = TickPeriod::default();
+        pace.set_write_window(2, 0);
+        let first = pace.admit_write_at(MS).unwrap();
+        let second = pace.admit_write_at(MS).unwrap();
+        assert!(
+            pace.admit_write_at(MS).is_none(),
+            "no round measured: strict"
+        );
+        pace.set_write_window(2, 10 * MS);
+        let third = pace.admit_write_at(2 * MS).unwrap();
+        let fourth = pace.admit_write_at(10 * MS).unwrap();
+        assert_eq!(pace.writes_admitted(), 4);
+        assert_eq!(pace.writes_absorbed(), 2);
+        drop((first, second, third, fourth));
+        assert_eq!(pace.writes_admitted(), 0);
+    }
+
+    /// A window full for its whole last round holds a standing queue: a write
+    /// past it is refused, from the write that filled it on.
+    #[test]
+    fn a_window_full_for_a_round_refuses_past_it() {
+        let pace = TickPeriod::default();
+        pace.set_write_window(1, 10 * MS);
+        let held = pace.admit_write_at(5 * MS).unwrap();
+        assert!(
+            pace.admit_write_at(14 * MS).is_some(),
+            "full for 9 ms: a burst"
+        );
+        assert!(pace.admit_write_at(15 * MS).is_none(), "full for a round");
+        assert!(pace.admit_write_at(40 * MS).is_none());
+        assert_eq!(pace.writes_absorbed(), 1);
+        drop(held);
+    }
+
+    /// A window that drained below its size is no longer full: the next fill
+    /// is a burst of its own, whatever the last fill's span was.
+    #[test]
+    fn a_window_that_drains_starts_its_next_fill_anew() {
+        let pace = TickPeriod::default();
+        pace.set_write_window(2, 10 * MS);
+        let first = pace.admit_write_at(MS).unwrap();
+        let second = pace.admit_write_at(MS).unwrap();
+        assert!(pace.admit_write_at(20 * MS).is_none(), "full for a round");
+        drop(second);
+        let refill = pace.admit_write_at(30 * MS).unwrap();
+        assert!(pace.admit_write_at(35 * MS).is_some(), "full anew: a burst");
+        assert!(
+            pace.admit_write_at(40 * MS).is_none(),
+            "full for a round again"
+        );
+        drop((first, refill));
     }
 }

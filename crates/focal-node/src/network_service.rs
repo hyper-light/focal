@@ -1560,6 +1560,7 @@ impl NetworkService {
                 tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
                 write_window: host.write_window(),
                 writes_admitted: host.writes_admitted(),
+                writes_absorbed: host.writes_absorbed(),
                 broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
                 pace_samples: host.current_pace().samples,
                 periods: host.periods(),

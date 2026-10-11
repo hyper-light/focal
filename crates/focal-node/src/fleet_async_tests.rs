@@ -1066,8 +1066,9 @@ fn a_write_past_its_sessions_window_is_refused_at_the_ingress_and_counted() {
         // The owner stated the window it starts with (RFC 6928's ten).
         assert_eq!(host.write_window(), 10);
         assert_eq!(host.writes_admitted(), 0);
-        // A window of one, and a write holding its place.
-        host.pace.set_write_window(1);
+        // A window of one, no round of it measured yet, so nothing past it,
+        // and a write holding its place.
+        host.pace.set_write_window(1, 0);
         let held = host.pace.admit_write().unwrap();
         assert_eq!(host.writes_admitted(), 1);
         assert!(host.pace.admit_write().is_none(), "the window is full");

@@ -1224,7 +1224,7 @@ impl ReplicaHost {
             u64::try_from(config.pending_clients).unwrap_or(u64::MAX),
             crate::pace::now_ns(),
         );
-        pace.set_write_window(window.window());
+        pace.set_write_window(window.window(), window.round_ns());
         let owner = Owner {
             window,
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
@@ -1383,6 +1383,10 @@ impl ReplicaHost {
     }
     pub fn writes_admitted(&self) -> u64 {
         self.pace.writes_admitted()
+    }
+    /// The writes taken past the window while it held a burst.
+    pub fn writes_absorbed(&self) -> u64 {
+        self.pace.writes_absorbed()
     }
     pub fn memory_stats(&self) -> focal_memory::BudgetStats {
         self.budget.stats()
@@ -4929,7 +4933,8 @@ impl Owner {
             }
         }
         if answered {
-            self.pace.set_write_window(self.window.window());
+            self.pace
+                .set_write_window(self.window.window(), self.window.round_ns());
         }
         Ok(())
     }

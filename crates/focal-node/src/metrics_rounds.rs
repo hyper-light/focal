@@ -569,6 +569,7 @@ impl SessionMetrics {
             tick_period_ms: wide,
             write_window: wide,
             writes_admitted: wide,
+            writes_absorbed: wide,
             periods: wide,
             refused_periods: wide,
             peers_unreachable: wide,

@@ -295,3 +295,32 @@ fn the_rate_filter_keeps_the_most_of_the_last_ten_rounds() {
     filter.update(15, 70);
     assert!(filter.get() <= 80, "round 3 aged out: {}", filter.get());
 }
+
+/// The window states the length of its last round, the interval a full window
+/// holds a burst within at the ingress; none before a round has ended.
+#[test]
+fn the_window_states_the_length_of_its_last_round() {
+    let mut window = WriteWindow::new(128, 0);
+    assert_eq!(window.round_ns(), 0);
+    // The first write, admitted with nothing delivered and answered 5 ms
+    // later, ends the first round
+    window.answered(
+        Admitted {
+            at_ns: 0,
+            delivered: 0,
+        },
+        5_000_000,
+        0,
+    );
+    assert_eq!(window.round_ns(), 5_000_000);
+    // A write admitted before the round's start ends no round
+    window.answered(
+        Admitted {
+            at_ns: 1_000_000,
+            delivered: 0,
+        },
+        9_000_000,
+        0,
+    );
+    assert_eq!(window.round_ns(), 5_000_000);
+}

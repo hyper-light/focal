@@ -195,6 +195,8 @@ pub(crate) struct WriteWindow {
     /// it, answered, ends the round.
     round_delivered: u64,
     round_started_ns: u64,
+    /// The length of the last round that ended, nanoseconds; zero before one.
+    last_round_ns: u64,
     /// Whether the window filled during the round: its rate is the
     /// pipeline's, not its load's.
     round_full: bool,
@@ -220,6 +222,7 @@ impl WriteWindow {
             round: 0,
             round_delivered: 0,
             round_started_ns: now_ns,
+            last_round_ns: 0,
             round_full: false,
             rate: MaxFilter::default(),
             latency_ns: 0,
@@ -234,6 +237,11 @@ impl WriteWindow {
     /// The writes the window holds now.
     pub(crate) fn window(&self) -> u64 {
         self.window
+    }
+    /// The length of the last round that ended, nanoseconds; zero before one:
+    /// the interval a full window holds a burst within (`TickPeriod::admit_write`).
+    pub(crate) fn round_ns(&self) -> u64 {
+        self.last_round_ns
     }
     /// Writes answered so far, for the next write's [`Admitted`].
     pub(crate) fn delivered(&self) -> u64 {
@@ -271,6 +279,7 @@ impl WriteWindow {
     /// The round that just ended: sample its rate, and move the phase.
     fn end_round(&mut self, now_ns: u64, inflight: u64) {
         let span = now_ns.saturating_sub(self.round_started_ns).max(1);
+        self.last_round_ns = span;
         let answered = self.delivered.saturating_sub(self.round_delivered);
         let rate = u128::from(answered)
             .saturating_mul(RATE_SCALE)

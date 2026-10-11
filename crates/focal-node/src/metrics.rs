@@ -155,6 +155,8 @@ pub struct SessionMetrics {
     /// learned its write window, and the writes admitted now.
     pub write_window: u64,
     pub writes_admitted: u64,
+    /// The writes taken past the window while it held a burst.
+    pub writes_absorbed: u64,
     /// Periods the session's owner has run: the unit its replica's election
     /// timer counts, and what a wait on it is charged in (27 §3.1 P8).
     pub periods: u64,
@@ -1574,7 +1576,7 @@ impl MetricsSnapshot {
                 text.labeled(name, &[("bound", bound)], count);
             }
         }
-        let series: [(&str, &str, &str); 34] = [
+        let series: [(&str, &str, &str); 35] = [
             (
                 "focal_session_observed",
                 "gauge",
@@ -1645,6 +1647,11 @@ impl MetricsSnapshot {
                 "focal_session_writes_admitted",
                 "gauge",
                 "The session's writes admitted now, from its host's ingress until each is answered.",
+            ),
+            (
+                "focal_session_writes_absorbed_total",
+                "counter",
+                "Writes the session's leader took past its write window while the window held a burst: full for less than a round of its writes.",
             ),
             (
                 "focal_session_broadcast_tail_microseconds",
@@ -1774,6 +1781,7 @@ impl MetricsSnapshot {
                     "focal_session_tick_period_milliseconds" => Some(session.tick_period_ms),
                     "focal_session_write_window" => Some(session.write_window),
                     "focal_session_writes_admitted" => Some(session.writes_admitted),
+                    "focal_session_writes_absorbed_total" => Some(session.writes_absorbed),
                     "focal_session_broadcast_tail_microseconds" => Some(session.broadcast_tail_us),
                     "focal_session_pace_samples" => Some(session.pace_samples),
                     "focal_session_committed_index" => Some(session.committed_index),
