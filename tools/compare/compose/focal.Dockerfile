@@ -13,7 +13,7 @@ FROM public.ecr.aws/docker/library/rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe
 RUN apk add --no-cache build-base protoc bash perl linux-headers
 WORKDIR /src
 COPY . .
-ENV RUSTFLAGS="-C target-feature=+crt-static" \
+ENV RUSTFLAGS="-C target-feature=+crt-static -C force-frame-pointers=yes" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc
 RUN --mount=type=cache,id=focal-bench-target,target=/src/target \

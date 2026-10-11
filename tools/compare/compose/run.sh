@@ -103,7 +103,7 @@ EOF
     # The leader's processor with call graphs, twenty seconds into the
     # measured window: who copies and who hashes.
     if [ "$rate" -ge 1000 ]; then
-      dc exec -d focal1 sh -c "sleep $(( warmup + 20 )); perf record -F 199 --call-graph dwarf,16384 -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
+      dc exec -d focal1 sh -c "sleep $(( warmup + 20 )); perf record -F 499 --call-graph fp -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
     fi
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
